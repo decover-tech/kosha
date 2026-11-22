@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kosha dashboard</title>
+<link rel="stylesheet" href="/dashboard/style.css">
+<script src="/dashboard/app.js" defer></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="#/">Kosha</a>
+  <nav>
+    <a href="#/" data-nav="namespaces">Namespaces</a>
+    <a href="#/console" data-nav="console">Query console</a>
+  </nav>
+  <form id="key-form" class="key-form" autocomplete="off">
+    <label for="api-key" class="key-label">API key</label>
+    <input id="api-key" type="password" placeholder="paste a key" spellcheck="false">
+    <button type="submit">Use key</button>
+    <button type="button" id="forget-key" class="secondary">Forget</button>
+    <span id="key-state" class="key-state"></span>
+  </form>
+</header>
+<main id="view" aria-live="polite"></main>
+<footer class="foot">Read-only. The key is kept in this tab's session storage and sent only to this server.</footer>
+</body>
+</html>

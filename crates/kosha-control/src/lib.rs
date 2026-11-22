@@ -10,6 +10,9 @@ use std::time::{Duration, Instant};
 
 use kosha_core::{ControlStore, KoshaError, Manifest, NamespaceId};
 
+mod namespace_rename;
+pub use namespace_rename::{rekey_manifest_references, NamespaceRename, RenameOutcome};
+
 #[cfg(feature = "postgres")]
 mod postgres;
 

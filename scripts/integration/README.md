@@ -10,8 +10,7 @@ runner drives them over HTTP and checks every answer exactly.
 CI runs it on every PR (`.github/workflows/integration.yml`, 15-minute
 timeout), followed by the Postgres CAS tests that plain `cargo test` skips:
 `cargo test -p kosha-control --features postgres --test postgres_cas -- --ignored`
-against a database created in the compose Postgres (one test thread until
-#330, a race between concurrent first-time migrations, is fixed).
+against a database created in the compose Postgres.
 
 It reuses the conformance suite (`scripts/conformance/`): its HTTP client,
 deterministic corpus, query set and BM25/filter reference model. Where
@@ -35,7 +34,7 @@ docker compose -f docker-compose.yml \
   -f scripts/integration/docker-compose.integration.yml \
   exec -T postgres createdb -U kosha kosha_cas_test
 KOSHA_TEST_DATABASE_URL=postgres://kosha:kosha-dev@localhost:5432/kosha_cas_test \
-  cargo test -p kosha-control --features postgres --test postgres_cas -- --ignored --test-threads=1
+  cargo test -p kosha-control --features postgres --test postgres_cas -- --ignored
 # Tear down (volumes included):
 docker compose -f docker-compose.yml \
   -f scripts/integration/docker-compose.integration.yml down -v

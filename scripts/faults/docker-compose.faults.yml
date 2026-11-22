@@ -1,0 +1,89 @@
+# Fault-injection overlay (#357), applied on top of the repo-root
+# docker-compose.yml and the integration overlay:
+#
+#   docker compose -f docker-compose.yml \
+#     -f scripts/integration/docker-compose.integration.yml \
+#     -f scripts/faults/docker-compose.faults.yml up --build -d
+#
+# It puts toxiproxy between the kosha pods and their backing stores: the S3
+# endpoint and DATABASE_URL of kosha-ingest and kosha-query point at the
+# proxies, so scripts/faults/run_faults.py can add latency, timeouts and
+# connection resets to S3 and cut the Postgres connection without touching
+# MinIO or Postgres themselves. The runner reads Postgres (psql in the
+# postgres container) and MinIO (localhost:9000) directly, past the proxies,
+# to check the invariants.
+#
+# The `first-boot` profile adds three pods (one ingest, two query) that the
+# concurrent-first-boot scenario starts at the same moment against a freshly
+# created database, ${KOSHA_FIRSTBOOT_DB} (the #330 migration race). Relative paths resolve
+# against the repo root (the directory of the first -f file).
+
+services:
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    command: ["-host=0.0.0.0", "-config=/etc/toxiproxy/toxiproxy.json"]
+    volumes:
+      - ./scripts/faults/toxiproxy.json:/etc/toxiproxy/toxiproxy.json:ro
+    ports:
+      - "8474:8474" # toxiproxy HTTP API
+
+  kosha-ingest:
+    depends_on:
+      toxiproxy:
+        condition: service_started
+    environment:
+      KOSHA_S3_ENDPOINT: http://toxiproxy:19000
+      DATABASE_URL: postgres://kosha:kosha-dev@toxiproxy:15432/kosha
+
+  kosha-query:
+    depends_on:
+      toxiproxy:
+        condition: service_started
+    environment:
+      KOSHA_S3_ENDPOINT: http://toxiproxy:19000
+      DATABASE_URL: postgres://kosha:kosha-dev@toxiproxy:15432/kosha
+
+  kosha-boot-1:
+    profiles: ["first-boot"]
+    image: kosha:latest
+    environment: &boot-env
+      KOSHA_ROLE: ingest
+      KOSHA_API_KEY: sk-kosha-dev
+      KOSHA_ADMIN_API_KEY: sk-kosha-admin-dev
+      KOSHA_INTERNAL_API_KEY: sk-kosha-internal-dev
+      KOSHA_HTTP_PORT: "8080"
+      KOSHA_DATA_DIR: /var/lib/kosha/data
+      KOSHA_S3_BUCKET: dsearch-dev
+      KOSHA_S3_PREFIX: ${KOSHA_FIRSTBOOT_DB:-kosha_firstboot}/
+      KOSHA_S3_ENDPOINT: http://minio:9000
+      KOSHA_S3_FORCE_PATH_STYLE: "true"
+      KOSHA_S3_ACCESS_KEY: kosha
+      KOSHA_S3_SECRET_KEY: kosha-dev-secret
+      AWS_DEFAULT_REGION: us-east-1
+      DATABASE_URL: postgres://kosha:kosha-dev@postgres:5432/${KOSHA_FIRSTBOOT_DB:-kosha_firstboot}
+      KOSHA_WAL_MODE: s3
+      KOSHA_WAL_WRITER_ID: firstboot-ingest
+      KOSHA_WRITER_LEASE_TTL_MS: "5000"
+      KOSHA_MANIFEST_REFRESH_MS: "200"
+    ports:
+      - "8091:8080"
+
+  kosha-boot-2:
+    profiles: ["first-boot"]
+    image: kosha:latest
+    environment:
+      <<: *boot-env
+      KOSHA_ROLE: query
+      KOSHA_INGEST_HOST: http://kosha-boot-1:8080
+    ports:
+      - "8092:8080"
+
+  kosha-boot-3:
+    profiles: ["first-boot"]
+    image: kosha:latest
+    environment:
+      <<: *boot-env
+      KOSHA_ROLE: query
+      KOSHA_INGEST_HOST: http://kosha-boot-1:8080
+    ports:
+      - "8093:8080"

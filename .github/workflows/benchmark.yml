@@ -18,9 +18,49 @@
 #   INFRA_REPO_TOKEN
 #     read token for the infra repo (terraform lives there).
 #
+# Warm gate (input warm_gate):
+#   queries (default): turbopuffer protocol. The server starts with no boot
+#     preload, warm_gate.py warms the namespace with the workload queries
+#     until every query has come back fully cached at least once and then
+#     3 consecutive random ones are, and only warm phases
+#     are measured (warmup time is logged, never measured). Span promotion
+#     (background whole-file hydration) is off on the container, so nothing
+#     downloads behind a measured phase. On a reused VM the local cache of
+#     the same snapshot is kept per namespace, so warmup is ~minutes.
+#   preload: the earlier protocol: KOSHA_WARMUP_NAMESPACES boot preload
+#     gated on /readyz after a local wipe, then cold + warm phases.
+#   timed (research #389, bounded-cache runs): empties the local store
+#     (every arm starts cold and the bound covers only the suite
+#     namespace), runs the workload unmeasured for warm_fill_s, then
+#     measures the no-result-cache phase phase_repeats times, sampling the
+#     local footprint and the server evictions (run_phases.sh header).
+#
+#   cold (research, #380): no preload at all. Local wipe, restart with no
+#     KOSHA_WARMUP_NAMESPACES, KOSHA_WARMUP_USAGE=off and span promotion
+#     off, then ONE first-touch phase (knn_cold_nocache / cold_or_nocache):
+#     the per-query S3 GETs and bytes of the layout under test. The preload
+#     "cold" phase cannot measure that: it runs after a full preload.
+# Disk-cache experiment input (research #389; empty = today), one
+# space-separated key=value list to stay under GitHub's 25 dispatch inputs:
+#   cache_experiment  max=<bytes>               KOSHA_CACHE_MAX_BYTES (default 600 GiB)
+#                     policy=legacy|sieve|s3fifo KOSHA_CACHE_POLICY
+#                     trace=true|false          per-search read trace + S3 size
+#                                               listing, archived as
+#                                               server/cache-trace.jsonl.gz and
+#                                               server/s3-sizes.tsv.gz for
+#                                               scripts/bench/cache_sim/cache_sim.py
+#                     order=cycle|shuffle|zipf  query_bench.py --order
+#                     fill=<s> repeats=1-5      warm_gate=timed only
+# A bound below the default only makes sense with warm_gate=timed and one
+# suite per dispatch (the bound covers the whole data dir); the validate
+# step refuses other combinations. KOSHA_CACHE_ACCOUNTING is no longer an
+# input: #342 made the cache count every file once on every path.
+#
 # Teardown policy mirrors the bench standing rule: destroy on success;
 # on failure the stack is KEPT for debugging (a summary line says so) —
 # destroy it manually or re-dispatch with suite=none after investigating.
+# keep_vm=true also keeps it after a success, for back-to-back iteration
+# runs that reuse its local cache (it keeps costing money until destroyed).
 name: benchmark
 
 on:
@@ -36,12 +76,76 @@ on:
         type: choice
         options: [restore, load]
         default: restore
+      bm25_docs:
+        description: >-
+          BM25 corpus size. 1m matches turbopuffer's published full-text
+          numbers (1M docs, ~300MB); 10m is the original 10M-doc corpus.
+          The first 1m run builds the namespace offline from the first 1M
+          docs of the same MSMarco shards and snapshots it; later runs
+          restore that snapshot.
+        type: choice
+        options: [10m, 1m]
+        default: 10m
       qps:
         description: target queries/sec per phase
         default: "8"
       duration:
         description: seconds per phase (300 = quick ~5min check; pass 1800 for the full tpuf-protocol duration on a publication-grade run)
         default: "300"
+      warm_gate:
+        description: >-
+          how the namespace gets warm before measuring. queries = the
+          turbopuffer protocol (no boot preload; warm with the workload
+          queries until 3 in a row are fully cached; warm phases only;
+          a reused VM keeps its local cache). preload = the earlier
+          KOSHA_WARMUP_NAMESPACES boot preload + cold and warm phases.
+          cold = no preload at all (local wipe, usage warming off), one
+          first-touch phase only (research #380).
+        type: choice
+        options: [queries, preload, timed, cold]
+        default: queries
+      return_fields:
+        description: >-
+          what each hit returns. ids = doc_id + score only (source_includes
+          empty), as turbopuffer's benchmark queries do; all = every stored
+          field including the embedding (~100-200KB per top-10 kNN
+          response, which also overflows the result cache).
+        type: choice
+        options: [ids, all]
+        default: ids
+      vector_snapshot:
+        description: >-
+          snapshot the vector suite restores into namespace msmarco-10m-vec.
+          msmarco-10m-vec is the original (vectors inlined as JSON in
+          doc_store.bin, ~249GB local working set); msmarco-10m-vec-sidecar
+          is the rebuild with the binary doc_vectors.bin sidecar (exists
+          once build_vector_snapshot has run for it).
+        default: msmarco-10m-vec
+      build_vector_snapshot:
+        description: >-
+          if vector_snapshot does not exist yet, build it offline
+          (build_and_import.sh --with-embeddings: ~40GB embeddings sync plus
+          the 10M segment build and upload) before the vector suite. Never
+          rebuilds msmarco-10m-vec or an existing snapshot. Slow: budget
+          against the 350-minute job limit, and prefer suite=vector.
+        type: boolean
+        default: false
+      build_segments_args:
+        description: >-
+          extra kosha-build-segments flags for a build_vector_snapshot
+          rebuild (research #380), e.g. "--cluster-layout namespace" for
+          cluster-aligned segments. Empty = the default builder. Only used
+          when build_vector_snapshot builds a new snapshot; characters
+          limited to [A-Za-z0-9 =._-].
+        default: ""
+      keep_vm:
+        description: >-
+          keep the bench VM stack after a successful run too, so the next
+          run reuses it (local cache kept when the snapshot matches). It
+          keeps billing: finish with a run where this is off (suite=none
+          just tears down).
+        type: boolean
+        default: false
       run_recall_check:
         description: >-
           also compute real recall@k against exact brute-force ground truth
@@ -55,6 +159,27 @@ on:
       recall_sample:
         description: number of queries to check recall for (statistical sample, not the full query set)
         default: "100"
+      cache_experiment:
+        description: >-
+          research #389 disk-cache knobs, space-separated key=value (empty =
+          today): max=<bytes> (KOSHA_CACHE_MAX_BYTES, default 644245094400),
+          policy=legacy|sieve|s3fifo, trace=true|false, order=cycle|shuffle|zipf,
+          and for warm_gate=timed fill=<seconds> (default 900) and
+          repeats=1-5 (default 1). A smaller max needs warm_gate=timed and
+          suite bm25 or vector, not both.
+        default: ""
+      two_tier_eval:
+        description: >-
+          research #387, measurement only: after the BM25 namespace is
+          restored, run the offline two-tier (head/tail) analysis
+          (scripts/bench/bm25_scale/vm/two_tier_eval.sh) over its live
+          segments and the query file. With suite none or vector it
+          restores the BM25 namespace itself. Never changes the server.
+        type: boolean
+        default: false
+      two_tier_fractions:
+        description: head fractions for two_tier_eval (comma-separated, each in (0, 1])
+        default: "0.1,0.2,0.3"
       recall_num_candidates:
         description: >-
           whole-query kNN probe budget for the recall check (knn.num_candidates
@@ -63,6 +188,50 @@ on:
           use gets thin fast as segment count grows; bump this to test
           whether recall recovers with a larger budget)
         default: "100"
+      knn_sweep:
+        description: >-
+          kNN probe-budget sweep (#384) after the vector suite; empty (default)
+          = off. "fractions" = KOSHA_KNN_BUDGET_FRACTION 0.05/0.03/0.02/0.01;
+          "relative" = the step 2 flag grid (alpha 0/0.5, alpha=0 relative
+          cutoff at eps 0.5/1/2, min probes 500/1000, plus f0.05);
+          or points "label:ENV=V,ENV=V;label2:..." over the kNN probe knobs
+          (see scripts/bench/bm25_scale/vm/knn_budget_sweep.sh). Each point
+          restarts the server with those env vars, runs a warm kNN phase of
+          `duration` seconds at `qps` and recall over 1000 random queries.
+          Needs run_recall_check=true. Adds ~(duration + 8 min) per point.
+        default: ""
+      bm25_snapshot:
+        description: >-
+          snapshot the BM25 suite restores into namespace msmarco-<bm25_docs>.
+          Empty (default) = the namespace name, exactly as before. A name
+          that does not exist yet is built offline once (build_and_import.sh,
+          first 1M docs when bm25_docs=1m) with server_env applied to the
+          builder, then restored; existing snapshots are never overwritten.
+          Restore mode only. Must match [a-z0-9.-]+.
+        default: ""
+      server_env:
+        description: >-
+          extra kosha server environment for experiments, space-separated
+          KEY=VALUE pairs (each must match ^[A-Z0-9_]+=[A-Za-z0-9._:/,-]*$;
+          anything else fails the run before provisioning). Appended as -e
+          flags after the standard bench env, so a repeated key overrides
+          it. Also passed to the offline segment builder when a new
+          bm25_snapshot / vector_snapshot is built. Empty = none.
+        default: ""
+      rustflags:
+        description: >-
+          RUSTFLAGS for the server image build (Docker build arg
+          KOSHA_RUSTFLAGS), e.g. -C target-cpu=x86-64-v3. Empty (default) =
+          no build arg, the image builds exactly as before. Allowed
+          characters: letters, digits, space and = + , . _ : -
+        default: ""
+      knn_budget_fraction:
+        description: >-
+          sets KOSHA_KNN_BUDGET_FRACTION on the server (kNN global probe
+          budget floor as a fraction of the namespace centroids; server
+          default 0.05). Empty (default) = unset. Must be a number with
+          0 < x <= 1; do not also set the key in server_env.
+        default: ""
 
 concurrency:
   group: bench-vm            # one bench stack; never two runs at once
@@ -72,14 +241,123 @@ env:
   AWS_ACCESS_KEY_ID: ${{ secrets.BENCH_AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.BENCH_AWS_SECRET_ACCESS_KEY }}
   AWS_DEFAULT_REGION: us-east-1
-  BM25_NS: msmarco-10m
+  BM25_NS: msmarco-${{ inputs.bm25_docs || '10m' }}
   VEC_NS: msmarco-10m-vec
+  VEC_SNAPSHOT: ${{ inputs.vector_snapshot || 'msmarco-10m-vec' }}
+  BUILD_SEGMENTS_ARGS: ${{ inputs.build_segments_args || '' }}
+  WARM_GATE: ${{ inputs.warm_gate || 'queries' }}
+  RETURN_FIELDS: ${{ inputs.return_fields || 'ids' }}
+  # research #389 cache knobs: defaults (today) here; the "Validate
+  # disk-cache experiment inputs" step overrides them via GITHUB_ENV from
+  # the single cache_experiment input.
+  IN_CACHE_EXPERIMENT: ${{ inputs.cache_experiment }}
+  CACHE_MAX_BYTES: "644245094400"
+  CACHE_POLICY: legacy
+  CACHE_TRACE: "false"
+  WARM_FILL_S: "900"
+  PHASE_REPEATS: "1"
+  QUERY_ORDER: cycle
+  BM25_SNAPSHOT: ${{ inputs.bm25_snapshot || format('msmarco-{0}', inputs.bm25_docs || '10m') }}
+  # Raw experiment inputs: read only as shell variables (never spliced into
+  # a script with an expression) until "Validate experiment inputs" has
+  # checked them; later steps use its normalized SERVER_ENV_ARGS and
+  # KOSHA_RUSTFLAGS.
+  IN_SERVER_ENV: ${{ inputs.server_env }}
+  IN_RUSTFLAGS: ${{ inputs.rustflags }}
+  IN_KNN_BUDGET_FRACTION: ${{ inputs.knn_budget_fraction }}
 
 jobs:
   bench:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
+      - name: Validate disk-cache experiment inputs
+        # Before any infrastructure. Parses cache_experiment (key=value
+        # list) into the CACHE_* / WARM_FILL_S / PHASE_REPEATS / QUERY_ORDER
+        # variables the later steps read. Their values are pasted into the
+        # single-quoted remote scripts below, so only fixed words and digits
+        # pass.
+        run: |
+          set -euo pipefail
+          bad() { echo "::error::cache_experiment: $*"; exit 1; }
+          set -f
+          for kv in $IN_CACHE_EXPERIMENT; do
+            k="${kv%%=*}"; v="${kv#*=}"
+            [ "$k" != "$kv" ] || bad "entries must be key=value, got: $kv"
+            case "$k" in
+              max) case "$v" in *[!0-9]*|'') bad "max must be digits, got: $v" ;; esac; CACHE_MAX_BYTES=$v ;;
+              policy) case "$v" in legacy|sieve|s3fifo) ;; *) bad "policy must be legacy, sieve or s3fifo, got: $v" ;; esac; CACHE_POLICY=$v ;;
+              trace) case "$v" in true|false) ;; *) bad "trace must be true or false, got: $v" ;; esac; CACHE_TRACE=$v ;;
+              order) case "$v" in cycle|shuffle|zipf) ;; *) bad "order must be cycle, shuffle or zipf, got: $v" ;; esac; QUERY_ORDER=$v ;;
+              fill) case "$v" in *[!0-9]*|'') bad "fill must be digits, got: $v" ;; esac; WARM_FILL_S=$v ;;
+              repeats) case "$v" in [1-5]) ;; *) bad "repeats must be 1-5, got: $v" ;; esac; PHASE_REPEATS=$v ;;
+              *) bad "unknown key: $k (allowed: max policy trace order fill repeats)" ;;
+            esac
+          done
+          set +f
+          if [ "$CACHE_MAX_BYTES" != 644245094400 ]; then
+            # The bound covers the whole data dir (every namespace), and a
+            # cache smaller than the working set never lets every query
+            # come back fully cached, so the queries gate would spin.
+            [ "${{ inputs.suite }}" = both ] && bad "a non-default max needs suite bm25 or vector, not both"
+            [ "$WARM_GATE" = timed ] || bad "a non-default max needs warm_gate=timed"
+          fi
+          {
+            echo "CACHE_MAX_BYTES=$CACHE_MAX_BYTES"
+            echo "CACHE_POLICY=$CACHE_POLICY"
+            echo "CACHE_TRACE=$CACHE_TRACE"
+            echo "QUERY_ORDER=$QUERY_ORDER"
+            echo "WARM_FILL_S=$WARM_FILL_S"
+            echo "PHASE_REPEATS=$PHASE_REPEATS"
+          } >> "$GITHUB_ENV"
+          echo "cache: max_bytes=$CACHE_MAX_BYTES policy=$CACHE_POLICY trace=$CACHE_TRACE order=$QUERY_ORDER fill=$WARM_FILL_S repeats=$PHASE_REPEATS" >> "$GITHUB_STEP_SUMMARY"
+
+      # Runs before anything is provisioned, so a bad input costs nothing.
+      # Inputs are read only from the environment here (no expression
+      # splicing). Later steps splice the normalized values into remote
+      # scripts, which is safe only because this step restricted them to
+      # characters without quotes, $, backticks, ; | & or redirections.
+      - name: Validate experiment inputs
+        run: |
+          set -euo pipefail
+          export LC_ALL=C   # ASCII ranges in the patterns below, whatever the locale
+          fail() { echo "::error::$*"; exit 1; }
+          case "$BM25_SNAPSHOT" in
+            *[!a-z0-9.-]*|'') fail "bm25_snapshot must match ^[a-z0-9.-]+$, got: $BM25_SNAPSHOT" ;;
+          esac
+          case "$VEC_SNAPSHOT" in
+            *[!a-z0-9.-]*|'') fail "vector_snapshot must match ^[a-z0-9.-]+$, got: $VEC_SNAPSHOT" ;;
+          esac
+          if [ "$BM25_SNAPSHOT" != "$BM25_NS" ] && [ "${{ inputs.mode }}" = load ]; then
+            fail "bm25_snapshot override is restore mode only (load mode snapshots under $BM25_NS as before)"
+          fi
+          RUSTFLAGS_RE='^[A-Za-z0-9 =+,._:-]+$'
+          if [ -n "$IN_RUSTFLAGS" ] && ! [[ "$IN_RUSTFLAGS" =~ $RUSTFLAGS_RE ]]; then
+            fail "rustflags may only contain letters, digits, space and = + , . _ : -"
+          fi
+          NUM_RE='^([0-9]*\.)?[0-9]+$'
+          PAIR_RE='^[A-Z0-9_]+=[A-Za-z0-9._:/,-]*$'
+          ARGS=""
+          if [ -n "$IN_KNN_BUDGET_FRACTION" ]; then
+            [[ "$IN_KNN_BUDGET_FRACTION" =~ $NUM_RE ]] \
+              && awk -v x="$IN_KNN_BUDGET_FRACTION" 'BEGIN { exit !(x > 0 && x <= 1) }' \
+              || fail "knn_budget_fraction must be a number with 0 < x <= 1, got: $IN_KNN_BUDGET_FRACTION"
+            ARGS="-e KOSHA_KNN_BUDGET_FRACTION=$IN_KNN_BUDGET_FRACTION"
+          fi
+          set -f   # no glob expansion while splitting the pairs
+          for pair in $IN_SERVER_ENV; do
+            [[ "$pair" =~ $PAIR_RE ]] \
+              || fail "server_env pair rejected (each must match $PAIR_RE): $pair"
+            if [ -n "$IN_KNN_BUDGET_FRACTION" ] && [ "${pair%%=*}" = KOSHA_KNN_BUDGET_FRACTION ]; then
+              fail "KOSHA_KNN_BUDGET_FRACTION is set by both knn_budget_fraction and server_env"
+            fi
+            ARGS="${ARGS:+$ARGS }-e $pair"
+          done
+          set +f
+          echo "SERVER_ENV_ARGS=$ARGS" >> "$GITHUB_ENV"
+          echo "KOSHA_RUSTFLAGS=$IN_RUSTFLAGS" >> "$GITHUB_ENV"
+          echo "experiment inputs: bm25_snapshot=$BM25_SNAPSHOT vector_snapshot=$VEC_SNAPSHOT server env args=[${ARGS:-none}] rustflags=[${IN_RUSTFLAGS:-none}]"
+
       - uses: actions/checkout@v4
 
       - uses: actions/checkout@v4
@@ -120,7 +398,12 @@ jobs:
         run: |
           IP='${{ steps.tf.outputs.ip }}'
           SSH="ssh -i $RUNNER_TEMP/bench.pem -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 ec2-user@$IP"
-          for i in $(seq 60); do $SSH 'command -v docker >/dev/null && echo ready' && break || sleep 10; done
+          # Docker is installed by user-data on first boot: wait for cloud-init
+          # to finish and the daemon to answer, not just for the binary.
+          for i in $(seq 60); do
+            $SSH 'sudo cloud-init status --wait >/dev/null 2>&1; sudo docker info >/dev/null 2>&1 && echo ready' && break || sleep 10
+            [ "$i" -eq 60 ] && { echo "::error::bench VM never reached cloud-init done + docker running"; exit 1; }
+          done
           rsync -az -e "ssh -i $RUNNER_TEMP/bench.pem -o StrictHostKeyChecking=accept-new" \
             --exclude target --exclude .git ./ "ec2-user@$IP:kosha/"
           $SSH 'sudo dnf install -q -y python3.11 python3.11-pip >/dev/null 2>&1 || true
@@ -133,9 +416,68 @@ jobs:
           IP='${{ steps.tf.outputs.ip }}'
           SSH="ssh -i $RUNNER_TEMP/bench.pem ec2-user@$IP"
           $SSH 'set -e
-            cd ~/kosha && sudo docker build -q -t kosha-server:bench .
+            cd ~/kosha
+            # rustflags input (validated: no quotes or shell metacharacters).
+            # Empty = the plain build, the same command as before.
+            KRF="${{ env.KOSHA_RUSTFLAGS }}"
+            if [ -n "$KRF" ]; then
+              echo "building server image with KOSHA_RUSTFLAGS=$KRF"
+              sudo docker build -q --build-arg KOSHA_RUSTFLAGS="$KRF" -t kosha-server:bench .
+            else
+              sudo docker build -q -t kosha-server:bench .
+            fi
             sudo mkdir -p /data/kosha /data/pg && sudo chown ec2-user:ec2-user /data && sudo chown -R 10001:10001 /data/kosha
+            # NOTE: this block is one single-quoted remote script, so it must
+            # not contain an apostrophe. One in a comment here once ended the
+            # quote, and the rest of the step silently ran on the runner.
+            # A reused VM (the previous run failed and kept the stack) still
+            # holds the kosha container of that run. Its log is the only record of
+            # what went wrong server-side, so archive it before recreating.
+            if sudo docker inspect kosha >/dev/null 2>&1; then
+              TS=$(date -u +%Y%m%dT%H%M%SZ)
+              sudo docker logs --timestamps kosha 2>&1 | gzip > /tmp/prev-kosha.log.gz || true
+              aws s3 cp --only-show-errors /tmp/prev-kosha.log.gz \
+                "s3://decoverai-bench-corpus-cache/runs/rescued-$TS/server/full.log.gz" || true
+              rm -f /tmp/prev-kosha.log.gz
+            fi
+            # Results/logs from a previous run on this VM must not leak into this one.
+            sudo rm -rf /data/results-ci
             sudo docker rm -f pg kosha 2>/dev/null || true
+            # warm_gate=queries: no boot preload, so /readyz is green at once
+            # and warm_gate.py does the warming with the workload queries.
+            # Span promotion is off in that mode: after enough ranged reads of
+            # a segment the server hydrates the whole doc store or postings
+            # shard in the background, and fully_cached does not see that,
+            # so the gate could pass with downloads still running into the
+            # measured phases. With it off, a warm query reads only the spans
+            # the gate already made local.
+            WARMUP_ARGS="-e KOSHA_DOC_SPAN_PROMOTE_GETS=0 -e KOSHA_DOC_SPAN_PROMOTE_BYTES=0"
+            WARMUP_ARGS="$WARMUP_ARGS -e KOSHA_POSTING_SPAN_PROMOTE_GETS=0 -e KOSHA_POSTING_SPAN_PROMOTE_BYTES=0"
+            if [ "${{ env.WARM_GATE }}" = preload ]; then
+              WARMUP_ARGS="-e KOSHA_WARMUP_NAMESPACES=default/msmarco-10m,default/msmarco-1m,default/msmarco-10m-vec"
+            fi
+            # warm_gate=cold: no boot warming of any kind, so the persisted
+            # usage warm set (#213) is not warmed either. run_phases.sh checks.
+            if [ "${{ env.WARM_GATE }}" = cold ]; then
+              WARMUP_ARGS="$WARMUP_ARGS -e KOSHA_WARMUP_USAGE=off"
+            fi
+            echo "warm gate: ${{ env.WARM_GATE }} (container args: ${WARMUP_ARGS:-none})"
+            # Research #389 disk-cache knobs. Defaults add nothing, so the
+            # container is created exactly as before.
+            # warm_gate=timed keeps the span-promotion-off args set above.
+            CACHE_ARGS=""
+            if [ "${{ env.CACHE_POLICY }}" != legacy ]; then CACHE_ARGS="-e KOSHA_CACHE_POLICY=${{ env.CACHE_POLICY }}"; fi
+            sudo rm -rf /data/kosha/trace
+            if [ "${{ env.CACHE_TRACE }}" = true ]; then
+              sudo mkdir -p /data/kosha/trace && sudo chown 10001:10001 /data/kosha/trace
+              CACHE_ARGS="$CACHE_ARGS -e KOSHA_CACHE_TRACE_PATH=/var/cache/kosha/trace/cache-trace.jsonl"
+            fi
+            echo "disk cache: max_bytes=${{ env.CACHE_MAX_BYTES }} args: ${CACHE_ARGS:-none}"
+            # server_env + knn_budget_fraction inputs, normalized to -e flags by
+            # the validate step. Appended last so a repeated key overrides the
+            # standard bench env above. Empty by default.
+            EXPERIMENT_ARGS="${{ env.SERVER_ENV_ARGS }}"
+            echo "experiment server env: ${EXPERIMENT_ARGS:-none}"
             sudo docker run -d --name pg --network host -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=kosha \
               -v /data/pg:/var/lib/postgresql/data postgres:16
             # Bounded waits throughout: an unbounded `until` loop turns a
@@ -152,13 +494,18 @@ jobs:
               -e AWS_DEFAULT_REGION=us-east-1 -e KOSHA_FLUSH_THRESHOLD=50000 -e KOSHA_FLUSH_MAX_AGE_MS=0 -e KOSHA_COMPACTION_INTERVAL_MS=0 \
               -e KOSHA_HTTP_IO_TIMEOUT_SECS=1800 \
               -e KOSHA_CACHE_DIR=/var/cache/kosha -e KOSHA_DATA_DIR=/var/cache/kosha/data \
-              -e KOSHA_CACHE_MAX_BYTES=644245094400 -e KOSHA_SEGMENT_CACHE_MAX_BYTES=51539607552 \
+              -e KOSHA_CACHE_MAX_BYTES=${{ env.CACHE_MAX_BYTES }} -e KOSHA_SEGMENT_CACHE_MAX_BYTES=51539607552 \
               -e KOSHA_SEGMENT_LIVE_MAX_BYTES=68719476736 -e KOSHA_SCORING_HYDRATE_CONCURRENCY=64 \
-              -e KOSHA_WARMUP_NAMESPACES="msmarco-10m,msmarco-10m-vec" \
+              -e KOSHA_ADMIN_API_KEY=sk-bench-admin \
+              -e KOSHA_DASHBOARD=on \
+              $WARMUP_ARGS $CACHE_ARGS $EXPERIMENT_ARGS \
               -v /data/kosha:/var/cache/kosha kosha-server:bench
             sudo docker start kosha
-            for i in $(seq 60); do curl -sf -H "Authorization: Bearer sk-bench" http://127.0.0.1:8080/stats >/dev/null && break; sleep 3
-              [ "$i" -eq 60 ] && { echo "::error::kosha /stats never responded after 180s"; sudo docker logs kosha; exit 1; }; done
+            # /healthz: unauthenticated liveness. Global /stats is admin-only
+            # since #262 (tenant isolation), so it 403s for sk-bench. Warmup
+            # ids are tenant-scoped (sk-bench is tenant "default").
+            for i in $(seq 60); do curl -sf http://127.0.0.1:8080/healthz >/dev/null && break; sleep 3
+              [ "$i" -eq 60 ] && { echo "::error::kosha /healthz never responded after 180s"; sudo docker logs --tail 200 kosha; exit 1; }; done
             aws s3 cp --only-show-errors s3://decoverai-bench-corpus-cache/msmarco-10m/queries.txt /data/queries.txt
             aws s3 cp --only-show-errors s3://decoverai-bench-corpus-cache/msmarco-10m-emb/queries_emb.f32 /data/queries_emb.f32 || true'
 
@@ -168,7 +515,24 @@ jobs:
           IP='${{ steps.tf.outputs.ip }}'
           SSH="ssh -i $RUNNER_TEMP/bench.pem -o ServerAliveInterval=30 ec2-user@$IP"
           if [ '${{ inputs.mode }}' = 'restore' ]; then
-            $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && ./restore_namespace.sh $BM25_NS"
+            # msmarco-1m has no snapshot until its first run: build it
+            # offline from the first 1M docs (minutes), which snapshots it.
+            if [ "$BM25_SNAPSHOT" = "$BM25_NS" ]; then
+              $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && \
+                if [ $BM25_NS = msmarco-1m ] && ! aws s3 ls s3://decoverai-bench-corpus-cache/snapshots/msmarco-1m/pg-kosha.sql.gz >/dev/null 2>&1; then \
+                  MAX_DOCS=1000000 ./build_and_import.sh msmarco-1m; \
+                else ./restore_namespace.sh $BM25_NS; fi"
+            else
+              # bm25_snapshot override: restore it, building it offline first
+              # (once, with server_env applied to the builder) if it does not
+              # exist. build_and_import.sh never overwrites a snapshot.
+              MAX_DOCS=0; [ "$BM25_NS" = msmarco-1m ] && MAX_DOCS=1000000
+              $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && \
+                if ! aws s3 ls s3://decoverai-bench-corpus-cache/snapshots/$BM25_SNAPSHOT/pg-kosha.sql.gz >/dev/null 2>&1; then \
+                  echo snapshot $BM25_SNAPSHOT missing, building it offline; \
+                  MAX_DOCS=$MAX_DOCS SNAPSHOT_NAME=$BM25_SNAPSHOT BUILD_DOCKER_ENV='$SERVER_ENV_ARGS' ./build_and_import.sh $BM25_NS; \
+                fi && ./restore_namespace.sh $BM25_NS $BM25_SNAPSHOT"
+            fi
           else
             $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && \
               ~/venv311/bin/python3 ../load_corpus.py --host http://127.0.0.1:8080 \
@@ -177,22 +541,70 @@ jobs:
                 --compact-after --compact-mode full --compact-passes 12 && \
               ./snapshot_namespace.sh $BM25_NS"
           fi
-          $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && \
+          $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && WARM_GATE=$WARM_GATE RETURN_FIELDS=$RETURN_FIELDS \
+            QUERY_ORDER=$QUERY_ORDER WARM_FILL_S=$WARM_FILL_S PHASE_REPEATS=$PHASE_REPEATS \
             ./run_phases.sh bm25 $BM25_NS /data/results-ci/bm25 '${{ inputs.qps }}' '${{ inputs.duration }}'"
+
+      - name: Two-tier analysis (research 387, offline, measurement only)
+        if: inputs.two_tier_eval == true
+        run: |
+          IP='${{ steps.tf.outputs.ip }}'
+          SSH="ssh -i $RUNNER_TEMP/bench.pem -o ServerAliveInterval=30 ec2-user@$IP"
+          FRACTIONS='${{ inputs.two_tier_fractions }}'
+          case "$FRACTIONS" in
+            *[!0-9.,]*|'') echo "::error::two_tier_fractions must match [0-9.,]+, got: $FRACTIONS"; exit 1 ;;
+          esac
+          # The BM25 suite (if it ran) already restored the namespace;
+          # otherwise restore it here so pg and the bench bucket hold it.
+          if [ '${{ inputs.suite }}' != 'both' ] && [ '${{ inputs.suite }}' != 'bm25' ]; then
+            $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && ./restore_namespace.sh $BM25_NS"
+          fi
+          $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && TWO_TIER_FRACTIONS=$FRACTIONS \
+            ./two_tier_eval.sh $BM25_NS /data/results-ci/two_tier"
 
       - name: Vector suite
         if: contains(fromJSON('["both","vector"]'), inputs.suite)
         run: |
           IP='${{ steps.tf.outputs.ip }}'
           SSH="ssh -i $RUNNER_TEMP/bench.pem -o ServerAliveInterval=30 ec2-user@$IP"
+          case "$VEC_SNAPSHOT" in
+            *[!a-z0-9.-]*|'') echo "::error::vector_snapshot must match [a-z0-9.-]+, got: $VEC_SNAPSHOT"; exit 1 ;;
+          esac
+          case "$BUILD_SEGMENTS_ARGS" in
+            *[!A-Za-z0-9\ =._-]*) echo "::error::build_segments_args may only contain [A-Za-z0-9 =._-], got: $BUILD_SEGMENTS_ARGS"; exit 1 ;;
+          esac
           if [ '${{ inputs.mode }}' = 'restore' ]; then
-            $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && ./restore_namespace.sh $VEC_NS"
+            if [ '${{ inputs.build_vector_snapshot }}' = 'true' ]; then
+              # Opt-in offline rebuild under a NEW snapshot name; existing
+              # snapshots (the original above all) are never overwritten.
+              if [ "$VEC_SNAPSHOT" = "$VEC_NS" ]; then
+                echo "::error::build_vector_snapshot needs a new vector_snapshot name (e.g. msmarco-10m-vec-sidecar); $VEC_NS is the original snapshot"
+                exit 1
+              fi
+              $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && \
+                if aws s3 ls s3://decoverai-bench-corpus-cache/snapshots/$VEC_SNAPSHOT/pg-kosha.sql.gz >/dev/null 2>&1; then \
+                  echo snapshot $VEC_SNAPSHOT exists, not rebuilding; \
+                else BUILD_DOCKER_ENV='$SERVER_ENV_ARGS' BUILD_ARGS='$BUILD_SEGMENTS_ARGS' BUILDER_SHA=$GITHUB_SHA SNAPSHOT_NAME=$VEC_SNAPSHOT ./build_and_import.sh $VEC_NS --with-embeddings; fi"
+            fi
+            $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && ./restore_namespace.sh $VEC_NS $VEC_SNAPSHOT"
+            # Provenance of the restored snapshot (builder commit and flags,
+            # written by build_and_import.sh since #380); snapshots built
+            # before that have none, and the run says so.
+            $SSH "sudo mkdir -p /data/results-ci/vector && sudo chown -R \$(id -u):\$(id -g) /data/results-ci && \
+              if aws s3 cp --only-show-errors s3://decoverai-bench-corpus-cache/snapshots/$VEC_SNAPSHOT/build-info.json /data/results-ci/vector/snapshot-build-info.json; then \
+                echo snapshot build info: && cat /data/results-ci/vector/snapshot-build-info.json; \
+              else echo snapshot $VEC_SNAPSHOT has no build-info.json, builder commit unknown; fi"
           else
             echo "::error::vector full-load (~6h) exceeds the job ceiling — run it from a workstation once, then use restore mode"
             exit 1
           fi
-          $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && \
-            ./run_phases.sh vector $VEC_NS /data/results-ci/vector '${{ inputs.qps }}' '${{ inputs.duration }}'"
+          # preload: ~249GB vector working set (original snapshot), warmup is
+          # bound by local disk writes (~30-45MB/s per file on the gp3 root
+          # volume), ~1h55m measured. queries: warm_gate.py hydrates only what
+          # the workload reads, and nothing on a reused VM with a kept cache.
+          $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && WARMUP_TIMEOUT_S=10800 WARM_GATE_TIMEOUT_S=10800 \
+            WARM_GATE=$WARM_GATE RETURN_FIELDS=$RETURN_FIELDS QUERY_ORDER=$QUERY_ORDER \
+            WARM_FILL_S=$WARM_FILL_S PHASE_REPEATS=$PHASE_REPEATS ./run_phases.sh vector $VEC_NS /data/results-ci/vector '${{ inputs.qps }}' '${{ inputs.duration }}'"
 
       - name: Recall check (real recall@k vs. brute-force ground truth)
         if: contains(fromJSON('["both","vector"]'), inputs.suite) && inputs.run_recall_check == true
@@ -211,18 +623,78 @@ jobs:
               --sample '${{ inputs.recall_sample }}' --k 10 --num-candidates '${{ inputs.recall_num_candidates }}' \
               --out /data/results-ci/vector/recall.json"
 
+      - name: kNN probe-budget sweep (#384)
+        if: contains(fromJSON('["both","vector"]'), inputs.suite) && inputs.knn_sweep != ''
+        env:
+          KNN_SWEEP: ${{ inputs.knn_sweep }}
+        run: |
+          IP='${{ steps.tf.outputs.ip }}'
+          SSH="ssh -i $RUNNER_TEMP/bench.pem -o ServerAliveInterval=30 ec2-user@$IP"
+          case "$KNN_SWEEP" in
+            *[!A-Za-z0-9_.=:\;,-]*) echo "::error::knn_sweep may only contain [A-Za-z0-9_.=:;,-], got: $KNN_SWEEP"; exit 1 ;;
+          esac
+          if [ '${{ inputs.run_recall_check }}' != 'true' ]; then
+            echo "::error::knn_sweep needs run_recall_check=true (the embeddings volume holds the recall ground truth)"
+            exit 1
+          fi
+          $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && \
+            EMB_DIR=\$(./mount_embeddings_cache.sh '${{ steps.tf.outputs.embeddings_volume_id }}') && \
+            WARM_GATE_TIMEOUT_S=10800 RETURN_FIELDS=$RETURN_FIELDS \
+            ./knn_budget_sweep.sh $VEC_NS /data/results-ci/knn_sweep \"\$EMB_DIR\" \
+              '${{ inputs.qps }}' '${{ inputs.duration }}' '$KNN_SWEEP'"
+
+      - name: Archive server logs + results to S3
+        # Runs on failure too: a failed run's logs are the useful ones. The
+        # bench segment bucket is destroyed with the stack, so this goes to
+        # the persistent corpus-cache bucket, keyed by run id:
+        #   s3://decoverai-bench-corpus-cache/runs/<run_id>/
+        #     meta.json, <suite>/<phase>.json, <phase>.requests.jsonl.gz,
+        #     <suite>/server/{warmup,<phase>}.log.gz, server/full.log.gz
+        if: always() && (inputs.suite != 'none' || inputs.two_tier_eval == true) && steps.tf.outputs.ip != ''
+        run: |
+          IP='${{ steps.tf.outputs.ip }}'
+          SSH="ssh -i $RUNNER_TEMP/bench.pem -o ServerAliveInterval=30 ec2-user@$IP"
+          DEST="s3://decoverai-bench-corpus-cache/runs/${{ github.run_id }}"
+          $SSH "set -e
+            sudo mkdir -p /data/results-ci/server && sudo chown -R \$(id -u):\$(id -g) /data/results-ci
+            sudo docker logs --timestamps kosha 2>&1 | gzip > /data/results-ci/server/full.log.gz || true
+            if [ -f /data/kosha/trace/cache-trace.jsonl ]; then
+              sudo gzip -c /data/kosha/trace/cache-trace.jsonl > /data/results-ci/server/cache-trace.jsonl.gz || true
+              aws s3 ls --recursive s3://decoverai-bench-kosha-segments/segments/ \
+                | awk -v OFS='\t' '{print \$4, \$3}' | gzip > /data/results-ci/server/s3-sizes.tsv.gz || true
+            fi
+            cat > /data/results-ci/meta.json <<META
+          {\"run_id\": \"${{ github.run_id }}\", \"sha\": \"${{ github.sha }}\", \"ref\": \"${{ github.ref_name }}\",
+           \"suite\": \"${{ inputs.suite }}\", \"mode\": \"${{ inputs.mode }}\", \"qps\": \"${{ inputs.qps }}\",
+           \"duration\": \"${{ inputs.duration }}\", \"warm_gate\": \"$WARM_GATE\", \"vector_snapshot\": \"$VEC_SNAPSHOT\",
+           \"cache_max_bytes\": \"$CACHE_MAX_BYTES\", \"cache_policy\": \"$CACHE_POLICY\",
+           \"cache_trace\": \"$CACHE_TRACE\", \"query_order\": \"$QUERY_ORDER\", \"warm_fill_s\": \"$WARM_FILL_S\", \"phase_repeats\": \"$PHASE_REPEATS\",
+           \"bm25_snapshot\": \"$BM25_SNAPSHOT\", \"server_env_args\": \"$SERVER_ENV_ARGS\", \"rustflags\": \"$KOSHA_RUSTFLAGS\",
+           \"two_tier_eval\": \"${{ inputs.two_tier_eval }}\", \"two_tier_fractions\": \"${{ inputs.two_tier_fractions }}\",
+           \"archived_at\": \"\$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}
+          META
+            aws s3 sync --only-show-errors /data/results-ci $DEST/"
+          echo "Server logs + results archived to $DEST/" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Collect results + summary
-        if: always() && inputs.suite != 'none'
+        if: always() && (inputs.suite != 'none' || inputs.two_tier_eval == true)
         run: |
           IP='${{ steps.tf.outputs.ip }}'
           mkdir -p results
           scp -i "$RUNNER_TEMP/bench.pem" -r "ec2-user@$IP:/data/results-ci/*" results/ 2>/dev/null || true
           {
-            echo "## Benchmark results (${{ inputs.suite }}, ${{ inputs.mode }}, ${{ inputs.qps }} QPS, ${{ inputs.duration }}s phases)"
+            echo "## Benchmark results (${{ inputs.suite }}, ${{ inputs.mode }}, ${{ inputs.qps }} QPS, ${{ inputs.duration }}s phases, BM25 corpus $BM25_NS, vector snapshot $VEC_SNAPSHOT, warm gate $WARM_GATE)"
+            if [ "$BM25_SNAPSHOT" != "$BM25_NS" ] || [ -n "$SERVER_ENV_ARGS" ] || [ -n "$KOSHA_RUSTFLAGS" ]; then
+              echo "- experiment: bm25_snapshot $BM25_SNAPSHOT, server env [${SERVER_ENV_ARGS:-none}], rustflags [${KOSHA_RUSTFLAGS:-none}]"
+            fi
+            for f in results/*/warm_gate.log; do
+              if [ -f "$f" ]; then echo "- warm gate $(basename "$(dirname "$f")"): $(grep -E 'WARM-GATE-(READY|TIMEOUT|UNSUPPORTED)' "$f" | tail -1)"; fi
+            done
             echo ""
             echo "| phase | p50 ms | p90 ms | p99 ms | requests | errors |"
             echo "|---|---|---|---|---|---|"
-            find results -name '*.json' ! -name 'recall.json' | sort | while read -r f; do
+            # knn_sweep/ (#384) has its own table, appended below.
+            find results -name '*.json' ! -name 'recall.json' ! -name 'meta.json' ! -path 'results/knn_sweep/*' ! -path '*/two_tier/*' | sort | while read -r f; do
               python3 - "$f" << 'EOF'
           import json, sys
           d = json.load(open(sys.argv[1]))
@@ -249,17 +721,31 @@ jobs:
               print("\n⚠️ below the 0.9 recall bar the ANN index's own unit tests require in isolation.")
           EOF
             fi
+            if [ -f results/knn_sweep/sweep.md ]; then
+              echo ""
+              cat results/knn_sweep/sweep.md
+            fi
+            # Research 387 analysis: its own section (report.json has no
+            # latency fields).
+            if [ -f results/two_tier/summary.txt ]; then
+              echo ""
+              echo "## Two-tier analysis (research 387, offline)"
+              echo ""
+              echo '```'
+              grep -E '^(head|footprint|  +touched|opened|analyzed|run checks|server cross-check|TWO-TIER-RUN)' results/two_tier/summary.txt || true
+              echo '```'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
-        if: always() && inputs.suite != 'none'
+        if: always() && (inputs.suite != 'none' || inputs.two_tier_eval == true)
         with:
           name: bench-results
           path: results/
           if-no-files-found: ignore
 
       - name: Teardown (success only — failures keep the VM for debugging)
-        if: success()
+        if: success() && inputs.keep_vm != true
         working-directory: infra/terraform/dev-machines/aws/bench-kosha
         # Same -var as apply: destroy needs the identical value to resolve
         # count-indexed resource addresses (aws_volume_attachment[0], the
@@ -272,3 +758,7 @@ jobs:
       - name: Teardown skipped notice
         if: failure()
         run: echo "::warning::bench VM stack KEPT for debugging (standing rule). Destroy manually when done."
+
+      - name: Kept-VM notice
+        if: success() && inputs.keep_vm == true
+        run: echo "::warning::bench VM stack KEPT (keep_vm=true). Re-dispatch with keep_vm off (suite=none to only tear down) when done iterating."

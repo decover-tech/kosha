@@ -14,7 +14,7 @@
 
 /// Days from 1970-01-01 to the given proleptic Gregorian date (Howard
 /// Hinnant's `days_from_civil`).
-fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+pub(crate) fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     let y = if month <= 2 { year - 1 } else { year };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400;
@@ -25,7 +25,7 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
 }
 
 /// The inverse of [`days_from_civil`].
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;
@@ -156,6 +156,37 @@ pub fn format_epoch_millis(millis: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}.{ms:03}Z")
 }
 
+/// Like [`format_epoch_millis`], but as the wall-clock time at UTC offset
+/// `offset_millis`, with that offset written out:
+/// `2024-03-10T00:00:00.000-08:00`. A zero offset is written `Z`, so the
+/// output is then exactly [`format_epoch_millis`]'s. An offset with
+/// seconds (historical local mean time) is written `±HH:MM:SS`.
+pub fn format_epoch_millis_at_offset(millis: i64, offset_millis: i64) -> String {
+    if offset_millis == 0 {
+        return format_epoch_millis(millis);
+    }
+    let mut text = format_epoch_millis(millis.saturating_add(offset_millis));
+    text.pop(); // the `Z`
+    let sign = if offset_millis < 0 { '-' } else { '+' };
+    let secs = (offset_millis / 1000).unsigned_abs();
+    let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+    if s == 0 {
+        text.push_str(&format!("{sign}{h:02}:{m:02}"));
+    } else {
+        text.push_str(&format!("{sign}{h:02}:{m:02}:{s:02}"));
+    }
+    text
+}
+
+/// Whether a date string [`parse_epoch_millis`] accepts names its own UTC
+/// offset (`Z`, `+05:30`, ...), as opposed to being a bare local date or
+/// date-time.
+pub fn has_explicit_offset(text: &str) -> bool {
+    text.trim()
+        .get(10..)
+        .is_some_and(|rest| rest.contains(['Z', 'z', '+', '-']))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +243,55 @@ mod tests {
             let millis = parse_epoch_millis(text).unwrap();
             assert_eq!(format_epoch_millis(millis), text);
         }
+    }
+
+    #[test]
+    fn formats_at_an_offset() {
+        let t = parse_epoch_millis("2024-03-10T08:00:00Z").unwrap();
+        assert_eq!(
+            format_epoch_millis_at_offset(t, -8 * 3_600_000),
+            "2024-03-10T00:00:00.000-08:00"
+        );
+        assert_eq!(
+            format_epoch_millis_at_offset(t, 19_800_000),
+            "2024-03-10T13:30:00.000+05:30"
+        );
+        assert_eq!(
+            format_epoch_millis_at_offset(t, 0),
+            "2024-03-10T08:00:00.000Z"
+        );
+        assert_eq!(
+            format_epoch_millis_at_offset(t, -(4 * 3600 + 56 * 60 + 2) * 1000),
+            "2024-03-10T03:03:58.000-04:56:02"
+        );
+        assert!(has_explicit_offset("2024-03-10T08:00:00Z"));
+        assert!(has_explicit_offset("2024-03-10T08:00:00-05:00"));
+        assert!(!has_explicit_offset("2024-03-10T08:00:00"));
+        assert!(!has_explicit_offset("2024-03-10"));
+    }
+
+    #[test]
+    fn civil_round_trip_including_leap_years_and_pre_epoch() {
+        for (y, m, d) in [
+            (1970, 1, 1),
+            (1969, 12, 31),
+            (2000, 2, 29),
+            (1900, 2, 28),
+            (1900, 3, 1),
+            (2024, 2, 29),
+            (2023, 3, 1),
+            (1600, 1, 1),
+            (-1, 12, 31),
+        ] {
+            assert_eq!(civil_from_days(days_from_civil(y, m, d)), (y, m, d));
+        }
+        assert_eq!(
+            days_from_civil(1900, 3, 1) - days_from_civil(1900, 2, 28),
+            1
+        );
+        assert_eq!(
+            days_from_civil(2000, 3, 1) - days_from_civil(2000, 2, 28),
+            2
+        );
     }
 }

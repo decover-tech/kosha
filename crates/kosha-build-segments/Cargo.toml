@@ -14,6 +14,12 @@ path = "src/main.rs"
 name = "kosha-vector-quant-eval"
 path = "src/bin/vector_quant_eval.rs"
 
+# Compares segment layouts (input order vs --cluster-layout namespace, #380)
+# under the global kNN probe budget at matched recall.
+[[bin]]
+name = "kosha-cluster-eval"
+path = "src/bin/cluster_eval.rs"
+
 [lints]
 workspace = true
 
@@ -23,3 +29,4 @@ kosha-segment = { path = "../kosha-segment" }
 clap = { version = "4", features = ["derive"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+rayon = { workspace = true }

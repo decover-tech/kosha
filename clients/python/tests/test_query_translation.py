@@ -591,6 +591,38 @@ def test_histogram_aggregations_pass_through_with_metric_sub_aggregations():
     )
 
 
+def test_histogram_calendar_time_zone_and_bounds_options_are_forwarded():
+    # Issues #300-#302: the options reach Kosha untouched (it validates
+    # them), and the bucket aggregation passthrough keeps nested metrics.
+    aggs = {
+        "per_month": {
+            "date_histogram": {
+                "field": "sentAt",
+                "calendar_interval": "1M",
+                "time_zone": "America/New_York",
+                "offset": "+6h",
+                "min_doc_count": 0,
+                "extended_bounds": {"min": "2024-01-01", "max": "2024-12-31"},
+                "hard_bounds": {"min": "2023-07-01", "max": 1735689600000},
+            },
+            "aggs": {"pages": {"sum": {"field": "pageNumber"}}},
+        },
+        "per_quarter": {
+            "date_histogram": {"field": "sentAt", "calendar_interval": "quarter", "time_zone": "+05:30"}
+        },
+        "by_size": {
+            "histogram": {
+                "field": "bytes",
+                "interval": 1024,
+                "extended_bounds": {"min": 0, "max": 8192},
+                "hard_bounds": {"min": 0, "max": 65536},
+            }
+        },
+    }
+    assert translate({"size": 0, "aggs": aggs})["aggs"] == aggs
+    assert translate({"size": 0, "aggregations": aggs})["aggs"] == aggs
+
+
 def test_response_reports_relation_sort_values_collapse_fields_and_highlight():
     client = KoshaClient(hosts=["http://localhost:9"], api_key="k")
     result = {

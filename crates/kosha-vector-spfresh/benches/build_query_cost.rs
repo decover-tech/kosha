@@ -7,7 +7,8 @@
 //! persisted).
 //!
 //! Run: `cargo bench -p kosha-vector-spfresh --bench build_query_cost`
-//! (`-- compaction_vector_index` for just the #253 compaction comparison).
+//! (`-- compaction_vector_index` for just the #253 compaction comparison,
+//! `-- build_refine` for the post-build refinement's cost).
 //! Not wired into CI's `bench-compare.yml` gate (that only runs
 //! `kosha-query`'s `segment_memory` today) — this is a local-run comparison,
 //! per README.md.
@@ -81,6 +82,31 @@ fn bench_build_cost(c: &mut Criterion) {
             });
             group.bench_function(format!("hnsw_rebuild/{n}x{dim}"), |b| {
                 b.iter(|| black_box(build_hnsw(black_box(&vectors))))
+            });
+        }
+    }
+    group.finish();
+}
+
+/// Post-build refinement (#253): `ClusterIndex::build` with
+/// `build_refine_rounds` at its default and at 0 (plain bisection, what
+/// `KOSHA_VECTOR_BUILD_REFINE=off` builds), from flush sizes up to a large
+/// compaction rebuild.
+fn bench_build_refine(c: &mut Criterion) {
+    let mut group = c.benchmark_group("build_refine");
+    group.sample_size(10);
+    let dim = 128;
+    for &n in &[1_000usize, 10_000, 100_000] {
+        let vectors = gen_vectors(n, dim, 1);
+        group.throughput(Throughput::Elements(n as u64));
+        for on in [false, true] {
+            let mut cfg = ClusterIndexConfig::new(dim);
+            if !on {
+                cfg.build_refine_rounds = 0;
+            }
+            let name = if on { "refine_on" } else { "refine_off" };
+            group.bench_function(format!("{name}/{n}x{dim}"), |b| {
+                b.iter(|| black_box(ClusterIndex::build(black_box(&vectors), cfg.clone()).unwrap()))
             });
         }
     }
@@ -345,6 +371,7 @@ fn lire_merge(
 criterion_group!(
     benches,
     bench_build_cost,
+    bench_build_refine,
     bench_incremental_update_cost,
     bench_query_latency,
     bench_compaction_vector_index
