@@ -69,6 +69,9 @@ SERVER_TIMINGS = False
 # (~100-200KB per top-10 kNN response), which also overflows the 64MB
 # result cache on the 1,677-query cycle.
 RETURN_FIELDS = "ids"
+# --raw-ids: also record each response's ranked doc_ids and scores in the
+# --raw-out records (#385 ranking parity, topk_parity.py).
+RAW_IDS = False
 
 
 def payload_for(namespace: str, query_text: str, topk: int, qidx: int = 0) -> dict:
@@ -97,6 +100,21 @@ def payload_for(namespace: str, query_text: str, topk: int, qidx: int = 0) -> di
     if RETURN_FIELDS == "ids":
         payload["source_includes"] = []
     return payload
+
+
+def read_blocks_decoded(session, host: str, admin_key: str | None) -> int | None:
+    """The server's scoring_blocks_decoded counter from GET /stats (#385);
+    None when not asked for, unreachable, or an older server without it."""
+    if not admin_key:
+        return None
+    try:
+        resp = session.get(f"{host}/stats", headers=auth_headers(admin_key), timeout=60)
+        resp.raise_for_status()
+        value = resp.json().get("scoring_blocks_decoded")
+        return int(value) if value is not None else None
+    except Exception as e:  # noqa: BLE001 - reporting only, never fails a run
+        print(f"WARN: could not read scoring_blocks_decoded from /stats: {e}")
+        return None
 
 
 def load_queries(path: Path) -> list[str]:
@@ -210,6 +228,13 @@ def run_query(
             degraded_counts.append(degraded if degraded is not None else 0)
             if rec is not None:
                 rec.update(latency_ms=round(latency * 1000, 3), hits=hits)
+                if RAW_IDS:
+                    # Ranked ids and scores, so two runs over different
+                    # snapshots can be checked for identical top-k per
+                    # qidx (topk_parity.py, #385).
+                    res = body.get("results", [])
+                    rec["ids"] = [r.get("doc_id") for r in res]
+                    rec["scores"] = [r.get("score") for r in res]
                 if "timings" in body:
                     rec["server"] = body["timings"]
                 raw.append(rec)
@@ -306,12 +331,29 @@ def main() -> None:
         "as turbopuffer's benchmark queries do; all: every stored field, "
         "including embeddings",
     )
+    ap.add_argument(
+        "--raw-ids",
+        action="store_true",
+        help="with --raw-out, also record each response's ranked doc_ids and "
+        "scores (ids, scores), for an off-vs-on ranking parity check with "
+        "topk_parity.py (#385)",
+    )
+    ap.add_argument(
+        "--stats-api-key",
+        default=None,
+        help="admin key for GET /stats: if set, read the server's "
+        "scoring_blocks_decoded counter before and after the phase and report "
+        "the delta and blocks decoded per successful request (#385). The "
+        "counter is process wide, so it is only per-query when nothing else "
+        "queries the server during the phase",
+    )
     args = ap.parse_args()
-    global OPERATOR, NO_CACHE, KNN_VECS, KNN_FIELD, KNN_NUM_CANDIDATES, SERVER_TIMINGS, RETURN_FIELDS
+    global OPERATOR, NO_CACHE, KNN_VECS, KNN_FIELD, KNN_NUM_CANDIDATES, SERVER_TIMINGS, RETURN_FIELDS, RAW_IDS
     OPERATOR = args.operator
     NO_CACHE = args.no_cache
     SERVER_TIMINGS = args.server_timings
     RETURN_FIELDS = args.return_fields
+    RAW_IDS = args.raw_ids
 
     queries = load_queries(args.queries_file)
 
@@ -341,6 +383,7 @@ def main() -> None:
         f"duration={args.duration}s (~{int(args.qps * args.duration)} requests) order={args.order}"
     )
 
+    blocks_before = read_blocks_decoded(session, args.host, args.stats_api_key)
     start = time.time()
     next_send = start
     i = 0
@@ -383,6 +426,7 @@ def main() -> None:
         th.join(timeout=args.timeout + 5)
 
     elapsed = time.time() - start
+    blocks_after = read_blocks_decoded(session, args.host, args.stats_api_key)
     achieved_qps = len(results) / elapsed if elapsed > 0 else 0
 
     # Correctness signal, not just latency: a 200 with an empty/short page,
@@ -427,6 +471,10 @@ def main() -> None:
         "knn_degraded_rate": (knn_degraded_requests / n) if n else float("nan"),
         "knn_degraded_segments_total": knn_degraded_segments_total,
     }
+    if blocks_before is not None and blocks_after is not None:
+        delta = blocks_after - blocks_before
+        summary["scoring_blocks_decoded"] = delta
+        summary["scoring_blocks_decoded_per_request"] = (delta / len(results)) if results else float("nan")
 
     print(json.dumps(summary, indent=2))
     if errors:

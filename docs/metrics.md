@@ -50,18 +50,33 @@ plus `+Inf`.
 | `kosha_flush_total` | counter | none | Flush requests that succeeded. The idle-flush timer is not counted |
 | `kosha_writer_fenced_total` | counter | none | Namespaces this writer fenced itself from because another writer took its writer lease (`KOSHA_WRITER_LEASE`). Any increase means two writers contended for a namespace; this one now refuses its writes |
 
+### Tenant limits
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `kosha_tenant_rejections_total` | counter | `reason` | Requests refused with HTTP 429 by a per-tenant limit or quota (#341, `KOSHA_TENANT_LIMITS_FILE`). `reason`: `tenant_qps_exceeded`, `tenant_concurrency_exceeded`, `tenant_write_rate_exceeded`, `namespace_quota_exceeded`, `doc_quota_exceeded`, `vector_dims_exceeded` or `body_too_large`, the same code as the response body's `reason`. A search refused here never reaches the scoring queue, so it is not counted in `kosha_search_requests_total`. Stays at zero without a limits file |
+
 ### Caches and hydration
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `kosha_cache_bytes` | gauge | `cache` | `nvme`: bytes in the local read-through file cache (`KOSHA_DATA_DIR`). `segment`: approximate bytes of parsed segments held in memory (the `KOSHA_SEGMENT_CACHE_MAX_BYTES` ledger) |
-| `kosha_cache_evictions_total` | counter | `cache` | `nvme`: evictions from the local file cache, one per file or directory (such as a segment) removed, whether by the `KOSHA_CACHE_MAX_BYTES` LRU or by an explicit eviction |
+| `kosha_cache_bytes` | gauge | `cache` (`tenant`) | `nvme`: bytes in the local read-through file cache (`KOSHA_DATA_DIR`). `segment`: approximate bytes of parsed segments held in memory (the `KOSHA_SEGMENT_CACHE_MAX_BYTES` ledger). `result`: bytes of cached `POST /search` responses (`KOSHA_RESULT_CACHE_MAX_BYTES`) |
+| `kosha_cache_evictions_total` | counter | `cache` (`tenant`) | `nvme`: evictions from the local file cache, one per file or directory (such as a segment) removed, whether by the `KOSHA_CACHE_MAX_BYTES` limit or by an explicit eviction. `segment`, `result`: entries evicted to stay within the cache's budget |
+| `kosha_cache_hits_total` | counter | `cache` (`tenant`) | Lookups that found their entry (#342). `nvme`: a search's segment whose scoring files were already local, counted per segment checked by a hydration pass and, for a warm search served from the cached hydration verdict, per manifest segment. `segment`: a parsed segment found in memory. `result`: a search answered from the result cache |
+| `kosha_cache_misses_total` | counter | `cache` (`tenant`) | Lookups that did not (#342). `nvme`: a search's segment that had to be hydrated. `segment`: a segment opened and parsed. `result`: a cacheable search that ran |
 | `kosha_hydrations_total` | counter | `source` | Segment files a hydration needed, by where they came from. `s3`: fetched from the object store. `peer`: streamed from the replica holding the hydration lease. `local`: already in the local cache when the fetch ran. Ranged span reads of doc stores and postings are not counted. Stays at zero without S3 |
 | `kosha_hydration_lease_outcome_total` | counter | `outcome` | Cross-replica hydration lease claims (S3 and Postgres builds with `POD_IP` set). `won`: this replica fetches the file. `streamed_from_peer`: another replica held the lease and served the bytes. `timeout`: the holder did not serve the bytes within the peer-fetch budget (or the fetch failed), and the file was fetched from S3 instead |
 | `kosha_segment_checksum_failures_total` | counter | none | Hydrated segment files that failed their `_COMMIT` size or CRC check, refetch failures included. The same number as `segment_checksum_failures` in `GET /v1/stats` |
 
 Values that already exist elsewhere in the server (cache bytes, NVMe evictions, checksum
 failures, queue depth) are read when Prometheus scrapes, not counted twice.
+
+Each cache keeps these figures per tenant (#342): the tenant is the first component of the
+`<tenant>/<name>` namespace id, and bare namespace ids from before tenants existed count as
+one shared `_legacy` tenant. Without tenant labels each `kosha_cache_*` family has one series
+per cache, summed over tenants; with `KOSHA_METRICS_TENANT_LABELS=on` it has one series per
+cache and tenant instead (see [Tenant labels](#tenant-labels)). The labelled NVMe evictions add
+up to the unlabelled count.
 
 ## Namespace labels
 
@@ -81,6 +96,16 @@ The trade-off:
   namespace is seen).
 
 Per-namespace dashboards are tracked separately (#214).
+
+## Tenant labels
+
+`KOSHA_METRICS_TENANT_LABELS=on` adds a `tenant` label to `kosha_tenant_rejections_total`
+and to the `kosha_cache_bytes`, `kosha_cache_hits_total`, `kosha_cache_misses_total` and
+`kosha_cache_evictions_total` families, and to no other metric. The same trade-off as
+namespace labels applies: one series per tenant and reason (or cache), every scraper sees
+tenant ids, and recording a rejection takes the family's lock to find its series. Rejections
+are rare next to searches, so the cost is off the hot path; the cache figures are kept by the
+caches regardless and only read per scrape.
 
 ## Overhead
 

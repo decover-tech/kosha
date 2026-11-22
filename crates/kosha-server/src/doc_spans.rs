@@ -813,6 +813,19 @@ mod tests {
         vectors: bool,
         needle: impl Fn(usize) -> bool,
     ) -> Fixture {
+        fixture_with(name, segs, docs, vectors, |_| false, needle)
+    }
+
+    /// [`fixture`] where segment `s` gets a zstd doc store (research #388)
+    /// when `zstd(s)`.
+    fn fixture_with(
+        name: &str,
+        segs: usize,
+        docs: usize,
+        vectors: bool,
+        zstd: impl Fn(usize) -> bool,
+        needle: impl Fn(usize) -> bool,
+    ) -> Fixture {
         let root = scratch(name);
         let data = root.join("data");
         let remote = root.join("remote");
@@ -821,7 +834,8 @@ mod tests {
         for s in 0..segs {
             let id = SegmentId(format!("s{s}"));
             let remote_dir = remote.join(&ns.0).join(&id.0);
-            let mut w = SegmentWriter::new(id.clone(), remote_dir.clone());
+            let mut w = SegmentWriter::new(id.clone(), remote_dir.clone())
+                .with_doc_store_zstd(zstd(s).then(kosha_segment::DocStoreZstdConfig::default));
             for i in 0..docs {
                 let word = if needle(i) { "needle" } else { "hay" };
                 let filler = format!(" filler{s}x{i}").repeat(60);
@@ -1071,6 +1085,88 @@ mod tests {
         let before = store.gets();
         let (r2, _, calls) = search(&f, &searcher, &hydrator, &store, &cache, &q);
         assert_eq!(r2.results.len(), 4);
+        assert_eq!(calls, 0);
+        assert_eq!(store.gets(), before);
+    }
+
+    /// Research #388: in a namespace mixing a zstd doc store (s0) with a
+    /// raw one (s1), a cold page still costs one ranged GET per segment for
+    /// the records (plus the vector header and spans), fetches exactly the
+    /// page documents' stored spans, which are smaller in the compressed
+    /// segment, and materializes every field and vector intact; the warm
+    /// repeat is free.
+    #[test]
+    fn mixed_format_namespace_serves_compressed_spans() {
+        let f = fixture_with(
+            "zstd-mixed",
+            2,
+            3000,
+            true,
+            |s| s == 0,
+            |i| (1500..1503).contains(&i),
+        );
+        let readers: Vec<SegmentReader> = (0..2)
+            .map(|s| SegmentReader::open(f.remote.join(&f.ns.0).join(format!("s{s}"))).unwrap())
+            .collect();
+        assert!(readers[0].doc_store_compressed());
+        assert!(!readers[1].doc_store_compressed());
+        let page_span = |r: &SegmentReader| -> u64 {
+            (1500..1503u32)
+                .map(|i| r.doc_span(i).unwrap().1 as u64)
+                .sum()
+        };
+        let (z_span, raw_span) = (page_span(&readers[0]), page_span(&readers[1]));
+        assert!(
+            z_span < raw_span,
+            "compressed spans {z_span} vs raw {raw_span}"
+        );
+
+        let store = CountingStore::new(f.remote.clone());
+        let cache = Cache::new(f.data.clone());
+        let hydrator = SpanHydrator::new(f.data.clone(), SpanConfig::default());
+        let searcher = Searcher::new(f.data.clone());
+        let q = query("needle", 10);
+        let (r, o, _) = search(&f, &searcher, &hydrator, &store, &cache, &q);
+        assert_eq!(r.results.len(), 6);
+        for doc in &r.results {
+            let (seg, i) = doc.doc_id.0.split_once("-d").unwrap();
+            let i: usize = i.parse().unwrap();
+            let t = doc.fields.iter().find(|fl| fl.name == "t").unwrap();
+            assert!(t
+                .value
+                .starts_with(&format!("needle {i} filler{}", &seg[1..])));
+            let emb = doc.fields.iter().find(|fl| fl.name == "emb").unwrap();
+            let v: Vec<f32> = serde_json::from_str(&emb.value).unwrap();
+            assert_eq!(
+                v,
+                (0..64)
+                    .map(|d| (i * 64 + d) as f32 * 0.5)
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(o.whole_fallback.is_empty());
+        // Per segment: vector header probe, one coalesced record GET, one
+        // coalesced vector GET (3000 x 12 B header fits one probe).
+        assert_eq!(store.gets(), 2 * 3);
+        let ds_bytes = |s: usize| {
+            let seg = f.data.join(&f.ns.0).join(format!("s{s}"));
+            assert!(!seg.join(DOC_STORE_FILE).exists());
+            SpanIndex::load(&seg, DOC_STORE_FILE).total_bytes()
+        };
+        // Only the page's own stored records were fetched (they are
+        // adjacent, so one span each, coalesced exactly).
+        assert_eq!(ds_bytes(0), z_span);
+        assert_eq!(ds_bytes(1), raw_span);
+        println!(
+            "mixed cold page: record bytes zstd {z_span} vs raw {raw_span}; doc_store.bin \
+             {} (zstd) vs {} (raw)",
+            doc_store_size(&f, 0),
+            doc_store_size(&f, 1)
+        );
+
+        let before = store.gets();
+        let (r2, _, calls) = search(&f, &searcher, &hydrator, &store, &cache, &q);
+        assert_eq!(r2.results.len(), 6);
         assert_eq!(calls, 0);
         assert_eq!(store.gets(), before);
     }

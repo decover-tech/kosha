@@ -109,6 +109,35 @@ impl SpanIndex {
         Some(buf)
     }
 
+    /// [`Self::read`] for many ranges, in order, without re-listing the
+    /// directory: consecutive ranges inside the same cached span share one
+    /// open file handle (#381: exact rescoring reads hundreds of vectors
+    /// per segment, and a listing per vector cost a `read_dir` plus a stat
+    /// of every cached span each time). `None` for a range no span covers
+    /// or whose span vanished (evicted) meanwhile.
+    pub fn read_many(&self, ranges: &[(u64, u64)]) -> Vec<Option<Vec<u8>>> {
+        let mut open: Option<((u64, u64), fs::File)> = None;
+        ranges
+            .iter()
+            .map(|&(start, end)| {
+                if start == end {
+                    return Some(Vec::new());
+                }
+                let span = self.covering(start, end)?;
+                if open.as_ref().is_none_or(|(s, _)| *s != span) {
+                    open = fs::File::open(self.dir.join(span_file_name(span.0, span.1)))
+                        .ok()
+                        .map(|f| (span, f));
+                }
+                let (_, file) = open.as_mut()?;
+                file.seek(SeekFrom::Start(start - span.0)).ok()?;
+                let mut buf = vec![0u8; (end - start) as usize];
+                file.read_exact(&mut buf).ok()?;
+                Some(buf)
+            })
+            .collect()
+    }
+
     /// The cached span starting at offset 0 (a file header), read whole.
     pub fn read_prefix(&self) -> Option<Vec<u8>> {
         let &(_, end) = self

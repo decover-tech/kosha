@@ -95,7 +95,12 @@ written with and stay readable (subject to the KMS permissions above).
   roll out the new value. New objects use the new key at once. Old objects keep the old key
   and stay readable as long as the role can still `kms:Decrypt` with it, so keep the old key
   enabled and in the IAM policy. Compaction rewrites segments into new objects, so the old
-  key's share of the data shrinks over time.
+  key's share of the data shrinks over time. The tenant map (including
+  `KOSHA_S3_TENANT_KMS_KEYS_FILE`) is read once at startup, so editing a mounted file takes
+  effect when the pods restart. The test
+  `rotating_a_tenant_key_applies_to_new_writes_and_old_objects_stay_readable` in
+  `s3_storage.rs` checks this: after a rotation, PUTs, multipart uploads and copies carry the
+  new key, and reads send no key at all.
 - **Hard cutover** (the old key must stop being used): after the rollout, re-encrypt the
   remaining objects in place, then disable the old key once nothing references it:
 
@@ -130,9 +135,10 @@ See `k8s/README.md` ("Encryption at rest") for an IAM policy and a StorageClass 
 
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
-| `KOSHA_CACHE_MAX_BYTES` | Size bound for the on-disk (NVMe) segment-file cache; least recently used files are evicted past it (`AppState::new`) | unset (unbounded) | bytes |
-| `KOSHA_CACHE_POLICY` | Research (#389), experimental: eviction policy under `KOSHA_CACHE_MAX_BYTES`. `legacy` keeps today's order (recency touched on write only, so effectively insertion order); `sieve` or `s3fifo` use per-search read hints so files read once do not displace re-read ones. No effect without `KOSHA_CACHE_MAX_BYTES` (`cache_reads.rs`) | unset (`legacy`) | `legacy` / `sieve` / `s3fifo` |
-| `KOSHA_CACHE_ACCOUNTING` | Research (#389), experimental: `exact` makes the legacy eviction path count each cached file once. Today (`legacy`) a file the hydration path re-notes (it notes every file of a batch, including ones already local) is added to the running total again, so the total drifts above the bytes on disk and the bound evicts early. The `sieve`/`s3fifo` policies always count exactly; set this on a legacy control so both get the same effective capacity. No effect without `KOSHA_CACHE_MAX_BYTES` (`cache_reads.rs`) | unset (`legacy`) | `legacy` / `exact` |
+| `KOSHA_CACHE_MAX_BYTES` | Size bound for the on-disk (NVMe) segment-file cache; past it, files are evicted least recently used first from the tenant furthest over its share (`AppState::new`) | unset (unbounded) | bytes |
+| `KOSHA_CACHE_TENANT_MIN_BYTES` | Guaranteed floor per active tenant in every process-wide cache: NVMe, parsed segments and results (#342, `kosha_core::tenancy`). Each cache splits its budget across the tenants holding bytes in it by weight (the tenant's plan `weight` from `KOSHA_TENANT_LIMITS_FILE`, default 1), evicts from the tenant furthest over its share, and never takes a tenant below this floor while another tenant can give. Capped at an equal split of the cache's budget, so the floors always fit. Bare pre-tenant namespace ids share one `_legacy` tenant | `67108864` (64 MiB) | bytes |
+| `KOSHA_CACHE_POLICY` | Research (#389), experimental: eviction policy under `KOSHA_CACHE_MAX_BYTES`. `legacy` keeps #342's per-tenant least-recently-used order. `sieve` or `s3fifo` use per-search read hints so files read once do not displace re-read ones. The policy runs per tenant: #342 still picks which tenant gives up bytes (`KOSHA_CACHE_TENANT_MIN_BYTES`, fair shares), and that tenant's own SIEVE/S3-FIFO state picks the file, so one tenant's evictions never touch another tenant's policy state. No effect without `KOSHA_CACHE_MAX_BYTES` (`cache_reads.rs`) | unset (`legacy`) | `legacy` / `sieve` / `s3fifo` |
+| `KOSHA_CACHE_ACCOUNTING` | Research (#389). Superseded by #342: the cache now counts each tracked file once on every path, so `exact` changes nothing. Accepted so existing configs and bench inputs keep working | unset (`legacy`) | `legacy` / `exact` |
 | `KOSHA_CACHE_TRACE_PATH` | Research (#389): append one JSON line per successful search (segments, classes, posting shards, page segments read) for `scripts/bench/cache_sim/cache_sim.py`. Keep it outside `KOSHA_DATA_DIR` | unset (off) | file path |
 | `KOSHA_SEGMENT_CACHE_CAPACITY` | Parsed segments kept in memory across queries | `4096` (`kosha_query::DEFAULT_SEGMENT_CACHE_CAPACITY`) | segments |
 | `KOSHA_SEGMENT_CACHE_MAX_BYTES` | Approximate memory budget for those cached parsed segments | `4294967296` (4 GiB) | bytes |
@@ -150,6 +156,7 @@ All **s3**. Read in `AppState::new` (`crates/kosha-server/src/main.rs`).
 | `KOSHA_SCORING_HYDRATE_CONCURRENCY` | Parallel GETs for small files: the scoring set, footer prefetch and page doc stores | `64` | requests |
 | `KOSHA_MAX_CONCURRENT_HYDRATIONS` | Independent hydration operations in flight per process | `4` | operations |
 | `KOSHA_HYDRATE_BYTE_BUDGET` | Process-wide cap on in-flight hydration bytes; also the pre-GET chunk size | `1073741824` (1 GiB) | bytes |
+| `KOSHA_HYDRATE_TENANT_MAX_INFLIGHT_BYTES` | Cap on one tenant's in-flight hydration bytes, so one tenant's cold start cannot hold all of the pod's S3 bandwidth (#342, `hydration_budget.rs`). Work-conserving: the cap binds only while another tenant holds or waits for hydration budget, so a lone tenant (or a pod serving only pre-#262 bare namespaces) may use the whole budget. A single object larger than the cap is admitted when it fits the global budget and no other tenant is waiting | half of `KOSHA_HYDRATE_BYTE_BUDGET` | bytes |
 | `KOSHA_HYDRATE_REQUEST_MAX_BYTES` | Bytes one search may hydrate before it is shed | `2147483648` (2 GiB) | bytes |
 | `KOSHA_DOC_STORE_READ_MODE` | How a page's documents are fetched: `ranged` (GETs for just those documents' byte spans in `doc_store.bin` / `doc_vectors.bin`, #245) or `whole` (the whole files, the pre-#245 path) (`doc_spans.rs`) | `ranged` | enum |
 | `KOSHA_DOC_SPAN_COALESCE_GAP_BYTES` | Ranged doc-store reads: spans of one file at most this far apart share a GET. The `KOSHA_DOC_SPAN` prefix names this group | `65536` (64 KiB) | bytes |
@@ -169,9 +176,63 @@ Peers share cold segments through hydration leases when the binary has **s3** an
 | `KOSHA_MAX_CONCURRENT_SEARCHES` | Searches that run at once | `8` | searches |
 | `KOSHA_SEARCH_QUEUE_DEPTH` | Searches that may wait for a slot; beyond it requests are shed | 4 × `KOSHA_MAX_CONCURRENT_SEARCHES` (`32`) | searches |
 | `KOSHA_SEARCH_QUEUE_TIMEOUT_MS` | How long a queued search waits for a slot; `0` waits without a deadline | `10000` | milliseconds |
+| `KOSHA_SEARCH_QUEUE_DEPTH_PER_TENANT` | Searches one tenant may have waiting for a slot; beyond it that tenant's searches are shed while other tenants still queue. Waiters are served round robin across tenants (#341, `fair_admission.rs`). `0`: only `KOSHA_SEARCH_QUEUE_DEPTH` applies | `0` | searches |
 | `KOSHA_SEGMENT_LIVE_MAX_BYTES` | Limit on live segment memory (cached plus pinned by running searches). Searches wait for memory above it | 2 × `KOSHA_SEGMENT_CACHE_MAX_BYTES` (8 GiB) | bytes |
 | `KOSHA_ADMISSION_TIMEOUT_MS` | How long a search waits for live memory before HTTP 429 | `15000` (`kosha_query::DEFAULT_ADMISSION_TIMEOUT`) | milliseconds |
 | `KOSHA_MAX_BODY_BYTES` | Largest accepted request body; HTTP 413 above it (`auth::max_body_bytes`) | `67108864` (64 MiB) | bytes |
+
+## Tenant limits
+
+Per-tenant quotas and rate limits (#341, `tenant_limits.rs`). Without
+`KOSHA_TENANT_LIMITS_FILE` nothing is limited. Limits are enforced per pod: query limits on the
+pod that serves the search, write limits on the pod that executes the write (the ingest pod; a
+query pod forwards writes first). Operator traffic (the admin and internal service credentials)
+is never limited. A request over a limit gets HTTP 429 with `Retry-After` and a JSON body
+`{"error", "reason", "limit", "retry_after_ms"}`, where `reason` is one of
+`tenant_qps_exceeded`, `tenant_concurrency_exceeded`, `tenant_write_rate_exceeded`,
+`namespace_quota_exceeded`, `doc_quota_exceeded`, `vector_dims_exceeded` or `body_too_large`.
+Rate limits give the time until the token bucket holds the request; quotas give 60 seconds.
+Each refusal is counted in `kosha_tenant_rejections_total` (see `metrics.md`).
+
+| Variable | Purpose | Default | Units |
+| --- | --- | --- | --- |
+| `KOSHA_TENANT_LIMITS_FILE` | JSON file of plans and per-tenant overrides (format below). A file that cannot be read or parsed at startup stops the pod | unset (no limits) | path |
+| `KOSHA_TENANT_DEFAULT_PLAN` | Plan for tenants without one of their own; overrides the file's `default_plan`. Requires `KOSHA_TENANT_LIMITS_FILE` | file's `default_plan` | plan name |
+| `KOSHA_TENANT_LIMITS_RELOAD_SECS` | How often the file is re-read. A reload that fails keeps the previous limits. `0` never reloads | `30` | seconds |
+
+The file:
+
+```json
+{
+  "default_plan": "standard",
+  "plans": {
+    "standard": {"qps": 50, "concurrent_queries": 8, "write_docs_per_sec": 2000,
+                 "write_bytes_per_sec": 16777216, "namespaces": 100,
+                 "docs_per_namespace": 10000000, "vector_dims": 4096,
+                 "max_body_bytes": 33554432, "weight": 1}
+  },
+  "tenants": {"acme": {"plan": "standard", "qps": 200, "weight": 4}}
+}
+```
+
+A tenant's limits are its plan's (its own `plan`, else the default plan) with its `tenants`
+fields laid over them. A tenant with no plan and no entry is unlimited, and so is any field
+left out.
+
+| Field | Limits | Checked |
+| --- | --- | --- |
+| `qps` | Searches per second; the bucket holds one second's worth | each search, after authentication |
+| `concurrent_queries` | Searches in flight at once | each search |
+| `write_docs_per_sec` | Documents per second in index and replace requests. A batch bigger than one second's worth is admitted from a full bucket and paid for afterwards | each index or replace |
+| `write_bytes_per_sec` | Request body bytes per second on write routes | each write request |
+| `max_body_bytes` | Largest write request body, under the pod-wide `KOSHA_MAX_BODY_BYTES` | each write request |
+| `namespaces` | Namespaces the tenant holds (top-level; shards and branches not counted) | namespace creation, and a write that would auto-create one |
+| `docs_per_namespace` | Documents in a namespace: committed and not deleted plus not yet flushed. An unflushed upsert of an existing id counts twice until flushed | each index or replace |
+| `vector_dims` | Widest vector a document may carry, supplied or produced by native embedding | each index or replace |
+| `weight` | Permits per round-robin turn in the search queue (default 1) | search admission |
+
+Limits stored in the control plane, cluster-wide rate limits across replicas and per-namespace
+storage quotas are not implemented yet (Phase H).
 
 ## Query and relevance
 
@@ -194,7 +255,13 @@ Read once in `crates/kosha-query/src/lib.rs`.
 | `KOSHA_KNN_BUDGET_MAX_CAP` | Ceiling on that lower bound. A larger explicit `num_candidates` is still honored | `20000` | centroids |
 | `KOSHA_KNN_EXACT_THRESHOLD` | A filtered kNN with at most this many filter-passing documents namespace-wide scores every passing document's vector exactly instead of probing (#252). `0` disables exact filtered kNN | `50000` | documents |
 | `KOSHA_KNN_EXACT_FRACTION` | A segment where at most this fraction of documents pass the filter is searched exactly too (#252) | `0.01` | fraction |
+| `KOSHA_KNN_GLOBAL_RESCORE` | Experimental (#381). `1`, `true` or `on`: an unfiltered kNN collects every segment's candidates with their error bounds, computes the `k`-th lower bound across the namespace, and rescores only the quantized candidates whose upper bound reaches it, reading f32 vectors from `doc_vectors.bin` locally or by ranged read. Candidates with no readable exact vector keep their estimate and their segment is counted in `knn_degraded_segments` (the default path returns them silently). Filtered, `limit_per` and late-interaction kNN keep the default path. With it on, a kNN also hydrates the `doc_vectors.bin` header of every segment whose queried column is quantized (with the scoring files, by range), and a failed ranged read of `doc_vectors.bin` is never retried as the whole file | off | flag |
+| `KOSHA_KNN_RESCORE_STATS` | Experimental (#381), observability only. `1`, `true` or `on`: a kNN counts the segments whose quantized column the default per-segment path probed, and how many of them returned unrescored estimates because `doc_vectors.bin` was not whole and local, and appends `knn_seg_quantized=` / `knn_seg_unrescored=` to the `search timing:` line. Results are unchanged. Implied by `KOSHA_KNN_GLOBAL_RESCORE` | off | flag |
+| `KOSHA_KNN_I8_BOUND` | Error bound of an i8 vector entry under `KOSHA_KNN_GLOBAL_RESCORE` (#381; read in `kosha-segment`): `strict` (`scale / 2 * ‖q‖₁`, guaranteed) or `probabilistic` (`1.9 * scale * ‖q‖₂ / √12`, not guaranteed, much tighter at high dimension) | `strict` | mode |
 | `KOSHA_KNN_FILTER_BUDGET_MAX_SCALE` | Most a filtered kNN widens the global probe budget by (`1 / selectivity`, #252) | `8` | multiplier |
+| `KOSHA_KNN_RELATIVE_CUTOFF_EPS` | Experimental (#384). Unfiltered kNN probes a posting only if its rank score is at most `(1 + eps)` times the best posting's score (SPANN's relative cutoff), never fewer than `KOSHA_KNN_RELATIVE_MIN_PROBES` postings and never more than the fixed budget. While on, each such search reports which rule set its cutoff (`timings.knn_cutoff_rule` and `knn_cutoff_rule=` on the `search timing:` line: `budget`, `eps`, `floor` or `zero_best`). Unset, empty, negative or unparseable: off | unset (off) | ratio |
+| `KOSHA_KNN_RELATIVE_MIN_PROBES` | Experimental (#384). Fewest postings the relative cutoff may leave a query with | the query's `num_candidates` | postings |
+| `KOSHA_KNN_PROBE_RADIUS_ALPHA` | Experimental (#384). Weight of a posting's radius in its rank score `max(0, d(q, c) - alpha * radius)`, used by the global cutoff and each segment's probe order. `1` is the triangle-inequality lower bound (unchanged); `0` ranks by raw centroid distance. Read once in `crates/kosha-segment/src/lib.rs` | `1.0` | weight |
 | `KOSHA_LATE_INTERACTION_NPROBE` | Token-index postings probed per query token by a late-interaction (`knn.vectors`) search, before candidates are re-scored exactly (#205) | `16` | postings |
 | `KOSHA_DEFAULT_CONSISTENCY` | Consistency of a search that does not ask for one: `strong` (also search acknowledged but unindexed writes) or `eventual` (indexed segments only), #255. Unset: `strong`, except on a query pod without `KOSHA_INTERNAL_API_KEY`, which defaults to `eventual` | unset | enum |
 | `KOSHA_TAIL_FETCH_TIMEOUT_MS` | Query pods: timeout of the fetch of the ingest pod's unindexed tail for a strong search (#255) | `10000` | ms |
@@ -250,6 +317,7 @@ server lists them in a `WARN` at boot. `kosha-server migrate-namespace --from <b
 | `KOSHA_HTTP_SHUTDOWN_GRACE_SECS` | On SIGTERM or SIGINT the listener closes, idle connections close, and in-flight requests get this long to finish. The pod then releases its writer leases and exits | `25` | seconds |
 | `KOSHA_TLS_CERT_PATH` | PEM certificate chain. With `KOSHA_TLS_KEY_PATH`, the listener serves HTTPS only. Setting just one of the two is a startup error | unset (HTTP) | path |
 | `KOSHA_TLS_KEY_PATH` | PEM private key (PKCS#8, PKCS#1 or SEC1) for `KOSHA_TLS_CERT_PATH` | unset | path |
+| `KOSHA_TLS_CLIENT_CA_PATH` | PEM CA bundle for client certificates (mTLS, #343). A presented certificate must chain to it or the handshake fails, and `/internal/*` answers 403 on a connection that presented none. Other routes still accept clients without a certificate. Needs `KOSHA_TLS_CERT_PATH`/`KOSHA_TLS_KEY_PATH`, or the server refuses to start | unset (no client certificates) | path |
 | `KOSHA_AUTH` | `disabled` (or `off`, `false`, `0`, `none`) turns authentication off; every request becomes tenant `dev`. Local development only | enabled | flag |
 | `KOSHA_API_KEY` | One tenant API key, mapped to tenant `default` | unset | string |
 | `KOSHA_API_KEYS` | Comma-separated `key=tenant` pairs | unset | list |
@@ -262,11 +330,47 @@ The server refuses to start when no credential is configured (no env key, no adm
 key, no Postgres keys) unless `KOSHA_AUTH=disabled`.
 
 The server speaks HTTP/1.1 with keep-alive (#259): responses carry a `content-length` and the
-connection stays open for the next request. TLS covers client-facing traffic only. The internal
-clients take no CA configuration yet: peer hydration always connects over `http://` (so pods
-that share segments through hydration leases should not turn TLS on), and query-to-ingest
-forwarding to an `https://` `KOSHA_INGEST_HOST` trusts only the platform's roots. TLS between
-pods is tracked in #343.
+connection stays open for the next request. `KOSHA_TLS_CERT_PATH` turns HTTPS on for every
+route on the port, client-facing and `/internal/*` alike. The clients that call other pods are
+configured separately, in the next section.
+
+### TLS between pods
+
+Pod-to-pod traffic is peer hydration (`GET /internal/segment/...`, query pod to query pod) and
+ingest traffic (forwarded writes and the strong-consistency tail read, query pod to
+`KOSHA_INGEST_HOST`). The clients for both are built in `internal_tls.rs`
+(`InternalTls::from_lookup`), read once at startup. The settings **fail closed**: an unknown
+mode, a missing or unparsable file, half a client identity, or a TLS setting while the mode is
+`off` logs `FATAL: internal TLS: ...` and exits. The startup log prints
+`internal TLS: on (internal CA, client_cert=yes, server_name=kosha-internal)` or similar.
+
+| Variable | Purpose | Default | Units |
+| --- | --- | --- | --- |
+| `KOSHA_INTERNAL_TLS` | `off`: plain `http://` to peers, as before. `on`: peers are fetched over `https://` and verified against `KOSHA_INTERNAL_TLS_CA_PATH`, and an `https://` `KOSHA_INGEST_HOST` is verified the same way (an `http://` one logs a warning). `required`: as `on`, and the pod refuses to start with an `http://` `KOSHA_INGEST_HOST` or without `KOSHA_TLS_CERT_PATH` | `off` | enum |
+| `KOSHA_INTERNAL_TLS_CA_PATH` | PEM CA bundle peer certificates must chain to. Required unless `off`. Only this bundle is trusted for internal traffic, not the platform roots | unset | path |
+| `KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH` | PEM client certificate chain, presented to peers that ask for one (their `KOSHA_TLS_CLIENT_CA_PATH`). Set it together with `KOSHA_INTERNAL_TLS_CLIENT_KEY_PATH` or not at all | unset (no client certificate) | path |
+| `KOSHA_INTERNAL_TLS_CLIENT_KEY_PATH` | PEM private key for `KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH` | unset | path |
+| `KOSHA_INTERNAL_TLS_SERVER_NAME` | DNS name peer certificates are checked against instead of the host in the URL. Peers are dialed by pod IP (`POD_IP`), which a certificate issued ahead of time cannot list; with this set, one certificate with this DNS name serves every pod. Unset, a certificate must match the URL host (an IP SAN for peer fetches) | unset (URL host) | DNS name |
+
+To turn it on across a cluster:
+
+1. Issue a certificate signed by an internal CA whose SANs include the ingest Service name and
+   a fixed name such as `kosha-internal` (`k8s/base/certificate-internal-tls.example.yaml` is a
+   cert-manager example). The same certificate can serve as the client identity.
+2. Mount it on every pod and set `KOSHA_TLS_CERT_PATH`/`KOSHA_TLS_KEY_PATH` (server side) and
+   `KOSHA_INTERNAL_TLS=on`, `KOSHA_INTERNAL_TLS_CA_PATH`, `KOSHA_INTERNAL_TLS_SERVER_NAME`
+   (client side), and switch `KOSHA_INGEST_HOST` to `https://`. HTTPS is per port, so the
+   kubelet probes need `scheme: HTTPS` too.
+3. Optionally require mTLS on `/internal/*` with `KOSHA_TLS_CLIENT_CA_PATH` and give every pod
+   `KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH`/`KEY_PATH`. Roll the clients out first, then the
+   server setting.
+4. Set `KOSHA_INTERNAL_TLS=required` once every pod is on TLS.
+
+During a rollout, a pod on `on` that reaches a peer still serving plain HTTP fails that peer
+fetch and falls back to S3, so mixed pods cost extra S3 reads, not errors. Forwarded writes have
+no such fallback: switch `KOSHA_INGEST_HOST` to `https://` only after the ingest pod serves
+HTTPS. Certificates are
+read at startup; a renewed certificate takes effect when the pod restarts.
 
 `GET /internal/segment/...` streams the cached file as raw `application/octet-stream`. Peers on
 builds from before #259 send base64 with `x-kosha-encoding: base64`; the client still decodes
@@ -282,6 +386,7 @@ that, so a rolling upgrade with mixed peers works.
 | `KOSHA_METRICS` | `off` (or `false`, `0`) makes `GET /metrics` return 404 | on | flag |
 | `KOSHA_METRICS_AUTH` | `admin` requires the `KOSHA_ADMIN_API_KEY` credential on `GET /metrics` (403 without it). `none` (or unset) leaves it open, like `/healthz`. Any other value is treated as `admin` | `none` | `none` \| `admin` |
 | `KOSHA_METRICS_NAMESPACE_LABELS` | `on` (or `true`, `1`) adds a `namespace` label to `kosha_search_requests_total`. One series per namespace and outcome, and it publishes tenant namespace names to whoever can scrape. See `metrics.md` | off | flag |
+| `KOSHA_METRICS_TENANT_LABELS` | `on` (or `true`, `1`) adds a `tenant` label to `kosha_tenant_rejections_total` and the `kosha_cache_*` families (#342). One series per tenant and reason (or cache), and it publishes tenant ids to whoever can scrape. See `metrics.md` | off | flag |
 
 ## Roles
 
@@ -373,13 +478,21 @@ before rolling back, until every reader understands the newer one. Read once in
 
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
-| `KOSHA_POSTINGS_WRITE_VERSION` | Inverted-postings version written: `4` or `5` | `5` | version |
+| `KOSHA_POSTINGS_WRITE_VERSION` | Inverted-postings version written: `4`, `5` or `6`. `6` is experimental (#386): v5 with bit-packed 128-posting scoring blocks, readable only by builds that include #386, so set it only once every query pod does | `5` | version |
 | `KOSHA_VECTOR_WRITE_VERSION` | Vector-index version written: `1` (flat), `2`, `3` or `4` (posting-based) | `4` | version |
 | `KOSHA_VECTOR_STORE` | Where vector field values are stored: `sidecar` (`doc_vectors.bin`) or `inline` (in `doc_store.bin`). Set `inline` before rolling back past #243 | `sidecar` | enum |
+| `KOSHA_DOC_STORE_COMPRESSION` | Experimental (research #388). `zstd`: new segments store each `doc_store.bin` record as its own zstd frame with a per-segment trained dictionary (kept in the `doc_store.offsets` trailer), and vectors always go to `doc_vectors.bin`. `auto`: fresh segments raw, merges keep their inputs' format. `none`: always raw (compact with this before rolling back past #388; older readers cannot read compressed segments) | `auto` | enum |
+| `KOSHA_DOC_STORE_ZSTD_LEVEL` | zstd level for a compressed doc store (1-22) | `3` | int |
+| `KOSHA_DOC_STORE_ZSTD_DICT_BYTES` | Dictionary size trained per segment; `0` compresses records without a dictionary | `65536` | bytes |
+| `KOSHA_DOC_STORE_ZSTD_SAMPLE_BYTES` | Record bytes sampled (even stride) to train the dictionary | 100x dictionary, max 16 MiB | bytes |
 | `KOSHA_VECTOR_QUANTIZATION` | How new segments store vector posting entries: `f32`, `i8` (scalar-quantized, vector index version 4, #210) or `rabitq` (RaBitQ 1-bit codes against the posting centroid, vector index version 5; ~30x smaller than `f32` at 1024 dims). Turn a quantized mode on only once every query pod reads its version; turn it off and compact before rolling back past it | `f32` | enum |
 | `KOSHA_VECTOR_QUANTIZATION_FIELDS` | Per-field overrides of `KOSHA_VECTOR_QUANTIZATION`, e.g. `body_emb:rabitq,title_emb:f32` | empty | list |
 | `KOSHA_VECTOR_RESCORE_FACTOR` | A quantized column rescores its best `k * factor` probe candidates with the f32 vectors in `doc_vectors.bin` (#210). A `rabitq` column also rescores every candidate its error bounds cannot rule out of the top `k`, up to `8 * k * factor`. Rescoring needs the whole `doc_vectors.bin` local; without it the estimates stand. `0` disables | `4` | multiplier |
+| `KOSHA_VECTOR_DOT_LANES` | Experimental (#382): accumulator lanes of the f32 dot that the SPFresh posting scans (exact restricted scan, `knn_search_within_lazy`, `knn_search_lazy`) score f32 posting entries with: `8`, `16`, `32` or `64`. Not covered: centroid ranking, quantized-column rescoring against `doc_vectors.bin`, sidecar/HNSW exact search. `8` is the existing kernel, bit for bit; wider ones differ in the last float bits. Meant to be measured together with an image built with `KOSHA_RUSTFLAGS` (Dockerfile build arg) | `8` | lanes |
+| `KOSHA_VECTOR_RABITQ_ESTIMATOR` | Experimental (#382): how a `rabitq` column's codes are scored at query time. `lut` reads a 256-entry f32 table per code byte (128 KiB per query at 1024 dims); `popcount` quantizes the rotated query to 4 bits and scores with AND + popcount (RaBitQ §3.3.2), with an error bound widened by the query rounding. Query-time only, same on-disk codes; unknown values fall back to `lut`. On the default baseline-x86-64 image there is no `popcnt` instruction, so the count is a software popcount; measure it with an image built with `KOSHA_RUSTFLAGS="-C target-cpu=x86-64-v3"` (or `+popcnt`). When either #382 variable is set, or the image is built above baseline x86-64, the server logs one `vector kernels (#382, experimental): ...` line at startup | `lut` | enum |
 | `KOSHA_VECTOR_BUILD_REFINE` | Whether a from-scratch vector index build (every flush, `KOSHA_VECTOR_COMPACTION=rebuild`, and compaction's fallback) refines balanced bisection's postings by nearest-centroid reassignment and a LIRE rebalance, tightening posting radii (#253). `off` builds exactly as before. Same on-disk format either way | `on` | enum |
+| `KOSHA_DOC_REORDER` | Experimental (#385). `bp` writes compaction outputs, and `kosha-build-segments` segments (unless `--doc-reorder` is given), with documents renumbered by recursive graph bisection so documents sharing terms get nearby `doc_seq`s. Same on-disk format; results are unchanged (ties break on `_id`). Compaction only reorders when `KOSHA_DOC_REORDER_COMPACTION_MAX_DOCS` also allows it. `off` writes in ingest order exactly as before | `off` | enum |
+| `KOSHA_DOC_REORDER_COMPACTION_MAX_DOCS` | Experimental (#385). With `KOSHA_DOC_REORDER=bp`, compaction reorders a merge only when its live documents (inputs minus pre-merge deletes) number at most this; BP compaction buffers the whole merged output (stored fields and sidecar vectors) in memory, so a larger merge streams in input order and logs a warning. `0` never reorders in compaction | `0` | documents |
 | `KOSHA_VECTOR_COMPACTION` | How compaction builds merged vector indexes: `lire` seeds each column from its largest input's postings and repairs them with SPFresh's LIRE split / merge / reassign; `rebuild` re-clusters every vector (#253) | `lire` | enum |
 | `KOSHA_TEXT_FILTER_IGNORE_ABOVE` | Longest `Text` value copied into filter columns, like Elasticsearch's `ignore_above`; `off` copies every value | `256` | characters |
 | `KOSHA_FIELD_INDEX` | Per-field inverted indexes (#249); `off` writes segments exactly as before. Set it and compact before rolling back past #249 | on | flag (default on) |

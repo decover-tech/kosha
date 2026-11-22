@@ -249,13 +249,16 @@ impl PolicyState {
         }
     }
 
-    pub(crate) fn kind(&self) -> CachePolicy {
-        self.kind
+    /// Re-size the budget this state sizes its queues against (S3-FIFO's
+    /// small queue is 10% of it). With per-tenant states (#342) the cache
+    /// sets it to the tenant's current fair share before each pick.
+    pub(crate) fn set_budget(&mut self, max_bytes: u64) {
+        self.max_bytes = max_bytes;
     }
 
-    /// Size this policy last recorded for `key`, if tracked.
-    pub(crate) fn size_of(&self, key: &str) -> Option<u64> {
-        self.entries.get(key).map(|e| e.size)
+    /// True when this state tracks nothing (its tenant left the cache).
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     /// Track a write. A brand-new key enters SIEVE's queue / S3-FIFO's small
