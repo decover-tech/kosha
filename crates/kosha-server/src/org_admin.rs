@@ -113,12 +113,22 @@ fn respond<T>(result: Result<T, OrgError>, body: impl FnOnce(T) -> Value) -> Str
     }
 }
 
-fn actor(headers: &HashMap<String, String>) -> Result<Actor, OrgError> {
-    let value = headers
+fn actor_header(headers: &HashMap<String, String>) -> Option<&str> {
+    headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(ACTOR_HEADER))
-        .map(|(_, v)| v.trim());
-    match value {
+        .map(|(_, v)| v.trim())
+}
+
+/// Whether the request names a user to act for, even an empty one. `route`
+/// refuses such a request on every admin route outside this module: those
+/// are operator-only and do not check roles.
+pub(crate) fn names_actor(headers: &HashMap<String, String>) -> bool {
+    actor_header(headers).is_some()
+}
+
+fn actor(headers: &HashMap<String, String>) -> Result<Actor, OrgError> {
+    match actor_header(headers) {
         None => Ok(Actor::Operator),
         // A present but empty header is a caller bug, and must not be read
         // as "no header": that would turn a user request into an operator's.
@@ -710,6 +720,31 @@ mod tests {
             assert!(crate::is_write_path(line), "{line}");
         }
         assert!(!crate::is_write_path("GET /v1/admin/orgs/org_1 HTTP/1.1"));
+    }
+
+    /// Acting for a user never reaches an operator-only admin route, where
+    /// no role would be checked: `POST /v1/admin/api-keys` would mint a key
+    /// for any tenant.
+    #[test]
+    fn operator_only_admin_routes_refuse_an_actor() {
+        let api = Api::new();
+        let ada = api.user("ada");
+        for (method, path) in [
+            ("POST", "/v1/admin/api-keys"),
+            ("POST", "/v1/admin/gc"),
+            ("POST", "/v1/admin/compact-namespace"),
+            ("GET", "/v1/admin/compaction-status"),
+            ("POST", "/v1/admin/no-such-route"),
+        ] {
+            let body = json!({ "tenant_id": "someone-elses-tenant" });
+            for actor in [ada.as_str(), ""] {
+                let (status, value) = api.call(Some(actor), method, path, body.clone());
+                assert_eq!(status, 403, "{method} {path} as {actor:?}: {value}");
+            }
+        }
+        // Without the header the operator still reaches them.
+        let (status, _) = api.call(None, "GET", "/v1/admin/compaction-status", Value::Null);
+        assert_eq!(status, 200);
     }
 
     #[test]

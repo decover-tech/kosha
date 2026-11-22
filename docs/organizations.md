@@ -33,6 +33,11 @@ key is never enough. The holder of the admin credential is then either:
 - **acting for a user**: `X-Kosha-Actor: <user id>`. The server enforces that
   user's role in the organization.
 
+`X-Kosha-Actor` is only understood by the routes on this page. Every other
+`/v1/admin/*` route (`api-keys`, `gc`, compaction, ...) is operator-only and
+answers 403 when the header is present, so a request made for a user can never
+run with the operator's powers.
+
 The server does not authenticate users. The admin credential's holder (today an
 operator's script, later the console's backend) is trusted to have done so
 before it names a user. Never hand the admin credential to an end user.

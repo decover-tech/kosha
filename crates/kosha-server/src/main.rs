@@ -6465,6 +6465,15 @@ fn route(
         {
             return response;
         }
+        // Every other admin route is the operator's and knows nothing of
+        // roles. A request that names a user must not reach one: it would
+        // run with the operator's powers (a key for any tenant, gc, ...).
+        if org_admin::names_actor(headers) {
+            return json_error(
+                403,
+                "this route is operator-only: it cannot be called with an 'x-kosha-actor' header",
+            );
+        }
     } else if path.starts_with("/internal/") {
         if !service_authorized(headers, state.internal_service_key.as_deref()) {
             return json_error(403, "internal service credential required");
