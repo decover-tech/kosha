@@ -11131,6 +11131,14 @@ fn log_search_timing(
             phases.knn_seg_quantized, phases.knn_seg_unrescored,
         ));
     }
+    // Posting-scan split of a kNN query's scoring time (#435): read,
+    // decode and dot, each summed across scoring threads.
+    if phases.knn_mode.is_some() {
+        knn_rescore.push_str(&format!(
+            " knn_read_ms={:.1} knn_decode_ms={:.1} knn_dot_ms={:.1} knn_postings_cached={}",
+            phases.knn_read_ms, phases.knn_decode_ms, phases.knn_dot_ms, phases.knn_postings_cached,
+        ));
+    }
     println!(
         "search timing: ns={} total_ms={:.1} hydrate_ms={:.1} hydrate_files={} \
          hydrate_mb={:.1} queue_ms={:.1} admit_ms={:.1} bm25_stats={} bm25_stats_ms={:.2} \

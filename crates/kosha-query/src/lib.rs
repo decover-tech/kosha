@@ -3185,6 +3185,19 @@ pub struct SearchPhaseStats {
     /// global budget, which a cluster-aligned layout does not reduce on its
     /// own. Zero for non-kNN queries and on the per-segment fallback.
     pub knn_centroids_scanned: usize,
+    /// Where the posting scans of this kNN query spent their time (#435),
+    /// each summed across rayon workers (so they can exceed the wall-clock
+    /// `score_wall_ms` they are part of): reading posting bytes from local
+    /// disk, decoding them, and scoring entries against the query. Postings
+    /// served from a segment's decoded-posting cache
+    /// (`knn_postings_cached`) cost neither read nor decode. Zero for
+    /// non-kNN queries and for the legacy flat and late-interaction paths.
+    pub knn_read_ms: f64,
+    pub knn_decode_ms: f64,
+    pub knn_dot_ms: f64,
+    /// Of the postings scanned, how many came from a decoded-posting
+    /// cache.
+    pub knn_postings_cached: usize,
     /// Wall time of `knn_plan` (segment opens plus the centroid scan and
     /// budget cutoff), the part of a kNN query that is paid per segment
     /// before any posting is read. Zero for non-kNN queries. Disjoint
@@ -3286,6 +3299,20 @@ impl Bm25StatsUsed {
     }
 }
 
+impl OpenStatsCollector {
+    /// Adds one segment probe's posting-scan split (#435).
+    fn add_knn_scan(&self, scan: &kosha_segment::KnnScanStats) {
+        self.knn_read_nanos
+            .fetch_add(scan.read_nanos, Ordering::Relaxed);
+        self.knn_decode_nanos
+            .fetch_add(scan.decode_nanos, Ordering::Relaxed);
+        self.knn_dot_nanos
+            .fetch_add(scan.score_nanos, Ordering::Relaxed);
+        self.knn_postings_cached
+            .fetch_add(scan.postings_cached, Ordering::Relaxed);
+    }
+}
+
 /// Shared-atomic collector threaded through the parallel scoring pass to
 /// build [`SearchPhaseStats`] (open counts/time come from inside
 /// `open_segment`, which runs concurrently per segment).
@@ -3301,6 +3328,12 @@ struct OpenStatsCollector {
     knn_segments: AtomicUsize,
     /// See [`SearchPhaseStats::knn_centroids_scanned`].
     knn_centroids: AtomicUsize,
+    /// Posting-scan phase split (#435) — see
+    /// [`SearchPhaseStats::knn_read_ms`] and its neighbours.
+    knn_read_nanos: AtomicU64,
+    knn_decode_nanos: AtomicU64,
+    knn_dot_nanos: AtomicU64,
+    knn_postings_cached: AtomicUsize,
     /// See [`SearchPhaseStats::wand_docs_scored`].
     wand_docs_scored: AtomicUsize,
     /// See [`SearchPhaseStats::wand_segments_skipped`].
@@ -3827,7 +3860,7 @@ impl Searcher {
     /// already resident in every open segment's `LazyVectorIndex` (loaded
     /// from the small `vector.offsets` sidecar), so this pass does no
     /// posting I/O at all — the expensive part of a kNN query is
-    /// `hydrate_posting`, and that is precisely what the cutoff then
+    /// `scan_posting`, and that is precisely what the cutoff then
     /// prevents. The filter sets it counts are the ones scoring would
     /// build anyway, and stay cached on the segment for it.
     ///
@@ -3949,16 +3982,18 @@ impl Searcher {
                 let accept = |doc_seq: u32| dead.is_none_or(|seqs| !seqs.contains(&doc_seq));
                 let accept_dyn: Option<&dyn Fn(u32) -> bool> =
                     if dead.is_some() { Some(&accept) } else { None };
-                let found = reader
-                    .knn_candidates_fetching(
+                let (found, scan) = kosha_segment::with_knn_scan_stats(|| {
+                    reader.knn_candidates_fetching(
                         &knn.field,
                         &knn.vector,
                         fetch_k,
                         budget,
                         accept_dyn,
                         vector_fetch,
-                    )?
-                    .ok()?;
+                    )
+                });
+                open_stats.add_knn_scan(&scan);
+                let found = found?.ok()?;
                 open_stats
                     .knn_postings
                     .fetch_add(found.postings, Ordering::Relaxed);
@@ -6338,13 +6373,17 @@ impl Searcher {
                             .filter(|&doc_seq| knn_accept(doc_seq))
                             .collect(),
                     };
-                    match reader.knn_exact_filtered_fetching(
-                        &knn.field,
-                        &knn.vector,
-                        fetch_k,
-                        &candidates,
-                        vector_fetch,
-                    ) {
+                    let (exact, scan) = kosha_segment::with_knn_scan_stats(|| {
+                        reader.knn_exact_filtered_fetching(
+                            &knn.field,
+                            &knn.vector,
+                            fetch_k,
+                            &candidates,
+                            vector_fetch,
+                        )
+                    });
+                    open_stats.add_knn_scan(&scan);
+                    match exact {
                         Some(Ok(exact)) => {
                             open_stats
                                 .knn_postings
@@ -6380,7 +6419,7 @@ impl Searcher {
                                 .fetch_add(1, Ordering::Relaxed);
                         }
                     }
-                    let probe = match knn_cutoff {
+                    let (probe, scan) = kosha_segment::with_knn_scan_stats(|| match knn_cutoff {
                         Some((cutoff, effective_budget)) => reader
                             .knn_search_within_filtered_fetching(
                                 &knn.field,
@@ -6422,7 +6461,8 @@ impl Searcher {
                                     open_stats.knn_segments.fetch_add(1, Ordering::Relaxed);
                                 })
                             }),
-                    };
+                    });
+                    open_stats.add_knn_scan(&scan);
                     match probe {
                         Some(Ok(results)) => results,
                         Some(Err(e)) => {
@@ -7222,6 +7262,11 @@ impl Searcher {
         phase_stats.knn_postings_probed = open_stats.knn_postings.load(Ordering::Relaxed);
         phase_stats.knn_segments_probed = open_stats.knn_segments.load(Ordering::Relaxed);
         phase_stats.knn_centroids_scanned = open_stats.knn_centroids.load(Ordering::Relaxed);
+        phase_stats.knn_read_ms = open_stats.knn_read_nanos.load(Ordering::Relaxed) as f64 / 1e6;
+        phase_stats.knn_decode_ms =
+            open_stats.knn_decode_nanos.load(Ordering::Relaxed) as f64 / 1e6;
+        phase_stats.knn_dot_ms = open_stats.knn_dot_nanos.load(Ordering::Relaxed) as f64 / 1e6;
+        phase_stats.knn_postings_cached = open_stats.knn_postings_cached.load(Ordering::Relaxed);
         phase_stats.knn_exact_vectors = open_stats.knn_exact_vectors.load(Ordering::Relaxed);
         if query.knn.is_some() && self.knn_rescore_stats_on() {
             phase_stats.knn_rescore_stats = true;
@@ -14525,7 +14570,7 @@ mod tests {
         // only opens `vector.idx` for real when a probed posting needs
         // hydrating — so a *warm* reader (already cached from a prior
         // search on the same `Searcher`) whose backing file then vanishes
-        // fails at hydration time, not at open time. `hydrate_posting`'s
+        // fails at hydration time, not at open time. `scan_posting`'s
         // one-shot admission also means the first touch of a posting is
         // never itself cached, so a second identical query is guaranteed to
         // re-hit disk rather than serve from the decoded-postings cache.
