@@ -175,6 +175,27 @@ pub fn read_local_range(
     start: u64,
     len: u64,
 ) -> Option<Vec<u8>> {
+    read_local_range_reusing(segment_dir, file, complete_len, start, len, &mut None)
+}
+
+/// [`read_local_range`] for a caller that reads many ranges of the same
+/// file in a row (a kNN probe hydrating its postings): the span listing is
+/// kept in `spans` between calls instead of being rebuilt per range. One
+/// listing is a `read_dir` plus a stat of every cached span, and a segment
+/// warmed by ranged reads holds hundreds of spans, so a listing per posting
+/// cost more than the read itself and did not scale across query threads.
+///
+/// A listing that does not serve the range is rebuilt once before giving
+/// up, so spans fetched (or evicted) since it was taken are seen. Pass the
+/// same `spans` only for the same `segment_dir` and `file`.
+pub fn read_local_range_reusing(
+    segment_dir: &Path,
+    file: &str,
+    complete_len: u64,
+    start: u64,
+    len: u64,
+    spans: &mut Option<SpanIndex>,
+) -> Option<Vec<u8>> {
     let whole = segment_dir.join(file);
     let read_whole = || -> Option<Vec<u8>> {
         let meta = fs::metadata(&whole).ok()?;
@@ -188,7 +209,15 @@ pub fn read_local_range(
         Some(buf)
     };
     read_whole()
-        .or_else(|| SpanIndex::load(segment_dir, file).read(start, start + len))
+        .or_else(|| {
+            if let Some(buf) = spans.as_ref().and_then(|s| s.read(start, start + len)) {
+                return Some(buf);
+            }
+            let fresh = SpanIndex::load(segment_dir, file);
+            let buf = fresh.read(start, start + len);
+            *spans = Some(fresh);
+            buf
+        })
         .or_else(read_whole)
 }
 
@@ -282,6 +311,27 @@ mod tests {
             read_local_range(&seg, "doc_store.bin", 4, 0, 4).as_deref(),
             Some(&b"SPAN"[..])
         );
+        let _ = fs::remove_dir_all(&seg);
+    }
+
+    #[test]
+    fn reused_listing_sees_spans_added_and_removed_after_it_was_taken() {
+        let seg = tmp("reuse");
+        put(&seg, "vector.idx", 0, b"AAAA");
+        let mut spans = None;
+        let read = |start, spans: &mut _| {
+            read_local_range_reusing(&seg, "vector.idx", 99, start, 4, spans)
+        };
+        assert_eq!(read(0, &mut spans).as_deref(), Some(&b"AAAA"[..]));
+        assert_eq!(spans.as_ref().map(|s| s.spans().len()), Some(1));
+        // Fetched after the listing: one rebuild finds it.
+        put(&seg, "vector.idx", 10, b"BBBB");
+        assert_eq!(read(10, &mut spans).as_deref(), Some(&b"BBBB"[..]));
+        assert_eq!(spans.as_ref().map(|s| s.spans().len()), Some(2));
+        // Evicted after the listing: a miss, not stale bytes or a panic.
+        fs::remove_file(spans_dir(&seg, "vector.idx").join(span_file_name(0, 4))).unwrap();
+        assert_eq!(read(0, &mut spans), None);
+        assert_eq!(read(10, &mut spans).as_deref(), Some(&b"BBBB"[..]));
         let _ = fs::remove_dir_all(&seg);
     }
 }
