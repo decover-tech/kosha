@@ -279,6 +279,41 @@ fn a_segment_of_another_model_is_skipped_and_counted_degraded() {
 }
 
 #[test]
+fn a_degraded_knn_answer_is_not_result_cached_or_fully_cached() {
+    let mut state = state_with(EmbedderRegistry::with_mock());
+    state.dashboard = dashboard::Dashboard::new(true);
+    assert_eq!(put_schema(&state, "deg", schema("mock-a", 64)).0, 200);
+    assert_eq!(index_texts(&state, "deg", DOCS).0, 200);
+    flush(&state, "deg");
+    // As in the test above: the segment's model no longer matches, so
+    // every kNN search skips it and counts it degraded.
+    let ns = NamespaceId("acme/deg".into());
+    let mut manifest = state.indexer.manifest(&ns).unwrap();
+    manifest.schema = Some(serde_json::from_value(schema("mock-b", 64)).unwrap());
+    manifest.version += 1;
+    state.indexer.restore_manifest(ns.clone(), manifest);
+    // Result cache on (no `no_cache`), timings requested: the shape the
+    // bench warmup gate polls with.
+    let search = || {
+        call(
+            &state,
+            "POST /v1/namespaces/deg/search",
+            serde_json::json!({"query_text": "", "timings": true,
+                "knn": {"field": "emb", "query_text": "running shoes", "k": 4}}),
+        )
+    };
+    for attempt in 0..2 {
+        let (status, body) = search();
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["knn_degraded_segments"], 1, "{attempt}: {body}");
+        // The repeat is searched again, not served from the result cache,
+        // and neither reads as fully cached.
+        assert_eq!(body["timings"]["cached"], false, "{attempt}: {body}");
+        assert_eq!(body["timings"]["fully_cached"], false, "{attempt}: {body}");
+    }
+}
+
+#[test]
 fn namespaces_without_a_model_are_untouched() {
     let counting = Counting::new(MODEL, DIMS);
     let plain = state_with(EmbedderRegistry::default());
