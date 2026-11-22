@@ -746,7 +746,7 @@ See "Deleting a namespace" in the README for what a pass removes and when.
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
 | `KOSHA_DELETION_PURGE_INTERVAL_MS` | How often this pod (any role) reads the deletion records it has not handled and removes the deleted namespaces' and tenants' cached copies from its memory and local disk. The first pass runs at boot and reads every record. Unset or `0`: off, and cached copies leave only by eviction | unset (off) | milliseconds |
-| `KOSHA_DELETION_RESUME_INTERVAL_MS` | How often a writer pod (`ingest` or `standalone`) retries the storage reclaim of pending namespace deletion records, starting at boot. A record that stays pending waits twice as long before each further try, up to one hour. Tenant records are not retried. Ignored on `query` and `indexer` pods. Unset or `0`: off | unset (off) | milliseconds |
+| `KOSHA_DELETION_RESUME_INTERVAL_MS` | How often a writer pod (`ingest` or `standalone`) retries the storage reclaim of pending namespace deletion records, starting at boot. A record that stays pending waits twice as long before each further try, up to one hour. Tenant records are not retried. Each retry takes the namespace's writer lease first and is skipped while another writer holds it; with `KOSHA_WRITER_LEASE=off` there is no such guard, so do not set this where two writer pods can overlap. Ignored on `query` and `indexer` pods. Unset or `0`: off | unset (off) | milliseconds |
 
 ## Segment format (rollout and rollback gates)
 

@@ -504,7 +504,9 @@ lists (the control store's, a branch's, or its own unpublished ones, read
 under the writer's locks) and removes the rest. The retired version on the
 record tells a manifest of the deleted incarnation from one of the new. A
 directory written to in the last 5 seconds, pinned, or being fetched is left
-for the next sweep.
+for the next sweep. So is a namespace on a writer pod whose first publish
+registered it after the sweep listed the control store: the writer asks the
+store again under its locks before it removes anything.
 
 A deletion record carries no per-pod acknowledgement: the control store has
 no list of pods to wait for. What holds for a pod that has the purge on and
@@ -518,13 +520,23 @@ can read the control store:
   seconds later, and it repeats any sweep every 60 seconds while one left
   something or failed. That removes what a search or fetch already running
   wrote after the first sweep;
+- it sweeps a deleted tenant again every 60 seconds for as long as the tenant's
+  record is `pending`, and once more after the record is `completed`. A tenant
+  record is written before the tenant's namespaces are deleted, and a sweep
+  keeps whatever the control store still lists, so the sweep after completion
+  is the one that removes what has no record of its own: the tenant's branches
+  and directories no namespace was ever registered for. For those, the window
+  starts when the tenant record completes, not when the delete was requested;
 - a pod that was down handles every record in its first pass after boot.
 
 Not covered: a pod with the purge off; parsed segments a search already
 running still holds, until it ends; a pod that cannot read the control store,
 until it can; a writer pod holding unpublished writes for a namespace another
-pod deleted, until they are published or dropped; freed disk blocks and the
-operating system's page cache. `GET /v1/stats` reports each pod's progress
+pod deleted, until they are published or dropped; a branch deleted on its own
+with `DELETE /v1/namespaces/{ns}/branch`, which writes no deletion record (its
+cached copies leave a pod only by eviction, or when its tenant is deleted);
+freed disk blocks and the operating system's page cache. `GET /v1/stats`
+reports each pod's progress
 under `deletion_purge` (`caught_up`, `pending_sweeps`, `last_error`, counters).
 
 **Deletion records.** Step 1 also writes a deletion record
@@ -564,6 +576,17 @@ boot and then on that interval, under the same rule. A record that stays
 pending waits twice as long before each further try, up to one hour. Pending
 tenant records are left to `POST /v1/admin/deletions/resume`: a tenant pass
 deletes whatever keys and namespaces the tenant id has when it runs.
+
+A retry deletes the namespace's whole prefix in object storage, unattended,
+and the first one runs at boot, when a second writer pod can still be alive.
+Each automatic retry therefore takes the namespace's writer lease first and is
+skipped (and paused like a failed one) while another writer holds it; with the
+lease held no other writer can commit a manifest for the namespace between the
+"not re-created" check and the delete. A lease taken only for the retry is
+released again. With `KOSHA_WRITER_LEASE=off` nothing fences the other writer:
+do not set `KOSHA_DELETION_RESUME_INTERVAL_MS` where two writer pods can run at
+the same time (a rolling restart of the ingest pod included). The admin resume
+call takes no lease; run it against the pod that is the active writer.
 
 **Deleting a tenant** (`DELETE /v1/admin/tenants/{tenant}`, admin key) needs
 the body `{"confirm": "<tenant>"}` and is permanent. In order: the tenant's

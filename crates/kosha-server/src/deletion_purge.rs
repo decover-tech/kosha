@@ -33,7 +33,10 @@
 //!   is half way. Its segments are kept when its manifest is above the
 //!   retired version and the control store has the namespace. A writer
 //!   holding unpublished work for a namespace that looks deleted keeps its
-//!   files too, and the sweep is repeated later;
+//!   files too, and the sweep is repeated later. A writer asks the control
+//!   store about the namespace again under those locks: a first publish
+//!   that registered it after the sweep's listing was read (so the listing
+//!   is stale) leaves the namespace for the next sweep;
 //! - a directory written to within [`PurgeTuning::write_margin`] of the
 //!   start of the sweep is left for the next sweep. A segment published
 //!   after the control store was read can only have reached this disk
@@ -52,19 +55,38 @@
 //! - every subject is swept a second time [`PurgeTuning::settle`] later
 //!   (again while anything was left or failed), which removes what a search
 //!   or fetch already running during the first sweep wrote afterwards;
+//! - a tenant is swept again every [`PurgeTuning::settle`] for as long as
+//!   its record is pending, and once more after the record completes. A
+//!   tenant record is written before the tenant's namespaces go, and a
+//!   sweep keeps what the control store still lists; the sweep after
+//!   completion is the one that removes what got no record of its own
+//!   (the tenant's branches, directories no namespace was registered for);
 //! - a pod that was down handles every record in its first pass after boot.
 //!
 //! Not covered: a pod with the purge off (the default); parsed segments a
 //! search already running still holds, until that search ends; a pod that
-//! cannot read the control store, until it can; freed disk blocks and the
-//! operating system's page cache. `GET /v1/stats` reports each pod's
-//! progress under `deletion_purge`.
+//! cannot read the control store, until it can; a branch deleted on its
+//! own (`DELETE /v1/namespaces/{ns}/branch` writes no deletion record, so
+//! its cached copies go only by eviction, or with its tenant); freed disk
+//! blocks and the operating system's page cache. `GET /v1/stats` reports
+//! each pod's progress under `deletion_purge`.
 //!
 //! **Retrying pending records.** `KOSHA_DELETION_RESUME_INTERVAL_MS`
 //! (opt-in, writer pods only) retries the storage reclaim of pending
 //! *namespace* records at boot and on a timer, with a growing pause per
 //! record. Tenant records are not retried automatically: a pending tenant
 //! record deletes whatever the tenant id holds at the time it runs.
+//!
+//! A retry deletes the namespace's whole object-storage prefix, and it runs
+//! unattended at boot, which is when two writer pods can overlap. So each
+//! retry first takes the namespace's writer lease (#254) and is skipped
+//! when another writer holds it: that writer may be publishing a new
+//! incarnation this process cannot see. Holding the lease, no other
+//! writer's manifest CAS for the namespace can commit between the "not
+//! re-created" check and the prefix delete. A lease taken only for the
+//! retry is released after it. With `KOSHA_WRITER_LEASE=off` there is no
+//! such guard: do not enable the retry where two writer pods can run at
+//! once.
 
 use super::*;
 use kosha_core::deletion::{
@@ -161,6 +183,11 @@ struct Resweep {
     subject: String,
     /// The highest retired version among the subject's records.
     floor: Option<u64>,
+    /// Tenant records of the subject not yet seen completed. While any is
+    /// pending the subject stays queued: the tenant's namespaces are still
+    /// in the control store, and what goes with them without a record of
+    /// its own is only removable after the record completes.
+    pending: Vec<String>,
     due: Instant,
 }
 
@@ -196,6 +223,7 @@ pub(crate) struct PurgeState {
     errors: AtomicU64,
     resume_attempts: AtomicU64,
     resume_completed: AtomicU64,
+    resume_fenced: AtomicU64,
 }
 
 impl PurgeState {
@@ -223,6 +251,7 @@ impl PurgeState {
             "kosha_deletion_purge_errors_total": load(&self.errors),
             "kosha_deletion_resume_attempts_total": load(&self.resume_attempts),
             "kosha_deletion_resume_completed_total": load(&self.resume_completed),
+            "kosha_deletion_resume_fenced_total": load(&self.resume_fenced),
         })
     }
 }
@@ -408,14 +437,18 @@ impl AppState {
         // Several records can name one subject (deleted, re-created,
         // deleted again): one sweep covers them, against the highest
         // retired version.
-        let mut subjects: BTreeMap<(bool, String), Option<u64>> = BTreeMap::new();
+        let mut subjects: BTreeMap<(bool, String), (Option<u64>, Vec<String>)> = BTreeMap::new();
         for record in &fresh {
             let tenant = record.scope == DeletionScope::Tenant;
-            let floor = subjects
+            let (floor, pending) = subjects
                 .entry((tenant, record.subject.clone()))
                 .or_default();
             if !tenant {
                 *floor = Some(floor.unwrap_or(0).max(record.last_version));
+            } else if record.state != DeletionState::Completed {
+                // Read before the sweep below: a record seen completed here
+                // was complete before its subject is swept.
+                pending.push(record.id.clone());
             }
         }
         let recent = fresh
@@ -424,19 +457,20 @@ impl AppState {
             .map(|record| record.subject.as_str())
             .collect::<HashSet<_>>();
         let mut requeue: Vec<Resweep> = Vec::new();
-        for ((tenant, subject), floor) in &subjects {
-            let scope = if *tenant {
+        for ((tenant, subject), (floor, pending)) in subjects {
+            let scope = if tenant {
                 DeletionScope::Tenant
             } else {
                 DeletionScope::Namespace
             };
-            let outcome = self.sweep_deleted_subject(scope, subject, *floor, tuning);
-            self.note_sweep(&outcome, subject, &mut report);
-            if outcome.unfinished() || recent.contains(subject.as_str()) {
+            let outcome = self.sweep_deleted_subject(scope, &subject, floor, tuning);
+            self.note_sweep(&outcome, &subject, &mut report);
+            if outcome.unfinished() || recent.contains(subject.as_str()) || !pending.is_empty() {
                 requeue.push(Resweep {
                     scope,
-                    subject: subject.clone(),
-                    floor: *floor,
+                    subject,
+                    floor,
+                    pending,
                     due: Instant::now() + tuning.settle,
                 });
             }
@@ -446,11 +480,17 @@ impl AppState {
         let due: Vec<Resweep> = {
             let mut progress = purge.progress.lock().unwrap();
             let now = Instant::now();
-            // A subject swept just now waits for its new turn instead.
-            progress.queue.retain(|queued| {
-                !requeue
-                    .iter()
-                    .any(|new| new.scope == queued.scope && new.subject == queued.subject)
+            // A subject swept just now waits for its new turn instead, and
+            // keeps waiting for the records its queued turn waited for.
+            progress.queue.retain_mut(|queued| {
+                let Some(new) = requeue
+                    .iter_mut()
+                    .find(|new| new.scope == queued.scope && new.subject == queued.subject)
+                else {
+                    return true;
+                };
+                new.pending.append(&mut queued.pending);
+                false
             });
             let (due, later) = std::mem::take(&mut progress.queue)
                 .into_iter()
@@ -459,12 +499,16 @@ impl AppState {
             due
         };
         for queued in due {
+            // Before the sweep: once a record reads completed here, this
+            // sweep ran after it and is the subject's last on its account.
+            let pending = self.deletions_still_pending(&queued.pending);
             let outcome =
                 self.sweep_deleted_subject(queued.scope, &queued.subject, queued.floor, tuning);
             self.note_sweep(&outcome, &queued.subject, &mut report);
-            if outcome.unfinished() {
+            if outcome.unfinished() || !pending.is_empty() {
                 requeue.push(Resweep {
                     due: Instant::now() + tuning.settle,
+                    pending,
                     ..queued
                 });
             }
@@ -500,6 +544,22 @@ impl AppState {
         progress.last_pass_at_ms = Some(now_ms);
         progress.last_error = report.errors.first().cloned();
         report
+    }
+
+    /// The records among `ids` that are not completed. A record that
+    /// cannot be read counts as pending; one that no longer exists does not.
+    fn deletions_still_pending(&self, ids: &[String]) -> Vec<String> {
+        ids.iter()
+            .filter(|id| {
+                let record = self.controller.lock().unwrap().deletion(id);
+                match record {
+                    Ok(Some(record)) => record.state != DeletionState::Completed,
+                    Ok(None) => false,
+                    Err(_) => true,
+                }
+            })
+            .cloned()
+            .collect()
     }
 
     fn note_sweep(&self, outcome: &SweepOutcome, subject: &str, report: &mut PassReport) {
@@ -726,6 +786,15 @@ impl AppState {
 
     /// Remove the segment directories of `ns` that no current manifest
     /// references. Runs under the writer's locks for `ns`.
+    ///
+    /// `stored` was listed before those locks were taken, possibly long
+    /// before (a tenant sweep locks each namespace in turn). On a writer
+    /// that knows `ns`, whether the store has it is therefore read again
+    /// under the locks: a namespace whose first publish landed in between
+    /// would otherwise read as deleted and fully published, and lose its
+    /// only local copy. The order makes the second read sufficient: what
+    /// this writer holds is captured first, so anything it reports as
+    /// published was committed before the store is asked.
     fn sweep_namespace_dir(
         &self,
         ns: &NamespaceId,
@@ -739,6 +808,23 @@ impl AppState {
         let in_store = stored.contains_key(ns);
         let follower = self.follows_only();
         self.indexer.while_quiesced(ns, |local| {
+            if local.is_some() && !follower {
+                let current = self.controller.lock().unwrap().manifest_version(ns);
+                match current {
+                    Ok(current) if current.is_some() == in_store => {}
+                    // The listing is stale for this namespace (registered or
+                    // dropped since), and so is `keep`: the next sweep reads
+                    // both again.
+                    Ok(_) => {
+                        outcome.deferred += 1;
+                        return;
+                    }
+                    Err(e) => {
+                        outcome.fail(format!("control store: reading '{}': {e}", ns.0));
+                        return;
+                    }
+                }
+            }
             let mut live = in_store;
             let mut local_keep = Keep::default();
             let local_version = local.as_ref().map(|local| local.manifest.version);
@@ -843,6 +929,16 @@ impl AppState {
     /// next try, from `interval` up to an hour, so records that cannot
     /// complete (a namespace that exists again) do not cost a control-store
     /// round trip per tick. Returns how many records completed.
+    ///
+    /// This runs unattended, at boot too, when another writer pod may still
+    /// be alive, and a retry deletes the namespace's whole object-storage
+    /// prefix on the strength of "not in the control store, untouched
+    /// here". Another writer can be about to publish a new incarnation
+    /// there. So each retry first takes the namespace's writer lease
+    /// (#254): refused while another writer holds it (the record waits its
+    /// pause), and once taken no other writer's CAS for the namespace can
+    /// commit, so the check stays true until the prefix is gone. A lease
+    /// taken only for this is released afterwards.
     pub(crate) fn run_deletion_resume_pass(&self, interval: Duration) -> usize {
         let purge = &self.deletion_purge;
         let pending = self
@@ -880,10 +976,31 @@ impl AppState {
             if waiting {
                 continue;
             }
-            purge.resume_attempts.fetch_add(1, Ordering::Relaxed);
-            let after = self.resume_namespace_deletion(record);
+            let ns = NamespaceId(record.subject.clone());
+            let held_before = self.writer_leases.held_before(&ns);
+            let state = match self.writer_leases.token(&ns, &self.controller) {
+                Ok(_) => {
+                    purge.resume_attempts.fetch_add(1, Ordering::Relaxed);
+                    let after = self.resume_namespace_deletion(record);
+                    if !held_before {
+                        self.writer_leases.release(&ns, &self.controller);
+                    }
+                    after.state
+                }
+                Err(error) => {
+                    purge.resume_fenced.fetch_add(1, Ordering::Relaxed);
+                    if !matches!(error, KoshaError::Fenced { .. }) {
+                        eprintln!(
+                            "WARN: deletion resume: {} ({}): taking the writer lease failed: \
+                             {error}; it is retried",
+                            record.id, record.subject
+                        );
+                    }
+                    DeletionState::Pending
+                }
+            };
             let mut progress = purge.progress.lock().unwrap();
-            if after.state == DeletionState::Completed {
+            if state == DeletionState::Completed {
                 completed += 1;
                 purge.resume_completed.fetch_add(1, Ordering::Relaxed);
                 progress.resume_backoff.remove(&record.id);

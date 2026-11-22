@@ -725,3 +725,224 @@ fn pending_namespace_deletions_are_retried_with_a_growing_pause() {
     assert_eq!(stats["kosha_deletion_resume_attempts_total"], 2, "{stats}");
     assert_eq!(stats["kosha_deletion_resume_completed_total"], 1, "{stats}");
 }
+
+/// The sweep lists the control store once, before it takes any namespace's
+/// writer locks. A namespace whose first publish registers it after that
+/// listing reads as "not in the store" with nothing unpublished: without a
+/// second look under the locks its segments, flushed long before the
+/// sweep, would be removed from the writer.
+#[test]
+fn a_first_publish_after_the_listing_does_not_cost_a_writer_its_segments() {
+    let control: SharedControl = Arc::new(Mutex::new(kosha_control::Controller::new()));
+    let writer = writer_on(&control);
+    index(&writer, "acme", "docs", &["old"]);
+    delete_ns(&writer, "acme", "docs");
+    let floor = writer
+        .controller
+        .lock()
+        .unwrap()
+        .deletions(&DeletionFilter::default())
+        .unwrap()[0]
+        .last_version;
+    // What a sweep starting now lists: the namespace is gone.
+    let stale: HashMap<NamespaceId, u64> = writer
+        .controller
+        .lock()
+        .unwrap()
+        .manifest_versions()
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert!(stale.is_empty());
+
+    // The new incarnation's first publish lands before the sweep reaches
+    // the namespace.
+    index(&writer, "acme", "docs", &["fresh"]);
+    let ns = NamespaceId("acme/docs".into());
+    let published = dirs(&writer, "acme/docs");
+    assert_eq!(published.len(), 1);
+    assert!(
+        !writer
+            .indexer
+            .while_quiesced(&ns, |local| local)
+            .unwrap()
+            .unpublished
+    );
+    settle_clock();
+
+    let mut outcome = SweepOutcome::default();
+    writer.sweep_namespace_dir(
+        &ns,
+        Some(floor),
+        &stale,
+        &Keep::default(),
+        SystemTime::now(),
+        &mut outcome,
+    );
+    assert_eq!(dirs(&writer, "acme/docs"), published, "{outcome:?}");
+    assert_eq!(
+        (
+            outcome.segment_dirs_removed,
+            outcome.deferred,
+            &outcome.error
+        ),
+        (0, 1, &None),
+        "left for a sweep with a fresh listing"
+    );
+
+    // That sweep keeps the segments because the manifest lists them.
+    let outcome = writer.sweep_deleted_subject(
+        DeletionScope::Namespace,
+        "acme/docs",
+        Some(floor),
+        &tuning(),
+    );
+    assert_eq!(
+        (
+            outcome.segment_dirs_removed,
+            outcome.deferred,
+            &outcome.error
+        ),
+        (0, 0, &None)
+    );
+    assert_eq!(dirs(&writer, "acme/docs"), published);
+    assert_eq!(search(&writer, "acme", "docs"), (200, vec!["fresh".into()]));
+}
+
+/// A tenant record is written before the tenant's namespaces go. While it
+/// is pending a sweep keeps what the control store still lists, so the
+/// tenant stays queued until its record completes; the sweep after that
+/// removes what no namespace record covers (a branch, here a namespace
+/// dropped from the store without a record).
+#[test]
+fn a_pending_tenant_is_swept_again_after_its_record_completes() {
+    let (writer, follower, _) = pods();
+    index(&writer, "acme", "exp", &["e1"]);
+    hydrate(&writer, &follower, "acme");
+    assert_eq!(search(&follower, "acme", "exp").1, vec!["e1".to_string()]);
+    let cached = dirs(&follower, "acme/exp");
+    assert_eq!(cached.len(), 1);
+
+    // `DELETE /v1/admin/tenants/acme` got as far as its record.
+    let record = writer
+        .controller
+        .lock()
+        .unwrap()
+        .begin_deletion(&NewDeletion::tenant("acme"), 0)
+        .unwrap();
+    let queued = |state: &AppState| state.deletion_purge.to_json()["pending_sweeps"].clone();
+    for round in 0..3 {
+        let report = pass(&follower);
+        assert_eq!(report.sweeps, 1, "round {round}: {report:?}");
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(dirs(&follower, "acme/exp"), cached, "still in the store");
+        assert_eq!(queued(&follower), 1, "round {round}: waits for the record");
+    }
+
+    // The tenant pass finishes later: the namespace leaves the store with
+    // no record of its own, then the tenant record completes.
+    let ns = NamespaceId("acme/exp".into());
+    writer
+        .controller
+        .lock()
+        .unwrap()
+        .delete_namespace(&ns, 0)
+        .unwrap();
+    let completed = writer
+        .controller
+        .lock()
+        .unwrap()
+        .record_deletion_attempt(&record.id, 0, None)
+        .unwrap();
+    assert!(completed.is_completed());
+
+    let report = pass(&follower);
+    assert_eq!((report.records, report.sweeps), (0, 1), "{report:?}");
+    assert_eq!(report.segment_dirs_removed, 1, "{report:?}");
+    assert!(!follower.data_dir.join("acme").exists());
+    assert_eq!(queued(&follower), 0, "nothing left to wait for");
+    assert_eq!(pass(&follower).sweeps, 0);
+}
+
+/// The automatic retry deletes a whole object-storage prefix, unattended.
+/// While another writer holds the namespace's lease (it may be publishing
+/// a new incarnation this pod cannot see) the retry does not run; once the
+/// lease is free it does, and the lease it took for that is given back.
+#[test]
+fn the_automatic_retry_does_not_run_while_another_writer_holds_the_lease() {
+    let mut writer = AppState::new(test_dir());
+    assert!(writer.writer_leases.enabled());
+    let remote = Arc::new(FlakyRemote::default());
+    writer.remote_prefix_override = Some(remote.clone());
+    let object = "acme/docs/seg/footer.json".to_string();
+    remote.objects.lock().unwrap().insert(object.clone());
+    let ns = NamespaceId("acme/docs".into());
+    let id = writer
+        .controller
+        .lock()
+        .unwrap()
+        .begin_deletion(&NewDeletion::namespace("acme/docs", Some("acme"), None), 3)
+        .unwrap()
+        .id;
+    let record = || {
+        writer
+            .controller
+            .lock()
+            .unwrap()
+            .deletion(&id)
+            .unwrap()
+            .unwrap()
+    };
+    // The active writer pod re-created the namespace and has not published
+    // it yet: nothing in the store, but the lease is its.
+    let ttl = Duration::from_secs(60);
+    let token = writer
+        .controller
+        .lock()
+        .unwrap()
+        .acquire_writer_lease(&ns, "ingest-a", ttl)
+        .unwrap()
+        .expect("free");
+
+    let interval = Duration::from_secs(3600);
+    assert_eq!(writer.run_deletion_resume_pass(interval), 0);
+    assert_eq!(record().attempts, 0, "not attempted");
+    assert!(remote.objects.lock().unwrap().contains(&object));
+    let stats = writer.deletion_purge.to_json();
+    assert_eq!(stats["kosha_deletion_resume_fenced_total"], 1, "{stats}");
+    assert_eq!(stats["kosha_deletion_resume_attempts_total"], 0, "{stats}");
+    // Skipped, and paused like a failed try.
+    assert_eq!(writer.run_deletion_resume_pass(interval), 0);
+    assert_eq!(
+        writer.deletion_purge.to_json()["kosha_deletion_resume_fenced_total"],
+        1
+    );
+
+    // The other writer is gone.
+    writer
+        .controller
+        .lock()
+        .unwrap()
+        .release_writer_lease(&ns, "ingest-a", token)
+        .unwrap();
+    writer
+        .deletion_purge
+        .progress
+        .lock()
+        .unwrap()
+        .resume_backoff
+        .clear();
+    assert_eq!(writer.run_deletion_resume_pass(interval), 1);
+    assert!(record().is_completed());
+    assert!(remote.objects.lock().unwrap().is_empty());
+    // The retry's lease does not outlive it: the next writer takes the
+    // namespace at once.
+    assert!(!writer.writer_leases.held_before(&ns));
+    assert!(writer
+        .controller
+        .lock()
+        .unwrap()
+        .acquire_writer_lease(&ns, "ingest-b", ttl)
+        .unwrap()
+        .is_some());
+}

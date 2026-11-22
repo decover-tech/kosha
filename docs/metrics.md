@@ -95,6 +95,7 @@ like any other explicit eviction. Its own counters are per pod, in the `deletion
 | `kosha_deletion_purge_deferred_total` | Directories or namespaces a sweep left for a later one (written to within the last 5 s, pinned, being fetched, or held by a writer's unpublished state) |
 | `kosha_deletion_purge_errors_total` | Passes or sweeps that failed (control store unreadable, a file that could not be removed) |
 | `kosha_deletion_resume_attempts_total`, `kosha_deletion_resume_completed_total` | Automatic retries of pending namespace records on a writer pod (`KOSHA_DELETION_RESUME_INTERVAL_MS`), and how many completed the record |
+| `kosha_deletion_resume_fenced_total` | Automatic retries skipped because the namespace's writer lease could not be taken (another writer pod holds it, or the lease store could not be reached) |
 
 Each cache keeps these figures per tenant (#342): the tenant is the first component of the
 `<tenant>/<name>` namespace id, and bare namespace ids from before tenants existed count as
