@@ -131,6 +131,18 @@ on:
           use gets thin fast as segment count grows; bump this to test
           whether recall recovers with a larger budget)
         default: "100"
+      knn_sweep:
+        description: >-
+          kNN probe-budget sweep (#384) after the vector suite; empty (default)
+          = off. "fractions" = KOSHA_KNN_BUDGET_FRACTION 0.05/0.03/0.02/0.01;
+          "relative" = the step 2 flag grid (alpha 0/0.5, alpha=0 relative
+          cutoff at eps 0.5/1/2, min probes 500/1000, plus f0.05);
+          or points "label:ENV=V,ENV=V;label2:..." over the kNN probe knobs
+          (see scripts/bench/bm25_scale/vm/knn_budget_sweep.sh). Each point
+          restarts the server with those env vars, runs a warm kNN phase of
+          `duration` seconds at `qps` and recall over 1000 random queries.
+          Needs run_recall_check=true. Adds ~(duration + 8 min) per point.
+        default: ""
       bm25_snapshot:
         description: >-
           snapshot the BM25 suite restores into namespace msmarco-<bm25_docs>.
@@ -457,6 +469,26 @@ jobs:
               --sample '${{ inputs.recall_sample }}' --k 10 --num-candidates '${{ inputs.recall_num_candidates }}' \
               --out /data/results-ci/vector/recall.json"
 
+      - name: kNN probe-budget sweep (#384)
+        if: contains(fromJSON('["both","vector"]'), inputs.suite) && inputs.knn_sweep != ''
+        env:
+          KNN_SWEEP: ${{ inputs.knn_sweep }}
+        run: |
+          IP='${{ steps.tf.outputs.ip }}'
+          SSH="ssh -i $RUNNER_TEMP/bench.pem -o ServerAliveInterval=30 ec2-user@$IP"
+          case "$KNN_SWEEP" in
+            *[!A-Za-z0-9_.=:\;,-]*) echo "::error::knn_sweep may only contain [A-Za-z0-9_.=:;,-], got: $KNN_SWEEP"; exit 1 ;;
+          esac
+          if [ '${{ inputs.run_recall_check }}' != 'true' ]; then
+            echo "::error::knn_sweep needs run_recall_check=true (the embeddings volume holds the recall ground truth)"
+            exit 1
+          fi
+          $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && \
+            EMB_DIR=\$(./mount_embeddings_cache.sh '${{ steps.tf.outputs.embeddings_volume_id }}') && \
+            WARM_GATE_TIMEOUT_S=10800 RETURN_FIELDS=$RETURN_FIELDS \
+            ./knn_budget_sweep.sh $VEC_NS /data/results-ci/knn_sweep \"\$EMB_DIR\" \
+              '${{ inputs.qps }}' '${{ inputs.duration }}' '$KNN_SWEEP'"
+
       - name: Archive server logs + results to S3
         # Runs on failure too: a failed run's logs are the useful ones. The
         # bench segment bucket is destroyed with the stack, so this goes to
@@ -499,7 +531,8 @@ jobs:
             echo ""
             echo "| phase | p50 ms | p90 ms | p99 ms | requests | errors |"
             echo "|---|---|---|---|---|---|"
-            find results -name '*.json' ! -name 'recall.json' ! -name 'meta.json' | sort | while read -r f; do
+            # knn_sweep/ (#384) has its own table, appended below.
+            find results -name '*.json' ! -name 'recall.json' ! -name 'meta.json' ! -path 'results/knn_sweep/*' | sort | while read -r f; do
               python3 - "$f" << 'EOF'
           import json, sys
           d = json.load(open(sys.argv[1]))
@@ -525,6 +558,10 @@ jobs:
           if d['mean_recall_at_k'] < 0.9:
               print("\n⚠️ below the 0.9 recall bar the ANN index's own unit tests require in isolation.")
           EOF
+            fi
+            if [ -f results/knn_sweep/sweep.md ]; then
+              echo ""
+              cat results/knn_sweep/sweep.md
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 

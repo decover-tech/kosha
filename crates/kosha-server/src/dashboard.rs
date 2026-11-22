@@ -77,6 +77,20 @@ pub struct SearchTimings {
     /// turbopuffer's `cache_hit_ratio == 1.0`, which its benchmark polls
     /// before measuring a hot namespace. A result-cache hit is fully cached.
     pub fully_cached: bool,
+    /// kNN posting probes this search made (#384): the same figure as
+    /// `knn_postings` on the `search timing:` log line, so a recall or
+    /// budget sweep can pair each query's recall with its probe depth.
+    /// Only present for a kNN search that ran (absent for a non-kNN query
+    /// and for a result-cache hit), so every other response's `timings`
+    /// object is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub knn_postings: Option<usize>,
+    /// Which rule set this query's global probe cutoff (#384): `budget`,
+    /// `eps`, `floor` or `zero_best`. Only present while the experimental
+    /// `KOSHA_KNN_RELATIVE_CUTOFF_EPS` is on and applied (an unfiltered kNN
+    /// search), so a sweep point that misses the bar can be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub knn_cutoff_rule: Option<&'static str>,
 }
 
 /// One search in a namespace's recent-query ring.

@@ -8332,6 +8332,8 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
                 s3_rounds: hydration.s3_rounds(),
                 s3_bytes: hydration.s3_bytes(),
                 fully_cached: search_fully_cached(&hydration, &phases, knn_degraded),
+                knn_postings: phases.knn_mode.map(|_| phases.knn_postings_probed),
+                knn_cutoff_rule: phases.knn_cutoff_rule.map(|rule| rule.as_str()),
             };
             state.dashboard.record(
                 &ns.0,
@@ -10860,7 +10862,7 @@ fn log_search_timing(
          page_ranged_kb={:.1} page_whole_files={} page_whole_mb={:.1} s3_rounds={} \
          s3_bytes={} postings_gets={} postings_ranged_kb={:.1} postings_whole_files={} \
          postings_whole_mb={:.1} vector_gets={} vector_ranged_kb={:.1} \
-         vector_whole_files={}{}",
+         vector_whole_files={}{}{}",
         ns.0,
         total_ms,
         hydrate_ms,
@@ -10896,6 +10898,14 @@ fn log_search_timing(
         hydration.vectors.ranged_gets,
         hydration.vectors.ranged_bytes as f64 / 1024.0,
         hydration.vectors.whole_files,
+        // #384: only with the experimental relative cutoff on, so the
+        // default line is unchanged.
+        phases
+            .knn_cutoff_rule
+            .map_or_else(String::new, |rule| format!(
+                " knn_cutoff_rule={}",
+                rule.as_str()
+            )),
         request_id(),
     );
 }
@@ -20332,6 +20342,9 @@ mod tests {
         assert_eq!(timings["s3_rounds"], 0, "{first}");
         assert_eq!(timings["s3_bytes"], 0, "{first}");
         assert_eq!(timings["fully_cached"], true, "{first}");
+        // kNN probe depth (#384) is reported only for kNN searches.
+        assert!(timings.get("knn_postings").is_none(), "{first}");
+        assert!(timings.get("knn_cutoff_rule").is_none(), "{first}");
         // The identical repeat is a result-cache hit: still recorded, and
         // fully cached (it read nothing at all).
         let second = search_with_timings(&state);

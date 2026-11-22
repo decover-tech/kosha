@@ -2261,6 +2261,134 @@ fn effective_knn_budget(requested: usize, total_centroids: usize) -> usize {
     requested.max(floor)
 }
 
+/// SPANN-style relative probe cutoff (#384, NeurIPS'21 §3.2.3): probe a
+/// posting only if its rank score is within `(1 + eps)` of the query's
+/// best posting score, but never fewer than `min_probes` postings. The
+/// score is `kosha_segment::centroid_probe_score`, so with
+/// `KOSHA_KNN_PROBE_RADIUS_ALPHA=0` this is exactly SPANN's
+/// `d(q,c) <= (1+eps) * d(q,c1)`; at the default alpha it applies to the
+/// radius-aware lower bound, which is often clamped to 0 for the best
+/// posting (and then only `min_probes` and ties at 0 qualify).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RelativeCutoff {
+    eps: f32,
+    min_probes: usize,
+}
+
+/// `KOSHA_KNN_RELATIVE_CUTOFF_EPS` (#384, experimental): unset (default),
+/// empty, negative or unparseable means OFF and the probe budget is the
+/// fixed corpus-scaled one from [`effective_knn_budget`], as before.
+fn knn_relative_cutoff_eps() -> Option<f32> {
+    static EPS: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *EPS.get_or_init(|| {
+        let raw = std::env::var("KOSHA_KNN_RELATIVE_CUTOFF_EPS").ok();
+        let eps = parse_relative_cutoff_eps(raw.as_deref());
+        if let Some(eps) = eps {
+            eprintln!(
+                "INFO: KOSHA_KNN_RELATIVE_CUTOFF_EPS={eps}: unfiltered kNN probes a \
+                 posting only within (1+eps) of the best posting score, capped by the \
+                 fixed budget (#384, experimental)"
+            );
+        }
+        eps
+    })
+}
+
+fn parse_relative_cutoff_eps(raw: Option<&str>) -> Option<f32> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|eps| eps.is_finite() && *eps >= 0.0)
+}
+
+/// `KOSHA_KNN_RELATIVE_MIN_PROBES` (#384): the fewest postings the relative
+/// cutoff may leave a query with. Unset means the client's
+/// `num_candidates`. Only read when the relative cutoff is on.
+fn knn_relative_min_probes() -> Option<usize> {
+    static MIN: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("KOSHA_KNN_RELATIVE_MIN_PROBES")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+    })
+}
+
+/// Which rule set a query's global probe cutoff when the #384 relative
+/// cutoff is on, so a sweep point that misses the bar can be read: a point
+/// where `floor` or `zero_best` dominates says nothing about `eps`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnnCutoffRule {
+    /// The fixed budget capped it (the relative cutoff admitted more).
+    Budget,
+    /// `(1 + eps) * best` decided it (SPANN's rule proper).
+    Eps,
+    /// The `min_probes` floor decided it (eps was tighter than the floor).
+    Floor,
+    /// The best posting's score was 0 (radius-aware score clamped), so
+    /// `eps` had no effect: the floor and ties at 0 decided it.
+    ZeroBest,
+}
+
+impl KnnCutoffRule {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KnnCutoffRule::Budget => "budget",
+            KnnCutoffRule::Eps => "eps",
+            KnnCutoffRule::Floor => "floor",
+            KnnCutoffRule::ZeroBest => "zero_best",
+        }
+    }
+}
+
+/// The global probe cutoff over every probed posting's rank score `all`
+/// (order is not preserved): the `budget`-th smallest score, or infinity
+/// when there are no more postings than that. With `relative` (#384) the
+/// cutoff is lowered to `(1 + eps) * min(all)` but not below the
+/// `min_probes`-th smallest score; it is never raised above the budget's,
+/// so the fixed budget stays the hard cap on probe depth. The rule that
+/// decided is returned only when `relative` is set.
+fn knn_budget_cutoff(
+    all: &mut [f32],
+    budget: usize,
+    relative: Option<RelativeCutoff>,
+) -> (f32, Option<KnnCutoffRule>) {
+    let cmp = |a: &f32, b: &f32| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal);
+    let nth = |all: &mut [f32], n: usize| -> f32 {
+        // The `n`-th smallest (1-based); infinity past the end.
+        if n == 0 {
+            return f32::NEG_INFINITY;
+        }
+        if n > all.len() {
+            return f32::INFINITY;
+        }
+        *all.select_nth_unstable_by(n - 1, cmp).1
+    };
+    let budget_cutoff = if all.len() <= budget {
+        // The whole namespace has fewer centroids than the budget:
+        // nothing to prune, admit everything.
+        f32::INFINITY
+    } else {
+        nth(all, budget)
+    };
+    let Some(RelativeCutoff { eps, min_probes }) = relative else {
+        return (budget_cutoff, None);
+    };
+    let best = all.iter().copied().fold(f32::INFINITY, f32::min);
+    let floor = nth(all, min_probes.min(all.len()));
+    let eps_cutoff = (1.0 + eps) * best;
+    let relative_cutoff = eps_cutoff.max(floor);
+    let rule = if relative_cutoff >= budget_cutoff {
+        KnnCutoffRule::Budget
+    } else if best <= 0.0 {
+        KnnCutoffRule::ZeroBest
+    } else if floor > eps_cutoff {
+        KnnCutoffRule::Floor
+    } else {
+        KnnCutoffRule::Eps
+    };
+    (relative_cutoff.min(budget_cutoff), Some(rule))
+}
+
 /// Namespace-wide number of filter-passing documents at or below which a
 /// filtered kNN query skips the centroid probe and scores every passing
 /// document's vector exactly (#252). `KOSHA_KNN_EXACT_THRESHOLD`, default
@@ -2385,6 +2513,9 @@ struct KnnPlan {
     /// Filter-passing, undeleted documents across the segments searched;
     /// `None` without a filter.
     filtered_candidates: Option<u64>,
+    /// Which rule set `cutoff` (#384); `None` unless the experimental
+    /// relative cutoff is on and applied to this query.
+    cutoff_rule: Option<KnnCutoffRule>,
 }
 
 /// Flat kNN search: compute cosine similarity against all stored vectors,
@@ -2440,6 +2571,9 @@ pub struct SearchPhaseStats {
     pub knn_mode: Option<KnnMode>,
     /// See `SearchResult::knn_filtered_candidates`.
     pub knn_filtered_candidates: Option<u64>,
+    /// Which rule set the global probe cutoff (#384): `None` unless
+    /// `KOSHA_KNN_RELATIVE_CUTOFF_EPS` is on and applied to this query.
+    pub knn_cutoff_rule: Option<KnnCutoffRule>,
     /// Time spent resolving namespace-level BM25 statistics (issue #246):
     /// one cache lookup when warm, the per-segment `df` pass for terms not
     /// seen yet at this manifest version when cold.
@@ -3121,6 +3255,7 @@ impl Searcher {
             exact_segments,
             mode: Some(mode),
             filtered_candidates,
+            cutoff_rule: None,
         };
 
         if !budgeted {
@@ -3162,17 +3297,20 @@ impl Searcher {
             effective_knn_budget(requested, total_centroids),
             selectivity,
         );
-        if all.len() <= budget {
-            // The whole namespace has fewer centroids than the budget:
-            // nothing to prune, admit everything.
-            plan.cutoff = Some((f32::INFINITY, budget));
-            return Ok(plan);
-        }
-        let idx = budget - 1;
-        all.select_nth_unstable_by(idx, |a, b| {
-            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        plan.cutoff = Some((all[idx], budget));
+        // #384 (experimental, off by default): SPANN-style relative cutoff
+        // for unfiltered queries only — a filtered probe already has its
+        // own widen-and-continue logic (#252) that this must not undercut.
+        let relative = if restricted {
+            None
+        } else {
+            knn_relative_cutoff_eps().map(|eps| RelativeCutoff {
+                eps,
+                min_probes: knn_relative_min_probes().unwrap_or(requested),
+            })
+        };
+        let (cutoff, rule) = knn_budget_cutoff(&mut all, budget, relative);
+        plan.cutoff = Some((cutoff, budget));
+        plan.cutoff_rule = rule;
         Ok(plan)
     }
 
@@ -5849,6 +5987,7 @@ impl Searcher {
         };
         phase_stats.knn_mode = knn_plan.mode;
         phase_stats.knn_filtered_candidates = knn_plan.filtered_candidates;
+        phase_stats.knn_cutoff_rule = knn_plan.cutoff_rule;
 
         // ── BM25 collection statistics (issue #246) ────────────────────
         // Namespace-level by default, so every segment scores with the same
@@ -23442,6 +23581,109 @@ mod filtered_knn_tests {
             24
         );
         assert_eq!(knn_passing_count(None, None, Some(&deleted), 100), 97);
+    }
+
+    /// The pre-#384 cutoff, kept verbatim as the reference the default
+    /// path must reproduce.
+    fn legacy_budget_cutoff(all: &mut [f32], budget: usize) -> f32 {
+        if all.len() <= budget {
+            return f32::INFINITY;
+        }
+        let idx = budget - 1;
+        all.select_nth_unstable_by(idx, |a, b| {
+            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        all[idx]
+    }
+
+    fn admitted(all: &[f32], cutoff: f32) -> usize {
+        all.iter().filter(|d| **d <= cutoff).count()
+    }
+
+    #[test]
+    fn budget_cutoff_without_relative_matches_the_legacy_cutoff() {
+        // Deterministic pseudo-random scores, ties included.
+        let scores: Vec<f32> = (0..997u32)
+            .map(|i| ((i.wrapping_mul(2_654_435_761) >> 20) % 400) as f32 / 400.0)
+            .collect();
+        for budget in [1, 2, 10, 50, 996, 997, 2_000] {
+            let (mut a, mut b) = (scores.clone(), scores.clone());
+            let (cutoff, rule) = knn_budget_cutoff(&mut a, budget, None);
+            assert_eq!(
+                cutoff.to_bits(),
+                legacy_budget_cutoff(&mut b, budget).to_bits(),
+                "budget {budget}"
+            );
+            assert_eq!(rule, None, "no cutoff rule reported when the flag is off");
+        }
+    }
+
+    #[test]
+    fn relative_cutoff_probes_fewer_for_an_easy_query_and_never_more_than_the_budget() {
+        // An "easy" query: one posting much closer than the rest.
+        let mut easy: Vec<f32> = vec![0.10, 0.105, 0.108];
+        easy.extend((0..1_000).map(|i| 0.5 + i as f32 * 1e-4));
+        let relative = Some(RelativeCutoff {
+            eps: 0.1,
+            min_probes: 2,
+        });
+        let (cutoff, rule) = knn_budget_cutoff(&mut easy.clone(), 100, relative);
+        assert_eq!(admitted(&easy, cutoff), 3, "within 10% of 0.10");
+        assert_eq!(rule, Some(KnnCutoffRule::Eps));
+
+        // A "hard" query: scores packed together, so the relative cutoff
+        // admits everything and the fixed budget caps it.
+        let hard: Vec<f32> = (0..1_000).map(|i| 0.40 + i as f32 * 1e-5).collect();
+        let (cutoff, rule) = knn_budget_cutoff(&mut hard.clone(), 100, relative);
+        assert_eq!(admitted(&hard, cutoff), 100, "hard cap = budget");
+        assert_eq!(rule, Some(KnnCutoffRule::Budget));
+
+        // No more postings than the budget: the relative cutoff still prunes.
+        let (cutoff, rule) = knn_budget_cutoff(&mut easy.clone(), 5_000, relative);
+        assert_eq!(admitted(&easy, cutoff), 3);
+        assert_eq!(rule, Some(KnnCutoffRule::Eps));
+
+        // A floor above what eps admits: the floor decides, and says so.
+        let floored = Some(RelativeCutoff {
+            eps: 0.1,
+            min_probes: 10,
+        });
+        let (cutoff, rule) = knn_budget_cutoff(&mut easy.clone(), 100, floored);
+        assert_eq!(admitted(&easy, cutoff), 10);
+        assert_eq!(rule, Some(KnnCutoffRule::Floor));
+    }
+
+    #[test]
+    fn relative_cutoff_keeps_min_probes_when_the_best_score_is_zero() {
+        // Radius-aware scores clamp at 0: (1+eps)*0 = 0 would admit only
+        // the zero-score postings, so min_probes must hold the floor.
+        let all: Vec<f32> = vec![0.0, 0.2, 0.3, 0.4, 0.5, 0.6];
+        let relative = Some(RelativeCutoff {
+            eps: 0.5,
+            min_probes: 4,
+        });
+        let (cutoff, rule) = knn_budget_cutoff(&mut all.clone(), 5, relative);
+        assert_eq!(admitted(&all, cutoff), 4);
+        assert_eq!(rule, Some(KnnCutoffRule::ZeroBest), "eps had no effect");
+        // min_probes above the budget is still capped by the budget.
+        let relative = Some(RelativeCutoff {
+            eps: 0.5,
+            min_probes: 100,
+        });
+        let (cutoff, rule) = knn_budget_cutoff(&mut all.clone(), 5, relative);
+        assert_eq!(admitted(&all, cutoff), 5);
+        assert_eq!(rule, Some(KnnCutoffRule::Budget));
+    }
+
+    #[test]
+    fn relative_cutoff_eps_parse_is_off_by_default() {
+        assert_eq!(parse_relative_cutoff_eps(None), None);
+        assert_eq!(parse_relative_cutoff_eps(Some("")), None);
+        assert_eq!(parse_relative_cutoff_eps(Some("-1")), None);
+        assert_eq!(parse_relative_cutoff_eps(Some("NaN")), None);
+        assert_eq!(parse_relative_cutoff_eps(Some("x")), None);
+        assert_eq!(parse_relative_cutoff_eps(Some(" 0.2 ")), Some(0.2));
+        assert_eq!(parse_relative_cutoff_eps(Some("0")), Some(0.0));
     }
 
     #[test]
