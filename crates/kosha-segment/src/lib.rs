@@ -4879,12 +4879,20 @@ impl<V: Clone> PostingsCache<V> {
     /// hot query terms recur and get admitted on their second lookup;
     /// wildcard blasts pass through without disturbing anything.
     fn admit_on_miss(&self, term_index: usize) -> bool {
+        self.admit_on_miss_within(term_index, POSTINGS_CACHE_MISS_RING)
+    }
+
+    /// [`Self::admit_on_miss`] remembering up to `ring` misses. A caller
+    /// whose single query can miss more keys than the default ring holds
+    /// passes a larger one: otherwise each key is pushed out before the
+    /// next query asks for it again and nothing is ever admitted.
+    fn admit_on_miss_within(&self, term_index: usize, ring: usize) -> bool {
         let mut st = self.state.lock().unwrap();
         if let Some(pos) = st.recent_misses.iter().position(|k| *k == term_index) {
             st.recent_misses.remove(pos);
             return true;
         }
-        if st.recent_misses.len() >= POSTINGS_CACHE_MISS_RING {
+        if st.recent_misses.len() >= ring {
             st.recent_misses.pop_front();
         }
         st.recent_misses.push_back(term_index);
@@ -7432,8 +7440,12 @@ impl SegmentReader {
         // Second-touch admission, same as text postings: one-shot probes
         // (a cold namespace scanned once) pass through without evicting a
         // hot working set; recurring probes get cached on their second
-        // hydration.
-        if self.vector_cache.admit_on_miss(key) {
+        // hydration. The ring holds every posting of the column, because
+        // one query can probe more of them than the default ring (256)
+        // remembers: at 1,610 probes nothing was ever admitted and every
+        // query re-read and re-decoded ~700 MB.
+        let ring = vi.ranges.len().max(POSTINGS_CACHE_MISS_RING);
+        if self.vector_cache.admit_on_miss_within(key, ring) {
             let bytes = decoded.resident_bytes();
             self.vector_cache.insert(key, Arc::clone(&decoded), bytes);
         }
@@ -10511,6 +10523,30 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A query that misses more keys than the ring remembers must still get
+    /// them admitted on its next run when the caller sizes the ring to fit.
+    #[test]
+    fn second_touch_admission_holds_a_probe_set_larger_than_the_default_ring() {
+        let probes = 1_610;
+        let small = PostingsCache::<u8>::new(usize::MAX, None);
+        let sized = PostingsCache::<u8>::new(usize::MAX, None);
+        for k in 0..probes {
+            assert!(!small.admit_on_miss(k));
+            assert!(!sized.admit_on_miss_within(k, probes));
+        }
+        let admitted = |c: &PostingsCache<u8>, ring| {
+            (0..probes)
+                .filter(|k| c.admit_on_miss_within(*k, ring))
+                .count()
+        };
+        assert_eq!(
+            admitted(&small, POSTINGS_CACHE_MISS_RING),
+            0,
+            "default ring forgets every probe"
+        );
+        assert_eq!(admitted(&sized, probes), probes);
     }
 
     #[test]
