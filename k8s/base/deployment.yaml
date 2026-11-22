@@ -77,6 +77,13 @@ spec:
                 secretKeyRef:
                   name: kosha-secret
                   key: bootstrap-api-key
+            # Admin routes (compaction, segment GC) are refused without it.
+            - name: KOSHA_ADMIN_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: kosha-secret
+                  key: admin-api-key
+                  optional: true
             # Pod-to-pod credential for /internal/* routes. Query pods use it
             # to read the ingest pod's unindexed writes for strong-consistency
             # searches (#255); without it they default to eventual

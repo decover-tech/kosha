@@ -128,6 +128,22 @@ spec:
             # evicted, 22 replacements rejected).
             - name: KOSHA_WARMUP_BUDGET_BYTES
               value: "12G"
+            # Decoded vector postings kept per segment: 2 GiB (default 32 MiB).
+            # A compacted segment's postings decode to up to 1.7 GB, and a
+            # semantic query examines hundreds of them, so with the default
+            # nearly every posting was re-read and re-decoded per query. On
+            # 60,000 real vectors scoring 684 postings took 118 ms with the
+            # default and 33 ms with the cache large enough to hold them.
+            # Total residency is still bounded by KOSHA_SEGMENT_LIVE_MAX_BYTES.
+            - name: KOSHA_VECTOR_POSTINGS_CACHE_MAX_BYTES
+              value: "2147483648"
+            # A semantic query examines at least 32% of the namespace's vector
+            # groups (default 5%). Measured on a 489K-chunk matter (5,020
+            # groups, 100 queries against exact neighbours): 5% gives recall@10
+            # 0.82, 16% gives 0.97, 32% gives 0.996 with the top hit right
+            # every time, at 76 ms p50 with the cache above.
+            - name: KOSHA_KNN_BUDGET_FRACTION
+              value: "0.32"
           resources:
             requests:
               cpu: "2"
