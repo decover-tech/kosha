@@ -31,15 +31,32 @@ def pods():
     return [p for p in kubectl("get", "pods", "-o", "name").split() if "loader" not in p]
 
 
+def last_time(path):
+    """Timestamp of the last line already saved for a pod, or None."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 8192))
+            lines = f.read().splitlines()
+        return lines[-1].split(b" ", 1)[0].decode() if lines else None
+    except OSError:
+        return None
+
+
 def follow(out):
     os.makedirs(f"{out}/logs", exist_ok=True)
     tails = {}
     while not os.path.exists(f"{out}/STOP"):
         for pod in pods():
-            if pod not in tails:
-                log = open(f"{out}/logs/{pod.split('/')[-1]}.log", "a")
-                tails[pod] = subprocess.Popen(["kubectl", "-n", NS, "logs", "-f", "--timestamps", "--since=1s", pod],
-                                              stdout=log, stderr=subprocess.DEVNULL)
+            # A stream ends when the connection drops (tunnel, laptop sleep):
+            # restart it from the last saved line so the gap is filled.
+            if pod not in tails or tails[pod].poll() is not None:
+                path = f"{out}/logs/{pod.split('/')[-1]}.log"
+                since = last_time(path)
+                tails[pod] = subprocess.Popen(
+                    ["kubectl", "-n", NS, "logs", "-f", "--timestamps",
+                     f"--since-time={since}" if since else "--since=1s", pod],
+                    stdout=open(path, "a"), stderr=subprocess.DEVNULL)
         time.sleep(15)
     for tail in tails.values():
         tail.terminate()
@@ -55,6 +72,11 @@ def finish(out, samples_path):
     time.sleep(16)
     open(f"{out}/events.txt", "w").write(kubectl("get", "events", "--sort-by=.lastTimestamp"))
     open(f"{out}/pods.txt", "w").write(kubectl("get", "pods", "-o", "wide") + kubectl("top", "pods"))
+    # Which hardware each pod ran on, and why a node went away if one did.
+    open(f"{out}/nodes.txt", "w").write(
+        kubectl("get", "nodes", "-L", "node.kubernetes.io/instance-type,karpenter.sh/capacity-type,karpenter.sh/nodepool")
+        + kubectl("get", "events", "-A", "--field-selector", "involvedObject.kind=Node", "--sort-by=.lastTimestamp")
+        + kubectl("get", "events", "-A", "--field-selector", "involvedObject.kind=NodeClaim", "--sort-by=.lastTimestamp"))
     open(f"{out}/manifests.txt", "w").write(kubectl(
         "exec", "postgres-0", "--", "psql", "-U", "postgres", "-d", "kosha", "-Atc",
         "select namespace_id, version, updated_at from kosha.manifests order by 1", namespace="decoverai-services"))
@@ -97,10 +119,11 @@ def finish(out, samples_path):
                 pod["ms"][s["area"]].append(s["ms"])
                 slow.append((s["ms"], s["area"], s["phase"], log))
             if s["area"].startswith("knn") and "knn_mode" in log:
-                knn[log["pod"]][f"mode {log['knn_mode']}"] += 1
-                knn[log["pod"]]["groups examined"] += int(log.get("knn_postings", 0))
-                knn[log["pod"]]["vectors scanned exactly"] += int(log.get("knn_exact_vectors", 0))
-                knn[log["pod"]]["queries"] += 1
+                who = f"{log['pod'][-5:]}, {s['area']}"
+                knn[who][f"mode {log['knn_mode']}"] += 1
+                knn[who]["groups examined"] += int(log.get("knn_postings", 0))
+                knn[who]["vectors scanned exactly"] += int(log.get("knn_exact_vectors", 0))
+                knn[who]["queries"] += 1
     md = [f"# What the servers did: {total} requests, {total - unmatched} matched to a pod log line", ""]
     md += ["| Pod | Started | Requests | Errors | Word p50/p95 | Phrase p50/p95 | Semantic p50/p95 |", "|---|---|---|---|---|---|---|"]
     for name, pod in sorted(by_pod.items()):
@@ -109,11 +132,11 @@ def finish(out, samples_path):
                   f"{cell('word')} | {cell('phrase')} | {cell('knn')} |")
     md += ["", "Errors by pod and reason", ""]
     md += [f"- {name[-5:]}: {n} × {reason}" for name, pod in sorted(by_pod.items()) for reason, n in pod["errors"].most_common(4)] or ["- none"]
-    md += ["", "Semantic queries by pod", ""]
+    md += ["", "Semantic queries by pod and area", ""]
     for name, c in sorted(knn.items()):
         q = max(1, c["queries"])
         modes = ", ".join(f"{k[5:]} ×{v}" for k, v in c.items() if k.startswith("mode "))
-        md.append(f"- {name[-5:]}: {c['queries']} queries; modes {modes}; {c['groups examined'] / q:.0f} groups and "
+        md.append(f"- {name}: {c['queries']} queries; modes {modes}; {c['groups examined'] / q:.0f} groups and "
                   f"{c['vectors scanned exactly'] / q:.0f} exactly-scanned vectors per query")
     md += ["", "Ten slowest answered requests", "", "| ms | Area | Phase | Pod | Fetched MB | Queue ms | Scoring ms | Page ms |", "|---|---|---|---|---|---|---|---|"]
     for ms, area, phase, log in sorted(slow, key=lambda r: -r[0])[:10]:

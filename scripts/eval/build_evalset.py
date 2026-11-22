@@ -17,12 +17,17 @@ OpenSearch-style body, exactly what the backend sends. `expect` holds any of:
   value        {"agg": name, "value": n} for a metric aggregation
   groups       number of distinct documents on a collapsed page
   ordered_ids  the exact first hits, in order
-  neighbours   exact nearest neighbours [[id, cosine], ...], best first
+  neighbours   exact nearest neighbours [[id, cosine], ...], best first: the
+               top 30 plus every chunk tied with the 10th (duplicate and
+               padded chunks share a vector). "ambiguous": true marks a case
+               with more ties than are stored; it is timed but not scored
 Tier "quick" marks the small subset run after every change.
 
 Text rules (the contract being tested): split on whitespace, trim ASCII
-punctuation from both ends, lowercase; a word matches a chunk if it is in
-any string field; a phrase must sit inside one field.
+punctuation from both ends, lowercase; a word or phrase matches a chunk when
+it is in the field the query names (`content`), as in OpenSearch. Sets up to
+v2 used "in any string field", which is what Kosha did before per-field
+indexes; `in_any_field` keeps that count for reference.
 """
 import argparse
 import collections
@@ -49,7 +54,7 @@ QUICK = {"matter": 9, "word": 10, "word_per_document": 5, "word_grouped": 5, "an
 ap = argparse.ArgumentParser()
 ap.add_argument("export_dir")
 ap.add_argument("out_dir")
-ap.add_argument("--version", default="v1")
+ap.add_argument("--version", default="v3")
 args = ap.parse_args()
 os.makedirs(args.out_dir, exist_ok=True)
 random.seed(11)
@@ -135,12 +140,15 @@ q = quantiles(bates, (0.1, 0.4, 0.5, 0.9))
 BATES_RANGES = [(q[0], q[1]), (q[2], q[3])] if q else []
 q = quantiles(sent, (0.1, 0.5, 0.5, 0.95))
 SENT_RANGES = [(q[0], q[1]), (q[2], q[3])] if q else []
+# A matter whose values cluster (every page 0, say) yields identical ranges;
+# each range must be counted once.
+PAGE_RANGES, BATES_RANGES, SENT_RANGES = (list(dict.fromkeys(r)) for r in (PAGE_RANGES, BATES_RANGES, SENT_RANGES))
 print(f"matter {matter}: {len(WORDS)} words, {len(PHRASES)} phrases, {len(DOCS)} docs, {len(KNN)} knn", flush=True)
 
 # ── One pass over every record ─────────────────────────────────────────────
 wset, ptoks = set(WORDS), {p: p.split() for p in PHRASES}
 word_ids = {w: [] for w in WORDS}
-word_content = collections.Counter()  # how many of those are in `content`
+word_any_field = collections.Counter()  # for reference: chunks with the word in any string field
 word_docs = {w: collections.Counter() for w in WORDS}
 word_format = {(w, f): [] for w in WORDS[:10] for f in FORMATS[:1]}
 phrase_ids = {p: [] for p in PHRASES}
@@ -149,7 +157,10 @@ counts = collections.defaultdict(collections.Counter)  # field -> value -> chunk
 range_counts = collections.Counter()
 all_docs, total, n_vec = set(), 0, 0
 vec_ids, vec_format = [], []
-capacity = 600000
+# Upper bound on vectors held for the exact-neighbour pass: one per 5 KB of
+# compressed export (measured 7-8 KB per chunk with an embedding). The scratch
+# file is sparse, so the bound costs disk only for vectors actually written.
+capacity = int(sum(os.path.getsize(f) for f in files) / 5000) + 1000
 vecs = np.lib.format.open_memmap(os.path.join(args.out_dir, "vectors.tmp.npy"), mode="w+", dtype=np.float32, shape=(capacity, DIM))
 knn_query = {}
 sha = hashlib.sha256()
@@ -160,19 +171,21 @@ for path in files:
         total += 1
         doc = src["documentId"]
         all_docs.add(doc)
-        fields = [tokens(v) for k, v in src.items() if isinstance(v, str)]
-        content = set(tokens(src.get("content") or ""))
-        anyset = set().union(*fields) if fields else set()
+        content_tokens = tokens(src.get("content") or "")
+        content = set(content_tokens)
+        elsewhere = set().union(*(tokens(v) for k, v in src.items() if k != "content" and isinstance(v, str)))
         fmts = src.get("fileFormats") or []
-        for w in wset & anyset:
+        for w in wset & (content | elsewhere):
+            word_any_field[w] += 1
+            if w not in content:
+                continue
             word_ids[w].append(cid)
             word_docs[w][doc] += 1
-            word_content[w] += w in content
             for f in fmts:
                 if (w, f) in word_format:
                     word_format[(w, f)].append(cid)
         for p, want in ptoks.items():
-            if want[0] in anyset and any(has_phrase(ft, want) for ft in fields):
+            if want[0] in content and has_phrase(content_tokens, want):
                 phrase_ids[p].append(cid)
         if doc in doc_pages:
             doc_pages[doc].append((src.get("pageNumber") or 0, cid))
@@ -209,7 +222,10 @@ Q = np.stack([v / (np.linalg.norm(v) or 1.0) for _, v in knn_cases])
 in_format = np.array(vec_format, dtype=bool)
 
 
-def all_neighbours(queries, mask=None, k=30):
+TIE_SCAN = 500  # how deep to look for chunks tied with the 10th neighbour
+
+
+def all_neighbours(queries, mask=None, k=TIE_SCAN):
     best_sim = np.full((len(queries), k), -2.0, dtype=np.float32)
     best_row = np.zeros((len(queries), k), dtype=np.int64)
     for a in range(0, n_vec, 50000):
@@ -223,8 +239,12 @@ def all_neighbours(queries, mask=None, k=30):
         best_sim, best_row = np.take_along_axis(sims, keep, 1), np.take_along_axis(rows, keep, 1)
     order = np.argsort(-best_sim, axis=1)
     best_sim, best_row = np.take_along_axis(best_sim, order, 1), np.take_along_axis(best_row, order, 1)
-    return [[[vec_ids[r], round(float(x), 6)] for r, x in zip(rows, sims) if x > -2.0]
-            for rows, sims in zip(best_row, best_sim)]
+    found = []
+    for rows, sims in zip(best_row, best_sim):
+        ranked = [[vec_ids[r], round(float(x), 6)] for r, x in zip(rows, sims) if x > -2.0]
+        tied = sum(1 for _, x in ranked if x >= ranked[min(9, len(ranked) - 1)][1] - 1e-5)
+        found.append((ranked[: max(30, tied)], tied >= len(ranked) and len(ranked) == k))
+    return found
 
 
 exact = all_neighbours(Q)
@@ -280,7 +300,7 @@ for hot in (True, False):
 
 for w in WORDS:
     ref = case("word", {"size": 20, "track_total_hits": True, "_source": ["documentId"], "query": scoped(must=match(w))},
-               total=len(word_ids[w]), in_content_only=word_content[w], **ids_or_none(word_ids[w]))
+               total=len(word_ids[w]), in_any_field=word_any_field[w], **ids_or_none(word_ids[w]))
     top = top_buckets(word_docs[w])
     case("word_per_document", {"size": 0, "query": scoped(must=match(w)),
                                "aggs": {"per_document": {"terms": {"field": "documentId", "size": 1000}}}},
@@ -316,10 +336,15 @@ def knn_body(vector, knn_filter):
         "vector": [float(x) for x in vector], "k": 30, "filter": knn_filter}}}}
 
 
+def knn_case(area, cid, vector, knn_filter, found):
+    neighbours, ambiguous = found
+    case(area, knn_body(vector, knn_filter), neighbours=neighbours, query_chunk=cid, **({"ambiguous": True} if ambiguous else {}))
+
+
 for (cid, vector), found in zip(knn_cases, exact):
-    case("knn", knn_body(vector, M), neighbours=found, query_chunk=cid)
+    knn_case("knn", cid, vector, M, found)
 for (cid, vector), found in zip(knn_cases, exact_in_format):
-    case("knn_filtered", knn_body(vector, scoped({"term": {"fileFormats": FORMATS[0]}})), neighbours=found, query_chunk=cid)
+    knn_case("knn_filtered", cid, vector, scoped({"term": {"fileFormats": FORMATS[0]}}), found)
 
 with gzip.open(os.path.join(args.out_dir, "cases.jsonl.gz"), "wt") as fh:
     for c in cases:
@@ -328,7 +353,7 @@ manifest = {
     "matter": matter, "version": args.version, "built_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "source": {"files": len(files), "fingerprint": sha.hexdigest()},
     "chunks": total, "documents": len(all_docs), "chunks_with_vector": n_vec,
-    "text_rules": "whitespace split; trim ASCII punctuation; lowercase; word in any string field; phrase within one field",
+    "text_rules": "whitespace split; trim ASCII punctuation; lowercase; a word or phrase matches in the queried field (content)",
     "cases": dict(seen), "quick_cases": sum(c["tier"] == "quick" for c in cases), "id_cap": ID_CAP,
 }
 json.dump(manifest, open(os.path.join(args.out_dir, "manifest.json"), "w"), indent=1)
