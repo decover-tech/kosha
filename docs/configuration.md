@@ -401,10 +401,20 @@ for), `snapshot_without_storage`, `deleted` (a deleted namespace, #347, whose pr
 last snapshots are still in the window), `deleted_with_storage` (objects remain under a deleted
 namespace's prefix; `deletion` carries the record), `snapshot_after_deletion` (a deleted namespace
 snapshotted again in an hour that began after its deletion: a writer is still metering it) and
-`empty`. Everything but `match`, `deleted` and `empty` is out of tolerance. `control_plane` says
-whether the namespace is `live`, `deleted` (a deletion record covers it) or `unknown`. Deleting a
-branch and `migrate-namespace` write no deletion record, so such a namespace reads as `unknown`
-with `snapshot_without_storage` until its last snapshot is older than the window. Prefixes the control
+`empty`, plus `removed` and `held_by_branch` (below). Everything but `match`, `deleted`, `empty`,
+`removed` and `held_by_branch` is out of tolerance. `control_plane` says whether the namespace is
+`live`, `deleted` (a deletion record covers it) or `unknown`.
+
+Deleting a branch and `migrate-namespace` write no deletion record, so such a namespace reads as
+`unknown`. It is not a fault: its last snapshots stay inside the window for a while, and deleting a
+branch keeps, under the deleted branch's prefix, the segments a descendant branch inherited from
+it. An `unknown` namespace is therefore `removed` when its prefix is empty and `held_by_branch`
+when every object under it is still listed by a branch's manifest (`referenced_unmetered_bytes`;
+do not delete such a prefix by hand), provided its latest snapshot, if any, is stamped with an
+earlier hour than the current one. A snapshot from the current hour says a writer may still be
+metering it, and the row is judged like any other (`snapshot_without_storage`, `mismatch`); so is
+one with orphaned objects (`storage_without_snapshot`). A namespace removed this way between the
+top of the hour and the run is reported once for that reason. Prefixes the control
 plane does not list are found by listing the storage root and each tenant's directory; at most
 1,000 of them get a row. Top-level names starting with `_` or `.` that are not namespaces (`_wal`,
 `_usage`, `_warmset`) are named in `skipped_prefixes` and not listed.

@@ -31,7 +31,17 @@
 //!
 //! Storage that belongs to no namespace the control plane knows is reported
 //! too, per `<tenant>/<name>` prefix, together with the deletion record
-//! (#347) that explains it when there is one.
+//! (#347) that explains it when there is one. Its objects are classed the
+//! same way, with no manifest of its own: what a branch's manifest still
+//! lists is `referenced_unmetered` (deleting a branch keeps the segments a
+//! descendant branch inherited from it, under the deleted branch's prefix),
+//! everything else is orphaned.
+//!
+//! Deleting a branch and `migrate-namespace` remove a namespace without a
+//! deletion record. Such a namespace passes as `removed` (nothing under its
+//! prefix) or `held_by_branch` (only objects a branch still lists) unless
+//! its latest snapshot is stamped with the current hour: only that says a
+//! writer may still be metering it.
 //!
 //! # Cost and memory
 //!
@@ -42,7 +52,7 @@
 //! the storage root and of every tenant prefix to find what is not known.
 
 use super::*;
-use kosha_control::usage::{meter, UsageStore};
+use kosha_control::usage::{meter, UsageStore, HOUR_MS};
 use kosha_core::branch::References;
 use kosha_core::deletion::{DeletionFilter, DeletionRecord, DeletionScope, DeletionState};
 use kosha_core::gc::deletion_generation_of;
@@ -492,11 +502,27 @@ pub(crate) enum Status {
     Deleted,
     /// A namespace with no objects and no snapshot.
     Empty,
+    /// A namespace the control plane no longer lists and no deletion record
+    /// covers (a deleted branch, the source of `migrate-namespace`), with
+    /// an empty prefix and a last snapshot from an earlier hour: it is
+    /// gone and its snapshots are ageing out of the window.
+    Removed,
+    /// A prefix the control plane no longer lists whose every object a
+    /// branch's manifest still lists (what deleting a branch keeps for its
+    /// descendants), and no snapshot from the current hour.
+    HeldByBranch,
 }
 
 impl Status {
     fn within_tolerance(self) -> bool {
-        matches!(self, Status::Match | Status::Deleted | Status::Empty)
+        matches!(
+            self,
+            Status::Match
+                | Status::Deleted
+                | Status::Empty
+                | Status::Removed
+                | Status::HeldByBranch
+        )
     }
 }
 
@@ -810,10 +836,39 @@ fn scan_root(
     Ok(storage)
 }
 
-/// Everything under a prefix no manifest covers: all of it is orphaned.
-fn scan_unknown(prefix: &str, inventory: &dyn ObjectInventory) -> Result<Storage, KoshaError> {
+/// Everything under a prefix no manifest covers. A branch's manifest can
+/// still list objects here: deleting a branch keeps, under its own prefix,
+/// the segments and bitmaps a descendant branch inherited from it
+/// (`AppState::delete_branch`). Those are referenced; the rest is orphaned.
+fn scan_unknown(
+    prefix: &str,
+    branches: &References,
+    inventory: &dyn ObjectInventory,
+) -> Result<Storage, KoshaError> {
+    // No manifest: nothing is owned or retired, so `classify` only asks
+    // the branch references.
+    let root = Member::of(&NamespaceId(prefix.to_string()), None);
+    let dir = format!("{prefix}/");
     let mut storage = Storage::default();
-    inventory.walk(prefix, &mut |_, size| storage.add(Class::Untracked, size))?;
+    inventory.walk(prefix, &mut |path, size| {
+        let Some(rest) = path.strip_prefix(&dir) else {
+            return;
+        };
+        let class = match rest.split_once('/') {
+            // A shard of the namespace that was here.
+            Some((first, after))
+                if kosha_core::sharding::shard_index_of(&NamespaceId(format!(
+                    "{prefix}/{first}"
+                )))
+                .is_some() =>
+            {
+                Member::of(&NamespaceId(format!("{prefix}/{first}")), None)
+                    .classify(branches, after)
+            }
+            _ => root.classify(branches, rest),
+        };
+        storage.add(class, size);
+    })?;
     Ok(storage)
 }
 
@@ -854,6 +909,16 @@ fn judge(
         (difference, options.allowed(storage.referenced_bytes, bytes))
     });
     let has_storage = storage.objects > 0;
+    // A namespace can leave the control plane without a deletion record
+    // (branch deletion, `migrate-namespace`). Its last snapshots stay in
+    // the window for a while and a descendant branch can keep objects under
+    // its prefix; neither is a fault. What would be one is a writer that
+    // still meters it, and that shows as a snapshot stamped with the
+    // current hour, so only an earlier one (or none) is passed here.
+    let hour_start_ms = options.now_ms / HOUR_MS * HOUR_MS;
+    let left_quietly =
+        control_plane == ControlPlane::Unknown && snapshot.is_none_or(|(at, _)| at < hour_start_ms);
+    let only_branch_held = has_storage && storage.objects == storage.referenced_unmetered_objects;
     // A snapshot is stamped with the start of its hour, so one taken in the
     // hour of the deletion (before it) is never later than the request.
     let snapshot_after_deletion = matches!(
@@ -864,6 +929,8 @@ fn judge(
         (ControlPlane::Deleted, _) if has_storage => Status::DeletedWithStorage,
         (ControlPlane::Deleted, _) if snapshot_after_deletion => Status::SnapshotAfterDeletion,
         (ControlPlane::Deleted, _) => Status::Deleted,
+        _ if left_quietly && only_branch_held => Status::HeldByBranch,
+        (_, Some(_)) if left_quietly && !has_storage => Status::Removed,
         (_, None) if has_storage => Status::StorageWithoutSnapshot,
         (_, None) => Status::Empty,
         (_, Some((difference, allowed))) if difference.unsigned_abs() <= allowed => Status::Match,
@@ -1059,7 +1126,8 @@ pub(crate) fn reconcile(
     }
     for (tenant, namespace) in unknown {
         let prefix = prefix_of(&tenant, &namespace);
-        let storage = scan_unknown(&prefix, inventory).map_err(|e| listing_error(&prefix, e))?;
+        let storage =
+            scan_unknown(&prefix, &branches, inventory).map_err(|e| listing_error(&prefix, e))?;
         let snapshot = snapshots.remove(&(tenant.clone(), namespace.clone()));
         if storage.objects == 0 && snapshot.is_none() {
             continue;
