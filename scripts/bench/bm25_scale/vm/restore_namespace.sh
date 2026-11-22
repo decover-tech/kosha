@@ -17,8 +17,16 @@
 # for KOSHA_API_KEY) whichever form the snapshot has, so clients keep
 # addressing it by its bare name.
 #
+# Reused VM (see snapshot_cache.sh): the local cache and the bench bucket
+# objects are kept when they were restored from this exact snapshot
+# identity (name + ETag/LastModified of its pg dump), so a rerun does not
+# re-download up to ~249GB. Any mismatch (other snapshot, same name
+# re-created, no marker) wipes them first. KEEP_LOCAL_CACHE=0 forces the
+# local wipe even on a match.
+#
 # Usage: ./restore_namespace.sh <namespace> [snapshot-name]
 set -euo pipefail
+. "$(dirname "$0")/snapshot_cache.sh"
 
 NS="${1:?usage: restore_namespace.sh <namespace> [snapshot-name]}"
 NAME="${2:-$NS}"
@@ -29,6 +37,15 @@ SNAP="s3://decoverai-bench-corpus-cache/snapshots/$NAME"
 API_KEY="${KOSHA_API_KEY:-sk-bench}"
 
 aws s3 ls "$SNAP/pg-kosha.sql.gz" >/dev/null || { echo "no snapshot at $SNAP"; exit 1; }
+IDENTITY="$(snapshot_identity "$NAME")" || { echo "::error::cannot read the identity of $SNAP"; exit 1; }
+KEEP_LOCAL=0
+if [ "${KEEP_LOCAL_CACHE:-1}" = 1 ] && marker_matches local "$NS" "$IDENTITY"; then KEEP_LOCAL=1; fi
+KEEP_BUCKET=0
+marker_matches bucket "$NS" "$IDENTITY" && KEEP_BUCKET=1
+echo "SNAPSHOT-IDENTITY $IDENTITY (keep local cache: $KEEP_LOCAL, keep bucket objects: $KEEP_BUCKET)"
+# Invalidate before touching anything; rewritten only on success below.
+marker_clear local "$NS"
+marker_clear bucket "$NS"
 
 # Pre-#262 snapshots store segments under the bare name; newer ones under
 # the scoped id. Either way they land at the scoped id in the bench bucket.
@@ -38,7 +55,14 @@ else
   SRC="$SNAP/segments/$NS"
 fi
 echo "restoring '$NS' as '$SCOPED' from $SRC"
+if [ "$KEEP_BUCKET" = 0 ]; then
+  # A different snapshot of this namespace may be in the bucket (reused
+  # stack). sync neither deletes extra objects nor reliably replaces
+  # same-size ones, and segment ids repeat across rebuilds: start empty.
+  aws s3 rm "s3://$SEG_BUCKET/segments/$SCOPED/" --recursive --only-show-errors
+fi
 aws s3 sync "$SRC" "s3://$SEG_BUCKET/segments/$SCOPED" --no-progress --copy-props none
+marker_write bucket "$NS" "$IDENTITY"
 
 sudo docker start pg >/dev/null 2>&1 || true
 until sudo docker exec pg pg_isready -U postgres >/dev/null 2>&1; do sleep 2; done
@@ -64,11 +88,17 @@ ROWS="$(sudo docker exec pg psql -U postgres -tA kosha \
   -c "SELECT count(*) FROM kosha.manifests WHERE namespace_id = '$SCOPED'")"
 [ "$ROWS" = "1" ] || { echo "::error::no manifest row for '$SCOPED' after restore"; exit 1; }
 
-# Fresh local store + server restart: boot-restore reads the manifests,
-# warmup (if configured for $SCOPED) hydrates before /readyz goes green.
+# Server restart: boot-restore reads the manifests, warmup (if configured
+# for $SCOPED) hydrates before /readyz goes green. The local store is
+# wiped unless it already holds exactly this snapshot.
 sudo docker stop kosha >/dev/null 2>&1 || true
 sudo rm -rf /var/cache/kosha-placeholder 2>/dev/null || true
-sudo rm -rf /data/kosha/data/* 2>/dev/null || true
+if [ "$KEEP_LOCAL" = 1 ]; then
+  echo "LOCAL-CACHE-KEPT $IDENTITY ($(sudo du -sh "$KOSHA_LOCAL_DATA" 2>/dev/null | cut -f1) local)"
+else
+  wipe_local_cache
+  echo "LOCAL-CACHE-WIPED"
+fi
 sudo docker start kosha >/dev/null
 until curl -sf http://127.0.0.1:8080/healthz >/dev/null; do sleep 3; done
 
@@ -85,4 +115,5 @@ case "$STATS_SEGMENTS" in
   "0 segments"*|"stats unavailable") echo "::error::restored namespace '$NS' is not visible to tenant '$TENANT'"; exit 1 ;;
 esac
 
+marker_write local "$NS" "$IDENTITY"
 echo "RESTORE-COMPLETE $NAME — server up; wait on /readyz for warmup before benching"

@@ -5,9 +5,26 @@
 # serialized server-side load — the 10M vector corpus went from ~6h of
 # /index requests to roughly total_build_cpu / cores.
 #
-# Usage: [MAX_DOCS=N] ./build_and_import.sh <namespace> [--with-embeddings]
+# Usage: [MAX_DOCS=N] [SNAPSHOT_NAME=name] ./build_and_import.sh <namespace> [--with-embeddings]
 #   ./build_and_import.sh msmarco-10m-vec --with-embeddings
 #   MAX_DOCS=1000000 ./build_and_import.sh msmarco-1m   # first 1M docs
+#   SNAPSHOT_NAME=msmarco-10m-vec-sidecar ./build_and_import.sh msmarco-10m-vec --with-embeddings
+#
+# SNAPSHOT_NAME (default: the namespace) names the snapshot this writes;
+# restore it with restore_namespace.sh <namespace> <snapshot-name>. An
+# existing snapshot is never overwritten unless SNAPSHOT_OVERWRITE=1:
+# the build would otherwise silently replace a corpus other runs restore.
+#
+# Vectors: kosha-build-segments writes through SegmentWriter, whose vector
+# store mode follows KOSHA_VECTOR_STORE (unset = sidecar), so vectors land
+# in the binary doc_vectors.bin sidecar, not inlined as JSON in
+# doc_store.bin. The builder container does not set the variable.
+#
+# The namespace's previous objects in the bench bucket and the server
+# local cache are dropped before the new segments go in: offline segment
+# ids are <ns>-offline-NNNNNN, the same on every rebuild, so leftovers of
+# an earlier build or restore of this namespace would be read as the new
+# ones (see snapshot_cache.sh).
 #
 # Tenant scoping (#262): clients address <namespace>, the server stores it
 # as <tenant>/<namespace> (sk-bench is tenant "default") and S3 keys embed
@@ -21,8 +38,10 @@
 # toolchain + protoc; shares its cached layers), so the VM needs no Rust
 # install and the binary never runs against the host glibc.
 set -euo pipefail
+. "$(dirname "$0")/snapshot_cache.sh"
 
-NS="${1:?usage: [MAX_DOCS=N] build_and_import.sh <namespace> [--with-embeddings]}"
+NS="${1:?usage: [MAX_DOCS=N] [SNAPSHOT_NAME=name] build_and_import.sh <namespace> [--with-embeddings]}"
+SNAPSHOT_NAME="${SNAPSHOT_NAME:-$NS}"
 WITH_EMB="${2:-}"
 MAX_DOCS="${MAX_DOCS:-0}"
 TENANT="${KOSHA_TENANT:-default}"
@@ -31,6 +50,12 @@ TXT_CACHE=s3://decoverai-bench-corpus-cache/msmarco-10m
 EMB_CACHE=s3://decoverai-bench-corpus-cache/msmarco-10m-emb
 SEG_BUCKET="${KOSHA_S3_BUCKET:-decoverai-bench-kosha-segments}"
 ADMIN_KEY="${KOSHA_ADMIN_API_KEY:-sk-bench-admin}"
+
+if [ "${SNAPSHOT_OVERWRITE:-0}" != 1 ] && \
+   aws s3 ls "s3://$SNAPSHOT_CACHE_BUCKET/snapshots/$SNAPSHOT_NAME/pg-kosha.sql.gz" >/dev/null 2>&1; then
+  echo "::error::snapshot $SNAPSHOT_NAME already exists; refusing to overwrite it (SNAPSHOT_OVERWRITE=1 to force)"
+  exit 1
+fi
 
 sudo mkdir -p /data/corpus-txt /data/corpus-emb /data/segments-out
 sudo chown -R "$(id -u):$(id -g)" /data/corpus-txt /data/corpus-emb /data/segments-out
@@ -55,8 +80,21 @@ sudo docker run --rm -v /data:/data kosha-builder:bench sh -c "
 echo "BUILD-COMPLETE $NS (max_docs=$MAX_DOCS)"
 
 echo "uploading segments..."
+marker_clear bucket "$NS"
+aws s3 rm "s3://$SEG_BUCKET/segments/$SCOPED/" --recursive --only-show-errors
 aws s3 sync "/data/segments-out/$NS" "s3://$SEG_BUCKET/segments/$SCOPED" --no-progress
 echo "UPLOAD-COMPLETE"
+# The bucket (and, below, the snapshot) holds the build now; the local
+# copy is only disk pressure for the restore that follows.
+sudo rm -rf "/data/segments-out/$NS"
+
+# Drop local files of any earlier version of this namespace before the
+# server sees the new manifest.
+sudo docker stop kosha >/dev/null
+wipe_local_cache
+sudo docker start kosha >/dev/null
+for i in $(seq 60); do curl -sf http://127.0.0.1:8080/healthz >/dev/null && break; sleep 3
+  [ "$i" -eq 60 ] && { echo "::error::kosha /healthz never responded after restart"; exit 1; }; done
 
 curl -sf -X POST http://127.0.0.1:8080/v1/admin/import-namespace \
   -H "Authorization: Bearer $ADMIN_KEY" -H "Content-Type: application/json" \
@@ -65,5 +103,10 @@ echo
 grep -q '"segments"' /tmp/import_result.json || { echo IMPORT-FAILED; exit 1; }
 echo "IMPORT-COMPLETE"
 
-"$(dirname "$0")/snapshot_namespace.sh" "$SCOPED" "$NS"
-echo "BUILD-AND-IMPORT-COMPLETE"
+"$(dirname "$0")/snapshot_namespace.sh" "$SCOPED" "$SNAPSHOT_NAME"
+# Bucket and local cache now derive from exactly this snapshot: a restore
+# of it right after keeps both instead of re-copying them.
+IDENTITY="$(snapshot_identity "$SNAPSHOT_NAME")"
+marker_write bucket "$NS" "$IDENTITY"
+marker_write local "$NS" "$IDENTITY"
+echo "BUILD-AND-IMPORT-COMPLETE $NS -> snapshot $SNAPSHOT_NAME"

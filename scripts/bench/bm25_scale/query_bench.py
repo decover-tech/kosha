@@ -90,6 +90,34 @@ def payload_for(namespace: str, query_text: str, topk: int, qidx: int = 0) -> di
     return payload
 
 
+def load_queries(path: Path) -> list[str]:
+    """Non-empty lines of a queries file, in order."""
+    queries = [l.strip() for l in path.read_text().splitlines() if l.strip()]
+    if not queries:
+        raise SystemExit(f"no queries in {path}")
+    return queries
+
+
+def load_knn_vectors(path: Path, n_queries: int, dim: int = 1024) -> list[list[float]]:
+    """queries_emb.f32 (dim-float32 records aligned with the queries file)."""
+    import array as _array
+
+    raw = path.read_bytes()
+    if len(raw) % (dim * 4) != 0:
+        raise SystemExit(f"{path} is not a whole number of {dim}-float records")
+    vecs = []
+    for off in range(0, len(raw), dim * 4):
+        a = _array.array("f")
+        a.frombytes(raw[off : off + dim * 4])
+        vecs.append(list(a))
+    if len(vecs) != n_queries:
+        raise SystemExit(
+            f"{len(vecs)} query embeddings vs {n_queries} queries — "
+            "misaligned inputs, refusing to run"
+        )
+    return vecs
+
+
 def run_query(
     session, host, namespace, headers, query_text, topk, timeout,
     results, lock, errors, hit_counts, degraded_counts, qidx=0,
@@ -206,27 +234,10 @@ def main() -> None:
     NO_CACHE = args.no_cache
     SERVER_TIMINGS = args.server_timings
 
-    queries = [l.strip() for l in args.queries_file.read_text().splitlines() if l.strip()]
-    if not queries:
-        raise SystemExit(f"no queries in {args.queries_file}")
+    queries = load_queries(args.queries_file)
 
     if args.knn_embeddings:
-        import array as _array
-
-        DIM = 1024
-        raw = args.knn_embeddings.read_bytes()
-        if len(raw) % (DIM * 4) != 0:
-            raise SystemExit(f"{args.knn_embeddings} is not a whole number of {DIM}-float records")
-        vecs = []
-        for off in range(0, len(raw), DIM * 4):
-            a = _array.array("f")
-            a.frombytes(raw[off : off + DIM * 4])
-            vecs.append(list(a))
-        if len(vecs) != len(queries):
-            raise SystemExit(
-                f"{len(vecs)} query embeddings vs {len(queries)} queries — "
-                "misaligned inputs, refusing to run"
-            )
+        vecs = load_knn_vectors(args.knn_embeddings, len(queries))
         KNN_VECS = vecs
         KNN_FIELD = args.knn_field
         KNN_NUM_CANDIDATES = args.knn_num_candidates

@@ -18,9 +18,20 @@
 #   INFRA_REPO_TOKEN
 #     read token for the infra repo (terraform lives there).
 #
+# Warm gate (input warm_gate):
+#   queries (default): turbopuffer protocol. The server starts with no boot
+#     preload, warm_gate.py warms the namespace with the workload queries
+#     until 3 consecutive responses are fully cached, and only warm phases
+#     are measured (warmup time is logged, never measured). On a reused VM
+#     the local cache of the same snapshot is kept, so warmup is ~minutes.
+#   preload: the earlier protocol: KOSHA_WARMUP_NAMESPACES boot preload
+#     gated on /readyz after a local wipe, then cold + warm phases.
+#
 # Teardown policy mirrors the bench standing rule: destroy on success;
 # on failure the stack is KEPT for debugging (a summary line says so) —
 # destroy it manually or re-dispatch with suite=none after investigating.
+# keep_vm=true also keeps it after a success, for back-to-back iteration
+# runs that reuse its local cache (it keeps costing money until destroyed).
 name: benchmark
 
 on:
@@ -52,6 +63,41 @@ on:
       duration:
         description: seconds per phase (300 = quick ~5min check; pass 1800 for the full tpuf-protocol duration on a publication-grade run)
         default: "300"
+      warm_gate:
+        description: >-
+          how the namespace gets warm before measuring. queries = the
+          turbopuffer protocol (no boot preload; warm with the workload
+          queries until 3 in a row are fully cached; warm phases only;
+          a reused VM keeps its local cache). preload = the earlier
+          KOSHA_WARMUP_NAMESPACES boot preload + cold and warm phases.
+        type: choice
+        options: [queries, preload]
+        default: queries
+      vector_snapshot:
+        description: >-
+          snapshot the vector suite restores into namespace msmarco-10m-vec.
+          msmarco-10m-vec is the original (vectors inlined as JSON in
+          doc_store.bin, ~249GB local working set); msmarco-10m-vec-sidecar
+          is the rebuild with the binary doc_vectors.bin sidecar (exists
+          once build_vector_snapshot has run for it).
+        default: msmarco-10m-vec
+      build_vector_snapshot:
+        description: >-
+          if vector_snapshot does not exist yet, build it offline
+          (build_and_import.sh --with-embeddings: ~40GB embeddings sync plus
+          the 10M segment build and upload) before the vector suite. Never
+          rebuilds msmarco-10m-vec or an existing snapshot. Slow: budget
+          against the 350-minute job limit, and prefer suite=vector.
+        type: boolean
+        default: false
+      keep_vm:
+        description: >-
+          keep the bench VM stack after a successful run too, so the next
+          run reuses it (local cache kept when the snapshot matches). It
+          keeps billing: finish with a run where this is off (suite=none
+          just tears down).
+        type: boolean
+        default: false
       run_recall_check:
         description: >-
           also compute real recall@k against exact brute-force ground truth
@@ -84,6 +130,8 @@ env:
   AWS_DEFAULT_REGION: us-east-1
   BM25_NS: msmarco-${{ inputs.bm25_docs || '10m' }}
   VEC_NS: msmarco-10m-vec
+  VEC_SNAPSHOT: ${{ inputs.vector_snapshot || 'msmarco-10m-vec' }}
+  WARM_GATE: ${{ inputs.warm_gate || 'queries' }}
 
 jobs:
   bench:
@@ -166,6 +214,13 @@ jobs:
             # Results/logs from a previous run on this VM must not leak into this one.
             sudo rm -rf /data/results-ci
             sudo docker rm -f pg kosha 2>/dev/null || true
+            # warm_gate=queries: no boot preload, so /readyz is green at once
+            # and warm_gate.py does the warming with the workload queries.
+            WARMUP_ARGS=""
+            if [ "${{ env.WARM_GATE }}" = preload ]; then
+              WARMUP_ARGS="-e KOSHA_WARMUP_NAMESPACES=default/msmarco-10m,default/msmarco-1m,default/msmarco-10m-vec"
+            fi
+            echo "warm gate: ${{ env.WARM_GATE }} (container args: ${WARMUP_ARGS:-none})"
             sudo docker run -d --name pg --network host -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=kosha \
               -v /data/pg:/var/lib/postgresql/data postgres:16
             # Bounded waits throughout: an unbounded `until` loop turns a
@@ -186,7 +241,7 @@ jobs:
               -e KOSHA_SEGMENT_LIVE_MAX_BYTES=68719476736 -e KOSHA_SCORING_HYDRATE_CONCURRENCY=64 \
               -e KOSHA_ADMIN_API_KEY=sk-bench-admin \
               -e KOSHA_DASHBOARD=on \
-              -e KOSHA_WARMUP_NAMESPACES="default/msmarco-10m,default/msmarco-1m,default/msmarco-10m-vec" \
+              $WARMUP_ARGS \
               -v /data/kosha:/var/cache/kosha kosha-server:bench
             sudo docker start kosha
             # /healthz: unauthenticated liveness. Global /stats is admin-only
@@ -217,7 +272,7 @@ jobs:
                 --compact-after --compact-mode full --compact-passes 12 && \
               ./snapshot_namespace.sh $BM25_NS"
           fi
-          $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && \
+          $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && WARM_GATE=$WARM_GATE \
             ./run_phases.sh bm25 $BM25_NS /data/results-ci/bm25 '${{ inputs.qps }}' '${{ inputs.duration }}'"
 
       - name: Vector suite
@@ -225,16 +280,33 @@ jobs:
         run: |
           IP='${{ steps.tf.outputs.ip }}'
           SSH="ssh -i $RUNNER_TEMP/bench.pem -o ServerAliveInterval=30 ec2-user@$IP"
+          case "$VEC_SNAPSHOT" in
+            *[!a-z0-9.-]*|'') echo "::error::vector_snapshot must match [a-z0-9.-]+, got: $VEC_SNAPSHOT"; exit 1 ;;
+          esac
           if [ '${{ inputs.mode }}' = 'restore' ]; then
-            $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && ./restore_namespace.sh $VEC_NS"
+            if [ '${{ inputs.build_vector_snapshot }}' = 'true' ]; then
+              # Opt-in offline rebuild under a NEW snapshot name; existing
+              # snapshots (the original above all) are never overwritten.
+              if [ "$VEC_SNAPSHOT" = "$VEC_NS" ]; then
+                echo "::error::build_vector_snapshot needs a new vector_snapshot name (e.g. msmarco-10m-vec-sidecar); $VEC_NS is the original snapshot"
+                exit 1
+              fi
+              $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && \
+                if aws s3 ls s3://decoverai-bench-corpus-cache/snapshots/$VEC_SNAPSHOT/pg-kosha.sql.gz >/dev/null 2>&1; then \
+                  echo snapshot $VEC_SNAPSHOT exists, not rebuilding; \
+                else SNAPSHOT_NAME=$VEC_SNAPSHOT ./build_and_import.sh $VEC_NS --with-embeddings; fi"
+            fi
+            $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && ./restore_namespace.sh $VEC_NS $VEC_SNAPSHOT"
           else
             echo "::error::vector full-load (~6h) exceeds the job ceiling — run it from a workstation once, then use restore mode"
             exit 1
           fi
-          # ~249GB vector working set: warmup is bound by local disk writes
-          # (~30-45MB/s per file on the gp3 root volume), ~1h55m measured.
-          $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && WARMUP_TIMEOUT_S=10800 \
-            ./run_phases.sh vector $VEC_NS /data/results-ci/vector '${{ inputs.qps }}' '${{ inputs.duration }}'"
+          # preload: ~249GB vector working set (original snapshot), warmup is
+          # bound by local disk writes (~30-45MB/s per file on the gp3 root
+          # volume), ~1h55m measured. queries: warm_gate.py hydrates only what
+          # the workload reads, and nothing on a reused VM with a kept cache.
+          $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && WARMUP_TIMEOUT_S=10800 WARM_GATE_TIMEOUT_S=10800 \
+            WARM_GATE=$WARM_GATE ./run_phases.sh vector $VEC_NS /data/results-ci/vector '${{ inputs.qps }}' '${{ inputs.duration }}'"
 
       - name: Recall check (real recall@k vs. brute-force ground truth)
         if: contains(fromJSON('["both","vector"]'), inputs.suite) && inputs.run_recall_check == true
@@ -271,7 +343,8 @@ jobs:
             cat > /data/results-ci/meta.json <<META
           {\"run_id\": \"${{ github.run_id }}\", \"sha\": \"${{ github.sha }}\", \"ref\": \"${{ github.ref_name }}\",
            \"suite\": \"${{ inputs.suite }}\", \"mode\": \"${{ inputs.mode }}\", \"qps\": \"${{ inputs.qps }}\",
-           \"duration\": \"${{ inputs.duration }}\", \"archived_at\": \"\$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}
+           \"duration\": \"${{ inputs.duration }}\", \"warm_gate\": \"$WARM_GATE\", \"vector_snapshot\": \"$VEC_SNAPSHOT\",
+           \"archived_at\": \"\$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}
           META
             aws s3 sync --only-show-errors /data/results-ci $DEST/"
           echo "Server logs + results archived to $DEST/" >> "$GITHUB_STEP_SUMMARY"
@@ -283,7 +356,10 @@ jobs:
           mkdir -p results
           scp -i "$RUNNER_TEMP/bench.pem" -r "ec2-user@$IP:/data/results-ci/*" results/ 2>/dev/null || true
           {
-            echo "## Benchmark results (${{ inputs.suite }}, ${{ inputs.mode }}, ${{ inputs.qps }} QPS, ${{ inputs.duration }}s phases, BM25 corpus $BM25_NS)"
+            echo "## Benchmark results (${{ inputs.suite }}, ${{ inputs.mode }}, ${{ inputs.qps }} QPS, ${{ inputs.duration }}s phases, BM25 corpus $BM25_NS, vector snapshot $VEC_SNAPSHOT, warm gate $WARM_GATE)"
+            for f in results/*/warm_gate.log; do
+              if [ -f "$f" ]; then echo "- warm gate $(basename "$(dirname "$f")"): $(grep -E 'WARM-GATE-(READY|TIMEOUT|UNSUPPORTED)' "$f" | tail -1)"; fi
+            done
             echo ""
             echo "| phase | p50 ms | p90 ms | p99 ms | requests | errors |"
             echo "|---|---|---|---|---|---|"
@@ -324,7 +400,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Teardown (success only — failures keep the VM for debugging)
-        if: success()
+        if: success() && inputs.keep_vm != true
         working-directory: infra/terraform/dev-machines/aws/bench-kosha
         # Same -var as apply: destroy needs the identical value to resolve
         # count-indexed resource addresses (aws_volume_attachment[0], the
@@ -337,3 +413,7 @@ jobs:
       - name: Teardown skipped notice
         if: failure()
         run: echo "::warning::bench VM stack KEPT for debugging (standing rule). Destroy manually when done."
+
+      - name: Kept-VM notice
+        if: success() && inputs.keep_vm == true
+        run: echo "::warning::bench VM stack KEPT (keep_vm=true). Re-dispatch with keep_vm off (suite=none to only tear down) when done iterating."
