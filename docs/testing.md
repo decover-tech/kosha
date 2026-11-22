@@ -113,8 +113,9 @@ workload and records every acknowledged id. The scenarios are:
 After each fault, the suite checks zero acknowledged-write loss (exists API) and the exact doc
 count on both pods. It also checks that no row of `kosha.manifests` references a segment
 without its `_COMMIT` in MinIO, both sampled during the fault and after recovery. It measures
-recovery time and writes a JSON report. Known engine bugs it trips, such as #368, are listed in
-`scripts/faults/expected_failures.json`. `.github/workflows/faults.yml` runs it nightly, on
+recovery time and writes a JSON report. Known engine bugs it trips are listed in
+`scripts/faults/expected_failures.json` (none now; #368 was the last).
+`.github/workflows/faults.yml` runs it nightly, on
 demand, and on PRs that touch `kosha-server`, `kosha-write`, `kosha-control` or the scripts.
 On failure the workflow uploads the report and server logs.
 
