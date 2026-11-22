@@ -10,6 +10,18 @@
 #   MAX_DOCS=1000000 ./build_and_import.sh msmarco-1m   # first 1M docs
 #   SNAPSHOT_NAME=msmarco-10m-vec-sidecar ./build_and_import.sh msmarco-10m-vec --with-embeddings
 #
+# BUILD_ARGS (default: empty) are extra kosha-build-segments flags, e.g.
+#   BUILD_ARGS="--cluster-layout namespace" for cluster-aligned segments
+#   (#380, research). Restricted to [A-Za-z0-9 =._-]. Pair it with a new
+#   SNAPSHOT_NAME: a snapshot built with other flags is a different corpus.
+#
+# Provenance (#380): next to the snapshot this writes
+# snapshots/<SNAPSHOT_NAME>/build-info.json with BUILDER_SHA (the commit
+# the builder was built from; the workflow passes github.sha, the VM copy
+# has no .git), a digest of the builder sources (crates/, Cargo.toml,
+# Cargo.lock), BUILD_ARGS and MAX_DOCS, so two snapshots can be shown to
+# come from the same builder. Snapshots built before this have none.
+#
 # SNAPSHOT_NAME (default: the namespace) names the snapshot this writes;
 # restore it with restore_namespace.sh <namespace> <snapshot-name>. An
 # existing snapshot is never overwritten unless SNAPSHOT_OVERWRITE=1:
@@ -89,6 +101,15 @@ done
 set +f
 if [ -n "$OLD_LC_ALL" ]; then LC_ALL="$OLD_LC_ALL"; else unset LC_ALL; fi
 [ "$EXPECT_PAIR" = 0 ] || { echo "::error::BUILD_DOCKER_ENV ends with a bare -e"; exit 1; }
+
+BUILD_ARGS="${BUILD_ARGS:-}"
+BUILDER_SHA="${BUILDER_SHA:-unknown}"
+case "$BUILDER_SHA" in
+  *[!0-9a-z]*) echo "::error::BUILDER_SHA must be a hex commit id or unknown, got: $BUILDER_SHA"; exit 1 ;;
+esac
+case "$BUILD_ARGS" in
+  *[!A-Za-z0-9\ =._-]*) echo "::error::BUILD_ARGS may only contain [A-Za-z0-9 =._-], got: $BUILD_ARGS"; exit 1 ;;
+esac
 TENANT="${KOSHA_TENANT:-default}"
 SCOPED="$TENANT/$NS"
 TXT_CACHE=s3://decoverai-bench-corpus-cache/msmarco-10m
@@ -115,6 +136,10 @@ if [ "$WITH_EMB" = "--with-embeddings" ]; then
 fi
 
 cd ~/kosha
+# Digest of what the builder compiles: every file under crates/ plus the
+# workspace manifest and lockfile, by path and content.
+SOURCE_DIGEST="$( { find crates -type f -print0 | sort -z | xargs -0 sha256sum; sha256sum Cargo.toml Cargo.lock; } | sha256sum | cut -d' ' -f1)"
+echo "BUILDER builder_sha=$BUILDER_SHA source_digest=$SOURCE_DIGEST build_args=[$BUILD_ARGS] max_docs=$MAX_DOCS"
 sudo docker build -q --target builder -t kosha-builder:bench . >/dev/null
 sudo rm -rf "/data/segments-out/$NS"
 if [ -n "$BUILD_DOCKER_ENV" ]; then echo "builder env: $BUILD_DOCKER_ENV"; fi
@@ -124,8 +149,8 @@ sudo docker run --rm $BUILD_ENV $BUILD_DOCKER_ENV -v /data:/data kosha-builder:b
   cargo build --release --locked -p kosha-build-segments &&
   ./target/release/kosha-build-segments \
     --shards-dir /data/corpus-txt $EMB_ARGS \
-    --namespace '$NS' --out-dir /data/segments-out --max-docs $MAX_DOCS"
-echo "BUILD-COMPLETE $NS (max_docs=$MAX_DOCS)"
+    --namespace '$NS' --out-dir /data/segments-out --max-docs $MAX_DOCS $BUILD_ARGS"
+echo "BUILD-COMPLETE $NS (max_docs=$MAX_DOCS build_args=$BUILD_ARGS)"
 
 # Research #388: the footers say which doc store format was written. A
 # builder that ignored KOSHA_DOC_STORE_COMPRESSION=zstd (a ref without
@@ -179,6 +204,12 @@ echo "IMPORT-COMPLETE"
 echo "$BUILD_INFO" | aws s3 cp - "s3://$SNAPSHOT_CACHE_BUCKET/snapshots/$SNAPSHOT_NAME/build_info.txt" --only-show-errors
 # Bucket and local cache now derive from exactly this snapshot: a restore
 # of it right after keeps both instead of re-copying them.
+printf '{"snapshot": "%s", "namespace": "%s", "builder_sha": "%s", "source_digest": "%s", "build_args": "%s", "max_docs": %s, "with_embeddings": "%s", "built_at": "%s"}\n' \
+  "$SNAPSHOT_NAME" "$NS" "$BUILDER_SHA" "$SOURCE_DIGEST" "$BUILD_ARGS" "$MAX_DOCS" "$WITH_EMB" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  > /tmp/build-info.json
+aws s3 cp --only-show-errors /tmp/build-info.json "s3://$SNAPSHOT_CACHE_BUCKET/snapshots/$SNAPSHOT_NAME/build-info.json"
+echo "BUILD-INFO $(cat /tmp/build-info.json)"
+rm -f /tmp/build-info.json
 IDENTITY="$(snapshot_identity "$SNAPSHOT_NAME")"
 marker_write bucket "$NS" "$IDENTITY"
 marker_write local "$NS" "$IDENTITY"

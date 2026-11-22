@@ -10938,7 +10938,7 @@ fn log_search_timing(
         "search timing: ns={} total_ms={:.1} hydrate_ms={:.1} hydrate_files={} \
          hydrate_mb={:.1} queue_ms={:.1} admit_ms={:.1} bm25_stats={} bm25_stats_ms={:.2} \
          score_ms={:.1} materialize_ms={:.1} opens_cold={} opens_cached={} \
-         open_total_ms={:.1} knn_postings={} knn_mode={} knn_exact_vectors={} \
+         open_total_ms={:.1} knn_postings={} knn_segments={} knn_centroids={} knn_plan_ms={:.1} knn_mode={} knn_exact_vectors={} \
          knn_filtered={} knn_degraded={} hits={} page_gets={} \
          page_ranged_kb={:.1} page_whole_files={} page_whole_mb={:.1} s3_rounds={} \
          s3_bytes={} postings_gets={} postings_ranged_kb={:.1} postings_whole_files={} \
@@ -10959,6 +10959,9 @@ fn log_search_timing(
         phases.open_cached,
         phases.open_total_ms,
         phases.knn_postings_probed,
+        phases.knn_segments_probed,
+        phases.knn_centroids_scanned,
+        phases.knn_plan_ms,
         phases.knn_mode.map_or("-", |mode| mode.as_str()),
         phases.knn_exact_vectors,
         phases

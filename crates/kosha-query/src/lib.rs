@@ -2619,6 +2619,31 @@ pub struct SearchPhaseStats {
     /// Under the global probe budget it should land near
     /// `num_candidates` for the whole query. Zero for non-kNN queries.
     pub knn_postings_probed: usize,
+    /// Segments in which this kNN query hydrated at least one posting (or,
+    /// on the per-segment fallback, ran a probe at all). Observability only
+    /// (#380): with per-segment clustering every segment holds centroids
+    /// near every query, so this tracks the segment count; with
+    /// cluster-aligned segments it should fall to the few segments that
+    /// own the query's region. Zero for non-kNN queries.
+    ///
+    /// This is NOT the query's fan-out: `knn_plan` still opens every
+    /// segment and ranks every centroid before any posting is probed, so
+    /// opens, cold `vector.offsets` hydration and the centroid scan scale
+    /// with the segment count whatever this says. Read it with
+    /// `knn_centroids_scanned`, `knn_plan_ms` and the open counters.
+    pub knn_segments_probed: usize,
+    /// Centroid lower bounds `knn_plan` computed for this query, summed
+    /// over every segment it opened (#380): the centroid-scan work of the
+    /// global budget, which a cluster-aligned layout does not reduce on its
+    /// own. Zero for non-kNN queries and on the per-segment fallback.
+    pub knn_centroids_scanned: usize,
+    /// Wall time of `knn_plan` (segment opens plus the centroid scan and
+    /// budget cutoff), the part of a kNN query that is paid per segment
+    /// before any posting is read. Zero for non-kNN queries. Disjoint
+    /// from the other wall-clock phases here (it runs between admission and
+    /// the BM25 statistics pass), so the server's `total_ms`, which sums
+    /// those phases, does not include it.
+    pub knn_plan_ms: f64,
     /// Segment directories holding at least one document of the returned
     /// page, deduplicated, in page order: the segments whose doc store this
     /// search read. The server's access tracker (#213) counts these as
@@ -2724,6 +2749,10 @@ struct OpenStatsCollector {
     /// Vector postings hydrated across segments (kNN only) — see
     /// [`SearchPhaseStats::knn_postings_probed`].
     knn_postings: AtomicUsize,
+    /// See [`SearchPhaseStats::knn_segments_probed`].
+    knn_segments: AtomicUsize,
+    /// See [`SearchPhaseStats::knn_centroids_scanned`].
+    knn_centroids: AtomicUsize,
     /// See [`SearchPhaseStats::wand_docs_scored`].
     wand_docs_scored: AtomicUsize,
     /// See [`SearchPhaseStats::wand_segments_skipped`].
@@ -3529,6 +3558,13 @@ impl Searcher {
                 })
             })
             .collect();
+        open_stats.knn_centroids.fetch_add(
+            per_segment
+                .iter()
+                .filter_map(|info| info.distances.as_ref().map(Vec::len))
+                .sum(),
+            Ordering::Relaxed,
+        );
 
         check_knn_field(namespace, knn, per_segment.iter().map(|info| &info.status))?;
 
@@ -5580,6 +5616,9 @@ impl Searcher {
                         open_stats
                             .knn_postings
                             .fetch_add(found.postings_probed, Ordering::Relaxed);
+                        if found.postings_probed > 0 {
+                            open_stats.knn_segments.fetch_add(1, Ordering::Relaxed);
+                        }
                         late_results = Some(found.hits);
                     }
                     Err(e @ KoshaError::InvalidQuery(_)) => return Err(e),
@@ -5655,6 +5694,9 @@ impl Searcher {
                             open_stats
                                 .knn_postings
                                 .fetch_add(exact.postings_hydrated, Ordering::Relaxed);
+                            if exact.postings_hydrated > 0 || exact.vectors_scored > 0 {
+                                open_stats.knn_segments.fetch_add(1, Ordering::Relaxed);
+                            }
                             open_stats
                                 .knn_exact_vectors
                                 .fetch_add(exact.vectors_scored, Ordering::Relaxed);
@@ -5697,6 +5739,9 @@ impl Searcher {
                             .map(|r| {
                                 r.map(|(results, probes)| {
                                     open_stats.knn_postings.fetch_add(probes, Ordering::Relaxed);
+                                    if probes > 0 {
+                                        open_stats.knn_segments.fetch_add(1, Ordering::Relaxed);
+                                    }
                                     results
                                 })
                             }),
@@ -5718,6 +5763,7 @@ impl Searcher {
                                     open_stats
                                         .knn_postings
                                         .fetch_add(knn.num_candidates, Ordering::Relaxed);
+                                    open_stats.knn_segments.fetch_add(1, Ordering::Relaxed);
                                 })
                             }),
                     };
@@ -6318,17 +6364,22 @@ impl Searcher {
         //
         // Late interaction (#205) probes its own per-field token index;
         // none of this applies to it.
+        let t_knn_plan = Instant::now();
         let knn_plan = match query.knn {
-            Some(ref knn) if !knn.is_late_interaction() => self.knn_plan(
-                namespace,
-                manifest,
-                query,
-                knn,
-                &filter_keys,
-                tombstones,
-                &permit,
-                &open_stats,
-            )?,
+            Some(ref knn) if !knn.is_late_interaction() => {
+                let plan = self.knn_plan(
+                    namespace,
+                    manifest,
+                    query,
+                    knn,
+                    &filter_keys,
+                    tombstones,
+                    &permit,
+                    &open_stats,
+                )?;
+                phase_stats.knn_plan_ms = t_knn_plan.elapsed().as_secs_f64() * 1e3;
+                plan
+            }
             _ => KnnPlan::default(),
         };
         phase_stats.knn_mode = knn_plan.mode;
@@ -6512,6 +6563,8 @@ impl Searcher {
             as f64
             / 1e6;
         phase_stats.knn_postings_probed = open_stats.knn_postings.load(Ordering::Relaxed);
+        phase_stats.knn_segments_probed = open_stats.knn_segments.load(Ordering::Relaxed);
+        phase_stats.knn_centroids_scanned = open_stats.knn_centroids.load(Ordering::Relaxed);
         phase_stats.knn_exact_vectors = open_stats.knn_exact_vectors.load(Ordering::Relaxed);
         if query.knn.is_some() && self.knn_rescore_stats_on() {
             phase_stats.knn_rescore_stats = true;
@@ -10332,6 +10385,20 @@ mod tests {
             stats.knn_postings_probed > 0,
             "a kNN query must probe something"
         );
+        // #380 observability: the probed-segment count is bounded by the
+        // segment count, while the centroid scan still covers every segment
+        // (each of the SEGS segments contributes at least one centroid).
+        assert!(
+            stats.knn_segments_probed > 0 && stats.knn_segments_probed <= SEGS,
+            "knn_segments_probed ({}) must be in 1..={SEGS}",
+            stats.knn_segments_probed
+        );
+        assert!(
+            stats.knn_centroids_scanned >= SEGS,
+            "knn_plan ranks centroids of every segment: {} < {SEGS}",
+            stats.knn_centroids_scanned
+        );
+        assert!(stats.knn_plan_ms >= 0.0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
