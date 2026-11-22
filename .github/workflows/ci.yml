@@ -175,6 +175,19 @@ jobs:
       - uses: actions/checkout@v4
       - run: bash scripts/test_commit_bench_section.sh
 
+  # docs/guarantees.md (#352): every limit on the page must equal its code
+  # constant, and every cited results file, run id and commit must exist.
+  # Full history so the cited commits can be verified.
+  guarantees:
+    name: guarantees page
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: python3 scripts/docs/check_guarantees.py --self-test
+      - run: python3 scripts/docs/check_guarantees.py
+
   # The Dockerfile is a release artifact (deployed as `kosha:latest`) — never
   # let it break on main.
   docker:
