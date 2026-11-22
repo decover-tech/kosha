@@ -177,6 +177,21 @@ restart with the boot preload, wait for `/readyz`, then run the cold and
 warm phases. On the original vector snapshot the boot preload takes about
 115 minutes, because the server preloads the whole ~249 GB namespace.
 
+### What each hit returns (`return_fields`: `ids` (default) or `all`)
+
+turbopuffer's benchmark queries return each hit's id and distance only (no
+`include_attributes`). `return_fields=ids` matches that: `query_bench.py`,
+`warm_gate.py` and `recall_check.py` send `source_includes: []`, so a hit is
+`doc_id` + `score`. `all` returns every stored field, including the 1024-dim
+embedding as JSON. That made top-10 kNN responses ~100-200KB (estimated),
+so the 1,677-query cycle (~165-330MB) overflowed the 64MB result cache
+(`KOSHA_RESULT_CACHE_MAX_BYTES`): run 44967150572 served 0 of 14,401
+cache-on kNN requests from the cache. Runs before this change used `all`.
+
+The server still reads each returned document's record before dropping its
+fields (materialize was ~1 ms per query in that run); skipping the read for
+an ids-only request is a possible server follow-up.
+
 ### Reusing the local cache on a reused VM
 
 A VM survives a run when the run fails (standing rule) or when `keep_vm`
