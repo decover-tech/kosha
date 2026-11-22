@@ -2214,6 +2214,72 @@ fn parse_rabitq_estimator(raw: Option<&str>) -> kosha_vector_spfresh::RaBitQEsti
     }
 }
 
+/// x86-64 target features above the baseline that this binary was compiled
+/// with (`-C target-cpu=x86-64-v3` turns on `avx2`, `fma`, `bmi2` and
+/// `popcnt`). Empty on the default image and on other architectures.
+fn compiled_x86_features() -> Vec<&'static str> {
+    let x86 = cfg!(target_arch = "x86_64");
+    [
+        ("popcnt", cfg!(target_feature = "popcnt")),
+        ("avx2", cfg!(target_feature = "avx2")),
+        ("fma", cfg!(target_feature = "fma")),
+        ("bmi2", cfg!(target_feature = "bmi2")),
+        ("avx512f", cfg!(target_feature = "avx512f")),
+    ]
+    .into_iter()
+    .filter(|&(_, enabled)| x86 && enabled)
+    .map(|(name, _)| name)
+    .collect()
+}
+
+/// The experimental #382 kernel configuration in effect, for one startup
+/// log line: `None` when everything is at its default (neither
+/// `KOSHA_VECTOR_DOT_LANES` nor `KOSHA_VECTOR_RABITQ_ESTIMATOR` set, and a
+/// baseline-x86-64 build), so a default server logs nothing new. Reading it
+/// also resolves both settings, so an unknown value warns at startup rather
+/// than on the first kNN query. The benchmark checks this line to confirm
+/// that a run's `server_env` / `rustflags` actually took effect.
+pub fn experimental_vector_kernels_summary() -> Option<String> {
+    let env_set = |key: &str| {
+        std::env::var(key)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    };
+    let lanes = DotLanes::from_env();
+    let estimator = rabitq_estimator();
+    let features = compiled_x86_features();
+    let any_set = env_set("KOSHA_VECTOR_DOT_LANES")
+        || env_set("KOSHA_VECTOR_RABITQ_ESTIMATOR")
+        || !features.is_empty();
+    any_set.then(|| format_vector_kernels_summary(lanes, estimator, &features))
+}
+
+fn format_vector_kernels_summary(
+    lanes: DotLanes,
+    estimator: kosha_vector_spfresh::RaBitQEstimator,
+    features: &[&str],
+) -> String {
+    let lanes = match lanes {
+        DotLanes::Eight => 8,
+        DotLanes::Sixteen => 16,
+        DotLanes::ThirtyTwo => 32,
+        DotLanes::SixtyFour => 64,
+    };
+    let estimator = match estimator {
+        kosha_vector_spfresh::RaBitQEstimator::Lut => "lut",
+        kosha_vector_spfresh::RaBitQEstimator::Popcount4 => "popcount",
+    };
+    let features = if features.is_empty() {
+        "baseline".to_string()
+    } else {
+        features.join(",")
+    };
+    format!(
+        "vector kernels (#382, experimental): dot_lanes={lanes} \
+         rabitq_estimator={estimator} x86_features={features}"
+    )
+}
+
 /// The [`kosha_vector_spfresh::RaBitQQuery`] for `unit_query`. It depends
 /// only on the query and its dimension (every RaBitQ code is written with
 /// the same rotation), so each thread keeps the last one it built: a query
@@ -8730,6 +8796,25 @@ mod tests {
             assert!((c - expected).abs() < 1e-5, "{lanes:?}: {c} vs {expected}");
             assert_eq!(lanes.cosine_similarity(&a, &zero), 0.0, "{lanes:?}");
         }
+    }
+
+    #[test]
+    fn vector_kernels_summary_names_the_effective_settings() {
+        use kosha_vector_spfresh::RaBitQEstimator;
+        assert_eq!(
+            format_vector_kernels_summary(DotLanes::Eight, RaBitQEstimator::Lut, &[]),
+            "vector kernels (#382, experimental): dot_lanes=8 rabitq_estimator=lut \
+             x86_features=baseline"
+        );
+        assert_eq!(
+            format_vector_kernels_summary(
+                DotLanes::ThirtyTwo,
+                RaBitQEstimator::Popcount4,
+                &["popcnt", "avx2", "fma", "bmi2"]
+            ),
+            "vector kernels (#382, experimental): dot_lanes=32 rabitq_estimator=popcount \
+             x86_features=popcnt,avx2,fma,bmi2"
+        );
     }
 
     #[test]

@@ -5562,6 +5562,11 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(300);
     let addr = format!("0.0.0.0:{port}");
+    // #382 experiment flags: one line only when one is set or the image was
+    // built above baseline x86-64, so a default server logs nothing new.
+    if let Some(summary) = kosha_segment::experimental_vector_kernels_summary() {
+        println!("kosha-server {summary}");
+    }
 
     let state = AppState::new_shared_as(PathBuf::from(data_dir.clone()), role);
     // Pre-#262 bare namespaces no tenant can reach (#344).

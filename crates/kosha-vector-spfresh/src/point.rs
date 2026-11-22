@@ -27,8 +27,9 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// [`dot`] with `L` independent accumulator lanes (`L` a power of two),
-/// reduced pairwise. Experimental (#382) and not used by any production
-/// path: it exists so `benches/distance_kernels.rs` can measure whether a
+/// reduced pairwise. Experimental (#382): used only when
+/// `KOSHA_VECTOR_DOT_LANES` is set to 16/32/64 (kosha-segment's posting
+/// scans), and by `benches/distance_kernels.rs`, to measure whether a
 /// wider accumulator helps. With AVX2 + FMA (`-C target-cpu=x86-64-v3`) one
 /// 8-lane accumulator is a single register, so every iteration waits on
 /// the previous FMA (~4 cycles latency, 2 per cycle throughput); 32-64
