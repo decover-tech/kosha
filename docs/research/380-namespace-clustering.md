@@ -20,7 +20,9 @@ research track in #260.
   measure the effect: `kosha-cluster-eval` (offline) and a
   `knn_segments=` field on the server's `search timing:` log line.
 - **Flags.** Builder: `--cluster-layout input|namespace` (default `input`,
-  which is byte-for-byte today's behaviour), `--cluster-method head|tree`,
+  which keeps today's behaviour; a local diff against `origin/main`'s
+  builder on a 50k-doc build differed only in footer `created_at`),
+  `--cluster-method head|tree`,
   `--cluster-head-per-segment`, `--cluster-sample`, `--cluster-iters`,
   `--cluster-seed`, `--spill-dir`. Bench: `BUILD_ARGS` in
   `build_and_import.sh` and the `build_segments_args` input in
