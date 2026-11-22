@@ -10524,7 +10524,25 @@ fn log_search_timing(
         + phases.admit_wall_ms
         + phases.bm25_stats_ms
         + phases.score_wall_ms
-        + phases.materialize_wall_ms;
+        + phases.materialize_wall_ms
+        + phases.knn_rescore_ms;
+    // Global bound-driven kNN rescoring (#381) logs its counters only when
+    // it ran (`KOSHA_KNN_GLOBAL_RESCORE`), so the line is unchanged by
+    // default.
+    let knn_rescore = if phases.knn_global_rescore {
+        format!(
+            " knn_rescore_ms={:.1} knn_rescore_candidates={} knn_rescore_selected={} \
+             knn_rescored={} knn_rescore_unavailable={} knn_rescore_ranged_spans={}",
+            phases.knn_rescore_ms,
+            phases.knn_rescore_candidates,
+            phases.knn_rescore_selected,
+            phases.knn_rescored,
+            phases.knn_rescore_unavailable,
+            phases.knn_rescore_ranged_spans,
+        )
+    } else {
+        String::new()
+    };
     println!(
         "search timing: ns={} total_ms={:.1} hydrate_ms={:.1} hydrate_files={} \
          hydrate_mb={:.1} queue_ms={:.1} admit_ms={:.1} bm25_stats={} bm25_stats_ms={:.2} \
@@ -10534,7 +10552,7 @@ fn log_search_timing(
          page_ranged_kb={:.1} page_whole_files={} page_whole_mb={:.1} s3_rounds={} \
          s3_bytes={} postings_gets={} postings_ranged_kb={:.1} postings_whole_files={} \
          postings_whole_mb={:.1} vector_gets={} vector_ranged_kb={:.1} \
-         vector_whole_files={}{}",
+         vector_whole_files={}{}{}",
         ns.0,
         total_ms,
         hydrate_ms,
@@ -10570,6 +10588,7 @@ fn log_search_timing(
         hydration.vectors.ranged_gets,
         hydration.vectors.ranged_bytes as f64 / 1024.0,
         hydration.vectors.whole_files,
+        knn_rescore,
         request_id(),
     );
 }
