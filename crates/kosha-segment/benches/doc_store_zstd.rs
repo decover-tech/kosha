@@ -4,7 +4,10 @@
 //! Builds one segment per configuration from the same passages and
 //! reports, per configuration:
 //!   - `doc_store.bin` bytes (and bytes/doc, ratio vs raw), plus the
-//!     `doc_store.offsets` bytes, which carry the dictionary trailer;
+//!     `doc_store.offsets` bytes, which carry the dictionary trailer. A
+//!     compressed file also ends with a second copy of the dictionary (so
+//!     the offsets can be rebuilt), so "rec B/doc" and "rec ratio" count
+//!     the stored records alone, the bytes ranged page reads fetch;
 //!   - build time of `finalize` (includes dictionary training and the
 //!     compression pass);
 //!   - `doc_record_full` latency on random documents with the file in the
@@ -187,11 +190,13 @@ fn main() {
         ),
     ];
     println!(
-        "{:<18} {:>12} {:>8} {:>7} {:>10} {:>9} {:>9} {:>9} {:>10} {:>10} {:>9} {:>9}",
+        "{:<18} {:>12} {:>8} {:>7} {:>9} {:>9} {:>10} {:>9} {:>9} {:>9} {:>10} {:>10} {:>9} {:>9}",
         "config",
         "doc_store B",
         "B/doc",
         "ratio",
+        "rec B/doc",
+        "rec ratio",
         "offsets B",
         "build ms",
         "rec p50us",
@@ -213,6 +218,8 @@ fn main() {
             raw_size = size;
         }
         let reader = SegmentReader::open(dir.clone()).unwrap();
+        // Stored records alone: where the last record ends.
+        let records = reader.doc_store_len().unwrap();
         let mut rng = Lcg(42);
         // Warm the page cache and the decoder pool.
         for seq in 0..reader.doc_count().min(2000) {
@@ -251,11 +258,13 @@ fn main() {
             v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         }
         println!(
-            "{:<18} {:>12} {:>8.1} {:>6.2}x {:>10} {:>9.0} {:>9.2} {:>9.2} {:>9.3}ms {:>9.3}ms {:>9.2} {:>9.2}",
+            "{:<18} {:>12} {:>8.1} {:>6.2}x {:>9.1} {:>8.2}x {:>10} {:>9.0} {:>9.2} {:>9.2} {:>9.3}ms {:>9.3}ms {:>9.2} {:>9.2}",
             name,
             size,
             size as f64 / n as f64,
             raw_size as f64 / size as f64,
+            records as f64 / n as f64,
+            raw_size as f64 / records as f64,
             offsets,
             build_ms,
             pct(&per_rec, 0.5),

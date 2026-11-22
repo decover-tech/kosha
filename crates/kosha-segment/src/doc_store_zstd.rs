@@ -17,11 +17,25 @@
 //!   or the raw record, kept when compressing it would not shrink it. A
 //!   raw record starts with its id length as a `u32`, which can never equal
 //!   the zstd magic (that would be a 4 GiB id), so the two never collide.
+//!   After the last record comes a copy of the dictionary, read from the
+//!   end of the file: `[dict][dict_len:u32][magic "KDZ1":u32]`. No offsets
+//!   entry points into it, so ranged page reads never fetch it.
 //! - `doc_store.offsets`: the usual header and entries (spans of the stored
 //!   bytes), then a trailer `[magic "KDZ1":u32][dict_len:u32][dict]`.
 //!   Readers that predate #388 stop after the entries and never look at the
 //!   trailer; `doc_store.offsets` is fetched for every lazily opened
 //!   segment anyway, so the dictionary needs no new file to hydrate.
+//!
+//! # Recovery
+//!
+//! `doc_store.offsets` is the fast path, not the only copy of anything:
+//! frames are self-delimiting (`ZSTD_findFrameCompressedSize`), raw records
+//! parse, and the dictionary has its second copy at the end of
+//! `doc_store.bin`. [`rebuild_offsets`] regenerates the whole sidecar,
+//! trailer included, from `doc_store.bin` alone. The reader uses it when
+//! the sidecar is missing or broken and `doc_store.bin` is local (slower,
+//! still correct, as for a raw doc store), and
+//! `SegmentReader::backfill_offset_tables` uses it to write a new one.
 //!
 //! The footer, not the bytes, decides the format: a reader decompresses
 //! only when `Footer::doc_store_compression` names a codec it knows, and
@@ -52,8 +66,22 @@ const MIN_TRAIN_RECORDS: usize = 16;
 /// Longest prefix of one record fed to the trainer.
 const MAX_SAMPLE_RECORD_BYTES: usize = 128 * 1024;
 
-/// Decoders kept per segment for reuse (each holds a digested dictionary).
-const DECODER_POOL_MAX: usize = 32;
+/// Decoders kept per segment for reuse. Each holds a zstd context plus a
+/// digested copy of the dictionary (roughly 100-200 KiB), and none of it
+/// is charged to the postings memory ledger, so the pool stays small: a
+/// burst beyond it allocates a context per decode and drops it after.
+const DECODER_POOL_MAX: usize = 4;
+
+/// Upper bound on a frame's decompressed size per stored byte. zstd's
+/// densest encoding is an RLE block (a 3-byte header plus 1 byte for up to
+/// 128 KiB), so a valid frame never claims more than ~32 KiB per stored
+/// byte; this is twice that. A damaged header that claims more is an
+/// error, not a multi-GiB allocation.
+const MAX_FRAME_EXPANSION: usize = 64 * 1024;
+
+/// Bytes of the dictionary tail copy's fixed part in `doc_store.bin`
+/// (`[dict_len:u32][magic:u32]`).
+const DICT_TAIL_FIXED: usize = 8;
 
 /// `KOSHA_DOC_STORE_COMPRESSION`: whether new segments compress
 /// `doc_store.bin` (research #388).
@@ -323,6 +351,11 @@ pub(crate) fn compress_doc_store(
         offsets.extend_from_slice(&(stored.len() as u32).to_le_bytes());
         written += stored.len() as u64;
     }
+    // Second copy of the dictionary, after the last record, so the
+    // sidecar can be rebuilt from doc_store.bin alone (see Recovery).
+    out.write_all(&dict)?;
+    out.write_all(&(dict.len() as u32).to_le_bytes())?;
+    out.write_all(&DOC_STORE_DICT_MAGIC.to_le_bytes())?;
     out.flush()?;
     offsets.extend_from_slice(&DOC_STORE_DICT_MAGIC.to_le_bytes());
     offsets.extend_from_slice(&(dict.len() as u32).to_le_bytes());
@@ -372,8 +405,9 @@ impl DocStoreDecoder {
                 "doc_store.bin: compressed record {doc_seq} is malformed: {why}"
             ))
         };
+        let cap = stored.len().saturating_mul(MAX_FRAME_EXPANSION) as u64;
         let size = match zstd::zstd_safe::get_frame_content_size(stored) {
-            Ok(Some(size)) if size <= u32::MAX as u64 => size as usize,
+            Ok(Some(size)) if size <= u32::MAX as u64 && size <= cap => size as usize,
             other => return Err(corrupt(format!("frame content size {other:?}"))),
         };
         let pooled = self.pool.lock().unwrap().pop();
@@ -396,6 +430,93 @@ impl DocStoreDecoder {
             Err(e) => Err(corrupt(e.to_string())),
         }
     }
+}
+
+/// The dictionary copy at the end of a compressed `doc_store.bin`, and
+/// where the records end (the copy's start). `None`: no valid tail.
+pub(crate) fn read_dict_tail(store: &[u8]) -> Option<(&[u8], usize)> {
+    let fixed_at = store.len().checked_sub(DICT_TAIL_FIXED)?;
+    let mut cursor = &store[fixed_at..];
+    let dict_len = u32_of(&mut cursor)? as usize;
+    if u32_of(&mut cursor)? != DOC_STORE_DICT_MAGIC {
+        return None;
+    }
+    let records_end = fixed_at.checked_sub(dict_len)?;
+    if records_end < 4 {
+        return None;
+    }
+    Some((&store[records_end..fixed_at], records_end))
+}
+
+/// Regenerate a compressed segment's `doc_store.offsets` (entries and
+/// dictionary trailer) from its `doc_store.bin` bytes alone. Errors when
+/// the file is not a complete compressed doc store of `expected_doc_count`
+/// records whose dictionary is `expected_dict_len` bytes long.
+pub(crate) fn rebuild_offsets(
+    store: &[u8],
+    expected_doc_count: u32,
+    expected_dict_len: u32,
+) -> Result<Vec<u8>, KoshaError> {
+    let corrupt = |why: String| {
+        KoshaError::CorruptSegment(format!(
+            "doc_store.bin: cannot rebuild doc_store.offsets of a compressed doc store: {why}"
+        ))
+    };
+    let mut head = store;
+    let doc_count = u32_of(&mut head).ok_or_else(|| corrupt("no header".into()))?;
+    if doc_count != expected_doc_count {
+        return Err(corrupt(format!(
+            "{doc_count} record(s), footer.json says {expected_doc_count}"
+        )));
+    }
+    let (dict, records_end) =
+        read_dict_tail(store).ok_or_else(|| corrupt("no dictionary tail".into()))?;
+    if dict.len() != expected_dict_len as usize {
+        return Err(corrupt(format!(
+            "dictionary tail is {} bytes, footer.json says {expected_dict_len}",
+            dict.len()
+        )));
+    }
+    let decoder = DocStoreDecoder::new(dict.to_vec());
+    let mut offsets = Vec::with_capacity(4 + doc_count as usize * 32 + 8 + dict.len());
+    offsets.extend_from_slice(&doc_count.to_le_bytes());
+    let mut pos = 4usize;
+    for doc_seq in 0..doc_count {
+        let rest = &store[pos.min(records_end)..records_end];
+        let len = if rest.starts_with(&ZSTD_FRAME_MAGIC) {
+            zstd::zstd_safe::find_frame_compressed_size(rest)
+                .map_err(|e| corrupt(format!("record {doc_seq}: frame size: {e}")))?
+        } else {
+            let mut cursor = rest;
+            crate::parse_one_doc_record(&mut cursor, doc_seq)?;
+            rest.len() - cursor.len()
+        };
+        let stored = rest
+            .get(..len)
+            .ok_or_else(|| corrupt(format!("record {doc_seq} runs past the records")))?;
+        let raw = decoder.decode(stored, doc_seq)?;
+        let mut cursor = &raw[..];
+        let record = crate::parse_one_doc_record(&mut cursor, doc_seq)?;
+        if !cursor.is_empty() {
+            return Err(corrupt(format!("record {doc_seq} has trailing bytes")));
+        }
+        let id = record.doc_id.0.as_bytes();
+        offsets.extend_from_slice(&(id.len() as u32).to_le_bytes());
+        offsets.extend_from_slice(id);
+        offsets.extend_from_slice(&record.field_length.to_le_bytes());
+        offsets.extend_from_slice(&(pos as u64).to_le_bytes());
+        offsets.extend_from_slice(&(len as u32).to_le_bytes());
+        pos += len;
+    }
+    if pos != records_end {
+        return Err(corrupt(format!(
+            "records end at byte {pos}, the dictionary tail starts at {records_end}"
+        )));
+    }
+    offsets.extend_from_slice(&DOC_STORE_DICT_MAGIC.to_le_bytes());
+    offsets.extend_from_slice(&(dict.len() as u32).to_le_bytes());
+    offsets.extend_from_slice(dict);
+    Ok(offsets)
 }
 
 #[cfg(test)]
@@ -466,5 +587,54 @@ mod tests {
         let frame = zstd::bulk::compress(b"hello hello hello", 3).unwrap();
         assert_eq!(&*decoder.decode(&frame, 0).unwrap(), b"hello hello hello");
         assert!(decoder.decode(&frame[..frame.len() - 2], 0).is_err());
+    }
+
+    /// A frame header claiming far more content than its stored bytes
+    /// could hold is refused before any allocation; a legitimately dense
+    /// frame (1 MiB of zeros) is not.
+    #[test]
+    fn implausible_frame_content_size_is_refused() {
+        let decoder = DocStoreDecoder::new(Vec::new());
+        let zeros = vec![0u8; 1 << 20];
+        let dense = zstd::bulk::compress(&zeros, 3).unwrap();
+        assert_eq!(&*decoder.decode(&dense, 0).unwrap(), &zeros[..]);
+
+        let frame = zstd::bulk::compress(b"hello hello hello", 3).unwrap();
+        let fhd = frame[4];
+        assert!(fhd & 0x20 != 0, "single-segment frame expected");
+        let fcs_len = match fhd >> 6 {
+            0 => 1,
+            1 => 2,
+            2 => 4,
+            _ => 8,
+        };
+        assert_eq!(fhd & 0x03, 0, "no dictionary id expected");
+        // Rewrite the content size as an 8-byte 3 GiB.
+        let mut forged = frame[..4].to_vec();
+        forged.push(fhd | 0xC0);
+        forged.extend_from_slice(&(3u64 << 30).to_le_bytes());
+        forged.extend_from_slice(&frame[5 + fcs_len..]);
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&forged).unwrap(),
+            Some(3u64 << 30)
+        );
+        let err = decoder.decode(&forged, 0).unwrap_err().to_string();
+        assert!(err.contains("frame content size"), "{err}");
+    }
+
+    #[test]
+    fn dict_tail_parses_and_rejects_garbage() {
+        let mut store = 2u32.to_le_bytes().to_vec();
+        store.extend_from_slice(b"rec");
+        store.extend_from_slice(b"dict!");
+        store.extend_from_slice(&5u32.to_le_bytes());
+        store.extend_from_slice(&DOC_STORE_DICT_MAGIC.to_le_bytes());
+        assert_eq!(read_dict_tail(&store), Some((&b"dict!"[..], 7)));
+        assert!(read_dict_tail(&store[..store.len() - 1]).is_none());
+        assert!(read_dict_tail(&[0u8; 6]).is_none());
+        let n = store.len();
+        let mut huge = store.clone();
+        huge[n - 8..n - 4].copy_from_slice(&1000u32.to_le_bytes());
+        assert!(read_dict_tail(&huge).is_none());
     }
 }
