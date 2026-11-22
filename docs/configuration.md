@@ -370,7 +370,7 @@ mode, a missing or unparsable file, half a client identity, or a TLS setting whi
 
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
-| `KOSHA_INTERNAL_TLS` | `off`: plain `http://` to peers, as before. `on`: peers are fetched over `https://` and verified against `KOSHA_INTERNAL_TLS_CA_PATH`, and an `https://` `KOSHA_INGEST_HOST` is verified the same way (an `http://` one logs a warning). `required`: as `on`, and the pod refuses to start with an `http://` `KOSHA_INGEST_HOST` or without `KOSHA_TLS_CERT_PATH` | `off` | enum |
+| `KOSHA_INTERNAL_TLS` | `off`: plain `http://` to peers, as before. `on`: peers are fetched over `https://` and verified against `KOSHA_INTERNAL_TLS_CA_PATH`, and an `https://` `KOSHA_INGEST_HOST` is verified the same way (an `http://` one logs a warning). `required`: as `on`, and the pod refuses to start with an `http://` `KOSHA_INGEST_HOST`, without `KOSHA_TLS_CERT_PATH`, or with a `DATABASE_URL` that does not force TLS (see "TLS to Postgres" below) | `off` | enum |
 | `KOSHA_INTERNAL_TLS_CA_PATH` | PEM CA bundle peer certificates must chain to. Required unless `off`. Only this bundle is trusted for internal traffic, not the platform roots | unset | path |
 | `KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH` | PEM client certificate chain, presented to peers that ask for one (their `KOSHA_TLS_CLIENT_CA_PATH`). Set it together with `KOSHA_INTERNAL_TLS_CLIENT_KEY_PATH` or not at all | unset (no client certificate) | path |
 | `KOSHA_INTERNAL_TLS_CLIENT_KEY_PATH` | PEM private key for `KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH` | unset | path |
@@ -395,6 +395,42 @@ fetch and falls back to S3, so mixed pods cost extra S3 reads, not errors. Forwa
 no such fallback: switch `KOSHA_INGEST_HOST` to `https://` only after the ingest pod serves
 HTTPS. Certificates are
 read at startup; a renewed certificate takes effect when the pod restarts.
+
+#### TLS to Postgres
+
+Every pod also talks to the control-plane database: manifests, namespace and tenant names,
+leases and the API-key registry. That connection is configured in `DATABASE_URL` itself, with
+the usual Postgres parameters, and applies to every pool the server opens (control plane,
+writer lease, hydration leases, API keys) and to `migrate` and `migrate-namespace`:
+
+| `sslmode=` | Encrypted | Server verified |
+| --- | --- | --- |
+| `disable`, `allow` | no | no |
+| `prefer` (the default when unset) | only if the server offers TLS; falls back to plaintext | no |
+| `require` | yes, or the connection fails | no |
+| `verify-ca` | yes | certificate chain |
+| `verify-full` | yes | certificate chain and host name |
+
+`verify-ca` and `verify-full` check the server certificate against `sslrootcert=<path>`, a PEM
+CA bundle mounted into the pod (for a managed database, the provider's CA bundle). Without
+`sslrootcert` they use the public web roots, which a private or provider CA is not part of.
+For example:
+
+```
+postgres://kosha:<password>@<host>:5432/kosha?sslmode=verify-full&sslrootcert=/etc/kosha/pg/ca.crt
+```
+
+`PGSSLMODE` and `PGSSLROOTCERT` are read when the URL does not name the parameter. The client
+ignores a `PGSSLMODE` it cannot parse, surrounding whitespace or a trailing newline included
+(a Secret made with `echo` has one), and uses `prefer`; the check below does not accept such a value
+as forcing TLS.
+
+`KOSHA_INTERNAL_TLS` holds this hop to the same rule as the others. With `required`, the
+server, `migrate` and `migrate-namespace` exit before opening a connection unless the
+`sslmode` in effect is `require`, `verify-ca` or `verify-full`. With `on`, any other value (or
+none) logs one `WARN:` line at startup. With `off` nothing is checked. Neither message prints
+the URL. The check reads only the mode, so `migrate` and `migrate-namespace` do not need the
+`KOSHA_INTERNAL_TLS_*` files mounted.
 
 `GET /internal/segment/...` streams the cached file as raw `application/octet-stream`. Peers on
 builds from before #259 send base64 with `x-kosha-encoding: base64`; the client still decodes
@@ -602,6 +638,7 @@ These do not start with `KOSHA_` but change server behavior:
 
 | Variable | Purpose |
 | --- | --- |
-| `DATABASE_URL` | Postgres control plane and API-key registry (**postgres**). Required by `kosha-server migrate` |
+| `DATABASE_URL` | Postgres control plane and API-key registry (**postgres**). Required by `kosha-server migrate`. Add `sslmode=verify-full&sslrootcert=<path>` to encrypt the connection (see "TLS to Postgres") |
+| `PGSSLMODE`, `PGSSLROOTCERT` | Fallbacks for `sslmode` and `sslrootcert` when `DATABASE_URL` does not name them |
 | `POD_IP` | This pod's IP, used as its peer-hydration address (**s3** + **postgres**) |
 | `AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, `AWS_REGION` | Fallbacks for the `KOSHA_S3_*` settings above |
