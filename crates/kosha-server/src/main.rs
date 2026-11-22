@@ -1214,7 +1214,9 @@ impl AppState {
                 .unwrap_or_else(|e| fatal(&e))
                 .role
         });
-        std::fs::create_dir_all(&data_dir).ok();
+        if let Err(e) = std::fs::create_dir_all(&data_dir) {
+            eprintln!("ERROR: cannot create {}: {e}", data_dir.display());
+        }
         // Before the disk cache scans `data_dir`: transient tail segments of
         // an earlier process are never reused (#255).
         unindexed::remove_stale_tail_segments(&data_dir);
