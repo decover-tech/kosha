@@ -171,9 +171,63 @@ Peers share cold segments through hydration leases when the binary has **s3** an
 | `KOSHA_MAX_CONCURRENT_SEARCHES` | Searches that run at once | `8` | searches |
 | `KOSHA_SEARCH_QUEUE_DEPTH` | Searches that may wait for a slot; beyond it requests are shed | 4 × `KOSHA_MAX_CONCURRENT_SEARCHES` (`32`) | searches |
 | `KOSHA_SEARCH_QUEUE_TIMEOUT_MS` | How long a queued search waits for a slot; `0` waits without a deadline | `10000` | milliseconds |
+| `KOSHA_SEARCH_QUEUE_DEPTH_PER_TENANT` | Searches one tenant may have waiting for a slot; beyond it that tenant's searches are shed while other tenants still queue. Waiters are served round robin across tenants (#341, `fair_admission.rs`). `0`: only `KOSHA_SEARCH_QUEUE_DEPTH` applies | `0` | searches |
 | `KOSHA_SEGMENT_LIVE_MAX_BYTES` | Limit on live segment memory (cached plus pinned by running searches). Searches wait for memory above it | 2 × `KOSHA_SEGMENT_CACHE_MAX_BYTES` (8 GiB) | bytes |
 | `KOSHA_ADMISSION_TIMEOUT_MS` | How long a search waits for live memory before HTTP 429 | `15000` (`kosha_query::DEFAULT_ADMISSION_TIMEOUT`) | milliseconds |
 | `KOSHA_MAX_BODY_BYTES` | Largest accepted request body; HTTP 413 above it (`auth::max_body_bytes`) | `67108864` (64 MiB) | bytes |
+
+## Tenant limits
+
+Per-tenant quotas and rate limits (#341, `tenant_limits.rs`). Without
+`KOSHA_TENANT_LIMITS_FILE` nothing is limited. Limits are enforced per pod: query limits on the
+pod that serves the search, write limits on the pod that executes the write (the ingest pod; a
+query pod forwards writes first). Operator traffic (the admin and internal service credentials)
+is never limited. A request over a limit gets HTTP 429 with `Retry-After` and a JSON body
+`{"error", "reason", "limit", "retry_after_ms"}`, where `reason` is one of
+`tenant_qps_exceeded`, `tenant_concurrency_exceeded`, `tenant_write_rate_exceeded`,
+`namespace_quota_exceeded`, `doc_quota_exceeded`, `vector_dims_exceeded` or `body_too_large`.
+Rate limits give the time until the token bucket holds the request; quotas give 60 seconds.
+Each refusal is counted in `kosha_tenant_rejections_total` (see `metrics.md`).
+
+| Variable | Purpose | Default | Units |
+| --- | --- | --- | --- |
+| `KOSHA_TENANT_LIMITS_FILE` | JSON file of plans and per-tenant overrides (format below). A file that cannot be read or parsed at startup stops the pod | unset (no limits) | path |
+| `KOSHA_TENANT_DEFAULT_PLAN` | Plan for tenants without one of their own; overrides the file's `default_plan`. Requires `KOSHA_TENANT_LIMITS_FILE` | file's `default_plan` | plan name |
+| `KOSHA_TENANT_LIMITS_RELOAD_SECS` | How often the file is re-read. A reload that fails keeps the previous limits. `0` never reloads | `30` | seconds |
+
+The file:
+
+```json
+{
+  "default_plan": "standard",
+  "plans": {
+    "standard": {"qps": 50, "concurrent_queries": 8, "write_docs_per_sec": 2000,
+                 "write_bytes_per_sec": 16777216, "namespaces": 100,
+                 "docs_per_namespace": 10000000, "vector_dims": 4096,
+                 "max_body_bytes": 33554432, "weight": 1}
+  },
+  "tenants": {"acme": {"plan": "standard", "qps": 200, "weight": 4}}
+}
+```
+
+A tenant's limits are its plan's (its own `plan`, else the default plan) with its `tenants`
+fields laid over them. A tenant with no plan and no entry is unlimited, and so is any field
+left out.
+
+| Field | Limits | Checked |
+| --- | --- | --- |
+| `qps` | Searches per second; the bucket holds one second's worth | each search, after authentication |
+| `concurrent_queries` | Searches in flight at once | each search |
+| `write_docs_per_sec` | Documents per second in index and replace requests. A batch bigger than one second's worth is admitted from a full bucket and paid for afterwards | each index or replace |
+| `write_bytes_per_sec` | Request body bytes per second on write routes | each write request |
+| `max_body_bytes` | Largest write request body, under the pod-wide `KOSHA_MAX_BODY_BYTES` | each write request |
+| `namespaces` | Namespaces the tenant holds (top-level; shards and branches not counted) | namespace creation, and a write that would auto-create one |
+| `docs_per_namespace` | Documents in a namespace: committed and not deleted plus not yet flushed. An unflushed upsert of an existing id counts twice until flushed | each index or replace |
+| `vector_dims` | Widest vector a document may carry, supplied or produced by native embedding | each index or replace |
+| `weight` | Permits per round-robin turn in the search queue (default 1) | search admission |
+
+Limits stored in the control plane, cluster-wide rate limits across replicas and per-namespace
+storage quotas are not implemented yet (Phase H).
 
 ## Query and relevance
 
@@ -321,6 +375,7 @@ that, so a rolling upgrade with mixed peers works.
 | `KOSHA_METRICS` | `off` (or `false`, `0`) makes `GET /metrics` return 404 | on | flag |
 | `KOSHA_METRICS_AUTH` | `admin` requires the `KOSHA_ADMIN_API_KEY` credential on `GET /metrics` (403 without it). `none` (or unset) leaves it open, like `/healthz`. Any other value is treated as `admin` | `none` | `none` \| `admin` |
 | `KOSHA_METRICS_NAMESPACE_LABELS` | `on` (or `true`, `1`) adds a `namespace` label to `kosha_search_requests_total`. One series per namespace and outcome, and it publishes tenant namespace names to whoever can scrape. See `metrics.md` | off | flag |
+| `KOSHA_METRICS_TENANT_LABELS` | `on` (or `true`, `1`) adds a `tenant` label to `kosha_tenant_rejections_total`. One series per tenant and reason, and it publishes tenant ids to whoever can scrape. See `metrics.md` | off | flag |
 
 ## Roles
 
