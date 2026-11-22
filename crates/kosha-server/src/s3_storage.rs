@@ -2683,4 +2683,105 @@ mod sse_request_tests {
         assert_eq!(requests.len(), 1);
         assert_kms(&requests[0], ACME_KEY);
     }
+
+    /// Key rotation (#343): pointing a tenant at a new KMS key in
+    /// `KOSHA_S3_TENANT_KMS_KEYS(_FILE)` takes effect on the next start for
+    /// every new write (PUT, multipart, copy). Objects written under the old
+    /// key stay readable: a GET carries no SSE headers, because S3 decrypts
+    /// with the key recorded on each object (the pod's role must keep
+    /// `kms:Decrypt` on the old key, and the key must stay enabled).
+    #[test]
+    fn rotating_a_tenant_key_applies_to_new_writes_and_old_objects_stay_readable() {
+        const OLD_KEY: &str = "arn:aws:kms:us-east-1:111122223333:key/acme-old";
+        const NEW_KEY: &str = "arn:aws:kms:us-east-1:111122223333:key/acme-new";
+        let root = temp_root("rotate");
+        let keys_file = root.join("tenant-kms-keys.json");
+        let seg = "acme/docs/docs-000001";
+        std::fs::create_dir_all(root.join(seg)).unwrap();
+
+        // What a pod builds at startup from the mounted keys file.
+        let start_pod = |inline: Option<&str>| {
+            let file = keys_file.to_str().unwrap().to_string();
+            let inline = inline.map(str::to_string);
+            let sse = SseConfig::from_lookup(|name| match name {
+                "KOSHA_S3_SSE" => Some("aws:kms".into()),
+                "KOSHA_S3_SSE_KMS_KEY_ID" => Some(DEFAULT_KEY.into()),
+                "KOSHA_S3_SSE_BUCKET_KEY" => Some("true".into()),
+                "KOSHA_S3_TENANT_KMS_KEYS" => inline.clone(),
+                "KOSHA_S3_TENANT_KMS_KEYS_FILE" if inline.is_none() => Some(file.clone()),
+                _ => None,
+            })
+            .unwrap();
+            capture::storage(root.clone(), "kosha/", sse)
+        };
+        let write_all = |storage: &S3Storage, sse: Option<ObjectSse>| {
+            assert!(storage.write(&format!("{seg}/_COMMIT"), b"commit").is_err());
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let multipart = rt.block_on(put_bytes(
+                storage.client().clone(),
+                "bucket".into(),
+                storage.s3_key(&format!("{seg}/big.bin")),
+                vec![0u8; 5 * 1024 * 1024 + 1],
+                storage.sse_for_path(&format!("{seg}/big.bin")),
+            ));
+            assert!(multipart.is_err());
+            let copy = rt.block_on(
+                storage
+                    .client()
+                    .copy_object()
+                    .bucket("bucket")
+                    .key(storage.s3_key("acme/docs/docs-000002/a.bin"))
+                    .copy_source(format!(
+                        "bucket/{}",
+                        storage.s3_key(&format!("{seg}/a.bin"))
+                    ))
+                    .apply_sse(sse.as_ref())
+                    .send(),
+            );
+            assert!(copy.is_err());
+        };
+
+        // Before: acme's objects are encrypted with the old key.
+        std::fs::write(&keys_file, format!(r#"{{"acme": "{OLD_KEY}"}}"#)).unwrap();
+        let (storage, capture) = start_pod(None);
+        write_all(
+            &storage,
+            storage.sse_for_path("acme/docs/docs-000002/a.bin"),
+        );
+        let requests = capture.take();
+        assert_eq!(requests.len(), 3, "{requests:?}");
+        for request in &requests {
+            assert_kms(request, OLD_KEY);
+        }
+
+        // Rotate: the operator edits the mounted file and restarts the pod.
+        std::fs::write(&keys_file, format!(r#"{{"acme": "{NEW_KEY}"}}"#)).unwrap();
+        let (storage, capture) = start_pod(None);
+        write_all(
+            &storage,
+            storage.sse_for_path("acme/docs/docs-000002/a.bin"),
+        );
+        let requests = capture.take();
+        assert_eq!(requests.len(), 3, "{requests:?}");
+        assert_eq!(requests[0].method, "PUT");
+        assert!(requests[1].uri.contains("uploads"), "{}", requests[1].uri);
+        assert!(requests[2].header("x-amz-copy-source").is_some());
+        for request in &requests {
+            assert_kms(request, NEW_KEY);
+        }
+
+        // Old objects: a read names no key at all, so nothing about the
+        // rotation can make an object written under OLD_KEY unreadable.
+        assert!(storage.read_remote(&format!("{seg}/a.bin")).is_err());
+        let reads = capture.take();
+        assert_eq!(reads.len(), 1, "{reads:?}");
+        assert_eq!(reads[0].method, "GET");
+        assert!(reads[0].sse_headers().is_empty(), "{reads:?}");
+
+        // The inline variable rotates the same way.
+        let (storage, capture) = start_pod(Some(&format!("acme={NEW_KEY}")));
+        assert!(storage.write(&format!("{seg}/_COMMIT"), b"c").is_err());
+        assert_kms(&capture.take()[0], NEW_KEY);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
