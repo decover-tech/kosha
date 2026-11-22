@@ -543,7 +543,9 @@ pub struct Indexer {
 impl Indexer {
     pub fn new(data_dir: PathBuf) -> Self {
         let wal_dir = data_dir.join("_wal");
-        std::fs::create_dir_all(&wal_dir).ok();
+        if let Err(e) = std::fs::create_dir_all(&wal_dir) {
+            eprintln!("ERROR: cannot create WAL dir {}: {e}", wal_dir.display());
+        }
         let (wal, records) = crate::wal::WalWriter::open(
             Arc::new(crate::wal::LocalWalStore::new(wal_dir)),
             crate::wal::GroupCommitConfig::from_env(),

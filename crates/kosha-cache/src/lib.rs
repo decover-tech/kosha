@@ -324,7 +324,9 @@ impl Cache {
         options: CacheOptions,
         shares: TenantShares,
     ) -> Self {
-        std::fs::create_dir_all(&cache_dir).ok();
+        if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+            eprintln!("ERROR: cannot create {}: {e}", cache_dir.display());
+        }
         let (recency, sizes) = Self::scan_existing(&cache_dir);
         let mut tracked = Tracked::default();
         let mut total_bytes = 0u64;
