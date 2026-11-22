@@ -283,6 +283,9 @@ pub struct RequestHydration {
     /// Ceiling in bytes; `u64::MAX` disables shedding.
     ceiling: u64,
     shed: AtomicBool,
+    /// Shed because a fetch waited out the pod's in-flight budget, rather
+    /// than because the request went over its own ceiling.
+    shed_waiting: AtomicBool,
     wait_micros: AtomicU64,
 }
 
@@ -292,6 +295,7 @@ impl RequestHydration {
             fetched_bytes: AtomicU64::new(0),
             ceiling,
             shed: AtomicBool::new(false),
+            shed_waiting: AtomicBool::new(false),
             wait_micros: AtomicU64::new(0),
         }
     }
@@ -345,7 +349,27 @@ impl RequestHydration {
         if self.ceiling == u64::MAX {
             return;
         }
+        self.shed_waiting.store(true, Ordering::Relaxed);
         self.shed.store(true, Ordering::Relaxed);
+    }
+
+    /// Why the request was shed, for its log line.
+    pub fn shed_reason(&self) -> String {
+        let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+        if self.shed_waiting.load(Ordering::Relaxed) {
+            format!(
+                "a fetch waited out the pod's in-flight budget (KOSHA_HYDRATE_BYTE_BUDGET), \
+                 waited_ms={:.0} fetched_mb={:.1}",
+                self.wait_ms(),
+                mb(self.fetched_bytes())
+            )
+        } else {
+            format!(
+                "over the request ceiling (KOSHA_HYDRATE_REQUEST_MAX_BYTES) fetched_mb={:.1} ceiling_mb={:.1}",
+                mb(self.fetched_bytes()),
+                mb(self.ceiling)
+            )
+        }
     }
 
     pub fn is_shed(&self) -> bool {

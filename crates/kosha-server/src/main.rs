@@ -593,6 +593,8 @@ struct HydrationOutcome {
     /// broken when the server merely declined to pull multiple GB inside
     /// one request.
     shed: bool,
+    /// Why `shed` is set, for the 429's log line.
+    shed_reason: Option<String>,
     /// Bytes the page's documents pulled from S3 after scoring (#245):
     /// ranged spans or whole files. Filled in after the search runs.
     page: doc_spans::PageFetchStats,
@@ -607,6 +609,16 @@ struct HydrationOutcome {
     /// (#245). Segments fetch concurrently, so `rounds` is the most any one
     /// segment needed. Filled in after the search runs.
     vectors: posting_spans::PostingFetchStats,
+}
+
+impl HydrationOutcome {
+    /// Mark the outcome shed (never unmark) if `request` was, with why.
+    fn set_shed(&mut self, request: &RequestHydration) {
+        if request.is_shed() {
+            self.shed = true;
+            self.shed_reason = Some(request.shed_reason());
+        }
+    }
 }
 
 impl HydrationOutcome {
@@ -3306,11 +3318,11 @@ impl AppState {
             // already decided not to serve.
             if request.is_shed() {
                 println!(
-                    "hydrate_files shed: stopped at chunk {}/{} after {:.1}MB \
-                     (KOSHA_HYDRATE_REQUEST_MAX_BYTES)",
+                    "hydrate_files shed: stopped at chunk {}/{}: {}{}",
                     chunk_idx + 1,
                     total_chunks,
-                    request.fetched_bytes() as f64 / (1024.0 * 1024.0),
+                    request.shed_reason(),
+                    request_id()
                 );
                 break;
             }
@@ -4144,7 +4156,7 @@ impl AppState {
         // aren't local), but the caller must not report it as a hydration
         // *failure* — nothing failed, the request declined to pull that
         // much. See `HydrationOutcome::shed`.
-        outcome.shed = request.is_shed();
+        outcome.set_shed(request);
         outcome
     }
 
@@ -4862,7 +4874,7 @@ impl AppState {
         self.posting_reads.record(&stats);
         outcome.rounds = stats.rounds;
         outcome.postings = stats;
-        outcome.shed |= request.is_shed();
+        outcome.set_shed(request);
         outcome
     }
 
@@ -5141,7 +5153,7 @@ impl AppState {
         // Set here as well as in `hydrate_segments_for_search`: on a warm
         // namespace the cached hydration verdict routes a query straight to
         // this function, and its outcome is the only one the handler sees.
-        outcome.shed = request.is_shed();
+        outcome.set_shed(request);
         outcome
     }
 
@@ -10828,6 +10840,11 @@ fn posting_blob_files_for_query<'a>(
 #[cfg(feature = "s3")]
 fn hydration_error_response(outcome: &HydrationOutcome) -> Option<String> {
     if outcome.shed {
+        eprintln!(
+            "WARN: search shed: {}{}",
+            outcome.shed_reason.as_deref().unwrap_or("-"),
+            request_id()
+        );
         return Some(hydration_shed_response());
     }
     if !outcome.missing.is_empty() {
