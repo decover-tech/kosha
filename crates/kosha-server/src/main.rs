@@ -7654,6 +7654,9 @@ fn handle_stats(state: &AppState) -> String {
         "s3_prefix": s3_prefix,
         "doc_store_reads": state.doc_store_reads.to_json(state.doc_read_mode),
         "posting_reads": state.posting_reads.to_json(state.posting_read_mode),
+        // Process-wide count of scoring blocks varint-decoded (#385); a
+        // bench diffs it around a run for blocks decoded per query.
+        "scoring_blocks_decoded": kosha_segment::scoring_blocks_decoded(),
         "manifest_refresh": state
             .ingest_host
             .is_some()

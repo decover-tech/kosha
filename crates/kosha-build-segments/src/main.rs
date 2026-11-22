@@ -24,7 +24,7 @@ use std::sync::mpsc;
 
 use clap::Parser;
 use kosha_core::{Bm25Params, DocumentId, Field, SegmentId};
-use kosha_segment::{SegmentWriter, VectorQuantizationConfig};
+use kosha_segment::{BpConfig, DocReorder, SegmentWriter, VectorQuantizationConfig};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -65,6 +65,12 @@ struct Args {
     /// server's writers do.
     #[arg(long)]
     vector_quantization: Option<String>,
+    /// Reorder each segment's documents before writing it (#385): `off`
+    /// keeps ingest order, `bp` uses recursive graph bisection over the
+    /// documents' terms. Unset follows KOSHA_DOC_REORDER (default off).
+    /// The output format is unchanged either way.
+    #[arg(long)]
+    doc_reorder: Option<String>,
     #[arg(long, default_value_t = 1.2)]
     bm25_k1: f64,
     #[arg(long, default_value_t = 0.75)]
@@ -196,6 +202,15 @@ fn main() {
             .unwrap_or_else(|| panic!("--vector-quantization {raw:?}: expected f32 or i8"));
         VectorQuantizationConfig::all(q)
     });
+    let doc_reorder = match args.doc_reorder.as_deref() {
+        None => DocReorder::from_env(),
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" => DocReorder::Off,
+            "bp" => DocReorder::Bp,
+            _ => panic!("--doc-reorder {raw:?}: expected off or bp"),
+        },
+    };
+    println!("doc reorder: {}", doc_reorder.as_str());
     let ns_out = args.out_dir.join(&args.namespace);
     std::fs::create_dir_all(&ns_out).expect("create out dir");
 
@@ -225,16 +240,35 @@ fn main() {
                     if let Some(q) = &quantization {
                         w = w.with_vector_quantization(q.clone());
                     }
-                    for (id, fields) in docs {
-                        w.add_document(id, fields);
+                    let mut reorder_secs = 0.0;
+                    if doc_reorder == DocReorder::Bp {
+                        // doc_seq follows add order, so adding in BP order
+                        // remaps every per-doc structure at once (#385).
+                        let tr = std::time::Instant::now();
+                        let order = w.bp_order(
+                            docs.iter().map(|(_, fields)| fields.as_slice()),
+                            &BpConfig::default(),
+                        );
+                        let mut slots: Vec<Option<(DocumentId, Vec<Field>)>> =
+                            docs.into_iter().map(Some).collect();
+                        reorder_secs = tr.elapsed().as_secs_f64();
+                        for old in order {
+                            let (id, fields) = slots[old as usize].take().expect("permutation");
+                            w.add_document(id, fields);
+                        }
+                    } else {
+                        for (id, fields) in docs {
+                            w.add_document(id, fields);
+                        }
                     }
                     w.finalize(bm25.clone())
                         .unwrap_or_else(|e| panic!("finalize {} failed: {e}", seg_id.0));
                     built += 1;
                     println!(
-                        "segment {} sealed: {n} docs in {:.1}s",
+                        "segment {} sealed: {n} docs in {:.1}s (reorder {:.1}s)",
                         seg_id.0,
-                        t.elapsed().as_secs_f64()
+                        t.elapsed().as_secs_f64(),
+                        reorder_secs
                     );
                 }
                 built

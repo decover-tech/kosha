@@ -518,6 +518,10 @@ pub struct Indexer {
     /// so a restarted writer never hands out a fingerprint an earlier
     /// process used for a different tail.
     instance: String,
+    /// Whether compaction writes its merged segment's documents in
+    /// recursive-graph-bisection order (#385). `KOSHA_DOC_REORDER`,
+    /// default off; see [`kosha_segment::DocReorder`].
+    doc_reorder: kosha_segment::DocReorder,
 }
 
 impl Indexer {
@@ -568,6 +572,7 @@ impl Indexer {
             min_docs_per_flush_writer: 1000,
             local_retired: Mutex::new(Vec::new()),
             instance: uuid::Uuid::new_v4().simple().to_string(),
+            doc_reorder: kosha_segment::DocReorder::from_env(),
         };
 
         // Recover un-flushed documents from WAL on startup.
@@ -604,6 +609,13 @@ impl Indexer {
     /// Enable or disable the WAL.
     pub fn with_wal(mut self, enabled: bool) -> Self {
         self.wal_enabled = enabled;
+        self
+    }
+
+    /// Compact into segments whose documents are reordered by `mode`
+    /// (#385), regardless of `KOSHA_DOC_REORDER`.
+    pub fn with_doc_reorder(mut self, mode: kosha_segment::DocReorder) -> Self {
+        self.doc_reorder = mode;
         self
     }
 
@@ -1999,46 +2011,120 @@ impl Indexer {
         let mut seq_remap: HashMap<(SegmentId, u32), u32> = HashMap::new();
         let mut next_new_seq: u32 = 0;
 
-        for entry in &plan.inputs {
-            let reader = kosha_segment::SegmentReader::open(input_dirs[&entry.segment_id].clone())?;
-            let ts = tombstones.get(&entry.segment_id);
-            // This input's old doc_seq → merged doc_seq (`u32::MAX`: not
-            // copied), for seeding the merged vector index (#253).
-            let mut input_remap: Vec<u32> = Vec::new();
-            // `?` here is deliberate: a doc that fails to read must abort
-            // the whole compaction, not just be skipped from the merge
-            // output — see `iter_doc_records`'s doc comment for the
-            // incident this silent-drop used to cause. `add_document`
-            // streams into `seg_dir/.build` (#242), but aborting here drops
-            // the writer, and `SegmentWriter`'s `Drop` removes that scratch
-            // (and `seg_dir` itself, still empty), so no partial output is
-            // left on disk.
-            //
-            // `iter_doc_records_raw` hands sidecar vectors over as f32, so
-            // they pass straight into the output without a JSON round trip
-            // (#242); inline-stored vectors stay JSON in their fields.
-            for raw in reader.iter_doc_records_raw() {
-                let kosha_segment::RawDocRecord {
-                    record: doc_rec,
-                    vectors,
-                } = raw?;
-                if ts.is_some_and(|set| set.contains(&doc_rec.doc_seq)) {
-                    continue;
-                }
-                seq_remap.insert((entry.segment_id.clone(), doc_rec.doc_seq), next_new_seq);
-                if seed_vectors {
-                    let old = doc_rec.doc_seq as usize;
-                    if input_remap.len() <= old {
-                        input_remap.resize(old + 1, u32::MAX);
+        if self.doc_reorder == kosha_segment::DocReorder::Bp {
+            // #385: the merged output's doc_seqs follow recursive graph
+            // bisection instead of input order. Every live input document
+            // is buffered (memory: the whole merged output's stored
+            // records, unlike the streaming path below), ordered, then
+            // added in that order, so the writer's own doc_seq-keyed
+            // structures follow; `seq_remap` and the vector seeds are
+            // remapped from the same order. Experimental, off by default.
+            let mut readers = Vec::with_capacity(plan.inputs.len());
+            type Buffered = (
+                usize,
+                u32,
+                DocumentId,
+                Vec<kosha_core::Field>,
+                Vec<(usize, Vec<f32>)>,
+            );
+            let mut buffered: Vec<Buffered> = Vec::new();
+            for (input, entry) in plan.inputs.iter().enumerate() {
+                let reader =
+                    kosha_segment::SegmentReader::open(input_dirs[&entry.segment_id].clone())?;
+                let ts = tombstones.get(&entry.segment_id);
+                // `?`: a doc that fails to read aborts the compaction, as
+                // in the streaming path below.
+                for raw in reader.iter_doc_records_raw() {
+                    let kosha_segment::RawDocRecord {
+                        record: doc_rec,
+                        vectors,
+                    } = raw?;
+                    if ts.is_some_and(|set| set.contains(&doc_rec.doc_seq)) {
+                        continue;
                     }
-                    input_remap[old] = next_new_seq;
+                    buffered.push((
+                        input,
+                        doc_rec.doc_seq,
+                        doc_rec.doc_id,
+                        doc_rec.fields,
+                        vectors,
+                    ));
+                }
+                readers.push(reader);
+            }
+            let order = writer.bp_order(
+                buffered.iter().map(|b| b.3.as_slice()),
+                &kosha_segment::BpConfig::default(),
+            );
+            let mut input_remaps: Vec<Vec<u32>> = vec![Vec::new(); plan.inputs.len()];
+            let mut slots: Vec<Option<Buffered>> = buffered.into_iter().map(Some).collect();
+            for old in order {
+                let (input, old_seq, doc_id, fields, vectors) = slots[old as usize]
+                    .take()
+                    .expect("bp_order is a permutation");
+                seq_remap.insert(
+                    (plan.inputs[input].segment_id.clone(), old_seq),
+                    next_new_seq,
+                );
+                if seed_vectors {
+                    let remap = &mut input_remaps[input];
+                    if remap.len() <= old_seq as usize {
+                        remap.resize(old_seq as usize + 1, u32::MAX);
+                    }
+                    remap[old_seq as usize] = next_new_seq;
                 }
                 next_new_seq += 1;
-                writer.add_document_with_vectors(doc_rec.doc_id, doc_rec.fields, vectors);
+                writer.add_document_with_vectors(doc_id, fields, vectors);
                 any_docs = true;
             }
             if seed_vectors {
-                seed_merged_vector_index(&reader, &input_remap, &mut writer);
+                for (reader, remap) in readers.iter().zip(&input_remaps) {
+                    seed_merged_vector_index(reader, remap, &mut writer);
+                }
+            }
+        } else {
+            for entry in &plan.inputs {
+                let reader =
+                    kosha_segment::SegmentReader::open(input_dirs[&entry.segment_id].clone())?;
+                let ts = tombstones.get(&entry.segment_id);
+                // This input's old doc_seq → merged doc_seq (`u32::MAX`: not
+                // copied), for seeding the merged vector index (#253).
+                let mut input_remap: Vec<u32> = Vec::new();
+                // `?` here is deliberate: a doc that fails to read must abort
+                // the whole compaction, not just be skipped from the merge
+                // output — see `iter_doc_records`'s doc comment for the
+                // incident this silent-drop used to cause. `add_document`
+                // streams into `seg_dir/.build` (#242), but aborting here drops
+                // the writer, and `SegmentWriter`'s `Drop` removes that scratch
+                // (and `seg_dir` itself, still empty), so no partial output is
+                // left on disk.
+                //
+                // `iter_doc_records_raw` hands sidecar vectors over as f32, so
+                // they pass straight into the output without a JSON round trip
+                // (#242); inline-stored vectors stay JSON in their fields.
+                for raw in reader.iter_doc_records_raw() {
+                    let kosha_segment::RawDocRecord {
+                        record: doc_rec,
+                        vectors,
+                    } = raw?;
+                    if ts.is_some_and(|set| set.contains(&doc_rec.doc_seq)) {
+                        continue;
+                    }
+                    seq_remap.insert((entry.segment_id.clone(), doc_rec.doc_seq), next_new_seq);
+                    if seed_vectors {
+                        let old = doc_rec.doc_seq as usize;
+                        if input_remap.len() <= old {
+                            input_remap.resize(old + 1, u32::MAX);
+                        }
+                        input_remap[old] = next_new_seq;
+                    }
+                    next_new_seq += 1;
+                    writer.add_document_with_vectors(doc_rec.doc_id, doc_rec.fields, vectors);
+                    any_docs = true;
+                }
+                if seed_vectors {
+                    seed_merged_vector_index(&reader, &input_remap, &mut writer);
+                }
             }
         }
 
@@ -5822,6 +5908,90 @@ mod tests {
              not silently discarded: {live_tombstones:?}"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #385: with BP reordering on, the merged output's doc_seqs are not in
+    /// input order, so a delete landing mid-merge must still be carried
+    /// forward onto the right merged doc_seqs (the same `seq_remap` the
+    /// reordered adds used), and pre-merge tombstones must still exclude
+    /// their documents.
+    #[test]
+    fn bp_compaction_remaps_tombstones_to_reordered_doc_seqs() {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-compact-bp-tombstones-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let idx = Indexer::new(dir.clone())
+            .with_flush_threshold(40)
+            .with_doc_reorder(kosha_segment::DocReorder::Bp);
+        // Two topics, interleaved, so BP really moves documents.
+        let docs: Vec<Document> = (0..120)
+            .map(|i| Document {
+                id: DocumentId(format!("d{i:03}")),
+                fields: vec![
+                    Field::text(
+                        "title",
+                        if i % 2 == 0 {
+                            "alpha beta gamma delta"
+                        } else {
+                            "omega sigma kappa lambda"
+                        },
+                    ),
+                    Field::keyword("bucket", format!("b{}", i % 7)),
+                ],
+            })
+            .collect();
+        let mut docs = docs.into_iter();
+        for _ in 0..3 {
+            idx.index_documents(ns.clone(), docs.by_ref().take(40).collect())
+                .unwrap();
+            idx.flush_namespace(&ns).unwrap();
+        }
+        assert_eq!(idx.manifest(&ns).unwrap().segments.len(), 3);
+        let m = idx.manifest(&ns).unwrap();
+        let pre: FilterClause = serde_json::from_str(r#"{"term": {"bucket": "b0"}}"#).unwrap();
+        assert_eq!(idx.delete_by_query(&ns, &m, &pre).unwrap(), 18);
+
+        let mid: FilterClause = serde_json::from_str(r#"{"term": {"bucket": "b3"}}"#).unwrap();
+        let ns_hook = ns.clone();
+        let result = idx
+            .compact_namespace_with_options_impl(&ns, CompactOptions::full(), || {
+                assert_eq!(idx.delete_by_query(&ns_hook, &m, &mid).unwrap(), 17);
+            })
+            .unwrap();
+        assert!(result.merged);
+
+        let m = idx.manifest(&ns).unwrap();
+        assert_eq!(m.segments.len(), 1);
+        let seg_id = m.segments[0].segment_id.clone();
+        let reader = kosha_segment::SegmentReader::open(dir.join("test").join(&seg_id.0)).unwrap();
+        assert_eq!(
+            reader.doc_count(),
+            120 - 18,
+            "pre-merge deletes are dropped"
+        );
+        let ids: Vec<String> = (0..reader.doc_count())
+            .map(|s| reader.doc_record_full(s).unwrap().unwrap().doc_id.0)
+            .collect();
+        let input_order: Vec<String> = (0..120)
+            .filter(|i| i % 7 != 0)
+            .map(|i| format!("d{i:03}"))
+            .collect();
+        assert_ne!(ids, input_order, "BP should have reordered the documents");
+        let tombstones = idx.get_tombstones(&ns).unwrap();
+        let mut deleted: Vec<String> = tombstones[&seg_id]
+            .iter()
+            .map(|&s| ids[s as usize].clone())
+            .collect();
+        deleted.sort();
+        let want: Vec<String> = (0..120)
+            .filter(|i| i % 7 == 3)
+            .map(|i| format!("d{i:03}"))
+            .collect();
+        assert_eq!(deleted, want);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

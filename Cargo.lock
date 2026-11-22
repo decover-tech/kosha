@@ -2188,6 +2188,7 @@ dependencies = [
  "kosha-core",
  "kosha-vector-spfresh",
  "proptest",
+ "rayon",
  "roaring",
  "rust-stemmers",
  "serde",

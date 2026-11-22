@@ -2,6 +2,7 @@ pub mod analysis;
 pub mod filter_columns;
 pub mod filter_eval;
 pub mod multivec;
+pub mod reorder;
 pub mod span_cache;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -21,6 +22,7 @@ use kosha_core::{AnalysisConfig, AnalyzerSpec, SegmentAnalysis};
 
 pub use analysis::Analyzer;
 pub use multivec::{LateInteractionHits, LateInteractionParams};
+pub use reorder::{BpConfig, DocReorder};
 
 /// A point in HNSW space using cosine distance.
 #[derive(Clone)]
@@ -396,6 +398,35 @@ impl SegmentWriter {
 
     pub fn add_document(&mut self, doc_id: DocumentId, fields: Vec<Field>) {
         self.add_document_with_vectors(doc_id, fields, Vec::new());
+    }
+
+    /// Recursive-graph-bisection order (#385) for `docs`, documents about
+    /// to be added to this writer: `order[new] = old`, `old` indexing
+    /// `docs`. Terms come from this writer's own analyzers, so they are the
+    /// terms the documents' postings will hold. Adding `docs` in this order
+    /// is all reordering takes: every `doc_seq`-keyed structure follows the
+    /// add order. See [`reorder`].
+    pub fn bp_order<'a, I>(&self, docs: I, config: &BpConfig) -> Vec<u32>
+    where
+        I: IntoIterator<Item = &'a [Field]>,
+    {
+        let mut forward = reorder::ForwardIndex::new();
+        let mut terms: Vec<String> = Vec::new();
+        for fields in docs {
+            terms.clear();
+            for field in fields {
+                if field.field_type != FieldType::Text {
+                    continue;
+                }
+                let analyzer = self
+                    .field_analyzers
+                    .get(&field.name)
+                    .unwrap_or(&self.default_analyzer);
+                terms.extend(analyzer.analyze(&field.value));
+            }
+            forward.push_doc(terms.iter());
+        }
+        forward.bp_order(config)
     }
 
     /// [`Self::add_document`] with some `Vector` fields' values supplied
@@ -4758,6 +4789,18 @@ fn write_postings_skip_split(out: &mut Vec<u8>, postings: &[Posting], field_leng
     }
 }
 
+/// Scoring blocks varint-decoded by [`BlockedTermPostings::read_block`]
+/// since process start, across every segment and query (#385). Read with
+/// [`scoring_blocks_decoded`]; a bench diffs it around a run and divides by
+/// the request count to get blocks decoded per query. One relaxed atomic
+/// add per decoded block (each decodes up to `SCORING_BLOCK_LEN` postings).
+static SCORING_BLOCKS_DECODED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`SCORING_BLOCKS_DECODED`].
+pub fn scoring_blocks_decoded() -> u64 {
+    SCORING_BLOCKS_DECODED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// One term's parsed v5 span: skip table in memory, scoring/position bytes
 /// shared, blocks decoded strictly on demand — a block the WAND pruning or
 /// the leapfrog gallop steps over is never varint-decoded at all.
@@ -4841,6 +4884,7 @@ impl BlockedTermPostings {
     /// the other formats.
     pub fn read_block(&self, block: usize, out: &mut Vec<ScoringPosting>) -> bool {
         out.clear();
+        SCORING_BLOCKS_DECODED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(summary) = self.blocks.get(block) else {
             return false;
         };

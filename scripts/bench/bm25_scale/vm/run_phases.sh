@@ -158,6 +158,7 @@ phase() { # phase <label> <extra-args...>
     --queries-file /data/queries.txt --api-key "$API_KEY" \
     --qps "$QPS" --topk 10 --duration "$DURATION" --timeout 600 \
     --server-timings --raw-out "$OUT/$label.requests.jsonl.gz" --return "$RETURN_FIELDS" \
+    --stats-api-key "${KOSHA_ADMIN_API_KEY:-sk-bench-admin}" \
     "$@" --out "$OUT/$label.json"
   save_server_log "$label" "$since"
   echo "PHASE-COMPLETE $label"

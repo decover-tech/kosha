@@ -274,6 +274,26 @@ Approximate times per stage:
 For comparison, `warm_gate=preload` on the original vector snapshot
 spends about 115 minutes in warmup alone, before its phases.
 
+### Docid reordering and blocks decoded (#385, experimental)
+
+`KOSHA_DOC_REORDER=bp` makes `kosha-build-segments` (and compaction)
+write each segment's documents in recursive-graph-bisection order. The
+segment format is unchanged and results are identical (ties break on
+`_id`); postings get smaller and block-max pruning should skip more.
+Default `off`. `kosha-build-segments --doc-reorder off|bp` overrides the
+env var. To compare, build both orders offline under new snapshot names
+(the harness's `bm25_snapshot` + `server_env`, which reaches the builder
+through `BUILD_DOCKER_ENV`): one with no `server_env`, one with
+`server_env=KOSHA_DOC_REORDER=bp`. The existing `msmarco-10m` snapshot was
+loaded through the server, so it is not the like-for-like "off" baseline.
+
+`GET /stats` (admin) reports `scoring_blocks_decoded`, a process-wide
+count of posting blocks varint-decoded. `run_phases.sh` passes the admin
+key to `query_bench.py --stats-api-key`, which reads it before and after
+each phase and writes `scoring_blocks_decoded` and
+`scoring_blocks_decoded_per_request` to the phase JSON (absent against an
+older server). It is only per-query while nothing else queries the server.
+
 ## Logs and tail analysis
 
 Every CI benchmark run (`.github/workflows/benchmark.yml`) archives its
