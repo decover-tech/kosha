@@ -19,7 +19,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::time::SystemTime;
 
@@ -240,6 +240,9 @@ pub struct Cache {
     /// Bumped once per file/dir actually removed by `evict` — see
     /// `eviction_generation()`.
     eviction_generation: AtomicU64,
+    /// Whether the last `enforce_limit` ended over `max_bytes` because every
+    /// remaining file was pinned. Logged on each change, not on every write.
+    over_budget: AtomicBool,
     /// Cache keys ordered oldest-touched (front) to most-recently-touched
     /// (back). Touched on both read and write.
     recency: Mutex<Recency>,
@@ -338,6 +341,7 @@ impl Cache {
             max_bytes: options.max_bytes,
             total_bytes: AtomicU64::new(total_bytes),
             eviction_generation: AtomicU64::new(0),
+            over_budget: AtomicBool::new(false),
             recency: Mutex::new(Recency::from_order(recency)),
             pinned: Mutex::new(HashMap::new()),
             tracked: Mutex::new(tracked),
@@ -638,6 +642,21 @@ impl Cache {
                 before.saturating_sub(now) as f64 / 1048576.0,
                 now as f64 / 1048576.0,
                 max as f64 / 1048576.0
+            );
+        }
+        let now = self.total_bytes.load(Ordering::Relaxed);
+        let over = now > max;
+        if self.over_budget.swap(over, Ordering::Relaxed) != over {
+            println!(
+                "disk cache {}: size_mb={:.1} max_mb={:.1} pinned_keys={}",
+                if over {
+                    "over budget, every remaining file is pinned by in-flight work"
+                } else {
+                    "back within budget"
+                },
+                now as f64 / 1048576.0,
+                max as f64 / 1048576.0,
+                self.pinned.lock().unwrap().len()
             );
         }
     }
