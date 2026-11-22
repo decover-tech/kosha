@@ -8,7 +8,10 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use kosha_core::deletion::{DeletionFilter, DeletionRecord, NewDeletion};
 use kosha_core::{ControlStore, KoshaError, Manifest, NamespaceId};
+
+mod deletion;
 
 mod namespace_rename;
 pub use namespace_rename::{rekey_manifest_references, NamespaceRename, RenameOutcome};
@@ -48,6 +51,9 @@ pub struct Controller {
     /// Rows are never removed: a released lease only expires, keeping its
     /// token for the next holder to exceed.
     writer_leases: HashMap<NamespaceId, WriterLease>,
+    /// Deletion records (#347), the in-memory twin of
+    /// `kosha.deletion_records`.
+    deletions: deletion::DeletionLog,
 }
 
 /// One namespace's writer lease.
@@ -69,6 +75,7 @@ impl Controller {
             namespaces: Vec::new(),
             retired: HashMap::new(),
             writer_leases: HashMap::new(),
+            deletions: deletion::DeletionLog::default(),
         }
     }
 
@@ -119,6 +126,44 @@ impl Controller {
             .max(retire_at_least);
         self.retired.insert(id.clone(), retired);
         Ok((manifest, retired))
+    }
+
+    /// See [`ControlStore::delete_namespace_recorded`].
+    pub fn delete_namespace_recorded(
+        &mut self,
+        id: &NamespaceId,
+        retire_at_least: u64,
+        deletion: &NewDeletion,
+    ) -> Result<(Manifest, u64, DeletionRecord), KoshaError> {
+        let (manifest, retired) = self.delete_namespace(id, retire_at_least)?;
+        let record = self.deletions.begin(deletion, retired);
+        Ok((manifest, retired, record))
+    }
+
+    /// See [`ControlStore::begin_deletion`].
+    pub fn begin_deletion(&mut self, deletion: &NewDeletion, last_version: u64) -> DeletionRecord {
+        self.deletions.begin(deletion, last_version)
+    }
+
+    /// See [`ControlStore::record_deletion_attempt`].
+    pub fn record_deletion_attempt(
+        &mut self,
+        deletion_id: &str,
+        objects_deleted: u64,
+        error: Option<&str>,
+    ) -> Result<DeletionRecord, KoshaError> {
+        self.deletions
+            .record_attempt(deletion_id, objects_deleted, error)
+    }
+
+    /// See [`ControlStore::deletion`].
+    pub fn deletion(&self, deletion_id: &str) -> Option<DeletionRecord> {
+        self.deletions.get(deletion_id)
+    }
+
+    /// See [`ControlStore::deletions`].
+    pub fn deletions(&self, filter: &DeletionFilter) -> Vec<DeletionRecord> {
+        self.deletions.list(filter)
     }
 
     /// Check if a namespace exists.
@@ -368,6 +413,35 @@ impl ControlStore for Controller {
     fn remove_namespace(&mut self, id: &NamespaceId) -> Result<Option<Manifest>, KoshaError> {
         Ok(self.remove_namespace(id))
     }
+    fn delete_namespace_recorded(
+        &mut self,
+        id: &NamespaceId,
+        retire_at_least: u64,
+        deletion: &NewDeletion,
+    ) -> Result<(Manifest, u64, DeletionRecord), KoshaError> {
+        self.delete_namespace_recorded(id, retire_at_least, deletion)
+    }
+    fn begin_deletion(
+        &mut self,
+        deletion: &NewDeletion,
+        last_version: u64,
+    ) -> Result<DeletionRecord, KoshaError> {
+        Ok(self.begin_deletion(deletion, last_version))
+    }
+    fn record_deletion_attempt(
+        &mut self,
+        deletion_id: &str,
+        objects_deleted: u64,
+        error: Option<&str>,
+    ) -> Result<DeletionRecord, KoshaError> {
+        self.record_deletion_attempt(deletion_id, objects_deleted, error)
+    }
+    fn deletion(&self, deletion_id: &str) -> Result<Option<DeletionRecord>, KoshaError> {
+        Ok(self.deletion(deletion_id))
+    }
+    fn deletions(&self, filter: &DeletionFilter) -> Result<Vec<DeletionRecord>, KoshaError> {
+        Ok(self.deletions(filter))
+    }
     fn acquire_writer_lease(
         &mut self,
         id: &NamespaceId,
@@ -470,6 +544,104 @@ mod tests {
         // An unfenced writer (no token) behaves exactly as before.
         ctrl.compare_and_swap_manifest_fenced(&ns, 2, manifest_at(3, "x3"), None)
             .unwrap();
+    }
+
+    /// #347: a recorded delete leaves a pending record at the retired
+    /// version; it completes only on an attempt without an error, and a
+    /// completed record never changes again.
+    #[test]
+    fn deletion_records_stay_pending_until_an_attempt_succeeds() {
+        use kosha_core::deletion::{DeletionScope, DeletionState};
+        let mut ctrl = Controller::new();
+        let ns = NamespaceId("acme/docs".into());
+        let request = NewDeletion::namespace(&ns.0, Some("acme"), None);
+        // Nothing to delete: nothing recorded.
+        assert!(matches!(
+            ctrl.delete_namespace_recorded(&ns, 0, &request),
+            Err(KoshaError::NamespaceNotFound(_))
+        ));
+        assert!(ctrl.deletions(&DeletionFilter::default()).is_empty());
+
+        ctrl.compare_and_swap_manifest(&ns, 0, manifest_at(3, "s"))
+            .unwrap();
+        let (manifest, retired, record) = ctrl.delete_namespace_recorded(&ns, 7, &request).unwrap();
+        assert_eq!((manifest.version, retired), (3, 7));
+        assert!(!ctrl.has_namespace(&ns));
+        assert_eq!(record.scope, DeletionScope::Namespace);
+        assert_eq!(record.subject, "acme/docs");
+        assert_eq!(record.tenant_id.as_deref(), Some("acme"));
+        assert_eq!(record.last_version, 7);
+        assert_eq!(record.state, DeletionState::Pending);
+        assert_eq!((record.attempts, record.objects_deleted), (0, 0));
+        assert!(record.completed_at_ms.is_none());
+
+        let failed = ctrl
+            .record_deletion_attempt(&record.id, 4, Some("S3 delete_objects: throttled"))
+            .unwrap();
+        assert_eq!(failed.state, DeletionState::Pending);
+        assert_eq!((failed.attempts, failed.objects_deleted), (1, 4));
+        assert_eq!(
+            failed.last_error.as_deref(),
+            Some("S3 delete_objects: throttled")
+        );
+        assert_eq!(ctrl.deletions(&DeletionFilter::pending()), vec![failed]);
+
+        let done = ctrl.record_deletion_attempt(&record.id, 2, None).unwrap();
+        assert_eq!(done.state, DeletionState::Completed);
+        assert_eq!((done.attempts, done.objects_deleted), (2, 6));
+        assert!(done.last_error.is_none());
+        assert!(done.completed_at_ms.is_some());
+        assert!(ctrl.deletions(&DeletionFilter::pending()).is_empty());
+        // A late attempt cannot reopen or rewrite a completed record.
+        let late = ctrl
+            .record_deletion_attempt(&record.id, 9, Some("late"))
+            .unwrap();
+        assert_eq!(late, done);
+        assert_eq!(ctrl.deletion(&record.id), Some(done));
+
+        assert!(matches!(
+            ctrl.record_deletion_attempt("del-missing", 0, None),
+            Err(KoshaError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn deletion_listings_filter_by_tenant_and_state_oldest_first() {
+        let mut ctrl = Controller::new();
+        let tenant = ctrl.begin_deletion(&NewDeletion::tenant("acme"), 0);
+        let child = ctrl.begin_deletion(
+            &NewDeletion::namespace("acme/a", Some("acme"), Some(&tenant.id)),
+            5,
+        );
+        let other =
+            ctrl.begin_deletion(&NewDeletion::namespace("globex/a", Some("globex"), None), 1);
+        assert_eq!(child.parent_id.as_deref(), Some(tenant.id.as_str()));
+        ctrl.record_deletion_attempt(&child.id, 1, None).unwrap();
+
+        let ids = |records: Vec<DeletionRecord>| -> Vec<String> {
+            records.into_iter().map(|record| record.id).collect()
+        };
+        assert_eq!(
+            ids(ctrl.deletions(&DeletionFilter::default())),
+            vec![tenant.id.clone(), child.id.clone(), other.id.clone()]
+        );
+        let acme = DeletionFilter {
+            tenant_id: Some("acme".into()),
+            ..DeletionFilter::default()
+        };
+        assert_eq!(
+            ids(ctrl.deletions(&acme)),
+            vec![tenant.id.clone(), child.id.clone()]
+        );
+        assert_eq!(
+            ids(ctrl.deletions(&DeletionFilter::pending())),
+            vec![tenant.id.clone(), other.id]
+        );
+        let first = DeletionFilter {
+            limit: Some(1),
+            ..DeletionFilter::default()
+        };
+        assert_eq!(ids(ctrl.deletions(&first)), vec![tenant.id]);
     }
 
     #[test]

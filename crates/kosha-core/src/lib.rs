@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod branch;
 pub mod deletes;
+pub mod deletion;
 pub mod fields;
 pub mod fuzzy;
 pub mod gc;
@@ -215,6 +216,77 @@ pub trait ControlStore: Send + Sync {
             "this control store cannot remove namespace {}",
             id.0
         )))
+    }
+
+    // ── Deletion records (#347) ───────────────────────────────────────────
+    //
+    // See [`deletion`]. The defaults refuse, so a store without them never
+    // drops a namespace while silently recording nothing.
+
+    /// [`ControlStore::delete_namespace`] that also writes a pending
+    /// [`deletion::DeletionRecord`] for it, atomically: either the
+    /// namespace's rows are gone and the record exists, or nothing changed.
+    /// The record's `last_version` is the returned retired version.
+    fn delete_namespace_recorded(
+        &mut self,
+        id: &NamespaceId,
+        retire_at_least: u64,
+        deletion: &deletion::NewDeletion,
+    ) -> Result<(Manifest, u64, deletion::DeletionRecord), KoshaError> {
+        let _ = (retire_at_least, deletion);
+        Err(KoshaError::ControlPlane(format!(
+            "this control store cannot record the deletion of namespace {}",
+            id.0
+        )))
+    }
+
+    /// Write a pending record for a deletion that has no namespace row to
+    /// remove with it: a tenant, or a namespace only its writer knew.
+    fn begin_deletion(
+        &mut self,
+        deletion: &deletion::NewDeletion,
+        last_version: u64,
+    ) -> Result<deletion::DeletionRecord, KoshaError> {
+        let _ = last_version;
+        Err(KoshaError::ControlPlane(format!(
+            "this control store cannot record the deletion of {}",
+            deletion.subject
+        )))
+    }
+
+    /// Record one storage-reclaim attempt on a pending record: count it,
+    /// add `objects_deleted`, and either complete the record (`error` is
+    /// `None`: storage is verified empty) or keep it pending with `error`.
+    /// A completed record is returned unchanged. `NotFound` if there is no
+    /// such record.
+    fn record_deletion_attempt(
+        &mut self,
+        deletion_id: &str,
+        objects_deleted: u64,
+        error: Option<&str>,
+    ) -> Result<deletion::DeletionRecord, KoshaError> {
+        let _ = (objects_deleted, error);
+        Err(KoshaError::ControlPlane(format!(
+            "this control store holds no deletion record {deletion_id}"
+        )))
+    }
+
+    /// One deletion record by id.
+    fn deletion(&self, deletion_id: &str) -> Result<Option<deletion::DeletionRecord>, KoshaError> {
+        Err(KoshaError::ControlPlane(format!(
+            "this control store holds no deletion record {deletion_id}"
+        )))
+    }
+
+    /// Deletion records matching `filter`, oldest first.
+    fn deletions(
+        &self,
+        filter: &deletion::DeletionFilter,
+    ) -> Result<Vec<deletion::DeletionRecord>, KoshaError> {
+        let _ = filter;
+        Err(KoshaError::ControlPlane(
+            "this control store holds no deletion records".into(),
+        ))
     }
 }
 

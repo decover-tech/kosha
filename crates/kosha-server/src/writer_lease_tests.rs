@@ -85,6 +85,58 @@ impl ControlStore for LeasedStore {
     ) -> Result<Option<kosha_core::Manifest>, KoshaError> {
         Ok(self.inner.lock().unwrap().remove_namespace(id))
     }
+    fn delete_namespace_recorded(
+        &mut self,
+        id: &NamespaceId,
+        retire_at_least: u64,
+        deletion: &kosha_core::deletion::NewDeletion,
+    ) -> Result<
+        (
+            kosha_core::Manifest,
+            u64,
+            kosha_core::deletion::DeletionRecord,
+        ),
+        KoshaError,
+    > {
+        self.inner
+            .lock()
+            .unwrap()
+            .delete_namespace_recorded(id, retire_at_least, deletion)
+    }
+    fn begin_deletion(
+        &mut self,
+        deletion: &kosha_core::deletion::NewDeletion,
+        last_version: u64,
+    ) -> Result<kosha_core::deletion::DeletionRecord, KoshaError> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .begin_deletion(deletion, last_version))
+    }
+    fn record_deletion_attempt(
+        &mut self,
+        deletion_id: &str,
+        objects_deleted: u64,
+        error: Option<&str>,
+    ) -> Result<kosha_core::deletion::DeletionRecord, KoshaError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .record_deletion_attempt(deletion_id, objects_deleted, error)
+    }
+    fn deletion(
+        &self,
+        deletion_id: &str,
+    ) -> Result<Option<kosha_core::deletion::DeletionRecord>, KoshaError> {
+        Ok(self.inner.lock().unwrap().deletion(deletion_id))
+    }
+    fn deletions(
+        &self,
+        filter: &kosha_core::deletion::DeletionFilter,
+    ) -> Result<Vec<kosha_core::deletion::DeletionRecord>, KoshaError> {
+        Ok(self.inner.lock().unwrap().deletions(filter))
+    }
     fn acquire_writer_lease(
         &mut self,
         id: &NamespaceId,

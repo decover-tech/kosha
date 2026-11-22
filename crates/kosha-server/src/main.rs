@@ -53,6 +53,7 @@ mod manifest_follow;
 mod metrics;
 #[cfg(feature = "migrate")]
 mod migrate;
+mod namespace_deletion;
 #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
 mod namespace_migrate;
 mod posting_spans;
@@ -96,6 +97,10 @@ use kosha_write::Indexer;
 
 struct AppState {
     controller: Mutex<Box<dyn ControlStore>>,
+    /// Tests only: stands in for S3 when a deletion reclaims and verifies a
+    /// namespace's objects (`namespace_deletion::RemotePrefixStore`).
+    #[cfg(test)]
+    remote_prefix_override: Option<Arc<dyn namespace_deletion::RemotePrefixStore>>,
     /// `KOSHA_ROLE`, resolved and validated (#254, `role.rs`).
     role: role::Role,
     /// Writer leases this process holds and namespaces it was fenced from
@@ -1762,6 +1767,8 @@ impl AppState {
 
         Self {
             controller: Mutex::new(control_store),
+            #[cfg(test)]
+            remote_prefix_override: None,
             role,
             writer_leases,
             compaction_on_ingest,
@@ -6311,6 +6318,10 @@ fn is_write_path(request_line: &str) -> bool {
     if request_line.starts_with("POST /v1/admin/") {
         return true;
     }
+    // Tenant deletion (#347).
+    if namespace_deletion::is_write_route(request_line) {
+        return true;
+    }
     // Compaction jobs and scheduler state live on the write pod that runs
     // them; a query pod has none, so these reads are forwarded too.
     if request_line.starts_with("GET /v1/admin/compaction-") {
@@ -6668,6 +6679,11 @@ fn route_inner(
         || request_line.starts_with("POST /v1/admin/gc?")
     {
         return handle_segment_gc(body, state);
+    }
+
+    // Tenant deletion and deletion records (#347).
+    if let Some(response) = namespace_deletion::route_admin(request_line, body, state) {
+        return response;
     }
 
     // `GET /internal/segment/...` (pod-to-pod) never reaches here: it
@@ -7049,17 +7065,22 @@ fn branches_referencing(
 /// Under the namespace's publication lock, in order:
 /// 1. the control store drops the namespace and its manifest, keeping the
 ///    highest version it reached so a re-created namespace continues above
-///    it (query replicas see a new version, never an old cached one);
+///    it (query replicas see a new version, never an old cached one), and
+///    in the same step writes a pending deletion record (#347);
 /// 2. the writer forgets the namespace: manifest, write buffer, deletes and
 ///    every WAL record of it, so neither a flush nor a restart brings the
 ///    documents back;
 /// 3. this node's caches for it are purged and its local segment
 ///    directory removed;
 /// 4. with S3, every object under the namespace's prefix is deleted,
-///    synchronously, before the response. A failure there is reported
-///    (`storage_reclaimed: false`) but does not undo the delete: the
-///    leftover objects are unreferenced, and a re-created namespace never
-///    reuses their keys (segment ids carry a random writer id).
+///    synchronously, before the response, and the prefix is listed again:
+///    the deletion record completes only if that listing is empty. A
+///    failure there is reported (`storage_reclaimed: false`, and
+///    `deletion.state` stays `pending` with `last_error`) but does not undo
+///    the delete; `POST /v1/admin/deletions/resume` retries it.
+///
+/// The response carries the record (`deletion`). See
+/// `namespace_deletion` for the record's life cycle.
 ///
 /// Query replicas keep their own disk cache of the deleted segments until
 /// LRU eviction (`KOSHA_CACHE_MAX_BYTES`); they answer 404 once they see
@@ -7067,170 +7088,10 @@ fn branches_referencing(
 /// `run_manifest_refresh_tick`, or a search with `max_staleness_seconds: 0`).
 fn handle_delete_namespace(name: &str, tenant: &str, state: &AppState) -> String {
     let id = NamespaceId(tenant_namespace(tenant, name));
-    // No branch is created from (or deleted under) this namespace while it
-    // goes (#208).
-    let _lineage = state.branch_lock.lock().unwrap();
-    // Deleting a namespace deletes everything under its prefix. A branch
-    // still listing segments or deletion bitmaps that live there would be
-    // left pointing at nothing, so the branches go first.
-    match branches_referencing(state, &id) {
-        Ok(branches) if branches.is_empty() => {}
-        Ok(branches) => {
-            return json_error(
-                409,
-                &format!(
-                    "namespace '{name}' has branches that share its segments ({}); delete \
-                     them first (DELETE /v1/namespaces/{{branch}}/branch)",
-                    branches
-                        .iter()
-                        .map(|b| b.0.split_once('/').map_or(b.0.as_str(), |(_, n)| n))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            )
-        }
-        Err(e) => return json_error(503, &format!("control store: {e}")),
+    match state.delete_namespace_recorded(&id, None) {
+        Ok(deleted) => namespace_deletion::namespace_deleted_response(name, &deleted),
+        Err(response) => response,
     }
-    // A branch goes through DELETE .../branch, which also reclaims the
-    // prefixes of deleted ancestor branches only it kept alive; deleting
-    // it here would leak those for good.
-    match state.controller.lock().unwrap().try_manifest_cloned(&id) {
-        Ok(Some(manifest)) if manifest.branch.is_some() => {
-            return json_error(
-                409,
-                &format!(
-                    "namespace '{name}' is a branch; delete it with \
-                     DELETE /v1/namespaces/{name}/branch"
-                ),
-            )
-        }
-        Ok(_) => {}
-        Err(e) => return json_error(503, &format!("control store: {e}")),
-    }
-    let lock = state.publication_lock(&id);
-    let _guard = lock.lock().unwrap();
-    let local_version = state.indexer.manifest_version(&id);
-    let deleted = state
-        .controller
-        .lock()
-        .unwrap()
-        .delete_namespace(&id, local_version.unwrap_or(0));
-    let (manifest, retired) = match deleted {
-        Ok(deleted) => deleted,
-        // Known only to this writer (written to but not yet registered, or
-        // WAL-recovered under the in-memory control plane): still delete it.
-        Err(KoshaError::NamespaceNotFound(_)) if local_version.is_some() => (
-            state
-                .indexer
-                .manifest_cloned(&id)
-                .unwrap_or_else(|| kosha_core::Manifest::empty(0)),
-            local_version.unwrap_or(0),
-        ),
-        Err(KoshaError::NamespaceNotFound(_)) => {
-            return json_error(404, &format!("namespace '{name}' not found"));
-        }
-        Err(e) => return json_error(500, &format!("delete namespace failed: {e}")),
-    };
-    // A sharded namespace (#207): its shards are namespaces of their own,
-    // nested under its prefix (so the local and S3 cleanup below covers
-    // their files). Drop them from the control store and the writer too,
-    // or their manifests, buffers and WAL records would outlive the root.
-    let shard_ids = manifest
-        .shards
-        .filter(|&n| n > 1)
-        .map(|n| kosha_core::sharding::shard_namespaces(&id, n))
-        .unwrap_or_default();
-    for shard in &shard_ids {
-        let shard_local = state.indexer.manifest_version(shard);
-        let shard_deleted = state
-            .controller
-            .lock()
-            .unwrap()
-            .delete_namespace(shard, shard_local.unwrap_or(0));
-        let shard_retired = match shard_deleted {
-            Ok((_, retired)) => retired,
-            Err(KoshaError::NamespaceNotFound(_)) => shard_local.unwrap_or(0),
-            Err(e) => {
-                return json_error(
-                    500,
-                    &format!("delete namespace failed: shard {}: {e}", shard.0),
-                )
-            }
-        };
-        let shard_next =
-            kosha_core::initial_manifest_version(Some(shard_retired.max(shard_local.unwrap_or(0))));
-        if let Err(e) = state.indexer.drop_namespace(shard, shard_next, || {}) {
-            return json_error(
-                500,
-                &format!(
-                    "namespace '{name}': discarding the write-ahead log of shard {} failed: {e}",
-                    shard.0
-                ),
-            );
-        }
-        state.forget_namespace_caches(shard);
-    }
-    let next_version =
-        kosha_core::initial_manifest_version(Some(retired.max(local_version.unwrap_or(0))));
-    // Local segment files go while the writer still holds the namespace's
-    // locks, so a write to the new incarnation cannot lose its fresh segment.
-    let mut local_cleanup = Ok(());
-    let dropped = state.indexer.drop_namespace(&id, next_version, || {
-        local_cleanup = state.cache.evict_prefix(&id.0);
-    });
-    match dropped {
-        Ok(0) => {}
-        Ok(shared) => println!(
-            "namespace {} deleted: {shared} WAL file(s) shared with other namespaces are kept \
-             until those flush; recovery skips this namespace's records in them",
-            id.0
-        ),
-        Err(e) => {
-            return json_error(
-                500,
-                &format!(
-                    "namespace '{name}' was removed from the control store, but discarding its \
-                     write-ahead log failed: {e}"
-                ),
-            )
-        }
-    }
-    state.forget_namespace_caches(&id);
-    let mut storage_reclaimed = true;
-    if let Err(e) = local_cleanup {
-        eprintln!(
-            "WARN: namespace {} deleted, local segment cleanup failed: {e}",
-            id.0
-        );
-        storage_reclaimed = false;
-    }
-    #[cfg(feature = "s3")]
-    if let Some(ref s3) = state.s3_storage {
-        match s3.delete_prefix(&id.0) {
-            Ok(objects) => println!(
-                "namespace deleted: ns={} s3_objects_deleted={objects}",
-                id.0
-            ),
-            Err(e) => {
-                eprintln!(
-                    "WARN: namespace {} deleted, but deleting its S3 objects failed: {e}",
-                    id.0
-                );
-                storage_reclaimed = false;
-            }
-        }
-    }
-    println!(
-        "namespace deleted: ns={} version={} segments={} next_version={next_version}",
-        id.0,
-        manifest.version,
-        manifest.segments.len()
-    );
-    json_ok(&serde_json::json!({
-        "namespace": name,
-        "acknowledged": true,
-        "storage_reclaimed": storage_reclaimed,
-    }))
 }
 
 // ─── POST /index ────────────────────────────────────────────────────────────
@@ -11318,6 +11179,58 @@ mod tests {
         ) -> Result<Option<kosha_core::Manifest>, KoshaError> {
             Ok(self.inner.lock().unwrap().remove_namespace(id))
         }
+        fn delete_namespace_recorded(
+            &mut self,
+            id: &NamespaceId,
+            retire_at_least: u64,
+            deletion: &kosha_core::deletion::NewDeletion,
+        ) -> Result<
+            (
+                kosha_core::Manifest,
+                u64,
+                kosha_core::deletion::DeletionRecord,
+            ),
+            KoshaError,
+        > {
+            self.inner
+                .lock()
+                .unwrap()
+                .delete_namespace_recorded(id, retire_at_least, deletion)
+        }
+        fn begin_deletion(
+            &mut self,
+            deletion: &kosha_core::deletion::NewDeletion,
+            last_version: u64,
+        ) -> Result<kosha_core::deletion::DeletionRecord, KoshaError> {
+            Ok(self
+                .inner
+                .lock()
+                .unwrap()
+                .begin_deletion(deletion, last_version))
+        }
+        fn record_deletion_attempt(
+            &mut self,
+            deletion_id: &str,
+            objects_deleted: u64,
+            error: Option<&str>,
+        ) -> Result<kosha_core::deletion::DeletionRecord, KoshaError> {
+            self.inner
+                .lock()
+                .unwrap()
+                .record_deletion_attempt(deletion_id, objects_deleted, error)
+        }
+        fn deletion(
+            &self,
+            deletion_id: &str,
+        ) -> Result<Option<kosha_core::deletion::DeletionRecord>, KoshaError> {
+            Ok(self.inner.lock().unwrap().deletion(deletion_id))
+        }
+        fn deletions(
+            &self,
+            filter: &kosha_core::deletion::DeletionFilter,
+        ) -> Result<Vec<kosha_core::deletion::DeletionRecord>, KoshaError> {
+            Ok(self.inner.lock().unwrap().deletions(filter))
+        }
     }
 
     impl SharedManifestStore {
@@ -12335,6 +12248,50 @@ mod tests {
         ) -> Result<Option<kosha_core::Manifest>, KoshaError> {
             self.check()?;
             self.inner.remove_namespace(id)
+        }
+        fn delete_namespace_recorded(
+            &mut self,
+            id: &NamespaceId,
+            retire_at_least: u64,
+            deletion: &kosha_core::deletion::NewDeletion,
+        ) -> Result<
+            (
+                kosha_core::Manifest,
+                u64,
+                kosha_core::deletion::DeletionRecord,
+            ),
+            KoshaError,
+        > {
+            self.inner
+                .delete_namespace_recorded(id, retire_at_least, deletion)
+        }
+        fn begin_deletion(
+            &mut self,
+            deletion: &kosha_core::deletion::NewDeletion,
+            last_version: u64,
+        ) -> Result<kosha_core::deletion::DeletionRecord, KoshaError> {
+            self.inner.begin_deletion(deletion, last_version)
+        }
+        fn record_deletion_attempt(
+            &mut self,
+            deletion_id: &str,
+            objects_deleted: u64,
+            error: Option<&str>,
+        ) -> Result<kosha_core::deletion::DeletionRecord, KoshaError> {
+            self.inner
+                .record_deletion_attempt(deletion_id, objects_deleted, error)
+        }
+        fn deletion(
+            &self,
+            deletion_id: &str,
+        ) -> Result<Option<kosha_core::deletion::DeletionRecord>, KoshaError> {
+            self.inner.deletion(deletion_id)
+        }
+        fn deletions(
+            &self,
+            filter: &kosha_core::deletion::DeletionFilter,
+        ) -> Result<Vec<kosha_core::deletion::DeletionRecord>, KoshaError> {
+            self.inner.deletions(filter)
         }
     }
 
