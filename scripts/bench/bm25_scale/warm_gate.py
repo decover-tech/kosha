@@ -125,11 +125,15 @@ def main(argv=None) -> int:
     ap.add_argument("--backoff-max", type=float, default=30.0)
     ap.add_argument("--progress-every", type=float, default=60.0, help="seconds between progress lines")
     ap.add_argument("--seed", type=int, default=0, help="seed for the poll's random query choice")
+    ap.add_argument("--return", dest="return_fields", choices=["ids", "all"], default="ids",
+                    help="same as query_bench.py --return; use the phase's value so the gate "
+                    "warms exactly what the measured queries read")
     args = ap.parse_args(argv)
 
     qb.OPERATOR = args.operator
     qb.NO_CACHE = True
     qb.SERVER_TIMINGS = True
+    qb.RETURN_FIELDS = args.return_fields
     queries = qb.load_queries(args.queries_file)
     if args.knn_embeddings:
         qb.KNN_VECS = qb.load_knn_vectors(args.knn_embeddings, len(queries))

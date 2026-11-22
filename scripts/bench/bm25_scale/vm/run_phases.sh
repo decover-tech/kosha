@@ -60,13 +60,16 @@ BENCH=~/kosha/scripts/bench/bm25_scale/query_bench.py
 GATE=~/kosha/scripts/bench/bm25_scale/warm_gate.py
 PY=~/venv311/bin/python3
 WARM_GATE="${WARM_GATE:-preload}"
+# What each hit returns: ids (doc_id + score, as tpuf queries do) or all.
+RETURN_FIELDS="${RETURN_FIELDS:-ids}"
+case "$RETURN_FIELDS" in ids|all) ;; *) echo "RETURN_FIELDS must be ids or all, got $RETURN_FIELDS"; exit 1 ;; esac
 case "$WARM_GATE" in queries|preload) ;; *) echo "WARM_GATE must be queries or preload, got $WARM_GATE"; exit 1 ;; esac
-echo "WARM_GATE=$WARM_GATE"
+echo "WARM_GATE=$WARM_GATE RETURN_FIELDS=$RETURN_FIELDS"
 
-for f in --no-cache --raw-out --server-timings; do $PY $BENCH --help | grep -q -- "$f" || { echo "FLAGS-MISSING $f"; exit 1; }; done
+for f in --no-cache --raw-out --server-timings --return; do $PY $BENCH --help | grep -q -- "$f" || { echo "FLAGS-MISSING $f"; exit 1; }; done
 [ "$SUITE" = "vector" ] && { $PY $BENCH --help | grep -q -- "--knn-embeddings" || { echo FLAGS-MISSING; exit 1; }; }
 if [ "$WARM_GATE" = queries ]; then
-  for f in --consecutive --knn-embeddings --operator; do $PY $GATE --help | grep -q -- "$f" || { echo "FLAGS-MISSING warm_gate $f"; exit 1; }; done
+  for f in --consecutive --knn-embeddings --operator --return; do $PY $GATE --help | grep -q -- "$f" || { echo "FLAGS-MISSING warm_gate $f"; exit 1; }; done
 fi
 sudo mkdir -p "$OUT/server" && sudo chown -R "$(id -u):$(id -g)" "$OUT"
 
@@ -99,7 +102,7 @@ GATE_SINCE=$(iso_now)
 set +e
 $PY $GATE --host http://127.0.0.1:8080 --namespace "$NS" \
   --queries-file /data/queries.txt --api-key "$API_KEY" --topk 10 \
-  "${WORKLOAD[@]}" --timeout "${WARM_GATE_TIMEOUT_S:-10800}" 2>&1 | tee "$OUT/warm_gate.log"
+  "${WORKLOAD[@]}" --return "$RETURN_FIELDS" --timeout "${WARM_GATE_TIMEOUT_S:-10800}" 2>&1 | tee "$OUT/warm_gate.log"
 GATE_RC=${PIPESTATUS[0]}
 set -e
 save_server_log warm_gate "$GATE_SINCE"
@@ -154,7 +157,7 @@ phase() { # phase <label> <extra-args...>
     --host http://127.0.0.1:8080 --namespace "$NS" \
     --queries-file /data/queries.txt --api-key "$API_KEY" \
     --qps "$QPS" --topk 10 --duration "$DURATION" --timeout 600 \
-    --server-timings --raw-out "$OUT/$label.requests.jsonl.gz" \
+    --server-timings --raw-out "$OUT/$label.requests.jsonl.gz" --return "$RETURN_FIELDS" \
     "$@" --out "$OUT/$label.json"
   save_server_log "$label" "$since"
   echo "PHASE-COMPLETE $label"
