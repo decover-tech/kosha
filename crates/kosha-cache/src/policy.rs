@@ -414,7 +414,7 @@ impl PolicyState {
         pinned: &HashMap<String, usize>,
         protect: Option<&str>,
     ) -> Option<String> {
-        let held = |key: &str| pinned.contains_key(key) || protect == Some(key);
+        let held = |key: &str| crate::held(pinned, key) || protect == Some(key);
         match self.kind {
             CachePolicy::Sieve => self.pick_sieve(held),
             CachePolicy::S3Fifo => self.pick_s3fifo(held),

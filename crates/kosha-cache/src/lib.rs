@@ -30,6 +30,17 @@ use kosha_core::tenancy::{
 use kosha_core::KoshaError;
 
 mod policy;
+
+/// Whether `key` holds a pin, either itself or through a directory that
+/// contains it: a search pins its segments' directories so no file it is
+/// using can be evicted mid-request.
+pub(crate) fn held(pinned: &HashMap<String, usize>, key: &str) -> bool {
+    let key = key.trim_start_matches('/');
+    pinned.contains_key(key)
+        || key
+            .match_indices('/')
+            .any(|(i, _)| pinned.contains_key(&key[..i]))
+}
 use policy::PolicyState;
 pub use policy::{CachePolicy, Classifier, ReadHint, CLASS_ANY};
 
@@ -196,7 +207,7 @@ impl Recency {
         self.by_tenant
             .get(tenant)?
             .iter()
-            .find(|k| !pinned.contains_key(k.as_str()))
+            .find(|k| !held(pinned, k))
     }
 }
 
@@ -529,7 +540,9 @@ impl Cache {
         }
     }
 
-    /// True if `key` currently has at least one outstanding pin.
+    /// True if `key` currently has at least one outstanding pin. A pin on a
+    /// directory (`pin("ns/segment")`) also holds every file under it
+    /// against eviction; see [`held`].
     pub fn is_pinned(&self, key: &str) -> bool {
         self.pinned.lock().unwrap().contains_key(key)
     }
@@ -585,10 +598,7 @@ impl Cache {
         // No tenant holding bytes has anything evictable: fall back to the
         // least recently used unpinned key overall (say, an untracked
         // zero-byte file).
-        let fallback = recency
-            .iter()
-            .find(|k| !pinned.contains_key(k.as_str()))
-            .cloned();
+        let fallback = recency.iter().find(|k| !held(&pinned, k)).cloned();
         fallback
     }
 
@@ -1216,6 +1226,37 @@ mod tests {
             cache.get("first").is_none(),
             "unpinning must restore normal LRU eligibility"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pinned_directory_holds_every_file_under_it() {
+        let dir = std::env::temp_dir().join("kosha-test-cache-pin-dir");
+        let _ = fs::remove_dir_all(&dir);
+        let cache = Cache::with_max_bytes(dir.clone(), Some(200));
+
+        cache
+            .put_bytes("ns/seg-a/inverted.idx", &[0u8; 60])
+            .unwrap();
+        cache.put_bytes("ns/seg-a/filters.bin", &[0u8; 60]).unwrap();
+        cache.pin("ns/seg-a");
+        cache
+            .put_bytes("ns/seg-b/inverted.idx", &[0u8; 60])
+            .unwrap();
+        // 240 > 200: both seg-a files are older, but the directory pin holds
+        // them, so seg-b's file is the one to go.
+        cache
+            .put_bytes("ns/seg-c/inverted.idx", &[0u8; 60])
+            .unwrap();
+        assert!(cache.get("ns/seg-a/inverted.idx").is_some());
+        assert!(cache.get("ns/seg-a/filters.bin").is_some());
+        assert!(cache.get("ns/seg-b/inverted.idx").is_none());
+        // A directory pin matches whole path components: "ns/seg" does not
+        // hold "ns/seg-a/...".
+        let pinned = HashMap::from([("ns/seg".to_string(), 1)]);
+        assert!(held(&pinned, "ns/seg/inverted.idx"));
+        assert!(!held(&pinned, "ns/seg-a/inverted.idx"));
 
         let _ = fs::remove_dir_all(&dir);
     }
