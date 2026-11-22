@@ -288,17 +288,44 @@ can address. A server booting on such a control plane logs:
 
     WARN: 2 namespace(s) predate tenant scoping (#262) and are unreachable through /v1/namespaces: ...
 
-`kosha-server migrate-namespace` (#344) moves one bare namespace to
-`<tenant>/<name>`. It is an offline command (a Job, or by hand), not an
-endpoint. It needs `DATABASE_URL` and the same S3 settings as the server
-(`KOSHA_S3_BUCKET`, `KOSHA_S3_PREFIX`, ...), so `kosha-config` and
-`kosha-secret` are all it needs. Without `KOSHA_S3_BUCKET` it moves
-segments inside `KOSHA_DATA_DIR`.
+`kosha-server migrate-namespace` (#344) moves bare namespaces to
+`<tenant>/<name>`, one at a time or as a batch. It is an offline command (a
+Job, or by hand), not an endpoint. It needs `DATABASE_URL` and the same S3
+settings as the server (`KOSHA_S3_BUCKET`, `KOSHA_S3_PREFIX`, ...), so
+`kosha-config` and `kosha-secret` are all it needs. Without
+`KOSHA_S3_BUCKET` it moves segments inside `KOSHA_DATA_DIR`.
 
     kosha-server migrate-namespace --list-unreachable
     kosha-server migrate-namespace --from <bare> --to <tenant>/<name> [--dry-run] [--keep-source]
+    kosha-server migrate-namespace --map <file> [--dry-run] [--keep-source]
+    kosha-server migrate-namespace --all-unreachable --tenant <tenant> [--dry-run] [--keep-source]
+    kosha-server migrate-namespace --verify (--map <file> | --from <bare> --to <tenant>/<name> | --all-unreachable)
 
-What a run does, in order:
+A map file holds one `bare=tenant/name` per line (`#` starts a comment), or
+JSON: `{"bare": "tenant/name", ...}` or
+`[{"from": "bare", "to": "tenant/name"}, ...]`. A bare id or destination
+listed twice is rejected before anything runs. `--all-unreachable --tenant
+<t>` maps every bare id `b` to `<t>/<b>`, for a deployment with one tenant.
+
+A batch runs the steps below for each namespace in order. When it refuses
+one (a live writer, a WAL tail, a collision, a branch) it prints the
+reason and moves on to the next. It ends with a summary table, one row per
+namespace (`moved`, `would move`, `skipped`, `refused`, with documents,
+objects and the reason), and exits non-zero if it refused any. `--dry-run`
+covers the whole batch. A rerun skips the namespaces already moved, so fix
+whatever it refused and run the same batch again.
+
+`--verify` re-checks a finished migration and changes nothing. For each
+pair it checks that the bare id is gone from the control plane, the
+destination exists, and every segment the destination's manifest lists has
+objects under `<tenant>/<name>/`. It prints one row per namespace (`ok` or
+`FAILED`, documents, segments), notes source objects a `--keep-source` run
+left behind, and lists any bare namespace that is still unreachable. It
+exits non-zero if a row failed or a bare namespace is left. After an
+`--all-unreachable` run, `--verify --all-unreachable` can only check that
+no bare id is left. Use a map file to get the per-namespace checks.
+
+What a run does for each namespace, in order:
 
 1. Takes the writer lease (#254) on both ids. A live writer holding either
    lease makes it refuse: stop the writer first.
@@ -349,12 +376,16 @@ Do this for each environment before it takes a build past #262, or right
 after (the data is invisible, not lost, until it is moved).
 
 1. List what needs moving and pick the tenant for each namespace (the
-   tenant of the API key its clients use; `default` for `KOSHA_API_KEY`):
+   tenant of the API key its clients use; `default` for `KOSHA_API_KEY`).
+   Write one `bare=tenant/name` line per namespace into the
+   `namespaces.map` key of the ConfigMap in
+   `k8s/base/job-migrate-namespace.yaml`, and set that file's image to the
+   tag the cluster runs:
 
        kubectl -n kosha exec deploy/kosha -- kosha-server migrate-namespace --list-unreachable
 
-2. Let the writer flush, then stop it, so nothing writes the bare id while
-   it moves. No client can write a bare id since #262, and the idle flush
+2. Let the writer flush, then stop it, so nothing writes the bare ids while
+   they move. No client can write a bare id since #262, and the idle flush
    (`KOSHA_FLUSH_MAX_AGE_MS`, default 1 s; check it is not `0`) publishes
    whatever the writer still buffers or recovered from its WAL, bare
    namespaces included. Give it a few seconds after boot, then:
@@ -363,32 +394,59 @@ after (the data is invisible, not lost, until it is moved).
 
    Query pods can keep serving other namespaces.
 
-3. Dry run, then the real run, from a one-off pod with the server's
-   configuration. With a local WAL, mount the ingest data dir or add
-   `--skip-wal-check` (only after step 2):
+3. Dry run the whole batch. The Job ships with `MODE: dry-run`. With a
+   local WAL (no `KOSHA_WAL_MODE=s3`) the Job cannot read the ingest pod's
+   WAL, so set `EXTRA_ARGS` to `--skip-wal-check`, but only after step 2:
 
-       kubectl -n kosha run kosha-migrate-ns --rm -it --restart=Never \
-         --image=<registry>/decover/kosha:<tag> \
-         --overrides='{"spec":{"serviceAccountName":"kosha","containers":[{"name":"kosha-migrate-ns","image":"<registry>/decover/kosha:<tag>","args":["migrate-namespace","--from","<bare>","--to","<tenant>/<name>","--dry-run"],"envFrom":[{"configMapRef":{"name":"kosha-config"}},{"secretRef":{"name":"kosha-secret"}}]}]}}'
+       kubectl apply -f k8s/base/job-migrate-namespace.yaml
+       kubectl -n kosha logs -f job/kosha-migrate-namespace
 
-   Check the plan (objects, bytes, documents), then run it again without
-   `--dry-run`. Use `--keep-source` for prod's first run if you want the
-   old objects kept until clients have checked the data.
+   Check each namespace's plan (objects, bytes, documents) and the summary
+   table. Every row should read `would move`. Fix anything `refused`
+   before going on.
 
-4. Start the writer and restart the query pods, so every pod drops its
-   view of the bare id:
+4. Real run: set `MODE` to `run` and run the Job again. Add
+   `--keep-source` to `EXTRA_ARGS` for prod's first run if you want the old
+   objects kept until clients have checked the data:
+
+       kubectl -n kosha delete job kosha-migrate-namespace
+       kubectl apply -f k8s/base/job-migrate-namespace.yaml
+       kubectl -n kosha logs -f job/kosha-migrate-namespace
+
+   The Job fails if it refused any namespace. The log says why for each
+   one. Fix the cause and repeat this step: the namespaces already moved
+   show as `skipped`.
+
+5. Start the writer and restart the query pods, so every pod drops its
+   view of the bare ids:
 
        kubectl -n kosha scale deploy/kosha --replicas=1
        kubectl -n kosha rollout restart deploy/kosha-query
 
-5. Verify as the tenant. The document count must equal the one the run
-   printed:
+6. Verify. Set `MODE` to `verify` and run the Job once more. It must end
+   with `verify: OK` and `unreachable bare namespaces: none`, and every
+   row's `DOCS` must equal what step 4 printed for that namespace:
+
+       kubectl -n kosha delete job kosha-migrate-namespace
+       kubectl apply -f k8s/base/job-migrate-namespace.yaml
+       kubectl -n kosha logs -f job/kosha-migrate-namespace
+
+   Spot-check a namespace as its tenant too:
 
        curl -H "Authorization: Bearer <tenant key>" "$KOSHA/v1/namespaces/<name>/stats"
 
-   The boot warning no longer lists the namespace. Local disk caches still
-   hold the old copies under `<bare>/`; they are only a cache and can be
-   deleted.
+   The boot warning no longer lists any namespace. After a `--keep-source`
+   run, the verify rows note the source objects left behind: rerun step 4
+   without `--keep-source` when you are ready to delete them. Local disk
+   caches still hold the old copies under `<bare>/`. They are only a cache
+   and can be deleted.
+
+To move a single namespace by hand instead, run the same command from a
+one-off pod with the server's configuration:
+
+    kubectl -n kosha run kosha-migrate-ns --rm -it --restart=Never \
+      --image=<registry>/decover/kosha:<tag> \
+      --overrides='{"spec":{"serviceAccountName":"kosha","containers":[{"name":"kosha-migrate-ns","image":"<registry>/decover/kosha:<tag>","args":["migrate-namespace","--from","<bare>","--to","<tenant>/<name>","--dry-run"],"envFrom":[{"configMapRef":{"name":"kosha-config"}},{"secretRef":{"name":"kosha-secret"}}]}]}}'
 
 ## Local verification
 
