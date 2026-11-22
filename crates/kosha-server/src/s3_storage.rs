@@ -1686,8 +1686,16 @@ async fn fetch_one(
         TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let t_transfer = std::time::Instant::now();
-    let streamed =
-        get_object_streamed_with_retry(client, bucket, &s3_key, &tmp_path, budget, &request).await;
+    let streamed = get_object_streamed_with_retry(
+        client,
+        bucket,
+        &s3_key,
+        kosha_core::tenancy::tenant_of_file_key(path),
+        &tmp_path,
+        budget,
+        &request,
+    )
+    .await;
     let transfer_ms = t_transfer.elapsed().as_secs_f64() * 1e3;
     let streamed = match streamed {
         Ok(s) => s,
@@ -1734,6 +1742,7 @@ async fn get_object_streamed_with_retry(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     key: &str,
+    tenant: &str,
     tmp_path: &Path,
     budget: Option<Arc<HydrationBudget>>,
     request: &Arc<RequestHydration>,
@@ -1763,7 +1772,7 @@ async fn get_object_streamed_with_retry(
             let _permit = match budget.as_ref() {
                 Some(budget) => {
                     let t_wait = std::time::Instant::now();
-                    let permit = budget.acquire(projected);
+                    let permit = budget.acquire(tenant, projected);
                     request.record_wait(t_wait.elapsed());
                     match permit {
                         Some(permit) => Some(permit),
@@ -1933,7 +1942,7 @@ async fn fetch_range_one(
     let _permit = match budget {
         Some(budget) => {
             let t_wait = std::time::Instant::now();
-            let permit = budget.acquire(length);
+            let permit = budget.acquire(kosha_core::tenancy::tenant_of_file_key(path), length);
             request.record_wait(t_wait.elapsed());
             match permit {
                 Some(permit) => Some(permit),

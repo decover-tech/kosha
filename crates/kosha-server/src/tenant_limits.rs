@@ -546,6 +546,21 @@ impl TenantLimiter {
             .max(1)
     }
 
+    /// The plan weights as a standalone function, for the caches' tenant
+    /// shares (#342): a tenant's cache share follows its search queue
+    /// weight, and follows the limits file across reloads. `None` when no
+    /// limits are configured (every tenant weighs 1).
+    pub(crate) fn weight_fn(&self) -> Option<kosha_core::tenancy::TenantWeightFn> {
+        let provider = Arc::clone(self.provider.as_ref()?);
+        Some(Arc::new(move |tenant: &str| {
+            provider
+                .limits(tenant)
+                .and_then(|l| l.weight)
+                .unwrap_or(1)
+                .max(1)
+        }))
+    }
+
     fn now(&self) -> u64 {
         self.epoch.elapsed().as_nanos() as u64
     }

@@ -60,7 +60,8 @@ pub(crate) struct MetricsConfig {
     /// `kosha_search_requests_total` by namespace as well as outcome.
     pub namespace_labels: bool,
     /// `KOSHA_METRICS_TENANT_LABELS=on`: label
-    /// `kosha_tenant_rejections_total` by tenant as well as reason (#341).
+    /// `kosha_tenant_rejections_total` by tenant as well as reason (#341),
+    /// and the `kosha_cache_*` families by tenant as well as cache (#342).
     pub tenant_labels: bool,
 }
 
@@ -267,14 +268,26 @@ pub(crate) enum LeaseOutcome {
     Timeout,
 }
 
+/// One tenant's figures in one cache (`nvme`, `segment` or `result`).
+#[derive(Clone, Debug)]
+pub(crate) struct CacheTenantSample {
+    pub cache: &'static str,
+    pub stats: kosha_core::tenancy::TenantCacheStats,
+}
+
+/// The caches `kosha_cache_*` reports, in exposition order.
+const CACHES: [&str; 3] = ["nvme", "segment", "result"];
+
 /// Point-in-time values read from the server's own atomics at scrape time.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Scrape {
     pub search_queue_depth: u64,
     pub nvme_cache_bytes: u64,
     pub segment_cache_bytes: u64,
     pub nvme_evictions: u64,
     pub segment_checksum_failures: u64,
+    /// Per-tenant bytes, hits, misses and evictions of every cache (#342).
+    pub cache_tenants: Vec<CacheTenantSample>,
 }
 
 /// Encodes the latest [`Scrape`]. Counters only move forward (`fetch_max`)
@@ -286,10 +299,14 @@ struct ScrapeCollector {
     segment_bytes: AtomicU64,
     nvme_evictions: AtomicU64,
     checksum_failures: AtomicU64,
+    cache_tenants: Mutex<Vec<CacheTenantSample>>,
+    /// Label the `kosha_cache_*` families by tenant (#342).
+    tenant_labels: bool,
 }
 
 impl ScrapeCollector {
     fn store(&self, s: &Scrape) {
+        *self.cache_tenants.lock().unwrap_or_else(|e| e.into_inner()) = s.cache_tenants.clone();
         self.queue_depth
             .store(s.search_queue_depth, Ordering::Relaxed);
         self.nvme_bytes.store(s.nvme_cache_bytes, Ordering::Relaxed);
@@ -314,28 +331,65 @@ impl Collector for ScrapeCollector {
             depth.metric_type(),
         )?)?;
 
-        let mut bytes = encoder.encode_descriptor(
-            "kosha_cache_bytes",
-            "Bytes held by each cache.",
-            None,
-            MetricType::Gauge,
-        )?;
-        for (cache, value) in [
-            ("nvme", load(&self.nvme_bytes)),
-            ("segment", load(&self.segment_bytes)),
-        ] {
-            let set = [("cache", cache)];
-            ConstGauge::new(value).encode(bytes.encode_family(&set)?)?;
+        let tenants = self
+            .cache_tenants
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        // One family per figure. With tenant labels, one series per cache
+        // and tenant; without, one per cache, summed over tenants — except
+        // the NVMe and segment bytes and NVMe evictions, which come from the
+        // caches' own totals as they did before #342.
+        type Pick = fn(&kosha_core::tenancy::TenantCacheStats) -> u64;
+        let families: [(&str, &str, MetricType, Pick); 4] = [
+            (
+                "kosha_cache_bytes",
+                "Bytes held by each cache.",
+                MetricType::Gauge,
+                |s| s.bytes,
+            ),
+            (
+                "kosha_cache_evictions",
+                "Entries evicted from each cache (files or directories for nvme).",
+                MetricType::Counter,
+                |s| s.evictions,
+            ),
+            (
+                "kosha_cache_hits",
+                "Cache lookups that found their entry.",
+                MetricType::Counter,
+                |s| s.hits,
+            ),
+            (
+                "kosha_cache_misses",
+                "Cache lookups that did not find their entry.",
+                MetricType::Counter,
+                |s| s.misses,
+            ),
+        ];
+        for (name, help, metric_type, pick) in families {
+            let mut family = encoder.encode_descriptor(name, help, None, metric_type)?;
+            for cache in CACHES {
+                if self.tenant_labels {
+                    for t in tenants.iter().filter(|t| t.cache == cache) {
+                        let set = [("cache", cache), ("tenant", t.stats.tenant.as_str())];
+                        encode_value(&mut family, &set, metric_type, pick(&t.stats))?;
+                    }
+                    continue;
+                }
+                let value = match (name, cache) {
+                    ("kosha_cache_bytes", "nvme") => load(&self.nvme_bytes),
+                    ("kosha_cache_bytes", "segment") => load(&self.segment_bytes),
+                    ("kosha_cache_evictions", "nvme") => load(&self.nvme_evictions),
+                    _ => tenants
+                        .iter()
+                        .filter(|t| t.cache == cache)
+                        .map(|t| pick(&t.stats))
+                        .sum(),
+                };
+                encode_value(&mut family, &[("cache", cache)], metric_type, value)?;
+            }
         }
-
-        let mut evictions = encoder.encode_descriptor(
-            "kosha_cache_evictions",
-            "Files or directories evicted from each cache.",
-            None,
-            MetricType::Counter,
-        )?;
-        let set = [("cache", "nvme")];
-        ConstCounter::new(load(&self.nvme_evictions)).encode(evictions.encode_family(&set)?)?;
 
         let failures = ConstCounter::new(load(&self.checksum_failures));
         failures.encode(encoder.encode_descriptor(
@@ -345,6 +399,21 @@ impl Collector for ScrapeCollector {
             failures.metric_type(),
         )?)?;
         Ok(())
+    }
+}
+
+/// One sample of a gauge or counter family under `labels`.
+fn encode_value(
+    family: &mut prometheus_client::encoding::MetricEncoder<'_>,
+    labels: &[(&str, &str)],
+    metric_type: MetricType,
+    value: u64,
+) -> Result<(), std::fmt::Error> {
+    let labels = labels.to_vec();
+    let encoder = family.encode_family(&labels)?;
+    match metric_type {
+        MetricType::Counter => ConstCounter::new(value).encode(encoder),
+        _ => ConstGauge::new(value).encode(encoder),
     }
 }
 
@@ -495,7 +564,10 @@ impl Metrics {
             }
         });
 
-        let scrape = Arc::new(ScrapeCollector::default());
+        let scrape = Arc::new(ScrapeCollector {
+            tenant_labels: config.tenant_labels,
+            ..ScrapeCollector::default()
+        });
         registry.register_collector(Box::new(Arc::clone(&scrape)));
 
         Self {
@@ -747,8 +819,94 @@ pub(crate) mod tests {
             segment_cache_bytes: 1024,
             nvme_evictions: 7,
             segment_checksum_failures: 2,
+            cache_tenants: vec![
+                cache_sample("nvme", "acme", 4000, 5, 1, 4),
+                cache_sample("nvme", "beta", 96, 1, 0, 3),
+                cache_sample("result", "beta", 100, 2, 3, 1),
+            ],
         });
         parse_exposition(&text).unwrap_or_else(|e| panic!("{e}\n{text}"))
+    }
+
+    fn cache_sample(
+        cache: &'static str,
+        tenant: &str,
+        bytes: u64,
+        hits: u64,
+        misses: u64,
+        evictions: u64,
+    ) -> CacheTenantSample {
+        CacheTenantSample {
+            cache,
+            stats: kosha_core::tenancy::TenantCacheStats {
+                tenant: tenant.into(),
+                bytes,
+                hits,
+                misses,
+                evictions,
+            },
+        }
+    }
+
+    #[test]
+    fn cache_figures_by_cache_and_gated_tenant_label() {
+        // #342. Without tenant labels: one series per cache, summed over
+        // tenants (NVMe/segment bytes and NVMe evictions from the caches'
+        // own totals).
+        let samples = rendered(&Metrics::default());
+        let get = |samples: &[Sample], name: &str, labels: &[(&str, &str)]| {
+            value(samples, name, labels).unwrap_or_else(|| panic!("{name} {labels:?}"))
+        };
+        assert_eq!(
+            get(&samples, "kosha_cache_hits_total", &[("cache", "nvme")]),
+            6.0
+        );
+        assert_eq!(
+            get(&samples, "kosha_cache_misses_total", &[("cache", "nvme")]),
+            1.0
+        );
+        assert_eq!(
+            get(&samples, "kosha_cache_hits_total", &[("cache", "segment")]),
+            0.0
+        );
+        assert_eq!(
+            get(&samples, "kosha_cache_bytes", &[("cache", "result")]),
+            100.0
+        );
+        assert_eq!(
+            get(
+                &samples,
+                "kosha_cache_evictions_total",
+                &[("cache", "result")]
+            ),
+            1.0
+        );
+        assert_eq!(
+            get(
+                &samples,
+                "kosha_cache_evictions_total",
+                &[("cache", "nvme")]
+            ),
+            7.0
+        );
+        assert!(samples.iter().all(|s| !s.labels.contains_key("tenant")));
+
+        let labelled = Metrics::new(MetricsConfig {
+            tenant_labels: true,
+            ..MetricsConfig::default()
+        });
+        let samples = rendered(&labelled);
+        let acme = [("cache", "nvme"), ("tenant", "acme")];
+        assert_eq!(get(&samples, "kosha_cache_bytes", &acme), 4000.0);
+        assert_eq!(get(&samples, "kosha_cache_hits_total", &acme), 5.0);
+        assert_eq!(get(&samples, "kosha_cache_misses_total", &acme), 1.0);
+        assert_eq!(get(&samples, "kosha_cache_evictions_total", &acme), 4.0);
+        let beta = [("cache", "result"), ("tenant", "beta")];
+        assert_eq!(get(&samples, "kosha_cache_misses_total", &beta), 3.0);
+        assert!(samples
+            .iter()
+            .filter(|s| s.name.starts_with("kosha_cache_"))
+            .all(|s| s.labels.contains_key("tenant")));
     }
 
     #[test]
