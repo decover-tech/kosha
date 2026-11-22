@@ -149,8 +149,9 @@ struct TenantLive {
     reserved: u64,
     /// This tenant's part of [`LedgerState::active`].
     active: usize,
-    /// Searches of this tenant blocked in [`MemoryLedger::admit`].
-    waiting: usize,
+    /// The estimate of each search of this tenant blocked in
+    /// [`MemoryLedger::admit`].
+    waiting: Vec<u64>,
 }
 
 impl TenantLive {
@@ -159,7 +160,14 @@ impl TenantLive {
     }
 
     fn is_empty(&self) -> bool {
-        self.live == 0 && self.reserved == 0 && self.active == 0 && self.waiting == 0
+        self.live == 0 && self.reserved == 0 && self.active == 0 && self.waiting.is_empty()
+    }
+
+    /// Take one blocked search of `estimate` bytes off the waiting list.
+    fn stop_waiting(&mut self, estimate: u64) {
+        if let Some(pos) = self.waiting.iter().position(|e| *e == estimate) {
+            self.waiting.swap_remove(pos);
+        }
     }
 }
 
@@ -200,23 +208,26 @@ impl LedgerState {
         }
     }
 
-    /// Whether `tenant` must leave free bytes to another tenant's blocked
-    /// search (#342): it has a search admitted, it is over its weighted
-    /// share of `max_live_bytes` among the tenants holding or waiting for
-    /// bytes, and some other tenant is waiting that is not itself over its
-    /// share with a search admitted. A lone tenant is never held back, and
-    /// neither is a tenant with nothing admitted.
+    /// How far over its share `tenant` is while it must leave free bytes
+    /// to another tenant's blocked search (#342), else `None`. It is held
+    /// back when it has a search admitted, it is over its weighted share
+    /// of `max_live_bytes` among the tenants holding or waiting for bytes,
+    /// and some other tenant has a search waiting that asks for bytes
+    /// within that tenant's own share (what it holds plus the waiting
+    /// estimate). A waiter asking for more than its share, such as one
+    /// larger than the whole watermark, holds nobody back: the bytes
+    /// withheld are not what keeps it out, and it could otherwise throttle
+    /// the other tenant for as long as it keeps retrying. A lone tenant is
+    /// never held back, and neither is a tenant with nothing admitted.
     fn held_back_for_others(
         &self,
         tenant: &str,
         max_live_bytes: u64,
         shares: &TenantShares,
-    ) -> bool {
-        let Some(mine) = self.tenants.get(tenant) else {
-            return false;
-        };
+    ) -> Option<u64> {
+        let mine = self.tenants.get(tenant)?;
         if mine.active == 0 {
-            return false;
+            return None;
         }
         let total_weight: u128 = self
             .tenants
@@ -224,16 +235,40 @@ impl LedgerState {
             .map(|t| shares.weight(t) as u128)
             .sum::<u128>()
             .max(1);
-        let over_share = |t: &str, e: &TenantLive| {
-            let share = max_live_bytes as u128 * shares.weight(t) as u128 / total_weight;
-            e.active > 0 && e.committed() as u128 > share
-        };
-        over_share(tenant, mine)
-            && self
-                .tenants
-                .iter()
-                .any(|(t, e)| t != tenant && e.waiting > 0 && !over_share(t, e))
+        let share_of =
+            |t: &str| (max_live_bytes as u128 * shares.weight(t) as u128 / total_weight) as u64;
+        let over_by = mine.committed().saturating_sub(share_of(tenant));
+        if over_by == 0 {
+            return None;
+        }
+        self.tenants
+            .iter()
+            .any(|(t, e)| {
+                t != tenant
+                    && e.waiting.iter().min().is_some_and(|smallest| {
+                        e.committed().saturating_add(*smallest) <= share_of(t)
+                    })
+            })
+            .then_some(over_by)
     }
+}
+
+/// What [`MemoryLedger::admit`] asks the segment cache to evict (see
+/// [`SegmentCache::evict_idle`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmissionEvict {
+    /// Room for a search that fits under the live-bytes watermark: free
+    /// the bytes asked for, whoever holds them. The watermark is the
+    /// memory guard, so tenant shares decide only who gives first.
+    Room,
+    /// Room for a search larger than the whole watermark. No eviction
+    /// makes it fit (it is admitted alone or not at all), so the other
+    /// tenants keep their shares and floors.
+    RoomSparingShares,
+    /// The tenant is held back for another tenant's waiting search
+    /// (per-tenant shares): free its own idle entries, so it can get back
+    /// under its share and the waiter gets the bytes.
+    OwnIdle,
 }
 
 pub struct MemoryLedger {
@@ -281,22 +316,28 @@ impl MemoryLedger {
 
     /// Reserve `estimate` bytes for a search of `tenant`, blocking
     /// (bounded) if that would push `live + reserved` past the watermark.
-    /// `evict_idle(needed)` is invoked (with the ledger lock *released* —
-    /// see the lock-order invariant above) to ask the cache to free idle
-    /// entries first.
+    /// `evict_idle(needed, what)` is invoked (with the ledger lock
+    /// *released* — see the lock-order invariant above) to ask the cache
+    /// to free idle entries first. A search that fits under the watermark
+    /// asks for [`AdmissionEvict::Room`]: whatever idle bytes it takes, so
+    /// it is not shed (or admitted over the watermark) while evictable
+    /// memory sits in the cache. One larger than the whole watermark asks
+    /// for [`AdmissionEvict::RoomSparingShares`].
     ///
     /// Tenants (#342): with per-tenant shares enabled, a tenant that is
     /// already over its weighted share of the watermark and has a search
-    /// admitted is not admitted again while another tenant's search waits,
-    /// so the bytes its searches free go to that waiter first (see
-    /// [`LedgerState::held_back_for_others`]). The limit is
-    /// work-conserving: it binds only while another tenant waits, so a
-    /// lone tenant keeps the whole watermark.
+    /// admitted is not admitted again while another tenant's search waits
+    /// for bytes within its own share, so the bytes its searches free go
+    /// to that waiter first (see [`LedgerState::held_back_for_others`]).
+    /// A tenant held back first sheds its own idle cached bytes
+    /// ([`AdmissionEvict::OwnIdle`]) and goes ahead if that brings it back
+    /// under its share. The limit is work-conserving: it binds only while
+    /// another tenant waits, so a lone tenant keeps the whole watermark.
     fn admit(
         self: &Arc<Self>,
         tenant: &str,
         estimate: u64,
-        evict_idle: impl Fn(u64),
+        evict_idle: impl Fn(u64, AdmissionEvict),
     ) -> Result<AdmissionPermit, KoshaError> {
         let deadline = Instant::now() + self.admission_timeout;
         let by_tenant = self.tenant_shares_enabled.load(Ordering::Relaxed);
@@ -306,24 +347,28 @@ impl MemoryLedger {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let mut tried_evict = false;
+        let mut tried_shed = false;
         let mut waiting = false;
         let mut st = self.state.lock().unwrap();
         loop {
             let committed = st.live.saturating_add(st.reserved);
             let fits = committed.saturating_add(estimate) <= self.max_live_bytes;
-            let held_back =
-                by_tenant && st.held_back_for_others(tenant, self.max_live_bytes, &shares);
+            let held_back = if by_tenant {
+                st.held_back_for_others(tenant, self.max_live_bytes, &shares)
+            } else {
+                None
+            };
             // Anti-starvation: alone (no other admitted search) after one
             // eviction attempt → admit regardless of size. See
             // `LedgerState::active`.
-            if (fits && !held_back) || (st.active == 0 && tried_evict) {
+            if (fits && held_back.is_none()) || (st.active == 0 && tried_evict) {
                 st.reserved = st.reserved.saturating_add(estimate);
                 st.active += 1;
                 st.tenant(tenant, |t| {
                     t.reserved = t.reserved.saturating_add(estimate);
                     t.active += 1;
                     if waiting {
-                        t.waiting = t.waiting.saturating_sub(1);
+                        t.stop_waiting(estimate);
                     }
                 });
                 drop(st);
@@ -341,9 +386,27 @@ impl MemoryLedger {
                 let needed = committed
                     .saturating_add(estimate)
                     .saturating_sub(self.max_live_bytes);
+                // Evicting cannot make a search larger than the whole
+                // watermark fit, so it does not cost the other tenants
+                // their shares; any other search gets the bytes it needs.
+                let what = if estimate > self.max_live_bytes {
+                    AdmissionEvict::RoomSparingShares
+                } else {
+                    AdmissionEvict::Room
+                };
                 drop(st);
-                evict_idle(needed);
+                evict_idle(needed, what);
                 tried_evict = true;
+                st = self.state.lock().unwrap();
+                continue;
+            }
+            if let (true, Some(over_by), false) = (fits, held_back, tried_shed) {
+                // Held back only for being over its share: idle cached
+                // bytes count toward that, and this is the one place the
+                // tenant can give them up (once per search).
+                drop(st);
+                evict_idle(over_by, AdmissionEvict::OwnIdle);
+                tried_shed = true;
                 st = self.state.lock().unwrap();
                 continue;
             }
@@ -351,9 +414,19 @@ impl MemoryLedger {
             if now >= deadline {
                 let active = st.active;
                 if waiting {
-                    st.tenant(tenant, |t| t.waiting = t.waiting.saturating_sub(1));
+                    st.tenant(tenant, |t| t.stop_waiting(estimate));
                     drop(st);
                     self.cv.notify_all();
+                }
+                if fits {
+                    // Shed by the per-tenant shares, not for lack of room.
+                    return Err(KoshaError::Overloaded(format!(
+                        "search fits under the {} live segment bytes watermark, \
+                         but tenant {tenant:?} is over its share of it and \
+                         another tenant's search waited for memory throughout \
+                         {:?} — retry with backoff",
+                        self.max_live_bytes, self.admission_timeout,
+                    )));
                 }
                 return Err(KoshaError::Overloaded(format!(
                     "search needs ~{estimate} more live segment bytes but \
@@ -365,7 +438,7 @@ impl MemoryLedger {
             }
             if !waiting {
                 waiting = true;
-                st.tenant(tenant, |t| t.waiting += 1);
+                st.tenant(tenant, |t| t.waiting.push(estimate));
             }
             let (guard, _timeout) = self.cv.wait_timeout(st, deadline - now).unwrap();
             st = guard;
@@ -574,8 +647,12 @@ impl Drop for AdmissionPermit {
 /// tenant, never taking a tenant below its floor while another can give
 /// or is over its share with every entry pinned by a running search.
 /// Eviction for admission ([`SegmentCache::evict_idle`]) also counts the
-/// tenant that is about to load, so a cold namespace cannot flush the
-/// other tenants' warm entries below their shares.
+/// tenant that is about to load and takes what tenants hold above their
+/// shares first. A search larger than the whole live-bytes watermark
+/// stops there, so a cold namespace that could never fit does not flush
+/// the other tenants' warm entries below their shares. A search that
+/// fits under the watermark is given the bytes it needs, below the
+/// shares if it must: the watermark is the memory guard.
 /// When the entry-count bound is the one exceeded, shares and the floor
 /// are counted in entries instead (the byte floor over the average entry
 /// size the budget allows), so a tenant opening many tiny segments evicts
@@ -683,16 +760,39 @@ impl SegmentCache {
     /// wait on in-flight releases. Returns the bytes freed.
     ///
     /// The search belongs to tenant `requester` and is about to load
-    /// `estimate` bytes (#342). Its own idle entries go first, least
-    /// recently used first. After that, the requester counts as an active
-    /// tenant holding its bytes plus `estimate`, and another tenant gives
-    /// only what it holds above both its weighted share of `max_bytes` and
-    /// its floor, the tenant furthest over its share first. A tenant
-    /// opening a cold namespace holds nothing yet, so without this it
-    /// would not count and the warm tenants would be the only candidates,
-    /// down to nothing. When no entry may be taken the walk stops short of
-    /// `needed`, and the search waits (or is admitted alone) in `admit`.
-    fn evict_idle(&self, needed: u64, requester: &str, estimate: u64) -> u64 {
+    /// `estimate` bytes (#342); `wanted(key)` says which cached entries it
+    /// is about to read. Admission runs before the search pins anything,
+    /// and its estimate counts those entries as already loaded, so
+    /// evicting one frees nothing the search does not load straight back
+    /// (a cache miss, and bytes it was never admitted for).
+    ///
+    /// The requester counts as an active tenant holding its bytes plus
+    /// `estimate`. A tenant opening a cold namespace holds nothing yet, so
+    /// without this it would not count and the warm tenants would be the
+    /// only candidates, down to nothing. Victims are taken in this order,
+    /// least recently used first within a tenant:
+    ///
+    /// 1. What a tenant (the requester included) holds above both its
+    ///    weighted share of `max_bytes` and its floor, the tenant furthest
+    ///    over its share first. Entries the search wants are skipped.
+    ///    [`AdmissionEvict::RoomSparingShares`] stops here: when no entry
+    ///    may be taken the walk ends short of `needed`.
+    /// 2. For [`AdmissionEvict::Room`], where the bytes have to be found:
+    ///    the requester's other idle entries; then the other tenants'
+    ///    entries, one that keeps its floor before one that does not, and
+    ///    the furthest over (or least under) its share first; and last
+    ///    the entries the search wants.
+    ///
+    /// [`AdmissionEvict::OwnIdle`] takes only the requester's idle entries
+    /// the search does not want.
+    fn evict_idle(
+        &self,
+        needed: u64,
+        requester: &str,
+        estimate: u64,
+        what: AdmissionEvict,
+        wanted: impl Fn(&SegmentCacheKey) -> bool,
+    ) -> u64 {
         let mut freed = 0u64;
         let shares = self.shares();
         let mut recency = self.recency.lock().unwrap();
@@ -706,10 +806,10 @@ impl SegmentCache {
                     Some((_, bytes)) => *bytes = bytes.saturating_add(estimate),
                     None => usage.push((requester, estimate)),
                 }
-                // The requester's oldest idle entry, else each other
-                // tenant's.
-                let mut own: Option<usize> = None;
+                // Each tenant's oldest idle entry the search does not
+                // want, and the oldest idle entry it does.
                 let mut oldest: HashMap<&str, (usize, u64)> = HashMap::new();
+                let mut oldest_wanted: Option<usize> = None;
                 for (pos, key) in recency.iter().enumerate() {
                     let Some((arc, size)) = entries.get(key) else {
                         continue;
@@ -717,28 +817,61 @@ impl SegmentCache {
                     if Arc::strong_count(arc) != 1 {
                         continue;
                     }
-                    let tenant = tenant_of_namespace(&key.0);
-                    if tenant == requester {
-                        own = Some(pos);
-                        break;
+                    if wanted(key) {
+                        oldest_wanted.get_or_insert(pos);
+                    } else {
+                        oldest
+                            .entry(tenant_of_namespace(&key.0))
+                            .or_insert((pos, *size));
                     }
-                    oldest.entry(tenant).or_insert((pos, *size));
                 }
-                own.or_else(|| {
+                let own = oldest.get(requester).map(|(pos, _)| *pos);
+                if what == AdmissionEvict::OwnIdle {
+                    own
+                } else {
                     let weighted = shares.shares(self.max_bytes, &usage);
                     let floor = shares.floor(self.max_bytes, weighted.len());
-                    weighted
+                    // Per tenant with an entry to give: whether it stays
+                    // at or above its share and its floor without the
+                    // entry, whether it keeps its floor, how far over its
+                    // share it is now, and the entry (oldest wins a tie).
+                    let candidates: Vec<(&str, bool, bool, i128, std::cmp::Reverse<usize>)> =
+                        weighted
+                            .iter()
+                            .filter_map(|(tenant, share)| {
+                                let (pos, size) = *oldest.get(tenant)?;
+                                let bytes = usage.iter().find(|(t, _)| t == tenant)?.1;
+                                let left = bytes.saturating_sub(size);
+                                Some((
+                                    *tenant,
+                                    left >= floor.max(*share),
+                                    left >= floor,
+                                    bytes as i128 - *share as i128,
+                                    std::cmp::Reverse(pos),
+                                ))
+                            })
+                            .collect();
+                    let above_share = candidates
                         .iter()
-                        .filter_map(|(tenant, share)| {
-                            let (pos, size) = *oldest.get(tenant)?;
-                            let bytes = usage.iter().find(|(t, _)| t == tenant)?.1;
-                            let keep = floor.max(*share);
-                            (bytes.saturating_sub(size) >= keep)
-                                .then(|| (bytes - share, std::cmp::Reverse(pos)))
+                        .filter(|(_, spare, ..)| *spare)
+                        .max_by_key(|(_, _, _, excess, pos)| (*excess, *pos))
+                        .map(|(.., pos)| pos.0);
+                    above_share.or_else(|| {
+                        if what != AdmissionEvict::Room {
+                            return None;
+                        }
+                        own.or_else(|| {
+                            candidates
+                                .iter()
+                                .filter(|(tenant, ..)| *tenant != requester)
+                                .max_by_key(|(_, _, keeps_floor, excess, pos)| {
+                                    (*keeps_floor, *excess, *pos)
+                                })
+                                .map(|(.., pos)| pos.0)
                         })
-                        .max()
-                        .map(|(_, pos)| pos.0)
-                })
+                        .or(oldest_wanted)
+                    })
+                }
             };
             let Some(pos) = victim else {
                 break;
@@ -3462,6 +3595,36 @@ impl Searcher {
         Ok(tracked)
     }
 
+    /// The eviction [`MemoryLedger::admit`] asks for on behalf of a search
+    /// or warmup pass over `manifest`'s segments of `namespace` that is
+    /// about to load `estimate` bytes. The entries that pass is about to
+    /// read are named to the cache, which takes them last or not at all
+    /// (see [`SegmentCache::evict_idle`]).
+    fn evict_for_admission(
+        &self,
+        namespace: &NamespaceId,
+        manifest: &Manifest,
+        load_vectors: bool,
+        estimate: u64,
+        needed: u64,
+        what: AdmissionEvict,
+    ) {
+        let segments: HashSet<&str> = manifest
+            .segments
+            .iter()
+            .map(|entry| entry.segment_id.0.as_str())
+            .collect();
+        self.segment_cache.evict_idle(
+            needed,
+            tenant_of_namespace(&namespace.0),
+            estimate,
+            what,
+            |key| {
+                key.0 == namespace.0 && key.2 == load_vectors && segments.contains(key.1.as_str())
+            },
+        );
+    }
+
     /// Opens and caches every manifest segment present locally, for
     /// `(namespace, segment_id, load_vectors)` — the missing half of
     /// warmup's own segment-cache prefetch: fetching `vector.idx`/
@@ -3528,8 +3691,8 @@ impl Searcher {
             .sum();
 
         let tenant = tenant_of_namespace(&namespace.0);
-        let permit = self.ledger.admit(tenant, estimate, |needed| {
-            self.segment_cache.evict_idle(needed, tenant, estimate);
+        let permit = self.ledger.admit(tenant, estimate, |needed, what| {
+            self.evict_for_admission(namespace, manifest, load_vectors, estimate, needed, what);
         })?;
 
         let mut pinned = Vec::with_capacity(present.len());
@@ -6727,8 +6890,8 @@ impl Searcher {
             })
             .sum();
         let tenant = tenant_of_namespace(&namespace.0);
-        let permit = self.ledger.admit(tenant, estimate, |needed| {
-            self.segment_cache.evict_idle(needed, tenant, estimate);
+        let permit = self.ledger.admit(tenant, estimate, |needed, what| {
+            self.evict_for_admission(namespace, manifest, load_vectors, estimate, needed, what);
         })?;
         phase_stats.admit_wall_ms = t_admit.elapsed().as_secs_f64() * 1e3;
 
@@ -11248,7 +11411,9 @@ mod tests {
 
         // Evicting the now-idle entry drops the last Arc → live returns to
         // zero, i.e. eviction and actual memory release now coincide.
-        searcher.segment_cache.evict_idle(u64::MAX, "_legacy", 0);
+        searcher
+            .segment_cache
+            .evict_idle(u64::MAX, "_legacy", 0, AdmissionEvict::Room, |_| false);
         assert_eq!(ledger_snapshot(&searcher).0, 0);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -11301,7 +11466,7 @@ mod tests {
         // and it was taken to zero. Beta's warm set here is half the
         // budget: its equal share once acme is active, so it keeps all of
         // it. (Bytes a tenant holds above its share are given up, in
-        // `admission_eviction_takes_the_requesters_entries_first_and_spares_other_shares`.)
+        // `admission_eviction_for_an_oversized_search_spares_other_tenants_shares`.)
         let dir = std::env::temp_dir().join(format!(
             "kosha-test-admission-tenant-floor-{}",
             std::process::id()
@@ -11374,7 +11539,9 @@ mod tests {
 
         // The same holds for a warmup pass over acme's namespace.
         let beta = tenant_cache_stats(&searcher, "beta");
-        searcher.segment_cache.evict_idle(u64::MAX, "acme", 0);
+        searcher
+            .segment_cache
+            .evict_idle(u64::MAX, "acme", 0, AdmissionEvict::OwnIdle, |_| false);
         searcher
             .warm_segments(&acme_ns, &acme_manifest, false)
             .unwrap();
@@ -11390,7 +11557,7 @@ mod tests {
     }
 
     #[test]
-    fn admission_eviction_takes_the_requesters_entries_first_and_spares_other_shares() {
+    fn admission_eviction_for_an_oversized_search_spares_other_tenants_shares() {
         let dir = std::env::temp_dir().join(format!(
             "kosha-test-admission-eviction-order-{}",
             std::process::id()
@@ -11420,14 +11587,23 @@ mod tests {
         for i in 0..20 {
             cache.insert(key("acme/old", i), segment("acme"), 100);
         }
-        // Acme needs 3,000 freed for a 5,000 byte load. Its own 2,000 idle
-        // bytes go first; then it counts for 5,000, each share is 5,000,
-        // and beta (6,000) gives the 1,000 it holds above its share.
-        assert_eq!(cache.evict_idle(3_000, "acme", 5_000), 3_000);
+        // Acme is about to load 5,000 bytes, more than the live watermark
+        // could ever hold, and asks for 3,000. It counts for its 2,000
+        // idle bytes plus the 5,000, each share is 5,000, and the two
+        // tenants give what they hold above it: acme its 2,000, beta
+        // (6,000) 1,000.
+        let sparing = AdmissionEvict::RoomSparingShares;
+        assert_eq!(
+            cache.evict_idle(3_000, "acme", 5_000, sparing, |_| false),
+            3_000
+        );
         assert_eq!(bytes(&cache, "acme"), 0);
         assert_eq!(bytes(&cache, "beta"), 5_000);
         // Beta is at its share: nothing more to take, whatever is asked.
-        assert_eq!(cache.evict_idle(u64::MAX, "acme", 5_000), 0);
+        assert_eq!(
+            cache.evict_idle(u64::MAX, "acme", 5_000, sparing, |_| false),
+            0
+        );
         assert_eq!(bytes(&cache, "beta"), 5_000);
         // The entries beta gave were its least recently used.
         assert!(!cache.contains(&key("beta/docs", 9)));
@@ -11445,19 +11621,249 @@ mod tests {
                 }
             },
         )));
-        assert_eq!(cache.evict_idle(u64::MAX, "acme", 5_000), 3_000);
+        assert_eq!(
+            cache.evict_idle(u64::MAX, "acme", 5_000, sparing, |_| false),
+            3_000
+        );
         assert_eq!(bytes(&cache, "beta"), 2_000);
+        // A search that fits under the watermark has to be given its
+        // bytes, so for it the floor only decides the order.
+        assert_eq!(
+            cache.evict_idle(300, "acme", 5_000, AdmissionEvict::Room, |_| false),
+            300
+        );
+        assert_eq!(bytes(&cache, "beta"), 1_700);
 
         // A pinned entry is never taken, the requester's own included.
         let pinned = segment("acme");
         cache.insert(key("acme/old", 0), Arc::clone(&pinned), 100);
-        assert_eq!(cache.evict_idle(u64::MAX, "acme", 0), 0);
+        assert_eq!(
+            cache.evict_idle(u64::MAX, "acme", 0, AdmissionEvict::OwnIdle, |_| false),
+            0
+        );
         assert!(cache.contains(&key("acme/old", 0)));
         drop(pinned);
-        assert_eq!(cache.evict_idle(u64::MAX, "acme", 0), 100);
+        // Shedding its own idle bytes, a tenant takes nobody else's.
+        assert_eq!(
+            cache.evict_idle(u64::MAX, "acme", 0, AdmissionEvict::OwnIdle, |_| false),
+            100
+        );
+        assert_eq!(bytes(&cache, "beta"), 1_700);
 
         drop(cache);
         assert!(ledger.state.lock().unwrap().tenants.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn admission_eviction_takes_over_share_tenants_before_the_requesters_warm_entries() {
+        // Admission runs before the search pins anything, so the
+        // requester's idle entries include the warm segments it is about
+        // to read. Taking those first cost an under-share tenant its own
+        // warm set while another tenant sat over its share.
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-admission-eviction-wanted-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut writer = SegmentWriter::new(SegmentId("s".into()), dir.clone());
+        writer.add_document(DocumentId("d".into()), vec![Field::text("t", "alpha")]);
+        writer.finalize(Bm25Params::default()).unwrap();
+        let ledger = Arc::new(MemoryLedger::new(u64::MAX, Duration::from_secs(1)));
+        let segment = |tenant: &str| {
+            Arc::new(TrackedSegment::new(
+                SegmentReader::open(dir.clone()).unwrap(),
+                100,
+                Arc::clone(&ledger),
+                tenant,
+            ))
+        };
+        let key = |ns: &str, i: usize| (ns.to_string(), format!("seg-{i}"), false);
+        let bytes =
+            |cache: &SegmentCache, tenant: &str| cache.tenants.lock().unwrap().bytes(tenant);
+        let cache = SegmentCache::new(10_000, 10_000);
+        *cache.shares.write().unwrap() = TenantShares::new(2_000);
+        // Beta's warm namespace is the least recently used of all.
+        for i in 0..30 {
+            cache.insert(key("beta/docs", i), segment("beta"), 100);
+        }
+        for i in 0..5 {
+            cache.insert(key("beta/other", i), segment("beta"), 100);
+        }
+        for i in 0..60 {
+            cache.insert(key("acme/docs", i), segment("acme"), 100);
+        }
+        let wanted = |key: &SegmentCacheKey| key.0 == "beta/docs";
+        let beta_docs = |cache: &SegmentCache| {
+            (0..30)
+                .filter(|i| cache.contains(&key("beta/docs", *i)))
+                .count()
+        };
+
+        // Beta searches beta/docs plus 1,000 new bytes and needs 500.
+        // It counts for 4,500, under its 5,000 share; acme (6,000) is
+        // over its own and gives.
+        assert_eq!(
+            cache.evict_idle(500, "beta", 1_000, AdmissionEvict::Room, wanted),
+            500
+        );
+        assert_eq!(bytes(&cache, "acme"), 5_500);
+        assert_eq!(bytes(&cache, "beta"), 3_500);
+
+        // A search larger than the whole watermark takes what is above
+        // the shares and no more.
+        let sparing = AdmissionEvict::RoomSparingShares;
+        assert_eq!(
+            cache.evict_idle(u64::MAX, "beta", 1_000, sparing, wanted),
+            500
+        );
+        assert_eq!(bytes(&cache, "acme"), 5_000);
+        assert_eq!(bytes(&cache, "beta"), 3_500);
+
+        // With nothing left above a share, a search that has to be given
+        // room takes the requester's entries it will not read, then the
+        // other tenant's below its share.
+        assert_eq!(
+            cache.evict_idle(700, "beta", 1_000, AdmissionEvict::Room, wanted),
+            700
+        );
+        assert_eq!(bytes(&cache, "beta"), 3_000);
+        assert_eq!(bytes(&cache, "acme"), 4_800);
+        assert_eq!(beta_docs(&cache), 30);
+        // Shedding its own idle bytes, it keeps the ones it will read.
+        assert_eq!(
+            cache.evict_idle(u64::MAX, "beta", 1_000, AdmissionEvict::OwnIdle, wanted),
+            0
+        );
+        // Those go last, when nothing else is idle.
+        assert_eq!(
+            cache.evict_idle(4_900, "beta", 1_000, AdmissionEvict::Room, wanted),
+            4_900
+        );
+        assert_eq!(bytes(&cache, "acme"), 0);
+        assert_eq!(beta_docs(&cache), 29);
+        assert!(!cache.contains(&key("beta/docs", 0)));
+
+        drop(cache);
+        assert!(ledger.state.lock().unwrap().tenants.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_search_under_its_share_keeps_its_warm_segments_through_admission() {
+        // The same through `Searcher::search`: beta is under its share,
+        // acme over its own, and another tenant's running search leaves
+        // half a segment less than beta's one new segment needs.
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-admission-keeps-warm-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let beta_ns = NamespaceId("beta/docs".into());
+        let acme_ns = NamespaceId("acme/docs".into());
+        let (beta_manifest, beta_bytes) = mk_tenant_namespace(&dir, &beta_ns.0, 5);
+        let unit = beta_bytes / 5;
+        let (acme_manifest, _) = mk_tenant_namespace(&dir, &acme_ns.0, 10);
+        let mut beta_warm = beta_manifest.clone();
+        beta_warm.segments.truncate(4);
+        let budget = 16 * unit;
+        let searcher = Searcher::with_memory_limits(
+            dir.clone(),
+            1_000,
+            budget,
+            2 * budget,
+            Duration::from_millis(50),
+        );
+        searcher.set_tenant_shares(TenantShares::new(
+            kosha_core::tenancy::DEFAULT_TENANT_MIN_BYTES,
+        ));
+        let query = mk_query("alpha", 10);
+        for _ in 0..2 {
+            searcher
+                .search(&acme_ns, &acme_manifest, &query, None)
+                .unwrap();
+            searcher.search(&beta_ns, &beta_warm, &query, None).unwrap();
+        }
+        let (live, _, _) = ledger_snapshot(&searcher);
+        let outstanding = searcher
+            .ledger
+            .admit("gamma", 2 * budget - live - unit / 2, |_, _| {})
+            .unwrap();
+
+        let beta = tenant_cache_stats(&searcher, "beta");
+        let acme = tenant_cache_stats(&searcher, "acme");
+        let result = searcher
+            .search(&beta_ns, &beta_manifest, &query, None)
+            .unwrap();
+        assert_eq!(result.total_hits, 5);
+        let beta_after = tenant_cache_stats(&searcher, "beta");
+        let acme_after = tenant_cache_stats(&searcher, "acme");
+        assert_eq!(
+            beta_after.evictions, beta.evictions,
+            "beta's warm segments are not evicted to admit beta's own search"
+        );
+        assert_eq!(
+            beta_after.misses - beta.misses,
+            1,
+            "only the new segment is a miss"
+        );
+        assert!(acme_after.evictions > acme.evictions);
+
+        drop(outstanding);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_search_that_fits_under_the_watermark_is_given_another_tenants_idle_bytes() {
+        // Beta's warm set is exactly its share of the cache. Acme's cold
+        // namespace fits under the live watermark only if some of it is
+        // evicted, and another search is in flight, so acme is never
+        // alone. Sparing beta's share here left acme waiting out the
+        // admission timeout (HTTP 429) with evictable memory in the cache.
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-admission-room-under-watermark-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        const WARM: usize = 8;
+        const COLD: usize = 3 * WARM + 2;
+        let beta_ns = NamespaceId("beta/docs".into());
+        let acme_ns = NamespaceId("acme/big".into());
+        let (beta_manifest, beta_bytes) = mk_tenant_namespace(&dir, &beta_ns.0, WARM);
+        let budget = 2 * beta_bytes;
+        let (acme_manifest, acme_bytes) = mk_tenant_namespace(&dir, &acme_ns.0, COLD);
+        assert!(acme_bytes < 2 * budget && acme_bytes + beta_bytes > 2 * budget);
+        let searcher = Searcher::with_memory_limits(
+            dir.clone(),
+            1_000,
+            budget,
+            2 * budget,
+            Duration::from_millis(50),
+        );
+        searcher.set_tenant_shares(TenantShares::new(
+            kosha_core::tenancy::DEFAULT_TENANT_MIN_BYTES,
+        ));
+        let query = mk_query("alpha", 10);
+        for _ in 0..2 {
+            searcher
+                .search(&beta_ns, &beta_manifest, &query, None)
+                .unwrap();
+        }
+        let outstanding = searcher.ledger.admit("gamma", 1, |_, _| {}).unwrap();
+
+        let result = searcher
+            .search(&acme_ns, &acme_manifest, &query, None)
+            .expect("admitted by evicting idle bytes, not shed");
+        assert_eq!(result.total_hits, COLD);
+        let beta = tenant_cache_stats(&searcher, "beta");
+        assert!(beta.evictions >= 1);
+        assert!(
+            beta.bytes >= beta_bytes / 2,
+            "beta gives what acme needs and no more, has {} of {beta_bytes}",
+            beta.bytes
+        );
+
+        drop(outstanding);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -11471,7 +11877,7 @@ mod tests {
                 .unwrap()
                 .tenants
                 .get(tenant)
-                .map_or(0, |t| t.waiting);
+                .map_or(0, |t| t.waiting.len());
             if waiting == count {
                 return;
             }
@@ -11497,8 +11903,8 @@ mod tests {
         // search, not back to acme, which is over its share.
         const ACME_RETRIES: usize = 8;
         let ledger = tenant_ledger(100, Duration::from_secs(30));
-        let first = ledger.admit("acme", 60, |_| {}).unwrap();
-        let second = ledger.admit("acme", 40, |_| {}).unwrap();
+        let first = ledger.admit("acme", 60, |_, _| {}).unwrap();
+        let second = ledger.admit("acme", 40, |_, _| {}).unwrap();
 
         let (acme_tx, acme_rx) = std::sync::mpsc::channel();
         let acme_threads: Vec<_> = (0..ACME_RETRIES)
@@ -11506,7 +11912,8 @@ mod tests {
                 let ledger = Arc::clone(&ledger);
                 let tx = acme_tx.clone();
                 std::thread::spawn(move || {
-                    tx.send(ledger.admit("acme", 40, |_| {}).unwrap()).unwrap();
+                    tx.send(ledger.admit("acme", 40, |_, _| {}).unwrap())
+                        .unwrap();
                 })
             })
             .collect();
@@ -11516,7 +11923,7 @@ mod tests {
             let ledger = Arc::clone(&ledger);
             std::thread::spawn(move || {
                 beta_tx
-                    .send(ledger.admit("beta", 40, |_| {}).unwrap())
+                    .send(ledger.admit("beta", 40, |_, _| {}).unwrap())
                     .unwrap();
             })
         };
@@ -11531,7 +11938,7 @@ mod tests {
             let st = ledger.state.lock().unwrap();
             assert_eq!(st.tenants["beta"].reserved, 40);
             assert_eq!(st.tenants["acme"].reserved, 60);
-            assert_eq!(st.tenants["acme"].waiting, ACME_RETRIES);
+            assert_eq!(st.tenants["acme"].waiting.len(), ACME_RETRIES);
         }
         assert!(acme_rx.try_recv().is_err(), "no acme retry got in first");
 
@@ -11557,12 +11964,12 @@ mod tests {
         // another search waiting. Neither may be held back for the other,
         // or both would wait out the timeout with bytes free.
         let ledger = tenant_ledger(100, Duration::from_secs(30));
-        let acme = ledger.admit("acme", 40, |_| {}).unwrap();
-        let beta = ledger.admit("beta", 40, |_| {}).unwrap();
+        let acme = ledger.admit("acme", 40, |_, _| {}).unwrap();
+        let beta = ledger.admit("beta", 40, |_, _| {}).unwrap();
         ledger.add_live("gamma", 20);
         let spawn = |tenant: &'static str| {
             let ledger = Arc::clone(&ledger);
-            std::thread::spawn(move || ledger.admit(tenant, 9, |_| {}).unwrap())
+            std::thread::spawn(move || ledger.admit(tenant, 9, |_, _| {}).unwrap())
         };
         let acme_waiter = spawn("acme");
         let beta_waiter = spawn("beta");
@@ -11581,22 +11988,22 @@ mod tests {
     fn a_lone_tenant_keeps_the_whole_live_watermark() {
         let ledger = tenant_ledger(100, Duration::from_millis(50));
         // Far over any share, but nobody else is waiting.
-        let first = ledger.admit("acme", 80, |_| {}).unwrap();
-        let second = ledger.admit("acme", 20, |_| {}).unwrap();
+        let first = ledger.admit("acme", 80, |_, _| {}).unwrap();
+        let second = ledger.admit("acme", 20, |_, _| {}).unwrap();
         assert_eq!(ledger.state.lock().unwrap().tenants["acme"].reserved, 100);
         // Full is still full: a further search waits, then is shed, and
         // leaves no waiter behind.
         assert!(matches!(
-            ledger.admit("acme", 1, |_| {}),
+            ledger.admit("acme", 1, |_, _| {}),
             Err(KoshaError::Overloaded(_))
         ));
         assert!(matches!(
-            ledger.admit("beta", 1, |_| {}),
+            ledger.admit("beta", 1, |_, _| {}),
             Err(KoshaError::Overloaded(_))
         ));
         {
             let st = ledger.state.lock().unwrap();
-            assert_eq!(st.tenants["acme"].waiting, 0);
+            assert_eq!(st.tenants["acme"].waiting.len(), 0);
             assert!(!st.tenants.contains_key("beta"));
         }
         drop(first);
@@ -11605,8 +12012,9 @@ mod tests {
         // attempt (the anti-starvation rule).
         let evictions = AtomicUsize::new(0);
         let oversized = ledger
-            .admit("acme", 1_000, |needed| {
+            .admit("acme", 1_000, |needed, what| {
                 assert_eq!(needed, 900);
+                assert_eq!(what, AdmissionEvict::RoomSparingShares);
                 evictions.fetch_add(1, Ordering::Relaxed);
             })
             .unwrap();
@@ -11617,17 +12025,107 @@ mod tests {
     }
 
     #[test]
+    fn a_waiter_asking_for_more_than_its_share_holds_nobody_back() {
+        // Beta's search wants 70 of 100 bytes against a share of 50, and
+        // can only run once acme's search is done. Holding acme's further
+        // searches back for it would cost beta nothing and serialise
+        // acme for as long as beta keeps retrying.
+        let ledger = tenant_ledger(100, Duration::from_secs(30));
+        let first = ledger.admit("acme", 60, |_, _| {}).unwrap();
+        let beta_waiter = {
+            let ledger = Arc::clone(&ledger);
+            std::thread::spawn(move || ledger.admit("beta", 70, |_, _| {}).unwrap())
+        };
+        wait_for_waiters(&ledger, "beta", 1);
+        let started = Instant::now();
+        let second = ledger.admit("acme", 30, |_, _| {}).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(ledger.state.lock().unwrap().tenants["acme"].reserved, 90);
+        // Beta gets in once acme is done.
+        drop((first, second));
+        drop(beta_waiter.join().unwrap());
+        assert!(ledger.state.lock().unwrap().tenants.is_empty());
+    }
+
+    #[test]
+    fn a_tenant_held_back_sheds_its_idle_bytes_and_goes_ahead() {
+        // Acme is over its share of 50 only through 50 idle cached bytes
+        // (its running search holds 10). Held back for beta's waiting
+        // search, it is asked for its own idle bytes, and once it has
+        // given enough of them both searches run.
+        let ledger = tenant_ledger(100, Duration::from_secs(30));
+        ledger.add_live("acme", 50);
+        let first = ledger.admit("acme", 10, |_, _| {}).unwrap();
+        let beta_waiter = {
+            let ledger = Arc::clone(&ledger);
+            std::thread::spawn(move || ledger.admit("beta", 45, |_, _| {}).unwrap())
+        };
+        wait_for_waiters(&ledger, "beta", 1);
+
+        let asked = Mutex::new(Vec::new());
+        let second = ledger
+            .admit("acme", 5, |needed, what| {
+                asked.lock().unwrap().push((needed, what));
+                if what == AdmissionEvict::OwnIdle {
+                    // The cache evicts 20 idle bytes of acme's.
+                    ledger.release_live("acme", 20);
+                }
+            })
+            .unwrap();
+        assert_eq!(*asked.lock().unwrap(), vec![(10, AdmissionEvict::OwnIdle)]);
+        let beta = beta_waiter.join().unwrap();
+        {
+            let st = ledger.state.lock().unwrap();
+            assert_eq!(st.tenants["acme"].committed(), 45);
+            assert_eq!(st.tenants["beta"].reserved, 45);
+        }
+        drop((first, second, beta));
+        ledger.release_live("acme", 30);
+        assert!(ledger.state.lock().unwrap().tenants.is_empty());
+    }
+
+    #[test]
+    fn a_search_shed_by_tenant_shares_is_told_so() {
+        let ledger = tenant_ledger(100, Duration::from_millis(50));
+        let first = ledger.admit("acme", 90, |_, _| {}).unwrap();
+        // A search of beta's that stays blocked throughout.
+        ledger
+            .state
+            .lock()
+            .unwrap()
+            .tenant("beta", |t| t.waiting.push(10));
+        // Acme's next search fits (95 of 100) and is shed for its share.
+        let Err(KoshaError::Overloaded(message)) = ledger.admit("acme", 5, |_, _| {}) else {
+            panic!("held back for beta's waiting search");
+        };
+        assert!(message.contains("over its share"), "{message}");
+        assert!(!message.contains("needs ~"), "{message}");
+        // One that does not fit is still told how much it lacks.
+        let Err(KoshaError::Overloaded(message)) = ledger.admit("acme", 20, |_, _| {}) else {
+            panic!("110 of 100 bytes");
+        };
+        assert!(message.contains("needs ~20"), "{message}");
+        ledger
+            .state
+            .lock()
+            .unwrap()
+            .tenant("beta", |t| t.stop_waiting(10));
+        drop(first);
+        assert!(ledger.state.lock().unwrap().tenants.is_empty());
+    }
+
+    #[test]
     fn tenant_shares_in_admission_are_off_unless_enabled() {
         // Default behaviour is unchanged: acme, over its share, is not
         // held back for beta's waiting search.
         let ledger = Arc::new(MemoryLedger::new(100, Duration::from_secs(30)));
-        let first = ledger.admit("acme", 90, |_| {}).unwrap();
+        let first = ledger.admit("acme", 90, |_, _| {}).unwrap();
         let beta_waiter = {
             let ledger = Arc::clone(&ledger);
-            std::thread::spawn(move || ledger.admit("beta", 20, |_| {}).unwrap())
+            std::thread::spawn(move || ledger.admit("beta", 20, |_, _| {}).unwrap())
         };
         wait_for_waiters(&ledger, "beta", 1);
-        let second = ledger.admit("acme", 10, |_| {}).unwrap();
+        let second = ledger.admit("acme", 10, |_, _| {}).unwrap();
         // Enabled, the same request waits behind beta.
         drop(second);
         ledger.tenant_shares_enabled.store(true, Ordering::Relaxed);
@@ -11635,7 +12133,8 @@ mod tests {
         let acme_waiter = {
             let ledger = Arc::clone(&ledger);
             std::thread::spawn(move || {
-                tx.send(ledger.admit("acme", 10, |_| {}).unwrap()).unwrap();
+                tx.send(ledger.admit("acme", 10, |_, _| {}).unwrap())
+                    .unwrap();
             })
         };
         wait_for_waiters(&ledger, "acme", 1);
@@ -11679,11 +12178,15 @@ mod tests {
         // Dropping acme's segments (and their postings caches with them)
         // returns its live bytes to zero and leaves the other tenant's.
         let legacy_live = tenant_live("_legacy");
-        searcher.segment_cache.evict_idle(u64::MAX, "acme", 0);
+        searcher
+            .segment_cache
+            .evict_idle(u64::MAX, "acme", 0, AdmissionEvict::OwnIdle, |_| false);
         assert_eq!(tenant_live("acme"), 0);
         assert_eq!(tenant_live("_legacy"), legacy_live);
         assert_eq!(ledger_snapshot(&searcher).0, legacy_live);
-        searcher.segment_cache.evict_idle(u64::MAX, "_legacy", 0);
+        searcher
+            .segment_cache
+            .evict_idle(u64::MAX, "_legacy", 0, AdmissionEvict::OwnIdle, |_| false);
         assert!(searcher.ledger.state.lock().unwrap().tenants.is_empty());
         assert_eq!(ledger_snapshot(&searcher), (0, 0, 0));
 
@@ -11709,7 +12212,7 @@ mod tests {
             Duration::from_millis(50),
         );
         // Simulate an admitted in-flight search holding the watermark.
-        let outstanding = searcher.ledger.admit("_legacy", 1, |_| {}).unwrap();
+        let outstanding = searcher.ledger.admit("_legacy", 1, |_, _| {}).unwrap();
 
         let manifest = Manifest {
             version: 1,
@@ -18502,7 +19005,7 @@ mod corpus_stats_tests {
         );
         let (manifest, locations) = write_segments(&dir, &ns.0, "s", &groups, 1);
         let searcher = Searcher::new(dir.clone());
-        let permit = searcher.ledger.admit("_legacy", 0, |_| {}).unwrap();
+        let permit = searcher.ledger.admit("_legacy", 0, |_, _| {}).unwrap();
         let open_stats = OpenStatsCollector::default();
         let mut checked = 0;
         for params in [
