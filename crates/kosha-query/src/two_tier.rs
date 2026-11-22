@@ -32,6 +32,13 @@
 //!      head-only top-k *set* is exactly the true top-k.
 //!    - **rank-certified**: set-certified and, down the list, every
 //!      `LB(d_i)` beats every later `UB(d_j)` — ids *and* order identical.
+//!      The scores a head-only answer could return are still only `LB`s.
+//!    - **score-exact**: rank-certified and every top-k document has
+//!      `UB = LB` (no unresolved tail term), so ids, order *and* scores
+//!      equal the exhaustive answer. This is what "identical top-10"
+//!      means for a response that carries scores (the bench and the
+//!      server return ids + scores); finishing a rank-certified query's
+//!      scores costs the tail reads counted in `tail_gets`.
 //! 4. **Oracle.** The exhaustive top-k over full postings. A certified
 //!    query whose head answer differs from it is counted as a *violation*;
 //!    any non-zero count means the bound logic is wrong.
@@ -42,8 +49,9 @@
 //! `*_with_ties` counters report how many more queries a tie-aware check
 //! would certify.
 //!
-//! Not modelled: tombstones/deletion vectors (every posting is live),
-//! filters, phrase/AND/fuzzy/wildcard queries, multi-field (#249)
+//! Not modelled: tombstones/deletion vectors (every posting is live; the
+//! bench script refuses a manifest that has any, and cross-checks the
+//! oracle against the live server), filters, phrase/AND/fuzzy/wildcard queries, multi-field (#249)
 //! queries, and segments whose footer names more than one analysis chain
 //! (counted in `segments_skipped_multi_reading`).
 
@@ -211,6 +219,39 @@ pub fn frontier_tf(steps: &[(u32, u32)], dl: u32) -> Option<u32> {
     (i > 0).then(|| steps[i - 1].1)
 }
 
+/// Bytes to store a tail's frontier step function: a count varint, then
+/// per point the `dl` and `tf` deltas as varints (both strictly
+/// ascending along the frontier). The metadata cost of `frontier_dl`.
+pub fn frontier_bytes(steps: &[(u32, u32)]) -> u64 {
+    let mut total = varint_len(steps.len() as u32);
+    let (mut prev_dl, mut prev_tf) = (0u32, 0u32);
+    for &(dl, tf) in steps {
+        total += varint_len(dl.wrapping_sub(prev_dl)) + varint_len(tf.wrapping_sub(prev_tf));
+        (prev_dl, prev_tf) = (dl, tf);
+    }
+    total
+}
+
+/// Assumed extra TOC bytes per split term for the tail span reference
+/// (blob id u32 + offset u64 + length u32, uncompressed): an estimate of
+/// what a v6 TOC entry adds, not a measured format.
+pub const TAIL_TOC_ENTRY_BYTES_EST: u64 = 16;
+
+/// File kinds that stay local whatever the posting layout: everything but
+/// posting shards (counted as span bytes instead), the doc store body and
+/// vectors (neither is part of the local text footprint).
+pub fn is_fixed_local_kind(kind: &str) -> bool {
+    !matches!(kind, "postings_shards" | "doc_store" | "vectors")
+}
+
+fn fixed_local_bytes(files: &HashMap<String, u64>) -> u64 {
+    files
+        .iter()
+        .filter(|(k, _)| is_fixed_local_kind(k))
+        .map(|(_, v)| *v)
+        .sum()
+}
+
 /// Bounds compared side by side: 0 = frontier with the document's own
 /// length, 1 = frontier max (the exact tail maximum), 2 = single
 /// `(max tf, min dl)` ceiling.
@@ -317,14 +358,29 @@ impl Segment {
         Ok(out)
     }
 
-    /// On-disk span bytes per term (split segments only).
+    /// On-disk span bytes per term (split segments only), looked up in
+    /// the TOC the reader already holds: no file read per call.
     fn span_lens(&self, terms: &[String]) -> HashMap<String, u64> {
         if !self.split {
             return HashMap::new();
         }
-        kosha_segment::posting_term_spans(self.reader.segment_dir(), terms)
-            .map(|spans| spans.into_iter().map(|s| (s.term, s.len)).collect())
-            .unwrap_or_default()
+        terms
+            .iter()
+            .filter_map(|t| self.reader.posting_span_len(t).map(|len| (t.clone(), len)))
+            .collect()
+    }
+
+    /// Local file bytes of this segment directory, by [`file_kind`].
+    fn file_bytes(&self) -> HashMap<String, u64> {
+        let mut files = HashMap::new();
+        if let Ok(dir) = std::fs::read_dir(self.reader.segment_dir()) {
+            for e in dir.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let len = e.metadata().map(|m| m.len()).unwrap_or(0);
+                *files.entry(file_kind(&name).to_string()).or_default() += len;
+            }
+        }
+        files
     }
 
     /// The external `_id` of `doc_seq`.
@@ -449,14 +505,17 @@ impl Scratch {
 pub struct Decision {
     pub set_certified: bool,
     pub rank_certified: bool,
+    /// Rank-certified and every top-k score pinned (`UB = LB`).
+    pub score_exact: bool,
     pub set_certified_with_ties: bool,
     /// Head-only top-k ∩ true top-k, out of `min(k, hits)`.
     pub overlap: usize,
     pub head_answer_exact: bool,
     pub violation: bool,
-    /// Segments whose tail must be read to finish the query exactly, and
-    /// the (segment, term) tail spans that costs if every query-term tail
-    /// of those segments is read (an upper bound on tail GETs).
+    /// Segments whose tail must be read to finish the query exactly (ids,
+    /// order and scores), and the (segment, term) tail spans that costs if
+    /// every query-term tail of those segments is read (an upper bound on
+    /// tail GETs). Zero only for score-exact queries.
     pub tail_segments: u32,
     pub tail_gets: u32,
     pub tail_bytes: u64,
@@ -465,6 +524,8 @@ pub struct Decision {
 #[derive(Clone, Debug, Serialize)]
 pub struct QueryOutcome {
     pub query: usize,
+    /// The query text as analyzed (for the server cross-check).
+    pub text: String,
     pub terms: usize,
     pub hits: usize,
     /// `[fraction][bound]`, bounds in [`BOUNDS`] order.
@@ -472,6 +533,8 @@ pub struct QueryOutcome {
     /// The exhaustive top-k: `(segment index, doc_seq, score)`.
     #[serde(skip)]
     pub oracle: Vec<(u32, u32, f64)>,
+    /// The same top-k as external `(_id, score)`.
+    pub oracle_hits: Vec<(String, f64)>,
 }
 
 /// Per distinct (segment, query term): bytes touched now vs. in a head.
@@ -481,6 +544,10 @@ struct Touched {
     full_scoring: u64,
     head_scoring: Vec<u64>,
     head_pos_share: Vec<f64>,
+    /// Per fraction: tail frontier bytes (0 when the term has no tail) and
+    /// whether the term is split.
+    frontier_bytes: Vec<u64>,
+    split: Vec<bool>,
 }
 
 struct TwoTierAnalyzer<'a> {
@@ -653,6 +720,16 @@ impl TwoTierAnalyzer<'_> {
                         full_scoring: t.full_scoring_bytes,
                         head_scoring: t.head_scoring_bytes.clone(),
                         head_pos_share: t.head_pos_share.clone(),
+                        frontier_bytes: (0..nf)
+                            .map(|j| {
+                                if t.has_tail[j] {
+                                    frontier_bytes(&t.steps[j])
+                                } else {
+                                    0
+                                }
+                            })
+                            .collect(),
+                        split: t.has_tail.clone(),
                     },
                 ));
             }
@@ -787,23 +864,34 @@ impl TwoTierAnalyzer<'_> {
 
         // Oracle: exhaustive top-k.
         top_k_by(&mut exact_tops, k, |x| (x.0, (x.1, x.2)));
-        let oracle: Vec<(u32, u32)> = exact_tops.iter().map(|x| (x.1, x.2)).collect();
-        let oracle_scored = exact_tops.iter().map(|x| (x.1, x.2, x.0)).collect();
+        let oracle_scored: Vec<(u32, u32, f64)> =
+            exact_tops.iter().map(|x| (x.1, x.2, x.0)).collect();
+        let oracle_hits = oracle_scored
+            .iter()
+            .map(|&(s, d, score)| {
+                let id = self.segments[s as usize]
+                    .doc_id(d)
+                    .unwrap_or_else(|| format!("<seg {s} doc {d}>"));
+                (id, score)
+            })
+            .collect();
 
         let mut decisions = Vec::with_capacity(nf);
         for j in 0..nf {
             let mut pair: [Decision; NB] = Default::default();
             for (b, decision) in pair.iter_mut().enumerate() {
-                *decision = decide(&seg_out, j, b, k, &oracle);
+                *decision = decide(&seg_out, j, b, k, &oracle_scored);
             }
             decisions.push(pair);
         }
         Ok(Some(QueryOutcome {
             query: qi,
+            text: text.to_string(),
             terms: max_terms,
             hits,
             decisions,
             oracle: oracle_scored,
+            oracle_hits,
         }))
     }
 }
@@ -836,8 +924,10 @@ fn decide(
     j: usize,
     b: usize,
     k: usize,
-    oracle: &[(u32, u32)],
+    oracle_scored: &[(u32, u32, f64)],
 ) -> Decision {
+    let oracle: Vec<(u32, u32)> = oracle_scored.iter().map(|x| (x.0, x.1)).collect();
+    let tol = |x: f64| REL_EPS * x.abs().max(1e-12);
     let mut pool: Vec<Cand> = seg_out
         .iter()
         .flat_map(|s| s[j].top.iter().copied())
@@ -875,7 +965,7 @@ fn decide(
     if rank_cert {
         let mut suffix = f64::NEG_INFINITY;
         for c in head.iter().rev() {
-            if suffix > c.lb - REL_EPS * c.lb.abs().max(1e-12) {
+            if suffix > c.lb - tol(c.lb) {
                 rank_cert = false;
                 break;
             }
@@ -883,10 +973,20 @@ fn decide(
         }
     }
 
+    // Scores: every top-k document's tail is ruled out, so LB is its score.
+    let score_exact = rank_cert && head.iter().all(|c| c.ub[b] <= c.lb + tol(c.lb));
+
     let head_ids: Vec<(u32, u32)> = head.iter().map(|c| (c.seg, c.doc)).collect();
     let overlap = head_ids.iter().filter(|id| oracle.contains(id)).count();
     let set_equal = overlap == oracle.len() && head_ids.len() == oracle.len();
-    let violation = (set_cert && !set_equal) || (rank_cert && head_ids != oracle);
+    let scores_equal = head.len() == oracle_scored.len()
+        && head
+            .iter()
+            .zip(oracle_scored)
+            .all(|(c, o)| (c.lb - o.2).abs() <= tol(o.2));
+    let violation = (set_cert && !set_equal)
+        || (rank_cert && head_ids != oracle)
+        || (score_exact && !scores_equal);
 
     // Tail work to finish exactly: segments where something could still
     // reach θ (set), plus segments of head top-k docs whose score is not
@@ -894,7 +994,7 @@ fn decide(
     let mut tail_segments = 0u32;
     let mut tail_gets = 0u32;
     let mut tail_bytes = 0u64;
-    if !rank_cert {
+    if !score_exact {
         let mut needs = vec![false; seg_out.len()];
         let seg_index: HashMap<u32, usize> = seg_out
             .iter()
@@ -913,7 +1013,7 @@ fn decide(
             }
         }
         for c in &head {
-            if c.ub[b] > c.lb + REL_EPS * c.lb.abs().max(1e-12) {
+            if c.ub[b] > c.lb + tol(c.lb) {
                 if let Some(&i) = seg_index.get(&c.seg) {
                     needs[i] = true;
                 }
@@ -930,6 +1030,7 @@ fn decide(
     Decision {
         set_certified: set_cert,
         rank_certified: rank_cert,
+        score_exact,
         set_certified_with_ties: set_cert_ties,
         overlap,
         head_answer_exact: head_ids == oracle,
@@ -948,11 +1049,13 @@ pub struct BoundSummary {
     pub queries: usize,
     pub set_certified: f64,
     pub rank_certified: f64,
+    /// Ids, order and scores pinned by the head alone: the #387 bar.
+    pub score_exact: f64,
     pub set_certified_with_ties: f64,
     pub head_answer_exact: f64,
     pub mean_overlap_at_k: f64,
     pub violations: usize,
-    /// Over queries that are not rank-certified.
+    /// Over queries that are not score-exact (they need tail reads).
     pub uncertified_queries: usize,
     pub tail_gets_mean: f64,
     pub tail_gets_p50: u32,
@@ -970,6 +1073,7 @@ pub struct TermBucket {
     pub queries: usize,
     pub set_certified: f64,
     pub rank_certified: f64,
+    pub score_exact: f64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -983,6 +1087,16 @@ pub struct FractionSummary {
     pub touched_head_scoring_bytes: u64,
     pub touched_span_bytes: u64,
     pub touched_head_span_bytes_est: u64,
+    /// Tail metadata a head tier adds for the touched split terms: frontier
+    /// step functions (exact) and tail TOC references (estimate).
+    pub touched_tail_frontier_bytes: u64,
+    pub touched_tail_toc_bytes_est: u64,
+    /// Local text bytes with a head tier / today, over the touched spans
+    /// plus every file that stays local either way (TOC, doc-store
+    /// offsets, filters, footers: [`QueryReport::fixed_local_bytes`]):
+    /// `(head span est + frontier + tail TOC + fixed) / (spans + fixed)`.
+    /// The #387 "3x smaller" bar is this <= 1/3. `None` without spans.
+    pub touched_local_ratio: Option<f64>,
 }
 
 const TERM_BUCKETS: [(usize, usize, &str); 5] = [
@@ -1013,16 +1127,18 @@ fn summarize(outcomes: &[QueryOutcome], j: usize, b: usize, k: usize) -> BoundSu
         ..Default::default()
     };
     let (mut set_c, mut rank_c, mut ties_c, mut exact_c, mut overlap) = (0, 0, 0, 0, 0.0);
+    let mut score_c = 0;
     for o in outcomes {
         let x = d(o);
         set_c += x.set_certified as usize;
         rank_c += x.rank_certified as usize;
+        score_c += x.score_exact as usize;
         ties_c += x.set_certified_with_ties as usize;
         exact_c += x.head_answer_exact as usize;
         s.violations += x.violation as usize;
         let denom = k.min(o.hits).max(1);
         overlap += x.overlap as f64 / denom as f64;
-        if !x.rank_certified {
+        if !x.score_exact {
             gets.push(x.tail_gets);
             segs += x.tail_segments as u64;
             bytes += x.tail_bytes;
@@ -1030,6 +1146,7 @@ fn summarize(outcomes: &[QueryOutcome], j: usize, b: usize, k: usize) -> BoundSu
     }
     s.set_certified = frac(set_c);
     s.rank_certified = frac(rank_c);
+    s.score_exact = frac(score_c);
     s.set_certified_with_ties = frac(ties_c);
     s.head_answer_exact = frac(exact_c);
     s.mean_overlap_at_k = if n == 0 { 0.0 } else { overlap / n as f64 };
@@ -1058,6 +1175,7 @@ fn summarize(outcomes: &[QueryOutcome], j: usize, b: usize, k: usize) -> BoundSu
             queries: bucket.len(),
             set_certified: bucket.iter().filter(|o| d(o).set_certified).count() as f64 / m,
             rank_certified: bucket.iter().filter(|o| d(o).rank_certified).count() as f64 / m,
+            score_exact: bucket.iter().filter(|o| d(o).score_exact).count() as f64 / m,
         });
     }
     s
@@ -1072,6 +1190,14 @@ pub struct QueryReport {
     pub queries_analyzed: usize,
     pub queries_without_terms: usize,
     pub segments_skipped_multi_reading: usize,
+    /// Queries not analyzed because the time budget ran out.
+    pub queries_skipped_time_budget: usize,
+    /// Segments whose postings are split (v3+, span bytes known).
+    pub split_segments: usize,
+    /// Local file bytes over all segments, by kind, and the part of it
+    /// that stays local whatever the posting layout.
+    pub local_files: HashMap<String, u64>,
+    pub fixed_local_bytes: u64,
     pub fractions: Vec<FractionSummary>,
 }
 
@@ -1080,6 +1206,21 @@ pub fn analyze_queries(
     segments: &[Segment],
     config: Config,
     queries: &[String],
+) -> Result<(QueryReport, Vec<QueryOutcome>), KoshaError> {
+    analyze_queries_until(segments, config, queries, None)
+}
+
+/// Queries per parallel batch; the time budget is checked between batches,
+/// so a budgeted run analyzes a prefix of the query file.
+const QUERY_BATCH: usize = 256;
+
+/// [`analyze_queries`], stopping before the next batch of queries once
+/// `deadline` has passed (the rest count as `queries_skipped_time_budget`).
+pub fn analyze_queries_until(
+    segments: &[Segment],
+    config: Config,
+    queries: &[String],
+    deadline: Option<std::time::Instant>,
 ) -> Result<(QueryReport, Vec<QueryOutcome>), KoshaError> {
     assert!(
         !config.head_fractions.is_empty() && config.head_fractions.len() <= MAX_FRACTIONS,
@@ -1095,41 +1236,63 @@ pub fn analyze_queries(
         usize,
         usize,
     );
-    let results: Vec<Result<Acc, KoshaError>> = queries
-        .par_iter()
-        .enumerate()
-        .fold(
-            || Ok((Vec::new(), Vec::new(), 0usize, 0usize)),
-            |acc: Result<Acc, KoshaError>, (qi, text)| {
-                let (mut outs, mut touched, mut empty, mut skipped) = acc?;
-                let mut scratch = Scratch::default();
-                SCRATCH.with(|cell| std::mem::swap(&mut *cell.borrow_mut(), &mut scratch));
-                let r = analyzer.run_query(qi, text, &mut scratch, &mut touched, &mut skipped);
-                SCRATCH.with(|cell| std::mem::swap(&mut *cell.borrow_mut(), &mut scratch));
-                match r? {
-                    Some(o) => outs.push(o),
-                    None => empty += 1,
-                }
-                // Dedup touched pairs as we go to bound memory.
-                if touched.len() > 4096 {
-                    dedup_touched(&mut touched);
-                }
-                Ok((outs, touched, empty, skipped))
-            },
-        )
-        .collect();
     let mut outcomes = Vec::new();
     let mut touched = Vec::new();
-    let (mut empty, mut skipped) = (0, 0);
-    for r in results {
-        let (o, t, e, s) = r?;
-        outcomes.extend(o);
-        touched.extend(t);
-        empty += e;
-        skipped += s;
+    let (mut empty, mut skipped, mut done) = (0, 0, 0usize);
+    for (batch_no, batch) in queries.chunks(QUERY_BATCH).enumerate() {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
+        let base = batch_no * QUERY_BATCH;
+        let results: Vec<Result<Acc, KoshaError>> = batch
+            .par_iter()
+            .enumerate()
+            .fold(
+                || Ok((Vec::new(), Vec::new(), 0usize, 0usize)),
+                |acc: Result<Acc, KoshaError>, (i, text)| {
+                    let (mut outs, mut touched, mut empty, mut skipped) = acc?;
+                    let mut scratch = Scratch::default();
+                    SCRATCH.with(|cell| std::mem::swap(&mut *cell.borrow_mut(), &mut scratch));
+                    let r = analyzer.run_query(
+                        base + i,
+                        text,
+                        &mut scratch,
+                        &mut touched,
+                        &mut skipped,
+                    );
+                    SCRATCH.with(|cell| std::mem::swap(&mut *cell.borrow_mut(), &mut scratch));
+                    match r? {
+                        Some(o) => outs.push(o),
+                        None => empty += 1,
+                    }
+                    // Dedup touched pairs as we go to bound memory.
+                    if touched.len() > 4096 {
+                        dedup_touched(&mut touched);
+                    }
+                    Ok((outs, touched, empty, skipped))
+                },
+            )
+            .collect();
+        for r in results {
+            let (o, t, e, s) = r?;
+            outcomes.extend(o);
+            touched.extend(t);
+            empty += e;
+            skipped += s;
+        }
+        dedup_touched(&mut touched);
+        done += batch.len();
     }
     outcomes.sort_by_key(|o| o.query);
     dedup_touched(&mut touched);
+
+    let mut local_files: HashMap<String, u64> = HashMap::new();
+    for seg in segments {
+        for (kind, len) in seg.file_bytes() {
+            *local_files.entry(kind).or_default() += len;
+        }
+    }
+    let fixed = fixed_local_bytes(&local_files);
 
     let fractions = config
         .head_fractions
@@ -1145,6 +1308,9 @@ pub fn analyze_queries(
                 touched_head_scoring_bytes: 0,
                 touched_span_bytes: 0,
                 touched_head_span_bytes_est: 0,
+                touched_tail_frontier_bytes: 0,
+                touched_tail_toc_bytes_est: 0,
+                touched_local_ratio: None,
             };
             for (_, t) in &touched {
                 fs.touched_full_scoring_bytes += t.full_scoring;
@@ -1154,7 +1320,18 @@ pub fn analyze_queries(
                     let positions = span.saturating_sub(t.full_scoring) as f64;
                     fs.touched_head_span_bytes_est +=
                         t.head_scoring[j] + (positions * t.head_pos_share[j]).round() as u64;
+                    fs.touched_tail_frontier_bytes += t.frontier_bytes[j];
+                    if t.split[j] {
+                        fs.touched_tail_toc_bytes_est += TAIL_TOC_ENTRY_BYTES_EST;
+                    }
                 }
+            }
+            if fs.touched_span_bytes > 0 {
+                let head = fs.touched_head_span_bytes_est
+                    + fs.touched_tail_frontier_bytes
+                    + fs.touched_tail_toc_bytes_est
+                    + fixed;
+                fs.touched_local_ratio = Some(head as f64 / (fs.touched_span_bytes + fixed) as f64);
             }
             fs
         })
@@ -1166,6 +1343,10 @@ pub fn analyze_queries(
         queries_analyzed: outcomes.len(),
         queries_without_terms: empty,
         segments_skipped_multi_reading: skipped,
+        queries_skipped_time_budget: queries.len() - done,
+        split_segments: segments.iter().filter(|s| s.split).count(),
+        local_files,
+        fixed_local_bytes: fixed,
         fractions,
         config,
     };
@@ -1195,7 +1376,18 @@ pub struct FootprintFraction {
     /// Tail ceilings: Pareto-frontier points summed / max over terms.
     pub tail_frontier_points: u64,
     pub tail_frontier_points_max: u64,
+    /// Bytes of those frontiers ([`frontier_bytes`]) and the estimated
+    /// extra TOC bytes for the tail references
+    /// ([`TAIL_TOC_ENTRY_BYTES_EST`] per split term).
+    pub tail_frontier_bytes: u64,
+    pub tail_toc_bytes_est: u64,
     pub split_terms: u64,
+    /// Local text bytes with this head tier: head span est + frontier +
+    /// tail TOC + [`Footprint::fixed_local_bytes`].
+    pub local_text_bytes: u64,
+    /// `local_text_bytes / Footprint::local_text_bytes_today`: the #387
+    /// "3x smaller local text footprint" bar is this <= 1/3.
+    pub local_text_ratio: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -1209,6 +1401,13 @@ pub struct Footprint {
     pub span_bytes: u64,
     /// Files in the segment directories, by kind.
     pub files: HashMap<String, u64>,
+    /// Segments with split postings (span bytes known).
+    pub split_segments: usize,
+    /// The files that stay local whatever the posting layout (TOC,
+    /// doc-store offsets, filters, footers: [`is_fixed_local_kind`]).
+    pub fixed_local_bytes: u64,
+    /// Local text bytes today: all spans + the fixed files.
+    pub local_text_bytes_today: u64,
     pub fractions: Vec<FootprintFraction>,
 }
 
@@ -1249,13 +1448,8 @@ pub fn footprint(segments: &[Segment], config: &Config) -> Result<Footprint, Kos
                     .collect(),
                 ..Default::default()
             };
-            if let Ok(dir) = std::fs::read_dir(seg.reader.segment_dir()) {
-                for e in dir.flatten() {
-                    let name = e.file_name().to_string_lossy().into_owned();
-                    let len = e.metadata().map(|m| m.len()).unwrap_or(0);
-                    *fp.files.entry(file_kind(&name).to_string()).or_default() += len;
-                }
-            }
+            fp.files = seg.file_bytes();
+            fp.split_segments = seg.split as usize;
             let local = seg.local_scorer();
             let all: Vec<String> = seg
                 .reader
@@ -1303,7 +1497,10 @@ pub fn footprint(segments: &[Segment], config: &Config) -> Result<Footprint, Kos
                             ff.tail_scoring_bytes += scoring_section_bytes(pick(false));
                             let mut tail: Vec<(u32, u32)> =
                                 pick(false).map(|(_, tf, dl)| (tf, dl)).collect();
-                            let points = frontier_steps(&mut tail).len() as u64;
+                            let steps = frontier_steps(&mut tail);
+                            let points = steps.len() as u64;
+                            ff.tail_frontier_bytes += frontier_bytes(&steps);
+                            ff.tail_toc_bytes_est += TAIL_TOC_ENTRY_BYTES_EST;
                             ff.tail_frontier_points += points;
                             ff.tail_frontier_points_max = ff.tail_frontier_points_max.max(points);
                         }
@@ -1343,6 +1540,7 @@ pub fn footprint(segments: &[Segment], config: &Config) -> Result<Footprint, Kos
         total.postings += fp.postings;
         total.full_scoring_bytes += fp.full_scoring_bytes;
         total.span_bytes += fp.span_bytes;
+        total.split_segments += fp.split_segments;
         for (kind, len) in fp.files {
             *total.files.entry(kind).or_default() += len;
         }
@@ -1353,8 +1551,20 @@ pub fn footprint(segments: &[Segment], config: &Config) -> Result<Footprint, Kos
             t.head_span_bytes_est += f.head_span_bytes_est;
             t.tail_frontier_points += f.tail_frontier_points;
             t.tail_frontier_points_max = t.tail_frontier_points_max.max(f.tail_frontier_points_max);
+            t.tail_frontier_bytes += f.tail_frontier_bytes;
+            t.tail_toc_bytes_est += f.tail_toc_bytes_est;
             t.split_terms += f.split_terms;
         }
+    }
+    total.fixed_local_bytes = fixed_local_bytes(&total.files);
+    total.local_text_bytes_today = total.span_bytes + total.fixed_local_bytes;
+    for f in &mut total.fractions {
+        f.local_text_bytes = f.head_span_bytes_est
+            + f.tail_frontier_bytes
+            + f.tail_toc_bytes_est
+            + total.fixed_local_bytes;
+        f.local_text_ratio = (total.span_bytes > 0)
+            .then(|| f.local_text_bytes as f64 / total.local_text_bytes_today as f64);
     }
     Ok(total)
 }
@@ -1414,6 +1624,17 @@ mod tests {
         for &(tf, dl) in tail.iter() {
             assert!(frontier_tf(&steps, dl).unwrap() >= tf);
         }
+    }
+
+    #[test]
+    fn frontier_bytes_are_delta_varints() {
+        // count 3 (1) + (5,1) (1+1) + (10-5, 2-1) (1+1) + (200-10, 3-2) (2+1).
+        assert_eq!(frontier_bytes(&[(5, 1), (10, 2), (200, 3)]), 8);
+        assert_eq!(frontier_bytes(&[]), 1);
+        assert!(is_fixed_local_kind("inverted_toc"));
+        assert!(is_fixed_local_kind("doc_store_offsets"));
+        assert!(!is_fixed_local_kind("postings_shards"));
+        assert!(!is_fixed_local_kind("doc_store"));
     }
 
     #[test]

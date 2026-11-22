@@ -38,7 +38,9 @@ stack — so each corpus is loaded once, ever.
   `kosha-two-tier-eval`, which reports head-only top-k certification and
   footprint per head fraction (`docs/research/387-two-tier-index.md`).
   `benchmark.yml` runs it when `two_tier_eval` is set. It does not change
-  the server.
+  the server. `two_tier_check.py` gates the run: no deletes in the
+  manifest, no skipped segments or queries, 0 violations, and the oracle
+  top-10 equal to the live server for `TWO_TIER_CROSSCHECK` queries.
 
 Economics: the 10M vector load runs ~6h at the measured ~485 docs/sec
 sustained (flush-build bound, see #126); a restore is minutes. Engine-fix

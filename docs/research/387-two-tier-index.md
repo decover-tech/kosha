@@ -69,8 +69,14 @@ For one query (OR of terms `t`, top-k), one segment `s` and head fraction `f`:
   - *set-certified*: every other document's `UB < theta`, and every
     segment's no-head bound is `< theta`. The top-k **set** is then exact.
   - *rank-certified*: set-certified, and `LB(d_i) > UB(d_j)` for every
-    `i < j` in the top-k. **Ids and order** are then exact (the issue's
-    "identical top-10").
+    `i < j` in the top-k. **Ids and order** are then exact, but a
+    head-only answer could only return each document's `LB` as its score.
+  - *score-exact*: rank-certified, and every top-k document has
+    `UB = LB` (no tail term left unresolved). **Ids, order and scores**
+    are then exact. This is the issue's "identical top-10": the bench
+    (`query_bench.py`) and the server return ids and scores. A
+    rank-certified query that is not score-exact still needs tail reads
+    to finish its scores, and the tool counts those reads.
   - Comparisons are strict, with a relative slack of 1e-9, so exact score
     ties at the cutoff never certify. The engine breaks those ties by `_id`.
     The `with_ties` counters report the extra share a tie-aware check could
@@ -104,12 +110,12 @@ kosha-two-tier-eval --segments-root DIR [--segment-list ids.txt] --queries queri
   (`crates/kosha-query/tests/two_tier_analysis.rs`) also checks the oracle
   against the real `Searcher` (OR, namespace statistics) on a 3-segment
   synthetic namespace with skewed segment sizes and lengths.
-- Per fraction and bound it reports: set/rank-certified share,
+- Per fraction and bound it reports: set/rank-certified/score-exact share,
   head-only-exact share, mean overlap@k of the head-only answer (what an
   approximate or anytime mode would return), and violations. It reports the
   same shares bucketed by query length (1-3, 4-6, 7-8, 9-12, 13+ terms).
-  For uncertified queries it reports the segments and (segment, term) tail
-  spans that would have to be read, plus their bytes. The GET count is an
+  For queries that are not score-exact it reports the segments and
+  (segment, term) tail spans that would have to be read, plus their bytes. The GET count is an
   upper bound: every query-term tail of each segment that cannot be ruled
   out.
 - Footprint, covering the bytes the query set touches (what the warm gate
@@ -118,11 +124,20 @@ kosha-two-tier-eval --segments-root DIR [--segment-list ids.txt] --queries queri
     (exact for v5 segments);
   - head **span** bytes. Positions are attributed by `1 + tf` weight, so
     this figure is an estimate;
-  - tail frontier size in points, which is the metadata cost of the exact
-    bounds;
-  - file sizes by kind.
+  - tail frontier size in points and in bytes (delta varints), which is
+    the metadata cost of the exact bounds;
+  - file sizes by kind;
+  - the **local text ratio**, the quantity the "3x smaller" bar is about:
+    `(head span est + tail frontier bytes + tail TOC refs + fixed files) /
+    (all spans + fixed files)`. Fixed files are everything that stays local
+    whatever the posting layout: the TOC (`inverted.idx`),
+    `doc_store.offsets` (ids and lengths, which `frontier_dl` needs),
+    filters, footers. Doc-store bodies and vectors are left out of both
+    sides. Tail TOC refs are an estimate of 16 bytes per split term (blob
+    id, offset, length, uncompressed). The ratio is reported for the
+    touched set and, with `--footprint`, for the whole index.
 - Not modelled: tombstones and deletion vectors (all postings count as
-  live), filters, phrase/AND/fuzzy/wildcard queries, per-field (#249)
+  live; the VM script refuses a manifest that has any), filters, phrase/AND/fuzzy/wildcard queries, per-field (#249)
   queries, and segments with more than one analysis chain (these are counted
   and skipped). The footprint pass covers the combined index only.
   Per-field keys would stay whole.
@@ -137,9 +152,36 @@ exists and skipping vector files. It builds the tool in the server image's
 and `s3_listing.txt`, which holds every object's size, including files that
 were not copied.
 
+**Run validity.** The analysis only means something if its oracle is the
+engine's answer on this namespace. `two_tier_check.py` gates the run:
+- before the copy, the restored manifest must have no tombstones, deletion
+  vectors or shards;
+- afterwards, `segments_skipped_multi_reading` and
+  `queries_skipped_time_budget` must be 0, every segment must be split
+  (span bytes known) and violations must be 0;
+- the oracle top-10 of the first `TWO_TIER_CROSSCHECK` (default 200)
+  analyzed queries must equal what the restored live server returns for
+  the same query (OR, k=10, no cache, ids and scores). Ids may differ only
+  among equal scores.
+
+Any failure writes `validity.json` and exits 1. That run's certification
+numbers must not be used.
+
+**Runtime guard.** Span lengths come from the TOC the segment reader
+already holds (`SegmentReader::posting_span_len`), not from re-reading and
+decompressing `inverted.idx` per (query, segment). The query pass stops
+starting new 256-query batches after `TWO_TIER_MAX_SECONDS` (default
+3600 s). A capped run reports how many queries it skipped and fails the
+validity gate. Runtime on 10M MSMarco is **not measured**: the default
+analyzer keeps stop words, so terms like `the` bring millions of postings
+into every query that has them.
+
 `benchmark.yml` gains `two_tier_eval` (boolean, default **false**) and
 `two_tier_fractions` (default `0.1,0.2,0.3`). With `suite=none` the step
-restores the BM25 namespace itself. Nothing on the server changes: the
+restores the BM25 namespace itself, from an **existing snapshot only**:
+`restore_namespace.sh` exits 1 when there is none. The build-if-absent
+path lives only in the BM25 suite step, so a corpus without a snapshot
+needs `suite=bm25`. Nothing on the server changes: the
 analysis runs in a throwaway builder container.
 
 ### Local results (not the success-bar measurement)
@@ -226,7 +268,10 @@ Interactions:
 - R6 (docid ordering): reordering makes heads denser in docid space, which
   shrinks head scoring bytes (the deltas get smaller).
 - Segment count: tail GETs scale with segments times terms. Fewer, larger
-  segments help both.
+  segments help both. Measuring that effect needs the same corpus with a
+  different segment layout (for example a compacted copy of 10M). A
+  different corpus size such as 1M also changes `N`, `df`, list lengths and
+  the build path, so it does not isolate segment count.
 
 ## S3 tail-fetch cost model
 
@@ -252,11 +297,22 @@ upper bound) and `tail_bytes` (tail scoring sections).
 
 ## Decision rule for the bench run
 
+The run must first pass the validity gate above (`validity.json` has
+`valid: true`: no deletes in the manifest, no skipped segments or queries,
+0 violations, and the oracle equals the live server on the cross-checked
+queries).
+
 Go to a format prototype only if, on 10M MSMarco with namespace statistics
 and the bench query set, some head fraction meets all three:
-1. rank-certified >= 95% (`frontier_dl`, or `maxtf_mindl` if possible);
-2. touched-set head span bytes <= 1/3 of today's touched spans, and
-   whole-index head span bytes <= 1/3 of the combined-index span bytes;
+1. score-exact >= 95% (`frontier_dl`, or `maxtf_mindl` if possible). If
+   rank-certified passes but score-exact does not, a head-only answer
+   would return lower-bound scores. Accepting ids plus order as the bar
+   needs explicit agreement on #387; it is not the default;
+2. local text ratio <= 1/3, both for the touched set
+   (`touched_local_ratio`) and for the whole index
+   (`footprint.fractions[].local_text_ratio`). Span-only ratios are
+   reported, but they leave out the TOC, doc-store offsets, filters and
+   tail metadata, so they overstate the reduction;
 3. violations = 0.
 
 If (1) fails but `overlap@k` is high, propose the anytime and approximate

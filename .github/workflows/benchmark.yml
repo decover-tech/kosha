@@ -447,7 +447,7 @@ jobs:
               echo "## Two-tier analysis (research 387, offline)"
               echo ""
               echo '```'
-              grep -E '^(head|footprint|  +touched|opened|analyzed)' results/two_tier/summary.txt || true
+              grep -E '^(head|footprint|  +touched|opened|analyzed|run checks|server cross-check|TWO-TIER-RUN)' results/two_tier/summary.txt || true
               echo '```'
             fi
           } >> "$GITHUB_STEP_SUMMARY"

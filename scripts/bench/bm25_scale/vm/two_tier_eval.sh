@@ -10,10 +10,25 @@
 # fraction it reports the share of queries whose exact top-k the head
 # alone certifies, plus footprint and tail-GET estimates.
 #
+# Validity (two_tier_check.py): the run refuses a manifest with tombstones,
+# deletion vectors or shards (the analysis counts every posting as live),
+# and afterwards fails unless no segment was skipped, no query was cut by
+# the time budget, violations are 0, and the oracle top-k of the first
+# TWO_TIER_CROSSCHECK queries equals what the live server returns (ids and
+# scores, OR, k=10). A failed check writes validity.json and exits 1: the
+# certification numbers of that run must not be used.
+#
 # Usage: ./two_tier_eval.sh <namespace> <out-dir>
 # Env:
 #   TWO_TIER_FRACTIONS   head fractions (default 0.1,0.2,0.3)
 #   TWO_TIER_MAX_QUERIES cap on queries (default 0 = the whole file)
+#   TWO_TIER_MAX_SECONDS stop starting new 256-query batches after this
+#                        long in the query pass (default 3600; 0 = no cap).
+#                        A capped run reports queries_skipped_time_budget
+#                        and fails the validity check, but its numbers for
+#                        the analyzed prefix are kept.
+#   TWO_TIER_CROSSCHECK  queries to compare against the live server
+#                        (default 200; 0 skips the check and fails validity)
 #   TWO_TIER_THREADS     analysis threads (default 8; each holds dense
 #                        per-segment arrays, ~41 bytes per doc of the
 #                        largest segment)
@@ -35,6 +50,11 @@ THREADS="${TWO_TIER_THREADS:-8}"
 MIN_SPLIT="${TWO_TIER_MIN_SPLIT:-128}"
 STATS="${TWO_TIER_STATS:-namespace}"
 QUERIES_FILE="${QUERIES_FILE:-/data/queries.txt}"
+MAX_SECONDS="${TWO_TIER_MAX_SECONDS:-3600}"
+CROSSCHECK="${TWO_TIER_CROSSCHECK:-200}"
+API_KEY="${KOSHA_API_KEY:-sk-bench}"
+HOST="http://127.0.0.1:8080"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 
 sudo mkdir -p "$OUT" "$WORK"
 sudo chown -R "$(id -u):$(id -g)" "$OUT" /data/two-tier
@@ -57,6 +77,9 @@ for e in entries:
 open(sys.argv[2], "w").write("\n".join(ids) + "\n")
 print(f"{len(ids)} live segments in the manifest")
 PY
+cp "$WORK/manifest.json" "$OUT/manifest.json"
+# Deletes would make the oracle differ from the engine: refuse early.
+python3 "$HERE/two_tier_check.py" manifest "$WORK/manifest.json"
 N_SEGS=$(wc -l < "$WORK/segment_ids.txt" | tr -d ' ')
 [ "$N_SEGS" -gt 0 ] || { echo "::error::no live segments for $SCOPED"; exit 1; }
 
@@ -80,6 +103,7 @@ cd ~/kosha
 sudo docker build -q --target builder -t kosha-builder:bench . >/dev/null
 QARGS=""
 [ "$MAX_QUERIES" != 0 ] && QARGS="--max-queries $MAX_QUERIES"
+[ "$MAX_SECONDS" != 0 ] && QARGS="$QARGS --max-seconds $MAX_SECONDS"
 sudo docker run --rm -v /data:/data kosha-builder:bench sh -c "
   cargo build --release --locked -p kosha-query --bin kosha-two-tier-eval &&
   ./target/release/kosha-two-tier-eval \
@@ -89,3 +113,12 @@ sudo docker run --rm -v /data:/data kosha-builder:bench sh -c "
     --out $OUT/report.json --per-query $OUT/per_query.jsonl" 2>&1 | tee "$OUT/summary.txt"
 sudo chown -R "$(id -u):$(id -g)" "$OUT"
 echo "TWO-TIER-EVAL-COMPLETE $NS -> $OUT"
+
+# Cross-check the oracle against the live server, then gate the run.
+for i in $(seq 120); do
+  curl -sf "$HOST/readyz" >/dev/null 2>&1 && break
+  [ "$i" -eq 120 ] && echo "server not ready after 600s; the cross-check will fail"
+  sleep 5
+done
+python3 "$HERE/two_tier_check.py" run "$OUT/report.json" "$OUT/per_query.jsonl" \
+  "$HOST" "$NS" "$API_KEY" "$CROSSCHECK" "$OUT/validity.json" 2>&1 | tee -a "$OUT/summary.txt"

@@ -12,8 +12,12 @@
 //!     [--segment-list ids.txt] --queries /data/queries.txt \
 //!     [--max-queries 2000] [--k 10] [--head-fractions 0.1,0.2,0.3] \
 //!     [--min-split-df 128] [--stats namespace|segment] [--footprint] \
-//!     [--threads N] [--out report.json] [--per-query rows.jsonl]
+//!     [--threads N] [--max-seconds S] [--out report.json] [--per-query rows.jsonl]
 //! ```
+//!
+//! `--max-seconds` stops starting new query batches (256 queries each)
+//! once the query pass has run that long; the report then covers a prefix
+//! of the query file and says how many queries it skipped.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -25,7 +29,8 @@ fn usage() -> ! {
     eprintln!(
         "usage: kosha-two-tier-eval --segments-root DIR [--segment-list FILE] --queries FILE \
          [--max-queries N] [--k 10] [--head-fractions 0.1,0.2,0.3] [--min-split-df 128] \
-         [--stats namespace|segment] [--footprint] [--threads N] [--out FILE] [--per-query FILE]"
+         [--stats namespace|segment] [--footprint] [--threads N] [--max-seconds S] \
+         [--out FILE] [--per-query FILE]"
     );
     std::process::exit(2)
 }
@@ -38,6 +43,7 @@ fn main() {
     let mut config = Config::default();
     let mut do_footprint = false;
     let mut threads: Option<usize> = None;
+    let mut max_seconds: Option<u64> = None;
     let mut out: Option<PathBuf> = None;
     let mut per_query: Option<PathBuf> = None;
 
@@ -76,6 +82,7 @@ fn main() {
             }
             "--footprint" => do_footprint = true,
             "--threads" => threads = Some(value().parse().unwrap_or_else(|_| usage())),
+            "--max-seconds" => max_seconds = Some(value().parse().unwrap_or_else(|_| usage())),
             "--out" => out = Some(value().into()),
             "--per-query" => per_query = Some(value().into()),
             "-h" | "--help" => usage(),
@@ -130,10 +137,24 @@ fn main() {
         .collect();
 
     let t = Instant::now();
-    let (report, rows) = two_tier::analyze_queries(&segments, config.clone(), &queries)
-        .unwrap_or_else(|e| panic!("analysis failed: {e}"));
+    let deadline = max_seconds.map(|s| t + std::time::Duration::from_secs(s));
+    let (report, rows) =
+        two_tier::analyze_queries_until(&segments, config.clone(), &queries, deadline)
+            .unwrap_or_else(|e| panic!("analysis failed: {e}"));
     let query_secs = t.elapsed().as_secs_f64();
-    eprintln!("analyzed {} queries in {query_secs:.1}s", rows.len());
+    eprintln!(
+        "analyzed {} queries in {query_secs:.1}s ({} skipped by --max-seconds)",
+        rows.len(),
+        report.queries_skipped_time_budget
+    );
+    println!(
+        "run checks: segments_skipped_multi_reading {}  queries_skipped_time_budget {}  \
+         split segments {}/{}",
+        report.segments_skipped_multi_reading,
+        report.queries_skipped_time_budget,
+        report.split_segments,
+        report.segments,
+    );
 
     let footprint = do_footprint.then(|| {
         let t = Instant::now();
@@ -147,12 +168,13 @@ fn main() {
         for b in &f.bounds {
             println!(
                 "head {:>4.0}% {:<12} set-certified {:>6.2}%  rank-certified {:>6.2}%  \
-                 (with ties {:>6.2}%)  head-only exact {:>6.2}%  overlap@k {:.3}  violations {}  \
-                 tail GETs/uncertified query mean {:.1} p99 {}",
+                 score-exact {:>6.2}%  (set with ties {:>6.2}%)  head-only exact {:>6.2}%  \
+                 overlap@k {:.3}  violations {}  tail GETs/not-score-exact query mean {:.1} p99 {}",
                 f.head_fraction * 100.0,
                 b.bound,
                 b.set_certified * 100.0,
                 b.rank_certified * 100.0,
+                b.score_exact * 100.0,
                 b.set_certified_with_ties * 100.0,
                 b.head_answer_exact * 100.0,
                 b.mean_overlap_at_k,
@@ -163,22 +185,25 @@ fn main() {
         }
         if f.touched_full_scoring_bytes > 0 {
             println!(
-                "           touched by the query set: scoring bytes head/full {:.3}; span bytes head-est/full {:.3}",
+                "           touched by the query set: scoring bytes head/full {:.3}; span bytes head-est/full {:.3}; \
+                 local text ratio (spans + frontier + tail TOC + fixed files) {:.3}",
                 f.touched_head_scoring_bytes as f64 / f.touched_full_scoring_bytes as f64,
                 if f.touched_span_bytes > 0 {
                     f.touched_head_span_bytes_est as f64 / f.touched_span_bytes as f64
                 } else {
                     f64::NAN
                 },
+                f.touched_local_ratio.unwrap_or(f64::NAN),
             );
         }
     }
     if let Some(fp) = &footprint {
         for f in &fp.fractions {
             println!(
-                "footprint head {:>4.0}%: postings {:.3}  scoring bytes {:.3}  span bytes (est) {:.3}  \
-                 tail frontier points {} (max/term {})",
+                "footprint head {:>4.0}%: local text ratio {:.3}  postings {:.3}  scoring bytes {:.3}  \
+                 span bytes (est) {:.3}  tail frontier points {} (max/term {}, {} bytes)",
                 f.head_fraction * 100.0,
+                f.local_text_ratio.unwrap_or(f64::NAN),
                 f.head_postings as f64 / fp.postings.max(1) as f64,
                 f.head_scoring_bytes as f64 / fp.full_scoring_bytes.max(1) as f64,
                 if fp.span_bytes > 0 {
@@ -188,6 +213,7 @@ fn main() {
                 },
                 f.tail_frontier_points,
                 f.tail_frontier_points_max,
+                f.tail_frontier_bytes,
             );
         }
     }

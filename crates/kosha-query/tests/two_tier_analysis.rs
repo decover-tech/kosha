@@ -109,6 +109,9 @@ fn oracle_matches_engine_and_certification_is_sound() {
     let (report, rows) = two_tier::analyze_queries(&segments, config, &qs).unwrap();
     assert_eq!(report.queries_analyzed, qs.len());
     assert_eq!(report.segments_skipped_multi_reading, 0);
+    assert_eq!(report.queries_skipped_time_budget, 0);
+    assert_eq!(report.split_segments, 3);
+    assert!(report.fixed_local_bytes > 0, "{:?}", report.local_files);
 
     // (a) The oracle is the engine's answer.
     let searcher = Searcher::new(root.clone());
@@ -130,6 +133,9 @@ fn oracle_matches_engine_and_certification_is_sound() {
             .iter()
             .map(|&(s, d, score)| (segments[s as usize].doc_id(d).unwrap(), score))
             .collect();
+        // The serialized external form the bench cross-check compares.
+        assert_eq!(row.oracle_hits, oracle);
+        assert_eq!(row.text, qs[row.query]);
         assert_eq!(engine.len(), oracle.len(), "query {:?}", qs[row.query]);
         for (e, o) in engine.iter().zip(&oracle) {
             assert!(
@@ -169,6 +175,7 @@ fn oracle_matches_engine_and_certification_is_sound() {
                 f.head_fraction, b.bound
             );
             assert!(b.rank_certified <= b.set_certified);
+            assert!(b.score_exact <= b.rank_certified);
             assert!(b.set_certified <= b.set_certified_with_ties);
         }
         let (dl, max, loose) = (&f.bounds[0], &f.bounds[1], &f.bounds[2]);
@@ -177,6 +184,16 @@ fn oracle_matches_engine_and_certification_is_sound() {
         } else {
             assert_eq!(max.set_certified_with_ties, 1.0);
             assert_eq!(dl.set_certified_with_ties, 1.0);
+            // No tails: nothing to add, so the local text ratio is 1.
+            assert_eq!(f.touched_tail_frontier_bytes, 0);
+            assert_eq!(f.touched_local_ratio, Some(1.0));
+        }
+        if let Some(r) = f.touched_local_ratio {
+            assert!(
+                r > 0.0 && r <= 1.0 + 1e-9,
+                "fraction {}: {r}",
+                f.head_fraction
+            );
         }
         for row in &rows {
             // Tighter bounds certify a superset of the queries.
@@ -193,9 +210,14 @@ fn oracle_matches_engine_and_certification_is_sound() {
             );
             assert!(d[0].rank_certified >= d[1].rank_certified);
             assert!(d[1].rank_certified >= d[2].rank_certified);
+            assert!(d[0].score_exact >= d[1].score_exact);
+            assert!(d[1].score_exact >= d[2].score_exact);
             for x in d {
                 if x.rank_certified {
-                    assert!(x.head_answer_exact && x.tail_gets == 0);
+                    assert!(x.head_answer_exact);
+                }
+                if x.score_exact {
+                    assert!(x.rank_certified && x.tail_gets == 0);
                 }
             }
         }
@@ -240,6 +262,40 @@ fn segment_stats_scope_is_sound_too() {
     }
     let by_kind: HashMap<&str, u64> = fp.files.iter().map(|(k, v)| (k.as_str(), *v)).collect();
     assert!(by_kind.get("postings_shards").copied().unwrap_or(0) > 0);
+    // The ratio counts the files that stay local either way.
+    assert!(by_kind.get("inverted_toc").copied().unwrap_or(0) > 0);
+    assert_eq!(fp.split_segments, 2);
+    assert!(fp.fixed_local_bytes >= by_kind["inverted_toc"]);
+    assert_eq!(
+        fp.local_text_bytes_today,
+        fp.span_bytes + fp.fixed_local_bytes
+    );
+    for f in &fp.fractions {
+        assert_eq!(
+            f.local_text_bytes,
+            f.head_span_bytes_est
+                + f.tail_frontier_bytes
+                + f.tail_toc_bytes_est
+                + fp.fixed_local_bytes
+        );
+        let r = f.local_text_ratio.unwrap();
+        assert!(r > 0.0 && r < 1.0 + 1e-9, "{r}");
+        assert_eq!(
+            f.tail_toc_bytes_est,
+            f.split_terms * two_tier::TAIL_TOC_ENTRY_BYTES_EST
+        );
+    }
+
+    // A zero time budget analyzes nothing and says so.
+    let (r0, rows0) = two_tier::analyze_queries_until(
+        &segments,
+        config.clone(),
+        &queries(60),
+        Some(std::time::Instant::now()),
+    )
+    .unwrap();
+    assert!(rows0.is_empty());
+    assert_eq!(r0.queries_skipped_time_budget, 60);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -271,6 +327,8 @@ fn scoring_section_bytes_match_v5_spans() {
     assert!(!spans.is_empty());
     let mut checked = 0;
     for span in spans {
+        // The reader's in-memory TOC lookup the analysis uses agrees.
+        assert_eq!(reader.posting_span_len(&span.term), Some(span.len));
         let postings = reader.postings(&span.term).unwrap();
         let scoring = two_tier::scoring_section_bytes(postings.iter().map(|p| {
             let dl = reader.doc_meta(p.doc_id).unwrap().field_length;
