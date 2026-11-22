@@ -58,6 +58,7 @@ mod migrate;
 mod namespace_deletion;
 #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
 mod namespace_migrate;
+mod operator_admin;
 mod org_admin;
 mod posting_spans;
 mod rerank;
@@ -1822,9 +1823,8 @@ impl AppState {
             role,
             writer_leases,
             compaction_on_ingest,
-            admin_auth_key: std::env::var("KOSHA_ADMIN_API_KEY")
-                .ok()
-                .filter(|k| !k.is_empty()),
+            // `None` when `KOSHA_ADMIN_BOOTSTRAP_KEY` switches it off (#346).
+            admin_auth_key: auth::bootstrap_admin_key(),
             orgs: org_admin::OrgBackend::from_env(),
             internal_service_key: std::env::var("KOSHA_INTERNAL_API_KEY")
                 .ok()
@@ -5847,7 +5847,7 @@ fn dispatch(state: &AppState, request: http::Request) -> http::Response {
 
     // ── API key authentication ──────────────────────────────────────────
     // Per proto/kosha/v1/kosha.proto: Authorization: Bearer <key> or X-Api-Key.
-    let authentication = if service_authorized(&headers, state.admin_auth_key.as_deref())
+    let authentication = if admin_actor(&headers, state).is_some()
         || service_authorized(&headers, state.internal_service_key.as_deref())
     {
         Ok("service".to_string())
@@ -6008,9 +6008,7 @@ fn cache_tenant_samples(state: &AppState) -> Vec<metrics::CacheTenantSample> {
 fn handle_metrics(state: &AppState, headers: &HashMap<String, String>) -> String {
     match state.metrics.config.exposure {
         metrics::Exposure::Off => return json_error(404, "not found"),
-        metrics::Exposure::Admin
-            if !service_authorized(headers, state.admin_auth_key.as_deref()) =>
-        {
+        metrics::Exposure::Admin if admin_actor(headers, state).is_none() => {
             return json_error(403, "admin credential required");
         }
         _ => {}
@@ -6629,6 +6627,35 @@ fn service_authorized(headers: &HashMap<String, String>, expected: Option<&str>)
         .is_some_and(|expected| request_key(headers) == Some(expected))
 }
 
+/// Who holds the admin credential a request presents, if it presents one:
+/// the shared bootstrap key (`KOSHA_ADMIN_API_KEY`, the unnamed operator)
+/// or a named operator credential from the key registry (#346), which is
+/// refused once it expires or is revoked like any registry key. A tenant
+/// key is never an admin credential.
+fn admin_actor_in(
+    headers: &HashMap<String, String>,
+    bootstrap_key: Option<&str>,
+    auth: &auth::Auth,
+) -> Option<kosha_control::orgs::Actor> {
+    use kosha_control::orgs::Actor;
+    if service_authorized(headers, bootstrap_key) {
+        return Some(Actor::Operator);
+    }
+    let auth::Auth::Keys(keys) = auth else {
+        return None;
+    };
+    keys.lookup_operator(request_key(headers)?.trim())
+        .ok()
+        .map(Actor::NamedOperator)
+}
+
+fn admin_actor(
+    headers: &HashMap<String, String>,
+    state: &AppState,
+) -> Option<kosha_control::orgs::Actor> {
+    admin_actor_in(headers, state.admin_auth_key.as_deref(), auth::global())
+}
+
 /// A tenant id as presented on a request: non-empty, not `.` or `..`, and
 /// free of separators and control characters.
 fn valid_name_component(name: &str) -> bool {
@@ -6669,17 +6696,23 @@ fn route(
         return json_error(400, "invalid request line");
     };
     if path.starts_with("/v1/admin/") {
-        if !service_authorized(headers, state.admin_auth_key.as_deref()) {
+        let Some(operator) = admin_actor(headers, state) else {
             return json_error(403, "admin credential required");
-        }
+        };
         // Organizations, users, projects, audit log (#345).
         let key_table = match auth::global() {
             auth::Auth::Keys(keys) => Some(keys),
             auth::Auth::Disabled => None,
         };
-        if let Some(response) =
-            org_admin::handle(method, path, headers, body, &state.orgs, key_table)
-        {
+        if let Some(response) = org_admin::handle(
+            method,
+            path,
+            headers,
+            body,
+            &state.orgs,
+            key_table,
+            &operator,
+        ) {
             return response;
         }
         // Every other admin route is the operator's and knows nothing of
@@ -6690,6 +6723,10 @@ fn route(
                 403,
                 "this route is operator-only: it cannot be called with an 'x-kosha-actor' header",
             );
+        }
+        // Per-operator admin credentials (#346).
+        if let Some(response) = operator_admin::handle(method, path, body, &operator) {
+            return response;
         }
     } else if path.starts_with("/internal/") {
         if !service_authorized(headers, state.internal_service_key.as_deref()) {
@@ -6726,7 +6763,7 @@ fn route(
             auth::record_legacy_use(tenant, bare_path);
         }
         if path == "/stats" || path == "/v1/stats" {
-            return if service_authorized(headers, state.admin_auth_key.as_deref()) {
+            return if admin_actor(headers, state).is_some() {
                 handle_stats(state)
             } else {
                 json_error(403, "use namespace-scoped stats")
@@ -14542,6 +14579,116 @@ mod tests {
             &state
         )
         .starts_with("HTTP/1.1 400"));
+    }
+
+    /// #346: an admin request is the bootstrap key's (the unnamed operator)
+    /// or a named operator credential's, and nothing else's.
+    #[test]
+    fn admin_credential_is_the_bootstrap_key_or_a_named_operator_credential() {
+        use kosha_control::orgs::Actor;
+        let bearer = |key: &str| HashMap::from([("authorization".into(), format!("Bearer {key}"))]);
+        let registry_row = |key: &str, tenant_id: String, expires_at| kosha_control::ApiKeyRecord {
+            key_hash: kosha_control::hash_api_key(key),
+            tenant_id,
+            description: String::new(),
+            scopes: kosha_control::Scopes::ALL,
+            namespaces: None,
+            expires_at,
+            last_used_at: None,
+            created_at: 0,
+        };
+        let operator = kosha_control::api_keys::operator_tenant_id;
+        let keys = auth::KeyStore::with_keys(auth::parse_env_keys(Some("sk-env=acme"), None));
+        keys.replace_db_keys(vec![
+            registry_row("sk-alice", operator("alice"), None),
+            registry_row("sk-old", operator("bob"), Some(1)),
+            // A tenant key with every scope is still only a tenant key.
+            registry_row("sk-tenant", "acme".into(), None),
+        ]);
+        let auth = auth::Auth::Keys(keys);
+        let boot = Some("admin-secret");
+
+        assert_eq!(
+            admin_actor_in(&bearer("admin-secret"), boot, &auth),
+            Some(Actor::Operator)
+        );
+        let alice = Some(Actor::NamedOperator("alice".into()));
+        assert_eq!(admin_actor_in(&bearer("sk-alice"), boot, &auth), alice);
+        let x_api_key = HashMap::from([("x-api-key".to_string(), "sk-alice".to_string())]);
+        assert_eq!(admin_actor_in(&x_api_key, boot, &auth), alice);
+        for refused in ["sk-tenant", "sk-env", "sk-old", "sk-nobody", ""] {
+            assert_eq!(
+                admin_actor_in(&bearer(refused), boot, &auth),
+                None,
+                "{refused}"
+            );
+        }
+        assert_eq!(admin_actor_in(&HashMap::new(), boot, &auth), None);
+
+        // Bootstrap key switched off (or never set): it opens nothing, and
+        // operator credentials still work.
+        assert_eq!(admin_actor_in(&bearer("admin-secret"), None, &auth), None);
+        assert_eq!(admin_actor_in(&bearer("sk-alice"), None, &auth), alice);
+
+        // Without a key registry there are no operator credentials.
+        let disabled = auth::Auth::Disabled;
+        assert_eq!(admin_actor_in(&bearer("sk-alice"), boot, &disabled), None);
+        assert_eq!(
+            admin_actor_in(&bearer("admin-secret"), boot, &disabled),
+            Some(Actor::Operator)
+        );
+    }
+
+    #[test]
+    fn operator_credential_routes_need_the_admin_credential() {
+        let mut state = test_state();
+        state.admin_auth_key = Some("admin-secret".into());
+        state.internal_service_key = Some("peer-secret".into());
+        let admin = HashMap::from([("authorization".into(), "Bearer admin-secret".into())]);
+        let peer = HashMap::from([("authorization".into(), "Bearer peer-secret".into())]);
+        let tenant = HashMap::from([("authorization".into(), "Bearer tenant-key".into())]);
+        let mut vouching = admin.clone();
+        vouching.insert("x-kosha-actor".into(), "usr_1".into());
+        for line in [
+            "POST /v1/admin/operators HTTP/1.1",
+            "GET /v1/admin/operators HTTP/1.1",
+            "POST /v1/admin/operators/revoke HTTP/1.1",
+            "POST /v1/admin/operators/rotate HTTP/1.1",
+            "GET /v1/admin/api-keys/plaintext-count HTTP/1.1",
+        ] {
+            for headers in [&peer, &tenant, &vouching, &HashMap::new()] {
+                let response = route(line, headers, br#"{"name":"alice"}"#, "acme", &state);
+                assert!(response.starts_with("HTTP/1.1 403"), "{line}: {response}");
+            }
+        }
+        // With the credential the routes exist. Unit tests have no key
+        // registry, which is what they then report.
+        for line in [
+            "GET /v1/admin/operators HTTP/1.1",
+            "GET /v1/admin/api-keys/plaintext-count HTTP/1.1",
+        ] {
+            let response = route(line, &admin, b"", "service", &state);
+            assert!(response.starts_with("HTTP/1.1 400"), "{line}: {response}");
+        }
+        let response = route(
+            "POST /v1/admin/operators HTTP/1.1",
+            &admin,
+            br#"{"name":"not a name"}"#,
+            "service",
+            &state,
+        );
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert!(response.contains("invalid 'name'"), "{response}");
+        // A bootstrap key that is switched off opens none of them.
+        state.admin_auth_key = None;
+        let response = route(
+            "GET /v1/admin/operators HTTP/1.1",
+            &admin,
+            b"",
+            "service",
+            &state,
+        );
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
     }
 
     #[test]

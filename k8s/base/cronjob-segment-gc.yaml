@@ -22,9 +22,18 @@
 #      run would reclaim.
 #   2. Once the list looks right, set DRY_RUN to "false" and unsuspend.
 #
-# Admin routes need the dedicated admin credential (#262): the ingest pod
-# must run with KOSHA_ADMIN_API_KEY, and kosha-secret must carry the same
-# value under `admin-api-key`. Neither is provisioned by default.
+# Admin routes need an admin credential (#262), which this job reads from
+# kosha-secret's `admin-api-key`. That entry may hold either:
+# - the shared key: the same value the ingest pod runs with as
+#   KOSHA_ADMIN_API_KEY; or
+# - a per-operator credential issued for this job (#346), e.g.
+#   POST /v1/admin/operators {"name": "segment-gc"}. Needs Postgres.
+# Neither is provisioned by default. Before setting
+# KOSHA_ADMIN_BOOTSTRAP_KEY=disabled on the pods, switch this entry to an
+# operator credential: the shared key is then refused (401) and every run
+# of this job would fail, so S3 garbage would stop being reclaimed. If the
+# credential has an expiry, rotate it before then. The variable below keeps
+# its name only for the script; either kind of credential goes in it.
 #
 # Calls the ingest Service directly: a query pod would only forward
 # /v1/admin/* to the ingest anyway.

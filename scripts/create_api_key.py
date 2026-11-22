@@ -5,8 +5,10 @@
 
 This script is a thin wrapper that runs exactly that command, so existing
 runbooks keep working. Connection settings come from the CLI's usual
-sources: KOSHA_HOST, KOSHA_API_KEY (which must be the server's
-KOSHA_ADMIN_API_KEY), or a profile in ~/.kosha/config.toml.
+sources: KOSHA_HOST, KOSHA_API_KEY (which must be an admin credential: an
+operator credential from POST /v1/admin/operators, or the server's
+KOSHA_ADMIN_API_KEY while KOSHA_ADMIN_BOOTSTRAP_KEY is not `disabled`), or a
+profile in ~/.kosha/config.toml.
 
 The CLI binary is found in this order: $KOSHA_BIN, `kosha` on PATH, then
 `cargo run -p kosha-cli` from this checkout.

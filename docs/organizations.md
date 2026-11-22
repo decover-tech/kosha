@@ -26,12 +26,19 @@ SAML/OIDC and the web console are not built yet; they will sit in front of it.
 
 ## Who is calling
 
-Every route is under `/v1/admin/` and needs `KOSHA_ADMIN_API_KEY`. A tenant API
+Every route is under `/v1/admin/` and needs an admin credential:
+`KOSHA_ADMIN_API_KEY`, or a named
+[operator credential](../README.md#operator-admin-credentials). A tenant API
 key is never enough. The holder of the admin credential is then either:
 
-- **the operator**: no `X-Kosha-Actor` header. Not bound by roles.
+- **the operator**: no `X-Kosha-Actor` header. Not bound by roles. Audited as
+  `operator` with the shared key, as `operator:<name>` with an operator
+  credential.
 - **acting for a user**: `X-Kosha-Actor: <user id>`. The server enforces that
-  user's role in the organization.
+  user's role in the organization. Audited as `user:<id>`; when the request
+  was made with an operator credential, the entry's detail also has
+  `"via": "operator:<name>"`, so naming a user never hides which credential
+  acted. The shared key has no name, and adds nothing.
 
 `X-Kosha-Actor` is only understood by the routes on this page. Every other
 `/v1/admin/*` route (`api-keys`, `gc`, compaction, ...) is operator-only and
@@ -122,16 +129,22 @@ Refused requests are not recorded.
 | `api_key.rotated` | tenant | The replacement key, as for `api_key.created`, and `replaces`: the old key's `key_id_prefix` and the `expires_at` it now has |
 | `api_key.revoked` | tenant | `key_id_prefix`, `description` |
 
-An entry has `id`, `org_id`, `actor` (`operator` or `user:<id>`), `action`,
-`target_type`, `target_id`, `detail` and `created_at_ms`. The log never holds an
+An entry has `id`, `org_id`, `actor` (`operator`, `operator:<name>` or
+`user:<id>`), `action`,
+`target_type`, `target_id`, `detail` and `created_at_ms`. Any entry by a user
+may also carry `via` in its detail (see [Who is calling](#who-is-calling)). The log never holds an
 API key. `GET .../audit-log` returns one organization's entries newest first,
 100 per page by default (`limit`, at most 1000); pass the response's
 `next_before` as `before` for the next page. Keys created, rotated
 (`/rotate`) or revoked (`/revoke`) through `POST /v1/admin/api-keys` are
 recorded too, with the operator as the actor, under the tenant's organization
-when it has one. `user.created`, and key entries for a tenant no organization
-owns, are recorded with no organization and are only visible in the
-`kosha.audit_log` table. An entry never holds a key or a whole `key_id`.
+when it has one. `user.created`, key entries for a tenant no organization
+owns, and changes to operator credentials (`operator_credential.created`,
+`.rotated`, `.revoked`; target type `operator`, target id the operator's name)
+are recorded with no organization and are only visible in the
+`kosha.audit_log` table. An entry never holds a key; a tenant-key entry never
+holds a whole `key_id` either, while an operator-credential entry names the
+credential by its full `key_id`.
 
 Not recorded yet: namespace deletion and other data-plane actions made with a
 tenant API key, the keys removed when a tenant is deleted, and

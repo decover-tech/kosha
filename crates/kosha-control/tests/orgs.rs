@@ -54,10 +54,7 @@ struct Fixture {
 
 impl Fixture {
     fn id(actor: &Actor) -> &str {
-        match actor {
-            Actor::User(id) => id,
-            Actor::Operator => panic!("the operator has no user id"),
-        }
+        actor.user_id().expect("the operator has no user id")
     }
 }
 
@@ -575,11 +572,81 @@ fn audit_log_records_each_action_once(store: &dyn OrgStore) {
     assert_eq!(other_log[0].action, "org.created");
 }
 
+/// A user a named operator's credential vouched for (#346) is that user for
+/// every rule, and the audit row keeps the credential in `via`.
+fn vouched_users_keep_their_role_and_name_the_credential(store: &dyn OrgStore) {
+    let names = Names::new();
+    let f = fixture(store, &names);
+    let org = f.org.as_str();
+    let via = |actor: &Actor| Actor::VouchedUser {
+        user_id: Fixture::id(actor).to_string(),
+        operator: "alice".to_string(),
+    };
+    assert_eq!(via(&f.owner).label(), f.owner.label());
+
+    // Bound by the user's role, not lifted to the operator's powers.
+    forbidden(orgs::create_project(
+        store,
+        &via(&f.member),
+        org,
+        "nope",
+        "Nope",
+    ));
+    forbidden(orgs::create_user(
+        store,
+        &via(&f.owner),
+        &names.email("x"),
+        "",
+    ));
+    forbidden(orgs::get_org(store, &via(&f.outsider), org));
+    // Leaving is still leaving, and the last owner still cannot.
+    conflict(orgs::remove_member(
+        store,
+        &via(&f.owner),
+        org,
+        Fixture::id(&f.owner),
+    ));
+
+    let project = orgs::create_project(store, &via(&f.admin), org, "vouched", "V").unwrap();
+    orgs::create_project(store, &f.admin, org, "direct", "D").unwrap();
+    let member = Fixture::id(&f.member);
+    orgs::remove_member(store, &via(&f.owner), org, member).unwrap();
+
+    let log = orgs::list_audit(store, &f.owner, org, None, None).unwrap();
+    let got: Vec<_> = log
+        .iter()
+        .take(3)
+        .rev()
+        .map(|e| (e.actor.clone(), e.action.as_str(), e.detail.clone()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (
+                f.admin.label(),
+                "project.created",
+                serde_json::json!({ "slug": project.slug, "via": "operator:alice" }),
+            ),
+            (
+                f.admin.label(),
+                "project.created",
+                serde_json::json!({ "slug": "direct" }),
+            ),
+            (
+                f.owner.label(),
+                "member.removed",
+                serde_json::json!({ "role": "member", "via": "operator:alice" }),
+            ),
+        ]
+    );
+}
+
 fn all(store: &dyn OrgStore) {
     users_and_organizations(store);
     roles_gate_every_operation(store);
     membership_rules(store);
     audit_log_records_each_action_once(store);
+    vouched_users_keep_their_role_and_name_the_credential(store);
 }
 
 #[test]
@@ -600,6 +667,11 @@ fn memory_membership_rules() {
 #[test]
 fn memory_audit_log_records_each_action_once() {
     audit_log_records_each_action_once(&MemoryOrgStore::new());
+}
+
+#[test]
+fn memory_vouched_users_keep_their_role_and_name_the_credential() {
+    vouched_users_keep_their_role_and_name_the_credential(&MemoryOrgStore::new());
 }
 
 #[test]

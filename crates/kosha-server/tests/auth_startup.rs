@@ -195,6 +195,64 @@ fn legacy_routes_can_be_switched_off() {
     assert!(!v1.starts_with("HTTP/1.1 410"), "{v1}");
 }
 
+/// #346: a typo in the switch for the bootstrap admin key must not leave
+/// the operator guessing which way it went.
+#[test]
+fn invalid_bootstrap_key_switch_refuses_to_start() {
+    let (mut cmd, _) = server(&[
+        ("KOSHA_API_KEYS", "sk-tenant=acme"),
+        ("KOSHA_ADMIN_API_KEY", "sk-admin"),
+        ("KOSHA_ADMIN_BOOTSTRAP_KEY", "disable"),
+    ]);
+    let out = cmd.output().expect("spawn kosha-server");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("FATAL: invalid KOSHA_ADMIN_BOOTSTRAP_KEY 'disable'"),
+        "stderr: {stderr}"
+    );
+}
+
+/// #346: `KOSHA_ADMIN_BOOTSTRAP_KEY=disabled` turns the shared admin key
+/// into a key the server does not know, and `enabled` (the default) leaves
+/// it working.
+#[test]
+fn bootstrap_admin_key_can_be_switched_off() {
+    let admin_stats = "GET /v1/stats HTTP/1.1\r\nauthorization: Bearer sk-admin\r\n\r\n";
+    let admin_route =
+        "GET /v1/admin/compaction-status HTTP/1.1\r\nauthorization: Bearer sk-admin\r\n\r\n";
+    let tenant = "GET /v1/namespaces HTTP/1.1\r\nauthorization: Bearer sk-tenant\r\n\r\n";
+    for (switch, admin_status) in [("disabled", "401"), ("enabled", "200")] {
+        let (mut cmd, port) = server(&[
+            ("KOSHA_API_KEYS", "sk-tenant=acme"),
+            ("KOSHA_ADMIN_API_KEY", "sk-admin"),
+            ("KOSHA_ADMIN_BOOTSTRAP_KEY", switch),
+        ]);
+        let mut child = cmd.spawn().unwrap();
+        wait_healthy(&mut child, port);
+        let stats = http(port, admin_stats).unwrap();
+        let admin = http(port, admin_route).unwrap();
+        let tenant = http(port, tenant).unwrap();
+        child.kill().ok();
+        child.wait().ok();
+        let expected = format!("HTTP/1.1 {admin_status}");
+        assert!(stats.starts_with(&expected), "{switch}: {stats}");
+        assert!(admin.starts_with(&expected), "{switch}: {admin}");
+        // Tenant keys are untouched either way.
+        assert!(tenant.starts_with("HTTP/1.1 200"), "{switch}: {tenant}");
+    }
+}
+
+/// A switched-off bootstrap key is not a configured credential: on its own
+/// it must not let the server start with nothing able to authenticate.
+#[test]
+fn switched_off_bootstrap_key_alone_is_not_enough_to_start() {
+    assert_refuses_to_start(&[
+        ("KOSHA_ADMIN_API_KEY", "sk-admin"),
+        ("KOSHA_ADMIN_BOOTSTRAP_KEY", "disabled"),
+    ]);
+}
+
 /// Scoped, expiring, rotating keys from the Postgres registry (#346),
 /// against the real binary. Opt-in, with a dedicated disposable database
 /// that no manifest-writing suite (`postgres_cas`) shares: the server
@@ -548,5 +606,255 @@ mod scoped_keys {
         );
         assert_eq!(status(port, "GET", &stats, &ro, None), 401);
         assert_eq!(status(port, "GET", &stats, &full, None), 401);
+    }
+
+    fn start_without_bootstrap_key(database_url: &str) -> Server {
+        let (mut cmd, port) = server(&[
+            ("DATABASE_URL", database_url),
+            ("KOSHA_ADMIN_API_KEY", ADMIN),
+            ("KOSHA_ADMIN_BOOTSTRAP_KEY", "disabled"),
+            ("KOSHA_API_KEY_REFRESH_SECS", "1"),
+        ]);
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = cmd.spawn().unwrap();
+        wait_healthy(&mut child, port);
+        Server(child, port)
+    }
+
+    /// Per-operator admin credentials (#346), against the real binary:
+    /// issued through the bootstrap key, accepted on every admin route,
+    /// audited under the operator's name, never usable as (or managed like)
+    /// a tenant key, rotated, expired and revoked like one, and enough on
+    /// their own once the bootstrap key is switched off.
+    #[test]
+    #[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+    fn operator_credentials_replace_the_shared_admin_key() {
+        let database_url =
+            std::env::var("KOSHA_TEST_DATABASE_URL").expect("set a dedicated test database URL");
+        let server = start(&database_url);
+        let port = server.1;
+        let run = format!("{}x{port}", std::process::id());
+        let operators = "/v1/admin/operators";
+        let create = |key: &str, request: Value| call(port, "POST", operators, key, Some(request));
+
+        // The bootstrap key issues the first operator credential.
+        let alice = format!("alice-{run}");
+        let (code, created) = create(ADMIN, json!({"name": alice, "description": "on call"}));
+        assert_eq!(code, 200, "{created}");
+        assert_eq!(created["name"], json!(alice));
+        let alice_key = created["api_key"].as_str().unwrap().to_string();
+        let alice_id = created["key_id"].as_str().unwrap().to_string();
+        // One usable credential per name: a second is a rotation.
+        let (code, answer) = create(ADMIN, json!({"name": alice}));
+        assert_eq!(code, 409, "{answer}");
+
+        // It opens the admin routes the shared key opens, at once.
+        assert_eq!(status(port, "GET", operators, &alice_key, None), 200);
+        assert_eq!(status(port, "GET", "/v1/stats", &alice_key, None), 200);
+        let (code, count) = call(
+            port,
+            "GET",
+            "/v1/admin/api-keys/plaintext-count",
+            &alice_key,
+            None,
+        );
+        assert_eq!(code, 200, "{count}");
+        let plaintext = count["plaintext_rows"].as_u64().expect("plaintext_rows");
+        assert_eq!(count["scrub_due"], json!(plaintext > 0));
+
+        // What its holder does is audited under its name.
+        let (code, user) = call(
+            port,
+            "POST",
+            "/v1/admin/users",
+            &alice_key,
+            Some(json!({"email": format!("ada-{run}@example.com")})),
+        );
+        assert_eq!(code, 200, "{user}");
+        let (code, org) = call(
+            port,
+            "POST",
+            "/v1/admin/orgs",
+            &alice_key,
+            Some(json!({"slug": format!("org-{run}"), "name": "Org", "owner_user_id": user["id"]})),
+        );
+        assert_eq!(code, 200, "{org}");
+        let org_base = format!("/v1/admin/orgs/{}", org["id"].as_str().unwrap());
+        // ... and the shared key's holder stays the anonymous `operator`.
+        let project = json!({"slug": "one", "name": "One"});
+        let projects = format!("{org_base}/projects");
+        assert_eq!(status(port, "POST", &projects, ADMIN, Some(project)), 200);
+        let (code, log) = call(
+            port,
+            "GET",
+            &format!("{org_base}/audit-log"),
+            &alice_key,
+            None,
+        );
+        assert_eq!(code, 200, "{log}");
+        let actors: Vec<(&str, &str)> = log["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .map(|e| (e["actor"].as_str().unwrap(), e["action"].as_str().unwrap()))
+            .collect();
+        let by_alice = format!("operator:{alice}");
+        assert_eq!(
+            actors,
+            [
+                (by_alice.as_str(), "org.created"),
+                ("operator", "project.created")
+            ]
+        );
+
+        // Tenant keys and operator credentials are separate worlds: a key
+        // alice issues for a tenant opens no admin route, alice's
+        // credential is not in the tenant-key registry's listing, and that
+        // registry's routes cannot revoke or rotate it.
+        let tenant = format!("t{run}");
+        let (code, tenant_key) = call(
+            port,
+            "POST",
+            "/v1/admin/api-keys",
+            &alice_key,
+            Some(json!({"tenant_id": tenant})),
+        );
+        assert_eq!(code, 200, "{tenant_key}");
+        let tenant_key = tenant_key["api_key"].as_str().unwrap().to_string();
+        assert_eq!(
+            status(port, "GET", "/v1/namespaces", &tenant_key, None),
+            200
+        );
+        assert_eq!(status(port, "GET", operators, &tenant_key, None), 403);
+        let (code, listed) = call(port, "GET", "/v1/admin/api-keys", ADMIN, None);
+        assert_eq!(code, 200, "{listed}");
+        assert!(!listed.to_string().contains(&alice_id), "{listed}");
+        assert!(!listed.to_string().contains("_operator/"), "{listed}");
+        for route in ["/v1/admin/api-keys/revoke", "/v1/admin/api-keys/rotate"] {
+            let by_id = Some(json!({"key_id": alice_id}));
+            assert_eq!(status(port, "POST", route, ADMIN, by_id), 404, "{route}");
+        }
+        // And the operator routes do not touch a tenant key.
+        for route in ["/v1/admin/operators/revoke", "/v1/admin/operators/rotate"] {
+            let by_key = Some(json!({"api_key": tenant_key}));
+            assert_eq!(status(port, "POST", route, ADMIN, by_key), 404, "{route}");
+        }
+        assert_eq!(
+            status(port, "GET", "/v1/namespaces", &tenant_key, None),
+            200
+        );
+        assert_eq!(status(port, "GET", operators, &alice_key, None), 200);
+
+        // The listing names the operator and shows no secret.
+        let (code, listed) = call(port, "GET", operators, &alice_key, None);
+        assert_eq!(code, 200, "{listed}");
+        assert!(!listed.to_string().contains(&alice_key), "{listed}");
+        let shown = listed["operators"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["key_id"] == json!(alice_id))
+            .expect("alice listed");
+        assert_eq!(shown["name"], json!(alice));
+        assert_eq!(shown["description"], json!("on call"));
+
+        // Rotation: both credentials work during the overlap, then the old
+        // one expires on its own. alice rotates her own.
+        let (code, rotated) = call(
+            port,
+            "POST",
+            "/v1/admin/operators/rotate",
+            &alice_key,
+            Some(json!({"key_id": alice_id, "overlap_secs": 3})),
+        );
+        assert_eq!(code, 200, "{rotated}");
+        assert_eq!(rotated["name"], json!(alice));
+        assert_eq!(rotated["replaces"]["key_id"], json!(alice_id));
+        let alice_new = rotated["api_key"].as_str().unwrap().to_string();
+        assert_eq!(status(port, "GET", operators, &alice_key, None), 200);
+        assert_eq!(status(port, "GET", operators, &alice_new, None), 200);
+        eventually("the rotated-out credential to expire", || {
+            let (code, answer) = call(port, "GET", operators, &alice_key, None);
+            code == 401 && answer["error"] == json!("API key expired")
+        });
+        assert_eq!(status(port, "GET", operators, &alice_new, None), 200);
+
+        // Expiry needs no refresh and no restart.
+        let bob = format!("bob-{run}");
+        let (code, created) = create(&alice_new, json!({"name": bob, "expires_in_secs": 2}));
+        assert_eq!(code, 200, "{created}");
+        let bob_key = created["api_key"].as_str().unwrap().to_string();
+        assert_eq!(status(port, "GET", operators, &bob_key, None), 200);
+        eventually("bob's credential to expire", || {
+            status(port, "GET", operators, &bob_key, None) == 401
+        });
+        // An expired credential no longer holds the name.
+        let (code, created) = create(&alice_new, json!({"name": bob}));
+        assert_eq!(code, 200, "{created}");
+        let bob_key = created["api_key"].as_str().unwrap().to_string();
+
+        // Revoked through the API (by name: every credential of that
+        // operator): refused by this pod at once.
+        let (code, answer) = call(
+            port,
+            "POST",
+            "/v1/admin/operators/revoke",
+            &alice_new,
+            Some(json!({"name": bob})),
+        );
+        assert_eq!(code, 200, "{answer}");
+        // Both of bob's: the usable one and the expired one.
+        assert_eq!(answer["revoked"].as_array().unwrap().len(), 2, "{answer}");
+        assert_eq!(status(port, "GET", operators, &bob_key, None), 401);
+
+        // Revoked elsewhere (another pod): refused within the refresh
+        // interval.
+        let carol = format!("carol-{run}");
+        let (code, created) = create(&alice_new, json!({"name": carol}));
+        assert_eq!(code, 200, "{created}");
+        let carol_key = created["api_key"].as_str().unwrap().to_string();
+        assert_eq!(status(port, "GET", operators, &carol_key, None), 200);
+        let registry = kosha_control::PgStore::new(&database_url).unwrap();
+        let revoked = registry
+            .revoke_operator_credentials(
+                kosha_control::OperatorCredentials::Operator(&carol),
+                "operator",
+            )
+            .unwrap();
+        assert_eq!(revoked.len(), 1);
+        eventually("a revocation made elsewhere to arrive", || {
+            status(port, "GET", operators, &carol_key, None) == 401
+        });
+
+        // With the bootstrap key switched off, the shared key is just an
+        // unknown key and alice's credential (loaded from its hash) still
+        // administers. Switching it back on is the break-glass path.
+        drop(server);
+        let server = start_without_bootstrap_key(&database_url);
+        let port = server.1;
+        assert_eq!(status(port, "GET", operators, ADMIN, None), 401);
+        assert_eq!(status(port, "GET", "/v1/stats", ADMIN, None), 401);
+        assert_eq!(status(port, "GET", operators, &alice_new, None), 200);
+        assert_eq!(status(port, "GET", operators, &carol_key, None), 401);
+        let dave = format!("dave-{run}");
+        let (code, created) = call(
+            port,
+            "POST",
+            operators,
+            &alice_new,
+            Some(json!({"name": dave})),
+        );
+        assert_eq!(code, 200, "{created}");
+        // Clean up after this run: alice revokes dave's and then her own.
+        for name in [&dave, &alice] {
+            let by_name = Some(json!({"name": name}));
+            let revoke = "/v1/admin/operators/revoke";
+            assert_eq!(status(port, "POST", revoke, &alice_new, by_name), 200);
+        }
+        assert_eq!(status(port, "GET", operators, &alice_new, None), 401);
+        drop(server);
+        let server = start(&database_url);
+        assert_eq!(status(server.1, "GET", operators, ADMIN, None), 200);
     }
 }

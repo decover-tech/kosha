@@ -117,6 +117,7 @@ isolation section):
 | `KOSHA_API_KEY` | Tenant key for tenant `default` |
 | `KOSHA_API_KEYS` | Tenant keys, `key1=tenant1,key2=tenant2` |
 | `KOSHA_ADMIN_API_KEY` | Admin credential for `/v1/admin/*` and global `/stats` |
+| `KOSHA_ADMIN_BOOTSTRAP_KEY=disabled` | Refuse `KOSHA_ADMIN_API_KEY`, leaving only per-operator credentials (`POST /v1/admin/operators`) |
 | `KOSHA_INTERNAL_API_KEY` | Peer credential for `/internal/*`: segment hydration, and query pods reading the ingest pod's unindexed writes for strong-consistency searches (#255) |
 | `KOSHA_DEFAULT_CONSISTENCY` | `strong` (default) or `eventual`: whether a search that does not say also scans unindexed writes. A query pod without `KOSHA_INTERNAL_API_KEY` defaults to `eventual` |
 | `KOSHA_MAX_UNINDEXED_BYTES` / `KOSHA_MAX_UNINDEXED_DOCS` | Per-namespace cap on unindexed writes (default 2 GiB / unset; `0` disables); past it `/index` and `/replace` return 429 |
