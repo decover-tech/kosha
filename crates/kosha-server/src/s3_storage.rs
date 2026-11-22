@@ -1320,6 +1320,47 @@ impl S3Storage {
         })
     }
 
+    /// Visit what is under the logical directory `dir` one LIST page at a
+    /// time, so the caller never holds more than a page (about 1,000 keys)
+    /// however large the prefix is. Usage reconciliation (#348) sums a whole
+    /// bucket this way. `recursive` visits every object below `dir`;
+    /// otherwise only its immediate children: objects directly in it and one
+    /// [`Listed::Dir`] per child "directory". Metadata only: no object body
+    /// is read.
+    pub fn visit_listing(
+        &self,
+        dir: &str,
+        recursive: bool,
+        visit: &mut dyn FnMut(Listed<'_>),
+    ) -> Result<(), KoshaError> {
+        let mut key_prefix = self.s3_key(dir.trim_matches('/'));
+        // The trailing slash keeps a sibling (`acme/docs2`) out of a listing
+        // of `acme/docs`.
+        if !key_prefix.is_empty() && !key_prefix.ends_with('/') {
+            key_prefix.push('/');
+        }
+        visit_listing_pages(
+            &self.prefix,
+            |continuation| {
+                let mut req = self
+                    .client
+                    .list_objects_v2()
+                    .bucket(&self.bucket)
+                    .prefix(&key_prefix);
+                if !recursive {
+                    req = req.delimiter("/");
+                }
+                if let Some(token) = continuation {
+                    req = req.continuation_token(token);
+                }
+                self.rt
+                    .block_on(req.send())
+                    .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))
+            },
+            visit,
+        )
+    }
+
     /// Delete one object from S3, surfacing failures (unlike the trait's
     /// `delete`, which predates GC and is best-effort remotely).
     pub fn delete_remote(&self, path: &str) -> Result<(), KoshaError> {
@@ -2164,6 +2205,67 @@ impl StorageBackend for S3GcStore<'_> {
     }
 }
 
+/// One entry of [`S3Storage::visit_listing`]. Paths are logical (without
+/// the configured key prefix).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Listed<'a> {
+    Object {
+        path: &'a str,
+        size: u64,
+    },
+    /// A child "directory" of a non-recursive listing, without the
+    /// trailing slash.
+    Dir {
+        path: &'a str,
+    },
+}
+
+/// The page loop of [`S3Storage::visit_listing`]: call `fetch` with the
+/// previous page's continuation token until a page is not truncated,
+/// handing each page's entries to `visit` before fetching the next.
+fn visit_listing_pages(
+    root_prefix: &str,
+    mut fetch: impl FnMut(
+        Option<String>,
+    ) -> Result<
+        aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output,
+        KoshaError,
+    >,
+    visit: &mut dyn FnMut(Listed<'_>),
+) -> Result<(), KoshaError> {
+    let mut continuation: Option<String> = None;
+    loop {
+        let page = fetch(continuation.take())?;
+        for object in page.contents() {
+            if let Some(path) = object
+                .key()
+                .and_then(|key| logical_path_of_key(root_prefix, key))
+            {
+                visit(Listed::Object {
+                    path: &path,
+                    size: object.size().unwrap_or(0).max(0) as u64,
+                });
+            }
+        }
+        for common in page.common_prefixes() {
+            if let Some(path) = common
+                .prefix()
+                .and_then(|key| logical_path_of_key(root_prefix, key))
+            {
+                visit(Listed::Dir {
+                    path: path.trim_end_matches('/'),
+                });
+            }
+        }
+        match page.next_continuation_token() {
+            Some(token) if page.is_truncated().unwrap_or(false) => {
+                continuation = Some(token.to_string())
+            }
+            _ => return Ok(()),
+        }
+    }
+}
+
 fn local_list_with_zero_sizes(
     local: &LocalStorage,
     path: &str,
@@ -2365,6 +2467,104 @@ mod tests {
         assert_eq!(streamed.bytes, payload.len() as u64);
         assert_eq!(std::fs::read(&tmp_path).unwrap(), payload);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #348: a listing is consumed page by page, each page's continuation
+    /// token goes into the next request, and nothing is accumulated.
+    #[test]
+    fn a_listing_is_visited_page_by_page_until_it_is_not_truncated() {
+        use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
+        use aws_sdk_s3::types::{CommonPrefix, Object};
+
+        let object = |key: &str, size: i64| Object::builder().key(key).size(size).build();
+        let mut pages = vec![
+            ListObjectsV2Output::builder()
+                .contents(object("kosha/acme/docs/seg-1/a.bin", 10))
+                .contents(object("kosha/acme/docs/seg-1/b.bin", 20))
+                .is_truncated(true)
+                .next_continuation_token("t1")
+                .build(),
+            // A page may be empty and still truncated.
+            ListObjectsV2Output::builder()
+                .is_truncated(true)
+                .next_continuation_token("t2")
+                .build(),
+            ListObjectsV2Output::builder()
+                .contents(object("kosha/acme/docs/seg-2/c.bin", 30))
+                // Outside the configured prefix: never reported.
+                .contents(object("other/x", 99))
+                .common_prefixes(CommonPrefix::builder().prefix("kosha/acme/logs/").build())
+                .is_truncated(false)
+                // S3-compatible stores may echo a token on the last page.
+                .next_continuation_token("ignored")
+                .build(),
+        ]
+        .into_iter();
+        let mut tokens = Vec::new();
+        let mut seen = Vec::new();
+        visit_listing_pages(
+            "kosha",
+            |token| {
+                tokens.push(token);
+                Ok(pages.next().expect("no request after the last page"))
+            },
+            &mut |entry| {
+                seen.push(match entry {
+                    Listed::Object { path, size } => format!("{path}={size}"),
+                    Listed::Dir { path } => format!("{path}/"),
+                });
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            tokens,
+            vec![None, Some("t1".to_string()), Some("t2".to_string())]
+        );
+        assert_eq!(
+            seen,
+            vec![
+                "acme/docs/seg-1/a.bin=10",
+                "acme/docs/seg-1/b.bin=20",
+                "acme/docs/seg-2/c.bin=30",
+                "acme/logs/",
+            ]
+        );
+
+        let failed = visit_listing_pages(
+            "",
+            |_| Err(KoshaError::NotFound("injected".into())),
+            &mut |_| panic!("nothing to visit"),
+        );
+        assert!(failed.is_err());
+    }
+
+    /// #348: the listing asks S3 for keys under `<dir>/` only, with a
+    /// delimiter when it wants immediate children, and never for a body.
+    #[test]
+    fn visit_listing_sends_a_list_request_scoped_to_the_directory() {
+        let dir = std::env::temp_dir().join(format!("kosha-list-req-{}", std::process::id()));
+        let (storage, capture) = capture::storage(dir, "kosha", sse::SseConfig::default());
+        for (recursive, delimited) in [(true, false), (false, true)] {
+            assert!(storage
+                .visit_listing("acme/docs", recursive, &mut |_| {})
+                .is_err());
+            let requests = capture.take();
+            assert_eq!(requests.len(), 1);
+            let request = &requests[0];
+            assert_eq!(request.method, "GET");
+            assert!(request.uri.contains("list-type=2"), "{}", request.uri);
+            assert!(
+                request.uri.contains("prefix=kosha%2Facme%2Fdocs%2F"),
+                "{}",
+                request.uri
+            );
+            assert_eq!(
+                request.uri.contains("delimiter=%2F"),
+                delimited,
+                "{}",
+                request.uri
+            );
+        }
     }
 
     #[test]

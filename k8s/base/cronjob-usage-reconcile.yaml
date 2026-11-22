@@ -1,0 +1,79 @@
+# Usage reconciliation (#348): compares the hourly `stored_bytes` usage
+# snapshots with what the segment bucket actually holds, per tenant and
+# namespace, and fails when they disagree.
+#
+# `kosha-server reconcile-usage` lists the bucket (LIST requests only, about
+# one per 1,000 objects, no object is read), reads the namespaces, deletion
+# records and usage events from Postgres, and prints one JSON report on
+# stdout. It changes nothing. Exit status:
+#   0  every namespace is within tolerance
+#   1  at least one is not: a snapshot that differs from the bytes its
+#      manifest references by more than the tolerance, objects with no
+#      snapshot (storage nobody is metered for, including what a deleted
+#      namespace left behind), or a snapshot with no objects
+#   2  the run could not finish (Postgres or S3 unreachable, bad settings)
+# so a failed Job (`kube_job_failed`) is the alert, and the Job log has the
+# report with the namespaces and the bytes. See "Usage metering" in
+# docs/configuration.md for the report fields and KOSHA_USAGE_RECONCILE_*.
+#
+# Ships suspended: it is only meaningful where KOSHA_USAGE_METERING=on, and
+# without snapshots every namespace is reported as unmetered. To roll out:
+#   1. kubectl -n kosha create job --from=cronjob/kosha-usage-reconcile reconcile-once
+#      and read the log.
+#   2. Set the tolerance in the args below (or KOSHA_USAGE_RECONCILE_* in
+#      kosha-config) and unsuspend.
+#
+# The schedule runs a few minutes past the hour on purpose: the snapshot of
+# an hour is taken within KOSHA_USAGE_SNAPSHOT_TICK_MS (5 minutes) of its
+# start, so the listing and the snapshot it is compared with are minutes
+# apart rather than up to an hour.
+#
+# Runs anywhere (no NVMe pool, no data volume): it needs the pods' ConfigMap
+# for the bucket settings, DATABASE_URL, and the service account's S3 list
+# permission on the bucket.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: kosha-usage-reconcile
+  namespace: kosha
+spec:
+  # Daily, off-peak UTC, ten minutes past the hour.
+  schedule: "10 6 * * *"
+  timeZone: Etc/UTC
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 7
+  suspend: true
+  jobTemplate:
+    spec:
+      # Out of tolerance is a finding, not a transient error: do not retry.
+      backoffLimit: 0
+      activeDeadlineSeconds: 7200
+      template:
+        spec:
+          restartPolicy: Never
+          serviceAccountName: kosha
+          containers:
+            - name: reconcile
+              image: kosha
+              imagePullPolicy: IfNotPresent
+              command: ["kosha-server", "reconcile-usage"]
+              # Defaults: --tolerance 0.05 --tolerance-bytes 1048576
+              # --max-snapshot-age 3h. Add --tenant <id> for one tenant.
+              args: []
+              envFrom:
+                - configMapRef:
+                    name: kosha-config
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: kosha-secret
+                      key: database-url
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: "128Mi"
+                limits:
+                  cpu: "1"
+                  memory: "512Mi"
