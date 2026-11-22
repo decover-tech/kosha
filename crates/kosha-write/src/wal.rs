@@ -744,6 +744,9 @@ impl WalWriter {
             encode_frame(&mut bytes, record.lsn, &record.payload);
         }
         let last = batch[batch.len() - 1].lsn;
+        // Crash-point seam (#257): nothing of this group is durable yet, and
+        // no caller has been acknowledged.
+        fail::fail_point!("wal.append.before_fsync");
         let outcome = match fenced {
             Some(reason) => GroupOutcome {
                 key,
@@ -761,6 +764,11 @@ impl WalWriter {
             },
         };
 
+        if outcome.result.is_ok() {
+            // Crash-point seam (#257): the group is durable, but no caller
+            // has been acknowledged yet.
+            fail::fail_point!("wal.append.after_fsync");
+        }
         let mut state = self.state.lock().unwrap();
         if let Some((file, high, locations)) = outcome.adopted {
             let entry = state.files.entry(file).or_default();
@@ -1273,6 +1281,29 @@ fn decode_frames(data: &[u8], file_lsn: u64) -> Result<DecodedFile, KoshaError> 
         complete_len: data.len(),
         torn: false,
     })
+}
+
+/// Encode `records` as one v3 WAL file, exactly as a group commit writes
+/// them. For property tests and fuzzing (#257).
+#[doc(hidden)]
+pub fn encode_wal_file(records: &[(u64, WalRecord)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (lsn, record) in records {
+        encode_frame(&mut out, *lsn, &encode_record(record));
+    }
+    out
+}
+
+/// Decode one WAL file (any format version) exactly as recovery does:
+/// the complete records and whether the file ends in a torn frame. For
+/// property tests and fuzzing (#257); never panics, whatever the bytes.
+#[doc(hidden)]
+pub fn decode_wal_file(
+    data: &[u8],
+    file_lsn: u64,
+) -> Result<(Vec<(u64, WalRecord)>, bool), KoshaError> {
+    let decoded = decode_frames(data, file_lsn)?;
+    Ok((decoded.records, decoded.torn))
 }
 
 fn invalid(message: &str) -> KoshaError {

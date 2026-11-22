@@ -37,6 +37,12 @@ spec:
       labels:
         app: kosha
         role: indexer
+      annotations:
+        # Scraped by annotation-based Prometheus pod discovery (#223). See
+        # docs/metrics.md.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
     spec:
       serviceAccountName: kosha
       containers:
@@ -111,8 +117,21 @@ spec:
           volumeMounts:
             - name: cache
               mountPath: /var/cache/kosha
+            # TLS between pods (#343): the certificate Secret, if one exists
+            # (see certificate-internal-tls.example.yaml). Mounting it does
+            # nothing on its own; the KOSHA_TLS_* / KOSHA_INTERNAL_TLS_*
+            # settings in configmap.yaml turn it on.
+            - name: internal-tls
+              mountPath: /etc/kosha/tls
+              readOnly: true
       volumes:
         # Merge scratch and hydrated inputs only; S3 + Postgres are the
         # source of truth.
         - name: cache
           emptyDir: {}
+        - name: internal-tls
+          secret:
+            secretName: kosha-internal-tls
+            # Optional so clusters without the Secret still start; with
+            # KOSHA_INTERNAL_TLS on, a missing file stops the pod instead.
+            optional: true

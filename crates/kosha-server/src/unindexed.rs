@@ -276,7 +276,10 @@ impl UnindexedState {
             .unwrap_or_default()
             .as_nanos();
         let http = query_role.then(|| {
-            reqwest::blocking::Client::builder()
+            // The ingest pod's tail route: internal traffic, so it trusts
+            // the internal CA when `KOSHA_INTERNAL_TLS` is on (#343).
+            crate::internal_tls::global()
+                .client_builder()
                 .timeout(Duration::from_millis(
                     std::env::var("KOSHA_TAIL_FETCH_TIMEOUT_MS")
                         .ok()

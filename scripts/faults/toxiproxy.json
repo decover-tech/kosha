@@ -1,0 +1,4 @@
+[
+  {"name": "minio", "listen": "0.0.0.0:19000", "upstream": "minio:9000", "enabled": true},
+  {"name": "postgres", "listen": "0.0.0.0:15432", "upstream": "postgres:5432", "enabled": true}
+]

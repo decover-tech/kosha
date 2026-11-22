@@ -9,6 +9,9 @@
 //!   - `KOSHA_S3_ENDPOINT` or `AWS_ENDPOINT_URL` (MinIO / custom endpoint)
 //!   - `KOSHA_S3_ACCESS_KEY` / `KOSHA_S3_SECRET_KEY` (or standard AWS_* creds)
 //!   - `KOSHA_S3_FORCE_PATH_STYLE=true` (default when a custom endpoint is set)
+//!   - `KOSHA_S3_SSE`, `KOSHA_S3_SSE_KMS_KEY_ID`, `KOSHA_S3_SSE_BUCKET_KEY`,
+//!     `KOSHA_S3_TENANT_KMS_KEYS` / `KOSHA_S3_TENANT_KMS_KEYS_FILE`:
+//!     server-side encryption on every write (#343), see [`sse`].
 
 use std::fmt::{self, Debug, Formatter};
 use std::path::{Path, PathBuf};
@@ -57,14 +60,34 @@ pub struct S3Config {
     pub access_key: Option<String>,
     pub secret_key: Option<String>,
     pub region: Option<String>,
+    /// Server-side encryption requested on every write (#343).
+    pub sse: SseConfig,
 }
 
 impl S3Config {
     /// Resolve config from process environment.
     ///
     /// Returns `None` when `KOSHA_S3_BUCKET` is unset (S3 disabled).
+    ///
+    /// Fails closed: an invalid encryption setting (see [`sse`]) exits the
+    /// process instead of starting a node that would write objects without
+    /// the encryption the operator asked for.
     pub fn from_env() -> Option<Self> {
-        let bucket = std::env::var("KOSHA_S3_BUCKET").ok()?;
+        match Self::try_from_env() {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!("FATAL: invalid S3 encryption config: {e}");
+                std::process::exit(1)
+            }
+        }
+    }
+
+    /// [`S3Config::from_env`] that returns an invalid encryption setting as
+    /// an error instead of exiting.
+    pub fn try_from_env() -> Result<Option<Self>, String> {
+        let Ok(bucket) = std::env::var("KOSHA_S3_BUCKET") else {
+            return Ok(None);
+        };
         let prefix = std::env::var("KOSHA_S3_PREFIX").unwrap_or_default();
         let endpoint = std::env::var("KOSHA_S3_ENDPOINT")
             .ok()
@@ -94,7 +117,9 @@ impl S3Config {
                 }
             });
 
-        Some(Self {
+        let sse = SseConfig::from_env()?;
+
+        Ok(Some(Self {
             bucket,
             prefix,
             endpoint,
@@ -102,7 +127,573 @@ impl S3Config {
             access_key,
             secret_key,
             region,
-        })
+            sse,
+        }))
+    }
+}
+
+pub use sse::{ApplySse, ObjectSse, SseConfig};
+
+/// Server-side encryption at rest (#343).
+///
+/// Every object Kosha writes (segment files, `_COMMIT` markers, deletion
+/// vectors, WAL group commits) is sent with the SSE headers resolved here,
+/// so encryption no longer depends on the bucket's default:
+///
+/// - `KOSHA_S3_SSE`: `none` (default: no header, the bucket default
+///   applies), `AES256` (SSE-S3) or `aws:kms` (SSE-KMS).
+/// - `KOSHA_S3_SSE_KMS_KEY_ID`: the KMS key (id, ARN or `alias/...`) for
+///   objects with no per-tenant key. Unset with `aws:kms` means the
+///   AWS-managed `aws/s3` key.
+/// - `KOSHA_S3_SSE_BUCKET_KEY`: `true`/`false`, S3 Bucket Keys (fewer KMS
+///   calls). Unset sends no header, so the bucket's setting applies.
+/// - `KOSHA_S3_TENANT_KMS_KEYS` (`tenant=key,tenant2=key2`) or
+///   `KOSHA_S3_TENANT_KMS_KEYS_FILE` (a JSON object `{"tenant": "key"}`):
+///   per-tenant keys (BYOK). At most one of the two.
+///
+/// The key-id, bucket-key and tenant settings require `aws:kms`; setting
+/// them with another mode is an error, as is any malformed entry, so a
+/// typo never silently falls back to weaker encryption.
+///
+/// The tenant of an object is read from its logical path, see
+/// [`tenant_of_path`](sse::tenant_of_path). WAL objects
+/// (`{prefix}/_wal/{writer_id}/...`) are one stream per ingest writer, and
+/// one group commit holds records of every tenant that wrote in that
+/// window, so they are not tenant-scoped and always use the default key.
+pub mod sse {
+    use std::collections::BTreeMap;
+    use std::fmt::{self, Debug, Formatter};
+
+    use aws_sdk_s3::operation::copy_object::builders::CopyObjectFluentBuilder;
+    use aws_sdk_s3::operation::create_multipart_upload::builders::CreateMultipartUploadFluentBuilder;
+    use aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder;
+    use aws_sdk_s3::types::ServerSideEncryption;
+    use kosha_core::NamespaceId;
+
+    pub const SSE_ENV: &str = "KOSHA_S3_SSE";
+    pub const KMS_KEY_ID_ENV: &str = "KOSHA_S3_SSE_KMS_KEY_ID";
+    pub const BUCKET_KEY_ENV: &str = "KOSHA_S3_SSE_BUCKET_KEY";
+    pub const TENANT_KEYS_ENV: &str = "KOSHA_S3_TENANT_KMS_KEYS";
+    pub const TENANT_KEYS_FILE_ENV: &str = "KOSHA_S3_TENANT_KMS_KEYS_FILE";
+
+    /// The encryption requested on writes.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub enum SseMode {
+        /// No SSE header: the bucket's default encryption applies.
+        #[default]
+        None,
+        /// SSE-S3 (`AES256`).
+        Aes256,
+        /// SSE-KMS (`aws:kms`).
+        AwsKms,
+    }
+
+    impl SseMode {
+        fn parse(raw: &str) -> Result<Self, String> {
+            match raw.trim() {
+                "" => Ok(Self::None),
+                v if v.eq_ignore_ascii_case("none") => Ok(Self::None),
+                v if v.eq_ignore_ascii_case("AES256") => Ok(Self::Aes256),
+                v if v.eq_ignore_ascii_case("aws:kms") => Ok(Self::AwsKms),
+                other => Err(format!(
+                    "{SSE_ENV}={other:?} is not one of none, AES256, aws:kms"
+                )),
+            }
+        }
+
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::None => "none",
+                Self::Aes256 => "AES256",
+                Self::AwsKms => "aws:kms",
+            }
+        }
+    }
+
+    /// Resolved, validated encryption settings. `Debug` prints a summary
+    /// (mode, whether a default key is set, how many tenant keys), never
+    /// the key ids.
+    #[derive(Clone, Default, PartialEq, Eq)]
+    pub struct SseConfig {
+        pub mode: SseMode,
+        /// KMS key for objects with no per-tenant key. `None` with
+        /// [`SseMode::AwsKms`] means the AWS-managed `aws/s3` key.
+        pub default_kms_key_id: Option<String>,
+        /// `Some` sends `x-amz-server-side-encryption-bucket-key-enabled`.
+        pub bucket_key_enabled: Option<bool>,
+        /// Per-tenant KMS keys (BYOK), keyed by tenant id.
+        pub tenant_kms_keys: BTreeMap<String, String>,
+    }
+
+    impl Debug for SseConfig {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            f.write_str(&self.describe())
+        }
+    }
+
+    /// The SSE headers for one object write.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ObjectSse {
+        pub algorithm: ServerSideEncryption,
+        pub kms_key_id: Option<String>,
+        pub bucket_key_enabled: Option<bool>,
+    }
+
+    impl SseConfig {
+        /// Read and validate the `KOSHA_S3_SSE*` and tenant-key settings.
+        pub fn from_env() -> Result<Self, String> {
+            Self::from_lookup(|name| std::env::var(name).ok())
+        }
+
+        /// [`SseConfig::from_env`] over any variable source (tests).
+        /// Empty or all-whitespace values count as unset.
+        pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+            let get = |name: &str| {
+                get(name)
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+            };
+            let mode = SseMode::parse(&get(SSE_ENV).unwrap_or_default())?;
+            let default_kms_key_id = get(KMS_KEY_ID_ENV)
+                .map(|key| validate_key_id(KMS_KEY_ID_ENV, &key))
+                .transpose()?;
+            let bucket_key_enabled = get(BUCKET_KEY_ENV)
+                .map(|v| match v.to_ascii_lowercase().as_str() {
+                    "1" | "true" | "yes" => Ok(true),
+                    "0" | "false" | "no" => Ok(false),
+                    _ => Err(format!("{BUCKET_KEY_ENV}={v:?} is not true or false")),
+                })
+                .transpose()?;
+            let inline = get(TENANT_KEYS_ENV);
+            let file = get(TENANT_KEYS_FILE_ENV);
+            let tenant_kms_keys = match (&inline, &file) {
+                (Some(_), Some(_)) => {
+                    return Err(format!(
+                        "set only one of {TENANT_KEYS_ENV} and {TENANT_KEYS_FILE_ENV}"
+                    ))
+                }
+                (Some(raw), None) => parse_tenant_keys(raw)?,
+                (None, Some(path)) => {
+                    let raw = std::fs::read_to_string(path)
+                        .map_err(|e| format!("{TENANT_KEYS_FILE_ENV}: cannot read {path}: {e}"))?;
+                    parse_tenant_keys_json(&raw)
+                        .map_err(|e| format!("{TENANT_KEYS_FILE_ENV} ({path}): {e}"))?
+                }
+                (None, None) => BTreeMap::new(),
+            };
+
+            if mode != SseMode::AwsKms {
+                let kms_only = [
+                    (KMS_KEY_ID_ENV, default_kms_key_id.is_some()),
+                    (BUCKET_KEY_ENV, bucket_key_enabled.is_some()),
+                    (TENANT_KEYS_ENV, inline.is_some()),
+                    (TENANT_KEYS_FILE_ENV, file.is_some()),
+                ];
+                if let Some((name, _)) = kms_only.iter().find(|(_, set)| *set) {
+                    return Err(format!(
+                        "{name} requires {SSE_ENV}=aws:kms ({SSE_ENV} is {})",
+                        mode.as_str()
+                    ));
+                }
+            }
+
+            Ok(Self {
+                mode,
+                default_kms_key_id,
+                bucket_key_enabled,
+                tenant_kms_keys,
+            })
+        }
+
+        /// The SSE headers for an object at `logical_path` (unprefixed,
+        /// e.g. `acme/docs/docs-000001/doc_store.bin`): the tenant's key
+        /// when the path is tenant-scoped and the tenant has one, else
+        /// the default. `None` when SSE is off. For a copy, pass the
+        /// destination path.
+        pub fn for_path(&self, logical_path: &str) -> Option<ObjectSse> {
+            self.for_tenant(tenant_of_path(logical_path))
+        }
+
+        /// The SSE headers for an object of `tenant` (`None`: an object
+        /// with no tenant, such as a WAL group commit).
+        pub fn for_tenant(&self, tenant: Option<&str>) -> Option<ObjectSse> {
+            match self.mode {
+                SseMode::None => None,
+                SseMode::Aes256 => Some(ObjectSse {
+                    algorithm: ServerSideEncryption::Aes256,
+                    kms_key_id: None,
+                    bucket_key_enabled: None,
+                }),
+                SseMode::AwsKms => Some(ObjectSse {
+                    algorithm: ServerSideEncryption::AwsKms,
+                    kms_key_id: tenant
+                        .and_then(|t| self.tenant_kms_keys.get(t))
+                        .or(self.default_kms_key_id.as_ref())
+                        .cloned(),
+                    bucket_key_enabled: self.bucket_key_enabled,
+                }),
+            }
+        }
+
+        /// One-line summary for the startup log. Never includes key ids.
+        pub fn describe(&self) -> String {
+            match self.mode {
+                SseMode::None => "mode=none (bucket default encryption applies)".into(),
+                SseMode::Aes256 => "mode=AES256".into(),
+                SseMode::AwsKms => format!(
+                    "mode=aws:kms default_key={} bucket_key={} tenant_keys={}",
+                    if self.default_kms_key_id.is_some() {
+                        "configured"
+                    } else {
+                        "aws-managed"
+                    },
+                    match self.bucket_key_enabled {
+                        Some(true) => "on",
+                        Some(false) => "off",
+                        None => "bucket-default",
+                    },
+                    self.tenant_kms_keys.len()
+                ),
+            }
+        }
+    }
+
+    /// The tenant an object belongs to, from its logical (unprefixed) path.
+    ///
+    /// Every object Kosha writes under a namespace is
+    /// `{namespace}/{segment}/{file}`, and a tenant-scoped namespace is
+    /// `{tenant}/{name}` (a branch is a sibling `{tenant}/{branch}`, a
+    /// shard `{tenant}/{name}/_shard-NNNN`). So the tenant is the first
+    /// component of a namespace that has more than one. A bare namespace
+    /// (`migrate` without `--namespace`, or a legacy shard
+    /// `{name}/_shard-NNNN`) and internal prefixes starting with `_`
+    /// (`_wal/...`) have no tenant and use the default key.
+    pub fn tenant_of_path(logical_path: &str) -> Option<&str> {
+        let path = logical_path.trim_start_matches('/');
+        let mut parts = path.rsplitn(3, '/');
+        let (_file, _segment, namespace) = (parts.next()?, parts.next()?, parts.next()?);
+        let (tenant, rest) = namespace.split_once('/')?;
+        if tenant.is_empty()
+            || tenant.starts_with('_')
+            || tenant.starts_with('.')
+            || rest.is_empty()
+        {
+            return None;
+        }
+        let legacy_shard = !rest.contains('/')
+            && kosha_core::sharding::shard_index_of(&NamespaceId(namespace.to_string())).is_some();
+        (!legacy_shard).then_some(tenant)
+    }
+
+    fn validate_key_id(what: &str, key: &str) -> Result<String, String> {
+        if key.is_empty() {
+            return Err(format!("{what}: empty KMS key id"));
+        }
+        if key
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == ',' || c == '=')
+        {
+            return Err(format!(
+                "{what}: KMS key id contains whitespace, ',' or '='"
+            ));
+        }
+        Ok(key.to_string())
+    }
+
+    fn insert_tenant_key(
+        keys: &mut BTreeMap<String, String>,
+        tenant: &str,
+        key: &str,
+    ) -> Result<(), String> {
+        let tenant = tenant.trim();
+        if tenant.is_empty()
+            || tenant == "."
+            || tenant == ".."
+            || tenant
+                .chars()
+                .any(|c| c == '/' || c == '\\' || c.is_whitespace() || c.is_control())
+        {
+            return Err(format!("invalid tenant id {tenant:?}"));
+        }
+        let key = validate_key_id(&format!("tenant {tenant:?}"), key.trim())?;
+        if keys.insert(tenant.to_string(), key).is_some() {
+            return Err(format!("tenant {tenant:?} listed twice"));
+        }
+        Ok(())
+    }
+
+    /// `tenant=key-id,tenant2=key-id2`. Blank entries (a trailing comma)
+    /// are ignored.
+    fn parse_tenant_keys(raw: &str) -> Result<BTreeMap<String, String>, String> {
+        let mut keys = BTreeMap::new();
+        for (i, entry) in raw.split(',').enumerate() {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let Some((tenant, key)) = entry.split_once('=') else {
+                return Err(format!(
+                    "{TENANT_KEYS_ENV}: entry {} is not tenant=key-id",
+                    i + 1
+                ));
+            };
+            insert_tenant_key(&mut keys, tenant, key)
+                .map_err(|e| format!("{TENANT_KEYS_ENV}: {e}"))?;
+        }
+        Ok(keys)
+    }
+
+    /// A JSON object of tenant id to KMS key id.
+    fn parse_tenant_keys_json(raw: &str) -> Result<BTreeMap<String, String>, String> {
+        let value: serde_json::Value =
+            serde_json::from_str(raw).map_err(|e| format!("not valid JSON: {e}"))?;
+        let object = value
+            .as_object()
+            .ok_or("expected a JSON object of tenant id to KMS key id")?;
+        let mut keys = BTreeMap::new();
+        for (tenant, key) in object {
+            let key = key
+                .as_str()
+                .ok_or_else(|| format!("tenant {tenant:?}: the KMS key id must be a string"))?;
+            insert_tenant_key(&mut keys, tenant, key)?;
+        }
+        Ok(keys)
+    }
+
+    /// Adds the SSE headers to an S3 write request. Implemented for every
+    /// request that creates an object: `PutObject`, `CreateMultipartUpload`
+    /// (its parts inherit the upload's encryption) and `CopyObject` (a copy
+    /// is encrypted with the headers given here, not the source's).
+    pub trait ApplySse: Sized {
+        /// `None` (SSE off) leaves the request unchanged.
+        fn apply_sse(self, sse: Option<&ObjectSse>) -> Self;
+    }
+
+    macro_rules! impl_apply_sse {
+        ($($builder:ty),* $(,)?) => {$(
+            impl ApplySse for $builder {
+                fn apply_sse(self, sse: Option<&ObjectSse>) -> Self {
+                    let Some(sse) = sse else { return self };
+                    self.server_side_encryption(sse.algorithm.clone())
+                        .set_ssekms_key_id(sse.kms_key_id.clone())
+                        .set_bucket_key_enabled(sse.bucket_key_enabled)
+                }
+            }
+        )*};
+    }
+
+    impl_apply_sse!(
+        PutObjectFluentBuilder,
+        CreateMultipartUploadFluentBuilder,
+        CopyObjectFluentBuilder,
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::collections::HashMap;
+
+        fn parse(vars: &[(&str, &str)]) -> Result<SseConfig, String> {
+            let vars: HashMap<String, String> = vars
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            SseConfig::from_lookup(|name| vars.get(name).cloned())
+        }
+
+        const ACME_KEY: &str = "arn:aws:kms:us-east-1:111122223333:key/acme";
+        const DEFAULT_KEY: &str = "arn:aws:kms:us-east-1:111122223333:key/default";
+
+        #[test]
+        fn unset_means_no_sse() {
+            let cfg = parse(&[]).unwrap();
+            assert_eq!(cfg, SseConfig::default());
+            assert_eq!(cfg.for_path("acme/docs/seg-1/a.bin"), None);
+            assert_eq!(parse(&[(SSE_ENV, "none")]).unwrap(), SseConfig::default());
+            assert_eq!(parse(&[(SSE_ENV, "  ")]).unwrap(), SseConfig::default());
+        }
+
+        #[test]
+        fn modes_parse_case_insensitively() {
+            assert_eq!(parse(&[(SSE_ENV, "aes256")]).unwrap().mode, SseMode::Aes256);
+            assert_eq!(
+                parse(&[(SSE_ENV, "AWS:KMS")]).unwrap().mode,
+                SseMode::AwsKms
+            );
+            let err = parse(&[(SSE_ENV, "kms")]).unwrap_err();
+            assert!(err.contains("KOSHA_S3_SSE"), "{err}");
+        }
+
+        #[test]
+        fn aes256_sends_only_the_algorithm() {
+            let cfg = parse(&[(SSE_ENV, "AES256")]).unwrap();
+            assert_eq!(
+                cfg.for_path("acme/docs/seg-1/a.bin"),
+                Some(ObjectSse {
+                    algorithm: ServerSideEncryption::Aes256,
+                    kms_key_id: None,
+                    bucket_key_enabled: None,
+                })
+            );
+        }
+
+        #[test]
+        fn kms_without_keys_uses_the_aws_managed_key() {
+            let cfg = parse(&[(SSE_ENV, "aws:kms")]).unwrap();
+            let sse = cfg.for_path("acme/docs/seg-1/a.bin").unwrap();
+            assert_eq!(sse.algorithm, ServerSideEncryption::AwsKms);
+            assert_eq!(sse.kms_key_id, None);
+            assert_eq!(sse.bucket_key_enabled, None);
+        }
+
+        #[test]
+        fn tenant_keys_resolve_per_tenant_with_default_fallback() {
+            let cfg = parse(&[
+                (SSE_ENV, "aws:kms"),
+                (KMS_KEY_ID_ENV, DEFAULT_KEY),
+                (BUCKET_KEY_ENV, "true"),
+                (
+                    TENANT_KEYS_ENV,
+                    &format!(" acme={ACME_KEY} , beta=alias/beta,"),
+                ),
+            ])
+            .unwrap();
+            assert_eq!(cfg.tenant_kms_keys.len(), 2);
+            let key = |path: &str| cfg.for_path(path).unwrap().kms_key_id;
+            assert_eq!(
+                key("acme/docs/docs-000001/doc_store.bin").as_deref(),
+                Some(ACME_KEY)
+            );
+            assert_eq!(
+                key("acme/docs/docs-000001/_COMMIT").as_deref(),
+                Some(ACME_KEY)
+            );
+            assert_eq!(
+                key("acme/docs/_shard-0003/seg-1/a.bin").as_deref(),
+                Some(ACME_KEY)
+            );
+            assert_eq!(key("beta/x/seg-1/a.bin").as_deref(), Some("alias/beta"));
+            // A tenant with no key of its own, a bare namespace and the WAL.
+            assert_eq!(key("other/docs/seg-1/a.bin").as_deref(), Some(DEFAULT_KEY));
+            assert_eq!(key("acme/seg-1/a.bin").as_deref(), Some(DEFAULT_KEY));
+            assert_eq!(
+                key("_wal/ingest-0/00000000000000000001.bin").as_deref(),
+                Some(DEFAULT_KEY)
+            );
+            assert_eq!(
+                cfg.for_tenant(None).unwrap().kms_key_id.as_deref(),
+                Some(DEFAULT_KEY)
+            );
+            assert_eq!(
+                cfg.for_path("acme/docs/seg/a").unwrap().bucket_key_enabled,
+                Some(true)
+            );
+        }
+
+        #[test]
+        fn tenant_of_path_reads_the_namespace() {
+            assert_eq!(tenant_of_path("acme/docs/docs-000001/a.bin"), Some("acme"));
+            assert_eq!(tenant_of_path("/acme/docs/docs-000001/a.bin"), Some("acme"));
+            assert_eq!(
+                tenant_of_path("acme/docs/_shard-0001/s/a.bin"),
+                Some("acme")
+            );
+            assert_eq!(tenant_of_path("docs/docs-000001/a.bin"), None);
+            assert_eq!(tenant_of_path("docs/_shard-0001/seg/a.bin"), None);
+            assert_eq!(tenant_of_path("_wal/ingest-0/meta/origin"), None);
+            assert_eq!(tenant_of_path("a.bin"), None);
+            assert_eq!(tenant_of_path("seg/a.bin"), None);
+        }
+
+        #[test]
+        fn tenant_keys_load_from_a_json_file() {
+            let dir = std::env::temp_dir().join(format!("kosha-sse-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let good = dir.join("good.json");
+            std::fs::write(&good, format!(r#"{{"acme": "{ACME_KEY}"}}"#)).unwrap();
+            let cfg = parse(&[
+                (SSE_ENV, "aws:kms"),
+                (TENANT_KEYS_FILE_ENV, good.to_str().unwrap()),
+            ])
+            .unwrap();
+            assert_eq!(
+                cfg.for_path("acme/d/s/f").unwrap().kms_key_id.as_deref(),
+                Some(ACME_KEY)
+            );
+            // The AWS-managed key for everyone else.
+            assert_eq!(cfg.for_path("beta/d/s/f").unwrap().kms_key_id, None);
+
+            for (name, body) in [
+                ("array.json", "[]"),
+                ("number.json", r#"{"acme": 3}"#),
+                ("broken.json", "{"),
+                ("slash.json", r#"{"a/b": "k"}"#),
+            ] {
+                let path = dir.join(name);
+                std::fs::write(&path, body).unwrap();
+                let err = parse(&[
+                    (SSE_ENV, "aws:kms"),
+                    (TENANT_KEYS_FILE_ENV, path.to_str().unwrap()),
+                ])
+                .unwrap_err();
+                assert!(err.contains(TENANT_KEYS_FILE_ENV), "{name}: {err}");
+            }
+            let missing = dir.join("missing.json");
+            assert!(parse(&[
+                (SSE_ENV, "aws:kms"),
+                (TENANT_KEYS_FILE_ENV, missing.to_str().unwrap()),
+            ])
+            .is_err());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn malformed_settings_fail_closed() {
+            let kms = (SSE_ENV, "aws:kms");
+            for (vars, needle) in [
+                (vec![kms, (TENANT_KEYS_ENV, "acme")], "not tenant=key-id"),
+                (vec![kms, (TENANT_KEYS_ENV, "acme=")], "empty KMS key id"),
+                (vec![kms, (TENANT_KEYS_ENV, "=k")], "invalid tenant"),
+                (vec![kms, (TENANT_KEYS_ENV, "a/b=k")], "invalid tenant"),
+                (
+                    vec![kms, (TENANT_KEYS_ENV, "acme=k1,acme=k2")],
+                    "listed twice",
+                ),
+                (vec![kms, (TENANT_KEYS_ENV, "acme=k 1")], "whitespace"),
+                (vec![kms, (KMS_KEY_ID_ENV, "a b")], "whitespace"),
+                (vec![kms, (BUCKET_KEY_ENV, "maybe")], "not true or false"),
+                (
+                    vec![kms, (TENANT_KEYS_ENV, "a=k"), (TENANT_KEYS_FILE_ENV, "/x")],
+                    "only one of",
+                ),
+                // KMS-only settings without aws:kms.
+                (vec![(KMS_KEY_ID_ENV, "k")], "requires KOSHA_S3_SSE=aws:kms"),
+                (
+                    vec![(SSE_ENV, "AES256"), (TENANT_KEYS_ENV, "a=k")],
+                    "requires KOSHA_S3_SSE=aws:kms",
+                ),
+                (
+                    vec![(BUCKET_KEY_ENV, "true")],
+                    "requires KOSHA_S3_SSE=aws:kms",
+                ),
+            ] {
+                let err = parse(&vars).unwrap_err();
+                assert!(err.contains(needle), "{vars:?}: {err}");
+            }
+        }
+
+        #[test]
+        fn debug_and_describe_never_print_key_ids() {
+            let cfg = parse(&[
+                (SSE_ENV, "aws:kms"),
+                (KMS_KEY_ID_ENV, DEFAULT_KEY),
+                (TENANT_KEYS_ENV, &format!("acme={ACME_KEY}")),
+            ])
+            .unwrap();
+            let text = format!("{cfg:?} {}", cfg.describe());
+            assert!(!text.contains("arn:"), "{text}");
+            assert!(text.contains("tenant_keys=1"), "{text}");
+        }
     }
 }
 
@@ -122,6 +713,7 @@ pub struct S3Storage {
     prefix: String,
     rt: tokio::runtime::Runtime,
     client: aws_sdk_s3::Client,
+    sse: SseConfig,
 }
 
 impl Debug for S3Storage {
@@ -130,6 +722,7 @@ impl Debug for S3Storage {
             .field("bucket", &self.bucket)
             .field("prefix", &self.prefix)
             .field("local_root", &self.local.root)
+            .field("sse", &self.sse)
             .finish()
     }
 }
@@ -160,13 +753,28 @@ impl S3Storage {
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| KoshaError::NotFound(format!("failed to create tokio runtime: {e}")))?;
 
+        println!("S3 server-side encryption: {}", config.sse.describe());
+
         Ok(Self {
             local,
             bucket: config.bucket,
             prefix: config.prefix,
             rt,
             client,
+            sse: config.sse,
         })
+    }
+
+    /// The encryption settings every write uses (#343).
+    pub fn sse(&self) -> &SseConfig {
+        &self.sse
+    }
+
+    /// The SSE headers for a write of `logical_path` (unprefixed; the
+    /// destination path for a copy). Apply them with
+    /// [`ApplySse::apply_sse`].
+    pub fn sse_for_path(&self, logical_path: &str) -> Option<ObjectSse> {
+        self.sse.for_path(logical_path)
     }
 
     pub fn bucket(&self) -> &str {
@@ -236,7 +844,7 @@ impl S3Storage {
         // Each task reads its own file, so at most `upload_concurrency`
         // files are in memory at once, not the whole segment.
         let limit = Arc::new(tokio::sync::Semaphore::new(upload_concurrency()));
-        let uploads: Vec<(String, PathBuf, String)> = names
+        let uploads: Vec<(String, PathBuf, String, Option<ObjectSse>)> = names
             .iter()
             .map(|name| {
                 let logical_path = logical_dir.join(name).to_string_lossy().into_owned();
@@ -244,6 +852,7 @@ impl S3Storage {
                     name.clone(),
                     local_dir.join(name),
                     self.s3_key(&logical_path),
+                    self.sse_for_path(&logical_path),
                 )
             })
             .collect();
@@ -251,7 +860,7 @@ impl S3Storage {
         let bucket = self.bucket.clone();
         let files = self.rt.block_on(async move {
             let mut tasks = tokio::task::JoinSet::new();
-            for (name, path, key) in uploads {
+            for (name, path, key, sse) in uploads {
                 let client = client.clone();
                 let bucket = bucket.clone();
                 let limit = Arc::clone(&limit);
@@ -259,7 +868,7 @@ impl S3Storage {
                     let _permit = limit.acquire_owned().await;
                     let data = tokio::fs::read(&path).await.map_err(KoshaError::Io)?;
                     let entry = segment_commit::SegmentCommit::entry(&name, &data);
-                    put_bytes(client, bucket, key, data).await?;
+                    put_bytes(client, bucket, key, data, sse).await?;
                     Ok::<_, KoshaError>(entry)
                 });
             }
@@ -285,28 +894,31 @@ impl S3Storage {
                 None => Ok(files),
             }
         })?;
-        let commit = segment_commit::SegmentCommit::new(files).to_bytes();
         let commit_path = logical_dir
             .join(segment_commit::COMMIT_FILE)
             .to_string_lossy()
             .into_owned();
-        self.local.write(&commit_path, &commit)?;
-        self.upload_bytes(commit, &self.s3_key(&commit_path))
+        segment_commit::commit_uploaded_files(files, |commit| {
+            self.local.write(&commit_path, &commit)?;
+            self.upload_bytes(commit, &commit_path)
+        })
     }
 
-    /// Upload a local file to S3. See `upload_bytes`.
-    fn upload_to_s3(&self, local_path: &Path, s3_key: &str) -> Result<(), KoshaError> {
+    /// Upload a local file to S3 at `logical_path`. See `upload_bytes`.
+    fn upload_to_s3(&self, local_path: &Path, logical_path: &str) -> Result<(), KoshaError> {
         let data = std::fs::read(local_path).map_err(KoshaError::Io)?;
-        self.upload_bytes(data, s3_key)
+        self.upload_bytes(data, logical_path)
     }
 
-    /// Upload bytes to S3. Uses multi-part upload for payloads > 5MB.
-    fn upload_bytes(&self, data: Vec<u8>, s3_key: &str) -> Result<(), KoshaError> {
+    /// Upload bytes to S3 at `logical_path` (unprefixed), with its SSE
+    /// headers. Uses multi-part upload for payloads > 5MB.
+    fn upload_bytes(&self, data: Vec<u8>, logical_path: &str) -> Result<(), KoshaError> {
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        let key = s3_key.to_string();
+        let key = self.s3_key(logical_path);
+        let sse = self.sse_for_path(logical_path);
         self.rt
-            .block_on(async move { put_bytes(client, bucket, key, data).await })
+            .block_on(async move { put_bytes(client, bucket, key, data, sse).await })
     }
 
     /// Download multiple logical paths concurrently, bounded by
@@ -1074,8 +1686,16 @@ async fn fetch_one(
         TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let t_transfer = std::time::Instant::now();
-    let streamed =
-        get_object_streamed_with_retry(client, bucket, &s3_key, &tmp_path, budget, &request).await;
+    let streamed = get_object_streamed_with_retry(
+        client,
+        bucket,
+        &s3_key,
+        kosha_core::tenancy::tenant_of_file_key(path),
+        &tmp_path,
+        budget,
+        &request,
+    )
+    .await;
     let transfer_ms = t_transfer.elapsed().as_secs_f64() * 1e3;
     let streamed = match streamed {
         Ok(s) => s,
@@ -1122,6 +1742,7 @@ async fn get_object_streamed_with_retry(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     key: &str,
+    tenant: &str,
     tmp_path: &Path,
     budget: Option<Arc<HydrationBudget>>,
     request: &Arc<RequestHydration>,
@@ -1151,7 +1772,7 @@ async fn get_object_streamed_with_retry(
             let _permit = match budget.as_ref() {
                 Some(budget) => {
                     let t_wait = std::time::Instant::now();
-                    let permit = budget.acquire(projected);
+                    let permit = budget.acquire(tenant, projected);
                     request.record_wait(t_wait.elapsed());
                     match permit {
                         Some(permit) => Some(permit),
@@ -1211,6 +1832,14 @@ async fn get_object_streamed_with_retry(
     Err(last_err.expect("at least one attempt runs, so an exhausted loop always has an error"))
 }
 
+/// Write buffer for [`stream_body_to_file`]: large writes instead of one
+/// blocking-pool round trip per network chunk, while keeping per-fetch
+/// memory bounded at hydration fan-out. Each fetch holds this buffer plus,
+/// at most, `tokio::fs::File`'s copy of the write in flight (also at most
+/// this size, since `BufWriter` hands it at most a buffer at a time except
+/// for a single oversized chunk), so 64 fetches in flight cost ~128 MiB.
+const STREAM_WRITE_BUFFER: usize = 1 << 20;
+
 /// Write a GET response body to `tmp_path` chunk by chunk, returning what it
 /// cost.
 ///
@@ -1221,7 +1850,15 @@ async fn get_object_streamed_with_retry(
 /// `KOSHA_MAX_CONCURRENT_HYDRATIONS` = 4 batches) a namespace of ~28 MB
 /// `inverted.idx` files put gigabytes of transient buffers behind a single
 /// cold search — the OOM this function exists to remove. Peak is now one
-/// chunk per in-flight fetch, whatever the object's size.
+/// chunk plus about two [`STREAM_WRITE_BUFFER`]s per in-flight fetch (see
+/// its doc), whatever the object's size.
+///
+/// Writes go through a [`STREAM_WRITE_BUFFER`]-sized buffer. Unbuffered,
+/// every network chunk (tens of KB) was its own `tokio::fs` write, a
+/// blocking-pool round trip awaited before the next chunk was read: the
+/// bench VM wrote 1 GB vector-namespace files at 30-45 MB/s while the GET
+/// itself took ~1 s (`hydrate_files timing:` write_ms 23-35 s), which made
+/// a 249 GB warmup take ~2 h.
 async fn stream_body_to_file(
     mut body: aws_sdk_s3::primitives::ByteStream,
     tmp_path: &Path,
@@ -1229,9 +1866,10 @@ async fn stream_body_to_file(
     use tokio::io::AsyncWriteExt;
 
     let t_create = std::time::Instant::now();
-    let mut file = tokio::fs::File::create(tmp_path)
+    let file = tokio::fs::File::create(tmp_path)
         .await
         .map_err(KoshaError::Io)?;
+    let mut file = tokio::io::BufWriter::with_capacity(STREAM_WRITE_BUFFER, file);
     let mut write_ms = t_create.elapsed().as_secs_f64() * 1e3;
     let mut bytes = 0u64;
 
@@ -1250,8 +1888,10 @@ async fn stream_body_to_file(
         }
     }
 
-    // `tokio::fs::File` buffers, so the flush is what makes the bytes real
-    // before the caller renames the temp file into place.
+    // Both the BufWriter and `tokio::fs::File` buffer, so the flush is what
+    // makes the bytes real before the caller renames the temp file into
+    // place: `BufWriter::flush` writes out its buffer and then flushes the
+    // inner `File`, which waits for its in-flight blocking write.
     let t_flush = std::time::Instant::now();
     file.flush().await.map_err(KoshaError::Io)?;
     write_ms += t_flush.elapsed().as_secs_f64() * 1e3;
@@ -1302,7 +1942,7 @@ async fn fetch_range_one(
     let _permit = match budget {
         Some(budget) => {
             let t_wait = std::time::Instant::now();
-            let permit = budget.acquire(length);
+            let permit = budget.acquire(kosha_core::tenancy::tenant_of_file_key(path), length);
             request.record_wait(t_wait.elapsed());
             match permit {
                 Some(permit) => Some(permit),
@@ -1348,12 +1988,15 @@ fn upload_concurrency() -> usize {
         .unwrap_or(16)
 }
 
-/// Upload bytes to one S3 key. Multi-part for payloads > 5MB.
+/// Upload bytes to one S3 key with the given SSE headers (#343): on the
+/// `PutObject`, or on the `CreateMultipartUpload` for payloads > 5MB (the
+/// parts inherit it).
 async fn put_bytes(
     client: aws_sdk_s3::Client,
     bucket: String,
     key: String,
     data: Vec<u8>,
+    sse: Option<ObjectSse>,
 ) -> Result<(), KoshaError> {
     let size = data.len();
 
@@ -1362,6 +2005,7 @@ async fn put_bytes(
             .create_multipart_upload()
             .bucket(&bucket)
             .key(&key)
+            .apply_sse(sse.as_ref())
             .send()
             .await
             .map_err(|e| KoshaError::NotFound(format!("S3 create_multipart_upload: {e}")))?;
@@ -1419,6 +2063,7 @@ async fn put_bytes(
             .put_object()
             .bucket(&bucket)
             .key(&key)
+            .apply_sse(sse.as_ref())
             .body(aws_sdk_s3::primitives::ByteStream::from(data))
             .send()
             .await
@@ -1440,8 +2085,7 @@ impl StorageBackend for S3Storage {
     fn write(&self, path: &str, data: &[u8]) -> Result<(), KoshaError> {
         self.local.write(path, data)?;
         let local_path = Path::new(&self.local.root).join(path);
-        let s3_key = self.s3_key(path);
-        self.upload_to_s3(&local_path, &s3_key)
+        self.upload_to_s3(&local_path, path)
     }
 
     fn exists(&self, path: &str) -> bool {
@@ -1628,6 +2272,77 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// An S3 body arrives as many small, uneven network chunks. Through the
+    /// [`STREAM_WRITE_BUFFER`] they must still land byte-exact and in order:
+    /// chunks that fill the buffer part-way, chunks that straddle a flush,
+    /// one chunk larger than the whole buffer (which `BufWriter` writes
+    /// straight through), and a tail smaller than the buffer that only the
+    /// final flush writes out.
+    #[test]
+    fn buffered_stream_of_many_uneven_chunks_lands_byte_exact() {
+        use hyper::body::{Bytes, Frame};
+        use std::collections::VecDeque;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        /// An http-body 1.x body that yields pre-cut frames, one per poll.
+        struct Chunks(VecDeque<Bytes>);
+        impl hyper::body::Body for Chunks {
+            type Data = Bytes;
+            type Error = std::convert::Infallible;
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+                Poll::Ready(self.get_mut().0.pop_front().map(|b| Ok(Frame::data(b))))
+            }
+        }
+
+        let total = 3 * STREAM_WRITE_BUFFER + 12_345;
+        let payload: Vec<u8> = (0..total as u64)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        // Uneven sizes from 1 byte to ~64 KB, with one chunk of 1.5x the
+        // buffer partway through.
+        let sizes = [1usize, 7, 4_093, 65_521, 17, 31_337, 8_191, 1, 60_000];
+        let mut chunks = VecDeque::new();
+        let mut at = 0;
+        let mut i = 0;
+        let big_at = STREAM_WRITE_BUFFER + 5_000;
+        let mut big_done = false;
+        while at < total {
+            let len = if !big_done && at >= big_at {
+                big_done = true;
+                STREAM_WRITE_BUFFER * 3 / 2
+            } else {
+                sizes[i % sizes.len()]
+            };
+            let end = (at + len).min(total);
+            chunks.push_back(Bytes::copy_from_slice(&payload[at..end]));
+            at = end;
+            i += 1;
+        }
+        assert!(big_done, "the oversized chunk is part of the stream");
+        assert!(chunks.len() > 50, "{} chunks", chunks.len());
+
+        let dir = std::env::temp_dir().join(format!("kosha-bufwrite-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp_path = dir.join("part.tmp");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let streamed = rt
+            .block_on(stream_body_to_file(
+                aws_sdk_s3::primitives::ByteStream::from_body_1_x(Chunks(chunks)),
+                &tmp_path,
+            ))
+            .expect("stream succeeds");
+
+        assert_eq!(streamed.bytes, total as u64);
+        let written = std::fs::read(&tmp_path).unwrap();
+        assert_eq!(written.len(), total, "the buffered tail must be flushed");
+        assert!(written == payload, "bytes must land exactly, in order");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A second attempt must not append to the first attempt's partial file:
     /// `File::create` truncates, so a retried fetch writes the object once,
     /// not twice. A doubled file would rename into place looking complete.
@@ -1693,8 +2408,389 @@ mod tests {
             access_key: Some("k".into()),
             secret_key: Some("s".into()),
             region: Some("us-east-1".into()),
+            sse: SseConfig::default(),
         };
         assert_eq!(cfg.bucket, "b");
         assert!(cfg.force_path_style);
+    }
+}
+
+/// Request capture for SSE tests (#343): an S3 client whose requests stop
+/// just before they would go on the wire (after serialization and signing),
+/// so a test sees the exact headers without any network.
+#[cfg(test)]
+pub(crate) mod capture {
+    use std::sync::{Arc, Mutex};
+
+    use aws_sdk_s3::config::interceptors::BeforeTransmitInterceptorContextRef;
+    use aws_sdk_s3::config::retry::RetryConfig;
+    use aws_sdk_s3::config::{
+        BehaviorVersion, ConfigBag, Credentials, Intercept, Region, RuntimeComponents,
+    };
+    use aws_sdk_s3::error::BoxError;
+
+    /// One request as it would have been sent.
+    #[derive(Debug, Clone)]
+    pub struct Captured {
+        pub method: String,
+        pub uri: String,
+        pub headers: Vec<(String, String)>,
+    }
+
+    impl Captured {
+        pub fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        }
+
+        /// Every `x-amz-server-side-encryption*` header.
+        pub fn sse_headers(&self) -> Vec<(String, String)> {
+            self.headers
+                .iter()
+                .filter(|(k, _)| {
+                    k.to_ascii_lowercase()
+                        .starts_with("x-amz-server-side-encryption")
+                })
+                .cloned()
+                .collect()
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    pub struct CaptureRequests(Arc<Mutex<Vec<Captured>>>);
+
+    impl CaptureRequests {
+        pub fn take(&self) -> Vec<Captured> {
+            std::mem::take(&mut self.0.lock().unwrap())
+        }
+    }
+
+    impl Intercept for CaptureRequests {
+        fn name(&self) -> &'static str {
+            "CaptureRequests"
+        }
+
+        fn read_before_transmit(
+            &self,
+            context: &BeforeTransmitInterceptorContextRef<'_>,
+            _runtime_components: &RuntimeComponents,
+            _cfg: &mut ConfigBag,
+        ) -> Result<(), BoxError> {
+            let request = context.request();
+            self.0.lock().unwrap().push(Captured {
+                method: request.method().to_string(),
+                uri: request.uri().to_string(),
+                headers: request
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            });
+            Err("captured by the test; not sent".into())
+        }
+    }
+
+    /// A client whose every request is captured and fails before sending.
+    pub fn client() -> (aws_sdk_s3::Client, CaptureRequests) {
+        let capture = CaptureRequests::default();
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+            .endpoint_url("http://127.0.0.1:9")
+            .force_path_style(true)
+            .retry_config(RetryConfig::disabled())
+            .interceptor(capture.clone())
+            .build();
+        (aws_sdk_s3::Client::from_conf(config), capture)
+    }
+
+    /// An [`S3Storage`](super::S3Storage) over [`client`].
+    pub fn storage(
+        local_root: std::path::PathBuf,
+        prefix: &str,
+        sse: super::SseConfig,
+    ) -> (super::S3Storage, CaptureRequests) {
+        let (client, capture) = client();
+        let storage = super::S3Storage {
+            local: kosha_core::LocalStorage::new(local_root),
+            bucket: "bucket".into(),
+            prefix: prefix.into(),
+            rt: tokio::runtime::Runtime::new().unwrap(),
+            client,
+            sse,
+        };
+        (storage, capture)
+    }
+}
+
+#[cfg(test)]
+mod sse_request_tests {
+    use super::capture::{self, Captured};
+    use super::*;
+
+    const ACME_KEY: &str = "arn:aws:kms:us-east-1:111122223333:key/acme";
+    const DEFAULT_KEY: &str = "arn:aws:kms:us-east-1:111122223333:key/default";
+
+    fn kms_config() -> SseConfig {
+        SseConfig::from_lookup(|name| match name {
+            "KOSHA_S3_SSE" => Some("aws:kms".into()),
+            "KOSHA_S3_SSE_KMS_KEY_ID" => Some(DEFAULT_KEY.into()),
+            "KOSHA_S3_SSE_BUCKET_KEY" => Some("true".into()),
+            "KOSHA_S3_TENANT_KMS_KEYS" => Some(format!("acme={ACME_KEY}")),
+            _ => None,
+        })
+        .unwrap()
+    }
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kosha-sse-req-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn assert_kms(request: &Captured, key: &str) {
+        assert_eq!(
+            request.header("x-amz-server-side-encryption"),
+            Some("aws:kms"),
+            "{request:?}"
+        );
+        assert_eq!(
+            request.header("x-amz-server-side-encryption-aws-kms-key-id"),
+            Some(key),
+            "{request:?}"
+        );
+        assert_eq!(
+            request.header("x-amz-server-side-encryption-bucket-key-enabled"),
+            Some("true"),
+            "{request:?}"
+        );
+    }
+
+    fn put_once(data: Vec<u8>, sse: Option<ObjectSse>) -> Captured {
+        let (client, capture) = capture::client();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(put_bytes(
+            client,
+            "bucket".into(),
+            "p/acme/docs/seg-1/a.bin".into(),
+            data,
+            sse,
+        ));
+        assert!(result.is_err(), "the capture client never sends");
+        let mut requests = capture.take();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        requests.remove(0)
+    }
+
+    #[test]
+    fn put_object_carries_the_tenant_kms_key() {
+        let sse = kms_config().for_path("acme/docs/seg-1/a.bin");
+        let request = put_once(b"small".to_vec(), sse);
+        assert_eq!(request.method, "PUT");
+        assert!(!request.uri.contains("uploads"), "{}", request.uri);
+        assert_kms(&request, ACME_KEY);
+    }
+
+    #[test]
+    fn create_multipart_upload_carries_the_tenant_kms_key() {
+        let sse = kms_config().for_path("acme/docs/seg-1/a.bin");
+        let request = put_once(vec![0u8; 5 * 1024 * 1024 + 1], sse);
+        assert_eq!(request.method, "POST");
+        assert!(request.uri.contains("uploads"), "{}", request.uri);
+        assert_kms(&request, ACME_KEY);
+    }
+
+    #[test]
+    fn aes256_sends_only_the_algorithm_header() {
+        let cfg =
+            SseConfig::from_lookup(|name| (name == "KOSHA_S3_SSE").then(|| "AES256".to_string()))
+                .unwrap();
+        let request = put_once(b"x".to_vec(), cfg.for_path("acme/docs/seg-1/a.bin"));
+        assert_eq!(
+            request.sse_headers(),
+            vec![(
+                "x-amz-server-side-encryption".to_string(),
+                "AES256".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn sse_unset_sends_no_encryption_headers() {
+        for data in [b"small".to_vec(), vec![0u8; 5 * 1024 * 1024 + 1]] {
+            let request = put_once(data, SseConfig::default().for_path("acme/docs/seg-1/a.bin"));
+            assert!(request.sse_headers().is_empty(), "{request:?}");
+        }
+    }
+
+    #[test]
+    fn storage_writes_resolve_the_key_from_the_logical_path() {
+        let root = temp_root("write");
+        let (storage, capture) = capture::storage(root.clone(), "kosha/", kms_config());
+        for dir in ["acme/docs/docs-000001", "legacy/legacy-000001"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+
+        // A tenant-scoped `_COMMIT`, then an object of a bare namespace.
+        assert!(storage
+            .write("acme/docs/docs-000001/_COMMIT", b"commit")
+            .is_err());
+        assert!(storage.write("legacy/legacy-000001/a.bin", b"x").is_err());
+        let requests = capture.take();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(
+            requests[0]
+                .uri
+                .contains("/bucket/kosha/acme/docs/docs-000001/_COMMIT?"),
+            "{}",
+            requests[0].uri
+        );
+        assert_kms(&requests[0], ACME_KEY);
+        assert_kms(&requests[1], DEFAULT_KEY);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn segment_upload_encrypts_every_file_with_the_tenant_key() {
+        let root = temp_root("segment");
+        let seg = Path::new("acme/docs/docs-000001");
+        std::fs::create_dir_all(root.join(seg)).unwrap();
+        for name in ["doc_store.bin", "inverted.idx"] {
+            std::fs::write(root.join(seg).join(name), b"data").unwrap();
+        }
+        let (storage, capture) = capture::storage(root.clone(), "", kms_config());
+        assert!(storage.sync_segment_dir(seg).is_err());
+        let requests = capture.take();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        for request in &requests {
+            assert_kms(request, ACME_KEY);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn copy_object_adopts_the_destination_tenant_key() {
+        // The helper a server-side copy path (#344) applies.
+        let (client, capture) = capture::client();
+        let sse = kms_config().for_path("acme/docs/docs-000002/a.bin");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(
+            client
+                .copy_object()
+                .bucket("bucket")
+                .key("acme/docs/docs-000002/a.bin")
+                .copy_source("bucket/legacy/legacy-000001/a.bin")
+                .apply_sse(sse.as_ref())
+                .send(),
+        );
+        assert!(result.is_err());
+        let requests = capture.take();
+        assert_eq!(requests.len(), 1);
+        assert_kms(&requests[0], ACME_KEY);
+    }
+
+    /// Key rotation (#343): pointing a tenant at a new KMS key in
+    /// `KOSHA_S3_TENANT_KMS_KEYS(_FILE)` takes effect on the next start for
+    /// every new write (PUT, multipart, copy). Objects written under the old
+    /// key stay readable: a GET carries no SSE headers, because S3 decrypts
+    /// with the key recorded on each object (the pod's role must keep
+    /// `kms:Decrypt` on the old key, and the key must stay enabled).
+    #[test]
+    fn rotating_a_tenant_key_applies_to_new_writes_and_old_objects_stay_readable() {
+        const OLD_KEY: &str = "arn:aws:kms:us-east-1:111122223333:key/acme-old";
+        const NEW_KEY: &str = "arn:aws:kms:us-east-1:111122223333:key/acme-new";
+        let root = temp_root("rotate");
+        let keys_file = root.join("tenant-kms-keys.json");
+        let seg = "acme/docs/docs-000001";
+        std::fs::create_dir_all(root.join(seg)).unwrap();
+
+        // What a pod builds at startup from the mounted keys file.
+        let start_pod = |inline: Option<&str>| {
+            let file = keys_file.to_str().unwrap().to_string();
+            let inline = inline.map(str::to_string);
+            let sse = SseConfig::from_lookup(|name| match name {
+                "KOSHA_S3_SSE" => Some("aws:kms".into()),
+                "KOSHA_S3_SSE_KMS_KEY_ID" => Some(DEFAULT_KEY.into()),
+                "KOSHA_S3_SSE_BUCKET_KEY" => Some("true".into()),
+                "KOSHA_S3_TENANT_KMS_KEYS" => inline.clone(),
+                "KOSHA_S3_TENANT_KMS_KEYS_FILE" if inline.is_none() => Some(file.clone()),
+                _ => None,
+            })
+            .unwrap();
+            capture::storage(root.clone(), "kosha/", sse)
+        };
+        let write_all = |storage: &S3Storage, sse: Option<ObjectSse>| {
+            assert!(storage.write(&format!("{seg}/_COMMIT"), b"commit").is_err());
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let multipart = rt.block_on(put_bytes(
+                storage.client().clone(),
+                "bucket".into(),
+                storage.s3_key(&format!("{seg}/big.bin")),
+                vec![0u8; 5 * 1024 * 1024 + 1],
+                storage.sse_for_path(&format!("{seg}/big.bin")),
+            ));
+            assert!(multipart.is_err());
+            let copy = rt.block_on(
+                storage
+                    .client()
+                    .copy_object()
+                    .bucket("bucket")
+                    .key(storage.s3_key("acme/docs/docs-000002/a.bin"))
+                    .copy_source(format!(
+                        "bucket/{}",
+                        storage.s3_key(&format!("{seg}/a.bin"))
+                    ))
+                    .apply_sse(sse.as_ref())
+                    .send(),
+            );
+            assert!(copy.is_err());
+        };
+
+        // Before: acme's objects are encrypted with the old key.
+        std::fs::write(&keys_file, format!(r#"{{"acme": "{OLD_KEY}"}}"#)).unwrap();
+        let (storage, capture) = start_pod(None);
+        write_all(
+            &storage,
+            storage.sse_for_path("acme/docs/docs-000002/a.bin"),
+        );
+        let requests = capture.take();
+        assert_eq!(requests.len(), 3, "{requests:?}");
+        for request in &requests {
+            assert_kms(request, OLD_KEY);
+        }
+
+        // Rotate: the operator edits the mounted file and restarts the pod.
+        std::fs::write(&keys_file, format!(r#"{{"acme": "{NEW_KEY}"}}"#)).unwrap();
+        let (storage, capture) = start_pod(None);
+        write_all(
+            &storage,
+            storage.sse_for_path("acme/docs/docs-000002/a.bin"),
+        );
+        let requests = capture.take();
+        assert_eq!(requests.len(), 3, "{requests:?}");
+        assert_eq!(requests[0].method, "PUT");
+        assert!(requests[1].uri.contains("uploads"), "{}", requests[1].uri);
+        assert!(requests[2].header("x-amz-copy-source").is_some());
+        for request in &requests {
+            assert_kms(request, NEW_KEY);
+        }
+
+        // Old objects: a read names no key at all, so nothing about the
+        // rotation can make an object written under OLD_KEY unreadable.
+        assert!(storage.read_remote(&format!("{seg}/a.bin")).is_err());
+        let reads = capture.take();
+        assert_eq!(reads.len(), 1, "{reads:?}");
+        assert_eq!(reads[0].method, "GET");
+        assert!(reads[0].sse_headers().is_empty(), "{reads:?}");
+
+        // The inline variable rotates the same way.
+        let (storage, capture) = start_pod(Some(&format!("acme={NEW_KEY}")));
+        assert!(storage.write(&format!("{seg}/_COMMIT"), b"c").is_err());
+        assert_kms(&capture.take()[0], NEW_KEY);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -257,3 +257,180 @@ fn postgres_fenced_cas_race_and_takeover() {
         .unwrap();
     leases.release(&ns, loser_holder, taken).unwrap();
 }
+
+/// #344: `migrate-namespace`'s control-plane step. The rename moves the
+/// namespace and manifest rows in one transaction, carries the lease token,
+/// fences the old id and retires it; a collision or a moved version
+/// changes nothing.
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn postgres_rename_namespace_rekeys_rows_in_one_transaction() {
+    use kosha_control::NamespaceRename;
+    use std::time::Duration;
+
+    let url = std::env::var("KOSHA_TEST_DATABASE_URL").expect("set a dedicated test database URL");
+    let mut store = PgStore::new(&url).unwrap();
+    let observer = PgStore::new(&url).unwrap();
+    let id = uuid::Uuid::new_v4();
+    let from = NamespaceId(format!("bare-{id}"));
+    let to = NamespaceId(format!("tenant-{id}/corpus"));
+    let ttl = Duration::from_secs(60);
+
+    let mut manifest = candidate("bare-000001", 1);
+    manifest.tombstones.clear();
+    manifest.deletion_vectors.insert(
+        SegmentId("bare-000001".into()),
+        kosha_core::deletes::DeletionVector {
+            generation: "a".repeat(64),
+            count: 1,
+            namespace: Some(from.clone()),
+        },
+    );
+    store.compare_and_swap_manifest(&from, 0, manifest).unwrap();
+    let token = store
+        .acquire_writer_lease(&from, "migrator", ttl)
+        .unwrap()
+        .unwrap();
+
+    // A moved version is refused and changes nothing.
+    assert!(matches!(
+        store.rename_namespace(&from, &to, 7),
+        Err(KoshaError::ManifestConflict {
+            actual: Some(1),
+            ..
+        })
+    ));
+    assert!(observer.has_namespace(&from));
+    assert!(!observer.has_namespace(&to));
+
+    // A collision is refused and changes nothing.
+    let taken = NamespaceId(format!("tenant-{id}/taken"));
+    store.create_namespace(taken.clone()).unwrap();
+    assert!(matches!(
+        store.rename_namespace(&from, &taken, 1),
+        Err(KoshaError::NamespaceExists(ref existing)) if existing == &taken
+    ));
+    assert_eq!(observer.manifest_version(&from).unwrap(), Some(1));
+    assert_eq!(observer.manifest_version(&taken).unwrap(), Some(0));
+
+    let outcome = store.rename_namespace(&from, &to, 1).unwrap();
+    assert_eq!(outcome.lease_token, Some(token));
+    assert!(!observer.has_namespace(&from));
+    assert_eq!(observer.manifest_version(&from).unwrap(), None);
+    let moved = observer.try_manifest_cloned(&to).unwrap().unwrap();
+    assert_eq!(moved.version, 1);
+    assert_eq!(moved.segments[0].segment_id.0, "bare-000001");
+    assert_eq!(
+        moved.deletion_vectors[&SegmentId("bare-000001".into())].namespace,
+        Some(to.clone())
+    );
+    // The holder keeps `to` under the carried token; `from` is fenced.
+    assert!(store
+        .renew_writer_lease(&to, "migrator", token, ttl)
+        .unwrap());
+    assert!(!store
+        .renew_writer_lease(&from, "migrator", token, ttl)
+        .unwrap());
+    store.release_writer_lease(&to, "migrator", token).unwrap();
+    // Renaming again finds nothing to move.
+    assert!(matches!(
+        store.rename_namespace(&from, &to, 1),
+        Err(KoshaError::NamespaceNotFound(_))
+    ));
+    // The bare id was retired: re-creating it starts above version 1.
+    store.create_namespace(from.clone()).unwrap();
+    assert_eq!(observer.manifest_version(&from).unwrap(), Some(2));
+}
+
+/// `url` with its database name replaced by `db` (query string kept).
+fn with_database(url: &str, db: &str) -> String {
+    let (base, query) = match url.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
+        None => (url, None),
+    };
+    let authority_start = base.find("://").map_or(0, |i| i + 3);
+    let server = match base[authority_start..].find('/') {
+        Some(slash) => &base[..authority_start + slash],
+        None => base,
+    };
+    match query {
+        Some(query) => format!("{server}/{db}?{query}"),
+        None => format!("{server}/{db}"),
+    }
+}
+
+/// Run `sql` on `url` over a fresh connection, on its own runtime.
+fn admin_exec(url: &str, sql: &str) {
+    use sqlx::Connection;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut conn = sqlx::PgConnection::connect(url).await.unwrap();
+        sqlx::raw_sql(sql).execute(&mut conn).await.unwrap();
+        conn.close().await.unwrap();
+    });
+}
+
+/// #330: several processes constructing `PgStore` against a database that
+/// has never been migrated must all succeed. Before the advisory lock,
+/// concurrent `CREATE SCHEMA IF NOT EXISTS kosha` failed with a duplicate
+/// key on `pg_namespace`. Uses its own freshly created database on the
+/// server of KOSHA_TEST_DATABASE_URL, so it neither depends on nor disturbs
+/// the schema the other tests in this file share.
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn concurrent_first_boot_migrations_all_succeed() {
+    const CONSTRUCTORS: usize = 8;
+    let url = std::env::var("KOSHA_TEST_DATABASE_URL").expect("set a dedicated test database URL");
+    let db = format!("kosha_migrate_{}", uuid::Uuid::new_v4().simple());
+    admin_exec(&url, &format!("CREATE DATABASE {db}"));
+    let fresh = with_database(&url, &db);
+
+    let barrier = Arc::new(Barrier::new(CONSTRUCTORS));
+    let results: Vec<Result<PgStore, String>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..CONSTRUCTORS)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let fresh = fresh.as_str();
+                scope.spawn(move || {
+                    barrier.wait();
+                    PgStore::new(fresh)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let failures: Vec<&String> = results.iter().filter_map(|r| r.as_ref().err()).collect();
+    assert!(failures.is_empty(), "constructors failed: {failures:?}");
+
+    // The migrated schema is usable from every store.
+    let mut stores: Vec<PgStore> = results.into_iter().map(Result::unwrap).collect();
+    let ns = NamespaceId(format!("migrate-test-{}", uuid::Uuid::new_v4()));
+    stores[0]
+        .compare_and_swap_manifest(&ns, 0, candidate("first", 1))
+        .unwrap();
+    for store in &stores {
+        assert_eq!(store.manifest_cloned(&ns).unwrap().version, 1);
+    }
+
+    drop(stores);
+    admin_exec(&url, &format!("DROP DATABASE {db} WITH (FORCE)"));
+}
+
+#[test]
+fn with_database_replaces_only_the_database_name() {
+    assert_eq!(
+        with_database("postgres://u:p@h:5432/kosha_cas_test", "x"),
+        "postgres://u:p@h:5432/x"
+    );
+    assert_eq!(
+        with_database("postgres://u:p@h/db?sslmode=disable", "x"),
+        "postgres://u:p@h/x?sslmode=disable"
+    );
+    assert_eq!(
+        with_database("postgres://h:5432", "x"),
+        "postgres://h:5432/x"
+    );
+}
