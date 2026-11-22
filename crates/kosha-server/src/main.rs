@@ -1761,6 +1761,16 @@ impl AppState {
             kosha_core::tenancy::TenantShares::from_env().with_weights(tenant_limits.weight_fn());
         cache.set_tenant_shares(tenant_shares.clone());
         searcher.set_tenant_shares(tenant_shares.clone());
+        // `KOSHA_ADMISSION_TENANT_SHARES`: also apply those weights in the
+        // live-memory admission gate (#342). Off unless asked for; a value
+        // that is neither on nor off stops startup.
+        let admission_tenant_shares = admission_tenant_shares_flag(
+            std::env::var("KOSHA_ADMISSION_TENANT_SHARES")
+                .ok()
+                .as_deref(),
+        )
+        .unwrap_or_else(|e| fatal(&e));
+        searcher.set_admission_tenant_shares(admission_tenant_shares);
         let mut result_cache = ResultCache::new(result_cache_budget());
         result_cache.shares = tenant_shares;
 
@@ -5252,6 +5262,21 @@ fn verify_fetched_against_commit(data_dir: &Path, fetched: &[(String, u64)]) -> 
 fn env_flag_default_on(raw: Option<&str>) -> bool {
     raw.map(|v| !matches!(v.trim(), "0" | "false" | "off"))
         .unwrap_or(true)
+}
+
+/// `KOSHA_ADMISSION_TENANT_SHARES` (#342): `on`, `true` or `1` turns on
+/// per-tenant shares in the live-memory admission gate
+/// (`Searcher::set_admission_tenant_shares`); unset, empty, `off`, `false`
+/// or `0` leaves it off. Any other value is an error, so a typo cannot
+/// quietly leave the gate in the other state.
+fn admission_tenant_shares_flag(raw: Option<&str>) -> Result<bool, String> {
+    match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("" | "off" | "false" | "0") => Ok(false),
+        Some("on" | "true" | "1") => Ok(true),
+        Some(other) => Err(format!(
+            "KOSHA_ADMISSION_TENANT_SHARES must be on or off, got {other:?}"
+        )),
+    }
 }
 
 /// Whether hydration should fetch a segment's `doc_store.offsets` sidecar
@@ -14796,6 +14821,26 @@ mod tests {
         assert!(!t.is_finished(), "must still be waiting, not shed");
         drop(held);
         assert!(t.join().unwrap());
+    }
+
+    #[test]
+    fn admission_tenant_shares_flag_is_off_by_default_and_rejects_typos() {
+        for off in [
+            None,
+            Some(""),
+            Some("off"),
+            Some(" OFF "),
+            Some("false"),
+            Some("0"),
+        ] {
+            assert_eq!(admission_tenant_shares_flag(off), Ok(false), "{off:?}");
+        }
+        for on in ["on", " On ", "true", "1"] {
+            assert_eq!(admission_tenant_shares_flag(Some(on)), Ok(true), "{on:?}");
+        }
+        for bad in ["yes", "enabled", "2", "onn"] {
+            assert!(admission_tenant_shares_flag(Some(bad)).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
