@@ -19,6 +19,7 @@ roaring = "0.11"
 crc32fast = "1"
 unicode-segmentation = "1"
 rust-stemmers = "1"
+rayon = { workspace = true }
 
 [dev-dependencies]
 # `stats` feature for `total_allocated()` (bytes ever requested, including
@@ -33,4 +34,12 @@ proptest = "1"
 
 [[bench]]
 name = "tokenizer"
+harness = false
+
+[[bench]]
+name = "doc_store_zstd"
+harness = false
+
+[[bench]]
+name = "postings_codec"
 harness = false

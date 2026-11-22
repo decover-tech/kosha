@@ -106,7 +106,7 @@ The `benchmark` workflow (`.github/workflows/benchmark.yml`) runs these
 scripts on the bench VM. Its inputs choose how the namespace gets warm,
 which vector snapshot to restore, and whether to keep the VM.
 
-### Warm gate (`warm_gate`: `queries` (default) or `preload`)
+### Warm gate (`warm_gate`: `queries` (default), `preload`, `timed` or `cold`)
 
 `queries` follows turbopuffer's tpuf-benchmark (`pkg/bench/bench.go`).
 For hot runs, tpuf warms the namespace, then polls with the workload's own
@@ -176,6 +176,57 @@ is what the workflow builds, `queries` fails fast with
 restart with the boot preload, wait for `/readyz`, then run the cold and
 warm phases. On the original vector snapshot the boot preload takes about
 115 minutes, because the server preloads the whole ~249 GB namespace.
+Its "cold" phase runs after that preload, so it measures a warm engine.
+
+`cold` (research, #380) measures first touch with no preload at all. The
+container starts without `KOSHA_WARMUP_NAMESPACES`, with
+`KOSHA_WARMUP_USAGE=off` (else the persisted usage warm set is warmed at
+boot) and with span promotion off. `run_phases.sh` checks the first two,
+wipes the local store, restarts, and runs one phase only
+(`knn_cold_nocache` or `cold_or_nocache`). Every byte a query needs is
+read from S3 during that phase, so the `search timing:` fields
+`hydrate_files`, `hydrate_mb`, `s3_bytes`, `vector_gets` and
+`postings_gets` in `server/<phase>.log.gz` are the per-query cold cost.
+A first-touch kNN query still fetches the small files (footer,
+`inverted.idx`, `doc_store.offsets`, `vector.offsets`) of every segment,
+because `knn_plan` opens every segment, so read the phase's first minutes
+apart from the rest (`knn_log_stats.py --skip-first-s`).
+
+`timed` (research #389) is for runs with a disk cache smaller than the
+working set, where `queries` cannot converge: a later query evicts what an
+earlier one needs, so "every query fully cached once" never happens.
+`run_phases.sh` then empties the local store (every arm starts cold, and
+the bound covers only the suite namespace), runs the workload unmeasured
+for `fill` seconds, and measures only the no-result-cache phase,
+`repeats` times (`warm_or_nocache_rN` / `knn_warm_nocache_rN`).
+S3 misses are part of the measured latency by design. It writes
+`footprint.tsv` (local bytes every 60 s) and `evictions.tsv` (files and
+MB the server evicted per stage, from its `disk cache evicted` lines).
+
+### Disk-cache experiment input (research #389): `cache_experiment`
+
+One input, a space-separated `key=value` list, so the workflow stays under
+GitHub's limit of 25 dispatch inputs. Empty (the default) is what every
+earlier run used. The "Validate disk-cache experiment inputs" step
+rejects unknown keys and bad values before anything is provisioned.
+
+| key | default | effect |
+| --- | --- | --- |
+| `max` | `644245094400` | `KOSHA_CACHE_MAX_BYTES`. A smaller value needs `warm_gate=timed` and one suite per dispatch (the validate step refuses otherwise). |
+| `policy` | `legacy` | `sieve` / `s3fifo` set `KOSHA_CACHE_POLICY`. The policy runs per tenant: #342 still picks which tenant gives up bytes, and that tenant's own policy state picks the file. |
+| `trace` | `false` | `true` sets `KOSHA_CACHE_TRACE_PATH` on the container; the trace and an S3 size listing are archived as `server/cache-trace.jsonl.gz` and `server/s3-sizes.tsv.gz` for `scripts/bench/cache_sim/cache_sim.py replay --strip-prefix segments/`. |
+| `order` | `cycle` | `query_bench.py --order`: `shuffle` or `zipf` (seeded, the same sequence for every arm). |
+| `fill`, `repeats` | `900`, `1` | `timed` mode only: seconds of unmeasured workload, then measured repeats (1-5). |
+
+Example: `cache_experiment="max=107374182400 policy=s3fifo order=zipf fill=600 repeats=3"` with `warm_gate=timed suite=bm25`.
+
+There is no `cache_accounting` key any more: #342 made the cache count
+every file once on every path, which is what `KOSHA_CACHE_ACCOUNTING=exact`
+used to provide. A legacy control and a policy arm get the same effective
+capacity without it.
+
+Compare arms with `cache_sim.py p99ci --a <control raw-out files> --b <arm
+raw-out files>` (bootstrap CIs for p50/p99 and their difference).
 
 ### What each hit returns (`return_fields`: `ids` (default) or `all`)
 
@@ -253,6 +304,42 @@ roughly 80–90 GB, against 249 GB.
   is off by default. It syncs ~40 GB+ of embeddings, builds 10M docs and
   uploads the segments. That is untimed so far, so run it with
   `suite=vector` and watch the 350-minute limit.
+- `build_segments_args` (research, #380; empty by default) passes extra
+  `kosha-build-segments` flags to that build, for example
+  `--cluster-layout namespace`.
+- Provenance: `build_and_import.sh` writes
+  `snapshots/<name>/build-info.json` (builder commit from `github.sha`, a
+  digest of the builder sources, build args, max docs). The vector suite
+  copies the restored snapshot's file to `vector/snapshot-build-info.json`
+  in the results, or logs that it has none. Snapshots built before this
+  change have none, so their builder commit is unknown. To compare two
+  layouts, build both under new names from one commit rather than reusing
+  an older snapshot.
+
+### Compressed doc store snapshots (research #388, experimental)
+
+`build_and_import.sh` passes `KOSHA_DOC_STORE_COMPRESSION` and the
+`KOSHA_DOC_STORE_ZSTD_*` tuning variables into the builder, and a
+`SNAPSHOT_NAME` containing `-zstd` defaults the first to `zstd`. That
+name rule only exists on refs that carry #388, and the workflow rsyncs
+the **dispatching ref** to the VM, so dispatch these builds from the #388
+branch (`gh workflow run benchmark.yml --ref <branch> ...`). A ref without
+#388 would build raw segments under the `-zstd` name, and the workflow
+never rebuilds an existing snapshot; on refs with #388 the build now
+refuses to upload when `zstd` was asked for and no footer is compressed.
+
+Every build also writes `snapshots/<name>/build_info.txt` with the
+builder env and a fingerprint (`source_sha256`) of the sources it
+compiled: the VM copy has no `.git`, so two snapshots come from the same
+commit exactly when their fingerprints match. Build the raw baseline for
+a comparison from the same ref under a name without `-zstd`.
+
+`vm/doc_store_bytes.sh <snapshot> [zstd|raw]` is the deterministic size
+check: it sums the snapshot's `doc_store.bin`, `doc_store.offsets` and
+`doc_vectors.bin` object sizes, reads every segment footer, splits
+`doc_store.bin` into stored records and the dictionary tail copy, and
+prints one JSON object (`doc_store_bytes.py`). With a format argument it
+exits 3 when the footers disagree. It only lists and downloads.
 
 ### Fast iteration recipe
 
@@ -274,6 +361,192 @@ Approximate times per stage:
 For comparison, `warm_gate=preload` on the original vector snapshot
 spends about 115 minutes in warmup alone, before its phases.
 
+### kNN probe-budget sweep (`knn_sweep`, #384)
+
+Recall@10 against p50/p99 and postings probed, one point per server
+configuration, without a new VM or a new snapshot per point. Dispatch with
+`suite=vector`, `warm_gate=queries`, `run_recall_check=true`,
+`duration=300` and `knn_sweep=fractions` (or a point list). After the
+normal vector phases, `vm/knn_budget_sweep.sh`, for each point:
+
+1. recreates the kosha container with its original environment plus the
+   point's env vars (the local NVMe cache is kept, so only the in-process
+   caches restart cold), and re-runs `warm_gate.py`;
+2. runs a warm, result-cache-off kNN phase (`query_bench.py
+   --server-timings --raw-out`) at `qps` for `duration` seconds;
+3. runs `recall_check.py` on 1,000 random queries (seed 384) with
+   `--server-timings --no-cache`, sharing one ground-truth cache file
+   across points (the first point pays the brute-force scan).
+
+The container is put back to its original configuration at the end, and
+`knn_sweep_report.py` writes `knn_sweep/sweep.{md,json,csv}` (the `.md`
+table is appended to the job summary). Points:
+
+- `fractions`: `KOSHA_KNN_BUDGET_FRACTION` = 0.05, 0.03, 0.02, 0.01
+  (labels `f0.05` ... `f0.01`; `f0.05` is the baseline the report's
+  success-bar column compares against).
+- `relative`: the #384 step 2 grid, 8 points: `f0.05` (baseline), `a0`
+  and `a0.5` (`KOSHA_KNN_PROBE_RADIUS_ALPHA` alone), `a0rel0.5`, `a0rel1`,
+  `a0rel2` (alpha 0 plus `KOSHA_KNN_RELATIVE_CUTOFF_EPS` 0.5 / 1 / 2), and
+  `a0rel1m500`, `a0rel0.5m1000` (`KOSHA_KNN_RELATIVE_MIN_PROBES` 500 /
+  1000). The relative points all use alpha 0: at alpha 1 the best score
+  is usually 0 and eps has no effect.
+- `label:ENV=V,ENV=V;label2:...`, over these knobs only:
+  `KOSHA_KNN_BUDGET_FRACTION`, `KOSHA_KNN_BUDGET_MAX_CAP`,
+  `KOSHA_KNN_RELATIVE_CUTOFF_EPS`, `KOSHA_KNN_RELATIVE_MIN_PROBES`,
+  `KOSHA_KNN_PROBE_RADIUS_ALPHA`. Include an `f0.05` point (or pass the
+  report `--baseline`) for the comparison column.
+
+`recall_check.py` reports, per query and summarized (mean, p1/p5/p10/p50):
+exact-id recall@k, ANN-Benchmarks distance-threshold recall (a returned
+doc counts if its exact distance is within the true k-th distance +
+1e-3, so exact ties count) and epsilon recall (within (1 + 0.01) x the
+k-th distance), plus each query's `timings.knn_postings`. Distances are
+computed from the corpus embeddings, never taken from the server's scores.
+Servers before #384 do not report `timings.knn_postings`; the report then
+reads `knn_postings=` from the `search timing:` log lines instead.
+
+The success bar (`meets_bar`) is judged on one query set: postings,
+mean recall and p10 recall all come from the 1,000 recall queries
+(`recall_postings_mean`). The latency phase's postings
+(`phase_postings_mean`, the workload queries in order) are shown next to
+them with their own ratio, and `pair_check` reads `DISAGREE` when the two
+ratios fall on different sides of 0.5 or differ by more than 15%.
+
+With the relative cutoff on, each kNN search also reports
+`timings.knn_cutoff_rule` (and `knn_cutoff_rule=` on its `search timing:`
+line): `budget` (the fixed budget capped it), `eps` (`(1 + eps) x best`
+decided), `floor` (`KOSHA_KNN_RELATIVE_MIN_PROBES` decided) or
+`zero_best` (the best score was 0, so eps had no effect). The report's
+`cutoff_rules` column gives each rule's share of the recall queries.
+Neither field appears with the flag off.
+
+The #384 engine flags are off by default:
+
+| env var | default | effect |
+|---|---|---|
+| `KOSHA_KNN_RELATIVE_CUTOFF_EPS` | unset (off) | unfiltered kNN probes a posting only if its rank score <= (1 + eps) x the best posting's score (SPANN's relative cutoff); never fewer than `KOSHA_KNN_RELATIVE_MIN_PROBES` postings, never more than the fixed budget |
+| `KOSHA_KNN_RELATIVE_MIN_PROBES` | the query's `num_candidates` | floor for the relative cutoff |
+| `KOSHA_KNN_PROBE_RADIUS_ALPHA` | 1.0 (`d - radius`, unchanged) | posting rank score `max(0, d(q,c) - alpha x radius)`; 0 = raw centroid distance |
+
+With the default alpha the best posting's score is often clamped to 0, so
+the relative cutoff then falls back to `min_probes`; SPANN's own rule is
+`KOSHA_KNN_PROBE_RADIUS_ALPHA=0` plus the cutoff.
+
+Cost: about `duration` + 8 minutes per point once the ground truth is
+cached (estimate, not measured).
+
+### Experiment inputs (`server_env`, `rustflags`, `bm25_snapshot`, `knn_budget_fraction`)
+
+These inputs serve the research track (#260): one dispatch measures one
+flag or build setting against the baseline. All four are optional. Left
+empty (the default), the run behaves exactly as before: the same
+`docker build` command, the same container env, the same snapshots.
+A first step, "Validate experiment inputs", checks them before anything
+is provisioned, so a rejected value costs nothing and fails the run
+with an `::error::` line.
+
+| input | default | effect | accepted values |
+|---|---|---|---|
+| `server_env` | empty | extra `-e KEY=VALUE` flags on the kosha container, after the standard bench env (so a repeated key, e.g. `KOSHA_CACHE_MAX_BYTES`, overrides it) | space-separated pairs, each `^[A-Z0-9_]+=[A-Za-z0-9._:/,-]*$` |
+| `rustflags` | empty | `--build-arg KOSHA_RUSTFLAGS=...` on the server image build; the Dockerfile exports it as `RUSTFLAGS` for `cargo chef cook` and `cargo build` only when non-empty | letters, digits, space and `= + , . _ : -`, e.g. `-C target-cpu=x86-64-v3` |
+| `bm25_snapshot` | `msmarco-<bm25_docs>` | snapshot the BM25 suite restores into `msmarco-<bm25_docs>`; one that does not exist yet is built offline first (see below) | `^[a-z0-9.-]+$`, restore mode only |
+| `knn_budget_fraction` | empty (server default 0.05) | `-e KOSHA_KNN_BUDGET_FRACTION=<x>` | a number with 0 < x <= 1; do not also set the key in `server_env` |
+
+No value may contain quotes, `$`, backticks, `;`, `|`, `&`, redirections
+or globs. The validated values are spliced into the remote scripts, so
+these rules are what keeps them safe.
+
+Examples:
+
+```
+# kNN probe budget sweep point
+knn_budget_fraction=0.02 suite=vector
+
+# a new code path behind an env flag, plus a cache size override
+server_env="KOSHA_SOME_FLAG=1 KOSHA_SEGMENT_CACHE_MAX_BYTES=34359738368"
+
+# x86-64-v3 build of the server (AVX2/FMA/BMI2)
+rustflags="-C target-cpu=x86-64-v3"
+
+# BM25 on a snapshot built with a new segment format flag
+bm25_snapshot=msmarco-10m-fmtv2 server_env="KOSHA_SOME_FORMAT_FLAG=2" suite=bm25
+```
+
+Details and caveats:
+
+- **New snapshots.** When `bm25_snapshot` names a snapshot that does not
+  exist, the BM25 step runs `SNAPSHOT_NAME=<name> build_and_import.sh
+  msmarco-<bm25_docs>` (first 1M docs when `bm25_docs=1m`) and then
+  restores it. The same rule as the vector side applies: an existing
+  snapshot is never overwritten, and the default name keeps its old
+  behaviour (the 1M snapshot is still built on its first run, without
+  `server_env`). `server_env` reaches the offline builder container
+  through `build_and_import.sh`'s `BUILD_DOCKER_ENV` (validated again
+  there), for both a new `bm25_snapshot` and a `build_vector_snapshot`
+  build, so a format flag applies when the segments are written as
+  well as when they are read. `rustflags` applies only to the server
+  image. The offline builder is built without it.
+- **Kept VM.** The local cache is reused when the snapshot identity
+  matches (see above), whatever `server_env` says. That is right for
+  flags that change only how segments are read or queried. A flag that
+  changes what the server writes to its local cache needs a VM that
+  has not cached that snapshot yet. Run the previous dispatch with
+  `keep_vm` off, or use a different snapshot name.
+- **Rebuilds.** A new `rustflags` value invalidates the dependency cook
+  layer, so that run does a full release build.
+- **Records.** `meta.json` in the S3 run archive also records
+  `bm25_snapshot`, `server_env_args` (the normalized `-e` flags,
+  including `knn_budget_fraction`) and `rustflags`. When any of them is
+  set, the job summary prints an `experiment:` line under the heading.
+- **Input count.** `workflow_dispatch` now has 17 inputs. GitHub's limit
+  is 25 (it used to be 10; this workflow already had 13 before these
+  four and dispatches fine).
+  Further experiment knobs go in `server_env` rather than new inputs.
+
+### Docid reordering and blocks decoded (#385, experimental)
+
+`KOSHA_DOC_REORDER=bp` makes `kosha-build-segments` (and compaction)
+write each segment's documents in recursive-graph-bisection order. The
+segment format is unchanged and results are identical (ties break on
+`_id`); postings get smaller and block-max pruning should skip more.
+Default `off`. `kosha-build-segments --doc-reorder off|bp` overrides the
+env var. To compare, build both orders offline under new snapshot names
+(the harness's `bm25_snapshot` + `server_env`, which reaches the builder
+through `BUILD_DOCKER_ENV`): one with no `server_env`, one with
+`server_env=KOSHA_DOC_REORDER=bp`. The existing `msmarco-10m` snapshot was
+loaded through the server, so it is not the like-for-like "off" baseline.
+
+`GET /stats` (admin) reports `scoring_blocks_decoded`, a process-wide
+count of posting blocks varint-decoded. `run_phases.sh` passes the admin
+key to `query_bench.py --stats-api-key`, which reads it before and after
+each phase and writes `scoring_blocks_decoded` and
+`scoring_blocks_decoded_per_request` to the phase JSON (absent against an
+older server). It is only per-query while nothing else queries the server.
+
+`run_phases.sh` also passes `--raw-ids`, so every `<phase>.requests.jsonl.gz`
+record carries the response's ranked `ids` and `scores`. Reordering must not
+change results; check it per query across the two snapshots' runs of the
+same phase:
+
+    topk_parity.py off/warm_or_nocache.requests.jsonl.gz bp/warm_or_nocache.requests.jsonl.gz
+
+It exits 0 only when at least one query was compared and every query
+answered in both logs returned the same ids in the same order (scores within
+`--score-rtol`, default 1e-6); a log recorded without `--raw-ids` is an
+error, not a pass.
+
+Both snapshots must be built by a ref that has the #385 builder *and* the
+harness's `bm25_snapshot` / `server_env` inputs. A builder without #385
+ignores `KOSHA_DOC_REORDER` and would write an ingest-order snapshot under
+the `bp` name, which later runs then reuse. The builder prints
+`doc reorder: bp` and a non-zero `(reorder Xs)` per segment when it really
+reorders; check the build log for both before trusting a `bp` snapshot.
+
+Compaction reorders only when `KOSHA_DOC_REORDER_COMPACTION_MAX_DOCS` is
+also set (default 0: never), because it buffers the merged output in
+memory; the bench runs with compaction off.
+
 ## Logs and tail analysis
 
 Every CI benchmark run (`.github/workflows/benchmark.yml`) archives its
@@ -292,6 +565,15 @@ server logs and per-request records to
 A VM kept after a failed run has its container log rescued to
 `runs/rescued-<timestamp>/` before the next run recreates the container.
 
+For kNN cost counters per query (`knn_postings`, `knn_segments`,
+`knn_centroids`, `knn_plan_ms`, opens, hydration and S3 bytes), summarize a
+phase's server log:
+
+```bash
+python3 knn_log_stats.py vector/server/knn_warm_nocache.log.gz
+python3 knn_log_stats.py vector/server/knn_cold_nocache.log.gz --skip-first-s 180
+```
+
 To see where a phase's tail comes from:
 
 ```bash
@@ -303,3 +585,36 @@ It splits client latency into server time vs time outside the engine,
 breaks the p99+ requests down by server phase, tells query-intrinsic cost
 (same queries slow every time) from contention (slow once, fast on
 repeats), and shows the tail by minute and by requests in flight.
+
+## Offline representation recall (`repr_recall_sim.py`, #383)
+
+`repr_recall_sim.py` asks, with no server and no ANN index, how much
+recall@k survives when the shortlist is picked with a smaller
+representation (a d-dim prefix, int8 codes, or sign bits) and then
+rescored with the full vector. It is brute force over an in-memory sample
+and is **not** a bound on Kosha's recall in either direction: it has no
+IVF probing, and by default R is one global shortlist, while Kosha
+rescores `k * KOSHA_VECTOR_RESCORE_FACTOR` candidates per segment.
+`--segments N` splits the sample into N shards and takes R per shard,
+which is closer to the engine; the mapping to the factor is still not
+measured. It prints bytes per vector for the search representation and
+"total x", which adds the f32 rescore vector in `doc_vectors.bin`
+(capped at 2x while that store is f32). It reads the same `emb-*.f32` /
+`queries_emb.f32` files as `recall_check.py`, or `.npy`:
+
+```bash
+python3 repr_recall_sim.py --docs /data/corpus/emb-00000.f32 \
+    --docs /data/corpus/emb-00001.f32 --docs-limit 200000 \
+    --queries /data/queries_emb.f32 --dim 1024 \
+    --truncate 512,256,128 --shortlist 10,40,100,200 \
+    --segments 1,4 --out sim.json
+```
+
+`fetch_te3s_dbpedia.py` (needs `pyarrow` and `huggingface_hub`) writes
+the `text-embedding-3-small` sample used in the doc: 1000 held-out
+DBpedia documents as queries (seed 383) and the other 99,000 as the
+corpus. Those are doc-to-doc neighbours, not queries over passages.
+
+Memory is roughly 5x the f32 sample (a copy per representation), so
+about 4 GB at 100k x 1024. Results and caveats are in
+`docs/research/383-matryoshka-binary.md`.

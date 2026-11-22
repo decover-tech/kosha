@@ -69,6 +69,9 @@ SERVER_TIMINGS = False
 # (~100-200KB per top-10 kNN response), which also overflows the 64MB
 # result cache on the 1,677-query cycle.
 RETURN_FIELDS = "ids"
+# --raw-ids: also record each response's ranked doc_ids and scores in the
+# --raw-out records (#385 ranking parity, topk_parity.py).
+RAW_IDS = False
 
 
 def payload_for(namespace: str, query_text: str, topk: int, qidx: int = 0) -> dict:
@@ -99,12 +102,67 @@ def payload_for(namespace: str, query_text: str, topk: int, qidx: int = 0) -> di
     return payload
 
 
+def read_blocks_decoded(session, host: str, admin_key: str | None) -> int | None:
+    """The server's scoring_blocks_decoded counter from GET /stats (#385);
+    None when not asked for, unreachable, or an older server without it."""
+    if not admin_key:
+        return None
+    try:
+        resp = session.get(f"{host}/stats", headers=auth_headers(admin_key), timeout=60)
+        resp.raise_for_status()
+        value = resp.json().get("scoring_blocks_decoded")
+        return int(value) if value is not None else None
+    except Exception as e:  # noqa: BLE001 - reporting only, never fails a run
+        print(f"WARN: could not read scoring_blocks_decoded from /stats: {e}")
+        return None
+
+
 def load_queries(path: Path) -> list[str]:
     """Non-empty lines of a queries file, in order."""
     queries = [l.strip() for l in path.read_text().splitlines() if l.strip()]
     if not queries:
         raise SystemExit(f"no queries in {path}")
     return queries
+
+
+def query_order(n: int, order: str, seed: int, zipf_s: float, rank_seed: int = 389):
+    """qidx for the i-th request. cycle (default): i % n, the fixed loop
+    every earlier run used. shuffle: a seeded random permutation, re-drawn
+    each pass, so no query is a fixed distance from its repeat. zipf:
+    i.i.d. draws with P(rank r) ~ 1/r^s over a random ranking of the
+    queries, a skewed popularity mix (#389 cache-policy runs: a pure loop
+    is adversarial to FIFO/LRU and flattering to SIEVE/S3-FIFO). The
+    ranking comes from rank_seed, so the popular queries stay the same
+    across stages run with different draw seeds."""
+    import random as _random
+
+    if order == "cycle":
+        return lambda i: i % n
+    rng = _random.Random(seed)
+    if order == "shuffle":
+        state = {"pass": -1, "perm": []}
+
+        def shuffled(i: int) -> int:
+            p = i // n
+            if p != state["pass"]:
+                state["pass"] = p
+                state["perm"] = list(range(n))
+                rng.shuffle(state["perm"])
+            return state["perm"][i % n]
+
+        return shuffled
+    if order == "zipf":
+        ranking = list(range(n))
+        _random.Random(rank_seed).shuffle(ranking)
+        weights = [1.0 / (r + 1) ** zipf_s for r in range(n)]
+        cum, total = [], 0.0
+        for w in weights:
+            total += w
+            cum.append(total)
+        import bisect
+
+        return lambda _i: ranking[min(bisect.bisect_left(cum, rng.random() * total), n - 1)]
+    raise SystemExit(f"unknown --order {order}")
 
 
 def load_knn_vectors(path: Path, n_queries: int, dim: int = 1024) -> list[list[float]]:
@@ -170,6 +228,13 @@ def run_query(
             degraded_counts.append(degraded if degraded is not None else 0)
             if rec is not None:
                 rec.update(latency_ms=round(latency * 1000, 3), hits=hits)
+                if RAW_IDS:
+                    # Ranked ids and scores, so two runs over different
+                    # snapshots can be checked for identical top-k per
+                    # qidx (topk_parity.py, #385).
+                    res = body.get("results", [])
+                    rec["ids"] = [r.get("doc_id") for r in res]
+                    rec["scores"] = [r.get("score") for r in res]
                 if "timings" in body:
                     rec["server"] = body["timings"]
                 raw.append(rec)
@@ -223,6 +288,26 @@ def main() -> None:
         default=100,
         help="ANN candidate pool per query (tpuf-comparable default)",
     )
+    ap.add_argument(
+        "--order",
+        choices=["cycle", "shuffle", "zipf"],
+        default="cycle",
+        help="request order over the queries file: cycle (default, the fixed loop), "
+        "shuffle (seeded permutation per pass) or zipf (seeded skewed popularity)",
+    )
+    ap.add_argument(
+        "--order-seed",
+        type=int,
+        default=389,
+        help="seed for the shuffle / zipf draws; use a different one per stage",
+    )
+    ap.add_argument(
+        "--zipf-rank-seed",
+        type=int,
+        default=389,
+        help="seed for which queries are popular under --order zipf (keep fixed across stages)",
+    )
+    ap.add_argument("--zipf-s", type=float, default=1.0, help="zipf exponent for --order zipf")
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument(
         "--raw-out",
@@ -246,12 +331,29 @@ def main() -> None:
         "as turbopuffer's benchmark queries do; all: every stored field, "
         "including embeddings",
     )
+    ap.add_argument(
+        "--raw-ids",
+        action="store_true",
+        help="with --raw-out, also record each response's ranked doc_ids and "
+        "scores (ids, scores), for an off-vs-on ranking parity check with "
+        "topk_parity.py (#385)",
+    )
+    ap.add_argument(
+        "--stats-api-key",
+        default=None,
+        help="admin key for GET /stats: if set, read the server's "
+        "scoring_blocks_decoded counter before and after the phase and report "
+        "the delta and blocks decoded per successful request (#385). The "
+        "counter is process wide, so it is only per-query when nothing else "
+        "queries the server during the phase",
+    )
     args = ap.parse_args()
-    global OPERATOR, NO_CACHE, KNN_VECS, KNN_FIELD, KNN_NUM_CANDIDATES, SERVER_TIMINGS, RETURN_FIELDS
+    global OPERATOR, NO_CACHE, KNN_VECS, KNN_FIELD, KNN_NUM_CANDIDATES, SERVER_TIMINGS, RETURN_FIELDS, RAW_IDS
     OPERATOR = args.operator
     NO_CACHE = args.no_cache
     SERVER_TIMINGS = args.server_timings
     RETURN_FIELDS = args.return_fields
+    RAW_IDS = args.raw_ids
 
     queries = load_queries(args.queries_file)
 
@@ -273,11 +375,15 @@ def main() -> None:
     threads: list[threading.Thread] = []
 
     interval = 1.0 / args.qps
+    next_qidx = query_order(
+        len(queries), args.order, args.order_seed, args.zipf_s, args.zipf_rank_seed
+    )
     print(
         f"phase={args.phase} qps={args.qps} topk={args.topk} "
-        f"duration={args.duration}s (~{int(args.qps * args.duration)} requests)"
+        f"duration={args.duration}s (~{int(args.qps * args.duration)} requests) order={args.order}"
     )
 
+    blocks_before = read_blocks_decoded(session, args.host, args.stats_api_key)
     start = time.time()
     next_send = start
     i = 0
@@ -285,7 +391,7 @@ def main() -> None:
         now = time.time()
         if now < next_send:
             time.sleep(next_send - now)
-        qidx = i % len(queries)
+        qidx = next_qidx(i)
         query_text = queries[qidx]
         i += 1
         th = threading.Thread(
@@ -320,6 +426,7 @@ def main() -> None:
         th.join(timeout=args.timeout + 5)
 
     elapsed = time.time() - start
+    blocks_after = read_blocks_decoded(session, args.host, args.stats_api_key)
     achieved_qps = len(results) / elapsed if elapsed > 0 else 0
 
     # Correctness signal, not just latency: a 200 with an empty/short page,
@@ -339,6 +446,7 @@ def main() -> None:
         "target_qps": args.qps,
         "achieved_qps": achieved_qps,
         "topk": args.topk,
+        "order": args.order,
         "duration_s": elapsed,
         "requests": i,
         "successes": len(results),
@@ -363,6 +471,10 @@ def main() -> None:
         "knn_degraded_rate": (knn_degraded_requests / n) if n else float("nan"),
         "knn_degraded_segments_total": knn_degraded_segments_total,
     }
+    if blocks_before is not None and blocks_after is not None:
+        delta = blocks_after - blocks_before
+        summary["scoring_blocks_decoded"] = delta
+        summary["scoring_blocks_decoded_per_request"] = (delta / len(results)) if results else float("nan")
 
     print(json.dumps(summary, indent=2))
     if errors:

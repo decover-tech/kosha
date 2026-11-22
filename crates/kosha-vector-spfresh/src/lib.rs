@@ -31,11 +31,13 @@ use std::collections::{HashMap, HashSet};
 
 pub use centroid_probe::{nearest_centroids, nearest_centroids_dot};
 pub use error::VectorIndexError;
-pub use point::{cosine_distance, cosine_similarity, dot, maxsim, mean_vector, normalize_in_place};
+pub use point::{
+    cosine_distance, cosine_similarity, dot, dot_lanes, maxsim, mean_vector, normalize_in_place,
+};
 pub use quant::{dequantize_i8, dot_i8, quantize_i8, I8_MAX_CODE};
 pub use rabitq::{
-    encode_rabitq, rabitq_code_bytes, rabitq_padded_dim, RaBitQCode, RaBitQQuery, RaBitQRotation,
-    RABITQ_EPSILON0, RABITQ_ROTATION_SEED,
+    encode_rabitq, rabitq_code_bytes, rabitq_padded_dim, RaBitQCode, RaBitQEstimator, RaBitQQuery,
+    RaBitQRotation, RABITQ_EPSILON0, RABITQ_QUERY_BITS, RABITQ_ROTATION_SEED,
 };
 pub use rng::DeterministicRng;
 

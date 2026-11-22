@@ -41,6 +41,49 @@ fn tenant_of_dir_key(key: &str) -> &str {
     }
 }
 
+mod policy;
+use policy::PolicyState;
+pub use policy::{CachePolicy, Classifier, ReadHint, CLASS_ANY};
+
+/// Construction options beyond the root directory. `Default` is today's
+/// behaviour: unbounded, with #342's per-tenant LRU eviction.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CacheOptions {
+    /// Eviction bound in bytes (`KOSHA_CACHE_MAX_BYTES`).
+    pub max_bytes: Option<u64>,
+    /// Opt-in scan-resistant policy (`KOSHA_CACHE_POLICY`, #389, research).
+    /// `None` keeps the per-tenant LRU. Only takes effect with `max_bytes`.
+    pub policy: Option<CachePolicy>,
+    /// File-class classifier for [`ReadHint::Class`] hints.
+    pub classify: Option<Classifier>,
+    /// `KOSHA_CACHE_ACCOUNTING=exact` (#389). Superseded by #342: the cache
+    /// now always counts each tracked key once (see `Tracked`), so this is
+    /// accepted for compatibility and has no effect.
+    pub exact_accounting: bool,
+}
+
+/// Opt-in policy state (#389), one [`PolicyState`] per tenant (#342): which
+/// tenant gives up bytes stays #342's decision ([`TenantShares`]), and the
+/// policy only chooses *within* that tenant, so evicting from one tenant
+/// never rotates, promotes or clears another tenant's entries.
+struct TenantPolicies {
+    kind: CachePolicy,
+    classify: Option<Classifier>,
+    /// Initial budget for a new tenant's state; re-sized to the tenant's
+    /// fair share before each pick (`PolicyState::set_budget`).
+    max_bytes: u64,
+    by_tenant: HashMap<String, PolicyState>,
+}
+
+impl TenantPolicies {
+    fn state(&mut self, tenant: &str) -> &mut PolicyState {
+        let (kind, max, classify) = (self.kind, self.max_bytes, self.classify);
+        self.by_tenant
+            .entry(tenant.to_string())
+            .or_insert_with(|| PolicyState::new(kind, max, classify))
+    }
+}
+
 /// Handle to a cached file. The file is present on local disk.
 #[derive(Debug, Clone)]
 pub struct CachedFile {
@@ -215,6 +258,13 @@ pub struct Cache {
     tracked: Mutex<Tracked>,
     /// How `max_bytes` is split between tenants.
     shares: RwLock<TenantShares>,
+    /// Opt-in eviction policy state (#389), per tenant. `None` = #342's
+    /// per-tenant LRU, and read hints are ignored. Lock order: always taken
+    /// last (after `recency`, `pinned`, `tracked`) or alone.
+    policies: Option<Mutex<TenantPolicies>>,
+    /// Logical clock for read hints (see `begin_read`). Only advanced when
+    /// a policy is configured.
+    read_clock: AtomicU64,
 }
 
 impl Cache {
@@ -238,26 +288,144 @@ impl Cache {
         max_bytes: Option<u64>,
         shares: TenantShares,
     ) -> Self {
+        Self::with_options_and_shares(
+            cache_dir,
+            CacheOptions {
+                max_bytes,
+                ..CacheOptions::default()
+            },
+            shares,
+        )
+    }
+
+    /// Full constructor, tenant shares from `KOSHA_CACHE_TENANT_MIN_BYTES`.
+    /// With `options.policy` unset this is exactly [`Self::with_max_bytes`].
+    pub fn with_options(cache_dir: PathBuf, options: CacheOptions) -> Self {
+        Self::with_options_and_shares(cache_dir, options, TenantShares::from_env())
+    }
+
+    /// [`Self::with_options`] with an explicit tenant policy.
+    pub fn with_options_and_shares(
+        cache_dir: PathBuf,
+        options: CacheOptions,
+        shares: TenantShares,
+    ) -> Self {
         std::fs::create_dir_all(&cache_dir).ok();
         let (recency, sizes) = Self::scan_existing(&cache_dir);
         let mut tracked = Tracked::default();
         let mut total_bytes = 0u64;
+        let policies = match (options.policy, options.max_bytes) {
+            (Some(kind), Some(max)) => Some(TenantPolicies {
+                kind,
+                classify: options.classify,
+                max_bytes: max,
+                by_tenant: HashMap::new(),
+            }),
+            _ => None,
+        };
+        let mut policies = policies;
         for (key, len) in sizes {
             total_bytes += len;
             tracked.set(&key, len);
+            // Files that survived a restart start in the main queue
+            // (S3-FIFO) / oldest-first (SIEVE), unread, in their tenant's
+            // state. `sizes` is oldest-modified first, like `recency`.
+            if let Some(p) = policies.as_mut() {
+                p.state(tenant_of_file_key(&key)).upsert(&key, len, 0, true);
+            }
         }
         let cache = Self {
             cache_dir,
-            max_bytes,
+            max_bytes: options.max_bytes,
             total_bytes: AtomicU64::new(total_bytes),
             eviction_generation: AtomicU64::new(0),
             recency: Mutex::new(Recency::from_order(recency)),
             pinned: Mutex::new(HashMap::new()),
             tracked: Mutex::new(tracked),
             shares: RwLock::new(shares),
+            policies: policies.map(Mutex::new),
+            read_clock: AtomicU64::new(0),
         };
         cache.enforce_limit();
         cache
+    }
+
+    /// The configured opt-in policy, if any (`None` = per-tenant LRU).
+    pub fn policy(&self) -> Option<CachePolicy> {
+        self.policies.as_ref().map(|p| p.lock().unwrap().kind)
+    }
+
+    /// Always true since #342: the running total counts each tracked key
+    /// once. Kept for #389 callers and logs.
+    pub fn exact_accounting(&self) -> bool {
+        true
+    }
+
+    /// True when read hints change eviction (a policy is configured).
+    /// Callers can skip building hints otherwise.
+    pub fn tracks_reads(&self) -> bool {
+        self.policies.is_some()
+    }
+
+    /// Stamp the start of a search for [`Cache::note_reads`]. A file this
+    /// search inserts (hydrates) does not count the search's own hint as a
+    /// re-read. Returns 0 and does nothing without a policy.
+    pub fn begin_read(&self) -> u64 {
+        if self.policies.is_none() {
+            return 0;
+        }
+        self.read_clock.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Report a search's reads (#389 read signal), each hint to the state
+    /// of the tenant owning its segment directory. No-op without a policy:
+    /// eviction order is unchanged.
+    pub fn note_reads(&self, started_at: u64, hints: &[ReadHint<'_>]) {
+        let Some(policies) = &self.policies else {
+            return;
+        };
+        let mut by_tenant: HashMap<&str, Vec<ReadHint<'_>>> = HashMap::new();
+        for hint in hints {
+            let dir = match hint {
+                ReadHint::Class { dir, .. } | ReadHint::File { dir, .. } => *dir,
+            };
+            by_tenant
+                .entry(tenant_of_segment_dir(dir))
+                .or_default()
+                .push(*hint);
+        }
+        let mut policies = policies.lock().unwrap();
+        for (tenant, hints) in by_tenant {
+            if let Some(state) = policies.by_tenant.get_mut(tenant) {
+                state.note_reads(started_at, &hints);
+            }
+        }
+    }
+
+    /// Reads reported for `key` (by hints or `get`) that the policy has not
+    /// consumed yet; `None` without a policy or for an untracked key. For
+    /// diagnostics and tests: it shows whether hints reach an entry.
+    pub fn policy_pending_reads(&self, key: &str) -> Option<u64> {
+        let key = key.trim_matches('/');
+        self.policies
+            .as_ref()?
+            .lock()
+            .unwrap()
+            .by_tenant
+            .get(tenant_of_file_key(key))?
+            .pending_reads(key)
+    }
+
+    /// Untrack keys the cache no longer holds, in every tenant's policy
+    /// state. Taken alone (no other cache lock held).
+    fn policy_forget(&self, remove: impl Fn(&str) -> bool) {
+        if let Some(policies) = &self.policies {
+            let mut policies = policies.lock().unwrap();
+            for state in policies.by_tenant.values_mut() {
+                state.forget(&remove);
+            }
+            policies.by_tenant.retain(|_, state| !state.is_empty());
+        }
     }
 
     /// Replace the tenant policy (weights and floor), e.g. once the
@@ -381,7 +549,7 @@ impl Cache {
     /// The next eviction victim: the least recently used unpinned key of
     /// the tenant [`TenantShares::pick_victim`] chooses, or the least
     /// recently used unpinned key overall when no tenant qualifies.
-    fn next_victim(&self, max: u64) -> Option<String> {
+    fn next_victim(&self, max: u64, protect: Option<&str>) -> Option<String> {
         let recency = self.recency.lock().unwrap();
         let pinned = self.pinned.lock().unwrap();
         let tracked = self.tracked.lock().unwrap();
@@ -403,6 +571,27 @@ impl Cache {
                 .get(tenant)
                 .map(|key| tracked.sizes.get(key.as_str()).copied().unwrap_or(0))
         }) {
+            // #389: with an opt-in policy, the tenant's own SIEVE / S3-FIFO
+            // state picks which of its files goes (its small queue sized
+            // to its current fair share). The tenant choice above used its
+            // least recently used candidate's size for the floor check, an
+            // estimate when the policy picks a different file. If the
+            // policy has nothing evictable for this tenant, fall back to
+            // that LRU candidate, exactly as without a policy.
+            if let Some(policies) = &self.policies {
+                let share = shares
+                    .shares(max, &usage)
+                    .into_iter()
+                    .find(|(t, _)| *t == tenant)
+                    .map_or(max, |(_, share)| share.max(1));
+                let mut policies = policies.lock().unwrap();
+                if let Some(state) = policies.by_tenant.get_mut(tenant) {
+                    state.set_budget(share);
+                    if let Some(key) = state.pick_victim(&pinned, protect) {
+                        return Some(key);
+                    }
+                }
+            }
             return oldest.get(tenant).map(|key| (*key).clone());
         }
         // No tenant holding bytes has anything evictable: fall back to the
@@ -422,6 +611,13 @@ impl Cache {
     /// same "nothing safe left to evict" fallback as a single file bigger
     /// than the whole bound.
     fn enforce_limit(&self) {
+        self.enforce_limit_protecting(None);
+    }
+
+    /// `enforce_limit`, never choosing `protect` (the key just written) as a
+    /// policy victim (#389). Without a policy `protect` is ignored, as in
+    /// #342.
+    fn enforce_limit_protecting(&self, protect: Option<&str>) {
         let Some(max) = self.max_bytes else {
             return;
         };
@@ -431,7 +627,7 @@ impl Cache {
             if self.total_bytes.load(Ordering::Relaxed) <= max {
                 break;
             }
-            let Some(key) = self.next_victim(max) else {
+            let Some(key) = self.next_victim(max, protect) else {
                 break;
             };
             let _ = self.evict(&key);
@@ -456,6 +652,17 @@ impl Cache {
         let path = self.path_for(key).ok()?;
         if path.is_file() {
             self.touch(key);
+            if let Some(policies) = &self.policies {
+                let key = key.trim_start_matches('/');
+                if let Some(state) = policies
+                    .lock()
+                    .unwrap()
+                    .by_tenant
+                    .get_mut(tenant_of_file_key(key))
+                {
+                    state.note_key_read(key);
+                }
+            }
             self.record_lookup(tenant_of_file_key(key), true);
             Some(CachedFile { local_path: path })
         } else {
@@ -520,6 +727,14 @@ impl Cache {
     /// the same file never counts it twice.
     fn account(&self, key: &str, new_len: u64) {
         let old_len = self.tracked.lock().unwrap().set(key, new_len);
+        if let Some(policies) = &self.policies {
+            let clock = self.read_clock.load(Ordering::Relaxed);
+            policies
+                .lock()
+                .unwrap()
+                .state(tenant_of_file_key(key))
+                .upsert(key, new_len, clock, false);
+        }
         if new_len >= old_len {
             self.total_bytes
                 .fetch_add(new_len - old_len, Ordering::Relaxed);
@@ -527,7 +742,7 @@ impl Cache {
             self.sub_total(old_len - new_len);
         }
         self.touch(key);
-        self.enforce_limit();
+        self.enforce_limit_protecting(Some(key));
     }
 
     fn sub_total(&self, bytes: u64) {
@@ -592,6 +807,7 @@ impl Cache {
         }
         drop(tracked);
         drop(recency);
+        self.policy_forget(|k| k == key || k.starts_with(&nested));
         self.sub_total(freed);
         Ok(removed)
     }
@@ -647,6 +863,7 @@ impl Cache {
         drop(tracked);
         drop(pinned);
         drop(recency);
+        self.policy_forget(|k| k == key || k.starts_with(&prefix));
         self.sub_total(freed);
         self.eviction_generation.fetch_add(1, Ordering::Relaxed);
         Ok(Some(on_disk))
@@ -679,6 +896,7 @@ impl Cache {
             });
             tracked.tenants.evicted(tenant_of_namespace(prefix));
         }
+        self.policy_forget(|k| k.starts_with(&below));
         if dir.is_dir() {
             std::fs::remove_dir_all(&dir)?;
         }
@@ -717,6 +935,9 @@ impl Cache {
         recency.clear();
         tracked.sizes.clear();
         tracked.tenants.clear_bytes();
+        drop(tracked);
+        drop(recency);
+        self.policy_forget(|_| true);
         self.total_bytes.store(0, Ordering::Relaxed);
         Ok(())
     }
@@ -1369,5 +1590,545 @@ mod tests {
         assert_eq!(cache.total_size(), 42);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- #389: opt-in scan-resistant policies -------------------------
+
+    fn policy_cache(name: &str, policy: Option<CachePolicy>, max: u64) -> (Cache, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-cache-policy-{name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let cache = Cache::with_options(
+            dir.clone(),
+            CacheOptions {
+                max_bytes: Some(max),
+                policy,
+                classify: None,
+                exact_accounting: false,
+            },
+        );
+        (cache, dir)
+    }
+
+    /// One search that hydrates `key` (100 bytes) and reads it: the search's
+    /// own hint must not make the new file look re-read.
+    fn one_touch_search(cache: &Cache, ns: &str, seg: &str) {
+        let t = cache.begin_read();
+        let key = format!("{ns}/{seg}/doc_store.bin");
+        cache.put_bytes(&key, &[0u8; 100]).unwrap();
+        cache.note_reads(
+            t,
+            &[ReadHint::File {
+                dir: &format!("{ns}/{seg}"),
+                file: "doc_store.bin",
+            }],
+        );
+    }
+
+    /// A hot segment re-read by every search while a stream of one-touch
+    /// segments (a scan: warmup of a cold namespace, a one-off query) flows
+    /// through a cache 10 files big. Returns whether the hot files survived.
+    /// `ns` is the namespace directory: `ns` (pre-#262 layout) or
+    /// `default/ns` (the server's tenant-scoped layout).
+    fn hot_survives_scan_in(policy: Option<CachePolicy>, ns: &str) -> bool {
+        let name = format!(
+            "{}-{}",
+            policy.map_or("legacy", CachePolicy::as_str),
+            ns.replace('/', "_")
+        );
+        let (cache, dir) = policy_cache(&name, policy, 1000);
+        let hot = format!("{ns}/hot");
+        let t = cache.begin_read();
+        cache
+            .put_bytes(&format!("{hot}/inverted.idx"), &[0u8; 100])
+            .unwrap();
+        cache
+            .put_bytes(&format!("{hot}/footer.json"), &[0u8; 100])
+            .unwrap();
+        cache.note_reads(
+            t,
+            &[ReadHint::Class {
+                dir: &hot,
+                class: CLASS_ANY,
+            }],
+        );
+        for i in 0..40 {
+            let t = cache.begin_read();
+            cache.note_reads(
+                t,
+                &[ReadHint::Class {
+                    dir: &hot,
+                    class: CLASS_ANY,
+                }],
+            );
+            one_touch_search(&cache, ns, &format!("scan-{i}"));
+            assert!(cache.total_size() <= 1000);
+        }
+        // `contains`, not `get`: `get` would itself count as a read.
+        let survived = cache.contains(&format!("{hot}/inverted.idx"))
+            && cache.contains(&format!("{hot}/footer.json"));
+        let _ = fs::remove_dir_all(&dir);
+        survived
+    }
+
+    fn hot_survives_scan(policy: Option<CachePolicy>) -> bool {
+        hot_survives_scan_in(policy, "ns")
+    }
+
+    /// The server's real layout is `{tenant}/{ns}/{segment}/{file}` (#262)
+    /// and its hints name `{tenant}/{ns}/{segment}`. Grouping by the first
+    /// two key components (the original #389 prototype) dropped every hint
+    /// there, so both policies degraded to FIFO; this is the regression test.
+    #[test]
+    fn policies_keep_re_read_entries_under_the_tenant_scoped_layout() {
+        assert!(!hot_survives_scan_in(None, "default/msmarco"));
+        assert!(hot_survives_scan_in(
+            Some(CachePolicy::Sieve),
+            "default/msmarco"
+        ));
+        assert!(hot_survives_scan_in(
+            Some(CachePolicy::S3Fifo),
+            "default/msmarco"
+        ));
+    }
+
+    /// Span-cache entries under the tenant layout belong to the segment
+    /// file they cache ranges of, and a `File` hint for that file reaches
+    /// them.
+    #[test]
+    fn span_entries_under_the_tenant_layout_take_file_hints() {
+        fn classify(name: &str) -> u8 {
+            if name.starts_with("postings-") {
+                1
+            } else {
+                0
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-cache-policy-tenant-spans-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let cache = Cache::with_options(
+            dir.clone(),
+            CacheOptions {
+                max_bytes: Some(300),
+                policy: Some(CachePolicy::Sieve),
+                classify: Some(classify),
+                ..CacheOptions::default()
+            },
+        );
+        let seg = "default/msmarco/seg-1";
+        cache
+            .put_bytes(&format!("{seg}/postings-02.bin.spans/0-10"), &[0u8; 100])
+            .unwrap();
+        cache
+            .put_bytes(&format!("{seg}/doc_store.bin.spans/0-10"), &[0u8; 100])
+            .unwrap();
+        cache
+            .put_bytes(&format!("{seg}/postings-03.bin"), &[0u8; 100])
+            .unwrap();
+        let t = cache.begin_read();
+        cache.note_reads(
+            t,
+            &[ReadHint::File {
+                dir: seg,
+                file: "postings-02.bin",
+            }],
+        );
+        cache.put_bytes("default/other/seg/a", &[0u8; 100]).unwrap();
+        // One eviction: the oldest unread entry (the doc-store span), not
+        // the read posting span.
+        assert!(cache.contains(&format!("{seg}/postings-02.bin.spans/0-10")));
+        assert!(!cache.contains(&format!("{seg}/doc_store.bin.spans/0-10")));
+        assert!(cache.contains(&format!("{seg}/postings-03.bin")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_policy_evicts_re_read_entries_under_a_one_touch_scan() {
+        // Today's behaviour, unchanged by default: read hints are ignored
+        // and eviction is insertion order, so the scan flushes the hot set.
+        assert!(!hot_survives_scan(None));
+    }
+
+    #[test]
+    fn sieve_keeps_re_read_entries_under_a_one_touch_scan() {
+        assert!(hot_survives_scan(Some(CachePolicy::Sieve)));
+    }
+
+    #[test]
+    fn s3fifo_keeps_re_read_entries_under_a_one_touch_scan() {
+        assert!(hot_survives_scan(Some(CachePolicy::S3Fifo)));
+    }
+
+    #[test]
+    fn policies_still_evict_hot_entries_once_they_stop_being_read() {
+        for policy in [CachePolicy::Sieve, CachePolicy::S3Fifo] {
+            let (cache, dir) =
+                policy_cache(&format!("cooled-{}", policy.as_str()), Some(policy), 1000);
+            cache.put_bytes("ns/hot/inverted.idx", &[0u8; 100]).unwrap();
+            for _ in 0..3 {
+                let t = cache.begin_read();
+                cache.note_reads(
+                    t,
+                    &[ReadHint::File {
+                        dir: "ns/hot",
+                        file: "inverted.idx",
+                    }],
+                );
+            }
+            // A sliding working set: each round one new segment arrives
+            // and the latest eight are re-read; older ones go cold, as does
+            // the formerly hot segment.
+            for round in 0..30 {
+                let seg = format!("ns/new-{round}");
+                let t = cache.begin_read();
+                cache
+                    .put_bytes(&format!("{seg}/inverted.idx"), &[0u8; 100])
+                    .unwrap();
+                cache.note_reads(
+                    t,
+                    &[ReadHint::File {
+                        dir: &seg,
+                        file: "inverted.idx",
+                    }],
+                );
+                let live: Vec<String> = (round.max(7) - 7..=round)
+                    .map(|i| format!("ns/new-{i}"))
+                    .collect();
+                for _ in 0..2 {
+                    let t = cache.begin_read();
+                    let hints: Vec<ReadHint<'_>> = live
+                        .iter()
+                        .map(|dir| ReadHint::File {
+                            dir,
+                            file: "inverted.idx",
+                        })
+                        .collect();
+                    cache.note_reads(t, &hints);
+                }
+            }
+            let live_kept = (22..30)
+                .filter(|i| cache.contains(&format!("ns/new-{i}/inverted.idx")))
+                .count();
+            assert_eq!(live_kept, 8, "{policy:?}: the live set stays");
+            assert!(
+                !cache.contains("ns/hot/inverted.idx"),
+                "{policy:?}: frequency must decay, not pin forever"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn class_and_file_hints_only_visit_what_they_name() {
+        fn classify(name: &str) -> u8 {
+            if name.starts_with("postings-") {
+                1
+            } else {
+                0
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-cache-policy-hints-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let cache = Cache::with_options(
+            dir.clone(),
+            CacheOptions {
+                max_bytes: Some(400),
+                policy: Some(CachePolicy::Sieve),
+                classify: Some(classify),
+                exact_accounting: false,
+            },
+        );
+        cache.put_bytes("ns/s/footer.json", &[0u8; 100]).unwrap();
+        cache
+            .put_bytes("ns/s/postings-01.bin", &[0u8; 100])
+            .unwrap();
+        // A span-cache entry belongs to the shard it caches.
+        cache
+            .put_bytes("ns/s/postings-02.bin.spans/0-10", &[0u8; 100])
+            .unwrap();
+        cache
+            .put_bytes("ns/s/postings-03.bin", &[0u8; 100])
+            .unwrap();
+        let t = cache.begin_read();
+        cache.note_reads(
+            t,
+            &[
+                ReadHint::Class {
+                    dir: "ns/s",
+                    class: 0,
+                },
+                ReadHint::File {
+                    dir: "ns/s",
+                    file: "postings-02.bin",
+                },
+            ],
+        );
+        // Two more files force two evictions: the unread shards 01 and 03.
+        cache.put_bytes("ns/other/a", &[0u8; 100]).unwrap();
+        cache.put_bytes("ns/other/b", &[0u8; 100]).unwrap();
+        assert!(cache.contains("ns/s/footer.json"));
+        assert!(cache.contains("ns/s/postings-02.bin.spans/0-10"));
+        assert!(!cache.contains("ns/s/postings-01.bin"));
+        assert!(!cache.contains("ns/s/postings-03.bin"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn policy_accounting_does_not_double_count_a_re_noted_file() {
+        let (cache, dir) = policy_cache("renote", Some(CachePolicy::S3Fifo), 10_000);
+        fs::create_dir_all(dir.join("ns/seg")).unwrap();
+        fs::write(dir.join("ns/seg/inverted.idx"), [0u8; 70]).unwrap();
+        // The hydration path notes every file of a batch, including files
+        // it found already local.
+        cache.note_external_write("ns/seg/inverted.idx");
+        cache.note_external_write("ns/seg/inverted.idx");
+        assert_eq!(cache.total_size(), 70);
+        let (small, main) = cache
+            .policies
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .by_tenant
+            .values()
+            .map(|state| state.queue_bytes())
+            .fold((0, 0), |(s, m), (a, b)| (s + a, m + b));
+        assert_eq!(small + main, 70);
+        cache.evict("ns/seg").unwrap();
+        assert_eq!(cache.total_size(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #389 added `exact_accounting` (KOSHA_CACHE_ACCOUNTING=exact) because
+    /// the legacy path counted a re-noted file twice. #342 made the cache
+    /// count each tracked key once on every path, so the option is now
+    /// accepted for compatibility and changes nothing: totals are exact
+    /// either way.
+    #[test]
+    fn accounting_is_exact_with_or_without_the_superseded_option() {
+        for exact in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "kosha-test-cache-exact-{exact}-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            let cache = Cache::with_options(
+                dir.clone(),
+                CacheOptions {
+                    max_bytes: Some(10_000),
+                    exact_accounting: exact,
+                    ..CacheOptions::default()
+                },
+            );
+            assert!(cache.exact_accounting());
+            fs::create_dir_all(dir.join("default/ns/seg")).unwrap();
+            fs::write(dir.join("default/ns/seg/inverted.idx"), [0u8; 70]).unwrap();
+            cache.note_external_write("default/ns/seg/inverted.idx");
+            cache.note_external_write("default/ns/seg/inverted.idx");
+            assert_eq!(cache.total_size(), 70);
+            cache.evict("default/ns/seg").unwrap();
+            assert_eq!(cache.total_size(), 0);
+            fs::create_dir_all(dir.join("default/ns/seg")).unwrap();
+            fs::write(dir.join("default/ns/seg/inverted.idx"), [0u8; 30]).unwrap();
+            cache.note_external_write("default/ns/seg/inverted.idx");
+            assert_eq!(cache.total_size(), 30);
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn policies_respect_pins_and_forget_external_evictions() {
+        for policy in [CachePolicy::Sieve, CachePolicy::S3Fifo] {
+            let (cache, dir) =
+                policy_cache(&format!("pins-{}", policy.as_str()), Some(policy), 200);
+            cache.pin("ns/a/x");
+            cache.put_bytes("ns/a/x", &[0u8; 100]).unwrap();
+            cache.put_bytes("ns/b/x", &[0u8; 100]).unwrap();
+            cache.put_bytes("ns/c/x", &[0u8; 100]).unwrap();
+            assert!(cache.contains("ns/a/x"), "{policy:?}: pinned survives");
+            assert!(!cache.contains("ns/b/x"));
+            cache.unpin("ns/a/x");
+            // Externally evicted keys leave the policy too: the next victim
+            // is a live file, so the bound still holds.
+            cache.evict_prefix("ns/c").unwrap();
+            cache.put_bytes("ns/d/x", &[0u8; 100]).unwrap();
+            cache.put_bytes("ns/e/x", &[0u8; 100]).unwrap();
+            assert!(cache.total_size() <= 200);
+            // Everything pinned: stop instead of spinning.
+            cache.clear().unwrap();
+            assert_eq!(cache.total_size(), 0);
+            for seg in ["p", "q", "r"] {
+                let key = format!("ns/{seg}/x");
+                cache.pin(&key);
+                cache.put_bytes(&key, &[0u8; 100]).unwrap();
+            }
+            assert_eq!(cache.total_size(), 300);
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn policy_adopts_files_found_on_disk_at_startup() {
+        for policy in [CachePolicy::Sieve, CachePolicy::S3Fifo] {
+            let dir = std::env::temp_dir().join(format!(
+                "kosha-test-cache-policy-prescan-{}-{}",
+                policy.as_str(),
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(dir.join("ns/seg")).unwrap();
+            fs::write(dir.join("ns/seg/a"), [0u8; 100]).unwrap();
+            fs::write(dir.join("ns/seg/b"), [0u8; 100]).unwrap();
+            let cache = Cache::with_options(
+                dir.clone(),
+                CacheOptions {
+                    max_bytes: Some(150),
+                    policy: Some(policy),
+                    classify: None,
+                    exact_accounting: false,
+                },
+            );
+            assert_eq!(cache.total_size(), 100, "{policy:?}");
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn policy_parse_defaults_to_legacy() {
+        assert_eq!(CachePolicy::parse(None), Ok(None));
+        assert_eq!(CachePolicy::parse(Some("")), Ok(None));
+        assert_eq!(CachePolicy::parse(Some("legacy")), Ok(None));
+        assert_eq!(
+            CachePolicy::parse(Some("SIEVE")),
+            Ok(Some(CachePolicy::Sieve))
+        );
+        assert_eq!(
+            CachePolicy::parse(Some("s3-fifo")),
+            Ok(Some(CachePolicy::S3Fifo))
+        );
+        assert!(CachePolicy::parse(Some("arc")).is_err());
+        // Without a bound there is nothing to evict, so no policy state.
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-cache-policy-unbounded-{}",
+            std::process::id()
+        ));
+        let cache = Cache::with_options(
+            dir.clone(),
+            CacheOptions {
+                max_bytes: None,
+                policy: Some(CachePolicy::Sieve),
+                classify: None,
+                exact_accounting: false,
+            },
+        );
+        assert!(!cache.tracks_reads());
+        assert_eq!(cache.begin_read(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- #389 x #342: the policy chooses within the tenant #342 picks ----
+
+    fn two_tenant_cache(name: &str, policy: Option<CachePolicy>) -> (Cache, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-cache-policy-tenants-{name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let cache = Cache::with_options_and_shares(
+            dir.clone(),
+            CacheOptions {
+                max_bytes: Some(1000),
+                policy,
+                ..CacheOptions::default()
+            },
+            TenantShares::default(),
+        );
+        (cache, dir)
+    }
+
+    /// Tenant `a` streams one-touch segments through a full cache while
+    /// tenant `b` holds two files, under its fair share. Whatever the policy,
+    /// #342 still decides that `a` (over its share) pays, so `b` keeps its
+    /// files.
+    #[test]
+    fn tenant_floors_hold_with_or_without_a_policy() {
+        for policy in [None, Some(CachePolicy::Sieve), Some(CachePolicy::S3Fifo)] {
+            let name = policy.map_or("legacy", CachePolicy::as_str);
+            let (cache, dir) = two_tenant_cache(name, policy);
+            cache
+                .put_bytes("b/ns/seg-b/inverted.idx", &[0u8; 100])
+                .unwrap();
+            cache
+                .put_bytes("b/ns/seg-b/footer.json", &[0u8; 100])
+                .unwrap();
+            for i in 0..20 {
+                let t = cache.begin_read();
+                let seg = format!("a/ns/seg-{i}");
+                cache
+                    .put_bytes(&format!("{seg}/doc_store.bin"), &[0u8; 100])
+                    .unwrap();
+                cache.note_reads(
+                    t,
+                    &[ReadHint::File {
+                        dir: &seg,
+                        file: "doc_store.bin",
+                    }],
+                );
+                assert!(cache.total_size() <= 1000, "{name}: bound holds");
+            }
+            assert!(
+                cache.contains("b/ns/seg-b/inverted.idx")
+                    && cache.contains("b/ns/seg-b/footer.json"),
+                "{name}: the tenant under its share keeps its files"
+            );
+            assert_eq!(cache.tenant_bytes("b"), 200, "{name}");
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Evicting from tenant `a` must not scan tenant `b`'s policy state: a
+    /// read `b` reported stays unconsumed (no visited bit cleared, no S3-FIFO
+    /// rotation or frequency change) until `b` itself is chosen.
+    #[test]
+    fn evicting_one_tenant_leaves_another_tenants_policy_state_alone() {
+        for policy in [CachePolicy::Sieve, CachePolicy::S3Fifo] {
+            let (cache, dir) =
+                two_tenant_cache(&format!("isolation-{}", policy.as_str()), Some(policy));
+            cache
+                .put_bytes("b/ns/seg-b/inverted.idx", &[0u8; 100])
+                .unwrap();
+            let t = cache.begin_read();
+            cache.note_reads(
+                t,
+                &[ReadHint::File {
+                    dir: "b/ns/seg-b",
+                    file: "inverted.idx",
+                }],
+            );
+            let before = cache.policy_pending_reads("b/ns/seg-b/inverted.idx");
+            assert!(
+                before.is_some_and(|n| n > 0),
+                "{policy:?}: the hint reached b's state: {before:?}"
+            );
+            for i in 0..20 {
+                cache
+                    .put_bytes(&format!("a/ns/seg-{i}/doc_store.bin"), &[0u8; 100])
+                    .unwrap();
+            }
+            assert_eq!(
+                cache.policy_pending_reads("b/ns/seg-b/inverted.idx"),
+                before,
+                "{policy:?}: a's evictions never visited b's entries"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 }

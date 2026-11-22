@@ -518,6 +518,14 @@ pub struct Indexer {
     /// so a restarted writer never hands out a fingerprint an earlier
     /// process used for a different tail.
     instance: String,
+    /// Whether compaction writes its merged segment's documents in
+    /// recursive-graph-bisection order (#385). `KOSHA_DOC_REORDER`,
+    /// default off; see [`kosha_segment::DocReorder`].
+    doc_reorder: kosha_segment::DocReorder,
+    /// Largest merged output (live docs) compaction reorders with BP;
+    /// `0` (the default) never. `KOSHA_DOC_REORDER_COMPACTION_MAX_DOCS`;
+    /// see [`kosha_segment::reorder::compaction_max_docs_from_env`].
+    doc_reorder_compaction_max_docs: u64,
 }
 
 impl Indexer {
@@ -568,6 +576,8 @@ impl Indexer {
             min_docs_per_flush_writer: 1000,
             local_retired: Mutex::new(Vec::new()),
             instance: uuid::Uuid::new_v4().simple().to_string(),
+            doc_reorder: kosha_segment::DocReorder::from_env(),
+            doc_reorder_compaction_max_docs: kosha_segment::reorder::compaction_max_docs_from_env(),
         };
 
         // Recover un-flushed documents from WAL on startup.
@@ -604,6 +614,21 @@ impl Indexer {
     /// Enable or disable the WAL.
     pub fn with_wal(mut self, enabled: bool) -> Self {
         self.wal_enabled = enabled;
+        self
+    }
+
+    /// Compact into segments whose documents are reordered by `mode`
+    /// (#385), regardless of `KOSHA_DOC_REORDER`.
+    pub fn with_doc_reorder(mut self, mode: kosha_segment::DocReorder) -> Self {
+        self.doc_reorder = mode;
+        self
+    }
+
+    /// Cap on the merged output (live docs) compaction reorders with BP
+    /// (#385), regardless of `KOSHA_DOC_REORDER_COMPACTION_MAX_DOCS`. `0`
+    /// never reorders; a larger merge streams in input order.
+    pub fn with_doc_reorder_compaction_max_docs(mut self, max_docs: u64) -> Self {
+        self.doc_reorder_compaction_max_docs = max_docs;
         self
     }
 
@@ -1983,8 +2008,16 @@ impl Indexer {
             uuid::Uuid::new_v4().simple()
         ));
         let seg_dir = ns_dir.join(seg_id.0.as_str());
-        let mut writer =
-            kosha_segment::SegmentWriter::new(seg_id.clone(), seg_dir).with_analysis(&analysis);
+        // Research #388: a merge keeps its inputs' doc-store format unless
+        // `KOSHA_DOC_STORE_COMPRESSION` says otherwise. Footers only; an
+        // unreadable one is decided by the open below, as before.
+        let any_input_compressed = plan.inputs.iter().any(|entry| {
+            kosha_segment::SegmentReader::read_footer(&input_dirs[&entry.segment_id])
+                .is_ok_and(|footer| footer.doc_store_compression.is_some())
+        });
+        let mut writer = kosha_segment::SegmentWriter::new(seg_id.clone(), seg_dir)
+            .with_analysis(&analysis)
+            .inherit_doc_store_compression(any_input_compressed);
         let mut any_docs = false;
         let old_segment_ids = plan.input_ids();
         let seed_vectors = vector_index
@@ -1999,46 +2032,142 @@ impl Indexer {
         let mut seq_remap: HashMap<(SegmentId, u32), u32> = HashMap::new();
         let mut next_new_seq: u32 = 0;
 
-        for entry in &plan.inputs {
-            let reader = kosha_segment::SegmentReader::open(input_dirs[&entry.segment_id].clone())?;
-            let ts = tombstones.get(&entry.segment_id);
-            // This input's old doc_seq → merged doc_seq (`u32::MAX`: not
-            // copied), for seeding the merged vector index (#253).
-            let mut input_remap: Vec<u32> = Vec::new();
-            // `?` here is deliberate: a doc that fails to read must abort
-            // the whole compaction, not just be skipped from the merge
-            // output — see `iter_doc_records`'s doc comment for the
-            // incident this silent-drop used to cause. `add_document`
-            // streams into `seg_dir/.build` (#242), but aborting here drops
-            // the writer, and `SegmentWriter`'s `Drop` removes that scratch
-            // (and `seg_dir` itself, still empty), so no partial output is
-            // left on disk.
-            //
-            // `iter_doc_records_raw` hands sidecar vectors over as f32, so
-            // they pass straight into the output without a JSON round trip
-            // (#242); inline-stored vectors stay JSON in their fields.
-            for raw in reader.iter_doc_records_raw() {
-                let kosha_segment::RawDocRecord {
-                    record: doc_rec,
-                    vectors,
-                } = raw?;
-                if ts.is_some_and(|set| set.contains(&doc_rec.doc_seq)) {
-                    continue;
-                }
-                seq_remap.insert((entry.segment_id.clone(), doc_rec.doc_seq), next_new_seq);
-                if seed_vectors {
-                    let old = doc_rec.doc_seq as usize;
-                    if input_remap.len() <= old {
-                        input_remap.resize(old + 1, u32::MAX);
+        // #385: BP buffers the whole merged output in memory, so it only
+        // runs when explicitly opted in for compaction and the merge is
+        // small enough; otherwise the streaming path below (input order).
+        let bp_compaction = self.doc_reorder == kosha_segment::DocReorder::Bp && {
+            let planned_live: u64 = plan
+                .inputs
+                .iter()
+                .map(|e| {
+                    let dead = tombstones.get(&e.segment_id).map_or(0, |t| t.len()) as u64;
+                    (e.doc_count as u64).saturating_sub(dead)
+                })
+                .sum();
+            let cap = self.doc_reorder_compaction_max_docs;
+            if planned_live > cap {
+                eprintln!(
+                    "WARN: KOSHA_DOC_REORDER=bp but compaction of {} has {planned_live} live docs \
+                     > KOSHA_DOC_REORDER_COMPACTION_MAX_DOCS={cap}; merging in input order",
+                    namespace.0
+                );
+            }
+            planned_live <= cap
+        };
+        if bp_compaction {
+            // #385: the merged output's doc_seqs follow recursive graph
+            // bisection instead of input order. Every live input document
+            // is buffered (memory: the whole merged output's stored
+            // records, unlike the streaming path below), ordered, then
+            // added in that order, so the writer's own doc_seq-keyed
+            // structures follow; `seq_remap` and the vector seeds are
+            // remapped from the same order. Experimental, off by default.
+            let mut readers = Vec::with_capacity(plan.inputs.len());
+            type Buffered = (
+                usize,
+                u32,
+                DocumentId,
+                Vec<kosha_core::Field>,
+                Vec<(usize, Vec<f32>)>,
+            );
+            let mut buffered: Vec<Buffered> = Vec::new();
+            for (input, entry) in plan.inputs.iter().enumerate() {
+                let reader =
+                    kosha_segment::SegmentReader::open(input_dirs[&entry.segment_id].clone())?;
+                let ts = tombstones.get(&entry.segment_id);
+                // `?`: a doc that fails to read aborts the compaction, as
+                // in the streaming path below.
+                for raw in reader.iter_doc_records_raw() {
+                    let kosha_segment::RawDocRecord {
+                        record: doc_rec,
+                        vectors,
+                    } = raw?;
+                    if ts.is_some_and(|set| set.contains(&doc_rec.doc_seq)) {
+                        continue;
                     }
-                    input_remap[old] = next_new_seq;
+                    buffered.push((
+                        input,
+                        doc_rec.doc_seq,
+                        doc_rec.doc_id,
+                        doc_rec.fields,
+                        vectors,
+                    ));
+                }
+                readers.push(reader);
+            }
+            let order = writer.bp_order(
+                buffered.iter().map(|b| b.3.as_slice()),
+                &kosha_segment::BpConfig::default(),
+            );
+            let mut input_remaps: Vec<Vec<u32>> = vec![Vec::new(); plan.inputs.len()];
+            let mut slots: Vec<Option<Buffered>> = buffered.into_iter().map(Some).collect();
+            for old in order {
+                let (input, old_seq, doc_id, fields, vectors) = slots[old as usize]
+                    .take()
+                    .expect("bp_order is a permutation");
+                seq_remap.insert(
+                    (plan.inputs[input].segment_id.clone(), old_seq),
+                    next_new_seq,
+                );
+                if seed_vectors {
+                    let remap = &mut input_remaps[input];
+                    if remap.len() <= old_seq as usize {
+                        remap.resize(old_seq as usize + 1, u32::MAX);
+                    }
+                    remap[old_seq as usize] = next_new_seq;
                 }
                 next_new_seq += 1;
-                writer.add_document_with_vectors(doc_rec.doc_id, doc_rec.fields, vectors);
+                writer.add_document_with_vectors(doc_id, fields, vectors);
                 any_docs = true;
             }
             if seed_vectors {
-                seed_merged_vector_index(&reader, &input_remap, &mut writer);
+                for (reader, remap) in readers.iter().zip(&input_remaps) {
+                    seed_merged_vector_index(reader, remap, &mut writer);
+                }
+            }
+        } else {
+            for entry in &plan.inputs {
+                let reader =
+                    kosha_segment::SegmentReader::open(input_dirs[&entry.segment_id].clone())?;
+                let ts = tombstones.get(&entry.segment_id);
+                // This input's old doc_seq → merged doc_seq (`u32::MAX`: not
+                // copied), for seeding the merged vector index (#253).
+                let mut input_remap: Vec<u32> = Vec::new();
+                // `?` here is deliberate: a doc that fails to read must abort
+                // the whole compaction, not just be skipped from the merge
+                // output — see `iter_doc_records`'s doc comment for the
+                // incident this silent-drop used to cause. `add_document`
+                // streams into `seg_dir/.build` (#242), but aborting here drops
+                // the writer, and `SegmentWriter`'s `Drop` removes that scratch
+                // (and `seg_dir` itself, still empty), so no partial output is
+                // left on disk.
+                //
+                // `iter_doc_records_raw` hands sidecar vectors over as f32, so
+                // they pass straight into the output without a JSON round trip
+                // (#242); inline-stored vectors stay JSON in their fields.
+                for raw in reader.iter_doc_records_raw() {
+                    let kosha_segment::RawDocRecord {
+                        record: doc_rec,
+                        vectors,
+                    } = raw?;
+                    if ts.is_some_and(|set| set.contains(&doc_rec.doc_seq)) {
+                        continue;
+                    }
+                    seq_remap.insert((entry.segment_id.clone(), doc_rec.doc_seq), next_new_seq);
+                    if seed_vectors {
+                        let old = doc_rec.doc_seq as usize;
+                        if input_remap.len() <= old {
+                            input_remap.resize(old + 1, u32::MAX);
+                        }
+                        input_remap[old] = next_new_seq;
+                    }
+                    next_new_seq += 1;
+                    writer.add_document_with_vectors(doc_rec.doc_id, doc_rec.fields, vectors);
+                    any_docs = true;
+                }
+                if seed_vectors {
+                    seed_merged_vector_index(&reader, &input_remap, &mut writer);
+                }
             }
         }
 
@@ -4389,6 +4518,105 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Research #388: a namespace mixing raw and compressed doc stores
+    /// compacts into a compressed one (with `KOSHA_DOC_STORE_COMPRESSION`
+    /// unset, a merge keeps its inputs' format), every record and sidecar
+    /// vector survives bit-identical, and the output keeps vectors out of
+    /// the doc store.
+    #[test]
+    fn compaction_of_mixed_doc_store_formats_keeps_compression() {
+        if kosha_segment::DocStoreCompressionMode::from_env()
+            != kosha_segment::DocStoreCompressionMode::Auto
+        {
+            eprintln!("skipped: KOSHA_DOC_STORE_COMPRESSION is set in this environment");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kosha-compact-zstd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let idx = Indexer::new(dir.clone());
+        let ns = NamespaceId("z".into());
+        let vector = |i: usize| -> Vec<f32> { vec![i as f32 + 0.25, -(i as f32), 0.5, 1.0e-3] };
+        let text = |i: usize| format!("passage {i} about compressed document stores and zstd");
+        for seg in 0..3 {
+            let docs = (0..40)
+                .map(|j| {
+                    let i = seg * 40 + j;
+                    Document {
+                        id: DocumentId(format!("d{i}")),
+                        fields: vec![
+                            Field::text("text", text(i)),
+                            Field {
+                                name: "emb".into(),
+                                field_type: kosha_core::FieldType::Vector,
+                                value: serde_json::to_string(&vector(i)).unwrap(),
+                            },
+                        ],
+                    }
+                })
+                .collect();
+            idx.index_documents(ns.clone(), docs).unwrap();
+            idx.flush_namespace(&ns).unwrap();
+        }
+        let before = idx.manifest(&ns).unwrap();
+        assert_eq!(before.segments.len(), 3);
+
+        // Rewrite the first segment in place with a compressed doc store:
+        // same documents in the same order, so every other file agrees.
+        let first = before.segments[0].segment_id.clone();
+        let first_dir = dir.join(&ns.0).join(&first.0);
+        let rebuilt = dir.join("rebuilt");
+        {
+            let reader = kosha_segment::SegmentReader::open(first_dir.clone()).unwrap();
+            assert!(!reader.doc_store_compressed());
+            let mut w = kosha_segment::SegmentWriter::new(first.clone(), rebuilt.clone())
+                .with_doc_store_zstd(Some(kosha_segment::DocStoreZstdConfig::default()));
+            for raw in reader.iter_doc_records_raw() {
+                let raw = raw.unwrap();
+                w.add_document_with_vectors(raw.record.doc_id, raw.record.fields, raw.vectors);
+            }
+            let footer = w.finalize(kosha_core::Bm25Params::default()).unwrap();
+            assert!(footer.doc_store_compression.is_some());
+        }
+        for entry in std::fs::read_dir(&rebuilt).unwrap().flatten() {
+            std::fs::copy(entry.path(), first_dir.join(entry.file_name())).unwrap();
+        }
+        let mixed: Vec<bool> = before
+            .segments
+            .iter()
+            .map(|e| {
+                kosha_segment::SegmentReader::open(dir.join(&ns.0).join(&e.segment_id.0))
+                    .unwrap()
+                    .doc_store_compressed()
+            })
+            .collect();
+        assert_eq!(mixed, vec![true, false, false], "a mixed-format namespace");
+
+        let result = idx
+            .compact_namespace_with_options(&ns, CompactOptions::full())
+            .unwrap();
+        assert!(result.merged);
+        let after = idx.manifest(&ns).unwrap();
+        assert_eq!(after.segments.len(), 1);
+        let seg_dir = dir.join(&ns.0).join(&after.segments[0].segment_id.0);
+        let reader = kosha_segment::SegmentReader::open(seg_dir).unwrap();
+        assert!(reader.doc_store_compressed(), "compaction kept compression");
+        assert!(reader.footer().doc_vectors, "vectors stay in the sidecar");
+        let mut seen = 0;
+        for record in reader.iter_doc_records() {
+            let record = record.unwrap();
+            let i: usize = record.doc_id.0[1..].parse().unwrap();
+            let t = record.fields.iter().find(|f| f.name == "text").unwrap();
+            assert_eq!(t.value, text(i));
+            let emb = record.fields.iter().find(|f| f.name == "emb").unwrap();
+            let got: Vec<f32> = serde_json::from_str(&emb.value).unwrap();
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&got), bits(&vector(i)), "doc {i}");
+            seen += 1;
+        }
+        assert_eq!(seen, 120);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// #253: `lire` compaction seeds the merged vector index from the
     /// inputs' postings (remapped to merged doc_seqs, tombstoned members
     /// dropped); `rebuild` clusters from scratch. Both stay searchable by
@@ -5823,6 +6051,157 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #385: with BP reordering on, the merged output's doc_seqs are not in
+    /// input order, so a delete landing mid-merge must still be carried
+    /// forward onto the right merged doc_seqs (the same `seq_remap` the
+    /// reordered adds used), and pre-merge tombstones must still exclude
+    /// their documents.
+    #[test]
+    fn bp_compaction_remaps_tombstones_to_reordered_doc_seqs() {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-compact-bp-tombstones-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let idx = Indexer::new(dir.clone())
+            .with_flush_threshold(40)
+            .with_doc_reorder(kosha_segment::DocReorder::Bp)
+            .with_doc_reorder_compaction_max_docs(u64::MAX);
+        // Two topics, interleaved, so BP really moves documents.
+        let docs: Vec<Document> = (0..120)
+            .map(|i| Document {
+                id: DocumentId(format!("d{i:03}")),
+                fields: vec![
+                    Field::text(
+                        "title",
+                        if i % 2 == 0 {
+                            "alpha beta gamma delta"
+                        } else {
+                            "omega sigma kappa lambda"
+                        },
+                    ),
+                    Field::keyword("bucket", format!("b{}", i % 7)),
+                ],
+            })
+            .collect();
+        let mut docs = docs.into_iter();
+        for _ in 0..3 {
+            idx.index_documents(ns.clone(), docs.by_ref().take(40).collect())
+                .unwrap();
+            idx.flush_namespace(&ns).unwrap();
+        }
+        assert_eq!(idx.manifest(&ns).unwrap().segments.len(), 3);
+        let m = idx.manifest(&ns).unwrap();
+        let pre: FilterClause = serde_json::from_str(r#"{"term": {"bucket": "b0"}}"#).unwrap();
+        assert_eq!(idx.delete_by_query(&ns, &m, &pre).unwrap(), 18);
+
+        let mid: FilterClause = serde_json::from_str(r#"{"term": {"bucket": "b3"}}"#).unwrap();
+        let ns_hook = ns.clone();
+        let result = idx
+            .compact_namespace_with_options_impl(&ns, CompactOptions::full(), || {
+                assert_eq!(idx.delete_by_query(&ns_hook, &m, &mid).unwrap(), 17);
+            })
+            .unwrap();
+        assert!(result.merged);
+
+        let m = idx.manifest(&ns).unwrap();
+        assert_eq!(m.segments.len(), 1);
+        let seg_id = m.segments[0].segment_id.clone();
+        let reader = kosha_segment::SegmentReader::open(dir.join("test").join(&seg_id.0)).unwrap();
+        assert_eq!(
+            reader.doc_count(),
+            120 - 18,
+            "pre-merge deletes are dropped"
+        );
+        let ids: Vec<String> = (0..reader.doc_count())
+            .map(|s| reader.doc_record_full(s).unwrap().unwrap().doc_id.0)
+            .collect();
+        let input_order: Vec<String> = (0..120)
+            .filter(|i| i % 7 != 0)
+            .map(|i| format!("d{i:03}"))
+            .collect();
+        assert_ne!(ids, input_order, "BP should have reordered the documents");
+        let tombstones = idx.get_tombstones(&ns).unwrap();
+        let mut deleted: Vec<String> = tombstones[&seg_id]
+            .iter()
+            .map(|&s| ids[s as usize].clone())
+            .collect();
+        deleted.sort();
+        let want: Vec<String> = (0..120)
+            .filter(|i| i % 7 == 3)
+            .map(|i| format!("d{i:03}"))
+            .collect();
+        assert_eq!(deleted, want);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #385: BP compaction buffers the whole merged output, so it only runs
+    /// when the planned live doc count (input docs minus pre-merge
+    /// tombstones) is within `KOSHA_DOC_REORDER_COMPACTION_MAX_DOCS`; above
+    /// it, and by default (cap 0), compaction streams in input order.
+    #[test]
+    fn bp_compaction_falls_back_to_input_order_above_the_doc_cap() {
+        let run = |cap: Option<u64>| -> Vec<String> {
+            let dir = std::env::temp_dir().join(format!(
+                "kosha-test-compact-bp-cap-{}-{}",
+                cap.map_or("default".to_string(), |c| c.to_string()),
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let ns = NamespaceId("test".into());
+            let mut idx = Indexer::new(dir.clone())
+                .with_flush_threshold(40)
+                .with_doc_reorder(kosha_segment::DocReorder::Bp);
+            if let Some(cap) = cap {
+                idx = idx.with_doc_reorder_compaction_max_docs(cap);
+            }
+            let mut docs = (0..120).map(|i| Document {
+                id: DocumentId(format!("d{i:03}")),
+                fields: vec![
+                    Field::text(
+                        "title",
+                        if i % 2 == 0 {
+                            "alpha beta gamma delta"
+                        } else {
+                            "omega sigma kappa lambda"
+                        },
+                    ),
+                    Field::keyword("bucket", format!("b{}", i % 7)),
+                ],
+            });
+            for _ in 0..3 {
+                idx.index_documents(ns.clone(), docs.by_ref().take(40).collect())
+                    .unwrap();
+                idx.flush_namespace(&ns).unwrap();
+            }
+            let m = idx.manifest(&ns).unwrap();
+            let pre: FilterClause = serde_json::from_str(r#"{"term": {"bucket": "b0"}}"#).unwrap();
+            assert_eq!(idx.delete_by_query(&ns, &m, &pre).unwrap(), 18);
+            assert!(
+                idx.compact_namespace_with_options_impl(&ns, CompactOptions::full(), || {})
+                    .unwrap()
+                    .merged
+            );
+            let m = idx.manifest(&ns).unwrap();
+            let seg = &m.segments[0].segment_id;
+            let reader = kosha_segment::SegmentReader::open(dir.join("test").join(&seg.0)).unwrap();
+            let ids = (0..reader.doc_count())
+                .map(|s| reader.doc_record_full(s).unwrap().unwrap().doc_id.0)
+                .collect();
+            let _ = std::fs::remove_dir_all(&dir);
+            ids
+        };
+        let input_order: Vec<String> = (0..120)
+            .filter(|i| i % 7 != 0)
+            .map(|i| format!("d{i:03}"))
+            .collect();
+        // 120 docs - 18 pre-merge deletes = 102 live.
+        assert_eq!(run(Some(101)), input_order, "over the cap: streams");
+        assert_eq!(run(Some(0)), input_order, "cap 0: never reorders");
+        assert_ne!(run(Some(102)), input_order, "at the cap: reorders");
     }
 
     #[test]

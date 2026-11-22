@@ -16,6 +16,11 @@ rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# Offline two-tier (head/tail) impact-index analysis (research #387).
+[[bin]]
+name = "kosha-two-tier-eval"
+path = "src/bin/two_tier_eval.rs"
+
 [dev-dependencies]
 cap = "0.1.2"
 # Test-only, one-directional (kosha-write never depends on kosha-query):
