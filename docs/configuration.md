@@ -135,7 +135,8 @@ See `k8s/README.md` ("Encryption at rest") for an IAM policy and a StorageClass 
 
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
-| `KOSHA_CACHE_MAX_BYTES` | Size bound for the on-disk (NVMe) segment-file cache; least recently used files are evicted past it (`AppState::new`) | unset (unbounded) | bytes |
+| `KOSHA_CACHE_MAX_BYTES` | Size bound for the on-disk (NVMe) segment-file cache; past it, files are evicted least recently used first from the tenant furthest over its share (`AppState::new`) | unset (unbounded) | bytes |
+| `KOSHA_CACHE_TENANT_MIN_BYTES` | Guaranteed floor per active tenant in every process-wide cache: NVMe, parsed segments and results (#342, `kosha_core::tenancy`). Each cache splits its budget across the tenants holding bytes in it by weight (the tenant's plan `weight` from `KOSHA_TENANT_LIMITS_FILE`, default 1), evicts from the tenant furthest over its share, and never takes a tenant below this floor while another tenant can give. Capped at an equal split of the cache's budget, so the floors always fit. Bare pre-tenant namespace ids share one `_legacy` tenant | `67108864` (64 MiB) | bytes |
 | `KOSHA_SEGMENT_CACHE_CAPACITY` | Parsed segments kept in memory across queries | `4096` (`kosha_query::DEFAULT_SEGMENT_CACHE_CAPACITY`) | segments |
 | `KOSHA_SEGMENT_CACHE_MAX_BYTES` | Approximate memory budget for those cached parsed segments | `4294967296` (4 GiB) | bytes |
 | `KOSHA_RESULT_CACHE_MAX_BYTES` | Whole-response cache for `POST /search`; `0` disables (`result_cache_budget`) | `67108864` (64 MiB) | bytes |
@@ -152,6 +153,7 @@ All **s3**. Read in `AppState::new` (`crates/kosha-server/src/main.rs`).
 | `KOSHA_SCORING_HYDRATE_CONCURRENCY` | Parallel GETs for small files: the scoring set, footer prefetch and page doc stores | `64` | requests |
 | `KOSHA_MAX_CONCURRENT_HYDRATIONS` | Independent hydration operations in flight per process | `4` | operations |
 | `KOSHA_HYDRATE_BYTE_BUDGET` | Process-wide cap on in-flight hydration bytes; also the pre-GET chunk size | `1073741824` (1 GiB) | bytes |
+| `KOSHA_HYDRATE_TENANT_MAX_INFLIGHT_BYTES` | Cap on one tenant's in-flight hydration bytes, so one tenant's cold start cannot hold all of the pod's S3 bandwidth (#342, `hydration_budget.rs`). Work-conserving: the cap binds only while another tenant holds or waits for hydration budget, so a lone tenant (or a pod serving only pre-#262 bare namespaces) may use the whole budget. A single object larger than the cap is admitted when it fits the global budget and no other tenant is waiting | half of `KOSHA_HYDRATE_BYTE_BUDGET` | bytes |
 | `KOSHA_HYDRATE_REQUEST_MAX_BYTES` | Bytes one search may hydrate before it is shed | `2147483648` (2 GiB) | bytes |
 | `KOSHA_DOC_STORE_READ_MODE` | How a page's documents are fetched: `ranged` (GETs for just those documents' byte spans in `doc_store.bin` / `doc_vectors.bin`, #245) or `whole` (the whole files, the pre-#245 path) (`doc_spans.rs`) | `ranged` | enum |
 | `KOSHA_DOC_SPAN_COALESCE_GAP_BYTES` | Ranged doc-store reads: spans of one file at most this far apart share a GET. The `KOSHA_DOC_SPAN` prefix names this group | `65536` (64 KiB) | bytes |
@@ -375,7 +377,7 @@ that, so a rolling upgrade with mixed peers works.
 | `KOSHA_METRICS` | `off` (or `false`, `0`) makes `GET /metrics` return 404 | on | flag |
 | `KOSHA_METRICS_AUTH` | `admin` requires the `KOSHA_ADMIN_API_KEY` credential on `GET /metrics` (403 without it). `none` (or unset) leaves it open, like `/healthz`. Any other value is treated as `admin` | `none` | `none` \| `admin` |
 | `KOSHA_METRICS_NAMESPACE_LABELS` | `on` (or `true`, `1`) adds a `namespace` label to `kosha_search_requests_total`. One series per namespace and outcome, and it publishes tenant namespace names to whoever can scrape. See `metrics.md` | off | flag |
-| `KOSHA_METRICS_TENANT_LABELS` | `on` (or `true`, `1`) adds a `tenant` label to `kosha_tenant_rejections_total`. One series per tenant and reason, and it publishes tenant ids to whoever can scrape. See `metrics.md` | off | flag |
+| `KOSHA_METRICS_TENANT_LABELS` | `on` (or `true`, `1`) adds a `tenant` label to `kosha_tenant_rejections_total` and the `kosha_cache_*` families (#342). One series per tenant and reason (or cache), and it publishes tenant ids to whoever can scrape. See `metrics.md` | off | flag |
 
 ## Roles
 

@@ -577,6 +577,7 @@ struct HydrationOutcome {
     /// and every later, differently-filtered query silently scored
     /// against only that same stale subset forever (not self-healing —
     /// only a pod restart, which drops the cache, recovered it).
+    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
     bloom_pruned: bool,
     /// `true` when this request hit its hydration byte ceiling
     /// (`KOSHA_HYDRATE_REQUEST_MAX_BYTES`) or waited out the process-wide
@@ -730,6 +731,7 @@ impl HydrationVerdict {
     /// `needs_filters` is the query's filter column names, `None` when it
     /// needs no filter files at all. `knn_field` is the query's
     /// `knn.field`, `None` for a non-kNN query.
+    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
     fn covers(&self, needs_filters: Option<&FilterFields>, knn_field: Option<&str>) -> bool {
         let filters_ok = needs_filters.is_none_or(|fields| {
             self.filters_verified && fields.is_subset(&self.filter_fields_verified)
@@ -795,6 +797,7 @@ fn knn_files_complete(
 /// `knn.field` for a single-vector kNN (#204), and a key of its own for a
 /// late-interaction kNN (#205), whose pass hydrates the field's multivec
 /// files rather than its single-vector column. `None` without kNN.
+#[cfg_attr(not(feature = "s3"), allow(dead_code))]
 fn knn_verdict_key(query: &SearchQuery) -> Option<String> {
     query.knn.as_ref().map(|knn| {
         if knn.is_late_interaction() {
@@ -1339,6 +1342,7 @@ impl AppState {
         );
 
         // ── Control plane: in-memory or Postgres ─────────────────────────
+        #[cfg_attr(not(feature = "postgres"), allow(unused_mut))]
         let mut control_plane_kind: &'static str = "in-memory";
         let control_store: Box<dyn ControlStore> = if let Some(store) = options.control_store {
             store
@@ -1699,6 +1703,18 @@ impl AppState {
             posting_spans::config_from_env(),
         );
 
+        let tenant_limits = tenant_limits::TenantLimiter::from_env()
+            .unwrap_or_else(|e| fatal(&format!("tenant limits: {e}")));
+        // Every process-wide cache splits its budget between tenants by
+        // their plan weight, with `KOSHA_CACHE_TENANT_MIN_BYTES` as each
+        // active tenant's floor (#342).
+        let tenant_shares =
+            kosha_core::tenancy::TenantShares::from_env().with_weights(tenant_limits.weight_fn());
+        cache.set_tenant_shares(tenant_shares.clone());
+        searcher.set_tenant_shares(tenant_shares.clone());
+        let mut result_cache = ResultCache::new(result_cache_budget());
+        result_cache.shares = tenant_shares;
+
         Self {
             controller: Mutex::new(control_store),
             role,
@@ -1815,8 +1831,7 @@ impl AppState {
                     (wait_ms > 0).then(|| Duration::from_millis(wait_ms)),
                 )
             },
-            tenant_limits: tenant_limits::TenantLimiter::from_env()
-                .unwrap_or_else(|e| fatal(&format!("tenant limits: {e}"))),
+            tenant_limits,
             #[cfg(all(feature = "s3", feature = "postgres"))]
             hydration_leases,
             #[cfg(all(feature = "s3", feature = "postgres"))]
@@ -1836,7 +1851,7 @@ impl AppState {
             gc_stats: segment_gc::GcStats::default(),
             gc_lock: Mutex::new(()),
             completed_hydrations: Mutex::new(HashMap::new()),
-            result_cache: Mutex::new(ResultCache::new(result_cache_budget())),
+            result_cache: Mutex::new(result_cache),
             rerankers: rerank::RerankRegistry::from_env(),
             embedders: embedding::EmbedderRegistry::from_env(),
             posting_blob_presence: Mutex::new(HashMap::new()),
@@ -2723,6 +2738,7 @@ impl AppState {
     /// CAS against the version the control store holds right now. Never
     /// rebases: a concurrent publish wins and this fails with
     /// `ManifestConflict`, leaving both the store and the indexer alone.
+    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
     fn import_manifest(
         &self,
         ns: &NamespaceId,
@@ -2844,6 +2860,7 @@ impl AppState {
     /// Cache footers parsed during a search's hydration on the manifest(s)
     /// that list their segments. A merged sharded view's segment ids are
     /// `_shard-XXXX/{id}`: those footers belong to the shard namespace.
+    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
     fn remember_search_footers(
         &self,
         ns: &NamespaceId,
@@ -4185,13 +4202,22 @@ impl AppState {
         let filters_of = |p: &Path| filter_files.get(p).map(Vec::as_slice).unwrap_or(&[]);
         let mut outcome = HydrationOutcome::default();
         let (owned, waiting) = partition_for_hydration(&self.in_flight_segments, seg_paths, |p| {
-            Self::scoring_complete(
+            let complete = Self::scoring_complete(
                 p,
                 knn_field,
                 vectors_ranged,
                 filters_of(p),
                 manifest_footers.get(p).copied(),
-            )
+            );
+            // A search's segment found with its scoring files already local
+            // is a disk-cache hit for its tenant; one that must hydrate is a
+            // miss (#342, `kosha_cache_{hits,misses}{cache="nvme"}`).
+            if let Ok(rel) = p.strip_prefix(&self.data_dir) {
+                let rel = rel.to_string_lossy();
+                self.cache
+                    .record_lookup(kosha_core::tenancy::tenant_of_segment_dir(&rel), complete);
+            }
+            complete
         });
 
         if !owned.is_empty() {
@@ -4524,6 +4550,19 @@ impl AppState {
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
         outcome
+    }
+
+    /// A warm search whose cached hydration verdict covers its scoring set
+    /// never reaches `ensure_scoring_files_local`, where per-segment
+    /// `kosha_cache_{hits,misses}{cache="nvme"}` are otherwise counted, so
+    /// its segments are counted as hits here (#342).
+    #[cfg(feature = "s3")]
+    fn record_warm_nvme_hits(&self, ns: &NamespaceId, manifest: &kosha_core::Manifest) {
+        self.cache.record_lookups(
+            kosha_core::tenancy::tenant_of_namespace(&ns.0),
+            manifest.segments.len() as u64,
+            0,
+        );
     }
 
     /// Per-query posting-blob ensure for the cached-verdict fast path: the
@@ -5405,6 +5444,7 @@ fn posting_blob_cache_insert(
     }
 }
 
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
 fn redact_database_url(url: &str) -> String {
     // postgresql://user:password@host/db → postgresql://user:***@host/db
     if let Some((scheme_user, rest)) = url.split_once("://") {
@@ -5732,6 +5772,23 @@ fn request_id() -> String {
     REQUEST_ID.with(|r| r.borrow().clone())
 }
 
+/// Every cache's per-tenant figures for `kosha_cache_*` (#342).
+fn cache_tenant_samples(state: &AppState) -> Vec<metrics::CacheTenantSample> {
+    let result = state.result_cache.lock().unwrap().tenants.stats();
+    [
+        ("nvme", state.cache.tenant_stats()),
+        ("segment", state.searcher.segment_cache_tenant_stats()),
+        ("result", result),
+    ]
+    .into_iter()
+    .flat_map(|(cache, stats)| {
+        stats
+            .into_iter()
+            .map(move |stats| metrics::CacheTenantSample { cache, stats })
+    })
+    .collect()
+}
+
 /// `GET /metrics`: the Prometheus text exposition of [`metrics::Metrics`],
 /// with the gauges and counters the server already keeps elsewhere read at
 /// scrape time. `KOSHA_METRICS=off` hides the route (404);
@@ -5758,6 +5815,7 @@ fn handle_metrics(state: &AppState, headers: &HashMap<String, String>) -> String
         segment_cache_bytes: state.searcher.segment_cache_bytes(),
         nvme_evictions: state.cache.eviction_generation(),
         segment_checksum_failures,
+        cache_tenants: cache_tenant_samples(state),
     });
     format!(
         "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: {}\r\n\r\n{body}",
@@ -6261,10 +6319,13 @@ fn service_authorized(headers: &HashMap<String, String>, expected: Option<&str>)
         .is_some_and(|expected| request_key(headers) == Some(expected))
 }
 
+/// A tenant id, or a namespace or branch name a tenant supplies. Names
+/// starting with `_` or `.` are reserved for internal and legacy layouts
+/// (`<tenant>/_shard-NNNN` would otherwise be accounted to the shared
+/// `_legacy` tenant — see [`kosha_core::tenancy::is_reserved_name`]).
 fn valid_namespace_component(name: &str) -> bool {
     !name.is_empty()
-        && name != "."
-        && name != ".."
+        && !kosha_core::tenancy::is_reserved_name(name)
         && !name
             .chars()
             .any(|c| c == '/' || c == '\\' || c.is_control())
@@ -8120,6 +8181,7 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
             // shards as zero hits (non-deterministically per pod). It is
             // sub-ms when the shards are already local: one metadata stat
             // per term-shard per split segment.
+            state.record_warm_nvme_hits(&ns, manifest);
             state.ensure_query_posting_blobs(&ns, manifest, search_query, &hydration_request)
         } else {
             let outcome =
@@ -8413,6 +8475,12 @@ fn canonical_query_for_cache(query: &SearchQuery) -> Option<String> {
 /// last-use tick with linear-scan eviction (entry counts are small at
 /// realistic budgets). Response strings are cached verbatim, so a hit is
 /// one map lookup plus a clone.
+///
+/// Tenants (#342): the key's namespace is the full `<tenant>/<name>` id,
+/// so two tenants with the same namespace name and query never share an
+/// entry. Bytes are accounted per tenant, and eviction takes the least
+/// recently used entry of the tenant furthest over its weighted share of
+/// the budget (see [`kosha_core::tenancy::TenantShares`]).
 struct ResultCache {
     entries: HashMap<(String, u64, String), ResultCacheEntry>,
     bytes: usize,
@@ -8420,6 +8488,8 @@ struct ResultCache {
     tick: u64,
     hits: u64,
     misses: u64,
+    tenants: kosha_core::tenancy::TenantLedger,
+    shares: kosha_core::tenancy::TenantShares,
 }
 
 struct ResultCacheEntry {
@@ -8437,18 +8507,23 @@ impl ResultCache {
             tick: 0,
             hits: 0,
             misses: 0,
+            tenants: Default::default(),
+            shares: kosha_core::tenancy::TenantShares::from_env(),
         }
     }
 
     fn lookup(&mut self, key: &(String, u64, String)) -> Option<String> {
         self.tick += 1;
         let tick = self.tick;
+        let tenant = kosha_core::tenancy::tenant_of_namespace(&key.0);
         if let Some(e) = self.entries.get_mut(key) {
             e.last_used = tick;
             self.hits += 1;
+            self.tenants.hit(tenant);
             Some(e.resp.clone())
         } else {
             self.misses += 1;
+            self.tenants.miss(tenant);
             None
         }
     }
@@ -8463,6 +8538,31 @@ impl ResultCache {
             keep
         });
         self.bytes -= freed;
+        self.tenants.sub_bytes(
+            kosha_core::tenancy::tenant_of_namespace(namespace),
+            freed as u64,
+        );
+    }
+
+    /// The next entry to evict: the least recently used entry of the
+    /// tenant furthest over its share (#342).
+    fn next_victim(&self) -> Option<(String, u64, String)> {
+        let mut oldest: HashMap<&str, (&(String, u64, String), &ResultCacheEntry)> = HashMap::new();
+        for (key, entry) in &self.entries {
+            let tenant = kosha_core::tenancy::tenant_of_namespace(&key.0);
+            let slot = oldest.entry(tenant).or_insert((key, entry));
+            if entry.last_used < slot.1.last_used {
+                *slot = (key, entry);
+            }
+        }
+        let usage = self.tenants.usage();
+        self.shares
+            .pick_victim(self.budget as u64, &usage, |t| {
+                oldest.get(t).map(|(_, e)| e.bytes as u64)
+            })
+            .and_then(|t| oldest.get(t))
+            .or_else(|| oldest.values().min_by_key(|(_, e)| e.last_used))
+            .map(|(k, _)| (*k).clone())
     }
 
     fn insert(&mut self, key: (String, u64, String), resp: &str) {
@@ -8475,11 +8575,14 @@ impl ResultCache {
         if entry_bytes > self.budget / 4 {
             return;
         }
+        let tenant = kosha_core::tenancy::tenant_of_namespace(&key.0).to_string();
         if let Some(old) = self.entries.remove(&key) {
             self.bytes -= old.bytes;
+            self.tenants.sub_bytes(&tenant, old.bytes as u64);
         }
         self.tick += 1;
         self.bytes += entry_bytes;
+        self.tenants.add_bytes(&tenant, entry_bytes as u64);
         self.entries.insert(
             key,
             ResultCacheEntry {
@@ -8489,16 +8592,14 @@ impl ResultCache {
             },
         );
         while self.bytes > self.budget {
-            let Some(oldest) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, e)| e.last_used)
-                .map(|(k, _)| k.clone())
-            else {
+            let Some(victim) = self.next_victim() else {
                 break;
             };
-            if let Some(e) = self.entries.remove(&oldest) {
+            if let Some(e) = self.entries.remove(&victim) {
                 self.bytes -= e.bytes;
+                let tenant = kosha_core::tenancy::tenant_of_namespace(&victim.0);
+                self.tenants.sub_bytes(tenant, e.bytes as u64);
+                self.tenants.evicted(tenant);
             }
         }
     }
@@ -8690,6 +8791,7 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
         let outcome = if cached_covers {
             // Posting blobs are per-query and outside the cached verdict —
             // see `handle_search_post` for the full rationale.
+            state.record_warm_nvme_hits(&ns, manifest);
             state.ensure_query_posting_blobs(&ns, manifest, &query, &hydration_request)
         } else {
             let outcome =
@@ -10246,6 +10348,7 @@ fn run_compaction_scheduler_tick(state: &Arc<AppState>, now: Instant) -> Vec<Nam
 /// by segment id (deterministic regardless of S3 listing order), doc counts
 /// from the footers themselves, version 1 (imports start a fresh version
 /// history — the old one is what was lost).
+#[cfg_attr(not(feature = "s3"), allow(dead_code))]
 fn manifest_from_footers(footers: Vec<kosha_core::Footer>) -> kosha_core::Manifest {
     let mut footers = footers;
     footers.sort_by(|a, b| a.segment_id.0.cmp(&b.segment_id.0));
@@ -10453,6 +10556,7 @@ fn handle_create_api_key(body: &[u8], _tenant: &str, state: &AppState) -> String
 
     #[cfg(not(feature = "postgres"))]
     {
+        let _ = state;
         let _ = tenant_id;
         let _ = description;
         json_error(
@@ -10945,6 +11049,7 @@ mod tests {
     use std::fs;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpStream;
+    use std::path::Path;
 
     #[derive(Clone)]
     pub(crate) struct SharedManifestStore {
@@ -11077,6 +11182,62 @@ mod tests {
         ]})
     }
 
+    /// #342: a warm search served from the cached hydration verdict still
+    /// counts its segments as NVMe hits for its tenant.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn warm_searches_count_nvme_hits_for_their_tenant() {
+        let state = test_state();
+        let ok = |resp: String| {
+            assert_eq!(status_of(&resp), 200, "{resp}");
+        };
+        ok(v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/docs/documents",
+            one_doc("d1", "quick fox"),
+        ));
+        ok(v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/docs/flush",
+            serde_json::json!({}),
+        ));
+        let nvme_hits = || {
+            state
+                .cache
+                .tenant_stats()
+                .into_iter()
+                .find(|s| s.tenant == "acme")
+                .map_or(0, |s| s.hits)
+        };
+        let search = |text: &str| {
+            ok(v1(
+                &state,
+                "acme",
+                "POST /v1/namespaces/docs/search",
+                serde_json::json!({"query_text": text}),
+            ))
+        };
+        // The first (unpruned) pass verifies the scoring set and caches the
+        // verdict; the second, a different query so the result cache does
+        // not answer it, is served from that verdict.
+        search("");
+        assert!(state
+            .completed_hydrations
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|(ns, _)| ns == "acme/docs"));
+        let after_first = nvme_hits();
+        search("quick");
+        assert!(
+            nvme_hits() > after_first,
+            "the warm search counted its segment as a hit ({after_first} → {})",
+            nvme_hits()
+        );
+    }
+
     #[test]
     fn namespace_create_conflicts_validates_and_is_tenant_scoped() {
         let state = test_state();
@@ -11128,10 +11289,25 @@ mod tests {
             serde_json::json!({"namespace": ".."}),
             serde_json::json!({"namespace": 7}),
             serde_json::json!({}),
+            // Reserved: `acme/_shard-0001` would be accounted to `_legacy`.
+            serde_json::json!({"namespace": "_shard-0001"}),
+            serde_json::json!({"namespace": "_internal"}),
+            serde_json::json!({"namespace": ".hidden"}),
         ] {
             let resp = create("acme", bad.clone());
             assert_eq!(status_of(&resp), 400, "{bad} → {resp}");
         }
+        // Nor can a tenant reach one through a namespace route, and a
+        // tenant id with a reserved prefix is refused outright.
+        let shard_route = v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/_shard-0001/search",
+            serde_json::json!({"query_text": "x"}),
+        );
+        assert_eq!(status_of(&shard_route), 400, "{shard_route}");
+        let bad_tenant = create("_legacy", serde_json::json!({"namespace": "docs"}));
+        assert_eq!(status_of(&bad_tenant), 403, "{bad_tenant}");
         let not_json = route(
             "POST /v1/namespaces HTTP/1.1\r\n",
             &HashMap::new(),
@@ -11569,6 +11745,7 @@ mod tests {
             .same_contents(&legacy));
     }
 
+    #[cfg(feature = "s3")]
     #[test]
     fn tiny_upsert_segments_only_hydrate_shards_present_in_the_toc() {
         let state = test_state();
@@ -13779,6 +13956,7 @@ mod tests {
     /// will read: every analysis reading of the query (#220) and its
     /// per-field keys and norms (#249). Fuzzy and wildcard terms are only
     /// known per segment, so those read whole shards (no terms).
+    #[cfg(feature = "s3")]
     #[test]
     fn posting_terms_follow_analysis_and_per_field_keys() {
         let terms = |json: &str| {
@@ -14493,6 +14671,7 @@ mod tests {
         assert_eq!(to_fetch, vec![("ns/seg-1/postings-02.bin".to_string(), 0)]);
     }
 
+    #[cfg(feature = "s3")]
     #[test]
     fn plan_posting_blob_fetch_skips_stat_for_cached_pairs() {
         use std::cell::Cell;
@@ -14741,6 +14920,7 @@ mod tests {
         assert!(chunk_by_byte_budget(&[], 100).is_empty());
     }
 
+    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
     fn test_footer(id: &str, docs: u32, format_version: u32) -> kosha_core::Footer {
         kosha_core::Footer {
             segment_id: kosha_core::SegmentId(id.into()),
@@ -20195,6 +20375,96 @@ mod tests {
         let stats = body_of(&handle_namespace_stats("docs", "acme", &state));
         assert!(stats.get("recent_queries").is_none(), "{stats}");
     }
+    // ─── Per-tenant cache isolation (#342) ────────────────────────────────
+
+    /// Two tenants with the same namespace name and the same query get
+    /// separate result-cache entries: neither can be served the other's
+    /// cached response, on the first search or on a repeat.
+    #[test]
+    fn result_cache_never_serves_one_tenant_another_tenants_entry() {
+        let state = test_state();
+        for (tenant, doc, text) in [
+            ("acme", "acme-doc", "breach of contract by acme"),
+            ("globex", "globex-doc", "breach of contract by globex"),
+        ] {
+            let indexed = v1(
+                &state,
+                tenant,
+                "POST /v1/namespaces/docs/documents",
+                one_doc(doc, text),
+            );
+            assert_eq!(status_of(&indexed), 200, "{indexed}");
+            let flushed = v1(
+                &state,
+                tenant,
+                "POST /v1/namespaces/docs/flush",
+                serde_json::json!({}),
+            );
+            assert_eq!(status_of(&flushed), 200, "{flushed}");
+        }
+        let search = |tenant: &str| -> Vec<String> {
+            let resp = v1(
+                &state,
+                tenant,
+                "POST /v1/namespaces/docs/search",
+                serde_json::json!({"query_text": "breach contract"}),
+            );
+            assert_eq!(status_of(&resp), 200, "{resp}");
+            body_of(&resp)["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["doc_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        for _ in 0..2 {
+            assert_eq!(search("acme"), ["acme-doc"]);
+            assert_eq!(search("globex"), ["globex-doc"]);
+        }
+        let cache = state.result_cache.lock().unwrap();
+        let mut namespaces: Vec<&str> = cache.entries.keys().map(|k| k.0.as_str()).collect();
+        namespaces.sort_unstable();
+        assert_eq!(namespaces, ["acme/docs", "globex/docs"]);
+        assert_eq!(
+            (cache.hits, cache.misses),
+            (2, 2),
+            "each tenant hit its own"
+        );
+        let stats = cache.tenants.stats();
+        assert_eq!(stats.len(), 2);
+        assert!(stats
+            .iter()
+            .all(|s| s.hits == 1 && s.misses == 1 && s.bytes > 0));
+    }
+
+    /// One tenant filling the result cache evicts its own entries, not a
+    /// quieter tenant's, while that tenant is under its share.
+    #[test]
+    fn result_cache_evicts_from_the_tenant_over_its_share() {
+        let mut c = ResultCache::new(10_000);
+        c.shares = kosha_core::tenancy::TenantShares::new(1_000);
+        for i in 0..5 {
+            c.insert(rc_key("beta/docs", 1, &format!("q{i}")), &"x".repeat(200));
+        }
+        for i in 0..200 {
+            c.insert(rc_key("acme/big", 1, &format!("q{i}")), &"x".repeat(200));
+        }
+        assert!(c.bytes <= 10_000);
+        for i in 0..5 {
+            assert!(
+                c.lookup(&rc_key("beta/docs", 1, &format!("q{i}")))
+                    .is_some(),
+                "beta's entry q{i} survived acme's flood"
+            );
+        }
+        let stats = c.tenants.stats();
+        let acme = stats.iter().find(|s| s.tenant == "acme").unwrap();
+        let beta = stats.iter().find(|s| s.tenant == "beta").unwrap();
+        assert!(acme.evictions > 0);
+        assert_eq!(beta.evictions, 0);
+        assert_eq!(acme.bytes + beta.bytes, c.bytes as u64);
+    }
+
     // ─── Per-tenant quotas and rate limits (#341) ────────────────────────
 
     fn limited_state(json: &str) -> AppState {
