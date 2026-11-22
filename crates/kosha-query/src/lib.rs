@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 
 pub mod rerank;
+/// Offline head/tail analysis (research #387); not on the query path.
+pub mod two_tier;
 
 use kosha_core::fields::{field_norms_key, field_term_key, segment_field_chain};
 use kosha_core::fuzzy::{ExpandStats, FuzzyQuery, MAX_FUZZY_EDITS};
@@ -2163,6 +2165,66 @@ fn knn_global_budget_enabled() -> bool {
     })
 }
 
+/// `KOSHA_KNN_GLOBAL_RESCORE` (#381): `1`, `true` or `on` turns on global
+/// bound-driven rescoring of quantized kNN candidates (see
+/// [`Searcher::knn_global_rescore`]). Off by default: results, logs and
+/// on-disk formats are unchanged unless it is set.
+pub fn knn_global_rescore_from_env() -> bool {
+    matches!(
+        std::env::var("KOSHA_KNN_GLOBAL_RESCORE")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
+/// `KOSHA_KNN_RESCORE_STATS` (#381): `1`, `true` or `on` counts, per kNN
+/// query, the quantized segments the default per-segment path probed and
+/// how many of them returned unrescored estimates (no whole local
+/// `doc_vectors.bin`), and logs them on the `search timing:` line. Off by
+/// default (no extra stat call, line unchanged). Always on with
+/// `KOSHA_KNN_GLOBAL_RESCORE`.
+fn knn_rescore_stats_from_env() -> bool {
+    matches!(
+        std::env::var("KOSHA_KNN_RESCORE_STATS")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
+/// One segment's kNN hits decided by the global rescoring pass (#381),
+/// used by the scoring pass in place of probing that segment again.
+#[derive(Debug, Clone, Default)]
+struct GlobalKnnSegment {
+    /// Best first, at most the query's per-segment `k`. Exact scores,
+    /// except for candidates counted in `unavailable`.
+    hits: Vec<(u32, f64)>,
+    /// Candidates whose exact vector could not be read: their estimate
+    /// stands, and the segment is reported in `knn_degraded_segments`.
+    unavailable: usize,
+}
+
+/// What [`Searcher::knn_global_rescore`] decided, for every segment it
+/// could probe.
+#[derive(Debug, Default)]
+struct GlobalKnnOutcome {
+    segments: HashMap<kosha_core::SegmentId, GlobalKnnSegment>,
+    /// Candidates segments returned after their local bound prune.
+    candidates: usize,
+    /// Quantized candidates whose upper bound reached the global `k`-th
+    /// lower bound: the ones that needed exact vectors.
+    selected: usize,
+    /// Of `selected`, how many were rescored exactly.
+    rescored: usize,
+    /// Of `selected`, how many had no readable exact vector.
+    unavailable: usize,
+    /// `doc_vectors.bin` spans fetched by ranged read.
+    ranged_spans: usize,
+}
+
 /// Centroids probed per query token by late-interaction search (#205)
 /// before candidates are re-scored exactly. `KOSHA_LATE_INTERACTION_NPROBE`,
 /// default 16. Widened automatically in a segment where it turns up fewer
@@ -2559,6 +2621,31 @@ pub struct SearchPhaseStats {
     /// Under the global probe budget it should land near
     /// `num_candidates` for the whole query. Zero for non-kNN queries.
     pub knn_postings_probed: usize,
+    /// Segments in which this kNN query hydrated at least one posting (or,
+    /// on the per-segment fallback, ran a probe at all). Observability only
+    /// (#380): with per-segment clustering every segment holds centroids
+    /// near every query, so this tracks the segment count; with
+    /// cluster-aligned segments it should fall to the few segments that
+    /// own the query's region. Zero for non-kNN queries.
+    ///
+    /// This is NOT the query's fan-out: `knn_plan` still opens every
+    /// segment and ranks every centroid before any posting is probed, so
+    /// opens, cold `vector.offsets` hydration and the centroid scan scale
+    /// with the segment count whatever this says. Read it with
+    /// `knn_centroids_scanned`, `knn_plan_ms` and the open counters.
+    pub knn_segments_probed: usize,
+    /// Centroid lower bounds `knn_plan` computed for this query, summed
+    /// over every segment it opened (#380): the centroid-scan work of the
+    /// global budget, which a cluster-aligned layout does not reduce on its
+    /// own. Zero for non-kNN queries and on the per-segment fallback.
+    pub knn_centroids_scanned: usize,
+    /// Wall time of `knn_plan` (segment opens plus the centroid scan and
+    /// budget cutoff), the part of a kNN query that is paid per segment
+    /// before any posting is read. Zero for non-kNN queries. Disjoint
+    /// from the other wall-clock phases here (it runs between admission and
+    /// the BM25 statistics pass), so the server's `total_ms`, which sums
+    /// those phases, does not include it.
+    pub knn_plan_ms: f64,
     /// Segment directories holding at least one document of the returned
     /// page, deduplicated, in page order: the segments whose doc store this
     /// search read. The server's access tracker (#213) counts these as
@@ -2567,6 +2654,34 @@ pub struct SearchPhaseStats {
     pub page_segments: Vec<PathBuf>,
     /// Vectors scored by exact filtered kNN (#252), summed over segments.
     pub knn_exact_vectors: usize,
+    /// Global bound-driven rescoring (#381, `KOSHA_KNN_GLOBAL_RESCORE`)
+    /// answered this query. The `knn_rescore_*` fields below are zero
+    /// otherwise.
+    pub knn_global_rescore: bool,
+    /// Candidates the segments returned after their own bound prune.
+    pub knn_rescore_candidates: usize,
+    /// Quantized candidates whose upper bound reached the global `k`-th
+    /// lower bound, so needed their exact vector.
+    pub knn_rescore_selected: usize,
+    /// Of those, rescored with their f32 vector from `doc_vectors.bin`.
+    pub knn_rescored: usize,
+    /// Of those, with no readable exact vector: returned as estimates and
+    /// their segments counted in `knn_degraded_segments`.
+    pub knn_rescore_unavailable: usize,
+    /// `doc_vectors.bin` spans fetched by ranged read for rescoring.
+    pub knn_rescore_ranged_spans: usize,
+    /// Wall time of the global rescoring pass (probe + rescore), before
+    /// the scoring pass.
+    pub knn_rescore_ms: f64,
+    /// `KOSHA_KNN_RESCORE_STATS` (or `KOSHA_KNN_GLOBAL_RESCORE`) was on,
+    /// so the two per-segment counters below were collected (#381).
+    pub knn_rescore_stats: bool,
+    /// Segments whose quantized column the default per-segment kNN path
+    /// probed (not the global pass).
+    pub knn_seg_quantized: usize,
+    /// Of those, segments without a whole local `doc_vectors.bin`: their
+    /// quantized estimates were returned unrescored as final scores.
+    pub knn_seg_unrescored: usize,
     /// See `SearchResult::knn_mode`; `None` for a non-kNN query.
     pub knn_mode: Option<KnnMode>,
     /// See `SearchResult::knn_filtered_candidates`.
@@ -2636,6 +2751,10 @@ struct OpenStatsCollector {
     /// Vector postings hydrated across segments (kNN only) — see
     /// [`SearchPhaseStats::knn_postings_probed`].
     knn_postings: AtomicUsize,
+    /// See [`SearchPhaseStats::knn_segments_probed`].
+    knn_segments: AtomicUsize,
+    /// See [`SearchPhaseStats::knn_centroids_scanned`].
+    knn_centroids: AtomicUsize,
     /// See [`SearchPhaseStats::wand_docs_scored`].
     wand_docs_scored: AtomicUsize,
     /// See [`SearchPhaseStats::wand_segments_skipped`].
@@ -2643,6 +2762,10 @@ struct OpenStatsCollector {
     /// Vectors scored by exact filtered kNN — see
     /// [`SearchPhaseStats::knn_exact_vectors`].
     knn_exact_vectors: AtomicUsize,
+    /// See [`SearchPhaseStats::knn_seg_quantized`].
+    knn_seg_quantized: AtomicUsize,
+    /// See [`SearchPhaseStats::knn_seg_unrescored`].
+    knn_seg_unrescored: AtomicUsize,
 }
 
 pub struct Searcher {
@@ -2665,6 +2788,14 @@ pub struct Searcher {
     knn_exact_threshold: usize,
     /// See [`DEFAULT_KNN_EXACT_FRACTION`].
     knn_exact_fraction: f64,
+    /// Global bound-driven rescoring (#381): see
+    /// [`Searcher::with_knn_global_rescore`]. Default from
+    /// `KOSHA_KNN_GLOBAL_RESCORE`, off.
+    knn_global_rescore: bool,
+    /// Per-segment rescoring counters (#381): see
+    /// [`Searcher::with_knn_rescore_stats`]. Default from
+    /// `KOSHA_KNN_RESCORE_STATS`, off.
+    knn_rescore_stats: bool,
 }
 
 /// Weak handles to the readers of one released segment.
@@ -2756,6 +2887,8 @@ impl Searcher {
             draining: Mutex::new(HashMap::new()),
             knn_exact_threshold: knn_exact_threshold_from_env(),
             knn_exact_fraction: knn_exact_fraction_from_env(),
+            knn_global_rescore: knn_global_rescore_from_env(),
+            knn_rescore_stats: knn_rescore_stats_from_env(),
         }
     }
 
@@ -2817,6 +2950,34 @@ impl Searcher {
         self.knn_exact_threshold = threshold;
         self.knn_exact_fraction = fraction.max(0.0);
         self
+    }
+
+    /// Turns global bound-driven rescoring of kNN candidates (#381) on or
+    /// off; see [`Searcher::knn_global_rescore`]. The default comes from
+    /// `KOSHA_KNN_GLOBAL_RESCORE` and is off.
+    pub fn with_knn_global_rescore(mut self, enabled: bool) -> Self {
+        self.knn_global_rescore = enabled;
+        self
+    }
+
+    /// Whether global bound-driven kNN rescoring (#381) is on. The server
+    /// reads it to hydrate `doc_vectors.bin` headers with a kNN's scoring
+    /// files, since the pass reads exact vectors by range.
+    pub fn knn_global_rescore_enabled(&self) -> bool {
+        self.knn_global_rescore
+    }
+
+    /// Turns the per-segment rescoring counters (#381,
+    /// [`SearchPhaseStats::knn_seg_quantized`] and
+    /// [`SearchPhaseStats::knn_seg_unrescored`]) on or off. The default
+    /// comes from `KOSHA_KNN_RESCORE_STATS` and is off.
+    pub fn with_knn_rescore_stats(mut self, enabled: bool) -> Self {
+        self.knn_rescore_stats = enabled;
+        self
+    }
+
+    fn knn_rescore_stats_on(&self) -> bool {
+        self.knn_rescore_stats || self.knn_global_rescore
     }
 
     /// Return the cached parsed segment for `(namespace, segment_id,
@@ -3052,6 +3213,199 @@ impl Searcher {
     /// `knn.vector`'s dimension differs from the field's. Judged on the
     /// segments present locally; with none present there is nothing to
     /// judge by and the query proceeds.
+    /// Global bound-driven rescoring of a kNN query's candidates (#381,
+    /// `KOSHA_KNN_GLOBAL_RESCORE`).
+    ///
+    /// The default path rescores per segment: a quantized column rescores
+    /// its best `k * KOSHA_VECTOR_RESCORE_FACTOR` (more for RaBitQ) in every
+    /// segment, so a 200-segment namespace reads >= 8,000 exact vectors for
+    /// one top-10, and without `doc_vectors.bin` it returns its estimates as
+    /// final scores with no signal. Here instead:
+    ///
+    /// 1. every segment probes as the plan says and returns its candidates
+    ///    with error bounds ([`SegmentReader::knn_candidates_fetching`]);
+    /// 2. the `k`-th largest lower bound across all of them is computed;
+    /// 3. only quantized candidates whose upper bound reaches it are
+    ///    rescored, from `doc_vectors.bin` locally or by ranged reads
+    ///    through `vector_fetch`
+    ///    ([`SegmentReader::knn_exact_scores_fetching`]);
+    /// 4. a candidate whose exact vector cannot be read keeps its estimate,
+    ///    counted in `knn_rescore_unavailable`, and its segment in
+    ///    `knn_degraded_segments`.
+    ///
+    /// The result per segment is the best `k` of its selected candidates,
+    /// which the scoring pass uses instead of probing again. Segments it
+    /// cannot answer (no lazy index, wrong dimension, another embedding
+    /// model, a probe error) are left to the scoring pass, which handles
+    /// and reports them as before.
+    ///
+    /// Exact against f32 brute force over the probed postings when the
+    /// bounds hold: i8 bounds do (`KOSHA_KNN_I8_BOUND=strict`, default),
+    /// RaBitQ's hold with its confidence (`RABITQ_EPSILON0`). A segment's
+    /// hit count may be below `k` where the default path returns `k`, so a
+    /// pure kNN query's `total_hits` can be smaller.
+    #[allow(clippy::too_many_arguments)]
+    fn knn_global_rescore(
+        &self,
+        namespace: &NamespaceId,
+        manifest: &Manifest,
+        query: &SearchQuery,
+        knn: &kosha_core::KnnQuery,
+        cutoff: Option<(f32, usize)>,
+        tombstones: Option<
+            &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
+        >,
+        permit: &AdmissionPermit,
+        open_stats: &OpenStatsCollector,
+        vector_fetch: Option<VectorSpanFetch<'_>>,
+    ) -> GlobalKnnOutcome {
+        // The same per-segment depth the scoring pass would ask for
+        // (`limit_per` never reaches here: see the gate in `search_inner`).
+        debug_assert!(query.limit_per.is_none());
+        let fetch_k = knn.k;
+        let budget = match cutoff {
+            Some((max_distance, max_probes)) => kosha_segment::KnnProbeBudget::Within {
+                max_distance,
+                max_probes,
+            },
+            None => kosha_segment::KnnProbeBudget::Nprobe(knn.num_candidates),
+        };
+        // 1. Candidates with bounds, per segment, in parallel.
+        let probed: Vec<(
+            &kosha_core::SegmentId,
+            Arc<TrackedSegment>,
+            kosha_segment::KnnCandidates,
+        )> = manifest
+            .segments
+            .par_iter()
+            .filter_map(|entry| {
+                let seg_dir = manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id);
+                if !seg_dir.exists() {
+                    return None;
+                }
+                let reader = self
+                    .open_segment(
+                        &namespace.0,
+                        &entry.segment_id.0,
+                        seg_dir,
+                        true,
+                        manifest.segment_footer(&entry.segment_id),
+                        Some(permit),
+                        Some(open_stats),
+                    )
+                    .ok()?;
+                if segment_embedding_model_mismatch(reader.footer(), knn) {
+                    return None;
+                }
+                let index = reader.vector_field(&knn.field).ok()??;
+                if !index.has_lazy_index() || index.dim().is_some_and(|d| d != knn.vector.len()) {
+                    return None;
+                }
+                let dead = tombstones
+                    .and_then(|t| t.get(&entry.segment_id))
+                    .filter(|seqs| !seqs.is_empty());
+                let accept = |doc_seq: u32| dead.is_none_or(|seqs| !seqs.contains(&doc_seq));
+                let accept_dyn: Option<&dyn Fn(u32) -> bool> =
+                    if dead.is_some() { Some(&accept) } else { None };
+                let found = reader
+                    .knn_candidates_fetching(
+                        &knn.field,
+                        &knn.vector,
+                        fetch_k,
+                        budget,
+                        accept_dyn,
+                        vector_fetch,
+                    )?
+                    .ok()?;
+                open_stats
+                    .knn_postings
+                    .fetch_add(found.postings, Ordering::Relaxed);
+                Some((&entry.segment_id, reader, found))
+            })
+            .collect();
+
+        // 2. The global k-th lower bound.
+        let all: Vec<kosha_segment::KnnCandidate> = probed
+            .iter()
+            .flat_map(|(_, _, found)| found.candidates.iter().copied())
+            .collect();
+        let threshold = kosha_segment::kth_lower_bound(&all, fetch_k);
+        let reaches = |c: &kosha_segment::KnnCandidate| threshold.is_none_or(|t| c.upper() >= t);
+
+        // 3-4. Rescore the survivors, per segment, in parallel.
+        struct Rescored {
+            segment: GlobalKnnSegment,
+            selected: usize,
+            rescored: usize,
+            ranged_spans: usize,
+        }
+        let rescored: Vec<(&kosha_core::SegmentId, Rescored)> =
+            probed
+                .par_iter()
+                .map(|(segment_id, reader, found)| {
+                    let survivors: Vec<&kosha_segment::KnnCandidate> =
+                        found.candidates.iter().filter(|c| reaches(c)).collect();
+                    let mut out = Rescored {
+                        segment: GlobalKnnSegment::default(),
+                        selected: 0,
+                        rescored: 0,
+                        ranged_spans: 0,
+                    };
+                    let mut hits: Vec<(u32, f64)> =
+                        if found.exact {
+                            survivors.iter().map(|c| (c.doc_seq, c.estimate)).collect()
+                        } else {
+                            out.selected = survivors.len();
+                            let seqs: Vec<u32> = survivors.iter().map(|c| c.doc_seq).collect();
+                            let exact = reader.knn_exact_scores_fetching(
+                                &knn.field,
+                                &knn.vector,
+                                &seqs,
+                                vector_fetch,
+                            );
+                            if exact.unavailable > 0 {
+                                eprintln!(
+                            "WARN: {} kNN candidates of {} kept their quantized estimate: {}",
+                            exact.unavailable,
+                            reader.segment_dir().display(),
+                            exact.reason.as_deref().unwrap_or("exact vectors unavailable")
+                        );
+                            }
+                            out.rescored = exact.scores.len();
+                            out.ranged_spans = exact.ranged_spans;
+                            out.segment.unavailable = exact.unavailable;
+                            let exact: HashMap<u32, f64> = exact.scores.into_iter().collect();
+                            survivors
+                                .iter()
+                                .map(|c| {
+                                    (
+                                        c.doc_seq,
+                                        exact.get(&c.doc_seq).copied().unwrap_or(c.estimate),
+                                    )
+                                })
+                                .collect()
+                        };
+                    hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    hits.truncate(fetch_k);
+                    out.segment.hits = hits;
+                    (*segment_id, out)
+                })
+                .collect();
+
+        let mut outcome = GlobalKnnOutcome {
+            candidates: all.len(),
+            ..GlobalKnnOutcome::default()
+        };
+        for (segment_id, r) in rescored {
+            outcome.selected += r.selected;
+            outcome.rescored += r.rescored;
+            outcome.unavailable += r.segment.unavailable;
+            outcome.ranged_spans += r.ranged_spans;
+            outcome.segments.insert(segment_id.clone(), r.segment);
+        }
+        outcome
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn knn_plan(
         &self,
@@ -3206,6 +3560,13 @@ impl Searcher {
                 })
             })
             .collect();
+        open_stats.knn_centroids.fetch_add(
+            per_segment
+                .iter()
+                .filter_map(|info| info.distances.as_ref().map(Vec::len))
+                .sum(),
+            Ordering::Relaxed,
+        );
 
         check_knn_field(namespace, knn, per_segment.iter().map(|info| &info.status))?;
 
@@ -3837,6 +4198,9 @@ impl Searcher {
         // The plan put this segment on the exact path (#252): score every
         // filter-passing document's vector instead of probing.
         knn_exact: bool,
+        // This segment's kNN hits, already decided by the global
+        // rescoring pass (#381); `None` probes here as usual.
+        knn_global: Option<&GlobalKnnSegment>,
         // Canonical JSON of `query.filter` and `query.knn.filter`, computed
         // once per request: the key into each segment's filter-set cache.
         filter_keys: &FilterKeys,
@@ -5254,6 +5618,9 @@ impl Searcher {
                         open_stats
                             .knn_postings
                             .fetch_add(found.postings_probed, Ordering::Relaxed);
+                        if found.postings_probed > 0 {
+                            open_stats.knn_segments.fetch_add(1, Ordering::Relaxed);
+                        }
                         late_results = Some(found.hits);
                     }
                     Err(e @ KoshaError::InvalidQuery(_)) => return Err(e),
@@ -5298,6 +5665,15 @@ impl Searcher {
                 Ok(Some(index)) if index.dim().is_some_and(|dim| dim != knn.vector.len()) => {
                     Vec::new()
                 }
+                // Decided by the global rescoring pass (#381): exact
+                // scores, or estimates it could not rescore (reported).
+                Ok(Some(_)) if knn_global.is_some() => {
+                    let global = knn_global.expect("checked by the guard");
+                    if global.unavailable > 0 {
+                        knn_segment_degraded = true;
+                    }
+                    global.hits.clone()
+                }
                 Ok(Some(index)) if index.has_lazy_index() && knn_exact => {
                     // Every document the filters and tombstones let
                     // through, scored exactly (#252). Planned only for a
@@ -5320,6 +5696,9 @@ impl Searcher {
                             open_stats
                                 .knn_postings
                                 .fetch_add(exact.postings_hydrated, Ordering::Relaxed);
+                            if exact.postings_hydrated > 0 || exact.vectors_scored > 0 {
+                                open_stats.knn_segments.fetch_add(1, Ordering::Relaxed);
+                            }
                             open_stats
                                 .knn_exact_vectors
                                 .fetch_add(exact.vectors_scored, Ordering::Relaxed);
@@ -5337,6 +5716,17 @@ impl Searcher {
                     }
                 }
                 Ok(Some(index)) if index.has_lazy_index() => {
+                    // Observability only (#381, off by default): would this
+                    // segment's quantized shortlist be rescored, or its
+                    // estimates returned as final?
+                    if self.knn_rescore_stats_on() && index.is_quantized() {
+                        open_stats.knn_seg_quantized.fetch_add(1, Ordering::Relaxed);
+                        if !reader.rescores_quantized_locally() {
+                            open_stats
+                                .knn_seg_unrescored
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     let probe = match knn_cutoff {
                         Some((cutoff, effective_budget)) => reader
                             .knn_search_within_filtered_fetching(
@@ -5351,6 +5741,9 @@ impl Searcher {
                             .map(|r| {
                                 r.map(|(results, probes)| {
                                     open_stats.knn_postings.fetch_add(probes, Ordering::Relaxed);
+                                    if probes > 0 {
+                                        open_stats.knn_segments.fetch_add(1, Ordering::Relaxed);
+                                    }
                                     results
                                 })
                             }),
@@ -5372,6 +5765,7 @@ impl Searcher {
                                     open_stats
                                         .knn_postings
                                         .fetch_add(knn.num_candidates, Ordering::Relaxed);
+                                    open_stats.knn_segments.fetch_add(1, Ordering::Relaxed);
                                 })
                             }),
                     };
@@ -5972,22 +6366,67 @@ impl Searcher {
         //
         // Late interaction (#205) probes its own per-field token index;
         // none of this applies to it.
+        let t_knn_plan = Instant::now();
         let knn_plan = match query.knn {
-            Some(ref knn) if !knn.is_late_interaction() => self.knn_plan(
-                namespace,
-                manifest,
-                query,
-                knn,
-                &filter_keys,
-                tombstones,
-                &permit,
-                &open_stats,
-            )?,
+            Some(ref knn) if !knn.is_late_interaction() => {
+                let plan = self.knn_plan(
+                    namespace,
+                    manifest,
+                    query,
+                    knn,
+                    &filter_keys,
+                    tombstones,
+                    &permit,
+                    &open_stats,
+                )?;
+                phase_stats.knn_plan_ms = t_knn_plan.elapsed().as_secs_f64() * 1e3;
+                plan
+            }
             _ => KnnPlan::default(),
         };
         phase_stats.knn_mode = knn_plan.mode;
         phase_stats.knn_filtered_candidates = knn_plan.filtered_candidates;
         phase_stats.knn_cutoff_rule = knn_plan.cutoff_rule;
+
+        // ── global bound-driven rescoring (#381) ───────────────────────
+        // Off by default. Unfiltered single-vector kNN only: a filtered
+        // query keeps the per-segment path (and its exact plan, #252).
+        // Nor under `limit_per`: there each segment returns
+        // `max(k, num_candidates)` hits so the diversity cap has groups to
+        // choose from, and a namespace-wide prune to that depth would hand
+        // the cap far fewer groups (a dominant group can fill all of it).
+        let knn_global: Option<GlobalKnnOutcome> = match query.knn {
+            Some(ref knn)
+                if self.knn_global_rescore
+                    && !knn.is_late_interaction()
+                    && knn.filter.is_none()
+                    && query.filter.is_none()
+                    && query.limit_per.is_none()
+                    && knn_plan.exact_segments.is_empty() =>
+            {
+                let t_rescore = Instant::now();
+                let outcome = self.knn_global_rescore(
+                    namespace,
+                    manifest,
+                    query,
+                    knn,
+                    knn_plan.cutoff,
+                    tombstones,
+                    &permit,
+                    &open_stats,
+                    vector_fetch,
+                );
+                phase_stats.knn_global_rescore = true;
+                phase_stats.knn_rescore_candidates = outcome.candidates;
+                phase_stats.knn_rescore_selected = outcome.selected;
+                phase_stats.knn_rescored = outcome.rescored;
+                phase_stats.knn_rescore_unavailable = outcome.unavailable;
+                phase_stats.knn_rescore_ranged_spans = outcome.ranged_spans;
+                phase_stats.knn_rescore_ms = t_rescore.elapsed().as_secs_f64() * 1e3;
+                Some(outcome)
+            }
+            _ => None,
+        };
 
         // ── BM25 collection statistics (issue #246) ────────────────────
         // Namespace-level by default, so every segment scores with the same
@@ -6038,6 +6477,9 @@ impl Searcher {
                 &open_stats,
                 knn_plan.cutoff,
                 knn_plan.exact_segments.contains(&entry.segment_id),
+                knn_global
+                    .as_ref()
+                    .and_then(|global| global.segments.get(&entry.segment_id)),
                 &filter_keys,
                 vector_fetch,
                 corpus.as_ref(),
@@ -6123,7 +6565,14 @@ impl Searcher {
             as f64
             / 1e6;
         phase_stats.knn_postings_probed = open_stats.knn_postings.load(Ordering::Relaxed);
+        phase_stats.knn_segments_probed = open_stats.knn_segments.load(Ordering::Relaxed);
+        phase_stats.knn_centroids_scanned = open_stats.knn_centroids.load(Ordering::Relaxed);
         phase_stats.knn_exact_vectors = open_stats.knn_exact_vectors.load(Ordering::Relaxed);
+        if query.knn.is_some() && self.knn_rescore_stats_on() {
+            phase_stats.knn_rescore_stats = true;
+            phase_stats.knn_seg_quantized = open_stats.knn_seg_quantized.load(Ordering::Relaxed);
+            phase_stats.knn_seg_unrescored = open_stats.knn_seg_unrescored.load(Ordering::Relaxed);
+        }
         let t_materialize = Instant::now();
 
         let mut candidates: Vec<HitCandidate> = Vec::new();
@@ -9938,6 +10387,20 @@ mod tests {
             stats.knn_postings_probed > 0,
             "a kNN query must probe something"
         );
+        // #380 observability: the probed-segment count is bounded by the
+        // segment count, while the centroid scan still covers every segment
+        // (each of the SEGS segments contributes at least one centroid).
+        assert!(
+            stats.knn_segments_probed > 0 && stats.knn_segments_probed <= SEGS,
+            "knn_segments_probed ({}) must be in 1..={SEGS}",
+            stats.knn_segments_probed
+        );
+        assert!(
+            stats.knn_centroids_scanned >= SEGS,
+            "knn_plan ranks centroids of every segment: {} < {SEGS}",
+            stats.knn_centroids_scanned
+        );
+        assert!(stats.knn_plan_ms >= 0.0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -11788,6 +12251,311 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A namespace of 300-vector segments, one per entry of `formats`, for
+    /// the global rescoring tests (#381): `(dir, ns, manifest, corpus)`
+    /// with `corpus` every `(doc_id, vector)`.
+    fn global_rescore_corpus(
+        name: &str,
+        formats: &[kosha_core::VectorQuantization],
+    ) -> (
+        std::path::PathBuf,
+        NamespaceId,
+        Manifest,
+        Vec<(String, Vec<f32>)>,
+    ) {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-knn-global-rescore-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let mut entries = Vec::new();
+        let mut corpus = Vec::new();
+        for (seg_idx, &quantization) in formats.iter().enumerate() {
+            let seg = format!("seg{seg_idx}-{}", quantization.as_str());
+            let mut w = SegmentWriter::new(SegmentId(seg.clone()), dir.join(&ns.0).join(&seg))
+                .with_vector_quantization(kosha_segment::VectorQuantizationConfig::all(
+                    quantization,
+                ));
+            for i in 0..300u64 {
+                let id = format!("{seg}-{i}");
+                let v = global_rescore_vector(seg_idx as u64 * 1000 + i);
+                corpus.push((id.clone(), v.clone()));
+                w.add_document(DocumentId(id), vec![Field::vector("emb", v)]);
+            }
+            w.finalize(Bm25Params::default()).unwrap();
+            entries.push(ManifestEntry {
+                segment_id: SegmentId(seg),
+                doc_count: 300,
+            });
+        }
+        let manifest = Manifest {
+            version: 1,
+            segments: entries,
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            schema: None,
+            retired: Default::default(),
+            shards: None,
+            branch: None,
+        };
+        (dir, ns, manifest, corpus)
+    }
+
+    fn global_rescore_vector(seed: u64) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..32)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+            })
+            .collect()
+    }
+
+    fn global_rescore_query(vector: Vec<f32>, k: usize) -> SearchQuery {
+        let mut q = mk_query("", k);
+        q.knn = Some(kosha_core::KnnQuery {
+            query_text: None,
+            embedding_model: None,
+            field: "emb".into(),
+            vector,
+            k,
+            // Every posting of every segment: only quantization, not the
+            // probe budget, could cost recall.
+            num_candidates: 10_000,
+            filter: None,
+            scoring: None,
+            vectors: None,
+        });
+        q
+    }
+
+    /// The brute-force f32 top `k` of `corpus` for `query`: `(id, cosine)`.
+    fn global_rescore_brute_force(
+        corpus: &[(String, Vec<f32>)],
+        query: &[f32],
+        k: usize,
+    ) -> Vec<(String, f64)> {
+        let cosine = |a: &[f32], b: &[f32]| -> f64 {
+            let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
+            let na: f64 = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            let nb: f64 = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            dot / (na * nb)
+        };
+        let mut exact: Vec<(String, f64)> = corpus
+            .iter()
+            .map(|(id, v)| (id.clone(), cosine(query, v)))
+            .collect();
+        exact.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        exact.truncate(k);
+        exact
+    }
+
+    #[test]
+    fn knn_global_rescore_is_exact_against_f32_brute_force_with_i8_segments() {
+        // #381: with global bound-driven rescoring, i8 segments (whose
+        // strict bound is a guarantee) mixed with f32 ones return exactly
+        // the f32 brute-force top k, scores included, and rescore only the
+        // candidates the global k-th lower bound cannot rule out.
+        use kosha_core::VectorQuantization::{F32, I8};
+        let (dir, ns, manifest, corpus) = global_rescore_corpus("i8", &[F32, I8, I8, F32, I8, I8]);
+        let global = Searcher::new(dir.clone()).with_knn_global_rescore(true);
+        let default = Searcher::new(dir.clone()).with_knn_global_rescore(false);
+        let k = 10;
+        for q_seed in 0..10u64 {
+            let query = global_rescore_vector(900_000 + q_seed);
+            let q = global_rescore_query(query.clone(), k);
+            let (r, stats) = global.search_with_stats(&ns, &manifest, &q, None).unwrap();
+            assert!(stats.knn_global_rescore);
+            assert_eq!(r.knn_degraded_segments, Some(0));
+            assert_eq!(stats.knn_rescore_unavailable, 0);
+            assert!(stats.knn_rescored > 0);
+            assert_eq!(stats.knn_rescored, stats.knn_rescore_selected);
+            assert!(stats.knn_rescore_selected <= stats.knn_rescore_candidates);
+            let want = global_rescore_brute_force(&corpus, &query, k);
+            let got: Vec<&str> = r.results.iter().map(|h| h.doc_id.0.as_str()).collect();
+            let want_ids: Vec<&str> = want.iter().map(|(id, _)| id.as_str()).collect();
+            assert_eq!(got, want_ids, "query {q_seed}");
+            // Pure kNN scores are `(cosine + 1) * 10`.
+            for (hit, (_, cosine)) in r.results.iter().zip(&want) {
+                assert!((hit.score - (cosine + 1.0) * 10.0).abs() < 1e-3);
+            }
+
+            // Off (the default), nothing about the query changes.
+            let (_, off) = default.search_with_stats(&ns, &manifest, &q, None).unwrap();
+            assert!(!off.knn_global_rescore);
+            assert_eq!(off.knn_rescore_candidates, 0);
+            assert_eq!(off.knn_rescored, 0);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn knn_global_rescore_recalls_the_f32_top_k_with_rabitq_segments() {
+        use kosha_core::VectorQuantization::{RaBitQ, F32, I8};
+        let (dir, ns, manifest, corpus) =
+            global_rescore_corpus("rabitq", &[RaBitQ, F32, RaBitQ, I8, RaBitQ]);
+        let searcher = Searcher::new(dir.clone()).with_knn_global_rescore(true);
+        let (k, queries) = (10, 20u64);
+        let mut recall = 0.0f64;
+        for q_seed in 0..queries {
+            let query = global_rescore_vector(800_000 + q_seed);
+            let q = global_rescore_query(query.clone(), k);
+            let (r, stats) = searcher
+                .search_with_stats(&ns, &manifest, &q, None)
+                .unwrap();
+            assert!(stats.knn_global_rescore);
+            assert_eq!(r.knn_degraded_segments, Some(0));
+            let want: HashSet<String> = global_rescore_brute_force(&corpus, &query, k)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            recall += r
+                .results
+                .iter()
+                .filter(|h| want.contains(&h.doc_id.0))
+                .count() as f64
+                / k as f64;
+            assert!(r.results.windows(2).all(|w| w[0].score >= w[1].score));
+        }
+        let recall = recall / queries as f64;
+        assert!(recall >= 0.95, "recall@10 {recall}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn knn_global_rescore_reports_missing_exact_vectors_as_degraded() {
+        // #381: the default path returns a quantized segment's estimates as
+        // final when `doc_vectors.bin` is not local, with no signal. Global
+        // rescoring keeps the estimates too (there is nothing better), but
+        // counts the segment in `knn_degraded_segments` and the candidates
+        // in `knn_rescore_unavailable`.
+        use kosha_core::VectorQuantization::{F32, I8};
+        let (dir, ns, manifest, _) = global_rescore_corpus("degraded", &[F32, I8, I8]);
+        let sidecars: Vec<(PathBuf, Vec<u8>)> = manifest
+            .segments
+            .iter()
+            .filter(|entry| entry.segment_id.0.contains("-i8"))
+            .map(|entry| {
+                let path = manifest
+                    .segment_dir(&dir, &ns, &entry.segment_id)
+                    .join(kosha_segment::DOC_VECTORS_FILE);
+                let bytes = std::fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect();
+        let evict = || {
+            for (path, _) in &sidecars {
+                let _ = std::fs::remove_file(path);
+            }
+        };
+        // Scoring sees no sidecar; the page's documents then get theirs
+        // back, as the server's page hydrator would fetch them.
+        let restore = |_: &[PageSegment<'_>]| {
+            for (path, bytes) in &sidecars {
+                std::fs::write(path, bytes).unwrap();
+            }
+        };
+        let q = global_rescore_query(global_rescore_vector(4242), 10);
+
+        evict();
+        let (silent, silent_stats) = Searcher::new(dir.clone())
+            .with_knn_global_rescore(false)
+            .search_with_hydrators(&ns, &manifest, &q, None, Some(&restore), None)
+            .unwrap();
+        assert_eq!(
+            silent.knn_degraded_segments,
+            Some(0),
+            "today's per-segment path: estimates returned silently"
+        );
+        assert!(!silent_stats.knn_global_rescore);
+
+        evict();
+        let (r, stats) = Searcher::new(dir.clone())
+            .with_knn_global_rescore(true)
+            .search_with_hydrators(&ns, &manifest, &q, None, Some(&restore), None)
+            .unwrap();
+        assert!(stats.knn_global_rescore);
+        assert!(stats.knn_rescore_unavailable > 0);
+        assert_eq!(stats.knn_rescored, 0);
+        assert_eq!(
+            r.knn_degraded_segments,
+            Some(2),
+            "both i8 segments surface their unreadable exact vectors"
+        );
+        assert_eq!(r.results.len(), 10, "estimates still answer the query");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn knn_global_rescore_reads_exact_vectors_by_range_when_not_local() {
+        // #381: codes-only local tier. `doc_vectors.bin` is not local, only
+        // its header (as page materialization caches it); the exact vectors
+        // the bound selects are fetched by ranged read through the search's
+        // vector fetcher, once per query, and the answer is exact.
+        use kosha_core::VectorQuantization::I8;
+        let (dir, ns, manifest, corpus) = global_rescore_corpus("ranged", &[I8, I8]);
+        let mut sidecars: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+        for entry in &manifest.segments {
+            let seg_dir = manifest.segment_dir(&dir, &ns, &entry.segment_id);
+            let path = seg_dir.join(kosha_segment::DOC_VECTORS_FILE);
+            let bytes = std::fs::read(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            let header_len = kosha_segment::doc_vectors_header_len(&bytes)
+                .unwrap()
+                .unwrap();
+            let spans =
+                kosha_segment::span_cache::spans_dir(&seg_dir, kosha_segment::DOC_VECTORS_FILE);
+            std::fs::create_dir_all(&spans).unwrap();
+            std::fs::write(
+                spans.join(kosha_segment::span_cache::span_file_name(0, header_len)),
+                &bytes[..header_len as usize],
+            )
+            .unwrap();
+            sidecars.insert(seg_dir, bytes);
+        }
+        let calls = Mutex::new(0usize);
+        let fetch = |seg: &Path, file: &str, ranges: &[(u64, u64)]| {
+            if file != kosha_segment::DOC_VECTORS_FILE {
+                return;
+            }
+            *calls.lock().unwrap() += 1;
+            let bytes = &sidecars[seg];
+            let spans = kosha_segment::span_cache::spans_dir(seg, file);
+            for &(s, e) in ranges {
+                std::fs::write(
+                    spans.join(kosha_segment::span_cache::span_file_name(s, e)),
+                    &bytes[s as usize..e as usize],
+                )
+                .unwrap();
+            }
+        };
+        let searcher = Searcher::new(dir.clone()).with_knn_global_rescore(true);
+        let query = global_rescore_vector(5150);
+        let q = global_rescore_query(query.clone(), 10);
+        let (r, stats) = searcher
+            .search_with_hydrators(&ns, &manifest, &q, None, None, Some(&fetch))
+            .unwrap();
+        assert_eq!(r.knn_degraded_segments, Some(0));
+        assert_eq!(stats.knn_rescore_unavailable, 0);
+        assert!(stats.knn_rescore_ranged_spans > 0);
+        assert_eq!(stats.knn_rescored, stats.knn_rescore_selected);
+        assert!(*calls.lock().unwrap() >= 1);
+        let want: Vec<String> = global_rescore_brute_force(&corpus, &query, 10)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let got: Vec<String> = r.results.iter().map(|h| h.doc_id.0.clone()).collect();
+        assert_eq!(got, want);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn namespace_mixing_f32_and_i8_segments_ranks_like_f32_brute_force() {
         // #210: an i8-quantized segment written next to f32 segments (a
@@ -13153,6 +13921,101 @@ mod tests {
             retired: Default::default(),
             shards: None,
         }
+    }
+
+    /// Two-segment namespace whose segments are written at the given
+    /// inverted-postings versions (#386): same documents as
+    /// `mk_or_corpus`, split across `s1` (even docs) and `s2` (odd docs).
+    fn mk_versioned_namespace(dir: &std::path::Path, ns: &str, versions: [u32; 2]) -> Manifest {
+        let mut manifest = mk_or_corpus(dir, "__unused", 0);
+        manifest.segments.clear();
+        let _ = std::fs::remove_dir_all(dir.join("__unused"));
+        for (s, version) in versions.into_iter().enumerate() {
+            let id = SegmentId(format!("s{}", s + 1));
+            let mut w = SegmentWriter::new(id.clone(), dir.join(ns).join(&id.0))
+                .with_postings_write_version(version);
+            let mut count = 0;
+            for i in (s..1_200).step_by(2) {
+                let mut content = String::new();
+                if i % 3 == 0 {
+                    content.push_str(&"solar ".repeat(i % 6 + 1));
+                }
+                if i % 4 == 0 {
+                    content.push_str(&"lunar ".repeat(i % 5 + 1));
+                }
+                if i % 7 == 0 {
+                    content.push_str("eclipse solar ");
+                }
+                content.push_str("filler ");
+                content.push_str(&"pad ".repeat(i % 11));
+                w.add_document(
+                    DocumentId(format!("doc-{i:04}")),
+                    vec![Field::text("content", content)],
+                );
+                count += 1;
+            }
+            w.finalize(Bm25Params::default()).unwrap();
+            manifest.segments.push(ManifestEntry {
+                segment_id: id,
+                doc_count: count,
+            });
+        }
+        manifest
+    }
+
+    /// Mixed v5/v6 namespace (#386): a namespace whose segments differ only
+    /// in postings version returns exactly the all-v5 namespace's hits,
+    /// totals and scores — AND/WAND, OR/WAND, single-term and phrase.
+    #[test]
+    fn mixed_v5_v6_namespace_matches_all_v5() {
+        use kosha_segment::{
+            BITPACKED_SKIP_SPLIT_INVERTED_VERSION as V6, SKIP_SPLIT_INVERTED_VERSION as V5,
+        };
+        let dir =
+            std::env::temp_dir().join(format!("kosha-test-mixed-v5-v6-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let base = NamespaceId("v5v5".into());
+        let base_manifest = mk_versioned_namespace(&dir, &base.0, [V5, V5]);
+        let searcher = Searcher::new(dir.clone());
+        let mut queries = vec![
+            mk_query("solar", 20),
+            mk_query("solar lunar", 20),
+            mk_query_or("solar lunar eclipse", 20),
+            mk_query_or("filler pad", 50),
+            force_legacy(mk_query_or("solar lunar", 20)),
+        ];
+        let mut phrase = mk_query("", 20);
+        phrase.match_phrase = Some(
+            serde_json::from_value(
+                serde_json::json!({"field": "content", "phrase": "eclipse solar"}),
+            )
+            .unwrap(),
+        );
+        queries.push(phrase);
+        for (name, versions) in [("v5v6", [V5, V6]), ("v6v5", [V6, V5]), ("v6v6", [V6, V6])] {
+            let ns = NamespaceId(name.into());
+            let manifest = mk_versioned_namespace(&dir, name, versions);
+            for q in &queries {
+                let want = searcher.search(&base, &base_manifest, q, None).unwrap();
+                let got = searcher.search(&ns, &manifest, q, None).unwrap();
+                assert!(
+                    want.total_hits > 0,
+                    "{name}: query must match: {:?}",
+                    q.query_text
+                );
+                assert_eq!(got.total_hits, want.total_hits, "{name} {:?}", q.query_text);
+                assert_eq!(page_ids(&got), page_ids(&want), "{name} {:?}", q.query_text);
+                for (g, w) in got.results.iter().zip(&want.results) {
+                    assert_eq!(
+                        g.score.to_bits(),
+                        w.score.to_bits(),
+                        "{name} {}",
+                        g.doc_id.0
+                    );
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -19258,6 +20121,30 @@ mod limit_per_tests {
         all.knn = knn(1000);
         let all = searcher.search(&ns(), &manifest, &all, None).unwrap();
         assert_eq!(ids(&r), reference_cap(&all.results, 2)[..10]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Global kNN rescoring (#381) must not change a `limit_per` kNN: it
+    /// stays on the per-segment path, which returns `num_candidates` per
+    /// segment for the cap to diversify. With a realistic `num_candidates`
+    /// a namespace-wide prune to that depth kept only the dominant author
+    /// (2 hits instead of 10) before the gate excluded `limit_per`.
+    #[test]
+    fn knn_limit_per_is_unchanged_by_global_rescore() {
+        let dir = scratch("knn-global-rescore");
+        let (manifest, _) = write(&dir, &corpus(), 3);
+        let mut q = query(serde_json::json!({"query_text": "", "max_results": 10}));
+        let mut knn = knn(10).unwrap();
+        knn.num_candidates = 60;
+        q.knn = Some(knn);
+        q.limit_per = limit(2);
+        let off = Searcher::new(dir.clone()).with_knn_global_rescore(false);
+        let on = Searcher::new(dir.clone()).with_knn_global_rescore(true);
+        let want = off.search(&ns(), &manifest, &q, None).unwrap();
+        assert_eq!(want.results.len(), 10, "{:?}", ids(&want));
+        let (got, stats) = on.search_with_stats(&ns(), &manifest, &q, None).unwrap();
+        assert!(!stats.knn_global_rescore, "limit_per must skip the pass");
+        assert_eq!(ids(&got), ids(&want));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

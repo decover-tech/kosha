@@ -790,7 +790,46 @@ fn knn_files_complete(
             return false;
         }
     }
-    !kosha_segment::knn_needs_doc_vectors(footer) || doc_spans::doc_vectors_header_local(seg_path)
+    !knn_wants_doc_vectors_header(footer, field) || doc_spans::doc_vectors_header_local(seg_path)
+}
+
+/// `KOSHA_KNN_GLOBAL_RESCORE` (#381), read once for the hydration
+/// predicates (the searcher reads the same variable).
+#[cfg(feature = "s3")]
+fn knn_global_rescore_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(kosha_query::knn_global_rescore_from_env)
+}
+
+/// Whether a kNN on `field` needs `doc_vectors.bin`'s header local in a
+/// segment with this footer: a legacy segment's always (its field table
+/// binds the unnamed index), and, with global rescoring on (#381), a
+/// quantized column's, because the pass reads exact vectors by range and
+/// a range needs the header to locate it. Fetching it here, with the
+/// scoring files, makes it part of a fully cached query, rather than
+/// depending on whether an earlier query happened to put this segment on
+/// a page. Off by default: the predicate is then exactly the legacy one.
+#[cfg(feature = "s3")]
+fn knn_wants_doc_vectors_header(footer: Option<&kosha_core::Footer>, field: &str) -> bool {
+    knn_wants_doc_vectors_header_with(footer, field, knn_global_rescore_on())
+}
+
+/// [`knn_wants_doc_vectors_header`] with the flag passed in, for tests.
+#[cfg(feature = "s3")]
+fn knn_wants_doc_vectors_header_with(
+    footer: Option<&kosha_core::Footer>,
+    field: &str,
+    global_rescore: bool,
+) -> bool {
+    kosha_segment::knn_needs_doc_vectors(footer)
+        || (global_rescore
+            && footer.is_some_and(|f| {
+                f.doc_vectors
+                    && f.vector_fields.as_ref().is_some_and(|cols| {
+                        cols.iter()
+                            .any(|c| c.name == field && !c.quantization.is_f32())
+                    })
+            }))
 }
 
 /// The vector key a query's [`HydrationVerdict`] records and checks: its
@@ -4357,8 +4396,10 @@ impl AppState {
                     }
                     // Only the header of a legacy `doc_vectors.bin` (its
                     // field table binds the unnamed index), by range below:
-                    // the whole file is as large as the index itself.
-                    if kosha_segment::knn_needs_doc_vectors(footer)
+                    // the whole file is as large as the index itself. With
+                    // global rescoring on (#381), a quantized column's
+                    // header too (see `knn_wants_doc_vectors_header`).
+                    if knn_wants_doc_vectors_header(footer, field)
                         && !doc_spans::doc_vectors_header_local(seg_path)
                     {
                         doc_vector_headers.push((seg_path.as_path(), s3_prefix.clone()));
@@ -4837,7 +4878,12 @@ impl AppState {
         stats.rounds = u64::from(o.gets > 0);
         stats.ranged_gets = o.gets;
         stats.ranged_bytes = o.bytes;
-        if o.failed {
+        // A failed range of `doc_vectors.bin` (only global rescoring, #381,
+        // asks for those) is NOT retried as the whole file: that is the
+        // full-precision sidecar the codes-only tier exists to keep remote,
+        // ~200 MB per segment. The pass reports the vectors it could not
+        // read as unavailable (and the segment degraded) instead.
+        if o.failed && file != kosha_segment::DOC_VECTORS_FILE {
             let (files, bytes) = self.ensure_files_local(&[seg.to_path_buf()], file, request);
             stats.rounds += 1;
             stats.whole_files = files as u64;
@@ -5553,6 +5599,11 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(300);
     let addr = format!("0.0.0.0:{port}");
+    // #382 experiment flags: one line only when one is set or the image was
+    // built above baseline x86-64, so a default server logs nothing new.
+    if let Some(summary) = kosha_segment::experimental_vector_kernels_summary() {
+        println!("kosha-server {summary}");
+    }
 
     let state = AppState::new_shared_as(PathBuf::from(data_dir.clone()), role);
     // Pre-#262 bare namespaces no tenant can reach (#344).
@@ -7937,6 +7988,9 @@ fn handle_stats(state: &AppState) -> String {
         "s3_prefix": s3_prefix,
         "doc_store_reads": state.doc_store_reads.to_json(state.doc_read_mode),
         "posting_reads": state.posting_reads.to_json(state.posting_read_mode),
+        // Process-wide count of scoring blocks varint-decoded (#385); a
+        // bench diffs it around a run for blocks decoded per query.
+        "scoring_blocks_decoded": kosha_segment::scoring_blocks_decoded(),
         "manifest_refresh": state
             .ingest_host
             .is_some()
@@ -10852,17 +10906,44 @@ fn log_search_timing(
         + phases.admit_wall_ms
         + phases.bm25_stats_ms
         + phases.score_wall_ms
-        + phases.materialize_wall_ms;
+        + phases.materialize_wall_ms
+        + phases.knn_rescore_ms;
+    // Global bound-driven kNN rescoring (#381) logs its counters only when
+    // it ran (`KOSHA_KNN_GLOBAL_RESCORE`), so the line is unchanged by
+    // default.
+    let mut knn_rescore = if phases.knn_global_rescore {
+        format!(
+            " knn_rescore_ms={:.1} knn_rescore_candidates={} knn_rescore_selected={} \
+             knn_rescored={} knn_rescore_unavailable={} knn_rescore_ranged_spans={}",
+            phases.knn_rescore_ms,
+            phases.knn_rescore_candidates,
+            phases.knn_rescore_selected,
+            phases.knn_rescored,
+            phases.knn_rescore_unavailable,
+            phases.knn_rescore_ranged_spans,
+        )
+    } else {
+        String::new()
+    };
+    // Per-segment path counters (#381, `KOSHA_KNN_RESCORE_STATS`, or with
+    // the flag above): quantized segments probed there, and how many of
+    // them returned unrescored estimates.
+    if phases.knn_rescore_stats {
+        knn_rescore.push_str(&format!(
+            " knn_seg_quantized={} knn_seg_unrescored={}",
+            phases.knn_seg_quantized, phases.knn_seg_unrescored,
+        ));
+    }
     println!(
         "search timing: ns={} total_ms={:.1} hydrate_ms={:.1} hydrate_files={} \
          hydrate_mb={:.1} queue_ms={:.1} admit_ms={:.1} bm25_stats={} bm25_stats_ms={:.2} \
          score_ms={:.1} materialize_ms={:.1} opens_cold={} opens_cached={} \
-         open_total_ms={:.1} knn_postings={} knn_mode={} knn_exact_vectors={} \
+         open_total_ms={:.1} knn_postings={} knn_segments={} knn_centroids={} knn_plan_ms={:.1} knn_mode={} knn_exact_vectors={} \
          knn_filtered={} knn_degraded={} hits={} page_gets={} \
          page_ranged_kb={:.1} page_whole_files={} page_whole_mb={:.1} s3_rounds={} \
          s3_bytes={} postings_gets={} postings_ranged_kb={:.1} postings_whole_files={} \
          postings_whole_mb={:.1} vector_gets={} vector_ranged_kb={:.1} \
-         vector_whole_files={}{}{}",
+         vector_whole_files={}{}{}{}",
         ns.0,
         total_ms,
         hydrate_ms,
@@ -10878,6 +10959,9 @@ fn log_search_timing(
         phases.open_cached,
         phases.open_total_ms,
         phases.knn_postings_probed,
+        phases.knn_segments_probed,
+        phases.knn_centroids_scanned,
+        phases.knn_plan_ms,
         phases.knn_mode.map_or("-", |mode| mode.as_str()),
         phases.knn_exact_vectors,
         phases
@@ -10906,6 +10990,7 @@ fn log_search_timing(
                 " knn_cutoff_rule={}",
                 rule.as_str()
             )),
+        knn_rescore,
         request_id(),
     );
 }
@@ -13900,6 +13985,7 @@ mod tests {
             fuzzy_bloom: kosha_core::fuzzy::build_fuzzy_bloom(terms.iter().copied()),
             vector_fields: None,
             multi_vectors: Vec::new(),
+            doc_store_compression: None,
         };
         let mut query: SearchQuery = serde_json::from_str(
             r#"{"query_text": "contract breach", "filter": {"term": {"matter": "m1"}}}"#,
@@ -14951,6 +15037,7 @@ mod tests {
             posting_blobs_raw: Default::default(),
             vector_fields: Default::default(),
             multi_vectors: Default::default(),
+            doc_store_compression: None,
         }
     }
 
@@ -15091,6 +15178,45 @@ mod tests {
 
     /// #204: a kNN's scoring set holds only the queried column's files, as
     /// the segment's footer lists them.
+    /// Global kNN rescoring (#381) reads a quantized column's exact
+    /// vectors by range, so with the flag on its `doc_vectors.bin` header
+    /// joins the kNN scoring set; with it off (the default) and for f32
+    /// columns, the predicate is the legacy one.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn global_rescore_wants_the_doc_vectors_header_of_quantized_columns() {
+        let footer = |quantization| {
+            let dir = std::env::temp_dir().join(format!(
+                "kosha-test-dv-header-{quantization:?}-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            let mut w =
+                kosha_segment::SegmentWriter::new(kosha_core::SegmentId("s".into()), dir.clone())
+                    .with_vector_store_mode(kosha_segment::VectorStoreMode::Sidecar)
+                    .with_vector_quantization(kosha_segment::VectorQuantizationConfig::all(
+                        quantization,
+                    ));
+            for i in 0..8 {
+                w.add_document(
+                    DocumentId(format!("d{i}")),
+                    vec![Field::vector("emb", vec![1.0, i as f32, 0.5, 0.0])],
+                );
+            }
+            let footer = w.finalize(Default::default()).unwrap();
+            let _ = fs::remove_dir_all(&dir);
+            assert!(footer.doc_vectors && footer.vector_fields.is_some());
+            footer
+        };
+        let i8 = footer(kosha_core::VectorQuantization::I8);
+        let f32 = footer(kosha_core::VectorQuantization::F32);
+        assert!(!knn_wants_doc_vectors_header_with(Some(&i8), "emb", false));
+        assert!(knn_wants_doc_vectors_header_with(Some(&i8), "emb", true));
+        assert!(!knn_wants_doc_vectors_header_with(Some(&i8), "other", true));
+        assert!(!knn_wants_doc_vectors_header_with(Some(&f32), "emb", true));
+        assert!(!knn_wants_doc_vectors_header_with(None, "emb", false));
+    }
+
     #[cfg(feature = "s3")]
     #[test]
     fn scoring_complete_needs_only_the_queried_vector_column() {
@@ -18465,6 +18591,7 @@ mod tests {
             fuzzy_bloom: None,
             vector_fields: None,
             multi_vectors: Vec::new(),
+            doc_store_compression: None,
         };
         // Deliberately unsorted input: S3 listing order must not leak into
         // the rebuilt manifest.

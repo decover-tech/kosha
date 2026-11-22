@@ -33,6 +33,14 @@ stack — so each corpus is loaded once, ever.
 - `run_phases.sh` — the measured phases; `WARM_GATE=queries` runs the
   tpuf-style `../warm_gate.py` and warm phases only, `WARM_GATE=preload`
   (the script default) the wipe + boot preload + cold/warm protocol.
+- `two_tier_eval.sh <ns> <out-dir>`: research #387, offline only. It copies
+  a restored namespace's live segments locally and runs
+  `kosha-two-tier-eval`, which reports head-only top-k certification and
+  footprint per head fraction (`docs/research/387-two-tier-index.md`).
+  `benchmark.yml` runs it when `two_tier_eval` is set. It does not change
+  the server. `two_tier_check.py` gates the run: no deletes in the
+  manifest, no skipped segments or queries, 0 violations, and the oracle
+  top-10 equal to the live server for `TWO_TIER_CROSSCHECK` queries.
 
 Economics: the 10M vector load runs ~6h at the measured ~485 docs/sec
 sustained (flush-build bound, see #126); a restore is minutes. Engine-fix

@@ -106,7 +106,7 @@ The `benchmark` workflow (`.github/workflows/benchmark.yml`) runs these
 scripts on the bench VM. Its inputs choose how the namespace gets warm,
 which vector snapshot to restore, and whether to keep the VM.
 
-### Warm gate (`warm_gate`: `queries` (default) or `preload`)
+### Warm gate (`warm_gate`: `queries` (default), `preload` or `cold`)
 
 `queries` follows turbopuffer's tpuf-benchmark (`pkg/bench/bench.go`).
 For hot runs, tpuf warms the namespace, then polls with the workload's own
@@ -176,6 +176,21 @@ is what the workflow builds, `queries` fails fast with
 restart with the boot preload, wait for `/readyz`, then run the cold and
 warm phases. On the original vector snapshot the boot preload takes about
 115 minutes, because the server preloads the whole ~249 GB namespace.
+Its "cold" phase runs after that preload, so it measures a warm engine.
+
+`cold` (research, #380) measures first touch with no preload at all. The
+container starts without `KOSHA_WARMUP_NAMESPACES`, with
+`KOSHA_WARMUP_USAGE=off` (else the persisted usage warm set is warmed at
+boot) and with span promotion off. `run_phases.sh` checks the first two,
+wipes the local store, restarts, and runs one phase only
+(`knn_cold_nocache` or `cold_or_nocache`). Every byte a query needs is
+read from S3 during that phase, so the `search timing:` fields
+`hydrate_files`, `hydrate_mb`, `s3_bytes`, `vector_gets` and
+`postings_gets` in `server/<phase>.log.gz` are the per-query cold cost.
+A first-touch kNN query still fetches the small files (footer,
+`inverted.idx`, `doc_store.offsets`, `vector.offsets`) of every segment,
+because `knn_plan` opens every segment, so read the phase's first minutes
+apart from the rest (`knn_log_stats.py --skip-first-s`).
 
 ### What each hit returns (`return_fields`: `ids` (default) or `all`)
 
@@ -253,6 +268,42 @@ roughly 80–90 GB, against 249 GB.
   is off by default. It syncs ~40 GB+ of embeddings, builds 10M docs and
   uploads the segments. That is untimed so far, so run it with
   `suite=vector` and watch the 350-minute limit.
+- `build_segments_args` (research, #380; empty by default) passes extra
+  `kosha-build-segments` flags to that build, for example
+  `--cluster-layout namespace`.
+- Provenance: `build_and_import.sh` writes
+  `snapshots/<name>/build-info.json` (builder commit from `github.sha`, a
+  digest of the builder sources, build args, max docs). The vector suite
+  copies the restored snapshot's file to `vector/snapshot-build-info.json`
+  in the results, or logs that it has none. Snapshots built before this
+  change have none, so their builder commit is unknown. To compare two
+  layouts, build both under new names from one commit rather than reusing
+  an older snapshot.
+
+### Compressed doc store snapshots (research #388, experimental)
+
+`build_and_import.sh` passes `KOSHA_DOC_STORE_COMPRESSION` and the
+`KOSHA_DOC_STORE_ZSTD_*` tuning variables into the builder, and a
+`SNAPSHOT_NAME` containing `-zstd` defaults the first to `zstd`. That
+name rule only exists on refs that carry #388, and the workflow rsyncs
+the **dispatching ref** to the VM, so dispatch these builds from the #388
+branch (`gh workflow run benchmark.yml --ref <branch> ...`). A ref without
+#388 would build raw segments under the `-zstd` name, and the workflow
+never rebuilds an existing snapshot; on refs with #388 the build now
+refuses to upload when `zstd` was asked for and no footer is compressed.
+
+Every build also writes `snapshots/<name>/build_info.txt` with the
+builder env and a fingerprint (`source_sha256`) of the sources it
+compiled: the VM copy has no `.git`, so two snapshots come from the same
+commit exactly when their fingerprints match. Build the raw baseline for
+a comparison from the same ref under a name without `-zstd`.
+
+`vm/doc_store_bytes.sh <snapshot> [zstd|raw]` is the deterministic size
+check: it sums the snapshot's `doc_store.bin`, `doc_store.offsets` and
+`doc_vectors.bin` object sizes, reads every segment footer, splits
+`doc_store.bin` into stored records and the dictionary tail copy, and
+prints one JSON object (`doc_store_bytes.py`). With a format argument it
+exits 3 when the footers disagree. It only lists and downloads.
 
 ### Fast iteration recipe
 
@@ -417,6 +468,49 @@ Details and caveats:
   four and dispatches fine).
   Further experiment knobs go in `server_env` rather than new inputs.
 
+### Docid reordering and blocks decoded (#385, experimental)
+
+`KOSHA_DOC_REORDER=bp` makes `kosha-build-segments` (and compaction)
+write each segment's documents in recursive-graph-bisection order. The
+segment format is unchanged and results are identical (ties break on
+`_id`); postings get smaller and block-max pruning should skip more.
+Default `off`. `kosha-build-segments --doc-reorder off|bp` overrides the
+env var. To compare, build both orders offline under new snapshot names
+(the harness's `bm25_snapshot` + `server_env`, which reaches the builder
+through `BUILD_DOCKER_ENV`): one with no `server_env`, one with
+`server_env=KOSHA_DOC_REORDER=bp`. The existing `msmarco-10m` snapshot was
+loaded through the server, so it is not the like-for-like "off" baseline.
+
+`GET /stats` (admin) reports `scoring_blocks_decoded`, a process-wide
+count of posting blocks varint-decoded. `run_phases.sh` passes the admin
+key to `query_bench.py --stats-api-key`, which reads it before and after
+each phase and writes `scoring_blocks_decoded` and
+`scoring_blocks_decoded_per_request` to the phase JSON (absent against an
+older server). It is only per-query while nothing else queries the server.
+
+`run_phases.sh` also passes `--raw-ids`, so every `<phase>.requests.jsonl.gz`
+record carries the response's ranked `ids` and `scores`. Reordering must not
+change results; check it per query across the two snapshots' runs of the
+same phase:
+
+    topk_parity.py off/warm_or_nocache.requests.jsonl.gz bp/warm_or_nocache.requests.jsonl.gz
+
+It exits 0 only when at least one query was compared and every query
+answered in both logs returned the same ids in the same order (scores within
+`--score-rtol`, default 1e-6); a log recorded without `--raw-ids` is an
+error, not a pass.
+
+Both snapshots must be built by a ref that has the #385 builder *and* the
+harness's `bm25_snapshot` / `server_env` inputs. A builder without #385
+ignores `KOSHA_DOC_REORDER` and would write an ingest-order snapshot under
+the `bp` name, which later runs then reuse. The builder prints
+`doc reorder: bp` and a non-zero `(reorder Xs)` per segment when it really
+reorders; check the build log for both before trusting a `bp` snapshot.
+
+Compaction reorders only when `KOSHA_DOC_REORDER_COMPACTION_MAX_DOCS` is
+also set (default 0: never), because it buffers the merged output in
+memory; the bench runs with compaction off.
+
 ## Logs and tail analysis
 
 Every CI benchmark run (`.github/workflows/benchmark.yml`) archives its
@@ -434,6 +528,15 @@ server logs and per-request records to
 
 A VM kept after a failed run has its container log rescued to
 `runs/rescued-<timestamp>/` before the next run recreates the container.
+
+For kNN cost counters per query (`knn_postings`, `knn_segments`,
+`knn_centroids`, `knn_plan_ms`, opens, hydration and S3 bytes), summarize a
+phase's server log:
+
+```bash
+python3 knn_log_stats.py vector/server/knn_warm_nocache.log.gz
+python3 knn_log_stats.py vector/server/knn_cold_nocache.log.gz --skip-first-s 180
+```
 
 To see where a phase's tail comes from:
 

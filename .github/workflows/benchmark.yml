@@ -29,6 +29,11 @@
 #     the same snapshot is kept per namespace, so warmup is ~minutes.
 #   preload: the earlier protocol: KOSHA_WARMUP_NAMESPACES boot preload
 #     gated on /readyz after a local wipe, then cold + warm phases.
+#   cold (research, #380): no preload at all. Local wipe, restart with no
+#     KOSHA_WARMUP_NAMESPACES, KOSHA_WARMUP_USAGE=off and span promotion
+#     off, then ONE first-touch phase (knn_cold_nocache / cold_or_nocache):
+#     the per-query S3 GETs and bytes of the layout under test. The preload
+#     "cold" phase cannot measure that: it runs after a full preload.
 #
 # Teardown policy mirrors the bench standing rule: destroy on success;
 # on failure the stack is KEPT for debugging (a summary line says so) —
@@ -73,8 +78,10 @@ on:
           queries until 3 in a row are fully cached; warm phases only;
           a reused VM keeps its local cache). preload = the earlier
           KOSHA_WARMUP_NAMESPACES boot preload + cold and warm phases.
+          cold = no preload at all (local wipe, usage warming off), one
+          first-touch phase only (research #380).
         type: choice
-        options: [queries, preload]
+        options: [queries, preload, cold]
         default: queries
       return_fields:
         description: >-
@@ -102,6 +109,14 @@ on:
           against the 350-minute job limit, and prefer suite=vector.
         type: boolean
         default: false
+      build_segments_args:
+        description: >-
+          extra kosha-build-segments flags for a build_vector_snapshot
+          rebuild (research #380), e.g. "--cluster-layout namespace" for
+          cluster-aligned segments. Empty = the default builder. Only used
+          when build_vector_snapshot builds a new snapshot; characters
+          limited to [A-Za-z0-9 =._-].
+        default: ""
       keep_vm:
         description: >-
           keep the bench VM stack after a successful run too, so the next
@@ -123,6 +138,18 @@ on:
       recall_sample:
         description: number of queries to check recall for (statistical sample, not the full query set)
         default: "100"
+      two_tier_eval:
+        description: >-
+          research #387, measurement only: after the BM25 namespace is
+          restored, run the offline two-tier (head/tail) analysis
+          (scripts/bench/bm25_scale/vm/two_tier_eval.sh) over its live
+          segments and the query file. With suite none or vector it
+          restores the BM25 namespace itself. Never changes the server.
+        type: boolean
+        default: false
+      two_tier_fractions:
+        description: head fractions for two_tier_eval (comma-separated, each in (0, 1])
+        default: "0.1,0.2,0.3"
       recall_num_candidates:
         description: >-
           whole-query kNN probe budget for the recall check (knn.num_candidates
@@ -187,6 +214,7 @@ env:
   BM25_NS: msmarco-${{ inputs.bm25_docs || '10m' }}
   VEC_NS: msmarco-10m-vec
   VEC_SNAPSHOT: ${{ inputs.vector_snapshot || 'msmarco-10m-vec' }}
+  BUILD_SEGMENTS_ARGS: ${{ inputs.build_segments_args || '' }}
   WARM_GATE: ${{ inputs.warm_gate || 'queries' }}
   RETURN_FIELDS: ${{ inputs.return_fields || 'ids' }}
   BM25_SNAPSHOT: ${{ inputs.bm25_snapshot || format('msmarco-{0}', inputs.bm25_docs || '10m') }}
@@ -347,6 +375,11 @@ jobs:
             if [ "${{ env.WARM_GATE }}" = preload ]; then
               WARMUP_ARGS="-e KOSHA_WARMUP_NAMESPACES=default/msmarco-10m,default/msmarco-1m,default/msmarco-10m-vec"
             fi
+            # warm_gate=cold: no boot warming of any kind, so the persisted
+            # usage warm set (#213) is not warmed either. run_phases.sh checks.
+            if [ "${{ env.WARM_GATE }}" = cold ]; then
+              WARMUP_ARGS="$WARMUP_ARGS -e KOSHA_WARMUP_USAGE=off"
+            fi
             echo "warm gate: ${{ env.WARM_GATE }} (container args: ${WARMUP_ARGS:-none})"
             # server_env + knn_budget_fraction inputs, normalized to -e flags by
             # the validate step. Appended last so a repeated key overrides the
@@ -419,6 +452,23 @@ jobs:
           $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && WARM_GATE=$WARM_GATE RETURN_FIELDS=$RETURN_FIELDS \
             ./run_phases.sh bm25 $BM25_NS /data/results-ci/bm25 '${{ inputs.qps }}' '${{ inputs.duration }}'"
 
+      - name: Two-tier analysis (research 387, offline, measurement only)
+        if: inputs.two_tier_eval == true
+        run: |
+          IP='${{ steps.tf.outputs.ip }}'
+          SSH="ssh -i $RUNNER_TEMP/bench.pem -o ServerAliveInterval=30 ec2-user@$IP"
+          FRACTIONS='${{ inputs.two_tier_fractions }}'
+          case "$FRACTIONS" in
+            *[!0-9.,]*|'') echo "::error::two_tier_fractions must match [0-9.,]+, got: $FRACTIONS"; exit 1 ;;
+          esac
+          # The BM25 suite (if it ran) already restored the namespace;
+          # otherwise restore it here so pg and the bench bucket hold it.
+          if [ '${{ inputs.suite }}' != 'both' ] && [ '${{ inputs.suite }}' != 'bm25' ]; then
+            $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && ./restore_namespace.sh $BM25_NS"
+          fi
+          $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && TWO_TIER_FRACTIONS=$FRACTIONS \
+            ./two_tier_eval.sh $BM25_NS /data/results-ci/two_tier"
+
       - name: Vector suite
         if: contains(fromJSON('["both","vector"]'), inputs.suite)
         run: |
@@ -426,6 +476,9 @@ jobs:
           SSH="ssh -i $RUNNER_TEMP/bench.pem -o ServerAliveInterval=30 ec2-user@$IP"
           case "$VEC_SNAPSHOT" in
             *[!a-z0-9.-]*|'') echo "::error::vector_snapshot must match [a-z0-9.-]+, got: $VEC_SNAPSHOT"; exit 1 ;;
+          esac
+          case "$BUILD_SEGMENTS_ARGS" in
+            *[!A-Za-z0-9\ =._-]*) echo "::error::build_segments_args may only contain [A-Za-z0-9 =._-], got: $BUILD_SEGMENTS_ARGS"; exit 1 ;;
           esac
           if [ '${{ inputs.mode }}' = 'restore' ]; then
             if [ '${{ inputs.build_vector_snapshot }}' = 'true' ]; then
@@ -438,9 +491,16 @@ jobs:
               $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && \
                 if aws s3 ls s3://decoverai-bench-corpus-cache/snapshots/$VEC_SNAPSHOT/pg-kosha.sql.gz >/dev/null 2>&1; then \
                   echo snapshot $VEC_SNAPSHOT exists, not rebuilding; \
-                else SNAPSHOT_NAME=$VEC_SNAPSHOT BUILD_DOCKER_ENV='$SERVER_ENV_ARGS' ./build_and_import.sh $VEC_NS --with-embeddings; fi"
+                else BUILD_DOCKER_ENV='$SERVER_ENV_ARGS' BUILD_ARGS='$BUILD_SEGMENTS_ARGS' BUILDER_SHA=$GITHUB_SHA SNAPSHOT_NAME=$VEC_SNAPSHOT ./build_and_import.sh $VEC_NS --with-embeddings; fi"
             fi
             $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && ./restore_namespace.sh $VEC_NS $VEC_SNAPSHOT"
+            # Provenance of the restored snapshot (builder commit and flags,
+            # written by build_and_import.sh since #380); snapshots built
+            # before that have none, and the run says so.
+            $SSH "sudo mkdir -p /data/results-ci/vector && sudo chown -R \$(id -u):\$(id -g) /data/results-ci && \
+              if aws s3 cp --only-show-errors s3://decoverai-bench-corpus-cache/snapshots/$VEC_SNAPSHOT/build-info.json /data/results-ci/vector/snapshot-build-info.json; then \
+                echo snapshot build info: && cat /data/results-ci/vector/snapshot-build-info.json; \
+              else echo snapshot $VEC_SNAPSHOT has no build-info.json, builder commit unknown; fi"
           else
             echo "::error::vector full-load (~6h) exceeds the job ceiling — run it from a workstation once, then use restore mode"
             exit 1
@@ -496,7 +556,7 @@ jobs:
         #   s3://decoverai-bench-corpus-cache/runs/<run_id>/
         #     meta.json, <suite>/<phase>.json, <phase>.requests.jsonl.gz,
         #     <suite>/server/{warmup,<phase>}.log.gz, server/full.log.gz
-        if: always() && inputs.suite != 'none' && steps.tf.outputs.ip != ''
+        if: always() && (inputs.suite != 'none' || inputs.two_tier_eval == true) && steps.tf.outputs.ip != ''
         run: |
           IP='${{ steps.tf.outputs.ip }}'
           SSH="ssh -i $RUNNER_TEMP/bench.pem -o ServerAliveInterval=30 ec2-user@$IP"
@@ -509,13 +569,14 @@ jobs:
            \"suite\": \"${{ inputs.suite }}\", \"mode\": \"${{ inputs.mode }}\", \"qps\": \"${{ inputs.qps }}\",
            \"duration\": \"${{ inputs.duration }}\", \"warm_gate\": \"$WARM_GATE\", \"vector_snapshot\": \"$VEC_SNAPSHOT\",
            \"bm25_snapshot\": \"$BM25_SNAPSHOT\", \"server_env_args\": \"$SERVER_ENV_ARGS\", \"rustflags\": \"$KOSHA_RUSTFLAGS\",
+           \"two_tier_eval\": \"${{ inputs.two_tier_eval }}\", \"two_tier_fractions\": \"${{ inputs.two_tier_fractions }}\",
            \"archived_at\": \"\$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}
           META
             aws s3 sync --only-show-errors /data/results-ci $DEST/"
           echo "Server logs + results archived to $DEST/" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Collect results + summary
-        if: always() && inputs.suite != 'none'
+        if: always() && (inputs.suite != 'none' || inputs.two_tier_eval == true)
         run: |
           IP='${{ steps.tf.outputs.ip }}'
           mkdir -p results
@@ -532,7 +593,7 @@ jobs:
             echo "| phase | p50 ms | p90 ms | p99 ms | requests | errors |"
             echo "|---|---|---|---|---|---|"
             # knn_sweep/ (#384) has its own table, appended below.
-            find results -name '*.json' ! -name 'recall.json' ! -name 'meta.json' ! -path 'results/knn_sweep/*' | sort | while read -r f; do
+            find results -name '*.json' ! -name 'recall.json' ! -name 'meta.json' ! -path 'results/knn_sweep/*' ! -path '*/two_tier/*' | sort | while read -r f; do
               python3 - "$f" << 'EOF'
           import json, sys
           d = json.load(open(sys.argv[1]))
@@ -563,10 +624,20 @@ jobs:
               echo ""
               cat results/knn_sweep/sweep.md
             fi
+            # Research 387 analysis: its own section (report.json has no
+            # latency fields).
+            if [ -f results/two_tier/summary.txt ]; then
+              echo ""
+              echo "## Two-tier analysis (research 387, offline)"
+              echo ""
+              echo '```'
+              grep -E '^(head|footprint|  +touched|opened|analyzed|run checks|server cross-check|TWO-TIER-RUN)' results/two_tier/summary.txt || true
+              echo '```'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
-        if: always() && inputs.suite != 'none'
+        if: always() && (inputs.suite != 'none' || inputs.two_tier_eval == true)
         with:
           name: bench-results
           path: results/

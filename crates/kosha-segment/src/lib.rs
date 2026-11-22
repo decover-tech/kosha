@@ -1,7 +1,10 @@
 pub mod analysis;
+pub mod bitpack;
+pub mod doc_store_zstd;
 pub mod filter_columns;
 pub mod filter_eval;
 pub mod multivec;
+pub mod reorder;
 pub mod span_cache;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -20,7 +23,10 @@ use kosha_core::{
 use kosha_core::{AnalysisConfig, AnalyzerSpec, SegmentAnalysis};
 
 pub use analysis::Analyzer;
+use doc_store_zstd::{compress_doc_store, parse_dict_trailer, rebuild_offsets, DocStoreDecoder};
+pub use doc_store_zstd::{DocStoreCompressionMode, DocStoreZstdConfig, DOC_STORE_DICT_MAGIC};
 pub use multivec::{LateInteractionHits, LateInteractionParams};
+pub use reorder::{BpConfig, DocReorder};
 
 /// A point in HNSW space using cosine distance.
 #[derive(Clone)]
@@ -156,6 +162,12 @@ pub struct SegmentWriter {
     /// Vector fields the namespace schema embeds server-side, with their
     /// model id (#209), recorded in the columns' footer entries.
     embedding_models: BTreeMap<String, String>,
+    /// Per-record zstd for `doc_store.bin` (research #388); `None` writes
+    /// the raw layout. See [`DocStoreCompressionMode`].
+    doc_store_zstd: Option<DocStoreZstdConfig>,
+    /// What `write_doc_store` produced, recorded as
+    /// `Footer::doc_store_compression`.
+    doc_store_compression_meta: Option<kosha_core::DocStoreCompression>,
 }
 
 /// Whether new segments get per-field indexes (#249):
@@ -260,6 +272,52 @@ impl SegmentWriter {
             field_stats: BTreeMap::new(),
             multi_vectors: multivec::MultiVectorBuilder::default(),
             embedding_models: BTreeMap::new(),
+            doc_store_zstd: match DocStoreCompressionMode::from_env() {
+                DocStoreCompressionMode::Zstd => Some(DocStoreZstdConfig::from_env()),
+                DocStoreCompressionMode::Auto | DocStoreCompressionMode::Off => None,
+            },
+            doc_store_compression_meta: None,
+        }
+    }
+
+    /// Override doc-store compression (research #388): `Some` writes
+    /// per-record zstd frames with a dictionary trained on this segment's
+    /// records, `None` the raw layout. Production writers follow
+    /// `KOSHA_DOC_STORE_COMPRESSION`; see [`DocStoreCompressionMode`].
+    /// While compression is on, vectors always go to `doc_vectors.bin`.
+    pub fn with_doc_store_zstd(mut self, config: Option<DocStoreZstdConfig>) -> Self {
+        self.doc_store_zstd = config;
+        self
+    }
+
+    /// For merges: keep the inputs' doc-store format. With
+    /// `KOSHA_DOC_STORE_COMPRESSION` unset (`auto`), a merge with any
+    /// compressed input writes a compressed output, so compaction never
+    /// silently undoes the format; `zstd` and `none` decide on their own
+    /// (`none` is the way back to the raw layout). Call before adding
+    /// documents.
+    pub fn inherit_doc_store_compression(self, any_input_compressed: bool) -> Self {
+        match DocStoreCompressionMode::from_env() {
+            DocStoreCompressionMode::Auto if any_input_compressed => {
+                self.with_doc_store_zstd(Some(DocStoreZstdConfig::from_env()))
+            }
+            _ => self,
+        }
+    }
+
+    /// Whether this writer compresses `doc_store.bin` (research #388).
+    pub fn doc_store_compressed(&self) -> bool {
+        self.doc_store_zstd.is_some()
+    }
+
+    /// Where vectors go: the configured mode, except that a compressed
+    /// doc store never takes inline vectors (research #388): JSON floats
+    /// would be the bulk of every record and compress poorly.
+    fn effective_vector_store_mode(&self) -> VectorStoreMode {
+        if self.doc_store_zstd.is_some() {
+            VectorStoreMode::Sidecar
+        } else {
+            self.vector_store_mode
         }
     }
 
@@ -309,10 +367,20 @@ impl SegmentWriter {
         self
     }
 
-    /// Override the inverted-index version (tests; production uses
-    /// `KOSHA_POSTINGS_WRITE_VERSION`).
-    #[cfg(test)]
-    fn with_postings_write_version(mut self, version: u32) -> Self {
+    /// Override the inverted-index version (tests, benches and mixed-version
+    /// fixtures in other crates; production uses
+    /// `KOSHA_POSTINGS_WRITE_VERSION`). Accepts 4, 5 or 6.
+    #[doc(hidden)]
+    pub fn with_postings_write_version(mut self, version: u32) -> Self {
+        assert!(
+            matches!(
+                version,
+                SPLIT_INVERTED_VERSION
+                    | SKIP_SPLIT_INVERTED_VERSION
+                    | BITPACKED_SKIP_SPLIT_INVERTED_VERSION
+            ),
+            "unsupported postings write version {version}"
+        );
         self.postings_write_version = version;
         self
     }
@@ -396,6 +464,35 @@ impl SegmentWriter {
 
     pub fn add_document(&mut self, doc_id: DocumentId, fields: Vec<Field>) {
         self.add_document_with_vectors(doc_id, fields, Vec::new());
+    }
+
+    /// Recursive-graph-bisection order (#385) for `docs`, documents about
+    /// to be added to this writer: `order[new] = old`, `old` indexing
+    /// `docs`. Terms come from this writer's own analyzers, so they are the
+    /// terms the documents' postings will hold. Adding `docs` in this order
+    /// is all reordering takes: every `doc_seq`-keyed structure follows the
+    /// add order. See [`reorder`].
+    pub fn bp_order<'a, I>(&self, docs: I, config: &BpConfig) -> Vec<u32>
+    where
+        I: IntoIterator<Item = &'a [Field]>,
+    {
+        let mut forward = reorder::ForwardIndex::new();
+        let mut terms: Vec<String> = Vec::new();
+        for fields in docs {
+            terms.clear();
+            for field in fields {
+                if field.field_type != FieldType::Text {
+                    continue;
+                }
+                let analyzer = self
+                    .field_analyzers
+                    .get(&field.name)
+                    .unwrap_or(&self.default_analyzer);
+                terms.extend(analyzer.analyze(&field.value));
+            }
+            forward.push_doc(terms.iter());
+        }
+        forward.bp_order(config)
     }
 
     /// [`Self::add_document`] with some `Vector` fields' values supplied
@@ -573,7 +670,7 @@ impl SegmentWriter {
                         // An empty value is the sidecar placeholder; a
                         // literal `[]` would be indistinguishable from it
                         // once blanked, so it stays inline (above).
-                        if self.vector_store_mode == VectorStoreMode::Sidecar {
+                        if self.effective_vector_store_mode() == VectorStoreMode::Sidecar {
                             let field_idx = match self
                                 .doc_vector_fields
                                 .iter()
@@ -828,6 +925,16 @@ impl SegmentWriter {
             }
         };
         let (path, offsets) = sink.finish(doc_count)?;
+        let (path, offsets) = match self.doc_store_zstd {
+            None => (path, offsets),
+            Some(config) => {
+                let out = self.build_dir().join("doc_store.zst");
+                let (offsets, meta) = compress_doc_store(&path, &out, &offsets, config)?;
+                let _ = fs::remove_file(&path);
+                self.doc_store_compression_meta = Some(meta);
+                (out, offsets)
+            }
+        };
         fs::rename(&path, self.output_dir.join("doc_store.bin"))?;
         self.backend.write("doc_store.offsets", &offsets)?;
         Ok(())
@@ -1318,6 +1425,7 @@ impl SegmentWriter {
             fuzzy_bloom: self.fuzzy_bloom.clone(),
             vector_fields: Some(vector_fields),
             multi_vectors,
+            doc_store_compression: self.doc_store_compression_meta.clone(),
         };
         let json = serde_json::to_string_pretty(&footer)?;
         self.backend.write("footer.json", json.as_bytes())?;
@@ -2129,6 +2237,196 @@ struct ProbeQuery<'q> {
     unit: std::borrow::Cow<'q, [f32]>,
     /// The rotated query lookup table, for a RaBitQ column.
     rabitq: Option<std::rc::Rc<kosha_vector_spfresh::RaBitQQuery>>,
+    /// An i8 entry's error bound per unit of its `scale` (#381): the
+    /// estimate `scale * <q, code>` is off from the exact `<q, x>` by at
+    /// most `scale * i8_error_per_scale`. See [`i8_error_per_scale`].
+    /// `0.0` for every other column, and never read by the default
+    /// per-segment probe (which rescores a fixed `k * factor` of an i8
+    /// column regardless of bounds).
+    i8_error_per_scale: f32,
+}
+
+/// How an i8 entry's error bound is derived (#381, global rescoring only;
+/// `KOSHA_KNN_I8_BOUND`).
+///
+/// * `strict` (default): each coordinate was rounded to the nearest code,
+///   so `|x_i - scale * code_i| <= scale / 2` and the estimate is within
+///   `scale / 2 * ||q||_1` of the exact dot product. A guarantee, but a
+///   loose one at high dimension (`||q||_1` of a unit 1024-dim query is
+///   ~25).
+/// * `probabilistic`: treats the rounding errors as independent and
+///   uniform on `[-scale/2, scale/2]`, so the error has standard deviation
+///   `scale * ||q||_2 / sqrt(12)`; the bound is `RABITQ_EPSILON0` of those
+///   (the same confidence the RaBitQ bound uses). Not a guarantee.
+fn i8_error_per_scale(unit_query: &[f32]) -> f32 {
+    static PROBABILISTIC: OnceLock<bool> = OnceLock::new();
+    let probabilistic = *PROBABILISTIC.get_or_init(|| {
+        matches!(
+            std::env::var("KOSHA_KNN_I8_BOUND")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("probabilistic")
+        )
+    });
+    // Slack for f32 accumulation in `dot_i8` and in the exact cosine the
+    // bound is compared against.
+    const SLACK: f32 = 1e-4;
+    if probabilistic {
+        let l2 = unit_query.iter().map(|x| x * x).sum::<f32>().sqrt();
+        kosha_vector_spfresh::RABITQ_EPSILON0 * l2 / 12f32.sqrt() + SLACK
+    } else {
+        0.5 * unit_query.iter().map(|x| x.abs()).sum::<f32>() + SLACK
+    }
+}
+
+/// `KOSHA_VECTOR_DOT_LANES`, read once: accumulator lanes of the f32 dot
+/// that kNN posting scans score f32 entries with (#382). `8` (the default)
+/// is [`kosha_vector_spfresh::dot`], exactly as before; `16`, `32` or `64`
+/// use [`kosha_vector_spfresh::dot_lanes`], whose sums differ in the last
+/// float bits. Experimental: for measuring the FMA latency chain on the
+/// bench host, together with the image's `KOSHA_RUSTFLAGS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DotLanes {
+    Eight,
+    Sixteen,
+    ThirtyTwo,
+    SixtyFour,
+}
+
+impl DotLanes {
+    fn from_env() -> Self {
+        static LANES: OnceLock<DotLanes> = OnceLock::new();
+        *LANES.get_or_init(|| Self::parse(std::env::var("KOSHA_VECTOR_DOT_LANES").ok().as_deref()))
+    }
+
+    fn parse(raw: Option<&str>) -> Self {
+        match raw.map(str::trim) {
+            None | Some("") | Some("8") => Self::Eight,
+            Some("16") => Self::Sixteen,
+            Some("32") => Self::ThirtyTwo,
+            Some("64") => Self::SixtyFour,
+            Some(other) => {
+                eprintln!("WARN: KOSHA_VECTOR_DOT_LANES={other} not 8|16|32|64 — using 8");
+                Self::Eight
+            }
+        }
+    }
+
+    fn dot(self, a: &[f32], b: &[f32]) -> f32 {
+        match self {
+            Self::Eight => kosha_vector_spfresh::dot(a, b),
+            Self::Sixteen => kosha_vector_spfresh::dot_lanes::<16>(a, b),
+            Self::ThirtyTwo => kosha_vector_spfresh::dot_lanes::<32>(a, b),
+            Self::SixtyFour => kosha_vector_spfresh::dot_lanes::<64>(a, b),
+        }
+    }
+
+    /// [`kosha_vector_spfresh::cosine_similarity`] with this dot.
+    fn cosine_similarity(self, a: &[f32], b: &[f32]) -> f32 {
+        if self == Self::Eight {
+            return kosha_vector_spfresh::cosine_similarity(a, b);
+        }
+        let d = self.dot(a, b);
+        let (na, nb) = (self.dot(a, a).sqrt(), self.dot(b, b).sqrt());
+        if na == 0.0 || nb == 0.0 {
+            return 0.0;
+        }
+        1.0 - (1.0 - (d / (na * nb)).clamp(-1.0, 1.0))
+    }
+}
+
+/// `KOSHA_VECTOR_RABITQ_ESTIMATOR`, read once: how a RaBitQ column's codes
+/// are scored at query time (#382). `lut` (the default) is the per-byte
+/// lookup table; `popcount` quantizes the rotated query to 4 bits and
+/// scores with AND + popcount (RaBitQ §3.3.2). Query-time only: the
+/// on-disk codes are the same either way.
+fn rabitq_estimator() -> kosha_vector_spfresh::RaBitQEstimator {
+    static ESTIMATOR: OnceLock<kosha_vector_spfresh::RaBitQEstimator> = OnceLock::new();
+    *ESTIMATOR.get_or_init(|| {
+        parse_rabitq_estimator(
+            std::env::var("KOSHA_VECTOR_RABITQ_ESTIMATOR")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+fn parse_rabitq_estimator(raw: Option<&str>) -> kosha_vector_spfresh::RaBitQEstimator {
+    use kosha_vector_spfresh::RaBitQEstimator;
+    match raw.map(str::trim) {
+        None | Some("") => RaBitQEstimator::Lut,
+        Some(raw) => RaBitQEstimator::parse(raw).unwrap_or_else(|| {
+            eprintln!("WARN: KOSHA_VECTOR_RABITQ_ESTIMATOR={raw} not lut|popcount — using lut");
+            RaBitQEstimator::Lut
+        }),
+    }
+}
+
+/// x86-64 target features above the baseline that this binary was compiled
+/// with (`-C target-cpu=x86-64-v3` turns on `avx2`, `fma`, `bmi2` and
+/// `popcnt`). Empty on the default image and on other architectures.
+fn compiled_x86_features() -> Vec<&'static str> {
+    let x86 = cfg!(target_arch = "x86_64");
+    [
+        ("popcnt", cfg!(target_feature = "popcnt")),
+        ("avx2", cfg!(target_feature = "avx2")),
+        ("fma", cfg!(target_feature = "fma")),
+        ("bmi2", cfg!(target_feature = "bmi2")),
+        ("avx512f", cfg!(target_feature = "avx512f")),
+    ]
+    .into_iter()
+    .filter(|&(_, enabled)| x86 && enabled)
+    .map(|(name, _)| name)
+    .collect()
+}
+
+/// The experimental #382 kernel configuration in effect, for one startup
+/// log line: `None` when everything is at its default (neither
+/// `KOSHA_VECTOR_DOT_LANES` nor `KOSHA_VECTOR_RABITQ_ESTIMATOR` set, and a
+/// baseline-x86-64 build), so a default server logs nothing new. Reading it
+/// also resolves both settings, so an unknown value warns at startup rather
+/// than on the first kNN query. The benchmark checks this line to confirm
+/// that a run's `server_env` / `rustflags` actually took effect.
+pub fn experimental_vector_kernels_summary() -> Option<String> {
+    let env_set = |key: &str| {
+        std::env::var(key)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    };
+    let lanes = DotLanes::from_env();
+    let estimator = rabitq_estimator();
+    let features = compiled_x86_features();
+    let any_set = env_set("KOSHA_VECTOR_DOT_LANES")
+        || env_set("KOSHA_VECTOR_RABITQ_ESTIMATOR")
+        || !features.is_empty();
+    any_set.then(|| format_vector_kernels_summary(lanes, estimator, &features))
+}
+
+fn format_vector_kernels_summary(
+    lanes: DotLanes,
+    estimator: kosha_vector_spfresh::RaBitQEstimator,
+    features: &[&str],
+) -> String {
+    let lanes = match lanes {
+        DotLanes::Eight => 8,
+        DotLanes::Sixteen => 16,
+        DotLanes::ThirtyTwo => 32,
+        DotLanes::SixtyFour => 64,
+    };
+    let estimator = match estimator {
+        kosha_vector_spfresh::RaBitQEstimator::Lut => "lut",
+        kosha_vector_spfresh::RaBitQEstimator::Popcount4 => "popcount",
+    };
+    let features = if features.is_empty() {
+        "baseline".to_string()
+    } else {
+        features.join(",")
+    };
+    format!(
+        "vector kernels (#382, experimental): dot_lanes={lanes} \
+         rabitq_estimator={estimator} x86_features={features}"
+    )
 }
 
 /// The [`kosha_vector_spfresh::RaBitQQuery`] for `unit_query`. It depends
@@ -2149,8 +2447,10 @@ fn rabitq_query_for(unit_query: &[f32]) -> std::rc::Rc<kosha_vector_spfresh::RaB
             }
         }
         let rotation = kosha_vector_spfresh::RaBitQRotation::new(unit_query.len());
-        let built = std::rc::Rc::new(kosha_vector_spfresh::RaBitQQuery::new(
-            &rotation, unit_query,
+        let built = std::rc::Rc::new(kosha_vector_spfresh::RaBitQQuery::with_estimator(
+            &rotation,
+            unit_query,
+            rabitq_estimator(),
         ));
         *last = Some((unit_query.to_vec(), std::rc::Rc::clone(&built)));
         built
@@ -2219,7 +2519,7 @@ impl VectorPosting {
                     }
                     let entry = &codes[i * dim..(i + 1) * dim];
                     let sim = kosha_vector_spfresh::dot_i8(&probe.unit, entry, scale);
-                    emit(id, sim.clamp(-1.0, 1.0), 0.0);
+                    emit(id, sim.clamp(-1.0, 1.0), scale * probe.i8_error_per_scale);
                 }
             }
             VectorPosting::RaBitQ {
@@ -2575,6 +2875,13 @@ pub const SPLIT_INVERTED_VERSION: u32 = 4;
 /// Positions are decoded only by the full [`SegmentReader::postings`] path
 /// (phrase queries, legacy consumers).
 pub const SKIP_SPLIT_INVERTED_VERSION: u32 = 5;
+/// Experimental bit-packed skip-split version (#386): byte-for-byte the v5
+/// span layout and skip table, but every *full* 128-posting scoring block
+/// is frame-of-reference bit-packed (SIMD-BP128 layout, see
+/// [`bitpack`]) instead of varint pairs. A term's partial last block and
+/// the positions section stay v5 varints. Written only when
+/// `KOSHA_POSTINGS_WRITE_VERSION=6`; never the default.
+pub const BITPACKED_SKIP_SPLIT_INVERTED_VERSION: u32 = 6;
 
 /// THE canonical "is this a split-format inverted TOC?" predicate. Every
 /// site that dispatches on split-ness (the server's posting-blob hydration
@@ -2587,11 +2894,14 @@ pub fn is_split_inverted_version(version: u32) -> bool {
     version == FIXED_SPLIT_INVERTED_VERSION
         || version == SPLIT_INVERTED_VERSION
         || version == SKIP_SPLIT_INVERTED_VERSION
+        || version == BITPACKED_SKIP_SPLIT_INVERTED_VERSION
 }
 
 /// The inverted-postings version the writer emits —
 /// `KOSHA_POSTINGS_WRITE_VERSION`, accepted values `4` (varint-delta
-/// split) and `5` (skip-split); default `5`. This is the mixed-fleet
+/// split), `5` (skip-split) and `6` (experimental bit-packed skip-split,
+/// #386 — opt-in only, readable only by builds that include #386); default
+/// `5`. This is the mixed-fleet
 /// rollout/rollback gate: a reader only understands versions up to its own
 /// build, so during a rolling deploy (writer upgraded before all query
 /// replicas) or ahead of a possible rollback, set `4` until the whole
@@ -2606,10 +2916,11 @@ fn postings_write_version() -> u32 {
         {
             Some("4") => SPLIT_INVERTED_VERSION,
             Some("5") | None => SKIP_SPLIT_INVERTED_VERSION,
+            Some("6") => BITPACKED_SKIP_SPLIT_INVERTED_VERSION,
             Some(other) => {
                 eprintln!(
                     "WARN: KOSHA_POSTINGS_WRITE_VERSION={other} not supported \
-                     (accepted: 4, 5) — writing v{SKIP_SPLIT_INVERTED_VERSION}"
+                     (accepted: 4, 5, 6) — writing v{SKIP_SPLIT_INVERTED_VERSION}"
                 );
                 SKIP_SPLIT_INVERTED_VERSION
             }
@@ -3209,6 +3520,10 @@ struct TermEncoder {
     block_min_fl: u32,
     block_last: u32,
     prev_block_last: u32,
+    /// v6: the current block's doc ids / tfs, packed when it fills (a
+    /// partial last block is written as v5 varints on `finish`).
+    bp_docs: Box<[u32; SCORING_BLOCK_LEN]>,
+    bp_tfs: Box<[u32; SCORING_BLOCK_LEN]>,
 }
 
 impl TermEncoder {
@@ -3226,7 +3541,35 @@ impl TermEncoder {
             block_min_fl: u32::MAX,
             block_last: 0,
             prev_block_last: 0,
+            bp_docs: Box::new([0; SCORING_BLOCK_LEN]),
+            bp_tfs: Box::new([0; SCORING_BLOCK_LEN]),
         }
+    }
+
+    /// v6: emit the buffered block's scoring bytes — bit-packed when full,
+    /// v5 varint pairs for a term's partial last block — then its skip
+    /// entry. Bytes match [`write_postings_skip_split_v6`].
+    fn flush_bp_block(&mut self) {
+        let n = self.in_block;
+        self.block_start = self.scoring.len();
+        // `skip` is empty exactly while the term's first block is open.
+        let first = self.skip.is_empty();
+        if n == SCORING_BLOCK_LEN {
+            let next_min = if first {
+                0
+            } else {
+                self.prev_block_last.wrapping_add(1)
+            };
+            bitpack::encode_bp_block(&self.bp_docs, &self.bp_tfs, next_min, &mut self.scoring.mem);
+        } else {
+            let mut prev = if first { 0 } else { self.prev_block_last };
+            for i in 0..n {
+                put_var_u32(&mut self.scoring.mem, self.bp_docs[i].wrapping_sub(prev));
+                prev = self.bp_docs[i];
+                put_var_u32(&mut self.scoring.mem, self.bp_tfs[i]);
+            }
+        }
+        self.close_block();
     }
 
     fn push(
@@ -3252,14 +3595,20 @@ impl TermEncoder {
             return self.scoring.maybe_spill();
         }
 
+        let bitpacked = self.version == BITPACKED_SKIP_SPLIT_INVERTED_VERSION;
         if self.in_block == 0 {
             self.block_start = self.scoring.len();
             self.block_max_tf = 0;
             self.block_min_fl = u32::MAX;
         }
-        put_var_u32(&mut self.scoring.mem, doc_id.wrapping_sub(self.prev_doc));
+        if bitpacked {
+            self.bp_docs[self.in_block] = doc_id;
+            self.bp_tfs[self.in_block] = term_frequency;
+        } else {
+            put_var_u32(&mut self.scoring.mem, doc_id.wrapping_sub(self.prev_doc));
+            put_var_u32(&mut self.scoring.mem, term_frequency);
+        }
         self.prev_doc = doc_id;
-        put_var_u32(&mut self.scoring.mem, term_frequency);
         self.block_max_tf = self.block_max_tf.max(term_frequency);
         if let Some(&field_length) = field_lengths.get(doc_id as usize) {
             self.block_min_fl = self.block_min_fl.min(field_length);
@@ -3267,7 +3616,11 @@ impl TermEncoder {
         self.block_last = doc_id;
         self.in_block += 1;
         if self.in_block == SCORING_BLOCK_LEN {
-            self.close_block();
+            if bitpacked {
+                self.flush_bp_block();
+            } else {
+                self.close_block();
+            }
         }
 
         let out = &mut self.positions.mem;
@@ -3309,7 +3662,11 @@ impl TermEncoder {
     /// Returns the span's length.
     fn finish(&mut self, out: &mut impl std::io::Write) -> Result<u64, KoshaError> {
         if self.in_block > 0 {
-            self.close_block();
+            if self.version == BITPACKED_SKIP_SPLIT_INVERTED_VERSION {
+                self.flush_bp_block();
+            } else {
+                self.close_block();
+            }
         }
         let mut header = Vec::with_capacity(5);
         put_var_u32(&mut header, self.count);
@@ -3790,6 +4147,32 @@ impl DocVectors {
         Ok(out)
     }
 
+    /// `field`'s vector of `doc_seq` out of `buf`, the bytes of the
+    /// document's whole [`Self::doc_span`] (#381). `None` when the document
+    /// has no `field` vector or `buf` is not that span's length.
+    fn field_vector_in_span(&self, doc_seq: u32, field: &str, buf: &[u8]) -> Option<Vec<f32>> {
+        let (start, end) = self.entry_range(doc_seq);
+        let (span_start, span_end) = self.doc_span(doc_seq)?;
+        if buf.len() as u64 != span_end - span_start {
+            return None;
+        }
+        (start..end).find_map(|i| {
+            let (_, field_idx, dim) = self.entries[i];
+            if self.fields[field_idx as usize] != field {
+                return None;
+            }
+            let at = (self.offsets[i] - span_start) as usize;
+            Some(
+                buf[at..at + dim as usize * 4]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b))
+                    .collect(),
+            )
+        })
+    }
+
     /// Whether the sidecar holds any vector of `field`.
     pub fn has_field(&self, field: &str) -> bool {
         self.fields.iter().any(|name| name == field)
@@ -4028,6 +4411,106 @@ pub fn posting_term_spans(
         .collect())
 }
 
+/// Byte breakdown of one skip-split (v5/v6) segment's postings, for the
+/// #386 bit-packing experiment. Diagnostics only: nothing on the query or
+/// write path calls it.
+#[doc(hidden)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PostingsSectionStats {
+    /// The `inverted.idx` TOC version (5 or 6).
+    pub inverted_version: u32,
+    pub terms: u64,
+    pub postings: u64,
+    /// Postings in full [`SCORING_BLOCK_LEN`] blocks: the only ones v6
+    /// bit-packs.
+    pub postings_in_full_blocks: u64,
+    /// Per-term doc count + skip table, as stored.
+    pub skip_bytes: u64,
+    /// Scoring `(doc, tf)` sections, as stored.
+    pub scoring_bytes: u64,
+    /// Positions sections, as stored (the same codec in v5 and v6).
+    pub positions_bytes: u64,
+    /// The same scoring blocks re-encoded as v5 varints and as v6
+    /// (full blocks bit-packed, tails varint): a codec-only comparison on
+    /// identical postings, whatever the segment layout.
+    pub scoring_bytes_as_v5: u64,
+    pub scoring_bytes_as_v6: u64,
+    /// Total logical (decompressed) bytes of the `postings-*.bin` shards
+    /// the TOC references.
+    pub shard_logical_bytes: u64,
+}
+
+/// [`PostingsSectionStats`] for a split segment whose shards are all local
+/// (whole files, not span-cache fragments). Errors on v3/v4 segments, on a
+/// missing shard and on any span or block that does not decode.
+#[doc(hidden)]
+pub fn postings_section_stats(segment_dir: &Path) -> Result<PostingsSectionStats, KoshaError> {
+    let corrupt =
+        |msg: String| KoshaError::CorruptSegment(format!("{}: {msg}", segment_dir.display()));
+    let data = read_inverted_payload(fs::read(segment_dir.join("inverted.idx"))?)?;
+    let index = SplitInvertedIndex::from_bytes(data, segment_dir.to_path_buf(), None)?;
+    let inverted_version = u32::from_le_bytes(index.data[4..8].try_into().unwrap());
+    let Some(bitpacked) = index.encoding.skip_split() else {
+        return Err(corrupt(format!(
+            "inverted version {inverted_version} is not skip-split (v5/v6)"
+        )));
+    };
+    let mut by_blob: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
+    for i in 0..index.term_count {
+        let (_, _, blob_id, off, len) = index.raw_entry(i);
+        by_blob.entry(blob_id).or_default().push((off, len));
+    }
+    let mut stats = PostingsSectionStats {
+        inverted_version,
+        terms: index.term_count as u64,
+        ..Default::default()
+    };
+    let mut block = Vec::with_capacity(SCORING_BLOCK_LEN);
+    let mut scratch = Vec::new();
+    for (blob_id, spans) in by_blob {
+        let blob = index
+            .read_posting_blob(blob_id)
+            .ok_or_else(|| corrupt(format!("shard {blob_id} missing or unreadable")))?;
+        stats.shard_logical_bytes += blob.len() as u64;
+        for (off, len) in spans {
+            let bytes = off
+                .checked_add(len)
+                .and_then(|end| blob.get(off..end))
+                .ok_or_else(|| corrupt(format!("span out of shard {blob_id} bounds")))?;
+            let parsed = BlockedTermPostings::parse_with(Arc::new(bytes.to_vec()), bitpacked)
+                .ok_or_else(|| corrupt(format!("span in shard {blob_id} does not parse")))?;
+            stats.postings += parsed.doc_count() as u64;
+            stats.skip_bytes += u64::from(parsed.scoring_base);
+            stats.scoring_bytes += u64::from(parsed.positions_base - parsed.scoring_base);
+            stats.positions_bytes += (bytes.len() - parsed.positions_base as usize) as u64;
+            for b in 0..parsed.block_count() {
+                if !parsed.read_block(b, &mut block) {
+                    return Err(corrupt(format!("block {b} in shard {blob_id} corrupt")));
+                }
+                let prev_doc = if b == 0 {
+                    0
+                } else {
+                    parsed.summary(b - 1).last_doc_id
+                };
+                scratch.clear();
+                bitpack::encode_varint_block(&block, prev_doc, &mut scratch);
+                stats.scoring_bytes_as_v5 += scratch.len() as u64;
+                if block.len() == SCORING_BLOCK_LEN {
+                    stats.postings_in_full_blocks += SCORING_BLOCK_LEN as u64;
+                    let docs: [u32; SCORING_BLOCK_LEN] = std::array::from_fn(|i| block[i].doc_id);
+                    let tfs: [u32; SCORING_BLOCK_LEN] =
+                        std::array::from_fn(|i| block[i].term_frequency);
+                    let next_min = if b == 0 { 0 } else { prev_doc.wrapping_add(1) };
+                    scratch.clear();
+                    bitpack::encode_bp_block(&docs, &tfs, next_min, &mut scratch);
+                }
+                stats.scoring_bytes_as_v6 += scratch.len() as u64;
+            }
+        }
+    }
+    Ok(stats)
+}
+
 pub fn inverted_uses_posting_blobs(segment_dir: &Path) -> bool {
     let Some(header) = read_inverted_header(&segment_dir.join("inverted.idx")) else {
         return false;
@@ -4163,6 +4646,20 @@ enum SplitPostingsEncoding {
     /// v5: `[skip table][scoring (doc,tf)][positions]` per term span — see
     /// [`BlockedTermPostings`] and [`write_postings_skip_split`].
     SkipSplit,
+    /// v6: the v5 span with bit-packed full scoring blocks (#386).
+    BitPackedSkipSplit,
+}
+
+impl SplitPostingsEncoding {
+    /// `Some(bitpacked)` when term spans are skip-split (v5/v6) and so
+    /// parse into a [`BlockedTermPostings`]; `None` for v3/v4.
+    fn skip_split(self) -> Option<bool> {
+        match self {
+            Self::SkipSplit => Some(false),
+            Self::BitPackedSkipSplit => Some(true),
+            Self::Fixed32 | Self::VarintDelta => None,
+        }
+    }
 }
 
 /// Checked little-endian u32 read that advances the cursor.
@@ -4777,19 +5274,47 @@ pub struct ScoringBlockSummary {
 /// byte-identity tests compare against.
 #[cfg_attr(not(test), allow(dead_code))]
 fn write_postings_skip_split(out: &mut Vec<u8>, postings: &[Posting], field_lengths: &[u32]) {
+    write_postings_skip_split_inner(out, postings, field_lengths, false);
+}
+
+/// v6 ([`BITPACKED_SKIP_SPLIT_INVERTED_VERSION`]) reference writer: the v5
+/// span with every full 128-posting scoring block bit-packed (see
+/// [`bitpack`]); the byte-identity reference for [`TermEncoder`]'s v6 mode.
+#[cfg_attr(not(test), allow(dead_code))]
+fn write_postings_skip_split_v6(out: &mut Vec<u8>, postings: &[Posting], field_lengths: &[u32]) {
+    write_postings_skip_split_inner(out, postings, field_lengths, true);
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn write_postings_skip_split_inner(
+    out: &mut Vec<u8>,
+    postings: &[Posting],
+    field_lengths: &[u32],
+    bitpacked: bool,
+) {
     put_var_u32(out, postings.len() as u32);
 
     let mut scoring: Vec<u8> = Vec::new();
     let mut prev_doc = 0u32;
     let mut prev_last = 0u32;
-    for block in postings.chunks(SCORING_BLOCK_LEN) {
+    for (b, block) in postings.chunks(SCORING_BLOCK_LEN).enumerate() {
         let start = scoring.len();
         let mut max_tf = 0u32;
         let mut min_fl = u32::MAX;
+        let pack = bitpacked && block.len() == SCORING_BLOCK_LEN;
+        if pack {
+            let docs: [u32; SCORING_BLOCK_LEN] = std::array::from_fn(|i| block[i].doc_id);
+            let tfs: [u32; SCORING_BLOCK_LEN] = std::array::from_fn(|i| block[i].term_frequency);
+            let next_min = if b == 0 { 0 } else { prev_doc.wrapping_add(1) };
+            bitpack::encode_bp_block(&docs, &tfs, next_min, &mut scoring);
+            prev_doc = block[SCORING_BLOCK_LEN - 1].doc_id;
+        }
         for posting in block {
-            put_var_u32(&mut scoring, posting.doc_id.wrapping_sub(prev_doc));
-            prev_doc = posting.doc_id;
-            put_var_u32(&mut scoring, posting.term_frequency);
+            if !pack {
+                put_var_u32(&mut scoring, posting.doc_id.wrapping_sub(prev_doc));
+                prev_doc = posting.doc_id;
+                put_var_u32(&mut scoring, posting.term_frequency);
+            }
             max_tf = max_tf.max(posting.term_frequency);
             if let Some(&field_length) = field_lengths.get(posting.doc_id as usize) {
                 min_fl = min_fl.min(field_length);
@@ -4817,6 +5342,18 @@ fn write_postings_skip_split(out: &mut Vec<u8>, postings: &[Posting], field_leng
     }
 }
 
+/// Scoring blocks varint-decoded by [`BlockedTermPostings::read_block`]
+/// since process start, across every segment and query (#385). Read with
+/// [`scoring_blocks_decoded`]; a bench diffs it around a run and divides by
+/// the request count to get blocks decoded per query. One relaxed atomic
+/// add per decoded block (each decodes up to `SCORING_BLOCK_LEN` postings).
+static SCORING_BLOCKS_DECODED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`SCORING_BLOCKS_DECODED`].
+pub fn scoring_blocks_decoded() -> u64 {
+    SCORING_BLOCKS_DECODED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// One term's parsed v5 span: skip table in memory, scoring/position bytes
 /// shared, blocks decoded strictly on demand — a block the WAND pruning or
 /// the leapfrog gallop steps over is never varint-decoded at all.
@@ -4827,12 +5364,25 @@ pub struct BlockedTermPostings {
     span: Arc<Vec<u8>>,
     scoring_base: u32,
     positions_base: u32,
+    /// v6: full blocks are bit-packed ([`bitpack`]); partial blocks and
+    /// all of v5 are varint pairs.
+    bitpacked: bool,
 }
 
 impl BlockedTermPostings {
     /// Parse a v5 term span. Validates the skip table against the span
     /// bounds once, so per-block decode can't walk off the buffer.
     fn parse(span: Arc<Vec<u8>>) -> Option<Self> {
+        Self::parse_with(span, false)
+    }
+
+    /// Parse a v6 ([`BITPACKED_SKIP_SPLIT_INVERTED_VERSION`]) term span —
+    /// same skip table as v5.
+    fn parse_v6(span: Arc<Vec<u8>>) -> Option<Self> {
+        Self::parse_with(span, true)
+    }
+
+    fn parse_with(span: Arc<Vec<u8>>, bitpacked: bool) -> Option<Self> {
         let mut buf: &[u8] = &span;
         let doc_count = take_var_u32(&mut buf)?;
         let n_blocks = (doc_count as usize).div_ceil(SCORING_BLOCK_LEN);
@@ -4867,6 +5417,7 @@ impl BlockedTermPostings {
             scoring_base: u32::try_from(scoring_base).ok()?,
             positions_base: u32::try_from(positions_base).ok()?,
             span,
+            bitpacked,
         })
     }
 
@@ -4900,34 +5451,35 @@ impl BlockedTermPostings {
     /// the other formats.
     pub fn read_block(&self, block: usize, out: &mut Vec<ScoringPosting>) -> bool {
         out.clear();
+        SCORING_BLOCKS_DECODED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(summary) = self.blocks.get(block) else {
             return false;
         };
         let start = self.scoring_base as usize + summary.scoring_start as usize;
         let end = self.scoring_base as usize + summary.scoring_end as usize;
-        let Some(mut buf) = self.span.get(start..end) else {
+        let Some(buf) = self.span.get(start..end) else {
             return false;
         };
         let in_block = block_posting_count(self.doc_count as usize, block);
-        let mut prev_doc = if block == 0 {
+        let prev_doc = if block == 0 {
             0
         } else {
             self.blocks[block - 1].last_doc_id
         };
-        for _ in 0..in_block {
-            let Some(doc_delta) = take_var_u32(&mut buf) else {
-                return false;
+        let decoded = if self.bitpacked && in_block == SCORING_BLOCK_LEN {
+            let next_min = if block == 0 {
+                0
+            } else {
+                prev_doc.wrapping_add(1)
             };
-            let Some(term_frequency) = take_var_u32(&mut buf) else {
-                return false;
-            };
-            let doc_id = prev_doc.wrapping_add(doc_delta);
-            prev_doc = doc_id;
-            out.push(ScoringPosting {
-                doc_id,
-                term_frequency,
-            });
-        }
+            bitpack::decode_bp_block(buf, next_min, out)
+        } else {
+            bitpack::decode_varint_block(buf, in_block, prev_doc, out)
+        };
+        let Some(prev_doc) = decoded else {
+            out.clear();
+            return false;
+        };
         // The delta chain must land exactly on the skip entry's
         // last_doc_id. Without this check a flipped bit in any doc-delta
         // varint still "decodes" — every doc_id after it is shifted, BM25
@@ -5020,6 +5572,7 @@ impl SplitInvertedIndex {
             FIXED_SPLIT_INVERTED_VERSION => SplitPostingsEncoding::Fixed32,
             SPLIT_INVERTED_VERSION => SplitPostingsEncoding::VarintDelta,
             SKIP_SPLIT_INVERTED_VERSION => SplitPostingsEncoding::SkipSplit,
+            BITPACKED_SKIP_SPLIT_INVERTED_VERSION => SplitPostingsEncoding::BitPackedSkipSplit,
             _ => return Err(corrupt(&format!("unsupported version {version}"))),
         };
         let term_count = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
@@ -5201,6 +5754,10 @@ impl SplitInvertedIndex {
             SplitPostingsEncoding::SkipSplit => {
                 BlockedTermPostings::parse(Arc::new(bytes.to_vec())).and_then(|b| b.decode_full())
             }
+            SplitPostingsEncoding::BitPackedSkipSplit => {
+                BlockedTermPostings::parse_v6(Arc::new(bytes.to_vec()))
+                    .and_then(|b| b.decode_full())
+            }
         }
     }
 
@@ -5226,9 +5783,7 @@ impl SplitInvertedIndex {
         &'a self,
         terms: &'a [String],
     ) -> Option<Vec<(&'a str, Arc<BlockedTermPostings>)>> {
-        if !matches!(self.encoding, SplitPostingsEncoding::SkipSplit) {
-            return None;
-        }
+        let bitpacked = self.encoding.skip_split()?;
         // Slot-assembled in requested-term order — same load-bearing
         // reason as `postings_for_terms`: the WAND leapfrog join sums
         // per-term float scores in whatever order this returns, and a
@@ -5268,7 +5823,9 @@ impl SplitInvertedIndex {
                     self.note_blob_read_failure();
                     continue;
                 };
-                let Some(parsed) = BlockedTermPostings::parse(Arc::new(bytes.into_owned())) else {
+                let Some(parsed) =
+                    BlockedTermPostings::parse_with(Arc::new(bytes.into_owned()), bitpacked)
+                else {
                     self.note_blob_read_failure();
                     continue;
                 };
@@ -5483,6 +6040,9 @@ enum DocStoreAccess {
     Lazy {
         doc_store_path: PathBuf,
         index: DocIndex,
+        /// `Some` for a compressed doc store (research #388): stored
+        /// records are decoded through it before parsing.
+        decoder: Option<Arc<DocStoreDecoder>>,
     },
     Eager(Vec<DocRecord>),
 }
@@ -5846,6 +6406,11 @@ impl VectorFieldIndex {
     pub fn has_lazy_index(&self) -> bool {
         self.lazy.is_some()
     }
+    /// The lazy index holds quantized codes (i8 or RaBitQ), whose probe
+    /// scores are estimates until rescored from `doc_vectors.bin`.
+    pub fn is_quantized(&self) -> bool {
+        self.lazy.as_ref().is_some_and(|vi| vi.quantized)
+    }
     /// Legacy / missing-sidecar vectors, served by exact flat scan. Empty
     /// when [`Self::has_lazy_index`].
     pub fn flat(&self) -> &VectorStore {
@@ -5913,6 +6478,92 @@ pub fn footer_vector_field_status(footer: &Footer, field: &str) -> Option<Vector
 /// [`SegmentReader::knn_search_within`]. `None` when the segment has no
 /// lazy v2 vector index.
 pub type BudgetedKnnResult = Option<Result<(Vec<(u32, f64)>, usize), KoshaError>>;
+
+/// How much of a column a kNN probe reads (#381, see
+/// [`SegmentReader::knn_candidates_fetching`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum KnnProbeBudget {
+    /// The global budget: postings whose centroid lower bound is within
+    /// `max_distance`, at most `max_probes` of them (see
+    /// [`SegmentReader::knn_search_within`]).
+    Within {
+        max_distance: f32,
+        max_probes: usize,
+    },
+    /// The per-segment fallback: the `nprobe` nearest centroids.
+    Nprobe(usize),
+}
+
+/// One kNN candidate with its score estimate and error bound (#381): the
+/// exact cosine similarity is (with the bound's confidence) within
+/// `estimate +- error`. `error == 0` means the estimate is exact.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KnnCandidate {
+    pub doc_seq: u32,
+    pub estimate: f64,
+    pub error: f64,
+}
+
+impl KnnCandidate {
+    /// Lowest score the candidate can have.
+    pub fn lower(&self) -> f64 {
+        self.estimate - self.error
+    }
+
+    /// Highest score the candidate can have.
+    pub fn upper(&self) -> f64 {
+        self.estimate + self.error
+    }
+}
+
+/// The `k`-th largest lower bound of `candidates`; `None` when there are
+/// fewer than `k` (nothing can be ruled out) or `k == 0`.
+pub fn kth_lower_bound(candidates: &[KnnCandidate], k: usize) -> Option<f64> {
+    if k == 0 || candidates.len() < k {
+        return None;
+    }
+    let mut lower: Vec<f64> = candidates.iter().map(KnnCandidate::lower).collect();
+    let (_, kth, _) = lower.select_nth_unstable_by(k - 1, |a, b| {
+        b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Some(*kth)
+}
+
+/// [`SegmentReader::knn_candidates_fetching`]'s answer.
+#[derive(Debug, Clone, Default)]
+pub struct KnnCandidates {
+    /// Best estimate first.
+    pub candidates: Vec<KnnCandidate>,
+    /// Postings hydrated and scored.
+    pub postings: usize,
+    /// The column is f32: every estimate is exact and needs no rescoring.
+    pub exact: bool,
+}
+
+/// [`SegmentReader::knn_exact_scores_fetching`]'s answer.
+#[derive(Debug, Clone, Default)]
+pub struct ExactRescore {
+    /// `(doc_seq, exact cosine similarity)` for each vector read, in no
+    /// particular order.
+    pub scores: Vec<(u32, f64)>,
+    /// Requested documents whose exact vector could not be read.
+    pub unavailable: usize,
+    /// Why, when `unavailable > 0`.
+    pub reason: Option<String>,
+    /// The whole `doc_vectors.bin` was not local: vectors came from the
+    /// span cache, after ranged reads where needed.
+    pub ranged: bool,
+    /// Spans handed to `fetch` (not already in the span cache).
+    pub ranged_spans: usize,
+}
+
+/// Every candidate a probe scored, before any cut: `errors[i]` is the
+/// error bound of `scored[i]`'s score (`0.0` when exact).
+struct ProbedCandidates {
+    scored: Vec<(u32, f64)>,
+    errors: Vec<f32>,
+    postings: usize,
+}
 
 /// One stored document plus its sidecar vectors, as yielded by
 /// [`SegmentReader::iter_doc_records_raw`]. `record`'s sidecar `Vector`
@@ -6107,12 +6758,18 @@ impl SegmentReader {
         } else {
             Vec::new()
         };
-        let doc_store = match try_read_doc_index(&segment_dir, footer.doc_count) {
-            Some(index) => DocStoreAccess::Lazy {
-                doc_store_path: segment_dir.join("doc_store.bin"),
-                index,
+        let doc_store = match &footer.doc_store_compression {
+            None => match try_read_doc_index(&segment_dir, footer.doc_count) {
+                Some(index) => DocStoreAccess::Lazy {
+                    doc_store_path: segment_dir.join("doc_store.bin"),
+                    index,
+                    decoder: None,
+                },
+                None => DocStoreAccess::Eager(Self::read_doc_store_for_fallback(&segment_dir)?),
             },
-            None => DocStoreAccess::Eager(Self::read_doc_store_for_fallback(&segment_dir)?),
+            Some(compression) => {
+                Self::open_compressed_doc_store(&segment_dir, &footer, compression)?
+            }
         };
         Ok(Self {
             segment_dir: segment_dir.clone(),
@@ -6127,6 +6784,90 @@ impl SegmentReader {
             vector_rescore_factor: vector_rescore_factor(),
             multi_vectors: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// A compressed doc store (research #388) opens only lazily: the
+    /// eager full parse cannot read frames. Its index and dictionary come
+    /// from `doc_store.offsets`. When that sidecar is missing or broken
+    /// (bad entries, bad dictionary trailer, or a dictionary length that
+    /// disagrees with the footer) and `doc_store.bin` is local, the index
+    /// is rebuilt in memory from `doc_store.bin` and its dictionary tail
+    /// copy: slower, still correct, as the eager fallback is for a raw
+    /// doc store. An unknown codec, or a broken sidecar with no local
+    /// `doc_store.bin` (or a damaged one), is an error.
+    fn open_compressed_doc_store(
+        segment_dir: &Path,
+        footer: &Footer,
+        compression: &kosha_core::DocStoreCompression,
+    ) -> Result<DocStoreAccess, KoshaError> {
+        let corrupt = |why: &str| {
+            KoshaError::CorruptSegment(format!(
+                "{}: compressed doc store ({}): {why}",
+                segment_dir.display(),
+                compression.codec
+            ))
+        };
+        if compression.codec != kosha_core::DocStoreCompression::ZSTD_DICT {
+            return Err(corrupt(
+                "unknown codec; this binary is too old for the segment",
+            ));
+        }
+        let index_and_dict = |parts: Option<(DocIndex, Vec<u8>)>| {
+            let (index, trailer) = parts?;
+            let dict = parse_dict_trailer(&trailer)?;
+            (dict.len() == compression.dict_bytes as usize).then_some((index, dict))
+        };
+        let from_sidecar = index_and_dict(try_read_doc_index_parts(segment_dir, footer.doc_count));
+        let (index, dict) = match from_sidecar {
+            Some(found) => found,
+            None => {
+                let store_path = segment_dir.join(DOC_STORE_FILE);
+                if !store_path.is_file() {
+                    return Err(corrupt(
+                        "doc_store.offsets (or its dictionary trailer) is missing or malformed, \
+                         and doc_store.bin is not local to rebuild it from",
+                    ));
+                }
+                eprintln!(
+                    "WARN: {}: doc_store.offsets of a compressed doc store is missing or \
+                     malformed; rebuilding it in memory from doc_store.bin",
+                    segment_dir.display()
+                );
+                let rebuilt = rebuild_offsets(
+                    &fs::read(&store_path)?,
+                    footer.doc_count,
+                    compression.dict_bytes,
+                )?;
+                index_and_dict(parse_doc_index_bytes(
+                    &rebuilt,
+                    &store_path,
+                    footer.doc_count,
+                ))
+                .ok_or_else(|| corrupt("offsets rebuilt from doc_store.bin do not parse"))?
+            }
+        };
+        Ok(DocStoreAccess::Lazy {
+            doc_store_path: segment_dir.join("doc_store.bin"),
+            index,
+            decoder: Some(Arc::new(DocStoreDecoder::new(dict))),
+        })
+    }
+
+    /// Whether this segment's `doc_store.bin` is compressed (research
+    /// #388; `Footer::doc_store_compression`).
+    pub fn doc_store_compressed(&self) -> bool {
+        self.footer.doc_store_compression.is_some()
+    }
+
+    /// Bytes of the compressed doc store's dictionary held resident (0 for
+    /// a raw doc store).
+    pub fn doc_store_dict_bytes(&self) -> usize {
+        match &self.doc_store {
+            DocStoreAccess::Lazy {
+                decoder: Some(d), ..
+            } => d.dict_len(),
+            _ => 0,
+        }
     }
 
     /// Override how many probe candidates per wanted hit an i8 vector
@@ -6960,6 +7701,227 @@ impl SegmentReader {
         Some(self.knn_search_within_lazy(vi, query, k, max_distance, max_probes, accept, fetch))
     }
 
+    /// The candidates half of a kNN probe over `field`'s column, for
+    /// global bound-driven rescoring (#381, `KOSHA_KNN_GLOBAL_RESCORE`).
+    ///
+    /// Probes exactly as [`Self::knn_search_within_filtered_fetching`]
+    /// (or [`Self::knn_search_filtered_fetching`] for
+    /// [`KnnProbeBudget::Nprobe`]) does, but neither cuts to a fixed
+    /// shortlist nor rescores. Instead:
+    ///
+    /// * an f32 column's scores are exact: its best `k`, each with error
+    ///   `0`, and [`KnnCandidates::exact`] set;
+    /// * a quantized column returns every candidate whose upper bound
+    ///   (`estimate + error`) reaches this segment's `k`-th largest lower
+    ///   bound (`estimate - error`). The query layer's global `k`-th lower
+    ///   bound is at least as high, so nothing dropped here could survive
+    ///   the global cut either.
+    ///
+    /// Candidates come back best estimate first. `None` when the column has
+    /// no lazy index here.
+    pub fn knn_candidates_fetching(
+        &self,
+        field: &str,
+        query: &[f32],
+        k: usize,
+        budget: KnnProbeBudget,
+        accept: Option<&dyn Fn(u32) -> bool>,
+        fetch: Option<VectorSpanFetch<'_>>,
+    ) -> Option<Result<KnnCandidates, KoshaError>> {
+        let index = match self.vector_field(field) {
+            Ok(index) => index?,
+            Err(e) => return Some(Err(e)),
+        };
+        let vi = index.lazy.as_ref()?;
+        if let Err(e) = Self::check_query_dim(vi, field, query) {
+            return Some(Err(e));
+        }
+        let probed = match budget {
+            KnnProbeBudget::Within {
+                max_distance,
+                max_probes,
+            } => self.probe_within_lazy(vi, query, k, max_distance, max_probes, accept, fetch),
+            KnnProbeBudget::Nprobe(nprobe) => {
+                let mut unit = query.to_vec();
+                if vi.unit_norm {
+                    kosha_vector_spfresh::normalize_in_place(&mut unit);
+                }
+                self.probe_nprobe_lazy(vi, &unit, k, nprobe, accept, fetch)
+            }
+        };
+        let probed = match probed {
+            Ok(probed) => probed,
+            Err(e) => return Some(Err(e)),
+        };
+        let postings = probed.postings;
+        if !vi.quantized {
+            let candidates = top_k_by_score(probed.scored, k)
+                .into_iter()
+                .map(|(doc_seq, estimate)| KnnCandidate {
+                    doc_seq,
+                    estimate,
+                    error: 0.0,
+                })
+                .collect();
+            return Some(Ok(KnnCandidates {
+                candidates,
+                postings,
+                exact: true,
+            }));
+        }
+        let mut candidates: Vec<KnnCandidate> = probed
+            .scored
+            .iter()
+            .zip(probed.errors.iter().chain(std::iter::repeat(&0.0)))
+            .map(|(&(doc_seq, estimate), &error)| KnnCandidate {
+                doc_seq,
+                estimate,
+                error: error as f64,
+            })
+            .collect();
+        if let Some(threshold) = kth_lower_bound(&candidates, k) {
+            candidates.retain(|c| c.upper() >= threshold);
+        }
+        candidates.sort_by(|a, b| {
+            b.estimate
+                .partial_cmp(&a.estimate)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Some(Ok(KnnCandidates {
+            candidates,
+            postings,
+            exact: false,
+        }))
+    }
+
+    /// Exact cosine similarity of `query` with `field`'s full-precision
+    /// vector of each of `doc_seqs` (#381), read from `doc_vectors.bin`:
+    /// the local file when it is whole, otherwise by ranged reads through
+    /// `fetch` into the span cache (one call for every missing span). The
+    /// sidecar's header must be local for the ranged path (whole file or
+    /// cached header span); it is not fetched here.
+    ///
+    /// Never fails: a document whose vector cannot be read is counted in
+    /// [`ExactRescore::unavailable`] and left out of `scores`, so the caller
+    /// can surface that its estimate stands, instead of silently returning
+    /// it as final.
+    pub fn knn_exact_scores_fetching(
+        &self,
+        field: &str,
+        query: &[f32],
+        doc_seqs: &[u32],
+        fetch: Option<VectorSpanFetch<'_>>,
+    ) -> ExactRescore {
+        let mut wanted: Vec<u32> = doc_seqs.to_vec();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let mut out = ExactRescore::default();
+        if wanted.is_empty() {
+            return out;
+        }
+        let unavailable = |mut out: ExactRescore, why: String| {
+            out.unavailable = wanted.len();
+            out.reason = Some(why);
+            out
+        };
+        if !self.footer.doc_vectors {
+            return unavailable(
+                out,
+                format!("segment stores vectors inline, no {DOC_VECTORS_FILE}"),
+            );
+        }
+        let dv = match self.doc_vectors() {
+            Ok(dv) => dv,
+            Err(e) => return unavailable(out, format!("{DOC_VECTORS_FILE} header: {e}")),
+        };
+        if !dv.has_field(field) {
+            return unavailable(
+                out,
+                format!("{DOC_VECTORS_FILE} holds no '{field}' vectors"),
+            );
+        }
+        let whole = self.segment_dir.join(DOC_VECTORS_FILE);
+        let whole_local =
+            fs::metadata(&whole).is_ok_and(|m| m.is_file() && m.len() == dv.file_len());
+        let mut exact: HashMap<u32, f64> = HashMap::with_capacity(wanted.len());
+        if whole_local {
+            let visited = dv.visit_field_vectors(field, &wanted, |doc_seq, v| {
+                if v.len() == query.len() {
+                    exact.insert(
+                        doc_seq,
+                        kosha_vector_spfresh::cosine_similarity(query, v) as f64,
+                    );
+                }
+            });
+            if let Err(e) = visited {
+                return unavailable(out, format!("{DOC_VECTORS_FILE} read: {e}"));
+            }
+        } else {
+            out.ranged = true;
+            let spans: Vec<(u32, (u64, u64))> = wanted
+                .iter()
+                .filter_map(|&doc_seq| dv.doc_span(doc_seq).map(|span| (doc_seq, span)))
+                .collect();
+            // The span cache is listed once before the fetch and once after
+            // it, never per candidate: a listing is a `read_dir` plus a stat
+            // of every cached span, and the directory grows as rescoring
+            // caches spans.
+            let mut local = span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE);
+            if let Some(fetch) = fetch {
+                let missing: Vec<(u64, u64)> = spans
+                    .iter()
+                    .map(|&(_, span)| span)
+                    .filter(|&(start, end)| !local.covers(start, end))
+                    .collect();
+                if !missing.is_empty() {
+                    out.ranged_spans = missing.len();
+                    fetch(&self.segment_dir, DOC_VECTORS_FILE, &missing);
+                    local = span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE);
+                }
+            }
+            let ranges: Vec<(u64, u64)> = spans.iter().map(|&(_, span)| span).collect();
+            let bytes = local.read_many(&ranges);
+            for ((doc_seq, (start, end)), buf) in spans.into_iter().zip(bytes) {
+                // A span evicted between the listing and the read (its
+                // whole file may have been promoted meanwhile): the
+                // per-document read checks both. A span never cached is
+                // just unavailable, with no further listing.
+                let buf = buf.or_else(|| {
+                    if !local.covers(start, end) {
+                        return None;
+                    }
+                    span_cache::read_local_range(
+                        &self.segment_dir,
+                        DOC_VECTORS_FILE,
+                        dv.file_len(),
+                        start,
+                        end - start,
+                    )
+                });
+                let Some(v) = buf.and_then(|buf| dv.field_vector_in_span(doc_seq, field, &buf))
+                else {
+                    continue;
+                };
+                if v.len() == query.len() {
+                    exact.insert(
+                        doc_seq,
+                        kosha_vector_spfresh::cosine_similarity(query, &v) as f64,
+                    );
+                }
+            }
+        }
+        out.unavailable = wanted.len() - exact.len();
+        if out.unavailable > 0 {
+            out.reason = Some(format!(
+                "{} of {} vectors not readable from {DOC_VECTORS_FILE}",
+                out.unavailable,
+                wanted.len()
+            ));
+        }
+        out.scores = exact.into_iter().collect();
+        out
+    }
+
     /// Exact kNN over `field`'s column (#204), restricted to `candidates`:
     /// the ascending `doc_seq`s a filter lets through, with deleted
     /// documents already removed (#252).
@@ -7061,6 +8023,7 @@ impl SegmentReader {
         let mut scored: Vec<(u32, f64)> = Vec::with_capacity(candidates.len());
         let probe = Self::probe_query(vi, query);
         let is_candidate = |id: u32| candidates.binary_search(&id).is_ok();
+        let lanes = DotLanes::from_env();
         for range_idx in 0..vi.ranges.len() {
             let posting = match self.hydrate_posting(vi, range_idx) {
                 Ok(posting) => posting,
@@ -7068,7 +8031,7 @@ impl SegmentReader {
             };
             posting.for_each_similarity(
                 Some(&is_candidate),
-                |v| kosha_vector_spfresh::cosine_similarity(query, v),
+                |v| lanes.cosine_similarity(query, v),
                 &probe,
                 &vi.centroids[range_idx],
                 |id, sim, _| scored.push((id, sim as f64)),
@@ -7094,6 +8057,27 @@ impl SegmentReader {
         accept: Option<&dyn Fn(u32) -> bool>,
         fetch: Option<VectorSpanFetch<'_>>,
     ) -> Result<(Vec<(u32, f64)>, usize), KoshaError> {
+        let probed =
+            self.probe_within_lazy(vi, query, k, max_distance, max_probes, accept, fetch)?;
+        Ok((
+            self.finish_probe(vi, query, probed.scored, &probed.errors, k),
+            probed.postings,
+        ))
+    }
+
+    /// The probe half of [`Self::knn_search_within_lazy`]: every candidate
+    /// scored, with its error bound, before any cut or rescoring.
+    #[allow(clippy::too_many_arguments)]
+    fn probe_within_lazy(
+        &self,
+        vi: &LazyVectorIndex,
+        query: &[f32],
+        k: usize,
+        max_distance: f32,
+        max_probes: usize,
+        accept: Option<&dyn Fn(u32) -> bool>,
+        fetch: Option<VectorSpanFetch<'_>>,
+    ) -> Result<ProbedCandidates, KoshaError> {
         // Rank this segment's qualifying postings nearest-first (by lower
         // bound, not raw centroid distance — see `centroid_lower_bound`),
         // so the `max_probes` cap keeps the *best* candidates when it
@@ -7122,6 +8106,7 @@ impl SegmentReader {
         let mut scored: Vec<(u32, f64)> = Vec::new();
         let mut errors: Vec<f32> = Vec::new();
         let probe = Self::probe_query(vi, query);
+        let lanes = DotLanes::from_env();
         for (position, (range_idx, _)) in ranked.iter().enumerate() {
             if position >= budgeted {
                 // Past the budget. Without a restriction this is where the
@@ -7139,7 +8124,7 @@ impl SegmentReader {
             probes += 1;
             self.hydrate_posting(vi, *range_idx)?.for_each_similarity(
                 accept,
-                |v| kosha_vector_spfresh::cosine_similarity(query, v),
+                |v| lanes.cosine_similarity(query, v),
                 &probe,
                 &vi.centroids[*range_idx],
                 |id, sim, err| {
@@ -7148,7 +8133,11 @@ impl SegmentReader {
                 },
             );
         }
-        Ok((self.finish_probe(vi, query, scored, &errors, k), probes))
+        Ok(ProbedCandidates {
+            scored,
+            errors,
+            postings: probes,
+        })
     }
 
     // Deliberately NOT radius-aware: this is the per-segment `nprobe`
@@ -7179,6 +8168,22 @@ impl SegmentReader {
         } else {
             query
         };
+        let probed = self.probe_nprobe_lazy(vi, query, k, nprobe, accept, fetch)?;
+        Ok(self.finish_probe(vi, query, probed.scored, &probed.errors, k))
+    }
+
+    /// The probe half of [`Self::knn_search_lazy`]. `postings` counts the
+    /// postings actually scored. A unit-norm column expects `query`
+    /// already unit-normalized (scores are bare dot products).
+    fn probe_nprobe_lazy(
+        &self,
+        vi: &LazyVectorIndex,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+        accept: Option<&dyn Fn(u32) -> bool>,
+        fetch: Option<VectorSpanFetch<'_>>,
+    ) -> Result<ProbedCandidates, KoshaError> {
         // With a restriction, rank every posting so the probe can continue
         // past `nprobe` while the page is still short, as the budgeted
         // variant does.
@@ -7199,6 +8204,8 @@ impl SegmentReader {
         // `query` is already unit-normalized for every unit-norm column,
         // which includes every quantized one.
         let probe = Self::probe_query(vi, query);
+        let mut postings = 0usize;
+        let lanes = DotLanes::from_env();
         for (position, &range_idx) in candidates.iter().enumerate() {
             if position >= nprobe && scored.len() >= k {
                 break;
@@ -7208,13 +8215,14 @@ impl SegmentReader {
                     &candidates[position..(position + VECTOR_PREFETCH_CHUNK).min(candidates.len())];
                 self.prefetch_vector_postings(vi, chunk.iter().copied(), fetch);
             }
+            postings += 1;
             self.hydrate_posting(vi, range_idx)?.for_each_similarity(
                 accept,
                 |v| {
                     if vi.unit_norm {
-                        kosha_vector_spfresh::dot(query, v).clamp(-1.0, 1.0)
+                        lanes.dot(query, v).clamp(-1.0, 1.0)
                     } else {
-                        kosha_vector_spfresh::cosine_similarity(query, v)
+                        lanes.cosine_similarity(query, v)
                     }
                 },
                 &probe,
@@ -7225,7 +8233,11 @@ impl SegmentReader {
                 },
             );
         }
-        Ok(self.finish_probe(vi, query, scored, &errors, k))
+        Ok(ProbedCandidates {
+            scored,
+            errors,
+            postings,
+        })
     }
 
     /// `query` prepared for scoring `vi`'s postings: unit-normalized when
@@ -7243,7 +8255,16 @@ impl SegmentReader {
         // A query of another dimension scores nothing here, as the f32
         // paths' dimension checks would have it.
         let rabitq = (vi.rabitq && unit.len() == vi.dim).then(|| rabitq_query_for(&unit));
-        ProbeQuery { unit, rabitq }
+        let i8_error_per_scale = if vi.quantized && !vi.rabitq {
+            i8_error_per_scale(&unit)
+        } else {
+            0.0
+        };
+        ProbeQuery {
+            unit,
+            rabitq,
+            i8_error_per_scale,
+        }
     }
 
     /// The probe's top `k` of `scored`, best first.
@@ -7293,6 +8314,17 @@ impl SegmentReader {
         shortlist.sort_by(by_score_desc);
         shortlist.truncate(k);
         shortlist
+    }
+
+    /// Whether the default per-segment kNN path (`finish_probe`) would
+    /// rescore a quantized column's shortlist here (#381 observability):
+    /// the same gate as [`Self::rescore_exact`], i.e. rescoring is on and
+    /// the WHOLE `doc_vectors.bin` is local. When this is `false` the
+    /// per-segment path returns its quantized estimates as final scores.
+    pub fn rescores_quantized_locally(&self) -> bool {
+        self.vector_rescore_factor > 0
+            && self.footer.doc_vectors
+            && self.segment_dir.join(DOC_VECTORS_FILE).exists()
     }
 
     /// Replaces each candidate's score with the cosine similarity of
@@ -7502,6 +8534,17 @@ impl SegmentReader {
         }
     }
 
+    /// On-disk span length of `term`'s postings, from the TOC this reader
+    /// already holds: split (v3+) segments only, `None` otherwise or when
+    /// the term is absent. Read-only metadata for offline analysis tools
+    /// (research #387); the query path does not use it.
+    pub fn posting_span_len(&self, term: &str) -> Option<u64> {
+        match &self.inverted {
+            InvertedAccess::Split(split) => split.find(term).map(|i| split.raw_entry(i).4 as u64),
+            _ => None,
+        }
+    }
+
     pub fn scoring_postings_for_terms<'a>(
         &'a self,
         terms: &'a [String],
@@ -7584,6 +8627,7 @@ impl SegmentReader {
             DocStoreAccess::Lazy {
                 doc_store_path,
                 index,
+                decoder,
             } => {
                 let Some(entry) = index.entries.get(doc_seq as usize) else {
                     return Ok(None);
@@ -7591,22 +8635,23 @@ impl SegmentReader {
                 // The whole file when it is complete, else the sparse span
                 // cache (#245). Neither → the plain read below, which fails
                 // with the same IO error as before spans existed.
-                if let Some(buf) = span_cache::read_local_range(
+                let buf = match span_cache::read_local_range(
                     &self.segment_dir,
                     DOC_STORE_FILE,
                     index.complete_len(),
                     entry.offset,
                     entry.length as u64,
                 ) {
-                    let mut cursor = &buf[..];
-                    return parse_one_doc_record(&mut cursor, doc_seq).map(Some);
-                }
-                let mut file = fs::File::open(doc_store_path)?;
-                file.seek(SeekFrom::Start(entry.offset))?;
-                let mut buf = vec![0u8; entry.length as usize];
-                file.read_exact(&mut buf)?;
-                let mut cursor = &buf[..];
-                parse_one_doc_record(&mut cursor, doc_seq).map(Some)
+                    Some(buf) => buf,
+                    None => {
+                        let mut file = fs::File::open(doc_store_path)?;
+                        file.seek(SeekFrom::Start(entry.offset))?;
+                        let mut buf = vec![0u8; entry.length as usize];
+                        file.read_exact(&mut buf)?;
+                        buf
+                    }
+                };
+                parse_stored_doc_record(decoder.as_deref(), &buf, doc_seq).map(Some)
             }
         }
     }
@@ -7643,6 +8688,7 @@ impl SegmentReader {
             DocStoreAccess::Lazy {
                 doc_store_path,
                 index,
+                ..
             } => {
                 // Existence alone is not enough: an interrupted hydration
                 // write can leave a zero-byte or truncated `doc_store.bin`
@@ -7751,8 +8797,11 @@ impl SegmentReader {
                 self.segment_dir
             )));
         }
-        let mut cursor = bytes;
-        let mut record = parse_one_doc_record(&mut cursor, doc_seq)?;
+        let decoder = match &self.doc_store {
+            DocStoreAccess::Lazy { decoder, .. } => decoder.as_deref(),
+            DocStoreAccess::Eager(_) => None,
+        };
+        let mut record = parse_stored_doc_record(decoder, bytes, doc_seq)?;
         self.fill_doc_vectors(&mut record)?;
         Ok(Some(record))
     }
@@ -7941,7 +8990,27 @@ impl SegmentReader {
     /// in-place upgrade for segments that already exist on disk, so already-
     /// large namespaces don't have to wait for their next compaction cycle
     /// to stop paying the full-materialization cost on every query.
+    ///
+    /// A compressed doc store (research #388) is rebuilt from its frames
+    /// and the dictionary copy at the end of `doc_store.bin` (see
+    /// [`doc_store_zstd`]'s Recovery section), trailer included; its
+    /// footer is left as it is.
     pub fn backfill_offset_tables(segment_dir: &Path) -> Result<Footer, KoshaError> {
+        if let Ok(footer) = Self::read_footer(segment_dir) {
+            if let Some(compression) = &footer.doc_store_compression {
+                if compression.codec != kosha_core::DocStoreCompression::ZSTD_DICT {
+                    return Err(KoshaError::CorruptSegment(format!(
+                        "{}: unknown doc store codec {}; this binary is too old for the segment",
+                        segment_dir.display(),
+                        compression.codec
+                    )));
+                }
+                let store = fs::read(segment_dir.join(DOC_STORE_FILE))?;
+                let offsets = rebuild_offsets(&store, footer.doc_count, compression.dict_bytes)?;
+                atomic_write(&segment_dir.join("doc_store.offsets"), &offsets)?;
+                return Ok(footer);
+            }
+        }
         let data = fs::read(segment_dir.join("doc_store.bin"))?;
         let mut cursor = &data[..];
         let doc_count = if cursor.len() < 4 {
@@ -8002,6 +9071,7 @@ impl SegmentReader {
     /// `try_read_doc_index`); the resulting `Vec<DocRecord>` costs exactly
     /// what every segment cost before lazy loading existed.
     fn read_doc_store(segment_dir: &Path) -> Result<Vec<DocRecord>, KoshaError> {
+        refuse_compressed_full_parse(segment_dir)?;
         let data = fs::read(segment_dir.join("doc_store.bin"))?;
         let mut cursor = &data[..];
         let mut records = Vec::new();
@@ -8235,6 +9305,43 @@ pub fn compute_aggregations(
 /// Parse one `doc_store.bin` record. Every length is checked against the
 /// bytes left: a damaged record is `CorruptSegment`, never a panic or an
 /// unbounded allocation (#257 found the unchecked slicing by fuzzing).
+/// One stored record's bytes (exactly its `doc_store.offsets` span) to a
+/// record: decoded first when the doc store is compressed (research #388).
+fn parse_stored_doc_record(
+    decoder: Option<&DocStoreDecoder>,
+    stored: &[u8],
+    doc_seq: u32,
+) -> Result<DocRecord, KoshaError> {
+    match decoder {
+        None => {
+            let mut cursor = stored;
+            parse_one_doc_record(&mut cursor, doc_seq)
+        }
+        Some(decoder) => {
+            let raw = decoder.decode(stored, doc_seq)?;
+            let mut cursor = &raw[..];
+            parse_one_doc_record(&mut cursor, doc_seq)
+        }
+    }
+}
+
+/// The sequential full parse of `doc_store.bin` only understands the raw
+/// layout; a compressed one (research #388) is readable only through its
+/// offsets. Errors (instead of parsing frames as garbage) when the local
+/// `footer.json` says the doc store is compressed.
+fn refuse_compressed_full_parse(segment_dir: &Path) -> Result<(), KoshaError> {
+    match SegmentReader::read_footer(segment_dir) {
+        Ok(footer) if footer.doc_store_compression.is_some() => {
+            Err(KoshaError::CorruptSegment(format!(
+                "{}: doc_store.bin is compressed and can only be read through a valid \
+                 doc_store.offsets",
+                segment_dir.display()
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn parse_one_doc_record(cursor: &mut &[u8], doc_seq: u32) -> Result<DocRecord, KoshaError> {
     fn take<'a>(cursor: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
         if cursor.len() < n {
@@ -8354,7 +9461,16 @@ pub fn doc_store_opens_lazily(segment_dir: &Path, footer: Option<&Footer>) -> bo
     let Ok(footer) = resolve_open_footer(segment_dir, footer.cloned()) else {
         return false;
     };
-    try_read_doc_index(segment_dir, footer.doc_count).is_some()
+    let parts = try_read_doc_index_parts(segment_dir, footer.doc_count);
+    match (&footer.doc_store_compression, parts) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        // A compressed doc store also needs its dictionary trailer; without
+        // it the reader rebuilds the index from doc_store.bin (#388), so
+        // that file must be local.
+        (Some(compression), Some((_, trailer))) => parse_dict_trailer(&trailer)
+            .is_some_and(|dict| dict.len() == compression.dict_bytes as usize),
+    }
 }
 
 /// Cheap, header-only version of [`doc_store_opens_lazily`] for checks that
@@ -8383,12 +9499,31 @@ pub fn doc_store_offsets_plausible(segment_dir: &Path, footer: Option<&Footer>) 
 /// a broken sidecar degrades to "slower, still correct," not a failed
 /// segment open.
 fn try_read_doc_index(segment_dir: &Path, expected_doc_count: u32) -> Option<DocIndex> {
+    try_read_doc_index_parts(segment_dir, expected_doc_count).map(|(index, _)| index)
+}
+
+/// [`try_read_doc_index`] plus the bytes after the entries: empty for a
+/// raw doc store, the dictionary trailer for a compressed one (#388).
+fn try_read_doc_index_parts(
+    segment_dir: &Path,
+    expected_doc_count: u32,
+) -> Option<(DocIndex, Vec<u8>)> {
     let path = segment_dir.join("doc_store.offsets");
     let data = match fs::read(&path) {
         Ok(data) => data,
         Err(_) => return None, // missing sidecar: legacy segment, not an error
     };
-    let mut cursor = &data[..];
+    parse_doc_index_bytes(&data, &path, expected_doc_count)
+}
+
+/// The parse behind [`try_read_doc_index_parts`], over `doc_store.offsets`
+/// bytes already in memory (`path` names them in warnings).
+fn parse_doc_index_bytes(
+    data: &[u8],
+    path: &Path,
+    expected_doc_count: u32,
+) -> Option<(DocIndex, Vec<u8>)> {
+    let mut cursor = data;
     if cursor.len() < 4 {
         eprintln!(
             "WARN: {} is truncated (missing header); falling back to full parse",
@@ -8441,7 +9576,7 @@ fn try_read_doc_index(segment_dir: &Path, expected_doc_count: u32) -> Option<Doc
         });
     }
     ids_pool.shrink_to_fit();
-    Some(DocIndex { ids_pool, entries })
+    Some((DocIndex { ids_pool, entries }, cursor.to_vec()))
 }
 
 // ─── Atomic file rewrite ────────────────────────────────────────────────────
@@ -8704,6 +9839,82 @@ mod tests {
             assert!(!parse_vector_build_refine(raw), "{raw:?}");
         }
         assert!(parse_vector_build_refine(Some("bogus")));
+    }
+
+    #[test]
+    fn dot_lanes_default_to_eight_and_agree_up_to_rounding() {
+        for raw in [None, Some(""), Some("8"), Some(" 8 "), Some("12")] {
+            assert_eq!(DotLanes::parse(raw), DotLanes::Eight, "{raw:?}");
+        }
+        assert_eq!(DotLanes::parse(Some("16")), DotLanes::Sixteen);
+        assert_eq!(DotLanes::parse(Some("32")), DotLanes::ThirtyTwo);
+        assert_eq!(DotLanes::parse(Some("64")), DotLanes::SixtyFour);
+        let a: Vec<f32> = (0..1027)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0)
+            .collect();
+        let b: Vec<f32> = (0..1027)
+            .map(|i| ((i * 53 % 97) as f32 - 48.0) / 48.0)
+            .collect();
+        // The default is the existing kernels, bit for bit.
+        assert_eq!(
+            DotLanes::Eight.dot(&a, &b),
+            kosha_vector_spfresh::dot(&a, &b)
+        );
+        assert_eq!(
+            DotLanes::Eight.cosine_similarity(&a, &b),
+            kosha_vector_spfresh::cosine_similarity(&a, &b)
+        );
+        let zero = vec![0.0f32; 1027];
+        for lanes in [
+            DotLanes::Eight,
+            DotLanes::Sixteen,
+            DotLanes::ThirtyTwo,
+            DotLanes::SixtyFour,
+        ] {
+            let d = lanes.dot(&a, &b);
+            assert!(
+                (d - kosha_vector_spfresh::dot(&a, &b)).abs() < 1e-3,
+                "{lanes:?}"
+            );
+            let c = lanes.cosine_similarity(&a, &b);
+            let expected = kosha_vector_spfresh::cosine_similarity(&a, &b);
+            assert!((c - expected).abs() < 1e-5, "{lanes:?}: {c} vs {expected}");
+            assert_eq!(lanes.cosine_similarity(&a, &zero), 0.0, "{lanes:?}");
+        }
+    }
+
+    #[test]
+    fn vector_kernels_summary_names_the_effective_settings() {
+        use kosha_vector_spfresh::RaBitQEstimator;
+        assert_eq!(
+            format_vector_kernels_summary(DotLanes::Eight, RaBitQEstimator::Lut, &[]),
+            "vector kernels (#382, experimental): dot_lanes=8 rabitq_estimator=lut \
+             x86_features=baseline"
+        );
+        assert_eq!(
+            format_vector_kernels_summary(
+                DotLanes::ThirtyTwo,
+                RaBitQEstimator::Popcount4,
+                &["popcnt", "avx2", "fma", "bmi2"]
+            ),
+            "vector kernels (#382, experimental): dot_lanes=32 rabitq_estimator=popcount \
+             x86_features=popcnt,avx2,fma,bmi2"
+        );
+    }
+
+    #[test]
+    fn rabitq_estimator_defaults_to_lut() {
+        use kosha_vector_spfresh::RaBitQEstimator;
+        for raw in [None, Some(""), Some(" "), Some("lut"), Some("bogus")] {
+            assert_eq!(parse_rabitq_estimator(raw), RaBitQEstimator::Lut, "{raw:?}");
+        }
+        for raw in [Some("popcount"), Some(" Popcount4 ")] {
+            assert_eq!(
+                parse_rabitq_estimator(raw),
+                RaBitQEstimator::Popcount4,
+                "{raw:?}"
+            );
+        }
     }
 
     /// Serialize an inverted index in the legacy v1 stream layout — the
@@ -11559,13 +12770,19 @@ mod bounded_build_tests {
                 .collect();
             terms.push(postings);
         }
-        for version in [SKIP_SPLIT_INVERTED_VERSION, SPLIT_INVERTED_VERSION] {
+        for version in [
+            SKIP_SPLIT_INVERTED_VERSION,
+            SPLIT_INVERTED_VERSION,
+            BITPACKED_SKIP_SPLIT_INVERTED_VERSION,
+        ] {
             // A 64-byte limit spills nearly every posting.
             let mut encoder = TermEncoder::new(version, &dir, 64);
             for postings in &terms {
                 let mut expected = Vec::new();
                 if version == SPLIT_INVERTED_VERSION {
                     write_postings_varint_delta(&mut expected, postings);
+                } else if version == BITPACKED_SKIP_SPLIT_INVERTED_VERSION {
+                    write_postings_skip_split_v6(&mut expected, postings, &field_lengths);
                 } else {
                     write_postings_skip_split(&mut expected, postings, &field_lengths);
                 }
@@ -11586,6 +12803,250 @@ mod bounded_build_tests {
             assert!(encoder.spilled_total() > 0, "the spill files were used");
         }
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Sum of all `postings-*.bin` shard bytes in a segment directory.
+    fn postings_bytes(dir: &Path) -> u64 {
+        files(dir)
+            .iter()
+            .filter(|(n, _)| n.starts_with("postings"))
+            .map(|(_, b)| b.len() as u64)
+            .sum()
+    }
+
+    /// v6 (#386): spilled and in-memory builds are byte-identical, the TOC
+    /// says v6, and every term reads back exactly as from a v5 build of the
+    /// same documents — full postings, skip table and every scoring block.
+    #[test]
+    fn v6_build_reads_back_identically_to_v5() {
+        let docs = corpus(3_000);
+        let (v5_dir, mem_dir, spill_dir) =
+            (scratch("v6ref5"), scratch("v6mem"), scratch("v6spill"));
+        build_version(&v5_dir, usize::MAX, &docs, SKIP_SPLIT_INVERTED_VERSION);
+        let (fa, _, _) = build_version(
+            &mem_dir,
+            usize::MAX,
+            &docs,
+            BITPACKED_SKIP_SPLIT_INVERTED_VERSION,
+        );
+        let (fb, runs, _) = build_version(
+            &spill_dir,
+            64 * 1024,
+            &docs,
+            BITPACKED_SKIP_SPLIT_INVERTED_VERSION,
+        );
+        assert!(runs >= 5, "expected several runs, got {runs}");
+        assert_same_files(&mem_dir, &spill_dir, &fa, &fb);
+        let toc = read_inverted_payload(fs::read(mem_dir.join("inverted.idx")).unwrap()).unwrap();
+        assert_eq!(
+            toc[4..8],
+            BITPACKED_SKIP_SPLIT_INVERTED_VERSION.to_le_bytes()
+        );
+
+        let r5 = SegmentReader::open(v5_dir.clone()).unwrap();
+        let r6 = SegmentReader::open(mem_dir.clone()).unwrap();
+        let terms: Vec<String> = r5.all_terms().iter().map(|t| t.to_string()).collect();
+        assert_eq!(
+            r6.all_terms(),
+            terms.iter().map(|t| t.as_str()).collect::<Vec<_>>()
+        );
+        assert!(r5.postings("stop").unwrap().len() >= 2 * SCORING_BLOCK_LEN);
+        for term in &terms {
+            assert_eq!(
+                &*r5.postings(term).unwrap(),
+                &*r6.postings(term).unwrap(),
+                "{term}"
+            );
+        }
+        let s5 = r5.scoring_postings_for_terms(&terms);
+        let s6 = r6.scoring_postings_for_terms(&terms);
+        assert_eq!(s5.len(), terms.len());
+        assert_eq!(s6.len(), terms.len());
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        let mut full_blocks = 0;
+        for ((t5, p5), (t6, p6)) in s5.iter().zip(&s6) {
+            assert_eq!(t5, t6);
+            let (ScoringPostingsRef::Blocked(p5), ScoringPostingsRef::Blocked(p6)) = (p5, p6)
+            else {
+                panic!("v5 and v6 must both take the blocked scoring path");
+            };
+            assert!(!p5.bitpacked && p6.bitpacked);
+            assert_eq!(p5.doc_count(), p6.doc_count());
+            assert_eq!(p5.block_count(), p6.block_count());
+            for blk in 0..p5.block_count() {
+                let (x, y) = (p5.summary(blk), p6.summary(blk));
+                assert_eq!(
+                    (x.last_doc_id, x.max_tf, x.min_field_length),
+                    (y.last_doc_id, y.max_tf, y.min_field_length)
+                );
+                assert!(p5.read_block(blk, &mut a));
+                assert!(p6.read_block(blk, &mut b));
+                assert_eq!(a, b, "{t5} block {blk}");
+                full_blocks += usize::from(a.len() == SCORING_BLOCK_LEN);
+            }
+        }
+        assert!(full_blocks > 10, "corpus must exercise bit-packed blocks");
+        let (b5, b6) = (postings_bytes(&v5_dir), postings_bytes(&mem_dir));
+        assert!(
+            b6 < b5,
+            "v6 postings {b6} B should be smaller than v5 {b5} B"
+        );
+        for d in [v5_dir, mem_dir, spill_dir] {
+            fs::remove_dir_all(d).unwrap();
+        }
+    }
+
+    /// Compaction across versions (#386): re-merging a v6 segment's raw
+    /// records with a v5 writer (rollback) and back to v6 (roll forward)
+    /// yields the same postings for every term.
+    #[test]
+    fn v6_segments_compact_to_v5_and_back() {
+        let docs = corpus(600);
+        let (v6_dir, v5_dir, back_dir) = (scratch("cmp6"), scratch("cmp5"), scratch("cmp6b"));
+        build_version(
+            &v6_dir,
+            usize::MAX,
+            &docs,
+            BITPACKED_SKIP_SPLIT_INVERTED_VERSION,
+        );
+        let remerge_to = |src: &Path, dst: &Path, version: u32| {
+            let r = SegmentReader::open(src.to_path_buf()).unwrap();
+            let mut w = SegmentWriter::new(SegmentId("c".into()), dst.to_path_buf())
+                .with_postings_write_version(version);
+            for raw in r.iter_doc_records_raw() {
+                let raw = raw.unwrap();
+                w.add_document_with_vectors(raw.record.doc_id, raw.record.fields, raw.vectors);
+            }
+            w.finalize(Bm25Params::default()).unwrap();
+        };
+        remerge_to(&v6_dir, &v5_dir, SKIP_SPLIT_INVERTED_VERSION);
+        remerge_to(&v5_dir, &back_dir, BITPACKED_SKIP_SPLIT_INVERTED_VERSION);
+        let toc = read_inverted_payload(fs::read(v5_dir.join("inverted.idx")).unwrap()).unwrap();
+        assert_eq!(toc[4..8], SKIP_SPLIT_INVERTED_VERSION.to_le_bytes());
+        let (r6, r5, rb) = (
+            SegmentReader::open(v6_dir.clone()).unwrap(),
+            SegmentReader::open(v5_dir.clone()).unwrap(),
+            SegmentReader::open(back_dir.clone()).unwrap(),
+        );
+        let terms = r6.all_terms();
+        assert_eq!(terms, r5.all_terms());
+        for term in terms {
+            let p = r6.postings(term).unwrap();
+            assert_eq!(&*p, &*r5.postings(term).unwrap(), "{term}");
+            assert_eq!(&*p, &*rb.postings(term).unwrap(), "{term}");
+        }
+        assert_eq!(postings_bytes(&v6_dir), postings_bytes(&back_dir));
+        for d in [v6_dir, v5_dir, back_dir] {
+            fs::remove_dir_all(d).unwrap();
+        }
+    }
+
+    /// `postings_section_stats` (#386 diagnostics): on v5 and v6 builds of
+    /// the same documents, the stored scoring bytes equal the re-encoded
+    /// size in the segment's own codec, the re-encoded sizes agree across
+    /// the two builds, positions are byte-identical in size, and the
+    /// sections tile the shards exactly.
+    #[test]
+    fn postings_section_stats_match_both_codecs() {
+        let docs = corpus(1_500);
+        let (d5, d6) = (scratch("stats5"), scratch("stats6"));
+        build_version(&d5, usize::MAX, &docs, SKIP_SPLIT_INVERTED_VERSION);
+        build_version(
+            &d6,
+            usize::MAX,
+            &docs,
+            BITPACKED_SKIP_SPLIT_INVERTED_VERSION,
+        );
+        let s5 = postings_section_stats(&d5).unwrap();
+        let s6 = postings_section_stats(&d6).unwrap();
+        assert_eq!(s5.inverted_version, SKIP_SPLIT_INVERTED_VERSION);
+        assert_eq!(s6.inverted_version, BITPACKED_SKIP_SPLIT_INVERTED_VERSION);
+        assert_eq!(s5.scoring_bytes, s5.scoring_bytes_as_v5);
+        assert_eq!(s6.scoring_bytes, s6.scoring_bytes_as_v6);
+        assert_eq!(s5.scoring_bytes_as_v5, s6.scoring_bytes_as_v5);
+        assert_eq!(s5.scoring_bytes_as_v6, s6.scoring_bytes_as_v6);
+        assert!(s6.scoring_bytes < s5.scoring_bytes);
+        assert_eq!(
+            (s5.terms, s5.postings, s5.postings_in_full_blocks),
+            (s6.terms, s6.postings, s6.postings_in_full_blocks)
+        );
+        assert!(s5.postings_in_full_blocks > 0);
+        assert_eq!(s5.positions_bytes, s6.positions_bytes);
+        for s in [&s5, &s6] {
+            assert_eq!(
+                s.skip_bytes + s.scoring_bytes + s.positions_bytes,
+                s.shard_logical_bytes
+            );
+        }
+        for d in [d5, d6] {
+            fs::remove_dir_all(d).unwrap();
+        }
+    }
+
+    /// Default writer stays v5: v6 is opt-in only.
+    #[test]
+    fn default_writer_does_not_emit_v6() {
+        // The env gate is process-global; only assert when unset.
+        if std::env::var_os("KOSHA_POSTINGS_WRITE_VERSION").is_none() {
+            assert_eq!(postings_write_version(), SKIP_SPLIT_INVERTED_VERSION);
+        }
+        let dir = scratch("v6default");
+        let docs = corpus(50);
+        let mut w = SegmentWriter::new(SegmentId("seg".into()), dir.clone());
+        for (id, fields) in &docs {
+            w.add_document(id.clone(), fields.clone());
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+        let toc = read_inverted_payload(fs::read(dir.join("inverted.idx")).unwrap()).unwrap();
+        assert_eq!(
+            toc[4..8],
+            postings_write_version().to_le_bytes(),
+            "writer follows the env gate"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Corrupting any byte of a v6 span's bit-packed scoring section must
+    /// never yield a block whose decode succeeds with different doc ids.
+    #[test]
+    fn v6_corrupt_scoring_bytes_fail_closed() {
+        let postings: Vec<Posting> = (0..300u32)
+            .map(|i| Posting {
+                doc_id: i * 5 + (i % 3),
+                term_frequency: 1 + i % 4,
+                positions: vec![i % 7],
+            })
+            .collect();
+        let field_lengths = vec![10u32; 2_000];
+        let mut span = Vec::new();
+        write_postings_skip_split_v6(&mut span, &postings, &field_lengths);
+        let clean = BlockedTermPostings::parse_v6(Arc::new(span.clone())).unwrap();
+        let mut reference = Vec::new();
+        let mut expect = Vec::new();
+        for blk in 0..clean.block_count() {
+            assert!(clean.read_block(blk, &mut reference));
+            expect.push(reference.clone());
+        }
+        let scoring = clean.scoring_base as usize..clean.positions_base as usize;
+        let mut out = Vec::new();
+        for i in scoring {
+            for bit in [0u8, 3, 7] {
+                let mut bad = span.clone();
+                bad[i] ^= 1 << bit;
+                let Some(parsed) = BlockedTermPostings::parse_v6(Arc::new(bad)) else {
+                    continue;
+                };
+                for (blk, want) in expect.iter().enumerate() {
+                    if parsed.read_block(blk, &mut out) {
+                        // A flipped tf bit is undetectable (as in v5) and
+                        // only changes a score; doc ids must never move.
+                        let got: Vec<u32> = out.iter().map(|p| p.doc_id).collect();
+                        let w: Vec<u32> = want.iter().map(|p| p.doc_id).collect();
+                        assert_eq!(got, w, "byte {i} bit {bit} block {blk}");
+                    }
+                }
+            }
+        }
     }
 
     fn assert_same_files(a_dir: &Path, b_dir: &Path, fa: &Footer, fb: &Footer) {
@@ -12452,5 +13913,792 @@ mod filter_column_format_tests {
         assert!(back.filter_columns.is_none());
         assert_eq!(back.filter_files_for(None), vec!["filters.bin".to_string()]);
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// Global bound-driven rescoring (#381): the segment half — candidates
+/// with error bounds, and exact scores from `doc_vectors.bin` (local or
+/// ranged) with unavailability reported rather than hidden.
+#[cfg(test)]
+mod global_rescore_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    const DIM: usize = 32;
+    const DOCS: u64 = 600;
+
+    fn scratch(name: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-global-rescore-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn vector(seed: u64) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..DIM)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+            })
+            .collect()
+    }
+
+    fn cosine(a: &[f32], b: &[f32]) -> f64 {
+        let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
+        let na: f64 = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+        let nb: f64 = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+        dot / (na * nb)
+    }
+
+    /// A segment of `DOCS` vectors in `quantization`, plus the vectors by
+    /// doc_seq (documents are added in doc_seq order).
+    fn segment(name: &str, quantization: VectorQuantization) -> (PathBuf, Vec<Vec<f32>>) {
+        let dir = scratch(name);
+        let mut w = SegmentWriter::new(SegmentId("s".into()), dir.clone())
+            .with_vector_store_mode(VectorStoreMode::Sidecar)
+            .with_vector_quantization(VectorQuantizationConfig::all(quantization));
+        let mut vectors = Vec::new();
+        for i in 0..DOCS {
+            let v = vector(i + 1);
+            vectors.push(v.clone());
+            w.add_document(DocumentId(format!("d{i}")), vec![Field::vector("emb", v)]);
+        }
+        let footer = w.finalize(Bm25Params::default()).unwrap();
+        assert!(footer.doc_vectors);
+        (dir, vectors)
+    }
+
+    fn brute_force(vectors: &[Vec<f32>], query: &[f32], k: usize) -> Vec<(u32, f64)> {
+        let scored: Vec<(u32, f64)> = vectors
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i as u32, cosine(query, v)))
+            .collect();
+        top_k_by_score(scored, k)
+    }
+
+    /// Every posting: only the quantization, never the probe budget, can
+    /// cost a neighbour here.
+    const ALL: KnnProbeBudget = KnnProbeBudget::Nprobe(1_000_000);
+
+    #[test]
+    fn i8_bounds_hold_and_bound_driven_rescoring_is_exact() {
+        let (dir, vectors) = segment("i8", VectorQuantization::I8);
+        let reader = SegmentReader::open(dir.clone()).unwrap();
+        let k = 10;
+        for q in 0..20u64 {
+            let query = vector(900_000 + q);
+            let found = reader
+                .knn_candidates_fetching("emb", &query, k, ALL, None, None)
+                .unwrap()
+                .unwrap();
+            assert!(!found.exact);
+            assert!(found.postings > 0);
+            // The strict i8 bound is a guarantee, not a confidence.
+            for c in &found.candidates {
+                let exact = cosine(&query, &vectors[c.doc_seq as usize]);
+                assert!(
+                    (c.estimate - exact).abs() <= c.error,
+                    "doc {} estimate {} exact {exact} error {}",
+                    c.doc_seq,
+                    c.estimate,
+                    c.error
+                );
+            }
+            // So the true top k always survives the segment's prune.
+            let want = brute_force(&vectors, &query, k);
+            let ids: HashSet<u32> = found.candidates.iter().map(|c| c.doc_seq).collect();
+            for (doc_seq, _) in &want {
+                assert!(ids.contains(doc_seq), "true neighbour {doc_seq} pruned");
+            }
+            // The prune keeps strictly fewer than every vector.
+            assert!(found.candidates.len() < DOCS as usize);
+            // Rescored exactly, the shortlist's top k is the brute force's.
+            let seqs: Vec<u32> = found.candidates.iter().map(|c| c.doc_seq).collect();
+            let rescored = reader.knn_exact_scores_fetching("emb", &query, &seqs, None);
+            assert_eq!(rescored.unavailable, 0, "{:?}", rescored.reason);
+            assert!(!rescored.ranged);
+            let got = top_k_by_score(rescored.scores, k);
+            let got_ids: Vec<u32> = got.iter().map(|h| h.0).collect();
+            let want_ids: Vec<u32> = want.iter().map(|h| h.0).collect();
+            assert_eq!(got_ids, want_ids);
+            for ((_, g), (_, w)) in got.iter().zip(&want) {
+                assert!((g - w).abs() < 1e-5);
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f32_candidates_are_the_exact_top_k() {
+        let (dir, vectors) = segment("f32", VectorQuantization::F32);
+        let reader = SegmentReader::open(dir.clone()).unwrap();
+        let query = vector(4242);
+        let found = reader
+            .knn_candidates_fetching("emb", &query, 10, ALL, None, None)
+            .unwrap()
+            .unwrap();
+        assert!(found.exact);
+        assert_eq!(found.candidates.len(), 10);
+        assert!(found.candidates.iter().all(|c| c.error == 0.0));
+        let want: Vec<u32> = brute_force(&vectors, &query, 10)
+            .into_iter()
+            .map(|h| h.0)
+            .collect();
+        let got: Vec<u32> = found.candidates.iter().map(|c| c.doc_seq).collect();
+        assert_eq!(got, want);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rabitq_bound_driven_rescoring_recalls_the_brute_force_top_k() {
+        // RaBitQ's bound holds with a confidence (epsilon0 = 1.9 standard
+        // deviations), not always: recall is high, not guaranteed.
+        let (dir, vectors) = segment("rabitq", VectorQuantization::RaBitQ);
+        let reader = SegmentReader::open(dir.clone()).unwrap();
+        let k = 10;
+        let (mut recall, mut held, mut total) = (0.0f64, 0usize, 0usize);
+        let queries = 20u64;
+        for q in 0..queries {
+            let query = vector(700_000 + q);
+            let found = reader
+                .knn_candidates_fetching("emb", &query, k, ALL, None, None)
+                .unwrap()
+                .unwrap();
+            assert!(!found.exact);
+            for c in &found.candidates {
+                total += 1;
+                let exact = cosine(&query, &vectors[c.doc_seq as usize]);
+                held += usize::from((c.estimate - exact).abs() <= c.error);
+            }
+            let seqs: Vec<u32> = found.candidates.iter().map(|c| c.doc_seq).collect();
+            let rescored = reader.knn_exact_scores_fetching("emb", &query, &seqs, None);
+            assert_eq!(rescored.unavailable, 0);
+            let got: HashSet<u32> = top_k_by_score(rescored.scores, k)
+                .into_iter()
+                .map(|h| h.0)
+                .collect();
+            let want = brute_force(&vectors, &query, k);
+            recall += want.iter().filter(|h| got.contains(&h.0)).count() as f64 / k as f64;
+        }
+        let recall = recall / queries as f64;
+        assert!(recall >= 0.95, "recall@10 {recall}");
+        assert!(
+            held as f64 >= 0.9 * total as f64,
+            "bounds held {held}/{total}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exact_scores_report_a_missing_sidecar_and_read_ranged_spans() {
+        let (dir, vectors) = segment("ranged", VectorQuantization::I8);
+        let query = vector(31337);
+        let seqs: Vec<u32> = vec![3, 17, 250, 599];
+        let dv = fs::read(dir.join(DOC_VECTORS_FILE)).unwrap();
+        fs::remove_file(dir.join(DOC_VECTORS_FILE)).unwrap();
+
+        // No sidecar at all (not even its header): every candidate is
+        // reported unavailable, with a reason — never silently final.
+        let reader = SegmentReader::open(dir.clone()).unwrap();
+        let missing = reader.knn_exact_scores_fetching("emb", &query, &seqs, None);
+        assert_eq!(missing.unavailable, seqs.len());
+        assert!(missing.scores.is_empty());
+        assert!(missing
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains(DOC_VECTORS_FILE));
+
+        // Header cached, vectors not: ranged reads through `fetch`.
+        let put = |s: u64, e: u64| {
+            let d = span_cache::spans_dir(&dir, DOC_VECTORS_FILE);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(
+                d.join(span_cache::span_file_name(s, e)),
+                &dv[s as usize..e as usize],
+            )
+            .unwrap();
+        };
+        let header_len = doc_vectors_header_len(&dv).unwrap().unwrap();
+        put(0, header_len);
+        let reader = SegmentReader::open(dir.clone()).unwrap();
+
+        // Without a fetcher the vectors are not local: unavailable.
+        let no_fetch = reader.knn_exact_scores_fetching("emb", &query, &seqs, None);
+        assert!(no_fetch.ranged);
+        assert_eq!(no_fetch.unavailable, seqs.len());
+
+        let calls = Mutex::new(Vec::<(String, usize)>::new());
+        let fetch = |seg: &Path, file: &str, ranges: &[(u64, u64)]| {
+            assert_eq!(seg, dir.as_path());
+            calls.lock().unwrap().push((file.to_string(), ranges.len()));
+            for &(s, e) in ranges {
+                put(s, e);
+            }
+        };
+        let fetched = reader.knn_exact_scores_fetching("emb", &query, &seqs, Some(&fetch));
+        assert!(fetched.ranged);
+        assert_eq!(fetched.unavailable, 0, "{:?}", fetched.reason);
+        assert_eq!(fetched.ranged_spans, seqs.len());
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![(DOC_VECTORS_FILE.to_string(), seqs.len())],
+            "one fetch call for every missing span"
+        );
+        for (doc_seq, score) in &fetched.scores {
+            let want = cosine(&query, &vectors[*doc_seq as usize]);
+            assert!((score - want).abs() < 1e-5);
+        }
+        // Spans now cached: no second fetch.
+        let again = reader.knn_exact_scores_fetching("emb", &query, &seqs, Some(&fetch));
+        assert_eq!(again.unavailable, 0);
+        assert_eq!(again.ranged_spans, 0);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kth_lower_bound_needs_k_candidates() {
+        let c = |doc_seq, estimate, error| KnnCandidate {
+            doc_seq,
+            estimate,
+            error,
+        };
+        let cands = [c(0, 0.9, 0.1), c(1, 0.8, 0.0), c(2, 0.5, 0.2)];
+        assert_eq!(kth_lower_bound(&cands, 0), None);
+        assert_eq!(kth_lower_bound(&cands, 4), None);
+        assert!((kth_lower_bound(&cands, 1).unwrap() - 0.8).abs() < 1e-12);
+        let second = kth_lower_bound(&cands, 2).unwrap();
+        assert!((second - 0.8).abs() < 1e-12);
+        assert!((kth_lower_bound(&cands, 3).unwrap() - 0.3).abs() < 1e-12);
+    }
+
+    /// Microbenchmark for the ranged rescore read (#381): a segment whose
+    /// `doc_vectors.bin` is not local and whose span cache holds one span
+    /// per document (`docs` spans), read for `selected` candidates. Compares
+    /// the per-candidate `vectors_for` loop (one span-directory listing per
+    /// candidate, the PR's first version) with `knn_exact_scores_fetching`
+    /// (one listing per call). Timing only, so ignored by default:
+    /// `cargo test -p kosha-segment --release -- --ignored --nocapture
+    /// ranged_rescore_read_microbench`.
+    #[test]
+    #[ignore]
+    fn ranged_rescore_read_microbench() {
+        const BENCH_DIM: usize = 1024;
+        let docs: u64 = std::env::var("MICROBENCH_DOCS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4000);
+        let selected: usize = 400;
+        let dir = scratch("microbench");
+        let mut w = SegmentWriter::new(SegmentId("s".into()), dir.clone())
+            .with_vector_store_mode(VectorStoreMode::Sidecar)
+            .with_vector_quantization(VectorQuantizationConfig::all(VectorQuantization::I8));
+        let gen = |seed: u64| -> Vec<f32> {
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            (0..BENCH_DIM)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+                })
+                .collect()
+        };
+        for i in 0..docs {
+            w.add_document(
+                DocumentId(format!("d{i}")),
+                vec![Field::vector("emb", gen(i + 1))],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+        let dv = fs::read(dir.join(DOC_VECTORS_FILE)).unwrap();
+        fs::remove_file(dir.join(DOC_VECTORS_FILE)).unwrap();
+        let spans_dir = span_cache::spans_dir(&dir, DOC_VECTORS_FILE);
+        fs::create_dir_all(&spans_dir).unwrap();
+        let header_len = doc_vectors_header_len(&dv).unwrap().unwrap();
+        let put = |s: u64, e: u64| {
+            fs::write(
+                spans_dir.join(span_cache::span_file_name(s, e)),
+                &dv[s as usize..e as usize],
+            )
+            .unwrap();
+        };
+        put(0, header_len);
+        let reader = SegmentReader::open(dir.clone()).unwrap();
+        let header = reader.doc_vectors().unwrap();
+        for doc_seq in 0..docs as u32 {
+            let (s, e) = header.doc_span(doc_seq).unwrap();
+            put(s, e);
+        }
+        let query = gen(424_242);
+        let seqs: Vec<u32> = (0..selected as u64)
+            .map(|i| ((i * 7919) % docs) as u32)
+            .collect();
+        let rounds = 5;
+        let t = std::time::Instant::now();
+        for _ in 0..rounds {
+            let mut n = 0;
+            for &doc_seq in &seqs {
+                n += header.vectors_for(doc_seq).unwrap().len();
+            }
+            assert_eq!(n, seqs.len());
+        }
+        let per_candidate = t.elapsed().as_secs_f64() * 1e3 / rounds as f64;
+        let t = std::time::Instant::now();
+        for _ in 0..rounds {
+            let r = reader.knn_exact_scores_fetching("emb", &query, &seqs, None);
+            assert_eq!(r.unavailable, 0, "{:?}", r.reason);
+        }
+        let batched = t.elapsed().as_secs_f64() * 1e3 / rounds as f64;
+        println!(
+            "ranged rescore read: {docs} cached spans, {selected} candidates, dim {BENCH_DIM}: \
+             per-candidate listing {per_candidate:.2} ms/call, one listing {batched:.2} ms/call"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod doc_store_zstd_tests {
+    //! Research #388: per-record zstd doc store with a per-segment
+    //! dictionary, behind `KOSHA_DOC_STORE_COMPRESSION` (default off).
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-docstore-zstd-{name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Passage-like text: a shared vocabulary with per-document variation.
+    fn passage(i: usize) -> String {
+        const WORDS: &[&str] = &[
+            "the",
+            "of",
+            "and",
+            "a",
+            "to",
+            "in",
+            "is",
+            "for",
+            "that",
+            "with",
+            "search",
+            "index",
+            "segment",
+            "document",
+            "query",
+            "storage",
+            "cache",
+            "latency",
+            "vector",
+            "term",
+            "posting",
+            "block",
+            "compression",
+            "dictionary",
+            "record",
+            "page",
+            "range",
+            "read",
+        ];
+        let mut s = 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i as u64 + 1) | 1;
+        let mut out = format!("passage {i}:");
+        for _ in 0..(40 + i % 30) {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            out.push(' ');
+            out.push_str(WORDS[(s % WORDS.len() as u64) as usize]);
+        }
+        out
+    }
+
+    fn fields(i: usize, with_vector: bool) -> Vec<Field> {
+        let mut f = vec![
+            Field::text("text", passage(i)),
+            Field::keyword("tag", if i.is_multiple_of(3) { "fizz" } else { "plain" }),
+            Field::integer("n", i as i64),
+        ];
+        if with_vector {
+            f.push(Field::vector(
+                "emb",
+                (0..8).map(|d| (i * 8 + d) as f32 * 0.125).collect(),
+            ));
+        }
+        f
+    }
+
+    fn write(
+        dir: &Path,
+        docs: usize,
+        zstd: Option<DocStoreZstdConfig>,
+        mode: VectorStoreMode,
+    ) -> Footer {
+        let mut w = SegmentWriter::new(SegmentId("z".into()), dir.to_path_buf())
+            .with_vector_store_mode(mode)
+            .with_doc_store_zstd(zstd);
+        for i in 0..docs {
+            w.add_document(DocumentId(format!("d{i}")), fields(i, true));
+        }
+        w.finalize(Bm25Params::default()).unwrap()
+    }
+
+    fn assert_same(a: &DocRecord, b: &DocRecord) {
+        assert_eq!(a.doc_id, b.doc_id);
+        assert_eq!(a.doc_seq, b.doc_seq);
+        assert_eq!(a.field_length, b.field_length);
+        assert_eq!(a.fields.len(), b.fields.len());
+        for (x, y) in a.fields.iter().zip(&b.fields) {
+            assert_eq!(
+                (&x.name, x.field_type, &x.value),
+                (&y.name, y.field_type, &y.value)
+            );
+        }
+    }
+
+    #[test]
+    fn default_writer_is_raw_and_footer_has_no_new_key() {
+        let dir = scratch("default");
+        let footer = write(&dir, 30, None, VectorStoreMode::Sidecar);
+        assert!(footer.doc_store_compression.is_none());
+        let json = fs::read_to_string(dir.join("footer.json")).unwrap();
+        assert!(!json.contains("doc_store_compression"));
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        assert!(!r.doc_store_compressed());
+        assert_eq!(r.doc_store_dict_bytes(), 0);
+        // No trailer after the entries: the offsets file is exactly what
+        // the pre-#388 writer produced.
+        let (_, trailer) = try_read_doc_index_parts(&dir, 30).unwrap();
+        assert!(trailer.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Round trip: every record (sidecar vectors filled back in) equals the
+    /// raw-layout segment's, through `doc_record_full`, `iter_doc_records`
+    /// and `iter_doc_records_raw`; and the compressed store is smaller.
+    #[test]
+    fn compressed_round_trips_every_record_and_is_smaller() {
+        let raw_dir = scratch("rt-raw");
+        let z_dir = scratch("rt-zstd");
+        let docs = 400;
+        write(&raw_dir, docs, None, VectorStoreMode::Sidecar);
+        let footer = write(
+            &z_dir,
+            docs,
+            Some(DocStoreZstdConfig::default()),
+            VectorStoreMode::Sidecar,
+        );
+        let meta = footer.doc_store_compression.clone().expect("compressed");
+        assert_eq!(meta.codec, kosha_core::DocStoreCompression::ZSTD_DICT);
+        assert!(meta.dict_bytes > 0, "a dictionary was trained");
+        let back: Footer =
+            serde_json::from_str(&fs::read_to_string(z_dir.join("footer.json")).unwrap()).unwrap();
+        assert_eq!(back.doc_store_compression, Some(meta.clone()));
+
+        let raw = SegmentReader::open(raw_dir.clone()).unwrap();
+        let z = SegmentReader::open(z_dir.clone()).unwrap();
+        assert!(z.doc_store_compressed());
+        assert_eq!(z.doc_store_dict_bytes(), meta.dict_bytes as usize);
+        assert!(z.has_local_doc_store());
+        for seq in 0..docs as u32 {
+            assert_same(
+                &raw.doc_record_full(seq).unwrap().unwrap(),
+                &z.doc_record_full(seq).unwrap().unwrap(),
+            );
+            let m = z.doc_meta(seq).unwrap();
+            assert_eq!(m.doc_id, format!("d{seq}"));
+        }
+        assert!(z.doc_record_full(docs as u32).unwrap().is_none());
+        let a: Vec<_> = raw.iter_doc_records().map(Result::unwrap).collect();
+        let b: Vec<_> = z.iter_doc_records().map(Result::unwrap).collect();
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(&b) {
+            assert_same(x, y);
+        }
+        for (x, y) in raw.iter_doc_records_raw().zip(z.iter_doc_records_raw()) {
+            let (x, y) = (x.unwrap(), y.unwrap());
+            assert_same(&x.record, &y.record);
+            assert_eq!(x.vectors, y.vectors);
+        }
+        let size = |d: &Path| fs::metadata(d.join(DOC_STORE_FILE)).unwrap().len();
+        // The file is the records, then the dictionary copy and 8 bytes.
+        let z_records = z.doc_store_len().unwrap();
+        assert_eq!(size(&z_dir), z_records + meta.dict_bytes as u64 + 8);
+        assert!(
+            z_records * 2 < size(&raw_dir),
+            "compressed records {z_records} vs raw {}",
+            size(&raw_dir)
+        );
+        let _ = fs::remove_dir_all(&raw_dir);
+        let _ = fs::remove_dir_all(&z_dir);
+    }
+
+    /// The ranged-read contract of #245 holds on stored (compressed)
+    /// bytes: the `doc_span` slice, and only it, materializes the record,
+    /// fetched remotely (`doc_record_from_bytes`) or from the sparse span
+    /// cache with `doc_store.bin` absent.
+    #[test]
+    fn ranged_reads_fetch_only_the_compressed_span() {
+        let dir = scratch("ranged");
+        let docs = 200;
+        write(
+            &dir,
+            docs,
+            Some(DocStoreZstdConfig::default()),
+            VectorStoreMode::Sidecar,
+        );
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        let store = fs::read(dir.join(DOC_STORE_FILE)).unwrap();
+        // The records end where the dictionary's tail copy starts.
+        let (dict_tail, records_end) = doc_store_zstd::read_dict_tail(&store).unwrap();
+        assert_eq!(dict_tail.len(), r.doc_store_dict_bytes());
+        assert_eq!(r.doc_store_len(), Some(records_end as u64));
+        let expected: Vec<DocRecord> = (0..docs as u32)
+            .map(|s| r.doc_record_full(s).unwrap().unwrap())
+            .collect();
+        let mut spans = Vec::new();
+        let mut prev_end = 4u64;
+        for seq in 0..docs as u32 {
+            let (off, len) = r.doc_span(seq).unwrap();
+            assert_eq!(off, prev_end, "records are back to back");
+            prev_end = off + len as u64;
+            let bytes = store[off as usize..prev_end as usize].to_vec();
+            assert_same(
+                &r.doc_record_from_bytes(seq, &bytes).unwrap().unwrap(),
+                &expected[seq as usize],
+            );
+            spans.push((off, bytes));
+        }
+        // Wrong-length buffer: an error, never garbage.
+        let (_, len0) = r.doc_span(0).unwrap();
+        assert!(r
+            .doc_record_from_bytes(0, &store[4..4 + len0 as usize + 1])
+            .is_err());
+
+        // Scoring-set-only hydration: doc_store.bin gone, only some spans
+        // persisted in the span cache.
+        fs::remove_file(dir.join(DOC_STORE_FILE)).unwrap();
+        assert!(!r.has_local_doc_store());
+        let page = [3u32, 77, 150];
+        let sdir = span_cache::spans_dir(&dir, DOC_STORE_FILE);
+        fs::create_dir_all(&sdir).unwrap();
+        for &seq in &page {
+            let (off, bytes) = &spans[seq as usize];
+            fs::write(
+                sdir.join(span_cache::span_file_name(*off, off + bytes.len() as u64)),
+                bytes,
+            )
+            .unwrap();
+        }
+        for seq in 0..docs as u32 {
+            let local = r.doc_is_local(seq);
+            assert_eq!(local, page.contains(&seq), "doc {seq}");
+            if local {
+                assert_same(
+                    &r.doc_record_full(seq).unwrap().unwrap(),
+                    &expected[seq as usize],
+                );
+            } else {
+                assert!(r.doc_record_full(seq).is_err());
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Vectors never go inline into a compressed doc store, even when
+    /// `KOSHA_VECTOR_STORE=inline` asks for it.
+    #[test]
+    fn compression_forces_the_vector_sidecar() {
+        let dir = scratch("inline");
+        let footer = write(
+            &dir,
+            40,
+            Some(DocStoreZstdConfig::default()),
+            VectorStoreMode::Inline,
+        );
+        assert!(footer.doc_vectors, "vectors moved to doc_vectors.bin");
+        assert!(dir.join(DOC_VECTORS_FILE).exists());
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        for raw in r.iter_doc_records_raw() {
+            let raw = raw.unwrap();
+            let emb = raw.record.fields.iter().find(|f| f.name == "emb").unwrap();
+            assert!(
+                emb.value.is_empty(),
+                "only the sidecar placeholder is stored"
+            );
+            assert_eq!(raw.vectors.len(), 1);
+        }
+        let rec = r.doc_record_full(5).unwrap().unwrap();
+        let emb = rec.fields.iter().find(|f| f.name == "emb").unwrap();
+        let got: Vec<f32> = serde_json::from_str(&emb.value).unwrap();
+        assert_eq!(
+            got,
+            (0..8).map(|d| (40 + d) as f32 * 0.125).collect::<Vec<_>>()
+        );
+        // Without compression, inline mode still means inline.
+        let raw_dir = scratch("inline-raw");
+        assert!(!write(&raw_dir, 40, None, VectorStoreMode::Inline).doc_vectors);
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&raw_dir);
+    }
+
+    /// Tiny segments train no dictionary; a disabled dictionary is plain
+    /// zstd. Both still round-trip, and records zstd cannot shrink stay
+    /// raw inside the compressed store.
+    #[test]
+    fn small_segments_and_no_dictionary_round_trip() {
+        for (name, docs, config) in [
+            ("tiny", 3usize, DocStoreZstdConfig::default()),
+            ("nodict", 50, DocStoreZstdConfig::with_dict_bytes(3, 0)),
+        ] {
+            let dir = scratch(name);
+            let footer = write(&dir, docs, Some(config), VectorStoreMode::Sidecar);
+            assert_eq!(
+                footer.doc_store_compression.as_ref().unwrap().dict_bytes,
+                0,
+                "{name}"
+            );
+            let r = SegmentReader::open(dir.clone()).unwrap();
+            for seq in 0..docs as u32 {
+                let rec = r.doc_record_full(seq).unwrap().unwrap();
+                assert_eq!(rec.doc_id.0, format!("d{seq}"));
+                assert_eq!(rec.fields[0].value, passage(seq as usize));
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
+        // An empty segment stays the 4-byte raw layout.
+        let dir = scratch("empty");
+        let w = SegmentWriter::new(SegmentId("e".into()), dir.clone())
+            .with_doc_store_zstd(Some(DocStoreZstdConfig::default()));
+        let footer = w.finalize(Bm25Params::default()).unwrap();
+        assert!(footer.doc_store_compression.is_none());
+        assert_eq!(SegmentReader::open(dir.clone()).unwrap().doc_count(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The format is the footer's call: a compressed segment never falls
+    /// back to the eager full parse (it would read frames as garbage), an
+    /// unknown codec is refused, and a reader that ignores the footer (a
+    /// pre-#388 binary) fails to parse a record instead of returning one.
+    #[test]
+    fn compressed_segments_fail_loudly_instead_of_misreading() {
+        let dir = scratch("loud");
+        write(
+            &dir,
+            60,
+            Some(DocStoreZstdConfig::default()),
+            VectorStoreMode::Sidecar,
+        );
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        let (off, len) = r.doc_span(7).unwrap();
+        let store = fs::read(dir.join(DOC_STORE_FILE)).unwrap();
+        let stored = &store[off as usize..(off + len as u64) as usize];
+        let mut cursor = stored;
+        assert!(
+            parse_one_doc_record(&mut cursor, 7).is_err(),
+            "an old reader's parse of a frame errors"
+        );
+
+        // Unknown codec.
+        let footer_path = dir.join("footer.json");
+        let good = fs::read_to_string(&footer_path).unwrap();
+        let mut footer: Footer = serde_json::from_str(&good).unwrap();
+        footer.doc_store_compression.as_mut().unwrap().codec = "zstd-v9".into();
+        fs::write(&footer_path, serde_json::to_string(&footer).unwrap()).unwrap();
+        assert!(matches!(
+            SegmentReader::open(dir.clone()),
+            Err(KoshaError::CorruptSegment(_))
+        ));
+        fs::write(&footer_path, &good).unwrap();
+
+        // Broken sidecar and no local doc_store.bin: an error, never the
+        // eager parse.
+        let offsets_path = dir.join("doc_store.offsets");
+        let offsets = fs::read(&offsets_path).unwrap();
+        let store_path = dir.join(DOC_STORE_FILE);
+        fs::write(&offsets_path, &offsets[..offsets.len() - 10]).unwrap();
+        fs::remove_file(&store_path).unwrap();
+        assert!(!doc_store_opens_lazily(&dir, None));
+        assert!(matches!(
+            SegmentReader::open(dir.clone()),
+            Err(KoshaError::CorruptSegment(_))
+        ));
+        // doc_store.bin with a damaged dictionary tail cannot rebuild it.
+        let mut bad_tail = store.clone();
+        let n = bad_tail.len();
+        bad_tail[n - 1] ^= 0xFF;
+        fs::write(&store_path, &bad_tail).unwrap();
+        assert!(SegmentReader::open(dir.clone()).is_err());
+        assert!(SegmentReader::backfill_offset_tables(&dir).is_err());
+        fs::write(&store_path, &store).unwrap();
+        fs::write(&offsets_path, &offsets).unwrap();
+        assert!(SegmentReader::open(dir.clone()).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `doc_store.offsets` is not a single point of failure: with it
+    /// missing, cut (dictionary trailer gone) or stale against the footer,
+    /// the reader rebuilds the index from `doc_store.bin` and its
+    /// dictionary tail copy, and `backfill_offset_tables` writes back a
+    /// sidecar byte-identical to the writer's.
+    #[test]
+    fn broken_offsets_are_rebuilt_from_doc_store_bin() {
+        for (name, dict) in [
+            ("rebuild", DocStoreZstdConfig::default()),
+            ("rebuild-nodict", DocStoreZstdConfig::with_dict_bytes(3, 0)),
+        ] {
+            let dir = scratch(name);
+            let docs = 150;
+            write(&dir, docs, Some(dict), VectorStoreMode::Sidecar);
+            let expected: Vec<DocRecord> = {
+                let r = SegmentReader::open(dir.clone()).unwrap();
+                (0..docs as u32)
+                    .map(|s| r.doc_record_full(s).unwrap().unwrap())
+                    .collect()
+            };
+            let offsets_path = dir.join("doc_store.offsets");
+            let offsets = fs::read(&offsets_path).unwrap();
+            let check = |r: &SegmentReader| {
+                assert!(r.doc_store_compressed());
+                for seq in 0..docs as u32 {
+                    assert_same(
+                        &r.doc_record_full(seq).unwrap().unwrap(),
+                        &expected[seq as usize],
+                    );
+                }
+            };
+            let mut stale = offsets.clone();
+            stale[0..4].copy_from_slice(&(docs as u32 + 1).to_le_bytes());
+            for broken in [
+                None,
+                Some(offsets[..offsets.len() - 10].to_vec()),
+                Some(stale),
+            ] {
+                match &broken {
+                    None => fs::remove_file(&offsets_path).unwrap(),
+                    Some(bytes) => fs::write(&offsets_path, bytes).unwrap(),
+                }
+                assert!(!doc_store_opens_lazily(&dir, None), "{name}");
+                check(&SegmentReader::open(dir.clone()).unwrap());
+                SegmentReader::backfill_offset_tables(&dir).unwrap();
+                assert_eq!(fs::read(&offsets_path).unwrap(), offsets, "{name}");
+                assert!(doc_store_opens_lazily(&dir, None), "{name}");
+                check(&SegmentReader::open(dir.clone()).unwrap());
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 }
