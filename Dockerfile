@@ -18,12 +18,21 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
+# Optional RUSTFLAGS for experiments (e.g. --build-arg
+# KOSHA_RUSTFLAGS="-C target-cpu=x86-64-v3"); the benchmark workflow sets it
+# from its rustflags input. Empty (the default) leaves RUSTFLAGS unset, so
+# the build is the same as without the arg. Applied to the dependency cook
+# too, so the cooked layer matches the final build flags.
+ARG KOSHA_RUSTFLAGS=""
+
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --locked --recipe-path recipe.json \
+RUN if [ -n "$KOSHA_RUSTFLAGS" ]; then export RUSTFLAGS="$KOSHA_RUSTFLAGS"; fi \
+    && cargo chef cook --release --locked --recipe-path recipe.json \
     --package kosha-server --features migrate
 
 COPY . .
-RUN cargo build --release --locked --package kosha-server --features migrate
+RUN if [ -n "$KOSHA_RUSTFLAGS" ]; then export RUSTFLAGS="$KOSHA_RUSTFLAGS"; fi \
+    && cargo build --release --locked --package kosha-server --features migrate
 
 # ---------- Runtime ----------
 FROM debian:bookworm-slim AS runtime

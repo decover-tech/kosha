@@ -20,6 +20,7 @@ pub use histogram::{
 pub mod docset;
 pub mod nested;
 pub mod sharding;
+pub mod tenancy;
 pub use analysis::{
     AnalysisConfig, AnalyzerSpec, EmbeddingSpec, FieldSchema, NamespaceSchema, SegmentAnalysis,
     TokenFilterSpec, TokenizerKind,

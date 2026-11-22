@@ -27,3 +27,20 @@ data:
   # KOSHA_S3_TENANT_KMS_KEYS: acme=arn:aws:kms:us-east-1:111122223333:key/ACME-KEY-ID
   # ...or the same map as JSON from a mounted file:
   # KOSHA_S3_TENANT_KMS_KEYS_FILE: /etc/kosha/tenant-kms-keys.json
+  # TLS between pods (#343). Off by default. Needs the kosha-internal-tls
+  # Secret mounted at /etc/kosha/tls by every Deployment (see
+  # certificate-internal-tls.example.yaml for a cert-manager example) and,
+  # on query pods, KOSHA_INGEST_HOST switched to https://. HTTPS is per port,
+  # so the probes need `scheme: HTTPS` once the server certificate is set.
+  # Bad settings stop the pod at startup. See docs/configuration.md,
+  # "TLS between pods".
+  # Server side: HTTPS on :8080, and mTLS required on /internal/*.
+  # KOSHA_TLS_CERT_PATH: /etc/kosha/tls/tls.crt
+  # KOSHA_TLS_KEY_PATH: /etc/kosha/tls/tls.key
+  # KOSHA_TLS_CLIENT_CA_PATH: /etc/kosha/tls/ca.crt
+  # Client side: peer hydration and ingest forwarding.
+  # KOSHA_INTERNAL_TLS: "on"   # "required" once every pod is on TLS
+  # KOSHA_INTERNAL_TLS_CA_PATH: /etc/kosha/tls/ca.crt
+  # KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH: /etc/kosha/tls/tls.crt
+  # KOSHA_INTERNAL_TLS_CLIENT_KEY_PATH: /etc/kosha/tls/tls.key
+  # KOSHA_INTERNAL_TLS_SERVER_NAME: kosha-internal

@@ -10,12 +10,13 @@ pub mod rerank;
 
 use kosha_core::fields::{field_norms_key, field_term_key, segment_field_chain};
 use kosha_core::fuzzy::{ExpandStats, FuzzyQuery, MAX_FUZZY_EDITS};
+use kosha_core::tenancy::{tenant_of_namespace, TenantCacheStats, TenantLedger, TenantShares};
 use kosha_core::{
     segment_may_contain_terms, AggBucket, AggBucketResult, AggCompositeBucket, AggCompositeResult,
-    AggMetricResult, Aggregation, AggregationResults, Bm25Params, Bm25StatsScope, DocSet,
-    DocumentId, FieldType, FilterClause, FilterStore, HighlightConfig, KoshaError, Manifest,
-    ManifestEntry, MetricKind, NamespaceId, RankDetails, RrfParams, ScoredDocument, SearchQuery,
-    SearchResult, SortSpec, TermBloomMode, TotalHitsRelation,
+    Aggregation, AggregationResults, Bm25Params, Bm25StatsScope, DocSet, DocumentId, FieldType,
+    FilterClause, FilterStore, HighlightConfig, KoshaError, Manifest, ManifestEntry, MetricKind,
+    NamespaceId, RankDetails, RrfParams, ScoredDocument, SearchQuery, SearchResult, SortSpec,
+    TermBloomMode, TotalHitsRelation,
 };
 use kosha_core::{AnalyzerSpec, FieldBoost, Footer, SegmentAnalysis};
 pub use kosha_segment::VectorSpanFetch;
@@ -412,6 +413,12 @@ impl Drop for AdmissionPermit {
 /// `size_of` of the parsed structures, but it's the right order of
 /// magnitude and, critically, bounds worst case instead of trusting entry
 /// count to correlate with memory.
+///
+/// Tenants (#342): the cache keeps bytes and hit, miss and eviction counts
+/// per tenant (the first component of the namespace id — see
+/// [`kosha_core::tenancy`]) and evicts from the tenant furthest over its
+/// weighted share of `max_bytes`, least recently used first within that
+/// tenant, never taking a tenant below its floor while another can give.
 /// Cache key: `(namespace, segment_id, load_vectors)`.
 type SegmentCacheKey = (String, String, bool);
 
@@ -421,6 +428,10 @@ struct SegmentCache {
     entries: Mutex<HashMap<SegmentCacheKey, (Arc<TrackedSegment>, u64)>>,
     recency: Mutex<VecDeque<SegmentCacheKey>>,
     total_bytes: AtomicU64,
+    /// Per-tenant bytes and counters. Lock order: `recency`, `entries`,
+    /// then `tenants`.
+    tenants: Mutex<TenantLedger>,
+    shares: std::sync::RwLock<TenantShares>,
 }
 
 impl SegmentCache {
@@ -431,7 +442,16 @@ impl SegmentCache {
             entries: Mutex::new(HashMap::new()),
             recency: Mutex::new(VecDeque::new()),
             total_bytes: AtomicU64::new(0),
+            tenants: Mutex::new(TenantLedger::default()),
+            shares: std::sync::RwLock::new(TenantShares::from_env()),
         }
+    }
+
+    fn shares(&self) -> TenantShares {
+        self.shares
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn touch(&self, key: &SegmentCacheKey) {
@@ -449,6 +469,15 @@ impl SegmentCache {
             .unwrap()
             .get(key)
             .map(|(r, _)| r.clone());
+        {
+            let mut tenants = self.tenants.lock().unwrap();
+            let tenant = tenant_of_namespace(&key.0);
+            if hit.is_some() {
+                tenants.hit(tenant);
+            } else {
+                tenants.miss(tenant);
+            }
+        }
         if hit.is_some() {
             self.touch(key);
         }
@@ -460,16 +489,25 @@ impl SegmentCache {
     }
 
     fn insert(&self, key: SegmentCacheKey, reader: Arc<TrackedSegment>, approx_bytes: u64) {
-        {
+        let old = {
             let mut entries = self.entries.lock().unwrap();
-            entries.insert(key.clone(), (reader, approx_bytes));
-        }
+            let old = entries
+                .insert(key.clone(), (reader, approx_bytes))
+                .map_or(0, |(_, size)| size);
+            let mut tenants = self.tenants.lock().unwrap();
+            let tenant = tenant_of_namespace(&key.0);
+            tenants.sub_bytes(tenant, old);
+            tenants.add_bytes(tenant, approx_bytes);
+            old
+        };
+        // A replaced entry's bytes leave the total with it.
         self.total_bytes.fetch_add(approx_bytes, Ordering::Relaxed);
+        self.total_bytes.fetch_sub(old, Ordering::Relaxed);
         self.touch(&key);
         self.enforce_budget();
     }
 
-    /// Evict idle LRU entries until the cache is back under both its entry
+    /// Evict idle entries until the cache is back under both its entry
     /// and byte budgets, or no idle entries remain. Called after every
     /// insert and at the start of every search — the latter catches
     /// segments that were pinned by in-flight requests at insert time
@@ -478,7 +516,7 @@ impl SegmentCache {
         self.evict_idle_until(|len, total, _freed| len <= self.capacity && total <= self.max_bytes);
     }
 
-    /// Evict idle LRU entries until at least `needed` bytes have been
+    /// Evict idle entries until at least `needed` bytes have been
     /// freed, or no idle entries remain. Used by admission (see
     /// [`MemoryLedger::admit`]) to free idle memory before making a search
     /// wait on in-flight releases.
@@ -491,20 +529,29 @@ impl SegmentCache {
     /// recency keys are skipped by the eviction walk.
     fn remove_segment(&self, namespace: &str, segment_id: &str) -> Vec<Arc<TrackedSegment>> {
         let mut entries = self.entries.lock().unwrap();
+        let mut tenants = self.tenants.lock().unwrap();
         let mut removed = Vec::new();
         for load_vectors in [false, true] {
             let key = (namespace.to_string(), segment_id.to_string(), load_vectors);
             if let Some((reader, size)) = entries.remove(&key) {
                 self.total_bytes.fetch_sub(size, Ordering::Relaxed);
+                tenants.sub_bytes(tenant_of_namespace(namespace), size);
                 removed.push(reader);
             }
         }
         removed
     }
 
-    /// Shared eviction walk: pop LRU-order entries, evicting the *idle*
-    /// ones (strong_count == 1 — the cache's own `Arc` is the only
-    /// reference) until `done(len, total_bytes, freed)` says stop.
+    /// Per-tenant bytes, hits, misses and evictions.
+    fn tenant_stats(&self) -> Vec<TenantCacheStats> {
+        self.tenants.lock().unwrap().stats()
+    }
+
+    /// Shared eviction walk: evict *idle* entries (strong_count == 1 — the
+    /// cache's own `Arc` is the only reference) until `done(len,
+    /// total_bytes, freed)` says stop. Each victim is the least recently
+    /// used idle entry of the tenant [`TenantShares::pick_victim`] picks
+    /// (#342); with a single tenant that is plain LRU.
     ///
     /// Entries pinned by in-flight requests are skipped with their recency
     /// order preserved: removing them from the cache would free no memory
@@ -515,41 +562,60 @@ impl SegmentCache {
     /// bounding pinned memory is the admission gate's job, not eviction's.
     fn evict_idle_until(&self, done: impl Fn(usize, u64, u64) -> bool) -> u64 {
         let mut freed = 0u64;
+        let shares = self.shares();
         let mut recency = self.recency.lock().unwrap();
         let mut entries = self.entries.lock().unwrap();
-        let mut pinned: Vec<SegmentCacheKey> = Vec::new();
+        let mut tenants = self.tenants.lock().unwrap();
         loop {
             let total = self.total_bytes.load(Ordering::Relaxed);
             if done(entries.len(), total, freed) {
                 break;
             }
-            let Some(oldest_key) = recency.pop_front() else {
-                break;
-            };
-            match entries
-                .get(&oldest_key)
-                .map(|(arc, _)| Arc::strong_count(arc) == 1)
-            {
-                // Stale recency key (entry already gone) — just drop it.
-                None => {}
-                Some(true) => {
-                    if let Some((_, size)) = entries.remove(&oldest_key) {
-                        // The Arc drops here → TrackedSegment::drop → ledger
-                        // lock. Safe per the lock-order invariant: cache
-                        // locks may be held while taking the ledger lock,
-                        // never the reverse.
-                        self.total_bytes.fetch_sub(size, Ordering::Relaxed);
-                        freed = freed.saturating_add(size);
+            // Stale recency keys (entry already gone) are dropped as found.
+            recency.retain(|k| entries.contains_key(k));
+            let usage = tenants.usage();
+            // One pass: each active tenant's least recently used idle entry.
+            let mut oldest: HashMap<&str, (usize, u64)> = HashMap::new();
+            let mut first_idle: Option<usize> = None;
+            for (pos, key) in recency.iter().enumerate() {
+                let Some((arc, size)) = entries.get(key) else {
+                    continue;
+                };
+                if Arc::strong_count(arc) != 1 {
+                    continue;
+                }
+                first_idle.get_or_insert(pos);
+                let tenant = tenant_of_namespace(&key.0);
+                if usage.iter().any(|(t, _)| *t == tenant) {
+                    oldest.entry(tenant).or_insert((pos, *size));
+                    if oldest.len() == usage.len() {
+                        break;
                     }
                 }
-                Some(false) => pinned.push(oldest_key),
             }
-        }
-        // Restore skipped (pinned) entries to the front, preserving their
-        // original LRU order — they're still the oldest, just untouchable
-        // right now.
-        for key in pinned.into_iter().rev() {
-            recency.push_front(key);
+            let victim = shares
+                .pick_victim(self.max_bytes, &usage, |t| {
+                    oldest.get(t).map(|(_, size)| *size)
+                })
+                .and_then(|t| oldest.get(t).map(|(pos, _)| *pos))
+                .or(first_idle);
+            drop(oldest);
+            drop(usage);
+            let Some(pos) = victim else {
+                break;
+            };
+            let key = recency.remove(pos).expect("position from this walk");
+            if let Some((_, size)) = entries.remove(&key) {
+                // The Arc drops here → TrackedSegment::drop → ledger
+                // lock. Safe per the lock-order invariant: cache
+                // locks may be held while taking the ledger lock,
+                // never the reverse.
+                self.total_bytes.fetch_sub(size, Ordering::Relaxed);
+                freed = freed.saturating_add(size);
+                let tenant = tenant_of_namespace(&key.0);
+                tenants.sub_bytes(tenant, size);
+                tenants.evicted(tenant);
+            }
         }
         if freed > 0 {
             println!(
@@ -1385,6 +1451,8 @@ const CORPUS_STATS_MAX_TERMS: usize = 100_000;
 #[derive(Default)]
 struct CorpusStatsCache {
     entries: Mutex<HashMap<CorpusKey, Arc<CorpusEntry>>>,
+    /// Weights for [`make_room_by_tenant`] (#342).
+    shares: std::sync::RwLock<TenantShares>,
 }
 
 impl CorpusStatsCache {
@@ -1395,10 +1463,43 @@ impl CorpusStatsCache {
     fn insert(&self, key: CorpusKey, entry: Arc<CorpusEntry>) -> Arc<CorpusEntry> {
         let mut entries = self.entries.lock().unwrap();
         entries.retain(|k, _| corpus_entry_survives(k, &key));
-        if entries.len() >= CORPUS_STATS_MAX_ENTRIES {
-            entries.clear();
-        }
+        let shares = self.shares.read().unwrap_or_else(|e| e.into_inner());
+        make_room_by_tenant(&mut entries, CORPUS_STATS_MAX_ENTRIES, &shares);
         Arc::clone(entries.entry(key).or_insert(entry))
+    }
+}
+
+/// Make room for one more entry in a manifest-level cache bounded at
+/// `max` entries (#342): remove entries, oldest manifest version first,
+/// from the tenant holding the most entries relative to its weighted share
+/// of `max`, instead of clearing every tenant's entries at once. Each
+/// active tenant keeps at least one entry while another can give.
+fn make_room_by_tenant<V>(entries: &mut HashMap<CorpusKey, V>, max: usize, shares: &TenantShares) {
+    let shares = shares.clone().with_min_bytes(1);
+    while !entries.is_empty() && entries.len() >= max {
+        let mut counts: HashMap<&str, u64> = HashMap::new();
+        for key in entries.keys() {
+            *counts.entry(tenant_of_namespace(&key.0)).or_insert(0) += 1;
+        }
+        let usage: Vec<(&str, u64)> = counts.into_iter().collect();
+        let victim_tenant = shares
+            .pick_victim(max as u64, &usage, |_| Some(1))
+            .map(str::to_string);
+        let victim = entries
+            .keys()
+            .filter(|k| {
+                victim_tenant
+                    .as_deref()
+                    .is_none_or(|t| tenant_of_namespace(&k.0) == t)
+            })
+            .min_by_key(|k| k.1)
+            .cloned();
+        match victim {
+            Some(key) => {
+                entries.remove(&key);
+            }
+            None => break,
+        }
     }
 }
 
@@ -1495,6 +1596,8 @@ const CEILING_CACHE_MAX_TERMS: usize = 4096;
 #[derive(Default)]
 struct CeilingCache {
     entries: Mutex<HashMap<CorpusKey, Arc<CeilingEntry>>>,
+    /// Weights for [`make_room_by_tenant`] (#342).
+    shares: std::sync::RwLock<TenantShares>,
 }
 
 impl CeilingCache {
@@ -1505,9 +1608,8 @@ impl CeilingCache {
     fn insert(&self, key: CorpusKey, entry: Arc<CeilingEntry>) -> Arc<CeilingEntry> {
         let mut entries = self.entries.lock().unwrap();
         entries.retain(|k, _| corpus_entry_survives(k, &key));
-        if entries.len() >= CEILING_CACHE_MAX_ENTRIES {
-            entries.clear();
-        }
+        let shares = self.shares.read().unwrap_or_else(|e| e.into_inner());
+        make_room_by_tenant(&mut entries, CEILING_CACHE_MAX_ENTRIES, &shares);
         Arc::clone(entries.entry(key).or_insert(entry))
     }
 }
@@ -2583,6 +2685,25 @@ impl Searcher {
     /// `KOSHA_SEGMENT_CACHE_MAX_BYTES` ledger), for `kosha_cache_bytes`.
     pub fn segment_cache_bytes(&self) -> u64 {
         self.segment_cache.total_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Per-tenant bytes, hits, misses and evictions of the parsed-segment
+    /// cache (#342), for `kosha_cache_*{cache="segment",tenant}`.
+    pub fn segment_cache_tenant_stats(&self) -> Vec<TenantCacheStats> {
+        self.segment_cache.tenant_stats()
+    }
+
+    /// Set how the in-memory caches (parsed segments, corpus statistics,
+    /// score ceilings) split their budgets between tenants (#342). The
+    /// default comes from `KOSHA_CACHE_TENANT_MIN_BYTES` with equal
+    /// weights.
+    pub fn set_tenant_shares(&self, shares: TenantShares) {
+        let set = |lock: &std::sync::RwLock<TenantShares>| {
+            *lock.write().unwrap_or_else(|e| e.into_inner()) = shares.clone();
+        };
+        set(&self.segment_cache.shares);
+        set(&self.corpus_stats.shares);
+        set(&self.ceilings.shares);
     }
 
     pub fn new(data_dir: PathBuf) -> Self {
@@ -6055,7 +6176,7 @@ impl Searcher {
             // counted, so only vector-only window members are added.
             total_hits += fused.vector_only.len();
             if !query.aggs.is_empty() && !fused.vector_only.is_empty() {
-                for (name, state) in aggregate_vector_only(query, &fused.vector_only) {
+                for (name, state) in aggregate_vector_only(query, &fused.vector_only)? {
                     all_aggs.entry(name).or_default().merge(state);
                 }
             }
@@ -7067,10 +7188,16 @@ fn rrf_fuse(
 /// window, grouped by segment: a hybrid request aggregates over the same
 /// documents its `total_hits` counts (lexical matches plus the vector
 /// window), and the per-segment pass only saw the lexical matches.
+///
+/// Reads each segment the way the per-segment pass does: a columnar
+/// segment (#244) from its columns, a `filters.bin` segment from the
+/// columns of the row store this query names. A damaged column fails the
+/// request closed instead of silently dropping these documents from the
+/// buckets (issue #215).
 fn aggregate_vector_only(
     query: &SearchQuery,
     vector_only: &[(Arc<TrackedSegment>, u32)],
-) -> Vec<(String, AggregationState)> {
+) -> Result<Vec<(String, AggregationState)>, KoshaError> {
     let mut by_segment: Vec<(&Arc<TrackedSegment>, HashSet<u32>)> = Vec::new();
     for (reader, doc_seq) in vector_only {
         match by_segment
@@ -7085,12 +7212,23 @@ fn aggregate_vector_only(
     }
     let mut out = Vec::new();
     for (reader, wanted) in by_segment {
-        let store = reader.filter_store();
-        for (name, agg) in &query.aggs {
-            out.push((name.clone(), aggregate_matches(&store, &wanted, agg)));
+        if reader.has_filter_columns() {
+            let mut wanted: Vec<u32> = wanted.into_iter().collect();
+            wanted.sort_unstable();
+            for (name, agg) in &query.aggs {
+                out.push((
+                    name.clone(),
+                    aggregate_matches_columnar(reader, &wanted, agg)?,
+                ));
+            }
+        } else {
+            let store = reader.filter_store_for(&query.filter_column_fields())?;
+            for (name, agg) in &query.aggs {
+                out.push((name.clone(), aggregate_matches(&store, &wanted, agg)));
+            }
         }
     }
-    out
+    Ok(out)
 }
 
 fn sort_fields_needing_values(sort: &[SortSpec]) -> Vec<String> {
@@ -8900,94 +9038,6 @@ pub fn segment_may_match_query_terms(
             let terms = reading.scoring_terms();
             terms.is_empty() || segment_may_contain_terms(&terms, mode, footer.term_bloom.as_ref())
         })
-}
-
-pub fn compute_single_aggregation(store: &FilterStore, field: &str) -> AggregationResults {
-    // Borrowed key while counting — one `String` alloc per *distinct*
-    // value at bucket-emission time, not one per document, matching
-    // `compute_cardinality`/`compute_composite` right below.
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-
-    if let Some(entries) = store.string_fields.get(field) {
-        for (_, val) in entries {
-            *counts.entry(val.as_str()).or_default() += 1;
-        }
-    }
-
-    let mut buckets: Vec<AggBucket> = counts
-        .into_iter()
-        .map(|(k, c)| AggBucket {
-            key: k.to_string(),
-            doc_count: c,
-            ..Default::default()
-        })
-        .collect();
-    buckets.sort_by_key(|b| std::cmp::Reverse(b.doc_count));
-
-    AggregationResults {
-        per_document: Some(AggBucketResult { buckets }),
-        total_documents: None,
-        matched_docs: None,
-        extra: HashMap::new(),
-    }
-}
-
-pub fn compute_cardinality(store: &FilterStore, field: &str) -> AggregationResults {
-    let count = store
-        .string_fields
-        .get(field)
-        .map(|entries| {
-            let unique: HashSet<&str> = entries.iter().map(|(_, v)| v.as_str()).collect();
-            unique.len()
-        })
-        .unwrap_or(0);
-
-    AggregationResults {
-        per_document: None,
-        total_documents: Some(AggMetricResult { value: count }),
-        matched_docs: None,
-        extra: HashMap::new(),
-    }
-}
-
-pub fn compute_composite(
-    store: &FilterStore,
-    composite: &kosha_core::AggComposite,
-) -> AggregationResults {
-    let mut buckets = Vec::new();
-    if let Some(source) = composite.sources.first() {
-        for (agg_name, terms_spec) in &source.source {
-            let field = &terms_spec.terms.field;
-            if let Some(entries) = store.string_fields.get(field) {
-                let mut seen: HashMap<&str, usize> = HashMap::new();
-                for (_, val) in entries {
-                    *seen.entry(val.as_str()).or_default() += 1;
-                }
-                let _ = agg_name;
-                for (key, count) in seen {
-                    if buckets.len() >= composite.size {
-                        break;
-                    }
-                    let mut key_map = HashMap::new();
-                    key_map.insert(field.clone(), key.to_string());
-                    buckets.push(AggCompositeBucket {
-                        key: key_map,
-                        doc_count: count,
-                        ..Default::default()
-                    });
-                }
-            }
-        }
-    }
-
-    let after_key = buckets.last().map(|b| b.key.clone());
-
-    AggregationResults {
-        per_document: None,
-        total_documents: None,
-        matched_docs: Some(AggCompositeResult { buckets, after_key }),
-        extra: HashMap::new(),
-    }
 }
 
 /// True when `cand` sorts strictly after the search_after cursor.
@@ -11029,32 +11079,6 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_terms() {
-        let mut store = FilterStore::default();
-        store.string_fields.insert(
-            "documentId".to_string(),
-            vec![(0, "d1".into()), (1, "d2".into()), (2, "d1".into())],
-        );
-        let result = compute_single_aggregation(&store, "documentId");
-        let per_doc = result.per_document.unwrap();
-        assert_eq!(per_doc.buckets.len(), 2);
-        assert_eq!(per_doc.buckets[0].key, "d1");
-        assert_eq!(per_doc.buckets[0].doc_count, 2);
-    }
-
-    #[test]
-    fn cardinality_aggregate() {
-        let mut store = FilterStore::default();
-        store.string_fields.insert(
-            "documentId".to_string(),
-            vec![(0, "d1".into()), (1, "d2".into()), (2, "d1".into())],
-        );
-        let result = compute_cardinality(&store, "documentId");
-        let total = result.total_documents.unwrap();
-        assert_eq!(total.value, 2);
-    }
-
-    #[test]
     fn repeated_search_serves_warm_segment_from_memory_not_disk() {
         // Regression test for the "warm NVMe cache still re-parses every
         // segment on every query" bug: without an in-memory segment cache,
@@ -11115,6 +11139,85 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn segment_cache_isolates_tenants() {
+        // #342: tenant A opening a namespace larger than the whole cache
+        // must leave tenant B's warm segments resident (B is under its fair
+        // share), and a low-weight tenant over its share is trimmed to its
+        // floor, never below it.
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-segment-cache-tenants-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut writer = SegmentWriter::new(SegmentId("s".into()), dir.clone());
+        writer.add_document(DocumentId("d".into()), vec![Field::text("t", "alpha")]);
+        writer.finalize(Bm25Params::default()).unwrap();
+        let ledger = Arc::new(MemoryLedger::new(u64::MAX, Duration::from_secs(1)));
+        let segment = || {
+            Arc::new(TrackedSegment::new(
+                SegmentReader::open(dir.clone()).unwrap(),
+                100,
+                Arc::clone(&ledger),
+            ))
+        };
+        let key = |ns: &str, i: usize| (ns.to_string(), format!("seg-{i}"), false);
+        let floor = 2_000;
+
+        for (weights, warm_count, expect_b) in [
+            // Equal weights: B (4,000) is under its share (5,000).
+            (None, 40usize, 4_000u64),
+            // A weighs 9: B's share is 1,000, so B is trimmed to its floor.
+            (Some(9u32), 50, floor),
+        ] {
+            let cache = SegmentCache::new(10_000, 10_000);
+            let shares = TenantShares::new(floor).with_weights(weights.map(|w| {
+                Arc::new(move |t: &str| if t == "acme" { w } else { 1 })
+                    as kosha_core::tenancy::TenantWeightFn
+            }));
+            *cache.shares.write().unwrap() = shares;
+            for i in 0..warm_count {
+                cache.insert(key("beta/docs", i), segment(), 100);
+            }
+            for i in 0..200 {
+                cache.insert(key("acme/big", i), segment(), 100);
+                let beta = cache.tenants.lock().unwrap().bytes("beta");
+                assert!(beta >= floor, "B never drops below its floor: {beta}");
+            }
+            assert!(cache.total_bytes.load(Ordering::Relaxed) <= 10_000);
+            let stats = cache.tenant_stats();
+            let beta = stats.iter().find(|s| s.tenant == "beta").unwrap();
+            assert_eq!(beta.bytes, expect_b);
+            // B's repeat pass over the warm segments it still should hold.
+            let kept = (expect_b / 100) as usize;
+            let hits = (warm_count - kept..warm_count)
+                .filter(|i| cache.get(&key("beta/docs", *i)).is_some())
+                .count();
+            assert_eq!(hits, kept, "B's warm hit rate stays at 100%");
+            let acme = stats.iter().find(|s| s.tenant == "acme").unwrap();
+            assert!(acme.evictions > 0);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manifest_caches_make_room_from_the_busiest_tenant() {
+        // #342: a tenant cycling through many namespaces used to clear
+        // every tenant's corpus statistics once the cache filled.
+        let mut entries: HashMap<CorpusKey, ()> = HashMap::new();
+        entries.insert(("beta/docs".into(), 7, 0, false), ());
+        for i in 0..9 {
+            entries.insert((format!("acme/ns-{i}"), i, 0, false), ());
+        }
+        make_room_by_tenant(&mut entries, 10, &TenantShares::default());
+        assert_eq!(entries.len(), 9);
+        assert!(entries.contains_key(&("beta/docs".into(), 7, 0, false)));
+        assert!(
+            !entries.contains_key(&("acme/ns-0".into(), 0, 0, false)),
+            "the busiest tenant's oldest version goes first"
+        );
     }
 
     #[test]
