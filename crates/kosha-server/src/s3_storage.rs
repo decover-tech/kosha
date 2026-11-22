@@ -1823,6 +1823,11 @@ async fn get_object_streamed_with_retry(
     Err(last_err.expect("at least one attempt runs, so an exhausted loop always has an error"))
 }
 
+/// Write buffer for [`stream_body_to_file`]: large writes instead of one
+/// blocking-pool round trip per network chunk, while keeping per-fetch
+/// memory bounded at hydration fan-out (64 in flight is ~64 MiB).
+const STREAM_WRITE_BUFFER: usize = 1 << 20;
+
 /// Write a GET response body to `tmp_path` chunk by chunk, returning what it
 /// cost.
 ///
@@ -1833,7 +1838,15 @@ async fn get_object_streamed_with_retry(
 /// `KOSHA_MAX_CONCURRENT_HYDRATIONS` = 4 batches) a namespace of ~28 MB
 /// `inverted.idx` files put gigabytes of transient buffers behind a single
 /// cold search — the OOM this function exists to remove. Peak is now one
-/// chunk per in-flight fetch, whatever the object's size.
+/// chunk plus one [`STREAM_WRITE_BUFFER`] per in-flight fetch, whatever the
+/// object's size.
+///
+/// Writes go through a [`STREAM_WRITE_BUFFER`]-sized buffer. Unbuffered,
+/// every network chunk (tens of KB) was its own `tokio::fs` write, a
+/// blocking-pool round trip awaited before the next chunk was read: the
+/// bench VM wrote 1 GB vector-namespace files at 30-45 MB/s while the GET
+/// itself took ~1 s (`hydrate_files timing:` write_ms 23-35 s), which made
+/// a 249 GB warmup take ~2 h.
 async fn stream_body_to_file(
     mut body: aws_sdk_s3::primitives::ByteStream,
     tmp_path: &Path,
@@ -1841,9 +1854,10 @@ async fn stream_body_to_file(
     use tokio::io::AsyncWriteExt;
 
     let t_create = std::time::Instant::now();
-    let mut file = tokio::fs::File::create(tmp_path)
+    let file = tokio::fs::File::create(tmp_path)
         .await
         .map_err(KoshaError::Io)?;
+    let mut file = tokio::io::BufWriter::with_capacity(STREAM_WRITE_BUFFER, file);
     let mut write_ms = t_create.elapsed().as_secs_f64() * 1e3;
     let mut bytes = 0u64;
 
@@ -1862,8 +1876,9 @@ async fn stream_body_to_file(
         }
     }
 
-    // `tokio::fs::File` buffers, so the flush is what makes the bytes real
-    // before the caller renames the temp file into place.
+    // Both the BufWriter and `tokio::fs::File` buffer, so the flush is what
+    // makes the bytes real before the caller renames the temp file into
+    // place.
     let t_flush = std::time::Instant::now();
     file.flush().await.map_err(KoshaError::Io)?;
     write_ms += t_flush.elapsed().as_secs_f64() * 1e3;

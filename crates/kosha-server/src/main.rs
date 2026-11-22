@@ -678,6 +678,40 @@ struct HydrationOutcome {
     vectors: posting_spans::PostingFetchStats,
 }
 
+impl HydrationOutcome {
+    /// Sequential S3 round trips: pre-scoring (scaffolding + postings),
+    /// kNN postings and the page's documents.
+    fn s3_rounds(&self) -> u64 {
+        self.rounds + self.vectors.rounds + self.page.rounds
+    }
+
+    /// Bytes pulled from S3: whole scaffolding/postings files, kNN posting
+    /// ranges and page documents (ranged or whole).
+    fn s3_bytes(&self) -> u64 {
+        self.bytes_fetched
+            + self.vectors.ranged_bytes
+            + self.vectors.whole_bytes
+            + self.page.ranged_bytes
+            + self.page.whole_bytes
+    }
+
+    /// Nothing this search read came from S3, and nothing it needed was
+    /// missing or shed: the namespace is warm for this query.
+    fn fully_cached(&self) -> bool {
+        self.missing.is_empty()
+            && !self.shed
+            && self.files_fetched == 0
+            && self.s3_rounds() == 0
+            && self.s3_bytes() == 0
+            && self.postings.ranged_gets == 0
+            && self.postings.whole_files == 0
+            && self.vectors.ranged_gets == 0
+            && self.vectors.whole_files == 0
+            && self.page.ranged_gets == 0
+            && self.page.whole_files == 0
+    }
+}
+
 /// Cached verdict for `completed_hydrations`: NOT a single "namespace is
 /// fully hydrated" bool, but which *file classes* have actually been
 /// confirmed local for every segment in this `(namespace, manifest_version)`
@@ -7770,6 +7804,7 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
                 let timings = dashboard::SearchTimings {
                     total_ms: t_request.elapsed().as_secs_f64() * 1e3,
                     cached: true,
+                    fully_cached: true,
                     ..Default::default()
                 };
                 let body = response_body_json(&resp);
@@ -7977,6 +8012,9 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
                 score_ms: phases.score_wall_ms,
                 materialize_ms: phases.materialize_wall_ms,
                 cached: false,
+                s3_rounds: hydration.s3_rounds(),
+                s3_bytes: hydration.s3_bytes(),
+                fully_cached: hydration.fully_cached(),
             };
             state.dashboard.record(
                 &ns.0,
@@ -10486,12 +10524,8 @@ fn log_search_timing(
         hydration.page.ranged_bytes as f64 / 1024.0,
         hydration.page.whole_files,
         hydration.page.whole_bytes as f64 / (1024.0 * 1024.0),
-        hydration.rounds + hydration.vectors.rounds + hydration.page.rounds,
-        hydration.bytes_fetched
-            + hydration.vectors.ranged_bytes
-            + hydration.vectors.whole_bytes
-            + hydration.page.ranged_bytes
-            + hydration.page.whole_bytes,
+        hydration.s3_rounds(),
+        hydration.s3_bytes(),
         hydration.postings.ranged_gets,
         hydration.postings.ranged_bytes as f64 / 1024.0,
         hydration.postings.whole_files,
