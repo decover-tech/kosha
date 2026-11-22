@@ -305,6 +305,50 @@ server lists them in a `WARN` at boot. `kosha-server migrate-namespace --from <b
 `KOSHA_WAL_MODE` like the server does. See "Migrating pre-#262 namespaces" in
 `k8s/README.md` for what it does and the staging/prod procedure.
 
+## Usage metering
+
+Off by default (#348). With `KOSHA_USAGE_METERING=on` a pod records usage events per tenant and
+namespace and delivers them to the usage store: `kosha.usage_events` in Postgres (migration 005)
+when `DATABASE_URL` is set in a binary built with **postgres**, otherwise an in-memory store that
+is per pod and lost on restart (local development only).
+
+What is recorded:
+
+- A search that answers 200: `queries` (1), `bytes_returned` (the response body) and
+  `bytes_fetched` (bytes it pulled from object storage, whole files and ranged reads alike; 0 for
+  a warm or result-cached search). `bytes_fetched` measures cache misses and is for cost
+  attribution, not billing.
+- An accepted document write (`/documents`, legacy `/index` and `/replace`): `bytes_written`
+  (each document's id plus every field's name and value, as submitted) and `documents_written`.
+  Recorded on the pod that executes the write. Deletes are not metered.
+- Once an hour, on a pod that accepts writes: `stored_bytes`, the object bytes of every segment
+  the namespace's manifest references. Shards are added up under their root namespace; a segment
+  a branch inherits is counted on the namespace that owns it. The WAL and superseded segments not
+  yet garbage-collected are not included.
+
+`GET /v1/usage` (the caller's tenant) and `GET /v1/admin/usage[?tenant=]` (admin key) summarize the
+raw events over `?from=&to=` (Unix seconds, `to` exclusive; default the last 30 days). The summary
+adds `bytes_queried`, the billing meter for query volume: each search priced at its namespace's
+`stored_bytes` snapshot current at that hour. It does not depend on what the search read, so it is
+the same for whole-file, ranged and fully cached searches. `stored_byte_hours` is the sum of the
+hourly snapshots in the window; an hour with no writer running has no snapshot and contributes
+nothing (`stored_snapshots` counts the hours that did).
+
+Delivery: a request appends its event to a spool file and returns; a background thread sends
+sealed spool files to the store and deletes each one after the store accepted it. The store ignores
+an event it already has, so a resend after a crash counts once. Events survive a store outage (up
+to the spool cap; beyond it they are dropped and counted in `pipeline.dropped_events` of the admin
+route) and a process restart on the same disk. A host crash or a pod replaced with an empty disk
+loses the events appended since the last flush.
+
+| Variable | Purpose | Default | Units |
+| --- | --- | --- | --- |
+| `KOSHA_USAGE_METERING` | `on`, `true` or `1` turns usage metering on for this pod | off | flag |
+| `KOSHA_USAGE_SPOOL_DIR` | Directory of the local event spool. Put it on a persistent volume to keep undelivered events across pod replacement | `<KOSHA_DATA_DIR>/_usage` | path |
+| `KOSHA_USAGE_SPOOL_MAX_BYTES` | Cap on undelivered events on disk; further events are dropped and counted | `268435456` | bytes |
+| `KOSHA_USAGE_FLUSH_MS` | How often the spool is delivered to the store. Minimum 100 | `5000` | milliseconds |
+| `KOSHA_USAGE_SNAPSHOT_TICK_MS` | How often a writer checks for namespaces without a `stored_bytes` snapshot this hour (one object listing per namespace per hour). Minimum 1000 | `300000` | milliseconds |
+
 ## HTTP server and auth
 
 | Variable | Purpose | Default | Units |

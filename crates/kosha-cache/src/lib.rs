@@ -462,13 +462,13 @@ impl Cache {
                 let Ok(meta) = entry.metadata() else {
                     continue;
                 };
-                // The WAL and a local WAL kept after moving it to S3
-                // (`_wal.migrated-*`) are not cache content.
+                // The WAL, a local WAL kept after moving it to S3
+                // (`_wal.migrated-*`) and the usage-metering spool (#348,
+                // `_usage`) are not cache content.
                 if dir == root
-                    && entry
-                        .file_name()
-                        .to_str()
-                        .is_some_and(|name| name == "_wal" || name.starts_with("_wal.migrated-"))
+                    && entry.file_name().to_str().is_some_and(|name| {
+                        name == "_wal" || name == "_usage" || name.starts_with("_wal.migrated-")
+                    })
                 {
                     continue;
                 }
@@ -1461,8 +1461,12 @@ mod tests {
         fs::write(dir.join("_wal/record.wal"), [1u8; 100]).unwrap();
         fs::create_dir_all(dir.join("_wal.migrated-1")).unwrap();
         fs::write(dir.join("_wal.migrated-1/record.wal"), [2u8; 100]).unwrap();
+        // The usage-metering spool (#348) is not cache content either.
+        fs::create_dir_all(dir.join("_usage")).unwrap();
+        fs::write(dir.join("_usage/sealed-1.jsonl"), [3u8; 100]).unwrap();
         let cache = Cache::with_max_bytes(dir.clone(), Some(1));
         cache.put_bytes("ns/seg/large.bin", &[0u8; 10]).unwrap();
+        assert!(dir.join("_usage/sealed-1.jsonl").exists());
         assert!(dir.join("_wal.migrated-1/record.wal").exists());
         assert_eq!(fs::read(dir.join("_wal/sequence")).unwrap(), b"100");
         assert_eq!(

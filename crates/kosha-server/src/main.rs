@@ -72,6 +72,9 @@ mod segment_commit;
 mod segment_gc;
 mod tenant_limits;
 mod unindexed;
+mod usage;
+#[cfg(test)]
+mod usage_tests;
 mod warm;
 mod warm_run;
 mod writer_lease;
@@ -243,6 +246,9 @@ struct AppState {
     /// Per-tenant quotas and rate limits (#341, `KOSHA_TENANT_LIMITS_FILE`).
     /// Inert when no limits file is configured.
     tenant_limits: tenant_limits::TenantLimiter,
+    /// Usage metering (#348, `usage.rs`); `None` unless
+    /// `KOSHA_USAGE_METERING=on`.
+    usage: Option<usage::UsageMeter>,
     /// Cross-replica hydration coordinator (DESIGN.md §9 gap: N query
     /// replicas cold-starting on the same namespace independently re-fetch
     /// the same segments from S3). `None` when Postgres isn't configured —
@@ -1125,6 +1131,8 @@ struct StateOptions {
     /// Writer leases on or off instead of `KOSHA_WRITER_LEASE` (still off
     /// on a role that accepts no writes).
     writer_lease: Option<bool>,
+    /// Usage meter instead of `KOSHA_USAGE_METERING` and its settings.
+    usage: Option<usage::UsageMeter>,
 }
 
 fn fatal(message: &str) -> ! {
@@ -1748,6 +1756,9 @@ impl AppState {
             posting_spans::config_from_env(),
         );
 
+        let usage = options
+            .usage
+            .or_else(|| usage::UsageMeter::from_env(&data_dir));
         let tenant_limits = tenant_limits::TenantLimiter::from_env()
             .unwrap_or_else(|e| fatal(&format!("tenant limits: {e}")));
         // Every process-wide cache splits its budget between tenants by
@@ -1877,6 +1888,7 @@ impl AppState {
                 )
             },
             tenant_limits,
+            usage,
             #[cfg(all(feature = "s3", feature = "postgres"))]
             hydration_leases,
             #[cfg(all(feature = "s3", feature = "postgres"))]
@@ -5651,6 +5663,8 @@ fn main() {
     state.spawn_writer_lease_renewer();
     state.spawn_manifest_refresher();
     state.spawn_local_gc();
+    state.spawn_usage_flusher();
+    state.spawn_usage_snapshotter();
     let listener = TcpListener::bind(&addr).expect("failed to bind HTTP listener");
     let config =
         http::Config::from_env(Duration::from_secs(io_timeout_secs), auth::max_body_bytes());
@@ -5679,6 +5693,7 @@ fn main() {
     // KOSHA_WRITER_LEASE_TTL_MS. Unflushed writes stay in the WAL, which the
     // next owner replays, exactly as after a crash.
     let released = state.writer_leases.release_all(&state.controller);
+    state.flush_usage_on_shutdown();
     println!("kosha-server stopped; released {released} writer lease(s)");
     std::process::exit(0);
 }
@@ -6166,10 +6181,18 @@ struct SearchObservation {
     /// The tenant owning the searched namespace: whose queue the search
     /// waits in for a scoring slot (#341).
     tenant: std::cell::RefCell<String>,
+    /// The searched namespace, for usage metering (#348).
+    searched: std::cell::RefCell<Option<NamespaceId>>,
+    /// Bytes the search pulled from object storage (`HydrationOutcome::
+    /// s3_bytes`); stays 0 for a result-cache hit.
+    s3_bytes: std::cell::Cell<u64>,
 }
 
 impl SearchObservation {
     fn namespace(&self, state: &AppState, ns: &NamespaceId) {
+        if state.usage.is_some() {
+            *self.searched.borrow_mut() = Some(ns.clone());
+        }
         *self.tenant.borrow_mut() = namespace_tenant(&ns.0).unwrap_or("").to_string();
         if state.metrics.config.namespace_labels {
             *self.namespace.borrow_mut() = Some(ns.0.clone());
@@ -6197,6 +6220,17 @@ fn observe_search(state: &AppState, run: impl FnOnce(&SearchObservation) -> Stri
     let observation = SearchObservation::default();
     let response = run(&observation);
     let outcome = metrics::SearchOutcome::classify(&response, observation.shed.get());
+    // Usage (#348): only a search that answered is metered.
+    if let (Some(meter), Some(ns), metrics::SearchOutcome::Ok) = (
+        state.usage.as_ref(),
+        observation.searched.borrow().as_ref(),
+        outcome,
+    ) {
+        let body_bytes = response
+            .split_once("\r\n\r\n")
+            .map_or(0, |(_, body)| body.len());
+        meter.record_query(ns, body_bytes as u64, observation.s3_bytes.get());
+    }
     state.metrics.record_search(
         outcome,
         started.elapsed().as_secs_f64(),
@@ -6544,7 +6578,7 @@ fn route(
             return route_inner(&scoped, headers, body, tenant, state);
         }
         if !path.starts_with("/v1/namespaces/")
-            && !["/healthz", "/v1/healthz", "/v1/namespaces"].contains(&bare_path)
+            && !["/healthz", "/v1/healthz", "/v1/namespaces", "/v1/usage"].contains(&bare_path)
         {
             return json_error(404, "not found");
         }
@@ -6628,6 +6662,17 @@ fn route_inner(
 
     if let Some(ns) = extract_namespace(request_line, "GET /v1/namespaces/", "/stats") {
         return handle_namespace_stats(&ns, tenant, state);
+    }
+
+    // ── Usage metering (#348) ──────────────────────────────────────────────
+    if request_line.starts_with("GET /v1/usage ") || request_line.starts_with("GET /v1/usage?") {
+        return usage::handle_usage(request_line, Some(tenant), false, state);
+    }
+
+    if request_line.starts_with("GET /v1/admin/usage ")
+        || request_line.starts_with("GET /v1/admin/usage?")
+    {
+        return usage::handle_admin_usage(request_line, state);
     }
 
     // ── Admin routes (Postgres-backed only) ────────────────────────────────
@@ -7264,6 +7309,8 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
     if let Err(response) = check_document_write(state, &ns, &documents) {
         return response;
     }
+    // Usage (#348) meters what the client sent, before embedding.
+    let logical_bytes = usage::documents_logical_bytes(&documents);
     if let Err(response) = embed_documents(state, &ns, &mut documents) {
         return response;
     }
@@ -7273,6 +7320,9 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
     match write_routed(state, &ns, documents, index_into) {
         Ok(count) => {
             state.metrics.record_indexed(count as u64);
+            if let Some(meter) = state.usage.as_ref() {
+                meter.record_write(&ns, logical_bytes, count as u64);
+            }
             json_ok(&IndexResponse {
                 indexed_count: count,
                 namespace: ns,
@@ -7635,6 +7685,7 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
     if let Err(response) = check_document_write(state, &namespace, &documents) {
         return response;
     }
+    let logical_bytes = usage::documents_logical_bytes(&documents);
     if let Err(response) = embed_documents(state, &namespace, &mut documents) {
         return response;
     }
@@ -7644,6 +7695,9 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
     match write_routed(state, &namespace, documents, replace_into) {
         Ok(count) => {
             state.metrics.record_indexed(count as u64);
+            if let Some(meter) = state.usage.as_ref() {
+                meter.record_write(&namespace, logical_bytes, count as u64);
+            }
             json_ok(&IndexResponse {
                 indexed_count: count,
                 namespace,
@@ -8405,6 +8459,7 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
                 vectors: *vector_fetch_stats.lock().unwrap(),
                 ..hydration
             };
+            obs.s3_bytes.set(hydration.s3_bytes());
             log_search_timing(
                 &ns,
                 &hydration,
@@ -8997,6 +9052,7 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
                 vectors: *vector_fetch_stats.lock().unwrap(),
                 ..hydration
             };
+            obs.s3_bytes.set(hydration.s3_bytes());
             log_search_timing(
                 &ns,
                 &hydration,
