@@ -916,6 +916,31 @@ impl SegmentCache {
         removed
     }
 
+    /// Drop every cached reader of the namespaces `matches` selects,
+    /// pinned or not. Returns how many went.
+    fn remove_namespaces(&self, matches: &dyn Fn(&str) -> bool) -> usize {
+        let mut entries = self.entries.lock().unwrap();
+        let mut tenants = self.tenants.lock().unwrap();
+        let doomed: Vec<_> = entries
+            .keys()
+            .filter(|key| matches(&key.0))
+            .cloned()
+            .collect();
+        let mut removed = Vec::with_capacity(doomed.len());
+        for key in doomed {
+            if let Some((reader, size)) = entries.remove(&key) {
+                self.total_bytes.fetch_sub(size, Ordering::Relaxed);
+                tenants.sub_bytes(tenant_of_namespace(&key.0), size);
+                removed.push(reader);
+            }
+        }
+        drop(tenants);
+        drop(entries);
+        // The readers drop here, outside the cache locks (dropping one
+        // takes the ledger lock).
+        removed.len()
+    }
+
     /// Per-tenant bytes, hits, misses and evictions.
     fn tenant_stats(&self) -> Vec<TenantCacheStats> {
         self.tenants.lock().unwrap().stats()
@@ -3457,6 +3482,33 @@ impl Searcher {
 
     pub fn set_global_wand_threshold(&self, enabled: bool) {
         self.global_wand.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Forget everything cached in memory for the namespaces `matches`
+    /// selects (#347, a deleted namespace or tenant): parsed segments,
+    /// corpus statistics and score ceilings. Returns how many parsed
+    /// segments were dropped.
+    ///
+    /// A search already running keeps the readers it holds until it ends;
+    /// nothing here waits for it. Forgetting a namespace that still exists
+    /// only costs its next search a reload.
+    pub fn forget_namespaces(&self, matches: impl Fn(&str) -> bool) -> usize {
+        let removed = self.segment_cache.remove_namespaces(&matches);
+        self.corpus_stats
+            .entries
+            .lock()
+            .unwrap()
+            .retain(|key, _| !matches(&key.0));
+        self.ceilings
+            .entries
+            .lock()
+            .unwrap()
+            .retain(|key, _| !matches(&key.0));
+        self.draining
+            .lock()
+            .unwrap()
+            .retain(|(namespace, _), _| !matches(namespace));
+        removed
     }
 
     /// Stop caching a retired segment and report whether any reader of it

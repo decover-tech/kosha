@@ -678,6 +678,17 @@ seconds or a unit (`90s`, `5m`, `1h`).
 | `KOSHA_LOCAL_GC_GRACE` | How long a retired segment's local files stay after the publish that dropped it (and after every search that could read them ends) | `5m` | duration |
 | `KOSHA_LOCAL_GC_INTERVAL_MS` | How often each pod reclaims retired local segments; `0` disables | `60000` | milliseconds |
 
+## Deleted namespaces (cache purge and retry)
+
+Read in `PurgeSettings::from_env` (`crates/kosha-server/src/deletion_purge.rs`). Both are off
+unless set. A value that is not a whole number of milliseconds stops the server at startup.
+See "Deleting a namespace" in the README for what a pass removes and when.
+
+| Variable | Purpose | Default | Units |
+| --- | --- | --- | --- |
+| `KOSHA_DELETION_PURGE_INTERVAL_MS` | How often this pod (any role) reads the deletion records it has not handled and removes the deleted namespaces' and tenants' cached copies from its memory and local disk. The first pass runs at boot and reads every record. Unset or `0`: off, and cached copies leave only by eviction | unset (off) | milliseconds |
+| `KOSHA_DELETION_RESUME_INTERVAL_MS` | How often a writer pod (`ingest` or `standalone`) retries the storage reclaim of pending namespace deletion records, starting at boot. A record that stays pending waits twice as long before each further try, up to one hour. Tenant records are not retried. Ignored on `query` and `indexer` pods. Unset or `0`: off | unset (off) | milliseconds |
+
 ## Segment format (rollout and rollback gates)
 
 Writers emit the newest format by default. Pin an older version during a rolling deploy, or

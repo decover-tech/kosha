@@ -40,6 +40,7 @@ mod branching;
 mod cache_reads;
 mod compaction_sched;
 mod dashboard;
+mod deletion_purge;
 mod doc_spans;
 #[cfg(all(test, feature = "s3"))]
 mod doc_store_fallback_tests;
@@ -312,6 +313,8 @@ struct AppState {
     /// and counters (#239).
     gc_settings: segment_gc::GcSettings,
     gc_stats: segment_gc::GcStats,
+    /// Purge of deleted namespaces' cached copies on this pod (#347).
+    deletion_purge: deletion_purge::PurgeState,
     /// Serializes `POST /v1/admin/gc` runs.
     gc_lock: Mutex<()>,
     /// Namespace-level cached hydration verdict (Tier 1 O2). Keyed by
@@ -1951,6 +1954,7 @@ impl AppState {
             ),
             gc_settings: segment_gc::GcSettings::from_env(),
             gc_stats: segment_gc::GcStats::default(),
+            deletion_purge: deletion_purge::PurgeState::default(),
             gc_lock: Mutex::new(()),
             completed_hydrations: Mutex::new(HashMap::new()),
             result_cache: Mutex::new(result_cache),
@@ -5711,6 +5715,10 @@ fn main() {
         println!("kosha-server {summary}");
     }
 
+    // Refuse to start on a mistyped interval rather than run with the
+    // purge silently off (#347).
+    let deletion_purge_settings =
+        deletion_purge::PurgeSettings::from_env().unwrap_or_else(|e| fatal(&e));
     let state = AppState::new_shared_as(PathBuf::from(data_dir.clone()), role);
     // Pre-#262 bare namespaces no tenant can reach (#344).
     namespace_migrate::warn_unreachable_bare_namespaces(
@@ -5729,6 +5737,7 @@ fn main() {
     state.spawn_writer_lease_renewer();
     state.spawn_manifest_refresher();
     state.spawn_local_gc();
+    state.spawn_deletion_purge(deletion_purge_settings);
     state.spawn_usage_flusher();
     state.spawn_usage_snapshotter();
     state.spawn_billing_refresher();
@@ -8169,6 +8178,7 @@ fn handle_stats(state: &AppState) -> String {
             state.indexer.retired_segment_count(),
             state.indexer.local_retired_count(),
         ),
+        "deletion_purge": state.deletion_purge.to_json(),
         "rerank": state.rerankers.stats_json(),
         "embedding_providers": state.embedders.providers(),
     }))
@@ -11424,6 +11434,13 @@ mod tests {
             filter: &kosha_core::deletion::DeletionFilter,
         ) -> Result<Vec<kosha_core::deletion::DeletionRecord>, KoshaError> {
             Ok(self.inner.lock().unwrap().deletions(filter))
+        }
+        fn deletions_after(
+            &self,
+            after: Option<&kosha_core::deletion::DeletionPosition>,
+            limit: u32,
+        ) -> Result<Vec<kosha_core::deletion::DeletionRecord>, KoshaError> {
+            Ok(self.inner.lock().unwrap().deletions_after(after, limit))
         }
     }
 

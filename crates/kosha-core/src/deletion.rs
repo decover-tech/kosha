@@ -132,6 +132,42 @@ impl DeletionRecord {
     }
 }
 
+impl DeletionRecord {
+    /// Where this record sits in the order
+    /// [`crate::ControlStore::deletions_after`] lists records in.
+    pub fn position(&self) -> DeletionPosition {
+        DeletionPosition {
+            requested_at_ms: self.requested_at_ms,
+            id: self.id.clone(),
+        }
+    }
+}
+
+/// A place in the `(requested_at_ms, id)` order of deletion records, for
+/// reading them a page at a time
+/// ([`crate::ControlStore::deletions_after`]).
+///
+/// The order is not the order records became visible in: a record is
+/// stamped when its transaction starts, so one committed later can sort
+/// before one a reader already saw. A reader that follows new records
+/// re-reads a window behind the newest position it has seen and skips the
+/// ids it already handled.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DeletionPosition {
+    pub requested_at_ms: u64,
+    pub id: String,
+}
+
+impl DeletionPosition {
+    /// Just before every record requested at or after `requested_at_ms`.
+    pub fn at_ms(requested_at_ms: u64) -> Self {
+        Self {
+            requested_at_ms,
+            id: String::new(),
+        }
+    }
+}
+
 /// Which records [`crate::ControlStore::deletions`] returns.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DeletionFilter {

@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use kosha_core::deletion::{DeletionFilter, DeletionRecord, NewDeletion};
+use kosha_core::deletion::{DeletionFilter, DeletionPosition, DeletionRecord, NewDeletion};
 use kosha_core::{ControlStore, KoshaError, Manifest, NamespaceId};
 
 mod deletion;
@@ -180,6 +180,15 @@ impl Controller {
     /// See [`ControlStore::deletions`].
     pub fn deletions(&self, filter: &DeletionFilter) -> Vec<DeletionRecord> {
         self.deletions.list(filter)
+    }
+
+    /// See [`ControlStore::deletions_after`].
+    pub fn deletions_after(
+        &self,
+        after: Option<&DeletionPosition>,
+        limit: u32,
+    ) -> Vec<DeletionRecord> {
+        self.deletions.list_after(after, limit)
     }
 
     /// Check if a namespace exists.
@@ -458,6 +467,13 @@ impl ControlStore for Controller {
     fn deletions(&self, filter: &DeletionFilter) -> Result<Vec<DeletionRecord>, KoshaError> {
         Ok(self.deletions(filter))
     }
+    fn deletions_after(
+        &self,
+        after: Option<&DeletionPosition>,
+        limit: u32,
+    ) -> Result<Vec<DeletionRecord>, KoshaError> {
+        Ok(self.deletions_after(after, limit))
+    }
     fn acquire_writer_lease(
         &mut self,
         id: &NamespaceId,
@@ -658,6 +674,49 @@ mod tests {
             ..DeletionFilter::default()
         };
         assert_eq!(ids(ctrl.deletions(&first)), vec![tenant.id]);
+    }
+
+    /// #347: the purge on each pod pages through every record in
+    /// `(requested_at_ms, id)` order.
+    #[test]
+    fn deletions_after_pages_through_every_record_in_position_order() {
+        let mut ctrl = Controller::new();
+        let mut issued = Vec::new();
+        for i in 0..5 {
+            let subject = format!("acme/ns{i}");
+            let request = NewDeletion::namespace(&subject, Some("acme"), None);
+            issued.push(ctrl.begin_deletion(&request, i));
+        }
+        // Completed records are listed too.
+        ctrl.record_deletion_attempt(&issued[1].id, 0, None)
+            .unwrap();
+
+        let mut seen = Vec::new();
+        let mut after: Option<DeletionPosition> = None;
+        loop {
+            let page = ctrl.deletions_after(after.as_ref(), 2);
+            let Some(last) = page.last() else { break };
+            after = Some(last.position());
+            seen.extend(page);
+        }
+        assert_eq!(seen.len(), 5);
+        let positions: Vec<DeletionPosition> = seen.iter().map(DeletionRecord::position).collect();
+        let mut sorted = positions.clone();
+        sorted.sort();
+        assert_eq!(positions, sorted);
+        let mut ids: Vec<&str> = seen.iter().map(|r| r.id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 5, "every record exactly once");
+
+        // A window behind the newest position re-reads what is in it.
+        let newest = seen.iter().map(|r| r.requested_at_ms).max().unwrap();
+        let window = ctrl.deletions_after(Some(&DeletionPosition::at_ms(newest)), 100);
+        assert!(!window.is_empty());
+        assert!(window.iter().all(|r| r.requested_at_ms >= newest));
+        assert!(ctrl
+            .deletions_after(Some(&DeletionPosition::at_ms(newest + 1)), 100)
+            .is_empty());
     }
 
     #[test]

@@ -17,10 +17,12 @@
 //! short of that (an S3 error, a leftover object, a crash) leaves the record
 //! pending with the reason, and a resume finishes it later.
 //!
-//! What a completed record does not cover: the disk caches of *other* pods.
+//! What a completed record does not cover: the caches of *other* pods.
 //! Query replicas stop serving a deleted namespace within one manifest
-//! refresh and drop their in-memory state for it, but their local copies of
-//! its segment files go only when the LRU evicts them.
+//! refresh. Their memory and local copies of its segment files are purged
+//! by each pod for itself, from the records, when
+//! `KOSHA_DELETION_PURGE_INTERVAL_MS` is set (see `deletion_purge.rs` for
+//! the window); otherwise they go only when the LRU evicts them.
 
 use super::*;
 use kosha_core::deletion::{

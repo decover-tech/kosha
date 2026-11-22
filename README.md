@@ -486,6 +486,45 @@ default 500 ms), or at once for a search with `max_staleness_seconds: 0`. Their 
 eagerly; the LRU cache (`KOSHA_CACHE_MAX_BYTES`) evicts them. Re-creating the
 namespace, explicitly or by writing to it, starts it empty.
 
+**Cached copies on every pod.** With `KOSHA_DELETION_PURGE_INTERVAL_MS` set
+(off by default), each pod of any role reads the deletion records it has not
+handled yet, at boot and then on that interval, and for every deleted
+namespace or tenant:
+
+- drops what it holds in memory for it: parsed segments, corpus statistics and
+  score ceilings, cached result pages, hydration verdicts, the unindexed tail;
+- removes its segment directories (byte-range spans included) from the local
+  disk.
+
+A namespace re-created under the same name shares the directory. Segment ids
+are never reused, so the pod keeps exactly the segments a current manifest
+lists (the control store's, a branch's, or its own unpublished ones, read
+under the writer's locks) and removes the rest. The retired version on the
+record tells a manifest of the deleted incarnation from one of the new. A
+directory written to in the last 5 seconds, pinned, or being fetched is left
+for the next sweep.
+
+A deletion record carries no per-pod acknowledgement: the control store has
+no list of pods to wait for. What holds for a pod that has the purge on and
+can read the control store:
+
+- it handles a record in the first pass that starts after the delete commits,
+  so within one interval plus the length of a pass. (Records are read in
+  request-time order with a 10-minute look-back; a delete whose transaction
+  stayed open longer than that is only seen after the pod restarts.)
+- for a deletion less than an hour old it sweeps the same namespace again 60
+  seconds later, and it repeats any sweep every 60 seconds while one left
+  something or failed. That removes what a search or fetch already running
+  wrote after the first sweep;
+- a pod that was down handles every record in its first pass after boot.
+
+Not covered: a pod with the purge off; parsed segments a search already
+running still holds, until it ends; a pod that cannot read the control store,
+until it can; a writer pod holding unpublished writes for a namespace another
+pod deleted, until they are published or dropped; freed disk blocks and the
+operating system's page cache. `GET /v1/stats` reports each pod's progress
+under `deletion_purge` (`caught_up`, `pending_sweeps`, `last_error`, counters).
+
 **Deletion records.** Step 1 also writes a deletion record
 (`kosha.deletion_records` in Postgres, migration 004) in the same transaction
 that drops the namespace, and the response returns it as `deletion`:
@@ -502,8 +541,8 @@ A record is `pending` until step 4 has deleted the prefix **and** listed it
 empty; only then is it `completed`. A record holds identifiers and counters,
 never document content, and is kept as the evidence that the erasure finished.
 What `completed` covers is the control store, the ingest pod's memory, WAL and
-disk, and object storage. It does not cover the disk caches of other pods (see
-above).
+disk, and object storage. It does not cover the caches of other pods, which
+each pod purges for itself within the window described above.
 
 | Method and path | Notes |
 |---|---|
@@ -516,6 +555,13 @@ A pending namespace record whose namespace was re-created in the meantime is
 not retried: the new incarnation writes into the same prefix. It completes
 after that namespace is deleted again. With the in-memory control store (no
 `DATABASE_URL`) records last only as long as the process.
+
+With `KOSHA_DELETION_RESUME_INTERVAL_MS` set (off by default), a writer pod
+(`ingest` or `standalone`) retries pending **namespace** records itself, at
+boot and then on that interval, under the same rule. A record that stays
+pending waits twice as long before each further try, up to one hour. Pending
+tenant records are left to `POST /v1/admin/deletions/resume`: a tenant pass
+deletes whatever keys and namespaces the tenant id has when it runs.
 
 **Deleting a tenant** (`DELETE /v1/admin/tenants/{tenant}`, admin key) needs
 the body `{"confirm": "<tenant>"}` and is permanent. In order: the tenant's
