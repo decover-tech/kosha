@@ -743,9 +743,12 @@ class Suite:
     def after_restart(self, name: str, w: Workload) -> None:
         # Writes still unacknowledged before the restart (a pod that stopped
         # accepting them) get another chance on the fresh process.
-        _, left = w.redrive(time.time() + self.args.max_recovery)
-        status, _ = self.flush(w)
-        self.record("%s:redrive-after-restart" % name, left == 0 and status == 200, "%d batches still unacknowledged, flush HTTP %s" % (left, status))
+        # The flush retries: a fresh pod refuses writes (503) until it holds
+        # the namespace's writer lease.
+        t = time.time()
+        _, left = w.redrive(t + self.args.max_recovery)
+        took = self.flush_until_ok(w, t, self.args.max_recovery)
+        self.record("%s:redrive-after-restart" % name, left == 0 and took is not None, "%d batches still unacknowledged, flushed after %s s" % (left, None if took is None else round(took, 2)))
         missing, errors = missing_ids(self.exists(w), w.acked)
         self.record("%s:acked-present-after-restart" % name, not missing and not errors, "%d missing %s" % (len(missing), missing[:10]))
         want = len(w.all_ids())
