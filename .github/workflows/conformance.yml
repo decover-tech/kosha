@@ -5,6 +5,10 @@ name: conformance
 # it — BM25 and filters checked exactly against a reference model across
 # flush, upsert, delete, compaction and a cold restart. Known bugs are listed
 # in scripts/conformance/expected_failures.json; anything else fails the job.
+#
+# The same stack then checks every OpenSearch / Elasticsearch DSL case in
+# scripts/conformance/dsl/cases.yaml through kosha-client (Python) and
+# regenerates docs/compat/opensearch.{md,json}; a stale matrix fails the job.
 
 on:
   push:
@@ -32,6 +36,29 @@ jobs:
             --restart-cmd scripts/conformance/compose_restart_cold.sh \
             --out conformance-report.json
 
+      # After the suite above, so its python3 (system, stdlib only) is
+      # unchanged. The DSL runner needs PyYAML.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: OpenSearch DSL compatibility matrix
+        run: |
+          python -m pip install pyyaml
+          python scripts/conformance/dsl/run.py \
+            --host http://localhost:8080 --api-key sk-kosha-dev \
+            --admin-key sk-kosha-admin-dev \
+            --out dsl-report.json
+
+      - name: Compatibility matrix is up to date
+        run: |
+          git diff --stat -- docs/compat/
+          if [ -n "$(git status --porcelain -- docs/compat/)" ]; then
+            git diff -- docs/compat/ | head -100
+            echo "::error::docs/compat/ is stale. Run 'make compat-matrix' and commit the result."
+            exit 1
+          fi
+
       - name: Server logs
         if: failure()
         run: docker compose logs --no-color --tail 300 kosha-server
@@ -40,5 +67,7 @@ jobs:
         if: always()
         with:
           name: conformance-report
-          path: conformance-report.json
+          path: |
+            conformance-report.json
+            dsl-report.json
           if-no-files-found: ignore

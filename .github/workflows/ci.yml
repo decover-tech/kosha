@@ -87,7 +87,8 @@ jobs:
       - name: Install client + pytest
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e . pytest
+          # pyyaml: tests/test_dsl_registry.py reads scripts/conformance/dsl/cases.yaml
+          python -m pip install -e . pytest pyyaml
       - name: Run unit tests
         run: python -m pytest tests/ -q
 
