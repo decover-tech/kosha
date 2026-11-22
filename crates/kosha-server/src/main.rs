@@ -3586,24 +3586,6 @@ impl AppState {
         (files, bytes)
     }
 
-    /// Fetch a batch of `(logical_path, projected_size_bytes)` pairs into
-    /// the local cache, using cross-replica lease coordination when it's
-    /// configured (`hydration_leases`) so a segment cold across the whole
-    /// fleet costs one S3 GET total instead of one per replica — see the
-    /// `kosha_control::hydration_lease` module doc for the protocol.
-    ///
-    /// Falls back to fetching every path from S3 directly whenever
-    /// coordination isn't configured (no Postgres / no `POD_IP`), a claim
-    /// attempt errors, or a peer fetch doesn't pan out — this never blocks a
-    /// caller on the coordination layer itself being unavailable.
-    ///
-    /// Every path in the batch is pinned in the disk cache for the whole
-    /// call — otherwise a later file's write in the *same* batch can evict
-    /// an earlier file's write once the working set gets close to
-    /// `KOSHA_CACHE_MAX_BYTES`, which makes hydration spin without ever
-    /// converging (observed in production as an incomplete-segment count
-    /// climbing 37→128→193 instead of shrinking). Unpinned unconditionally
-    /// afterward regardless of outcome.
     /// Pin every segment directory of `manifest` in the disk cache until
     /// the returned guard drops.
     fn pin_segments(&self, ns: &NamespaceId, manifest: &kosha_core::Manifest) -> SegmentPins<'_> {
@@ -3626,6 +3608,24 @@ impl AppState {
         }
     }
 
+    /// Fetch a batch of `(logical_path, projected_size_bytes)` pairs into
+    /// the local cache, using cross-replica lease coordination when it's
+    /// configured (`hydration_leases`) so a segment cold across the whole
+    /// fleet costs one S3 GET total instead of one per replica — see the
+    /// `kosha_control::hydration_lease` module doc for the protocol.
+    ///
+    /// Falls back to fetching every path from S3 directly whenever
+    /// coordination isn't configured (no Postgres / no `POD_IP`), a claim
+    /// attempt errors, or a peer fetch doesn't pan out — this never blocks a
+    /// caller on the coordination layer itself being unavailable.
+    ///
+    /// Every path in the batch is pinned in the disk cache for the whole
+    /// call — otherwise a later file's write in the *same* batch can evict
+    /// an earlier file's write once the working set gets close to
+    /// `KOSHA_CACHE_MAX_BYTES`, which makes hydration spin without ever
+    /// converging (observed in production as an incomplete-segment count
+    /// climbing 37→128→193 instead of shrinking). Unpinned unconditionally
+    /// afterward regardless of outcome.
     #[cfg(feature = "s3")]
     fn hydrate_files(
         &self,
