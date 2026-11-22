@@ -100,6 +100,165 @@ python3 query_bench.py --host http://localhost:8080 \
   corpus), and whether tpuf-benchmark's "8 QPS" is per-namespace or
   aggregate across concurrent namespaces.
 
+## CI benchmark: warm gate, cache reuse, sidecar snapshot, quick runs
+
+The `benchmark` workflow (`.github/workflows/benchmark.yml`) runs these
+scripts on the bench VM. Its inputs choose how the namespace gets warm,
+which vector snapshot to restore, and whether to keep the VM.
+
+### Warm gate (`warm_gate`: `queries` (default) or `preload`)
+
+`queries` follows turbopuffer's tpuf-benchmark (`pkg/bench/bench.go`).
+For hot runs, tpuf warms the namespace, then polls with the workload's own
+queries until `performance.cache_hit_ratio >= 1.0` on 3 consecutive
+queries, backing off on a miss. Only after that does the measured phase
+start, and warmup time is never measured. In this mode:
+
+- The kosha container starts **without** `KOSHA_WARMUP_NAMESPACES`, so no
+  boot preload runs and `/readyz` is green right away.
+- Span promotion is **off** on the container
+  (`KOSHA_DOC_SPAN_PROMOTE_GETS/BYTES=0`,
+  `KOSHA_POSTING_SPAN_PROMOTE_GETS/BYTES=0`). By default, after 64 ranged
+  GETs or 16 MiB on one segment's doc store (32 or 8 MiB on a postings
+  shard), the server downloads the whole file in the background. On the
+  original vector snapshot that is ~1 GB of JSON-vector `doc_store.bin`
+  per segment, and a large enough hydrate pass would queue it for most
+  segments. `fully_cached` reports only what the search itself fetched,
+  not promotions still running, so the gate could pass while hundreds of
+  GB were still being written during the measured phases. With promotion
+  off, warm queries read the spans the gate made local and nothing else
+  downloads. This differs from the server defaults: promotion would turn
+  many small span files into one whole file, which this mode does not
+  measure.
+- `run_phases.sh` does not wipe or restart. It runs `warm_gate.py` with the
+  phase's workload (BM25 `--operator or`, or kNN `--knn-embeddings`) and
+  builds each payload with `query_bench.py`'s own `payload_for`, always
+  with `no_cache: true` and `timings: true`. The gate works in four steps:
+  1. A probe query. If the response has no `timings.fully_cached`, the gate
+     exits 2 with `WARM-GATE-UNSUPPORTED` (the server is older than the
+     cache-hit gate, or `KOSHA_DASHBOARD` is off).
+  2. A hydrate pass that sends every query in `queries.txt` once, 16 at a
+     time. Each query fetches what it reads: scoring files, `vector.idx`,
+     and the ranged doc-store spans of its result pages, which the span
+     cache keeps.
+  3. A verify pass. Every query whose last response was not fully cached
+     (an error, a timeout, a shed or degraded search, or just the query
+     that did the fetching) is sent again, 16 at a time, round after
+     round with backoff (1 s doubling to at most 30 s), until **every**
+     query in `queries.txt` has come back fully cached at least once. The
+     measured phases cycle through all of them, so one left cold would
+     read S3 during a warm phase.
+  4. tpuf's check: queries drawn at random from the whole set until 3
+     consecutive responses have `timings.fully_cached == true`. A miss
+     resets the streak, backs off, and sends that query back through the
+     verify step.
+  It prints `WARM-GATE-READY in <s>s (queries sent, s3 bytes observed)`,
+  or `WARM-GATE-TIMEOUT` and exits 1 (budget: `WARM_GATE_TIMEOUT_S`,
+  default 3h). The output goes to `<suite>/warm_gate.log` and the server
+  log to `<suite>/server/warm_gate.log.gz`. Both are archived, and the
+  job summary prints the final marker line.
+- Only warm phases are measured: BM25 runs `warm_or_nocache` and
+  `warm_or_cache`, and vector runs `knn_warm_nocache` and
+  `knn_warm_cache`. The old warmup-gated "cold" phase is **dropped** in
+  this mode because it is not turbopuffer's cold. tpuf cold sends
+  `disable_cache: true` on every query, so every query reads object
+  storage. Kosha has no equivalent switch, and a phase that runs after a
+  full preload measures a warm engine.
+
+`fully_cached` is true when a search made no S3 request of any kind and
+nothing it needed was missing or shed. A result-cache hit also counts, and
+that is why the gate always sends `no_cache`. The flag is new in the
+cache-hit-gate server PR (`feat/bench-cache-hit-gate`). Until that server
+is what the workflow builds, `queries` fails fast with
+`WARM-GATE-UNSUPPORTED`; use `preload`.
+
+`preload` keeps the earlier protocol unchanged: wipe the local store,
+restart with the boot preload, wait for `/readyz`, then run the cold and
+warm phases. On the original vector snapshot the boot preload takes about
+115 minutes, because the server preloads the whole ~249 GB namespace.
+
+### Reusing the local cache on a reused VM
+
+A VM survives a run when the run fails (standing rule) or when `keep_vm`
+is on. Before this change, every restore wiped `/data/kosha/data` and
+downloaded everything again. Now `restore_namespace.sh` records which
+snapshot populated the local cache and the bench bucket. It uses
+`vm/snapshot_cache.sh` and keeps markers under
+`/data/bench-snapshot-markers/`. A snapshot's identity is its name plus
+the S3 ETag and LastModified of its `pg-kosha.sql.gz`, which is
+re-uploaded on every (re-)snapshot.
+
+- Restoring the **same** identity keeps the local cache and skips
+  re-copying bucket objects. Pass `KEEP_LOCAL_CACHE=0` to force a wipe.
+- Wipes in `restore_namespace.sh` and `build_and_import.sh` are **per
+  namespace**: they remove `/data/kosha/data/<tenant>/<ns>` (and a
+  pre-#262 bare `<ns>` dir), the local WAL, and only the `local.<ns>`
+  marker. So a `suite=both` run keeps both caches on a kept VM: the vector
+  restore no longer wipes the BM25 cache or its marker, and the other way
+  round. Both caches then sit on the 1,000 GB root volume together (the
+  vector one is ~249 GB on the original snapshot), under the server
+  `KOSHA_CACHE_MAX_BYTES` of 600 GiB.
+- **Any mismatch** wipes. That covers a different snapshot, the same name
+  re-created, and a missing marker. Segment ids repeat across rebuilds of
+  a namespace name (`<ns>-offline-NNNNNN`), so stale local files or bucket
+  objects would be served silently wrong. On a mismatch, the bucket prefix
+  is also emptied before `aws s3 sync`, because sync neither deletes
+  extra objects nor reliably replaces same-size ones.
+- Markers are removed before the state they describe is touched, and
+  written only after a successful restore. A failed restore leaves no
+  marker, so the next restore wipes.
+- `run_phases.sh` never wipes in `queries` mode, where warmup is not
+  measured. In `preload` mode it always wipes the whole local store,
+  because that mode measures warmup, and the wipe also drops every
+  `local.*` marker.
+- Caveat: a kept cache was written by the previous run's server build.
+  Use `KEEP_LOCAL_CACHE=0` (or a fresh VM) when a change alters the local
+  file layout.
+
+### Vector snapshot with the binary sidecar (`vector_snapshot`, `build_vector_snapshot`)
+
+The original `msmarco-10m-vec` snapshot stores every vector as JSON
+inside `doc_store.bin`, about 1 GB per segment. `kosha-build-segments`
+writes through `SegmentWriter`, whose vector store follows
+`KOSHA_VECTOR_STORE`. That variable is unset in the builder container,
+which means **sidecar**, so a rebuild puts vectors in `doc_vectors.bin`
+instead. Estimate, not measured: about 200 segments × (~205 MB
+`vector.idx` + ~205 MB `doc_vectors.bin` + a small text doc store) is
+roughly 80–90 GB, against 249 GB.
+
+- `vector_snapshot` names the snapshot that the vector suite restores into
+  namespace `msmarco-10m-vec`. The default is `msmarco-10m-vec` (today's).
+- `build_vector_snapshot: true` with a **new** name (for example
+  `msmarco-10m-vec-sidecar`) builds that snapshot once, offline, with
+  `SNAPSHOT_NAME=<name> build_and_import.sh msmarco-10m-vec
+  --with-embeddings`. If the snapshot already exists, the step skips the
+  build and only restores. The workflow refuses to build under
+  `msmarco-10m-vec`, and `build_and_import.sh` refuses to overwrite any
+  existing snapshot unless `SNAPSHOT_OVERWRITE=1` is set. The build path
+  is off by default. It syncs ~40 GB+ of embeddings, builds 10M docs and
+  uploads the segments. That is untimed so far, so run it with
+  `suite=vector` and watch the 350-minute limit.
+
+### Fast iteration recipe
+
+Dispatch with `suite=vector` (or `bm25`, or `both`), `warm_gate=queries`,
+`duration=300` and `keep_vm=true`, then dispatch again for each change.
+The last run turns `keep_vm` off, or a `suite=none` run tears down.
+Approximate times per stage:
+
+| stage | first run (fresh VM) | rerun on the kept VM |
+|---|---|---|
+| terraform apply | VM create, a few min | no-op, ~1 min |
+| wait for SSH, rsync, pip | cloud-init, a few min | <1 min |
+| docker build | full release build | cached layers; a Rust change rebuilds |
+| restore (same snapshot) | S3 copy + pg load, minutes | sync no-op + pg load + restart, ~2–3 min |
+| warm gate | hydrates what the workload reads from S3 (not measured yet) | local files only: ~1 min (warmup from local files took ~10 s in August) |
+| phases | 2 × 5 min | 2 × 5 min |
+| archive + summary | ~1 min | ~1 min |
+
+For comparison, `warm_gate=preload` on the original vector snapshot
+spends about 115 minutes in warmup alone, before its phases.
+
 ## Logs and tail analysis
 
 Every CI benchmark run (`.github/workflows/benchmark.yml`) archives its

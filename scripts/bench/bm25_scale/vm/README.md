@@ -19,7 +19,20 @@ stack — so each corpus is loaded once, ever.
 - `restore_namespace.sh <ns> [name]` — inverse: sync segments into the
   current round's bench bucket, load the dump, restart the server; the
   boot-restore picks the namespace up and warmup (if configured) makes
-  the pod query-ready.
+  the pod query-ready. On a reused VM it keeps the local cache and the
+  bucket objects when they came from this exact snapshot (name + ETag /
+  LastModified of its pg dump), and wipes them on any mismatch (the
+  local wipe covers that namespace only, so other namespaces keep their
+  caches); the
+  markers live in `snapshot_cache.sh` (see ../README.md, "Reusing the
+  local cache on a reused VM").
+- `build_and_import.sh <ns> [--with-embeddings]` — offline build +
+  import + snapshot; `SNAPSHOT_NAME=<name>` snapshots under a different
+  name (e.g. `msmarco-10m-vec-sidecar`), and an existing snapshot is
+  never overwritten unless `SNAPSHOT_OVERWRITE=1`.
+- `run_phases.sh` — the measured phases; `WARM_GATE=queries` runs the
+  tpuf-style `../warm_gate.py` and warm phases only, `WARM_GATE=preload`
+  (the script default) the wipe + boot preload + cold/warm protocol.
 
 Economics: the 10M vector load runs ~6h at the measured ~485 docs/sec
 sustained (flush-build bound, see #126); a restore is minutes. Engine-fix
