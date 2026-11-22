@@ -26,10 +26,14 @@ SAML/OIDC and the web console are not built yet; they will sit in front of it.
 
 ## Who is calling
 
-Every route is under `/v1/admin/` and needs `KOSHA_ADMIN_API_KEY`. A tenant API
+Every route is under `/v1/admin/` and needs an admin credential:
+`KOSHA_ADMIN_API_KEY`, or a named
+[operator credential](../README.md#operator-admin-credentials). A tenant API
 key is never enough. The holder of the admin credential is then either:
 
-- **the operator**: no `X-Kosha-Actor` header. Not bound by roles.
+- **the operator**: no `X-Kosha-Actor` header. Not bound by roles. Audited as
+  `operator` with the shared key, as `operator:<name>` with an operator
+  credential.
 - **acting for a user**: `X-Kosha-Actor: <user id>`. The server enforces that
   user's role in the organization.
 
@@ -120,15 +124,17 @@ Refused requests are not recorded.
 | `tenant.linked` | tenant | `project_id`, `existing_tenant` |
 | `api_key.created` | tenant | `key_suffix` (last four characters), `description` |
 
-An entry has `id`, `org_id`, `actor` (`operator` or `user:<id>`), `action`,
+An entry has `id`, `org_id`, `actor` (`operator`, `operator:<name>` or
+`user:<id>`), `action`,
 `target_type`, `target_id`, `detail` and `created_at_ms`. The log never holds an
 API key. `GET .../audit-log` returns one organization's entries newest first,
 100 per page by default (`limit`, at most 1000); pass the response's
 `next_before` as `before` for the next page. Keys created through
 `POST /v1/admin/api-keys` are recorded too, under the tenant's organization when
-it has one. `user.created`, and keys for a tenant no organization owns, are
-recorded with no organization and are only visible in the `kosha.audit_log`
-table.
+it has one. `user.created`, keys for a tenant no organization owns, and changes
+to operator credentials (`operator_credential.created`, `.rotated`, `.revoked`;
+target type `operator`, target id the operator's name) are recorded with no
+organization and are only visible in the `kosha.audit_log` table.
 
 Not recorded yet: namespace deletion and other data-plane actions made with a
 tenant API key.

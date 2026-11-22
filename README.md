@@ -675,7 +675,10 @@ tenant id starting with `_` or `.`, since namespaces under it would be accounted
 to the shared `_legacy` cache tenant; such ids already configured keep working,
 and the server logs a warning at startup for any in `KOSHA_API_KEYS`.
 
-- Set `KOSHA_ADMIN_API_KEY` for `/v1/admin/*` and global `/stats` access.
+- Set `KOSHA_ADMIN_API_KEY` for `/v1/admin/*` and global `/stats` access. With
+  a Postgres control plane, give each operator their own credential instead and
+  keep this one for bootstrap and break-glass; see
+  [Operator admin credentials](#operator-admin-credentials).
 - Organizations, users with roles (owner, admin, member, read-only), projects,
   the tenants they own and an audit log of control-plane actions are managed
   under `/v1/admin/users` and `/v1/admin/orgs`; see
@@ -707,7 +710,7 @@ a query pod forwards a write to the ingest pod:
 Scopes are independent (`admin` does not include `write`). A request outside a
 key's scopes or namespaces gets a `403` naming what is missing; an expired key
 gets `401` "API key expired". The `admin` scope is tenant-level: `/v1/admin/*`
-still needs `KOSHA_ADMIN_API_KEY`. Env keys (`KOSHA_API_KEY`, `KOSHA_API_KEYS`)
+still needs an admin credential. Env keys (`KOSHA_API_KEY`, `KOSHA_API_KEYS`)
 and every key created before scopes existed have all three scopes, every
 namespace and no expiry, so they behave as before. A key restricted to
 namespaces cannot list all namespaces, and can only create a namespace or
@@ -722,9 +725,55 @@ Manage keys with the admin credential (`kosha admin ...` wraps these):
 | `POST /v1/admin/api-keys/revoke` | `{"key_id"}`. The pod that answers refuses the key at once, the others within `KOSHA_API_KEY_REFRESH_SECS` |
 | `POST /v1/admin/api-keys/rotate` | `{"key_id", "overlap_secs": 86400}`. Issues a replacement with the same tenant, scopes and namespaces; the old key keeps working for the overlap (default one day), so clients switch without downtime |
 | `POST /v1/admin/api-keys/scrub-plaintext` | Removes the plaintext that keys created before this feature still hold in the database |
+| `GET /v1/admin/api-keys/plaintext-count` | Read-only: `{"plaintext_rows": N, "scrub_due": true}`, the rows `scrub-plaintext` would rewrite. The server logs the same count at startup (`api keys: N row(s) still hold a plaintext key`) |
 
 Keys are stored as SHA-256 hashes; a key's `key_id` is that hash.
 `last_used_at` is written about once per refresh interval, not per request.
+
+### Operator admin credentials
+
+`KOSHA_ADMIN_API_KEY` is one secret shared by everyone who administers the
+deployment: it cannot expire, cannot be taken from one person, and the audit log
+can only say `operator` did something. With a Postgres control plane, each
+operator can hold a named credential instead. It opens exactly what the shared
+key opens (`/v1/admin/*`, global `/stats`, `/metrics` under
+`KOSHA_METRICS_AUTH=admin`), is sent the same way (`Authorization: Bearer` or
+`X-Api-Key`), and is recorded in the
+[audit log](docs/organizations.md#audit-log) as `operator:<name>`.
+
+| Route | Does |
+|---|---|
+| `POST /v1/admin/operators` | Issue a credential: `{"name": "alice", "description", "expires_in_secs": 7776000}`. Only `name` is required (1 to 64 of letters, digits, `. _ - @ +`). The credential is in the response and is never shown again. `409` if that operator already holds a usable one: rotate it |
+| `GET /v1/admin/operators` | List credentials that are not revoked: id, name, `expires_at`, `last_used_at`. No secrets |
+| `POST /v1/admin/operators/revoke` | `{"key_id"}` revokes one credential, `{"name"}` every credential of that operator. The pod that answers refuses them at once, the others within `KOSHA_API_KEY_REFRESH_SECS` |
+| `POST /v1/admin/operators/rotate` | `{"key_id", "overlap_secs": 86400}`. Issues a replacement for the same operator; the old credential keeps working for the overlap (default one day) |
+
+Operator credentials are stored in the key registry like tenant keys (hashed,
+same expiry, rotation and refresh), but the two never mix: an operator
+credential is not a key for any tenant, a tenant key (whatever its scopes) is
+not an admin credential, and the `/v1/admin/api-keys` routes neither list nor
+change operator credentials. Creating, rotating and revoking one is written to
+`kosha.audit_log` (`operator_credential.created` / `.rotated` / `.revoked`) with
+whoever did it, in the same transaction as the change.
+
+**Moving off the shared key.**
+
+1. With `KOSHA_ADMIN_API_KEY`, issue a credential for each operator
+   (`POST /v1/admin/operators`), and check each one works.
+2. Set `KOSHA_ADMIN_BOOTSTRAP_KEY=disabled` on every pod and restart. The shared
+   key is now refused like any unknown key (`401`); it can stay in the
+   deployment's secret.
+3. To break glass (every operator credential lost, expired or revoked), set
+   `KOSHA_ADMIN_BOOTSTRAP_KEY=enabled` (or remove it) and restart: the shared key
+   works again. Rotate it afterwards if it was exposed.
+
+Leaving the variable unset keeps today's behaviour: the shared key and operator
+credentials both work. The server refuses to start on any other value. It does
+not stop you disabling the shared key while no operator credential is usable;
+it logs a warning at startup, and step 3 is the way back. During a rolling
+upgrade, pods still on a build without this feature refuse operator credentials
+(as an admin credential and as a tenant key), so issue them once every pod is
+upgraded. `/internal/*` and `KOSHA_INTERNAL_API_KEY` are unaffected.
 
 **Upgrading.** The migration (`003_scoped_api_keys.sql`, also applied by the
 server at startup) only adds columns and hashes existing keys; it leaves their

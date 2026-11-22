@@ -21,7 +21,7 @@ annotation and trust the internal CA; see `k8s/README.md`, "Encryption in transi
 | Setting | Effect |
 | --- | --- |
 | default | Unauthenticated, like `/healthz` and `/readyz` |
-| `KOSHA_METRICS_AUTH=admin` | Requires the `KOSHA_ADMIN_API_KEY` credential (`Authorization: Bearer <key>` or `X-Api-Key`); 403 without it. With no admin key configured, every scrape is refused |
+| `KOSHA_METRICS_AUTH=admin` | Requires the `KOSHA_ADMIN_API_KEY` credential or an operator credential (`Authorization: Bearer <key>` or `X-Api-Key`); 403 without it. With no admin key configured and no operator credential, every scrape is refused |
 | `KOSHA_METRICS=off` | `GET /metrics` returns 404 |
 
 The default exposes no tenant data: no series carries a namespace or tenant label. Leave the

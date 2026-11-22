@@ -64,9 +64,9 @@ pub(crate) fn handle(request_line: &str, body: &[u8]) -> Option<String> {
     Some(execute(action))
 }
 
-type Rejection = (u16, String);
+pub(crate) type Rejection = (u16, String);
 
-fn bad_request(message: impl Into<String>) -> Rejection {
+pub(crate) fn bad_request(message: impl Into<String>) -> Rejection {
     (400, message.into())
 }
 
@@ -90,15 +90,7 @@ fn parse(method: &str, sub: &str, query: &str, body: &[u8], now: i64) -> Result<
             let req = json()?;
             Ok(Action::Rotate {
                 key_hash: parse_key_ref(&req)?,
-                overlap_secs: match req.get("overlap_secs") {
-                    None | Some(serde_json::Value::Null) => DEFAULT_ROTATION_OVERLAP_SECS,
-                    Some(v) => v
-                        .as_u64()
-                        .filter(|secs| *secs <= MAX_LIFETIME_SECS)
-                        .ok_or_else(|| {
-                            bad_request("'overlap_secs' must be a non-negative number of seconds")
-                        })?,
-                },
+                overlap_secs: parse_overlap(&req)?,
                 expires_at: parse_expiry(&req, now)?,
             })
         }
@@ -170,9 +162,21 @@ fn parse_create(req: &serde_json::Value, now: i64) -> Result<NewApiKey, Rejectio
     })
 }
 
+/// `overlap_secs`: how long a rotated key keeps working. One day when the
+/// request does not say.
+pub(crate) fn parse_overlap(req: &serde_json::Value) -> Result<u64, Rejection> {
+    match req.get("overlap_secs") {
+        None | Some(serde_json::Value::Null) => Ok(DEFAULT_ROTATION_OVERLAP_SECS),
+        Some(v) => v
+            .as_u64()
+            .filter(|secs| *secs <= MAX_LIFETIME_SECS)
+            .ok_or_else(|| bad_request("'overlap_secs' must be a non-negative number of seconds")),
+    }
+}
+
 /// `expires_in_secs` (relative) or `expires_at` (unix seconds); neither
 /// means the key never expires.
-fn parse_expiry(req: &serde_json::Value, now: i64) -> Result<Option<i64>, Rejection> {
+pub(crate) fn parse_expiry(req: &serde_json::Value, now: i64) -> Result<Option<i64>, Rejection> {
     let present = |field: &str| req.get(field).filter(|v| !v.is_null());
     match (present("expires_in_secs"), present("expires_at")) {
         (None, None) => Ok(None),
@@ -193,7 +197,7 @@ fn parse_expiry(req: &serde_json::Value, now: i64) -> Result<Option<i64>, Reject
 }
 
 /// The hash of the key a request refers to: `key_id`, or the key itself.
-fn parse_key_ref(req: &serde_json::Value) -> Result<String, Rejection> {
+pub(crate) fn parse_key_ref(req: &serde_json::Value) -> Result<String, Rejection> {
     if let Some(id) = req.get("key_id").and_then(|v| v.as_str()) {
         let is_hash = id.len() == 64
             && id

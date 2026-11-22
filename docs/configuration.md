@@ -494,6 +494,7 @@ far, and its invoices. `GET /v1/admin/billing/accounts` and
 | `KOSHA_API_KEY` | One tenant API key, mapped to tenant `default` | unset | string |
 | `KOSHA_API_KEYS` | Comma-separated `key=tenant` pairs | unset | list |
 | `KOSHA_ADMIN_API_KEY` | Key for `/v1/admin/*` and global `/stats`. Unset disables those routes | unset | string |
+| `KOSHA_ADMIN_BOOTSTRAP_KEY` | `disabled` (or `off`, `false`, `0`) makes the server refuse `KOSHA_ADMIN_API_KEY` everywhere, so only per-operator credentials (`POST /v1/admin/operators`, Postgres) reach `/v1/admin/*`, global `/stats` and an admin-gated `/metrics`. Set it once operator credentials exist; set it back to `enabled` to break glass. Any other value is a startup error. With it disabled and no usable operator credential the server warns at startup and has no admin access; a disabled key also no longer counts as a configured credential for the fail-closed startup check | `enabled` | `enabled` \| `disabled` |
 | `KOSHA_INTERNAL_API_KEY` | Key peers use for `GET /internal/segment/...` hydration. Unset disables peer-file access | unset | string |
 | `KOSHA_LEGACY_ROUTES` | `off` (or `disabled`, `false`, `0`, `none`) makes the unversioned Phase 1 routes return 410 | on | flag |
 | `KOSHA_DASHBOARD` | `on` (or `true`, `1`, `yes`, `enabled`) serves the read-only web UI at `/dashboard`, adds `recent_queries` to `GET /v1/namespaces/{ns}/stats`, and honors `"timings": true` on searches. See [dashboard.md](dashboard.md). `dashboard.rs`, `Dashboard::from_env` | off | flag |
