@@ -290,9 +290,12 @@ struct MemoryInner {
     /// The next N conditional puts store nothing and report a conflict,
     /// like S3's 409 while an earlier put of the key is still in flight.
     phantom_conflicts: AtomicUsize,
+    /// The next N gets fail, like an unreachable store.
+    fail_gets: AtomicUsize,
     /// Simulated put latency: fixed part, and nanoseconds per byte.
     latency: Mutex<(Duration, u64)>,
     puts: AtomicU64,
+    put_attempts: AtomicU64,
 }
 
 impl MemoryObjectBackend {
@@ -320,9 +323,19 @@ impl MemoryObjectBackend {
         self.inner.phantom_conflicts.store(n, Ordering::SeqCst);
     }
 
+    /// Fail the next `n` gets.
+    pub fn fail_next_gets(&self, n: usize) {
+        self.inner.fail_gets.store(n, Ordering::SeqCst);
+    }
+
     /// Every put sleeps `fixed + bytes * nanos_per_byte`.
     pub fn set_put_latency(&self, fixed: Duration, nanos_per_byte: u64) {
         *self.inner.latency.lock().unwrap() = (fixed, nanos_per_byte);
+    }
+
+    /// Puts sent so far, whatever their outcome.
+    pub fn put_attempts(&self) -> u64 {
+        self.inner.put_attempts.load(Ordering::SeqCst)
     }
 
     /// Successful puts so far (conditional and plain).
@@ -348,6 +361,7 @@ impl MemoryObjectBackend {
     }
 
     fn store(&self, key: &str, bytes: &[u8], conditional: bool) -> Result<(), KoshaError> {
+        self.inner.put_attempts.fetch_add(1, Ordering::SeqCst);
         let (fixed, per_byte) = *self.inner.latency.lock().unwrap();
         let delay = fixed + Duration::from_nanos(per_byte.saturating_mul(bytes.len() as u64));
         if !delay.is_zero() {
@@ -403,6 +417,9 @@ impl WalObjectBackend for MemoryObjectBackend {
     }
 
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, KoshaError> {
+        if Self::take(&self.inner.fail_gets) {
+            return Err(std::io::Error::other("injected object store get failure").into());
+        }
         Ok(self.inner.objects.lock().unwrap().get(key).cloned())
     }
 
@@ -575,6 +592,99 @@ mod tests {
         drop(writer);
         // Unacknowledged but durable records replay (at-least-once).
         assert_eq!(open(&backend).1, vec!["landed", "next", "after"]);
+    }
+
+    /// #368: a put lands although its reply is lost, and the store stays
+    /// unreachable for far more groups than the writer remembers attempts.
+    /// The landed attempt must still be recognized once the store answers.
+    #[test]
+    fn a_landed_put_is_still_adopted_after_a_long_outage() {
+        let backend = MemoryObjectBackend::new();
+        let (writer, _) = open(&backend);
+        writer.append(&ns(), &[doc("a")]).unwrap();
+        backend.lose_next_put_replies(1);
+        assert!(writer.append(&ns(), &[doc("landed")]).is_err());
+        // The outage: puts and gets fail.
+        backend.fail_next_puts(usize::MAX);
+        backend.fail_next_gets(usize::MAX);
+        let sent_before = backend.put_attempts();
+        for i in 0..40 {
+            let err = writer.append(&ns(), &[doc(&format!("down-{i}"))]);
+            let err = err.unwrap_err().to_string();
+            assert!(!err.contains("fenced"), "{err}");
+        }
+        // Once as many attempts are remembered as the writer keeps, it
+        // sends no put it could not account for later.
+        let sent = backend.put_attempts() - sent_before;
+        assert!(sent < 10, "{sent} puts sent during the outage");
+        backend.fail_next_puts(0);
+        backend.fail_next_gets(0);
+        writer.append(&ns(), &[doc("b")]).unwrap();
+        writer.append(&ns(), &[doc("c")]).unwrap();
+        drop(writer);
+        // Unacknowledged but durable records replay (at-least-once).
+        assert_eq!(open(&backend).1, vec!["a", "landed", "b", "c"]);
+    }
+
+    /// The counterpart of the test above: with as many failed attempts
+    /// remembered as the writer keeps, an object another writer put at the
+    /// key still fences this one, and nothing of the other's is replaced.
+    #[test]
+    fn a_foreign_object_still_fences_after_many_failed_puts() {
+        let backend = MemoryObjectBackend::new();
+        let (writer, _) = open(&backend);
+        writer.append(&ns(), &[doc("a")]).unwrap();
+        // Puts that never landed: the key stays free.
+        backend.fail_next_puts(20);
+        for i in 0..20 {
+            assert!(writer.append(&ns(), &[doc(&format!("down-{i}"))]).is_err());
+        }
+        // A second process on the same stream takes the key.
+        let (other, recovered) = open(&backend);
+        assert_eq!(recovered, vec!["a"]);
+        other.append(&ns(), &[doc("foreign")]).unwrap();
+        let before = backend.keys();
+        let err = writer.append(&ns(), &[doc("late")]).unwrap_err();
+        assert!(err.to_string().contains("fenced"), "{err}");
+        let err = writer.append(&ns(), &[doc("later")]).unwrap_err();
+        assert!(err.to_string().contains("fenced"), "{err}");
+        assert_eq!(backend.keys(), before);
+        other.append(&ns(), &[doc("foreign-2")]).unwrap();
+        drop((writer, other));
+        assert_eq!(open(&backend).1, vec!["a", "foreign", "foreign-2"]);
+    }
+
+    /// A foreign object fences even when this writer has an attempt of its
+    /// own with an unknown outcome for the same key.
+    #[test]
+    fn a_foreign_object_fences_a_writer_with_an_ambiguous_put() {
+        let backend = MemoryObjectBackend::new();
+        let (writer, _) = open(&backend);
+        writer.append(&ns(), &[doc("a")]).unwrap();
+        backend.fail_next_puts(1);
+        assert!(writer.append(&ns(), &[doc("unknown")]).is_err());
+        let (other, _) = open(&backend);
+        other.append(&ns(), &[doc("foreign")]).unwrap();
+        let err = writer.append(&ns(), &[doc("late")]).unwrap_err();
+        assert!(err.to_string().contains("fenced"), "{err}");
+        drop((writer, other));
+        assert_eq!(open(&backend).1, vec!["a", "foreign"]);
+    }
+
+    /// Failed puts that never landed do not wedge the key: the store says
+    /// it is still absent, so the writer keeps trying it.
+    #[test]
+    fn many_failed_puts_that_never_landed_do_not_block_the_key() {
+        let backend = MemoryObjectBackend::new();
+        let (writer, _) = open(&backend);
+        backend.fail_next_puts(20);
+        for i in 0..20 {
+            assert!(writer.append(&ns(), &[doc(&format!("down-{i}"))]).is_err());
+        }
+        writer.append(&ns(), &[doc("a")]).unwrap();
+        writer.append(&ns(), &[doc("b")]).unwrap();
+        drop(writer);
+        assert_eq!(open(&backend).1, vec!["a", "b"]);
     }
 
     #[test]

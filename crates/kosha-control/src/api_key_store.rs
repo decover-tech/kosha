@@ -9,6 +9,12 @@
 //! tenant-key methods never see them, and the operator methods never see a
 //! tenant key. Every change to one is written to `kosha.audit_log` in the
 //! same transaction.
+//!
+//! Creating, rotating and revoking a tenant key each append a row to
+//! `kosha.audit_log` (migration 006, #345) in the transaction that makes
+//! the change, with the operator as the actor: these back the operator's
+//! `/v1/admin/api-keys` routes. Keys created through the organization
+//! console are audited by `orgs::create_api_key`.
 
 use crate::api_keys::{
     hash_api_key, operator_name, operator_tenant_id, valid_operator_name, ApiKeyRecord, NewApiKey,
@@ -124,6 +130,54 @@ const INSERT: &str = "INSERT INTO kosha.api_keys \
         (api_key, key_hash, tenant_id, description, scopes, namespaces, expires_at) \
      VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7::BIGINT::DOUBLE PRECISION)) \
      RETURNING EXTRACT(EPOCH FROM created_at)::BIGINT";
+
+/// How many characters of a key's id (its hash) an audit row carries:
+/// enough to pick the key out of the key listing, not the whole id.
+const AUDIT_KEY_ID_PREFIX_LEN: usize = 12;
+
+fn key_id_prefix(key_hash: &str) -> &str {
+    key_hash.get(..AUDIT_KEY_ID_PREFIX_LEN).unwrap_or(key_hash)
+}
+
+/// The audit detail for a key that was just issued: what the key may do
+/// and enough to tell it apart, never the key or its whole hash.
+fn issued_detail(issued: &IssuedApiKey) -> serde_json::Value {
+    let tail = issued.api_key.len().saturating_sub(4);
+    serde_json::json!({
+        "key_suffix": issued.api_key.get(tail..).unwrap_or(""),
+        "key_id_prefix": key_id_prefix(&issued.record.key_hash),
+        "description": issued.record.description,
+        "scopes": issued.record.scopes.names(),
+        "namespaces": issued.record.namespaces,
+        "expires_at": issued.record.expires_at,
+    })
+}
+
+/// Append an operator action on one of `tenant_id`'s keys to the audit
+/// log, under the tenant's organization when it has one (as
+/// `orgs::create_api_key` does for the console's keys). Run it on the
+/// transaction that makes the change, so neither exists without the other.
+async fn audit<'e, E>(
+    executor: E,
+    action: &str,
+    tenant_id: &str,
+    detail: &serde_json::Value,
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    sqlx::query(
+        "INSERT INTO kosha.audit_log (org_id, actor, action, target_type, target_id, detail) \
+         VALUES ((SELECT org_id FROM kosha.tenants WHERE tenant_id = $1), \
+                 'operator', $2, 'tenant', $1, $3)",
+    )
+    .bind(tenant_id)
+    .bind(action)
+    .bind(detail.to_string())
+    .execute(executor)
+    .await
+    .map(|_| ())
+}
 
 async fn insert<'e, E>(executor: E, new: &NewApiKey) -> Result<IssuedApiKey, sqlx::Error>
 where
@@ -261,10 +315,19 @@ impl PgStore {
     }
 
     /// Create a key. Only its hash is stored; the returned `api_key` is the
-    /// one chance to see the key.
+    /// one chance to see the key. Audited as `api_key.created` by the
+    /// operator, in the same transaction.
     pub fn create_api_key(&self, new: &NewApiKey) -> Result<IssuedApiKey, KoshaError> {
         let (pool, rt) = self.pool_and_runtime();
-        rt.block_on(insert(pool, new)).map_err(db_error)
+        rt.block_on(async {
+            let mut tx = pool.begin().await?;
+            let issued = insert(&mut *tx, new).await?;
+            let detail = issued_detail(&issued);
+            audit(&mut *tx, "api_key.created", &new.tenant_id, &detail).await?;
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(issued)
+        })
+        .map_err(db_error)
     }
 
     /// Every tenant key that is not revoked (expired keys included, so an
@@ -311,21 +374,34 @@ impl PgStore {
 
     /// Revoke the tenant key with this hash. `false` when there is no such
     /// active key. Servers stop accepting it on their next key refresh.
+    /// Audited as `api_key.revoked` by the operator, in the same
+    /// transaction.
     pub fn revoke_api_key(&self, key_hash: &str) -> Result<bool, KoshaError> {
         let (pool, rt) = self.pool_and_runtime();
         let sql = format!(
             "UPDATE kosha.api_keys SET revoked_at = NOW() \
-             WHERE {KEY_HASH} = $1 AND revoked_at IS NULL AND {}",
+             WHERE {KEY_HASH} = $1 AND revoked_at IS NULL AND {} \
+             RETURNING tenant_id, description",
             Kind::Tenant.condition()
         );
         rt.block_on(async {
-            let done = sqlx::query(&sql)
+            let mut tx = pool.begin().await?;
+            let revoked: Option<(String, String)> = sqlx::query_as(&sql)
                 .bind(key_hash)
-                .execute(pool)
-                .await
-                .map_err(db_error)?;
-            Ok(done.rows_affected() > 0)
+                .fetch_optional(&mut *tx)
+                .await?;
+            let Some((tenant_id, description)) = revoked else {
+                return Ok(false);
+            };
+            let detail = serde_json::json!({
+                "key_id_prefix": key_id_prefix(key_hash),
+                "description": description,
+            });
+            audit(&mut *tx, "api_key.revoked", &tenant_id, &detail).await?;
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(true)
         })
+        .map_err(db_error)
     }
 
     /// Replace a key without downtime: issue a new key with the same
@@ -334,6 +410,8 @@ impl PgStore {
     /// `overlap_secs` more seconds. The overlap never extends the old key:
     /// one that already expires sooner keeps its earlier expiry. `None`
     /// when there is no such key, or it is revoked or already expired.
+    /// Audited as `api_key.rotated` by the operator, in the same
+    /// transaction.
     pub fn rotate_api_key(
         &self,
         key_hash: &str,
@@ -343,7 +421,7 @@ impl PgStore {
         let (pool, rt) = self.pool_and_runtime();
         rt.block_on(async {
             let mut tx = pool.begin().await.map_err(db_error)?;
-            let rotated = rotate(
+            let Some(rotated) = rotate(
                 &mut tx,
                 Kind::Tenant,
                 key_hash,
@@ -351,9 +429,21 @@ impl PgStore {
                 new_expires_at,
             )
             .await
-            .map_err(db_error)?;
+            .map_err(db_error)?
+            else {
+                return Ok(None);
+            };
+            let mut detail = issued_detail(&rotated.new);
+            detail["replaces"] = serde_json::json!({
+                "key_id_prefix": key_id_prefix(key_hash),
+                "expires_at": rotated.old_expires_at,
+            });
+            let tenant_id = &rotated.new.record.tenant_id;
+            audit(&mut *tx, "api_key.rotated", tenant_id, &detail)
+                .await
+                .map_err(db_error)?;
             tx.commit().await.map_err(db_error)?;
-            Ok(rotated)
+            Ok(Some(rotated))
         })
     }
 

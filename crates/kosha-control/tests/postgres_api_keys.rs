@@ -569,3 +569,103 @@ fn operator_credentials_rotate_and_revoke_with_an_audit_trail() {
     );
     assert_eq!(rotation["replaces"]["expires_at"], rotated.old_expires_at);
 }
+
+/// The operator's key routes are audited (#345): one row per change, in
+/// the change's transaction, holding neither a key nor a whole key id.
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn create_rotate_and_revoke_are_audited_without_secrets() {
+    let store = PgStore::new(&url()).unwrap();
+    let t = tenant("audited");
+    let expires = now() + 3600;
+    let created = store
+        .create_api_key(&NewApiKey {
+            tenant_id: t.clone(),
+            description: "ci".into(),
+            scopes: Scopes::of(&[Scope::Read, Scope::Write]),
+            namespaces: Some(vec!["docs".into()]),
+            expires_at: Some(expires),
+        })
+        .unwrap();
+    let rotated = store
+        .rotate_api_key(&created.record.key_hash, 600, None)
+        .unwrap()
+        .expect("active key");
+    assert!(store.revoke_api_key(&rotated.new.record.key_hash).unwrap());
+    // Changes that did not happen leave no row.
+    assert!(!store.revoke_api_key(&rotated.new.record.key_hash).unwrap());
+    assert!(!store.revoke_api_key(&hash_api_key("sk-unknown")).unwrap());
+    assert!(store
+        .rotate_api_key(&hash_api_key("sk-unknown"), 600, None)
+        .unwrap()
+        .is_none());
+
+    // A tenant no organization owns: recorded with no organization.
+    type Audit = (Option<String>, String, String, String, String);
+    let rows: Vec<Audit> = sql(
+        "SELECT org_id, actor, action, target_type, detail FROM kosha.audit_log \
+         WHERE target_id = $1 ORDER BY id",
+        &[&t],
+    );
+    let details: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(org_id, actor, _, target_type, detail)| {
+            assert_eq!(org_id, &None);
+            assert_eq!(actor, "operator");
+            assert_eq!(target_type, "tenant");
+            serde_json::from_str(detail).unwrap()
+        })
+        .collect();
+    let actions: Vec<&str> = rows.iter().map(|row| row.2.as_str()).collect();
+    assert_eq!(
+        actions,
+        ["api_key.created", "api_key.rotated", "api_key.revoked"]
+    );
+    let suffix = |key: &str| key[key.len() - 4..].to_string();
+    let id_prefix = |hash: &str| hash[..12].to_string();
+    assert_eq!(
+        details[0],
+        serde_json::json!({
+            "key_suffix": suffix(&created.api_key),
+            "key_id_prefix": id_prefix(&created.record.key_hash),
+            "description": "ci",
+            "scopes": ["read", "write"],
+            "namespaces": ["docs"],
+            "expires_at": expires,
+        })
+    );
+    // The replacement keeps the scopes and namespaces; the old key's
+    // deadline (the overlap, sooner than its own expiry) is recorded.
+    assert_eq!(
+        details[1],
+        serde_json::json!({
+            "key_suffix": suffix(&rotated.new.api_key),
+            "key_id_prefix": id_prefix(&rotated.new.record.key_hash),
+            "description": "ci",
+            "scopes": ["read", "write"],
+            "namespaces": ["docs"],
+            "expires_at": null,
+            "replaces": {
+                "key_id_prefix": id_prefix(&created.record.key_hash),
+                "expires_at": rotated.old_expires_at,
+            },
+        })
+    );
+    assert_eq!(
+        details[2],
+        serde_json::json!({
+            "key_id_prefix": id_prefix(&rotated.new.record.key_hash),
+            "description": "ci",
+        })
+    );
+    for (.., detail) in &rows {
+        for secret in [
+            &created.api_key,
+            &rotated.new.api_key,
+            &created.record.key_hash,
+            &rotated.new.record.key_hash,
+        ] {
+            assert!(!detail.contains(secret.as_str()), "{detail}");
+        }
+    }
+}

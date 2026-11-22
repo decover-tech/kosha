@@ -857,30 +857,9 @@ pub fn create_api_key(
     })
 }
 
-/// The operator's `POST /v1/admin/api-keys`: a key for any tenant id,
-/// linked to an organization or not. Audited against the tenant's
-/// organization when it has one. The caller validates `tenant_id`.
-pub fn create_operator_api_key(
-    store: &dyn OrgStore,
-    tenant_id: &str,
-    description: &str,
-) -> Result<ApiKey, OrgError> {
-    run(store, |tx| {
-        let org_id = tx.tenant(tenant_id)?.map(|t| t.org_id);
-        let key = new_api_key(tenant_id, description);
-        tx.insert_api_key(&key)?;
-        audit(
-            tx,
-            &Actor::Operator,
-            org_id.as_deref(),
-            "api_key.created",
-            "tenant",
-            tenant_id,
-            key_detail(&key),
-        )?;
-        Ok(key)
-    })
-}
+// The operator's `POST /v1/admin/api-keys` (a key for any tenant id, with
+// scopes, namespaces and an expiry) is `PgStore::create_api_key`, which
+// writes its own `api_key.created` row: see `api_key_store`.
 
 /// One page of the organization's audit log, newest first. Page with
 /// `before` = the last `id` of the previous page.

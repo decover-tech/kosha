@@ -703,7 +703,7 @@ a query pod forwards a write to the ingest pod:
 
 | Scope | Routes |
 |---|---|
-| `read` | search, exists, namespace stats, reading a schema, listing namespaces and branches |
+| `read` | search, exists, namespace stats, reading a schema, listing namespaces and branches, the tenant's own usage (`GET /v1/usage`) and billing state (`GET /v1/billing`) |
 | `write` | index, replace, delete documents, flush |
 | `admin` | create and delete namespaces and branches, change a namespace's schema or shards |
 
@@ -713,8 +713,9 @@ gets `401` "API key expired". The `admin` scope is tenant-level: `/v1/admin/*`
 still needs an admin credential. Env keys (`KOSHA_API_KEY`, `KOSHA_API_KEYS`)
 and every key created before scopes existed have all three scopes, every
 namespace and no expiry, so they behave as before. A key restricted to
-namespaces cannot list all namespaces, and can only create a namespace or
-branch whose name is on its list.
+namespaces cannot use the routes that answer for the whole tenant (listing all
+namespaces, `GET /v1/usage`, `GET /v1/billing`), and can only create a
+namespace or branch whose name is on its list.
 
 Manage keys with the admin credential (`kosha admin ...` wraps these):
 
@@ -727,7 +728,9 @@ Manage keys with the admin credential (`kosha admin ...` wraps these):
 | `POST /v1/admin/api-keys/scrub-plaintext` | Removes the plaintext that keys created before this feature still hold in the database |
 | `GET /v1/admin/api-keys/plaintext-count` | Read-only: `{"plaintext_rows": N, "scrub_due": true}`, the rows `scrub-plaintext` would rewrite. The server logs the same count at startup (`api keys: N row(s) still hold a plaintext key`) |
 
-Keys are stored as SHA-256 hashes; a key's `key_id` is that hash.
+Keys are stored as SHA-256 hashes; a key's `key_id` is that hash. Creating,
+rotating and revoking a key are recorded in the audit log, in the same
+transaction as the change; see [docs/organizations.md](docs/organizations.md#audit-log).
 `last_used_at` is written about once per refresh interval, not per request.
 
 ### Operator admin credentials
