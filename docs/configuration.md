@@ -373,6 +373,110 @@ loses the events appended since the last flush.
 | `KOSHA_USAGE_FLUSH_MS` | How often the spool is delivered to the store. Minimum 100 | `5000` | milliseconds |
 | `KOSHA_USAGE_SNAPSHOT_TICK_MS` | How often a writer checks for namespaces without a `stored_bytes` snapshot this hour (one object listing per namespace per hour). Minimum 1000 | `300000` | milliseconds |
 
+## Billing
+
+Off by default (#349). With `KOSHA_BILLING=on` a pod loads a plan catalog, refuses requests of
+tenants that are over their free tier or behind on payment, applies each plan's quota defaults, and
+serves the billing API. It needs usage metering (`KOSHA_USAGE_METERING=on`) on every pod: charges
+and free-tier limits are computed from the usage events. Accounts and invoices are kept in
+`kosha.billing_accounts` and `kosha.billing_invoices` in Postgres (migration 007) when
+`DATABASE_URL` is set in a binary built with **postgres**, otherwise in memory (per pod, lost on
+restart; local development only).
+
+**Plans.** `KOSHA_BILLING_PLANS_FILE` is a JSON price list. No prices are built in; the numbers
+below are an example. It is read at startup only: restart the pods to change it.
+
+```json
+{
+  "default_plan": "free",
+  "dunning": {"payment_terms_days": 14, "read_only_after_days": 7, "suspend_after_days": 21},
+  "plans": {
+    "free": {
+      "kind": "free",
+      "meters": {"queries": {"included": 100000}, "stored_bytes": {"included": 1073741824}},
+      "limits": {"qps": 5, "namespaces": 3}
+    },
+    "payg": {
+      "kind": "usage",
+      "base_fee_cents": 2500,
+      "meters": {
+        "queries": {"included": 1000000, "unit": 1000000, "unit_price_cents": 400},
+        "bytes_queried": {"unit": 1099511627776, "unit_price_cents": 500},
+        "bytes_written": {"unit": 1073741824, "unit_price_cents": 200},
+        "stored_bytes": {"included": 1073741824, "unit": 1073741824, "unit_price_cents": 33}
+      }
+    },
+    "enterprise": {"kind": "enterprise", "base_fee_cents": 500000}
+  }
+}
+```
+
+- `kind` is `free` (included amounts are hard limits, nothing is charged), `usage` (use above the
+  included amount is charged) or `enterprise` (rated like `usage`, never restricted automatically
+  for non-payment).
+- `meters` prices the billable meters: `queries`, `bytes_queried`, `bytes_written` (see "Usage
+  metering") and `stored_bytes`, the average bytes stored over the month (byte-hours divided by the
+  hours in the month). The first `included` are free; the rest cost `unit_price_cents` per `unit`.
+  A meter a plan does not list is neither charged nor limited.
+- `limits` are the plan's tenant quota defaults, with the fields of a plan in
+  `KOSHA_TENANT_LIMITS_FILE` ("Tenant limits"). Where that file also gives the tenant a limit, the
+  file wins, field by field.
+- `default_plan` is the plan of a tenant nobody put on one. Without it such a tenant is not
+  billed, limited or restricted, which is what happens to every existing tenant when billing is
+  first turned on.
+
+**Rating.** A period is a calendar month, UTC. Amounts are integer US cents; each invoice line is
+rounded half up and the invoice total is the sum of its lines. `POST /v1/admin/billing/close-period`
+(`{"period": "YYYY-MM"}`, default last month) is the monthly job: one invoice per tenant, id
+`<tenant>/<YYYY-MM>`. It is safe to run again: an existing invoice is never re-rated, and one that
+could not be handed to the payment provider is handed over by the next run. Nothing schedules it;
+call it from a CronJob once every pod has delivered its usage for the month (usage that arrives
+after a period is closed is not on the invoice). An invoice is rated on the plan the tenant is on
+when the period is closed; plan changes inside a month are not prorated. An invoice that totals
+zero is recorded as paid.
+
+**Payment provider.** With `KOSHA_BILLING_PROVIDER=stripe` an invoice is sent to Stripe (a
+customer per tenant, an invoice with one item per charged line, `collection_method=send_invoice`),
+and `POST /v1/admin/billing/sync` copies paid and void results back. Without a provider invoices
+are only recorded, and a payment collected elsewhere is recorded with
+`POST /v1/admin/billing/invoices/mark-paid` (`{"invoice_id": ...}`).
+
+**Enforcement.** A refused request gets `402 Payment Required` with a JSON body
+`{error, reason, plan, state}`:
+
+- `free_tier_exceeded` (also `meter`, `used`, `included`): on a free plan, a meter's month-to-date
+  use has reached its included amount. `queries` and `bytes_queried` block searches;
+  `bytes_written` and `stored_bytes` (what is stored now) block writes. Moving the tenant to a paid
+  plan (`POST /v1/admin/billing/accounts`, `{"tenant", "plan"}`) lifts it, as does the next month.
+- `billing_read_only`: an invoice is `read_only_after_days` past due. Writes are refused; searches
+  and deletes are not.
+- `billing_suspended`: an invoice is `suspend_after_days` past due. Everything is refused except
+  `GET /v1/billing` and `GET /v1/usage`.
+
+An invoice is due `payment_terms_days` after it is issued. The state follows the oldest unpaid
+invoice and is computed, not stored: once the invoice is paid or voided the account is `active`
+again. Admin and pod-to-pod credentials are never restricted.
+
+Each pod enforces from a snapshot it rebuilds every `KOSHA_BILLING_REFRESH_SECS`, so a tenant can
+run past a free allowance, and a change made through another pod takes effect, up to one interval
+late (plus `KOSHA_USAGE_FLUSH_MS` for usage). The refresh reads every tenant's usage for the month
+so far when a free plan with limits is in use. A pod that cannot reach the stores keeps its last
+snapshot; a pod that has never read them restricts nobody and applies no plan quotas (only the
+limits file) until its first refresh succeeds.
+
+`GET /v1/billing` shows a tenant its plan, state, month-to-date usage with the charge accrued so
+far, and its invoices. `GET /v1/admin/billing/accounts` and
+`GET /v1/admin/billing/invoices[?tenant=]` are the operator's views.
+
+| Variable | Purpose | Default | Units |
+| --- | --- | --- | --- |
+| `KOSHA_BILLING` | `on`, `true` or `1` turns billing on for this pod. Startup fails without usage metering or a valid plans file | off | flag |
+| `KOSHA_BILLING_PLANS_FILE` | The plan catalog (JSON, above). Required with `KOSHA_BILLING=on` | unset | path |
+| `KOSHA_BILLING_REFRESH_SECS` | How often a pod rebuilds its snapshot of tenant standings | `60` | seconds |
+| `KOSHA_BILLING_PROVIDER` | `stripe`, or `none` to only record invoices | `none` | name |
+| `KOSHA_STRIPE_API_KEY` | Stripe secret key. Required with `KOSHA_BILLING_PROVIDER=stripe`; keep it in a secret, never in a tracked file | unset | secret |
+| `KOSHA_STRIPE_API_BASE` | Base URL of the Stripe API. Must be `https://`; plain `http://` is accepted for `localhost`, `127.0.0.1` and `[::1]` only (the secret key is sent to it), and startup fails otherwise | `https://api.stripe.com` | URL |
+
 ## HTTP server and auth
 
 | Variable | Purpose | Default | Units |

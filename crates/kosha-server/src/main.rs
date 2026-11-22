@@ -65,6 +65,9 @@ mod s3_storage;
 mod s3_wal;
 // The crash-point harness uploads to an in-memory bucket through the same
 // commit-marker sequence as S3, so it needs this module without `s3`.
+mod billing;
+#[cfg(test)]
+mod billing_tests;
 #[cfg(all(test, feature = "failpoints"))]
 mod crash_points_tests;
 #[cfg(any(feature = "s3", all(test, feature = "failpoints")))]
@@ -253,6 +256,8 @@ struct AppState {
     /// Usage metering (#348, `usage.rs`); `None` unless
     /// `KOSHA_USAGE_METERING=on`.
     usage: Option<usage::UsageMeter>,
+    /// Billing (#349, `billing.rs`); `None` unless `KOSHA_BILLING` is on.
+    billing: Option<Arc<billing::Billing>>,
     /// Cross-replica hydration coordinator (DESIGN.md §9 gap: N query
     /// replicas cold-starting on the same namespace independently re-fetch
     /// the same segments from S3). `None` when Postgres isn't configured —
@@ -1137,6 +1142,8 @@ struct StateOptions {
     writer_lease: Option<bool>,
     /// Usage meter instead of `KOSHA_USAGE_METERING` and its settings.
     usage: Option<usage::UsageMeter>,
+    /// Billing instead of `KOSHA_BILLING` and its settings.
+    billing: Option<billing::Billing>,
 }
 
 fn fatal(message: &str) -> ! {
@@ -1763,8 +1770,21 @@ impl AppState {
         let usage = options
             .usage
             .or_else(|| usage::UsageMeter::from_env(&data_dir));
+        let billing = options
+            .billing
+            .or_else(|| {
+                billing::Billing::from_env(usage.as_ref().map(usage::UsageMeter::store))
+                    .unwrap_or_else(|e| fatal(&format!("billing: {e}")))
+            })
+            .map(Arc::new);
         let tenant_limits = tenant_limits::TenantLimiter::from_env()
             .unwrap_or_else(|e| fatal(&format!("tenant limits: {e}")));
+        // A billing plan's quotas are the tenant's limits unless the limits
+        // file says otherwise (#349).
+        let tenant_limits = match &billing {
+            Some(billing) => tenant_limits.with_plan_defaults(billing.clone()),
+            None => tenant_limits,
+        };
         // Every process-wide cache splits its budget between tenants by
         // their plan weight, with `KOSHA_CACHE_TENANT_MIN_BYTES` as each
         // active tenant's floor (#342).
@@ -1904,6 +1924,7 @@ impl AppState {
             },
             tenant_limits,
             usage,
+            billing,
             #[cfg(all(feature = "s3", feature = "postgres"))]
             hydration_leases,
             #[cfg(all(feature = "s3", feature = "postgres"))]
@@ -5701,6 +5722,7 @@ fn main() {
     state.spawn_local_gc();
     state.spawn_usage_flusher();
     state.spawn_usage_snapshotter();
+    state.spawn_billing_refresher();
     let listener = TcpListener::bind(&addr).expect("failed to bind HTTP listener");
     let config =
         http::Config::from_env(Duration::from_secs(io_timeout_secs), auth::max_body_bytes());
@@ -5843,12 +5865,22 @@ fn dispatch_authenticated(
     // is_write_path/forward_to_ingest. Every other request (all reads, and
     // everything on the ingest pod itself, which never forwards) is handled
     // locally exactly as before this existed.
+    // ── Billing gate (#349) ──────────────────────────────────────────────
+    // Ahead of the role routing, so a query pod refuses a blocked write
+    // itself instead of forwarding it.
+    let billing_refusal = authentication
+        .as_ref()
+        .ok()
+        .and_then(|tenant| billing::gate(state, tenant, request_line));
     let response = match (
         &authentication,
         &state.ingest_host,
         &state.write_http_client,
     ) {
         (Err(resp), _, _) => http::Response::from_raw(resp.clone()),
+        (Ok(_), _, _) if billing_refusal.is_some() => {
+            http::Response::from_raw(billing_refusal.unwrap_or_default())
+        }
         // An indexer (#254) serves only the compaction admin API.
         (Ok(_), _, _)
             if state.role == role::Role::Indexer && !role::Role::indexer_serves(request_line) =>
@@ -6727,7 +6759,14 @@ fn route(
             return route_inner(&scoped, headers, body, tenant, state);
         }
         if !path.starts_with("/v1/namespaces/")
-            && !["/healthz", "/v1/healthz", "/v1/namespaces", "/v1/usage"].contains(&bare_path)
+            && ![
+                "/healthz",
+                "/v1/healthz",
+                "/v1/namespaces",
+                "/v1/usage",
+                "/v1/billing",
+            ]
+            .contains(&bare_path)
         {
             return json_error(404, "not found");
         }
@@ -6822,6 +6861,11 @@ fn route_inner(
         || request_line.starts_with("GET /v1/admin/usage?")
     {
         return usage::handle_admin_usage(request_line, state);
+    }
+
+    // ── Billing (#349) ─────────────────────────────────────────────────────
+    if let Some(response) = billing::route(request_line, body, tenant, state) {
+        return response;
     }
 
     // ── Admin routes (Postgres-backed only) ────────────────────────────────

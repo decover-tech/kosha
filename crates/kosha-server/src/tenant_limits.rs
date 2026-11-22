@@ -294,6 +294,23 @@ impl LimitsProvider for ConfigLimitsProvider {
     }
 }
 
+/// Plan quota defaults with the operator's limits laid over them. See
+/// [`TenantLimiter::with_plan_defaults`].
+struct LayeredLimits {
+    defaults: Arc<dyn LimitsProvider>,
+    overrides: Option<Arc<dyn LimitsProvider>>,
+}
+
+impl LimitsProvider for LayeredLimits {
+    fn limits(&self, tenant: &str) -> Option<TenantLimits> {
+        let over = self.overrides.as_ref().and_then(|p| p.limits(tenant));
+        match (self.defaults.limits(tenant), over) {
+            (Some(defaults), Some(over)) => Some(defaults.overlay(&over)),
+            (defaults, over) => over.or(defaults),
+        }
+    }
+}
+
 // ─── Token bucket ───────────────────────────────────────────────────────────
 
 /// A token bucket as a generic cell rate algorithm: one atomic holding the
@@ -543,6 +560,21 @@ impl TenantLimiter {
                 .map_or(String::new(), |p| p.display().to_string())
         );
         Ok(Self::new(provider))
+    }
+
+    /// `self` with `plans` as the defaults underneath it (#349): a tenant's
+    /// limits are what `plans` gives it (its billing plan's quotas), with
+    /// every field this limiter's own provider (the limits file) sets laid
+    /// over them. Without a limits file the plan quotas apply as they are.
+    pub(crate) fn with_plan_defaults(self, plans: Arc<dyn LimitsProvider>) -> Self {
+        Self {
+            provider: Some(Arc::new(LayeredLimits {
+                defaults: plans,
+                overrides: self.provider,
+            })),
+            tenants: self.tenants,
+            epoch: self.epoch,
+        }
     }
 
     /// Whether any limits are configured.

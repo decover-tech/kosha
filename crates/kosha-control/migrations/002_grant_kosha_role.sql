@@ -25,3 +25,6 @@ ALTER TABLE IF EXISTS kosha.org_members OWNER TO kosha;
 ALTER TABLE IF EXISTS kosha.projects OWNER TO kosha;
 ALTER TABLE IF EXISTS kosha.tenants OWNER TO kosha;
 ALTER TABLE IF EXISTS kosha.audit_log OWNER TO kosha;
+-- 007_billing.sql (#349). IF EXISTS for the same reason.
+ALTER TABLE IF EXISTS kosha.billing_accounts OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.billing_invoices OWNER TO kosha;
