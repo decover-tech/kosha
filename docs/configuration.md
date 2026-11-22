@@ -131,6 +131,8 @@ See `k8s/README.md` ("Encryption at rest") for an IAM policy and a StorageClass 
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
 | `KOSHA_CACHE_MAX_BYTES` | Size bound for the on-disk (NVMe) segment-file cache; least recently used files are evicted past it (`AppState::new`) | unset (unbounded) | bytes |
+| `KOSHA_CACHE_POLICY` | Research (#389), experimental: eviction policy under `KOSHA_CACHE_MAX_BYTES`. `legacy` keeps today's order (recency touched on write only, so effectively insertion order); `sieve` or `s3fifo` use per-search read hints so files read once do not displace re-read ones. No effect without `KOSHA_CACHE_MAX_BYTES` (`cache_reads.rs`) | unset (`legacy`) | `legacy` / `sieve` / `s3fifo` |
+| `KOSHA_CACHE_TRACE_PATH` | Research (#389): append one JSON line per successful search (segments, classes, posting shards, page segments read) for `scripts/bench/cache_sim/cache_sim.py`. Keep it outside `KOSHA_DATA_DIR` | unset (off) | file path |
 | `KOSHA_SEGMENT_CACHE_CAPACITY` | Parsed segments kept in memory across queries | `4096` (`kosha_query::DEFAULT_SEGMENT_CACHE_CAPACITY`) | segments |
 | `KOSHA_SEGMENT_CACHE_MAX_BYTES` | Approximate memory budget for those cached parsed segments | `4294967296` (4 GiB) | bytes |
 | `KOSHA_RESULT_CACHE_MAX_BYTES` | Whole-response cache for `POST /search`; `0` disables (`result_cache_budget`) | `67108864` (64 MiB) | bytes |
