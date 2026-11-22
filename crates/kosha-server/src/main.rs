@@ -4552,6 +4552,19 @@ impl AppState {
         outcome
     }
 
+    /// A warm search whose cached hydration verdict covers its scoring set
+    /// never reaches `ensure_scoring_files_local`, where per-segment
+    /// `kosha_cache_{hits,misses}{cache="nvme"}` are otherwise counted, so
+    /// its segments are counted as hits here (#342).
+    #[cfg(feature = "s3")]
+    fn record_warm_nvme_hits(&self, ns: &NamespaceId, manifest: &kosha_core::Manifest) {
+        self.cache.record_lookups(
+            kosha_core::tenancy::tenant_of_namespace(&ns.0),
+            manifest.segments.len() as u64,
+            0,
+        );
+    }
+
     /// Per-query posting-blob ensure for the cached-verdict fast path: the
     /// namespace-level verdict can never cover posting blobs, because they
     /// are fetched per query term (each term hashes to one of the
@@ -6306,10 +6319,13 @@ fn service_authorized(headers: &HashMap<String, String>, expected: Option<&str>)
         .is_some_and(|expected| request_key(headers) == Some(expected))
 }
 
+/// A tenant id, or a namespace or branch name a tenant supplies. Names
+/// starting with `_` or `.` are reserved for internal and legacy layouts
+/// (`<tenant>/_shard-NNNN` would otherwise be accounted to the shared
+/// `_legacy` tenant — see [`kosha_core::tenancy::is_reserved_name`]).
 fn valid_namespace_component(name: &str) -> bool {
     !name.is_empty()
-        && name != "."
-        && name != ".."
+        && !kosha_core::tenancy::is_reserved_name(name)
         && !name
             .chars()
             .any(|c| c == '/' || c == '\\' || c.is_control())
@@ -8165,6 +8181,7 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
             // shards as zero hits (non-deterministically per pod). It is
             // sub-ms when the shards are already local: one metadata stat
             // per term-shard per split segment.
+            state.record_warm_nvme_hits(&ns, manifest);
             state.ensure_query_posting_blobs(&ns, manifest, search_query, &hydration_request)
         } else {
             let outcome =
@@ -8774,6 +8791,7 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
         let outcome = if cached_covers {
             // Posting blobs are per-query and outside the cached verdict —
             // see `handle_search_post` for the full rationale.
+            state.record_warm_nvme_hits(&ns, manifest);
             state.ensure_query_posting_blobs(&ns, manifest, &query, &hydration_request)
         } else {
             let outcome =
@@ -11164,6 +11182,62 @@ mod tests {
         ]})
     }
 
+    /// #342: a warm search served from the cached hydration verdict still
+    /// counts its segments as NVMe hits for its tenant.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn warm_searches_count_nvme_hits_for_their_tenant() {
+        let state = test_state();
+        let ok = |resp: String| {
+            assert_eq!(status_of(&resp), 200, "{resp}");
+        };
+        ok(v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/docs/documents",
+            one_doc("d1", "quick fox"),
+        ));
+        ok(v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/docs/flush",
+            serde_json::json!({}),
+        ));
+        let nvme_hits = || {
+            state
+                .cache
+                .tenant_stats()
+                .into_iter()
+                .find(|s| s.tenant == "acme")
+                .map_or(0, |s| s.hits)
+        };
+        let search = |text: &str| {
+            ok(v1(
+                &state,
+                "acme",
+                "POST /v1/namespaces/docs/search",
+                serde_json::json!({"query_text": text}),
+            ))
+        };
+        // The first (unpruned) pass verifies the scoring set and caches the
+        // verdict; the second, a different query so the result cache does
+        // not answer it, is served from that verdict.
+        search("");
+        assert!(state
+            .completed_hydrations
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|(ns, _)| ns == "acme/docs"));
+        let after_first = nvme_hits();
+        search("quick");
+        assert!(
+            nvme_hits() > after_first,
+            "the warm search counted its segment as a hit ({after_first} → {})",
+            nvme_hits()
+        );
+    }
+
     #[test]
     fn namespace_create_conflicts_validates_and_is_tenant_scoped() {
         let state = test_state();
@@ -11215,10 +11289,25 @@ mod tests {
             serde_json::json!({"namespace": ".."}),
             serde_json::json!({"namespace": 7}),
             serde_json::json!({}),
+            // Reserved: `acme/_shard-0001` would be accounted to `_legacy`.
+            serde_json::json!({"namespace": "_shard-0001"}),
+            serde_json::json!({"namespace": "_internal"}),
+            serde_json::json!({"namespace": ".hidden"}),
         ] {
             let resp = create("acme", bad.clone());
             assert_eq!(status_of(&resp), 400, "{bad} → {resp}");
         }
+        // Nor can a tenant reach one through a namespace route, and a
+        // tenant id with a reserved prefix is refused outright.
+        let shard_route = v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/_shard-0001/search",
+            serde_json::json!({"query_text": "x"}),
+        );
+        assert_eq!(status_of(&shard_route), 400, "{shard_route}");
+        let bad_tenant = create("_legacy", serde_json::json!({"namespace": "docs"}));
+        assert_eq!(status_of(&bad_tenant), 403, "{bad_tenant}");
         let not_json = route(
             "POST /v1/namespaces HTTP/1.1\r\n",
             &HashMap::new(),

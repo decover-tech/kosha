@@ -63,6 +63,111 @@ impl Tracked {
     }
 }
 
+/// LRU order of cache keys, kept both globally and per tenant, so the
+/// eviction policy can find one tenant's least recently used unpinned key
+/// by scanning only that tenant's own keys — a tenant whose keys are all
+/// pinned (a cold hydration batch in progress) or all recent never makes
+/// every eviction walk the whole pod's list.
+#[derive(Default)]
+struct Recency {
+    /// Oldest-touched (front) to most-recently-touched (back).
+    all: VecDeque<String>,
+    /// The same keys split by [`tenant_of_file_key`], in the same order.
+    by_tenant: HashMap<String, VecDeque<String>>,
+}
+
+impl Recency {
+    fn from_order(order: VecDeque<String>) -> Self {
+        let mut by_tenant: HashMap<String, VecDeque<String>> = HashMap::new();
+        for key in &order {
+            by_tenant
+                .entry(tenant_of_file_key(key).to_string())
+                .or_default()
+                .push_back(key.clone());
+        }
+        Self {
+            all: order,
+            by_tenant,
+        }
+    }
+
+    /// Move `key` to the most-recently-used end (adding it if new).
+    fn touch(&mut self, key: &str) {
+        remove_from(&mut self.all, key);
+        self.all.push_back(key.to_string());
+        let list = self
+            .by_tenant
+            .entry(tenant_of_file_key(key).to_string())
+            .or_default();
+        remove_from(list, key);
+        list.push_back(key.to_string());
+    }
+
+    /// Drop `key`; true when it was present.
+    fn remove(&mut self, key: &str) -> bool {
+        if !remove_from(&mut self.all, key) {
+            return false;
+        }
+        let tenant = tenant_of_file_key(key);
+        if let Some(list) = self.by_tenant.get_mut(tenant) {
+            remove_from(list, key);
+            if list.is_empty() {
+                self.by_tenant.remove(tenant);
+            }
+        }
+        true
+    }
+
+    /// Keep only the keys for which `keep` returns true.
+    fn retain(&mut self, mut keep: impl FnMut(&String) -> bool) {
+        let mut dropped = Vec::new();
+        self.all.retain(|k| {
+            let kept = keep(k);
+            if !kept {
+                dropped.push(k.clone());
+            }
+            kept
+        });
+        for key in dropped {
+            let tenant = tenant_of_file_key(&key);
+            if let Some(list) = self.by_tenant.get_mut(tenant) {
+                remove_from(list, &key);
+                if list.is_empty() {
+                    self.by_tenant.remove(tenant);
+                }
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.all.clear();
+        self.by_tenant.clear();
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &String> {
+        self.all.iter()
+    }
+
+    /// `tenant`'s least recently used key that `pinned` does not hold.
+    fn oldest_unpinned_of(&self, tenant: &str, pinned: &HashMap<String, usize>) -> Option<&String> {
+        self.by_tenant
+            .get(tenant)?
+            .iter()
+            .find(|k| !pinned.contains_key(k.as_str()))
+    }
+}
+
+/// Remove the first occurrence of `key` from `list`; true when found.
+fn remove_from(list: &mut VecDeque<String>, key: &str) -> bool {
+    match list.iter().position(|k| k == key) {
+        Some(pos) => {
+            list.remove(pos);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Read-through cache for segment files.
 ///
 /// Tracks total cached bytes with an atomic counter (rather than walking the
@@ -83,7 +188,7 @@ pub struct Cache {
     eviction_generation: AtomicU64,
     /// Cache keys ordered oldest-touched (front) to most-recently-touched
     /// (back). Touched on both read and write.
-    recency: Mutex<VecDeque<String>>,
+    recency: Mutex<Recency>,
     /// Ref-counted set of keys currently in use by an in-flight operation
     /// (e.g. a hydration batch still writing later files for the same
     /// segment, or a request actively reading one) — see `pin`/`unpin`.
@@ -134,7 +239,7 @@ impl Cache {
             max_bytes,
             total_bytes: AtomicU64::new(total_bytes),
             eviction_generation: AtomicU64::new(0),
-            recency: Mutex::new(recency),
+            recency: Mutex::new(Recency::from_order(recency)),
             pinned: Mutex::new(HashMap::new()),
             tracked: Mutex::new(tracked),
             shares: RwLock::new(shares),
@@ -217,11 +322,7 @@ impl Cache {
 
     /// Move `key` to the most-recently-used end of the recency list.
     fn touch(&self, key: &str) {
-        let mut recency = self.recency.lock().unwrap();
-        if let Some(pos) = recency.iter().position(|k| k == key) {
-            recency.remove(pos);
-        }
-        recency.push_back(key.to_string());
+        self.recency.lock().unwrap().touch(key);
     }
 
     /// Mark `key` as in-use by an in-flight operation — `enforce_limit`
@@ -273,32 +374,33 @@ impl Cache {
         let pinned = self.pinned.lock().unwrap();
         let tracked = self.tracked.lock().unwrap();
         let usage = tracked.tenants.usage();
-        // One pass: each active tenant's least recently used unpinned key.
-        let mut oldest: HashMap<&str, &String> = HashMap::new();
-        let mut first_unpinned: Option<&String> = None;
-        for key in recency.iter() {
-            if pinned.contains_key(key.as_str()) {
-                continue;
-            }
-            first_unpinned.get_or_insert(key);
-            let tenant = tenant_of_file_key(key);
-            if usage.iter().any(|(t, _)| *t == tenant) {
-                oldest.entry(tenant).or_insert(key);
-                if oldest.len() == usage.len() {
-                    break;
-                }
-            }
-        }
-        let shares = self.shares.read().unwrap_or_else(|e| e.into_inner());
-        shares
-            .pick_victim(max, &usage, |tenant| {
-                oldest
-                    .get(tenant)
-                    .map(|key| tracked.sizes.get(key.as_str()).copied().unwrap_or(0))
+        // Each active tenant's least recently used unpinned key, from that
+        // tenant's own list: the scan stops at its first unpinned key, and
+        // a tenant with everything pinned costs only its own keys.
+        let oldest: HashMap<&str, &String> = usage
+            .iter()
+            .filter_map(|(tenant, _)| {
+                recency
+                    .oldest_unpinned_of(tenant, &pinned)
+                    .map(|key| (*tenant, key))
             })
-            .and_then(|tenant| oldest.get(tenant).copied())
-            .or(first_unpinned)
-            .cloned()
+            .collect();
+        let shares = self.shares.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(tenant) = shares.pick_victim(max, &usage, |tenant| {
+            oldest
+                .get(tenant)
+                .map(|key| tracked.sizes.get(key.as_str()).copied().unwrap_or(0))
+        }) {
+            return oldest.get(tenant).map(|key| (*key).clone());
+        }
+        // No tenant holding bytes has anything evictable: fall back to the
+        // least recently used unpinned key overall (say, an untracked
+        // zero-byte file).
+        let fallback = recency
+            .iter()
+            .find(|k| !pinned.contains_key(k.as_str()))
+            .cloned();
+        fallback
     }
 
     /// Evict unpinned files until `total_bytes` is within bound, choosing
@@ -355,12 +457,20 @@ impl Cache {
     /// had to hydrate them), so per-tenant hit rates cover the paths that
     /// check the disk directly instead of calling [`Self::get`].
     pub fn record_lookup(&self, tenant: &str, hit: bool) {
-        let mut tracked = self.tracked.lock().unwrap();
-        if hit {
-            tracked.tenants.hit(tenant);
-        } else {
-            tracked.tenants.miss(tenant);
+        let (hits, misses) = if hit { (1, 0) } else { (0, 1) };
+        self.record_lookups(tenant, hits, misses);
+    }
+
+    /// Count `hits` and `misses` lookups for `tenant` at once (for example
+    /// every segment of a warm search whose cached hydration verdict says
+    /// its scoring files are all local).
+    pub fn record_lookups(&self, tenant: &str, hits: u64, misses: u64) {
+        if hits == 0 && misses == 0 {
+            return;
         }
+        let mut tracked = self.tracked.lock().unwrap();
+        tracked.tenants.hits(tenant, hits);
+        tracked.tenants.misses(tenant, misses);
     }
 
     /// True when a segment directory (or file) is already present locally.
@@ -517,8 +627,7 @@ impl Cache {
                 continue;
             };
             let rel = rel.to_string_lossy().replace('\\', "/");
-            if let Some(pos) = recency.iter().position(|k| *k == rel) {
-                recency.remove(pos);
+            if recency.remove(&rel) {
                 freed += tracked.forget(&rel);
             }
         }
@@ -1107,6 +1216,56 @@ mod tests {
         // The most recently used part of B's set survived.
         let rate = repeat_pass_hit_rate(&cache, &warm[30..]);
         assert_eq!(rate, 1.0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A tenant whose keys are all pinned (its cold hydration batch is in
+    /// progress) holds most of a large cache. Every eviction must still
+    /// pick the other tenant's oldest unpinned key, and each tenant's own
+    /// recency list must stay in step with the global one.
+    #[test]
+    fn eviction_with_one_tenant_fully_pinned_picks_from_the_other() {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-cache-tenant-pinned-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let cache = Cache::with_tenant_shares(dir.clone(), Some(50_000), TenantShares::new(0));
+        let pinned: Vec<String> = (0..2_000)
+            .map(|i| format!("acme/cold/seg-{}/f{i}.bin", i / 100))
+            .collect();
+        for key in &pinned {
+            cache.pin(key);
+            cache.put_bytes(key, &[0u8; 10]).unwrap();
+        }
+        // acme: 20,000 bytes, all pinned. beta streams past the bound.
+        for i in 0..5_000 {
+            cache
+                .put_bytes(&format!("beta/docs/seg-{}/f{i}.bin", i / 100), &[0u8; 10])
+                .unwrap();
+        }
+        assert!(cache.total_size() <= 50_000);
+        assert_eq!(cache.tenant_bytes("acme"), 20_000, "pins hold");
+        assert_eq!(cache.tenant_bytes("beta"), 30_000);
+        // beta lost its oldest files, kept its newest.
+        assert!(cache.get("beta/docs/seg-0/f0.bin").is_none());
+        assert!(cache.get("beta/docs/seg-49/f4999.bin").is_some());
+        {
+            let recency = cache.recency.lock().unwrap();
+            let per_tenant: usize = recency.by_tenant.values().map(VecDeque::len).sum();
+            assert_eq!(per_tenant, recency.all.len());
+            assert_eq!(recency.by_tenant["acme"].len(), 2_000);
+        }
+        for key in &pinned {
+            cache.unpin(key);
+        }
+        // Once unpinned, a third tenant's write is paid for by beta, which
+        // is over its share, not by the larger-but-under-share acme.
+        cache
+            .put_bytes("gamma/docs/seg/new.bin", &[0u8; 10])
+            .unwrap();
+        assert_eq!(cache.tenant_bytes("acme"), 20_000);
+        assert_eq!(cache.tenant_bytes("beta"), 29_990);
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -48,17 +48,40 @@ pub fn tenant_of_segment_dir(key: &str) -> &str {
     }
 }
 
+/// Suffix of a per-file span-cache directory (`{file}.spans/`), mirrored
+/// from `kosha_segment::span_cache::SPANS_SUFFIX`.
+const SPANS_SUFFIX: &str = ".spans";
+
 /// The tenant of a segment file key, `{namespace}/{segment}/{file}` — the
 /// shape of every disk-cache key and S3 object path under a namespace.
-/// Anything shorter has no namespace and is [`LEGACY_TENANT`].
+/// A span-cache file, `{namespace}/{segment}/{file}.spans/{span}`, belongs
+/// to the same namespace as `{file}`. Anything shorter has no namespace and
+/// is [`LEGACY_TENANT`].
 pub fn tenant_of_file_key(key: &str) -> &str {
-    let key = key.trim_matches('/');
+    let mut key = key.trim_matches('/');
+    // Strip the span name so `{file}.spans` takes the file's place.
+    if let Some((parent, _span)) = key.rsplit_once('/') {
+        let dir = parent.rsplit_once('/').map_or(parent, |(_, d)| d);
+        if dir.len() > SPANS_SUFFIX.len() && dir.ends_with(SPANS_SUFFIX) {
+            key = parent;
+        }
+    }
     let mut parts = key.rsplitn(3, '/');
     let (Some(_file), Some(_segment), Some(namespace)) = (parts.next(), parts.next(), parts.next())
     else {
         return LEGACY_TENANT;
     };
     tenant_of_namespace(namespace)
+}
+
+/// True for a tenant id, or a tenant-supplied namespace or branch name,
+/// that would be mistaken for an internal or legacy layout: a leading `_`
+/// (shard components such as `_shard-0001`, internal prefixes) or `.`.
+/// Stored as `<tenant>/_shard-NNNN`, a tenant's namespace would be
+/// accounted to [`LEGACY_TENANT`], taking it out of its own cache share and
+/// hydration cap, so such names are reserved.
+pub fn is_reserved_name(name: &str) -> bool {
+    name.starts_with('_') || name.starts_with('.')
 }
 
 fn is_shard_component(component: &str) -> bool {
@@ -254,6 +277,20 @@ impl TenantLedger {
         self.entry(tenant).misses += 1;
     }
 
+    /// Count `n` hits at once (no-op for zero).
+    pub fn hits(&mut self, tenant: &str, n: u64) {
+        if n > 0 {
+            self.entry(tenant).hits += n;
+        }
+    }
+
+    /// Count `n` misses at once (no-op for zero).
+    pub fn misses(&mut self, tenant: &str, n: u64) {
+        if n > 0 {
+            self.entry(tenant).misses += n;
+        }
+    }
+
     pub fn evicted(&mut self, tenant: &str) {
         self.entry(tenant).evictions += 1;
     }
@@ -308,6 +345,26 @@ mod tests {
             LEGACY_TENANT
         );
         assert_eq!(tenant_of_file_key("first"), LEGACY_TENANT);
+        // Span-cache files sit one level below their file.
+        assert_eq!(
+            tenant_of_file_key("docs/seg/doc_store.bin.spans/0-10"),
+            LEGACY_TENANT
+        );
+        assert_eq!(
+            tenant_of_file_key("docs/_shard-0001/seg/x.spans/0-10"),
+            LEGACY_TENANT
+        );
+        assert_eq!(
+            tenant_of_file_key("acme/docs/seg/doc_store.bin.spans/0-10"),
+            "acme"
+        );
+        assert_eq!(
+            tenant_of_file_key("acme/docs/_shard-0001/seg/postings-00.bin.spans/0-10"),
+            "acme"
+        );
+        assert!(is_reserved_name("_shard-0001"));
+        assert!(is_reserved_name(".x"));
+        assert!(!is_reserved_name("docs"));
         assert_eq!(tenant_of_segment_dir("acme/docs/seg-1"), "acme");
         assert_eq!(tenant_of_segment_dir("docs/seg-1"), LEGACY_TENANT);
     }

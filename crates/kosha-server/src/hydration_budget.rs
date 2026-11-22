@@ -29,7 +29,10 @@
 //! component of each object's namespace), with a per-tenant cap
 //! (`KOSHA_HYDRATE_TENANT_MAX_INFLIGHT_BYTES`, by default half the global
 //! budget), so one tenant's cold start cannot hold all of the pod's S3
-//! bandwidth while another tenant's fetches wait behind it.
+//! bandwidth while another tenant's fetches wait behind it. The cap is
+//! work-conserving: it binds only while some other tenant holds or waits
+//! for budget, so a single-tenant pod (or one serving only pre-#262 bare
+//! namespaces, which all share `_legacy`) keeps the whole budget.
 //!
 //! [`RequestHydration`] is the per-request half: a running total that lets a
 //! request whose hydration set is absurd stop and shed (HTTP 429) instead of
@@ -83,6 +86,34 @@ struct BudgetState {
     /// In-flight bytes and permits per tenant; a tenant leaves the map
     /// when its last permit drops.
     tenants: HashMap<String, TenantInFlight>,
+    /// Fetches blocked in [`HydrationBudget::acquire`], per tenant; a
+    /// tenant leaves the map when its last waiter is admitted or gives up.
+    waiting: HashMap<String, usize>,
+}
+
+impl BudgetState {
+    /// Whether a tenant other than `tenant` holds a permit.
+    fn other_tenant_holding(&self, tenant: &str) -> bool {
+        self.tenants.keys().any(|t| t != tenant)
+    }
+
+    /// Whether a tenant other than `tenant` is waiting for budget.
+    fn other_tenant_waiting(&self, tenant: &str) -> bool {
+        self.waiting.keys().any(|t| t != tenant)
+    }
+
+    fn add_waiter(&mut self, tenant: &str) {
+        *self.waiting.entry(tenant.to_string()).or_insert(0) += 1;
+    }
+
+    fn remove_waiter(&mut self, tenant: &str) {
+        if let Some(n) = self.waiting.get_mut(tenant) {
+            *n -= 1;
+            if *n == 0 {
+                self.waiting.remove(tenant);
+            }
+        }
+    }
 }
 
 /// Process-wide cap on hydration bytes in flight at once.
@@ -109,6 +140,7 @@ impl HydrationBudget {
                 in_flight: 0,
                 holders: 0,
                 tenants: HashMap::new(),
+                waiting: HashMap::new(),
             }),
             cv: Condvar::new(),
             capacity: capacity.max(1),
@@ -132,9 +164,17 @@ impl HydrationBudget {
     /// must degrade to "fetched alone", never to "never fetched". The same
     /// rule applies per tenant: a tenant with nothing in flight is never
     /// held back by its own cap, only by the global one.
+    ///
+    /// The tenant cap is work-conserving: it is waived while no other
+    /// tenant holds or waits for budget (there is nobody to protect), and a
+    /// single object larger than the cap itself — which could otherwise
+    /// only ever be admitted with its tenant's in-flight count at zero,
+    /// racing that tenant's own smaller fetches — is waived while no other
+    /// tenant is waiting.
     pub fn acquire(self: &Arc<Self>, tenant: &str, bytes: u64) -> Option<BudgetPermit> {
         let deadline = Instant::now() + self.wait_timeout;
         let mut st = self.state.lock().unwrap();
+        let mut registered = false;
         loop {
             let fits = st.in_flight.saturating_add(bytes) <= self.capacity;
             let (tenant_bytes, tenant_holders) = st
@@ -142,7 +182,15 @@ impl HydrationBudget {
                 .get(tenant)
                 .map_or((0, 0), |t| (t.bytes, t.holders));
             let tenant_fits = tenant_bytes.saturating_add(bytes) <= self.tenant_capacity;
-            if (fits || st.holders == 0) && (tenant_fits || tenant_holders == 0) {
+            let others_waiting = st.other_tenant_waiting(tenant);
+            let tenant_ok = tenant_fits
+                || tenant_holders == 0
+                || !(others_waiting || st.other_tenant_holding(tenant))
+                || (bytes > self.tenant_capacity && !others_waiting);
+            if (fits || st.holders == 0) && tenant_ok {
+                if registered {
+                    st.remove_waiter(tenant);
+                }
                 st.in_flight = st.in_flight.saturating_add(bytes);
                 st.holders += 1;
                 let t = st.tenants.entry(tenant.to_string()).or_default();
@@ -156,7 +204,18 @@ impl HydrationBudget {
             }
             let now = Instant::now();
             if now >= deadline {
+                if registered {
+                    st.remove_waiter(tenant);
+                    drop(st);
+                    // Our wait may have been what held another tenant's
+                    // fetch to its cap.
+                    self.cv.notify_all();
+                }
                 return None;
+            }
+            if !registered {
+                st.add_waiter(tenant);
+                registered = true;
             }
             let (guard, _timeout) = self.cv.wait_timeout(st, deadline - now).unwrap();
             st = guard;
@@ -374,13 +433,14 @@ mod tests {
             50,
             Duration::from_millis(50),
         ));
+        // The cap binds only while another tenant is present.
+        let b = budget.acquire("beta", 50).expect("B is admitted at once");
         let a1 = budget.acquire("acme", 40).expect("under A's cap");
         assert!(
             budget.acquire("acme", 20).is_none(),
             "40 + 20 is over A's cap of 50 though the pod has room"
         );
         assert_eq!(budget.tenant_in_flight("acme"), 40);
-        let b = budget.acquire("beta", 50).expect("B is admitted at once");
         assert_eq!(budget.in_flight(), 90);
         assert_eq!(budget.tenant_in_flight("beta"), 50);
         // Anti-starvation per tenant: alone in its tenant, an object larger
@@ -394,6 +454,59 @@ mod tests {
         assert_eq!(budget.tenant_in_flight("acme"), 0);
     }
 
+    /// The default config's tenant cap (half the budget) must not halve a
+    /// single-tenant pod's hydration bandwidth: alone, a tenant may use the
+    /// whole budget.
+    #[test]
+    fn a_lone_tenant_may_use_the_whole_budget() {
+        let budget = Arc::new(HydrationBudget::with_tenant_cap(
+            100,
+            50,
+            Duration::from_millis(50),
+        ));
+        let a = budget.acquire("_legacy", 60).expect("first fits");
+        let b = budget
+            .acquire("_legacy", 30)
+            .expect("60 + 30 is over the tenant cap, but nobody else wants budget");
+        assert_eq!(budget.in_flight(), 90);
+        drop(a);
+        drop(b);
+        assert_eq!(budget.in_flight(), 0);
+    }
+
+    /// An object larger than the tenant cap (a 600 MB doc_store.bin under
+    /// a 512 MiB cap) is admitted while its tenant has smaller fetches in
+    /// flight, as long as it fits globally and no other tenant is waiting.
+    #[test]
+    fn an_object_over_the_tenant_cap_is_admitted_beside_its_tenants_small_fetches() {
+        let budget = Arc::new(HydrationBudget::with_tenant_cap(
+            1_000,
+            500,
+            Duration::from_millis(50),
+        ));
+        let small = budget.acquire("acme", 100).unwrap();
+        let big = budget
+            .acquire("acme", 600)
+            .expect("fits globally, nobody else present");
+        assert_eq!(budget.tenant_in_flight("acme"), 700);
+        drop(big);
+        // With another tenant holding (but not waiting), the oversized
+        // object is still admitted: it can never fit under the cap.
+        let beta = budget.acquire("beta", 100).unwrap();
+        let big = budget
+            .acquire("acme", 600)
+            .expect("oversized, nobody waiting");
+        drop(big);
+        // A small fetch over the cap waits while another tenant holds.
+        let mid = budget.acquire("acme", 300).unwrap();
+        assert!(
+            budget.acquire("acme", 200).is_none(),
+            "100 + 300 + 200 is over A's cap while B is present"
+        );
+        drop((small, mid, beta));
+        assert_eq!(budget.in_flight(), 0);
+    }
+
     /// A tenant waiting on its own cap is admitted as soon as its earlier
     /// fetch finishes, and never sees more than its cap in flight.
     #[test]
@@ -403,6 +516,8 @@ mod tests {
             50,
             Duration::from_secs(5),
         ));
+        // Another tenant is present, so A's cap binds.
+        let _other = budget.acquire("beta", 10).unwrap();
         let held = budget.acquire("acme", 40).unwrap();
         let b2 = Arc::clone(&budget);
         let handle = std::thread::spawn(move || {
@@ -414,7 +529,11 @@ mod tests {
         assert_eq!(budget.tenant_in_flight("acme"), 40, "still waiting");
         drop(held);
         handle.join().unwrap();
-        assert_eq!(budget.in_flight(), 0);
+        assert_eq!(
+            budget.in_flight(),
+            10,
+            "only the other tenant's permit is left"
+        );
     }
 
     #[test]
