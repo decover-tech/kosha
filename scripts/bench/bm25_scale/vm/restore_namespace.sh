@@ -57,6 +57,9 @@ else
   SRC="$SNAP/segments/$NS"
 fi
 echo "restoring '$NS' as '$SCOPED' from $SRC"
+# The CLI default of 10 concurrent requests made the 52,600-object vector
+# snapshot copy take ~20 min (server-side copies, so the VM is not the limit).
+aws configure set default.s3.max_concurrent_requests "${RESTORE_S3_CONCURRENCY:-128}"
 if [ "$KEEP_BUCKET" = 0 ]; then
   # A different snapshot of this namespace may be in the bucket (reused
   # stack). sync neither deletes extra objects nor reliably replaces
