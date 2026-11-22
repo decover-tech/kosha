@@ -71,10 +71,12 @@ fn call(state: &AppState, line: &str, body: serde_json::Value) -> (u16, serde_js
     );
     let status: u16 = response[9..12].parse().unwrap();
     let body = &response[response.find("\r\n\r\n").unwrap() + 4..];
-    (
-        status,
-        serde_json::from_str(body).unwrap_or(serde_json::Value::Null),
-    )
+    let mut body: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+    // Differs per request by design; the tests compare everything else.
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("request_id");
+    }
+    (status, body)
 }
 
 fn schema(model: &str, dims: u32) -> serde_json::Value {

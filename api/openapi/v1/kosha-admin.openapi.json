@@ -9,7 +9,35 @@
         "description": "The body of every non-2xx JSON response, on every route (ADR-350 §b).\nSee docs/api/errors.md for the code table.",
         "properties": {
           "code": {
-            "description": "The stable machine-readable error code.",
+            "description": "The stable machine-readable error code; docs/api/errors.md lists\nthem. Clients treat an unknown code by its HTTP status and\n`retryable`: codes are added without a new API version.",
+            "enum": [
+              "invalid_argument",
+              "invalid_query",
+              "unauthenticated",
+              "payment_required",
+              "permission_denied",
+              "namespace_quota_exceeded",
+              "doc_quota_exceeded",
+              "vector_dims_exceeded",
+              "not_found",
+              "namespace_not_found",
+              "method_not_allowed",
+              "request_timeout",
+              "already_exists",
+              "conflict",
+              "write_conflict",
+              "legacy_route_disabled",
+              "payload_too_large",
+              "tenant_qps_exceeded",
+              "tenant_concurrency_exceeded",
+              "tenant_write_rate_exceeded",
+              "tenant_queue_full",
+              "overloaded",
+              "internal",
+              "not_implemented",
+              "upstream_error",
+              "unavailable"
+            ],
             "type": "string"
           },
           "details": {
@@ -64,7 +92,7 @@
   "info": {
     "description": "The operator API. Every route needs the admin credential (KOSHA_ADMIN_API_KEY) as `Authorization: Bearer <key>` or `X-Api-Key: <key>`. Beta: bodies are free-form JSON objects.",
     "title": "Kosha Admin API",
-    "version": "0.9.0"
+    "version": "0.10.0"
   },
   "openapi": "3.0.3",
   "paths": {

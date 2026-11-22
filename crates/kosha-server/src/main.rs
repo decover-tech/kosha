@@ -33,6 +33,7 @@ fn namespace_tenant(ns: &str) -> Option<&str> {
 /// credentials. Operator traffic is never tenant-limited (#341).
 const SERVICE_TENANT: &str = "service";
 
+mod api_error;
 mod api_key_admin;
 #[cfg(test)]
 mod api_spec_tests;
@@ -91,6 +92,7 @@ mod writer_lease;
 #[cfg(test)]
 mod writer_lease_tests;
 
+use api_error::{api_error, api_error_status, ApiError, ErrorCode};
 #[cfg(feature = "s3")]
 use hydration_budget::{HydrationBudget, RequestHydration};
 use kosha_cache::Cache;
@@ -1057,27 +1059,21 @@ fn rebase_backoff(attempt: u32) -> Duration {
 /// writer caused (and a rebase could not resolve) is a 409 the client can
 /// retry; anything else is a server error.
 fn publication_error(context: &str, error: &KoshaError) -> String {
-    let status = match error {
-        KoshaError::ManifestConflict { .. } => 409,
+    let message = format!("{context}: {error}");
+    match error {
+        KoshaError::ManifestConflict { .. } => api_error(ErrorCode::WriteConflict, &message),
         // Another writer owns the namespace (#254): retry, by when its
         // lease would have lapsed, against whichever pod owns it now.
         KoshaError::Fenced { .. } => {
             let ttl =
                 writer_lease::ttl_from(std::env::var("KOSHA_WRITER_LEASE_TTL_MS").ok().as_deref());
-            return retry_after(
-                json_error(503, &format!("{context}: {error}")),
-                ttl.as_secs().max(1),
-            );
+            ApiError::new(ErrorCode::Unavailable, message)
+                .detail("reason", "writer_lease")
+                .retry_after(ttl.max(Duration::from_secs(1)))
+                .into_raw()
         }
-        _ => 500,
-    };
-    json_error(status, &format!("{context}: {error}"))
-}
-
-/// Add a `Retry-After` header to a ready-made response, right after its
-/// status line.
-fn retry_after(response: String, secs: u64) -> String {
-    with_header(response, "retry-after", &secs.to_string())
+        _ => api_error(ErrorCode::Internal, &message),
+    }
 }
 
 /// Add one header to a ready-made response, right after its status line.
@@ -2199,10 +2195,10 @@ impl AppState {
 
     /// 503 + `Retry-After` for a write this writer may not make.
     fn write_refusal(&self, error: &KoshaError) -> String {
-        retry_after(
-            json_error(503, &format!("write refused: {error}")),
-            self.writer_leases.retry_after_secs(),
-        )
+        ApiError::new(ErrorCode::Unavailable, format!("write refused: {error}"))
+            .detail("reason", "writer_lease")
+            .retry_after(Duration::from_secs(self.writer_leases.retry_after_secs()))
+            .into_raw()
     }
 
     /// Another writer owns `ns` (#254). Stop accepting writes for it and
@@ -5799,13 +5795,22 @@ fn serve(listener: TcpListener, state: Arc<AppState>, io_timeout: Duration) {
 /// Handle one parsed request: probes, the dashboard, authentication, role
 /// routing, then [`route`]. Synchronous; the HTTP server (`http.rs`) has
 /// already enforced the body-size cap and read the body.
+///
+/// Every response, success or error, carries `X-Request-Id` (the caller's,
+/// sanitized, or a generated one) and `Kosha-Api-Version` (#350).
 fn dispatch(state: &AppState, request: http::Request) -> http::Response {
+    let request_id =
+        api_error::begin_request(request.headers.get("x-request-id").map(String::as_str));
+    dispatch_request(state, request)
+        .with_header("x-request-id", &request_id)
+        .with_header("kosha-api-version", api_error::API_VERSION)
+}
+
+fn dispatch_request(state: &AppState, request: http::Request) -> http::Response {
     let started = Instant::now();
     let request_line = request.request_line();
     let headers = request.headers;
     let body = request.body;
-
-    set_request_id(headers.get("x-request-id").map(String::as_str));
 
     // Liveness/readiness probes hit this with no Authorization header (k8s
     // httpGet probes don't support that out of the box) — must stay
@@ -5862,7 +5867,7 @@ fn dispatch(state: &AppState, request: http::Request) -> http::Response {
             let (method, path) = parse_method_and_path(&request_line).unwrap_or(("", ""));
             match authz::authorize(&principal, method, path, &body) {
                 Ok(()) => Ok(principal.tenant),
-                Err(message) => Err(json_error_body(403, &message)),
+                Err(message) => Err(api_error(ErrorCode::PermissionDenied, &message)),
             }
         })
     };
@@ -5912,8 +5917,8 @@ fn dispatch_authenticated(
         (Ok(_), _, _)
             if state.role == role::Role::Indexer && !role::Role::indexer_serves(request_line) =>
         {
-            http::Response::from_raw(json_error(
-                404,
+            http::Response::from_raw(api_error(
+                ErrorCode::NotFound,
                 "not served by an indexer pod (KOSHA_ROLE=indexer): it serves only \
                  /v1/admin/compact* and /v1/admin/compaction-*",
             ))
@@ -5954,31 +5959,12 @@ fn dispatch_authenticated(
     response
 }
 
-thread_local! {
-    /// " rid=<id>" for the request this connection thread is serving, or
-    /// empty. A caller's `X-Request-Id` on every log line of its request
-    /// lets one slow or failed request be found in the pod log.
-    static REQUEST_ID: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
-}
-
-fn set_request_id(header: Option<&str>) {
-    let id: String = header
-        .unwrap_or("")
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-        .take(64)
-        .collect();
-    REQUEST_ID.with(|r| {
-        *r.borrow_mut() = if id.is_empty() {
-            id
-        } else {
-            format!(" rid={id}")
-        }
-    });
-}
-
+/// `" rid=<id>"` for log lines of the request this thread is serving: a
+/// caller's `X-Request-Id` (or the generated one, which every response
+/// echoes) on every log line lets one slow or failed request be found in
+/// the pod log. See [`api_error::begin_request`].
 fn request_id() -> String {
-    REQUEST_ID.with(|r| r.borrow().clone())
+    api_error::log_rid()
 }
 
 /// Every cache's per-tenant figures for `kosha_cache_*` (#342).
@@ -6009,11 +5995,11 @@ fn cache_tenant_samples(state: &AppState) -> Vec<metrics::CacheTenantSample> {
 /// `KOSHA_METRICS_AUTH=admin` requires the admin credential (403 without).
 fn handle_metrics(state: &AppState, headers: &HashMap<String, String>) -> String {
     match state.metrics.config.exposure {
-        metrics::Exposure::Off => return json_error(404, "not found"),
+        metrics::Exposure::Off => return api_error(ErrorCode::NotFound, "not found"),
         metrics::Exposure::Admin
             if !service_authorized(headers, state.admin_auth_key.as_deref()) =>
         {
-            return json_error(403, "admin credential required");
+            return api_error(ErrorCode::PermissionDenied, "admin credential required");
         }
         _ => {}
     }
@@ -6087,8 +6073,9 @@ fn is_search_route(request_line: &str) -> bool {
     )
 }
 
-/// The 429 for a request refused by a tenant limit: `Retry-After` plus a
-/// JSON body `{error, reason, limit, retry_after_ms}`. Counted in
+/// The response for a request refused by a tenant limit (#341, #350): its
+/// code (429 for a rate, 403 for a quota, 413 for the body cap), plus the
+/// deprecated `reason` and `limit` aliases. Counted in
 /// `kosha_tenant_rejections_total`.
 fn tenant_rejection(
     state: &AppState,
@@ -6098,21 +6085,25 @@ fn tenant_rejection(
     state
         .metrics
         .record_tenant_rejection(rejection.reason, tenant);
+    let code = rejection.reason.code();
     eprintln!(
-        "WARN: request refused: status=429 tenant={tenant} reason={} limit={} retry_after_ms={}{}",
+        "WARN: request refused: status={} tenant={tenant} reason={} limit={}{}",
+        code.status(),
         rejection.reason.as_str(),
         rejection.limit,
-        rejection.retry_after_ms,
         request_id()
     );
-    let body = rejection.body().to_string();
-    retry_after(
-        format!(
-            "HTTP/1.1 429 Too Many Requests\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{body}",
-            body.len()
-        ),
-        rejection.retry_after_secs(),
-    )
+    let limit = rejection.limit_json();
+    let mut error = ApiError::new(code, rejection.reason.message())
+        .detail("limit", limit.clone())
+        .retry_after(Duration::from_millis(rejection.retry_after_ms))
+        // Deprecated aliases for clients of the pre-#350 body.
+        .alias("reason", rejection.reason.as_str())
+        .alias("limit", limit);
+    if code == ErrorCode::PayloadTooLarge {
+        error = error.detail("scope", "tenant");
+    }
+    error.into_raw()
 }
 
 /// The tenant whose limits apply to writes into `ns`, with its limits.
@@ -6365,24 +6356,14 @@ impl SearchObservation {
 /// carries `Retry-After` and a JSON body `{error, reason, retry_after_ms}`
 /// (#341). Not counted in `kosha_tenant_rejections_total`.
 fn overload_shed_response(reason: &str, message: &str) -> String {
-    let retry_after_ms = tenant_limits::QUEUE_SHED_RETRY_AFTER_MS;
-    eprintln!(
-        "WARN: request failed: status=429 reason={reason} {message}{}",
-        request_id()
-    );
-    let body = serde_json::json!({
-        "error": message,
-        "reason": reason,
-        "retry_after_ms": retry_after_ms,
-    })
-    .to_string();
-    retry_after(
-        format!(
-            "HTTP/1.1 429 Too Many Requests\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{body}",
-            body.len()
-        ),
-        retry_after_ms.div_ceil(1000).max(1),
-    )
+    ApiError::new(ErrorCode::Overloaded, message)
+        .detail("reason", reason)
+        .retry_after(Duration::from_millis(
+            tenant_limits::QUEUE_SHED_RETRY_AFTER_MS,
+        ))
+        // Deprecated alias for clients of the pre-#350 body.
+        .alias("reason", reason)
+        .into_raw()
 }
 
 /// Run one search handler and record its outcome and latency.
@@ -6465,14 +6446,20 @@ fn authenticate(headers: &HashMap<String, String>) -> Result<auth::Principal, St
     match api_key {
         Some(key) => match store.lookup(key) {
             Ok(principal) => Ok(principal),
-            Err(auth::Rejected::Unknown) => Err(json_error_body(401, "invalid API key")),
-            Err(auth::Rejected::Expired) => Err(json_error_body(401, "API key expired")),
+            Err(auth::Rejected::Unknown) => Err(unauthenticated("invalid API key")),
+            Err(auth::Rejected::Expired) => Err(unauthenticated("API key expired")),
         },
-        None => Err(json_error_body(
-            401,
+        None => Err(unauthenticated(
             "missing API key — use Authorization: Bearer <key> or X-Api-Key header",
         )),
     }
+}
+
+/// The 401 for a missing, unknown or expired key.
+fn unauthenticated(message: &str) -> String {
+    ApiError::new(ErrorCode::Unauthenticated, message)
+        .header("www-authenticate", "Bearer realm=\"kosha\"")
+        .into_raw()
 }
 
 /// True for every write-mutating route — the set a query pod forwards to
@@ -6515,14 +6502,20 @@ fn legacy_route(request_line: &str) -> Option<(&str, &'static str)> {
 }
 
 /// Forward a write-path request to the single ingest pod, verbatim, and
-/// relay its response back exactly as received. Used only by query-role
-/// pods (`AppState::ingest_host`/`write_http_client` are `None` on the
-/// ingest pod itself, which never calls this).
+/// relay its response back as received: status (with its correct reason
+/// phrase), body, and the headers that are part of the API contract
+/// ([`RELAYED_HEADERS`]: `Retry-After`, `X-Request-Id`, `Allow`, the
+/// deprecation headers, ...). Used only by query-role pods
+/// (`AppState::ingest_host`/`write_http_client` are `None` on the ingest
+/// pod itself, which never calls this). The request carries this pod's
+/// request id, so both pods log the same one.
 ///
-/// Single attempt, bounded timeout, no retry here — if the ingest pod is
-/// mid-`Recreate` restart this fails fast with a clear error; the caller's
-/// own retry logic (kosha_client's max_retries/retry_on_timeout) is what
-/// recovers, exactly as it would against a single pod restarting today.
+/// Single attempt, bounded timeout, no retry here: if the ingest pod is
+/// mid-`Recreate` restart this fails fast with a retryable `unavailable`
+/// (`details.reason: "ingest_unreachable"`), and a client retries on
+/// `retryable: true` after `Retry-After`. When the failure came after the
+/// request may have reached the ingest pod, `details.outcome` is
+/// `"unknown"`: the write may have been applied.
 fn forward_to_ingest(
     client: &reqwest::blocking::Client,
     ingest_host: &str,
@@ -6531,7 +6524,7 @@ fn forward_to_ingest(
     body: &[u8],
 ) -> String {
     let Some((method, path)) = parse_method_and_path(request_line) else {
-        return json_error(400, "malformed request line");
+        return api_error(ErrorCode::InvalidArgument, "malformed request line");
     };
 
     let url = format!("{}{}", ingest_host.trim_end_matches('/'), path);
@@ -6544,12 +6537,16 @@ fn forward_to_ingest(
     for (k, v) in headers {
         // Host/content-length are set by reqwest itself from the URL/body;
         // forwarding the original values would just be wrong for the new
-        // destination.
-        if k.eq_ignore_ascii_case("host") || k.eq_ignore_ascii_case("content-length") {
+        // destination. The request id is this pod's (below).
+        if k.eq_ignore_ascii_case("host")
+            || k.eq_ignore_ascii_case("content-length")
+            || k.eq_ignore_ascii_case("x-request-id")
+        {
             continue;
         }
         req = req.header(k, v);
     }
+    req = req.header("x-request-id", api_error::current_request_id());
     if !body.is_empty() {
         req = req.body(body.to_vec());
     }
@@ -6557,28 +6554,47 @@ fn forward_to_ingest(
     match req.send() {
         Ok(resp) => {
             let status = resp.status().as_u16();
-            // `Retry-After` is part of the 429/503 contract (#341): a
-            // client must see the same back-off through a query pod as
-            // from the ingest pod itself. Relayed only when it is the
-            // plain delay-seconds form the server itself emits.
-            let retry_after_secs = resp
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.trim().parse::<u64>().ok());
+            let relayed: Vec<(String, String)> = RELAYED_HEADERS
+                .iter()
+                .filter_map(|name| {
+                    let value = resp.headers().get(*name)?.to_str().ok()?;
+                    Some((name.to_string(), value.to_string()))
+                })
+                .collect();
             let upstream_body = resp.text().unwrap_or_default();
-            let response = raw_response(status, &upstream_body);
-            match retry_after_secs {
-                Some(secs) => retry_after(response, secs),
-                None => response,
-            }
+            relayed
+                .iter()
+                .fold(raw_response(status, &upstream_body), |out, (k, v)| {
+                    with_header(out, k, v)
+                })
         }
-        Err(e) => json_error(
-            503,
-            &format!("forward to ingest ({ingest_host}) failed: {e}"),
-        ),
+        Err(e) => {
+            let mut error = ApiError::new(
+                ErrorCode::Unavailable,
+                format!("forward to ingest ({ingest_host}) failed: {e}"),
+            )
+            .detail("reason", "ingest_unreachable");
+            // A connect failure never reached the ingest pod; anything later
+            // (a timeout, a reset) may have been applied there.
+            if !e.is_connect() {
+                error = error.detail("outcome", "unknown");
+            }
+            error.into_raw()
+        }
     }
 }
+
+/// Response headers a query pod relays from the ingest pod.
+const RELAYED_HEADERS: [&str; 8] = [
+    "retry-after",
+    "x-request-id",
+    "allow",
+    "deprecation",
+    "sunset",
+    "link",
+    "kosha-api-version",
+    "www-authenticate",
+];
 
 /// Parse `"METHOD /path HTTP/1.1\r\n"` into `("METHOD", "/path")`.
 fn parse_method_and_path(request_line: &str) -> Option<(&str, &str)> {
@@ -6638,11 +6654,11 @@ fn route(
     state: &AppState,
 ) -> String {
     let Some((method, path)) = parse_method_and_path(request_line) else {
-        return json_error(400, "invalid request line");
+        return api_error(ErrorCode::InvalidArgument, "invalid request line");
     };
     if path.starts_with("/v1/admin/") {
         if !service_authorized(headers, state.admin_auth_key.as_deref()) {
-            return json_error(403, "admin credential required");
+            return api_error(ErrorCode::PermissionDenied, "admin credential required");
         }
         if let Some(response) = unrouted_v1(method, path) {
             return response;
@@ -6661,18 +6677,21 @@ fn route(
         // roles. A request that names a user must not reach one: it would
         // run with the operator's powers (a key for any tenant, gc, ...).
         if org_admin::names_actor(headers) {
-            return json_error(
-                403,
+            return api_error(
+                ErrorCode::PermissionDenied,
                 "this route is operator-only: it cannot be called with an 'x-kosha-actor' header",
             );
         }
     } else if path.starts_with("/internal/") {
         if !service_authorized(headers, state.internal_service_key.as_deref()) {
-            return json_error(403, "internal service credential required");
+            return api_error(
+                ErrorCode::PermissionDenied,
+                "internal service credential required",
+            );
         }
     } else {
         if !valid_name_component(tenant) {
-            return json_error(403, "invalid tenant");
+            return api_error(ErrorCode::PermissionDenied, "invalid tenant");
         }
         if let Some(rest) = path.strip_prefix("/v1/namespaces/") {
             // `/v1/namespaces/{ns}/{action}`, or the bare
@@ -6682,18 +6701,14 @@ fn route(
                 None => rest.split('?').next().unwrap_or(rest),
             };
             if !valid_namespace_component(&url_decode(ns)) {
-                return json_error(400, "invalid namespace");
+                return api_error(ErrorCode::InvalidArgument, "invalid namespace");
             }
         }
         let bare_path = path.split('?').next().unwrap_or(path);
         let is_legacy = legacy_route(request_line).is_some();
         if is_legacy {
             if !auth::legacy_routes_enabled() {
-                return json_error(
-                    410,
-                    "unversioned routes are disabled (KOSHA_LEGACY_ROUTES=off); \
-                     use /v1/namespaces/{ns}/...",
-                );
+                return legacy_route_disabled(bare_path);
             }
             auth::record_legacy_use(tenant, bare_path);
         }
@@ -6701,7 +6716,7 @@ fn route(
             return if service_authorized(headers, state.admin_auth_key.as_deref()) {
                 handle_stats(state)
             } else {
-                json_error(403, "use namespace-scoped stats")
+                api_error(ErrorCode::PermissionDenied, "use namespace-scoped stats")
             };
         }
         if method == "POST"
@@ -6712,13 +6727,16 @@ fn route(
         {
             let mut value: serde_json::Value = match serde_json::from_slice(body) {
                 Ok(v) => v,
-                Err(_) => return json_error(400, "invalid JSON"),
+                Err(_) => return api_error(ErrorCode::InvalidArgument, "invalid JSON"),
             };
             let Some(ns) = value.get("namespace").and_then(|v| v.as_str()) else {
-                return json_error(400, "missing namespace");
+                return api_error(ErrorCode::InvalidArgument, "missing namespace");
             };
             if !valid_namespace_component(ns) {
-                return json_error(400, "invalid namespace; use an unqualified namespace name");
+                return api_error(
+                    ErrorCode::InvalidArgument,
+                    "invalid namespace; use an unqualified namespace name",
+                );
             }
             value["namespace"] = serde_json::json!(tenant_namespace(tenant, ns));
             return route_inner(
@@ -6731,18 +6749,18 @@ fn route(
         }
         if method == "GET" && bare_path == "/search" {
             let Some((_, query)) = path.split_once('?') else {
-                return json_error(400, "missing query parameters");
+                return api_error(ErrorCode::InvalidArgument, "missing query parameters");
             };
             let mut pairs = Vec::new();
             let mut found = false;
             for pair in query.split('&') {
                 if let Some(raw) = pair.strip_prefix("ns=") {
                     if found {
-                        return json_error(400, "duplicate namespace");
+                        return api_error(ErrorCode::InvalidArgument, "duplicate namespace");
                     }
                     let ns = url_decode(raw);
                     if !valid_namespace_component(&ns) {
-                        return json_error(400, "invalid namespace");
+                        return api_error(ErrorCode::InvalidArgument, "invalid namespace");
                     }
                     // The original escaped component is preserved; tenant names
                     // are escaped too so they cannot inject query parameters.
@@ -6755,7 +6773,7 @@ fn route(
                 }
             }
             if !found {
-                return json_error(400, "missing ns");
+                return api_error(ErrorCode::InvalidArgument, "missing ns");
             }
             let scoped = format!("GET /search?{} HTTP/1.1", pairs.join("&"));
             return route_inner(&scoped, headers, body, tenant, state);
@@ -6765,7 +6783,7 @@ fn route(
                 return response;
             }
         } else if bare_path != "/healthz" {
-            return json_error(404, "not found");
+            return api_error(ErrorCode::NotFound, "not found");
         }
     }
     route_inner(request_line, headers, body, tenant, state)
@@ -6780,17 +6798,46 @@ fn unrouted_v1(method: &str, path: &str) -> Option<String> {
     }
     let allowed = routes::allowed_methods(path);
     if allowed.is_empty() {
-        return Some(json_error(404, "not found"));
+        return Some(api_error(ErrorCode::NotFound, "not found"));
     }
     let allow = allowed.join(", ");
-    Some(with_header(
-        json_error(
-            405,
-            &format!("method {method} is not allowed on this path (allowed: {allow})"),
+    Some(
+        ApiError::new(
+            ErrorCode::MethodNotAllowed,
+            format!("method {method} is not allowed on this path (allowed: {allow})"),
+        )
+        .detail("allowed", allowed)
+        .header("allow", &allow)
+        .into_raw(),
+    )
+}
+
+/// The `/v1` route that replaces a legacy unversioned one.
+fn legacy_replacement(path: &str) -> &'static str {
+    match path {
+        "/index" => "POST /v1/namespaces/{namespace}/documents",
+        "/replace" => "POST /v1/namespaces/{namespace}/replace",
+        "/exists" => "POST /v1/namespaces/{namespace}/exists",
+        "/search" => "POST /v1/namespaces/{namespace}/search",
+        "/flush" => "POST /v1/namespaces/{namespace}/flush",
+        "/delete" => "POST /v1/namespaces/{namespace}/delete",
+        "/stats" => "GET /v1/namespaces/{namespace}/stats",
+        _ => "/v1/namespaces/{namespace}/...",
+    }
+}
+
+/// The 410 for a legacy route that is off for the caller.
+fn legacy_route_disabled(path: &str) -> String {
+    let replacement = legacy_replacement(path);
+    ApiError::new(
+        ErrorCode::LegacyRouteDisabled,
+        format!(
+            "unversioned route {path} is disabled (KOSHA_LEGACY_ROUTES=off); use {replacement}"
         ),
-        "allow",
-        &allow,
-    ))
+    )
+    .detail("route", path)
+    .detail("replacement", replacement)
+    .into_raw()
 }
 
 fn route_inner(
@@ -6951,7 +6998,7 @@ fn route_inner(
             Some(ns) if !ns.is_empty() => {
                 unindexed::handle_internal_unindexed(&url_decode(ns), query, state)
             }
-            _ => json_error(404, "not found"),
+            _ => api_error(ErrorCode::NotFound, "not found"),
         };
     }
 
@@ -6993,7 +7040,7 @@ fn route_inner(
         return handle_stats(state);
     }
 
-    json_error(404, "not found")
+    api_error(ErrorCode::NotFound, "not found")
 }
 
 /// Extract a namespace from a v1 path: `METHOD /v1/namespaces/{ns}/suffix ...`
@@ -7186,19 +7233,24 @@ fn parse_namespace_schema(value: &serde_json::Value) -> Result<serde_json::Value
 fn handle_create_namespace(body: &[u8], tenant: &str, state: &AppState) -> String {
     let request: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
-        Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
+        Err(e) => return api_error(ErrorCode::InvalidArgument, &format!("invalid JSON: {e}")),
     };
     let Some(name) = request.get("namespace").and_then(|v| v.as_str()) else {
-        return json_error(400, "missing 'namespace'");
+        return api_error(ErrorCode::InvalidArgument, "missing 'namespace'");
     };
     if !valid_namespace_component(name) {
-        return json_error(400, "invalid namespace; use an unqualified namespace name");
+        return api_error(
+            ErrorCode::InvalidArgument,
+            "invalid namespace; use an unqualified namespace name",
+        );
     }
     let schema = match request.get("schema") {
         None | Some(serde_json::Value::Null) => serde_json::json!({ "fields": {} }),
         Some(raw) => match parse_namespace_schema(raw) {
             Ok(schema) => schema,
-            Err(e) => return json_error(400, &format!("invalid schema: {e}")),
+            Err(e) => {
+                return api_error(ErrorCode::InvalidArgument, &format!("invalid schema: {e}"))
+            }
         },
     };
     let typed_schema: kosha_core::NamespaceSchema =
@@ -7213,7 +7265,10 @@ fn handle_create_namespace(body: &[u8], tenant: &str, state: &AppState) -> Strin
     // A namespace this writer already holds (written to, not yet
     // registered) exists as far as the caller can tell.
     if state.indexer.manifest_version(&id).is_some() {
-        return json_error(409, &format!("namespace '{name}' already exists"));
+        return api_error(
+            ErrorCode::AlreadyExists,
+            &format!("namespace '{name}' already exists"),
+        );
     }
     let created = state
         .controller
@@ -7223,9 +7278,17 @@ fn handle_create_namespace(body: &[u8], tenant: &str, state: &AppState) -> Strin
     match created {
         Ok(()) => {}
         Err(KoshaError::NamespaceExists(_)) => {
-            return json_error(409, &format!("namespace '{name}' already exists"));
+            return api_error(
+                ErrorCode::AlreadyExists,
+                &format!("namespace '{name}' already exists"),
+            );
         }
-        Err(e) => return json_error(500, &format!("create namespace failed: {e}")),
+        Err(e) => {
+            return api_error(
+                ErrorCode::Internal,
+                &format!("create namespace failed: {e}"),
+            )
+        }
     }
     let manifest = state
         .controller
@@ -7247,15 +7310,20 @@ fn handle_create_namespace(body: &[u8], tenant: &str, state: &AppState) -> Strin
         match state.indexer.set_schema(&id, typed_schema) {
             Ok(true) => {
                 if let Err(e) = state.publish_namespace(&id) {
-                    return json_error(500, &format!("schema publication failed: {e}"));
+                    return api_error(
+                        ErrorCode::Internal,
+                        &format!("schema publication failed: {e}"),
+                    );
                 }
                 if let Some(published) = state.indexer.manifest(&id) {
                     manifest = published;
                 }
             }
             Ok(false) => {}
-            Err(KoshaError::InvalidQuery(message)) => return json_error(400, &message),
-            Err(e) => return json_error(500, &format!("schema update failed: {e}")),
+            Err(KoshaError::InvalidQuery(message)) => {
+                return api_error(ErrorCode::InvalidArgument, &message)
+            }
+            Err(e) => return api_error(ErrorCode::Internal, &format!("schema update failed: {e}")),
         }
     }
     let created_at = std::time::SystemTime::now()
@@ -7351,7 +7419,7 @@ fn handle_delete_namespace(name: &str, tenant: &str, state: &AppState) -> String
 fn handle_index(body: &[u8], state: &AppState) -> String {
     let request: IndexRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
-        Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
+        Err(e) => return api_error(ErrorCode::InvalidArgument, &format!("invalid JSON: {e}")),
     };
     // A GeoPoint that is not a point would be stored but never indexed, so
     // `geo_distance` and geo decays could never see it: refuse it (#212).
@@ -7360,8 +7428,8 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
             if field.field_type == kosha_core::FieldType::GeoPoint
                 && kosha_core::rank::parse_geo_str(&field.value).is_none()
             {
-                return json_error(
-                    400,
+                return api_error(
+                    ErrorCode::InvalidArgument,
                     &format!(
                         "document {:?}: GeoPoint field {:?} must be \"lat,lon\", \
                          {{\"lat\": .., \"lon\": ..}} or [lon, lat] within range, got {:?}",
@@ -7430,8 +7498,8 @@ fn embed_documents(
                 }
                 match embedding::supplied_vector(&value.value) {
                     Some(Ok(vector)) if vector.len() != spec.dims as usize => {
-                        return Err(json_error(
-                            400,
+                        return Err(api_error(
+                            ErrorCode::InvalidArgument,
                             &format!(
                                 "document {:?}: field {field:?} has a {}-dimensional vector, \
                                  but its embedding model {} has {} dimensions",
@@ -7455,13 +7523,13 @@ fn embed_documents(
         let embedder = state
             .embedders
             .get(spec)
-            .map_err(|e| json_error(e.status(), e.message()))?;
+            .map_err(|e| api_error_status(e.status(), e.message()))?;
         let texts: Vec<&str> = positions
             .iter()
             .map(|&(d, f)| documents[d].fields[f].value.as_str())
             .collect();
         let vectors = embedding::embed_checked(embedder.as_ref(), spec, &texts)
-            .map_err(|e| json_error(e.status(), e.message()))?;
+            .map_err(|e| api_error_status(e.status(), e.message()))?;
         for ((d, f), vector) in positions.into_iter().zip(vectors) {
             let value = &mut documents[d].fields[f];
             value.value = serde_json::to_string(&vector).unwrap_or_default();
@@ -7495,7 +7563,7 @@ fn resolve_knn_query_text(
         .ensure_query_manifest_fresh(ns, max_staleness)
         .map_err(|e| search_error_response(&e))?;
     let Some(manifest) = state.indexer.manifest_shared(ns) else {
-        return Err(json_error(404, &format!("namespace '{}' not found", ns.0)));
+        return Err(namespace_not_found(&ns.0));
     };
     let Some(spec) = manifest
         .schema
@@ -7503,8 +7571,8 @@ fn resolve_knn_query_text(
         .and_then(|schema| schema.embedding_for(&knn.field))
         .cloned()
     else {
-        return Err(json_error(
-            400,
+        return Err(api_error(
+            ErrorCode::InvalidArgument,
             &format!(
                 "knn.query_text needs an embedding model for field '{}', and the namespace \
                  schema declares none; send knn.vector instead",
@@ -7515,9 +7583,9 @@ fn resolve_knn_query_text(
     let embedder = state
         .embedders
         .get(&spec)
-        .map_err(|e| json_error(e.status(), e.message()))?;
+        .map_err(|e| api_error_status(e.status(), e.message()))?;
     let mut vectors = embedding::embed_checked(embedder.as_ref(), &spec, &[text.as_str()])
-        .map_err(|e| json_error(e.status(), e.message()))?;
+        .map_err(|e| api_error_status(e.status(), e.message()))?;
     knn.vector = vectors.pop().unwrap_or_default();
     knn.embedding_model = Some(spec.model);
     Ok(())
@@ -7615,8 +7683,15 @@ fn index_into(
             Ok(c) => c,
             // A rejected document (e.g. a vector of the wrong dimension
             // for its field, #204) is the client's error.
-            Err(KoshaError::InvalidQuery(message)) => return Err(json_error(400, &message)),
-            Err(e) => return Err(json_error(500, &format!("indexing error: {e}"))),
+            Err(KoshaError::InvalidQuery(message)) => {
+                return Err(api_error(ErrorCode::InvalidArgument, &message))
+            }
+            Err(e) => {
+                return Err(api_error(
+                    ErrorCode::Internal,
+                    &format!("indexing error: {e}"),
+                ))
+            }
         };
         // index_documents auto-flushes when the buffer hits the threshold
         // (or rewrites on id collision), which mutates the manifest —
@@ -7653,7 +7728,7 @@ struct ExistsRequest {
 fn handle_exists(body: &[u8], state: &AppState) -> String {
     let request: ExistsRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
-        Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
+        Err(e) => return api_error(ErrorCode::InvalidArgument, &format!("invalid JSON: {e}")),
     };
 
     let ids: Vec<kosha_core::DocumentId> = request
@@ -7738,7 +7813,7 @@ fn existing_ids_in(
     state
         .indexer
         .existing_ids(namespace, ids)
-        .map_err(|e| json_error(500, &format!("exists error: {e}")))
+        .map_err(|e| api_error(ErrorCode::Internal, &format!("exists error: {e}")))
 }
 
 // ─── POST /replace ──────────────────────────────────────────────────────────
@@ -7746,7 +7821,12 @@ fn existing_ids_in(
 fn handle_replace(body: &[u8], state: &AppState) -> String {
     let request: IndexRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
-        Err(error) => return json_error(400, &format!("invalid JSON: {error}")),
+        Err(error) => {
+            return api_error(
+                ErrorCode::InvalidArgument,
+                &format!("invalid JSON: {error}"),
+            )
+        }
     };
     let namespace = request.namespace;
     let mut documents = request.documents;
@@ -7819,8 +7899,15 @@ fn replace_into(
         let indexer = &state.indexer;
         match indexer.replace_documents(namespace.clone(), documents) {
             Ok(count) => count,
-            Err(KoshaError::InvalidQuery(message)) => return Err(json_error(400, &message)),
-            Err(error) => return Err(json_error(500, &format!("replacement error: {error}"))),
+            Err(KoshaError::InvalidQuery(message)) => {
+                return Err(api_error(ErrorCode::InvalidArgument, &message))
+            }
+            Err(error) => {
+                return Err(api_error(
+                    ErrorCode::Internal,
+                    &format!("replacement error: {error}"),
+                ))
+            }
         }
     };
     {
@@ -7872,7 +7959,7 @@ fn flush_and_publish_namespace(state: &AppState, namespace: &NamespaceId) -> Res
     state
         .indexer
         .flush_namespace(namespace)
-        .map_err(|e| json_error(500, &format!("flush error: {e}")))?;
+        .map_err(|e| api_error(ErrorCode::Internal, &format!("flush error: {e}")))?;
     state
         .publish_namespace(namespace)
         .map_err(|e| publication_error("publication failed", &e))
@@ -7911,7 +7998,7 @@ fn handle_flush(body: &[u8], state: &AppState) -> String {
     }
 
     if let Err(e) = state.indexer.flush_all() {
-        return json_error(500, &format!("flush error: {e}"));
+        return api_error(ErrorCode::Internal, &format!("flush error: {e}"));
     }
 
     // Publish manifest(s) to the control store and upload segments to S3.
@@ -7999,12 +8086,12 @@ fn run_idle_flush_tick(
 fn handle_delete(body: &[u8], state: &AppState) -> String {
     let body_val: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
-        Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
+        Err(e) => return api_error(ErrorCode::InvalidArgument, &format!("invalid JSON: {e}")),
     };
 
     let ns = match body_val.get("namespace").and_then(|v| v.as_str()) {
         Some(n) => NamespaceId(n.to_string()),
-        None => return json_error(400, "missing 'namespace'"),
+        None => return api_error(ErrorCode::InvalidArgument, "missing 'namespace'"),
     };
 
     // Extract filter from body — supports ES-style "query" field.
@@ -8012,9 +8099,11 @@ fn handle_delete(body: &[u8], state: &AppState) -> String {
     let filter: kosha_core::FilterClause = match filter_val {
         Some(v) => match serde_json::from_value(v.clone()) {
             Ok(f) => f,
-            Err(e) => return json_error(400, &format!("invalid filter: {e}")),
+            Err(e) => {
+                return api_error(ErrorCode::InvalidArgument, &format!("invalid filter: {e}"))
+            }
         },
-        None => return json_error(400, "missing 'filter' or 'query'"),
+        None => return api_error(ErrorCode::InvalidArgument, "missing 'filter' or 'query'"),
     };
 
     let deleted = match state.indexer.shard_count(&ns) {
@@ -8059,7 +8148,7 @@ fn delete_in(
 
     let manifest = match state.indexer.manifest_cloned(ns) {
         Some(m) => m,
-        None => return Err(json_error(404, &format!("namespace '{}' not found", ns.0))),
+        None => return Err(namespace_not_found(&ns.0)),
     };
     let count = state
         .indexer
@@ -8067,8 +8156,8 @@ fn delete_in(
         .map_err(|e| match e {
             // A filter the data cannot answer (e.g. `prefix` on a numeric
             // field) is the client's mistake, not a server fault.
-            KoshaError::InvalidQuery(_) => json_error(400, &e.to_string()),
-            e => json_error(500, &format!("delete error: {e}")),
+            KoshaError::InvalidQuery(_) => api_error(ErrorCode::InvalidArgument, &e.to_string()),
+            e => api_error(ErrorCode::Internal, &format!("delete error: {e}")),
         })?;
 
     if let Err(e) = state.publish_namespace(ns) {
@@ -8208,7 +8297,7 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     // Parse the full JSON body that includes namespace alongside SearchQuery fields.
     let body_val: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
-        Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
+        Err(e) => return api_error(ErrorCode::InvalidArgument, &format!("invalid JSON: {e}")),
     };
     // `"timings": true` asks for the phase breakdown in the response, while
     // the dashboard is on (#214). Otherwise ignored, like any unknown key.
@@ -8217,7 +8306,12 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
 
     let ns = match body_val.get("namespace").and_then(|v| v.as_str()) {
         Some(n) => NamespaceId(n.to_string()),
-        None => return json_error(400, "missing 'namespace' in search body"),
+        None => {
+            return api_error(
+                ErrorCode::InvalidArgument,
+                "missing 'namespace' in search body",
+            )
+        }
     };
     obs.namespace(state, &ns);
 
@@ -8225,18 +8319,23 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     let max_staleness =
         match manifest_follow::parse_max_staleness(body_val.get("max_staleness_seconds")) {
             Ok(v) => v,
-            Err(e) => return json_error(400, &e),
+            Err(e) => return api_error(ErrorCode::InvalidArgument, &e),
         };
 
     // Read-your-writes (#255): whether to also search unindexed writes.
     let consistency = match unindexed::Consistency::from_json(body_val.get("consistency")) {
         Ok(c) => c.unwrap_or_else(|| state.default_consistency()),
-        Err(e) => return json_error(400, &e),
+        Err(e) => return api_error(ErrorCode::InvalidArgument, &e),
     };
 
     let mut query: kosha_core::SearchQuery = match serde_json::from_value(body_val) {
         Ok(q) => q,
-        Err(e) => return json_error(400, &format!("invalid search query: {e}")),
+        Err(e) => {
+            return api_error(
+                ErrorCode::InvalidArgument,
+                &format!("invalid search query: {e}"),
+            )
+        }
     };
     // Reject out-of-range parameters before touching storage or the
     // result cache (the searcher checks again for non-HTTP callers).
@@ -8256,8 +8355,8 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
         Some(ref spec) => match state.rerankers.get(&spec.provider) {
             Some(provider) => Some(Arc::clone(provider)),
             None => {
-                return json_error(
-                    400,
+                return api_error(
+                    ErrorCode::InvalidArgument,
                     &format!(
                         "unknown rerank provider '{}'; configured: {:?}",
                         spec.provider,
@@ -8281,7 +8380,7 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     // `view.base`.
     let view = match state.search_view(&ns, consistency, max_staleness) {
         Ok(Some(view)) => view,
-        Ok(None) => return json_error(404, &format!("namespace '{}' not found", ns.0)),
+        Ok(None) => return namespace_not_found(&ns.0),
         Err(response) => return response,
     };
     let manifest: &kosha_core::Manifest = &view.base;
@@ -8875,13 +8974,13 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
 
     let ns = match params.get("ns") {
         Some(ns) => NamespaceId(ns.clone()),
-        None => return json_error(400, "missing 'ns' query parameter"),
+        None => return api_error(ErrorCode::InvalidArgument, "missing 'ns' query parameter"),
     };
     obs.namespace(state, &ns);
 
     let query_text = match params.get("q") {
         Some(q) => q.clone(),
-        None => return json_error(400, "missing 'q' query parameter"),
+        None => return api_error(ErrorCode::InvalidArgument, "missing 'q' query parameter"),
     };
 
     let max_results: usize = params
@@ -8908,8 +9007,8 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
         Some(v) => match kosha_core::Bm25StatsScope::parse(v) {
             Some(scope) => Some(scope),
             None => {
-                return json_error(
-                    400,
+                return api_error(
+                    ErrorCode::InvalidArgument,
                     &format!("'bm25_stats' must be 'namespace' or 'segment', got '{v}'"),
                 )
             }
@@ -8917,7 +9016,7 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
     };
     let bm25_params = match (parse_param("k1"), parse_param("b")) {
         (Ok(k1), Ok(b)) => kosha_core::Bm25Overrides { k1, b, stats },
-        (Err(e), _) | (_, Err(e)) => return json_error(400, &e),
+        (Err(e), _) | (_, Err(e)) => return api_error(ErrorCode::InvalidArgument, &e),
     };
 
     let query = SearchQuery {
@@ -8966,8 +9065,8 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
         Some(raw) => match unindexed::Consistency::parse(raw) {
             Some(c) => c,
             None => {
-                return json_error(
-                    400,
+                return api_error(
+                    ErrorCode::InvalidArgument,
                     &format!("'consistency' must be 'strong' or 'eventual', got '{raw}'"),
                 )
             }
@@ -8981,7 +9080,7 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
             .as_ref(),
     ) {
         Ok(v) => v,
-        Err(e) => return json_error(400, &e),
+        Err(e) => return api_error(ErrorCode::InvalidArgument, &e),
     };
     // Shared, not copied: see `Indexer::manifest_shared`. A sharded
     // namespace (#207) is searched through one merged view of its shards.
@@ -8991,7 +9090,7 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
     // `view.base`.
     let view = match state.search_view(&ns, consistency, max_staleness) {
         Ok(Some(view)) => view,
-        Ok(None) => return json_error(404, &format!("namespace '{}' not found", ns.0)),
+        Ok(None) => return namespace_not_found(&ns.0),
         Err(response) => return response,
     };
     let manifest: &kosha_core::Manifest = &view.base;
@@ -9182,7 +9281,7 @@ fn handle_replace_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &Ap
     let scoped_ns = tenant_namespace(tenant, namespace);
     let mut body_val: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
-        Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
+        Err(e) => return api_error(ErrorCode::InvalidArgument, &format!("invalid JSON: {e}")),
     };
     if let Some(obj) = body_val.as_object_mut() {
         obj.insert("namespace".into(), serde_json::json!(scoped_ns));
@@ -9209,7 +9308,7 @@ fn handle_put_schema_with_ns(
     let ns = NamespaceId(tenant_namespace(tenant, namespace));
     let value: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
-        Err(_) => return json_error(400, "invalid JSON"),
+        Err(_) => return api_error(ErrorCode::InvalidArgument, "invalid JSON"),
     };
     let value = match value.get("schema") {
         Some(inner) => inner.clone(),
@@ -9217,10 +9316,10 @@ fn handle_put_schema_with_ns(
     };
     let schema: kosha_core::NamespaceSchema = match serde_json::from_value(value) {
         Ok(schema) => schema,
-        Err(e) => return json_error(400, &format!("invalid schema: {e}")),
+        Err(e) => return api_error(ErrorCode::InvalidArgument, &format!("invalid schema: {e}")),
     };
     if let Err(e) = schema.validate_embeddings() {
-        return json_error(400, &format!("invalid schema: {e}"));
+        return api_error(ErrorCode::InvalidArgument, &format!("invalid schema: {e}"));
     }
     // Model pinning (#209): a field's embedding model cannot change while
     // vectors of the old one are indexed. Checked on every shard before
@@ -9231,17 +9330,19 @@ fn handle_put_schema_with_ns(
     }
     for target in &pinned {
         if let Some(conflict) = state.indexer.embedding_conflict(target, &schema) {
-            return json_error(409, &conflict);
+            return api_error(ErrorCode::Conflict, &conflict);
         }
     }
     let changed = match state.indexer.set_schema(&ns, schema.clone()) {
         Ok(changed) => changed,
-        Err(KoshaError::InvalidQuery(message)) => return json_error(400, &message),
-        Err(e) => return json_error(500, &format!("schema update failed: {e}")),
+        Err(KoshaError::InvalidQuery(message)) => {
+            return api_error(ErrorCode::InvalidArgument, &message)
+        }
+        Err(e) => return api_error(ErrorCode::Internal, &format!("schema update failed: {e}")),
     };
     if changed {
         if let Err(e) = state.publish_namespace(&ns) {
-            return json_error(500, &format!("publication failed: {e}"));
+            return api_error(ErrorCode::Internal, &format!("publication failed: {e}"));
         }
     }
     // A sharded namespace (#207): every shard writes segments, so every
@@ -9271,11 +9372,11 @@ fn propagate_schema_to_shards(
         let changed = state
             .indexer
             .set_schema(&shard, schema.clone())
-            .map_err(|e| json_error(500, &format!("schema update failed: {e}")))?;
+            .map_err(|e| api_error(ErrorCode::Internal, &format!("schema update failed: {e}")))?;
         if changed {
             state
                 .publish_namespace(&shard)
-                .map_err(|e| json_error(500, &format!("publication failed: {e}")))?;
+                .map_err(|e| api_error(ErrorCode::Internal, &format!("publication failed: {e}")))?;
         }
     }
     Ok(())
@@ -9301,15 +9402,15 @@ fn handle_put_shards_with_ns(
     let ns = NamespaceId(tenant_namespace(tenant, namespace));
     let value: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
-        Err(_) => return json_error(400, "invalid JSON"),
+        Err(_) => return api_error(ErrorCode::InvalidArgument, "invalid JSON"),
     };
     let Some(shards) = value.get("shards").and_then(|v| v.as_u64()) else {
-        return json_error(400, "missing integer 'shards'");
+        return api_error(ErrorCode::InvalidArgument, "missing integer 'shards'");
     };
     if shards == 1 {
         return match state.indexer.shard_count(&ns) {
-            Some(existing) => json_error(
-                400,
+            Some(existing) => api_error(
+                ErrorCode::InvalidArgument,
                 &format!("namespace already has {existing} shards; resharding is not supported"),
             ),
             None => json_ok(&serde_json::json!({
@@ -9321,12 +9422,14 @@ fn handle_put_shards_with_ns(
     }
     let shards = match u32::try_from(shards) {
         Ok(n) => n,
-        Err(_) => return json_error(400, "shards out of range"),
+        Err(_) => return api_error(ErrorCode::InvalidArgument, "shards out of range"),
     };
     let changed = match state.indexer.set_shard_count(&ns, shards) {
         Ok(changed) => changed,
-        Err(KoshaError::InvalidQuery(message)) => return json_error(400, &message),
-        Err(e) => return json_error(500, &format!("sharding failed: {e}")),
+        Err(KoshaError::InvalidQuery(message)) => {
+            return api_error(ErrorCode::InvalidArgument, &message)
+        }
+        Err(e) => return api_error(ErrorCode::Internal, &format!("sharding failed: {e}")),
     };
     let shard_ids = kosha_core::sharding::shard_namespaces(&ns, shards);
     {
@@ -9372,14 +9475,14 @@ fn handle_get_schema_with_ns(namespace: &str, tenant: &str, state: &AppState) ->
     // An admin read: always confirm against the control store on a query
     // replica (no-op on the ingest pod).
     if let Err(e) = state.ensure_query_manifest_fresh(&ns, Some(Duration::ZERO)) {
-        return json_error(404, &format!("{e}"));
+        return search_error_response(&e);
     }
     match state.indexer.manifest_shared(&ns) {
         Some(manifest) => json_ok(&serde_json::json!({
             "namespace": namespace,
             "schema": manifest.schema.clone().unwrap_or_default(),
         })),
-        None => json_error(404, "namespace not found"),
+        None => namespace_not_found(&ns.0),
     }
 }
 
@@ -9406,7 +9509,7 @@ fn search_post_with_ns(
     let scoped_ns = tenant_namespace(tenant, namespace);
     let mut body_val: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
-        Err(_) => return json_error(400, "invalid JSON"),
+        Err(_) => return api_error(ErrorCode::InvalidArgument, "invalid JSON"),
     };
     if let Some(obj) = body_val.as_object_mut() {
         obj.insert("namespace".into(), serde_json::json!(scoped_ns));
@@ -9432,7 +9535,7 @@ fn handle_delete_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &App
     let scoped_ns = tenant_namespace(tenant, namespace);
     let mut body_val: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
-        Err(_) => return json_error(400, "invalid JSON"),
+        Err(_) => return api_error(ErrorCode::InvalidArgument, "invalid JSON"),
     };
     if let Some(obj) = body_val.as_object_mut() {
         obj.insert("namespace".into(), serde_json::json!(scoped_ns));
@@ -9445,7 +9548,7 @@ fn handle_exists_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &App
     let scoped_ns = tenant_namespace(tenant, namespace);
     let mut req: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
-        Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
+        Err(e) => return api_error(ErrorCode::InvalidArgument, &format!("invalid JSON: {e}")),
     };
     if let Some(obj) = req.as_object_mut() {
         obj.insert("namespace".into(), serde_json::json!(scoped_ns));
@@ -9510,17 +9613,15 @@ fn handle_namespace_stats(namespace: &str, tenant: &str, state: &AppState) -> St
         state.ensure_query_manifest_fresh(&NamespaceId(scoped_ns.clone()), Some(Duration::ZERO))
     {
         return match e {
-            KoshaError::NamespaceNotFound(_) => {
-                json_error(404, &format!("namespace '{namespace}' not found"))
-            }
-            e => json_error(500, &format!("stats error: {e}")),
+            KoshaError::NamespaceNotFound(_) => namespace_not_found(namespace),
+            e => api_error(ErrorCode::Internal, &format!("stats error: {e}")),
         };
     }
     let indexer = &state.indexer;
     let root_id = NamespaceId(scoped_ns.clone());
     let manifest = match indexer.manifest_shared(&root_id) {
         Some(m) => m,
-        None => return json_error(404, &format!("namespace '{namespace}' not found")),
+        None => return namespace_not_found(namespace),
     };
     // A sharded namespace (#207) reports totals over its merged view, plus
     // a per-shard breakdown.
@@ -9593,11 +9694,11 @@ fn handle_namespace_stats(namespace: &str, tenant: &str, state: &AppState) -> St
 fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> String {
     let req: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
-        Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
+        Err(e) => return api_error(ErrorCode::InvalidArgument, &format!("invalid JSON: {e}")),
     };
     let ns_raw = match req.get("namespace").and_then(|v| v.as_str()) {
         Some(n) => n,
-        None => return json_error(400, "missing 'namespace'"),
+        None => return api_error(ErrorCode::InvalidArgument, "missing 'namespace'"),
     };
     // Prefer the name as given (migration uses bare index names); fall back
     // to tenant-scoped lookup used by v1 routes.
@@ -9608,7 +9709,7 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
             if indexer.manifest_cloned(&ns).is_some() {
                 ns
             } else {
-                return json_error(404, &format!("namespace '{}' not found", ns.0));
+                return namespace_not_found(&ns.0);
             }
         } else {
             let bare = NamespaceId(ns_raw.to_string());
@@ -9619,7 +9720,7 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
                 if indexer.manifest_cloned(&scoped).is_some() {
                     scoped
                 } else {
-                    return json_error(404, &format!("namespace '{ns_raw}' not found"));
+                    return namespace_not_found(ns_raw);
                 }
             }
         }
@@ -9706,11 +9807,11 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
 fn handle_backfill_offset_tables(body: &[u8], tenant: &str, state: &AppState) -> String {
     let req: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
-        Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
+        Err(e) => return api_error(ErrorCode::InvalidArgument, &format!("invalid JSON: {e}")),
     };
     let ns_raw = match req.get("namespace").and_then(|v| v.as_str()) {
         Some(n) => n,
-        None => return json_error(400, "missing 'namespace'"),
+        None => return api_error(ErrorCode::InvalidArgument, "missing 'namespace'"),
     };
     // Prefer the name as given (migration uses bare index names); fall back
     // to tenant-scoped lookup used by v1 routes.
@@ -9721,7 +9822,7 @@ fn handle_backfill_offset_tables(body: &[u8], tenant: &str, state: &AppState) ->
             if indexer.manifest_cloned(&ns).is_some() {
                 ns
             } else {
-                return json_error(404, &format!("namespace '{}' not found", ns.0));
+                return namespace_not_found(&ns.0);
             }
         } else {
             let bare = NamespaceId(ns_raw.to_string());
@@ -9732,7 +9833,7 @@ fn handle_backfill_offset_tables(body: &[u8], tenant: &str, state: &AppState) ->
                 if indexer.manifest_cloned(&scoped).is_some() {
                     scoped
                 } else {
-                    return json_error(404, &format!("namespace '{ns_raw}' not found"));
+                    return namespace_not_found(ns_raw);
                 }
             }
         }
@@ -9752,7 +9853,10 @@ fn handle_backfill_offset_tables(body: &[u8], tenant: &str, state: &AppState) ->
     // previous synchronous version always answered into a dead socket with
     // no way to observe what happened.
     let Some(job_state) = state.self_ref.upgrade() else {
-        return json_error(500, "server not initialized for background jobs");
+        return api_error(
+            ErrorCode::Internal,
+            "server not initialized for background jobs",
+        );
     };
     {
         let mut jobs = state.backfill_jobs.lock().unwrap();
@@ -9885,12 +9989,17 @@ fn handle_segment_gc(body: &[u8], state: &AppState) -> String {
     let req: segment_gc::GcRequest = if body.iter().all(u8::is_ascii_whitespace) {
         match serde_json::from_str("{}") {
             Ok(r) => r,
-            Err(e) => return json_error(500, &e.to_string()),
+            Err(e) => return api_error(ErrorCode::Internal, &e.to_string()),
         }
     } else {
         match serde_json::from_slice(body) {
             Ok(r) => r,
-            Err(e) => return json_error(400, &format!("invalid GC request: {e}")),
+            Err(e) => {
+                return api_error(
+                    ErrorCode::InvalidArgument,
+                    &format!("invalid GC request: {e}"),
+                )
+            }
         }
     };
     let all = state.controller.lock().unwrap().list_namespaces();
@@ -9898,7 +10007,7 @@ fn handle_segment_gc(body: &[u8], state: &AppState) -> String {
         Some(name) => {
             let ns = NamespaceId(name.clone());
             if !all.contains(&ns) {
-                return json_error(404, &format!("namespace '{name}' not found"));
+                return namespace_not_found(name);
             }
             vec![ns]
         }
@@ -9972,18 +10081,18 @@ fn handle_segment_gc(body: &[u8], state: &AppState) -> String {
 fn handle_compact_namespace(body: &[u8], tenant: &str, state: &AppState) -> String {
     let req: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
-        Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
+        Err(e) => return api_error(ErrorCode::InvalidArgument, &format!("invalid JSON: {e}")),
     };
     let ns_raw = match req.get("namespace").and_then(|v| v.as_str()) {
         Some(n) => n,
-        None => return json_error(400, "missing 'namespace'"),
+        None => return api_error(ErrorCode::InvalidArgument, "missing 'namespace'"),
     };
     let mode = match req.get("mode").and_then(|v| v.as_str()).unwrap_or("tiered") {
         "tiered" => kosha_write::CompactMode::Tiered,
         "full" => kosha_write::CompactMode::Full,
         other => {
-            return json_error(
-                400,
+            return api_error(
+                ErrorCode::InvalidArgument,
                 &format!("invalid mode '{other}' (expected tiered|full)"),
             );
         }
@@ -10001,7 +10110,7 @@ fn handle_compact_namespace(body: &[u8], tenant: &str, state: &AppState) -> Stri
             if state.indexer.manifest_cloned(&ns).is_some() {
                 ns
             } else {
-                return json_error(404, &format!("namespace '{}' not found", ns.0));
+                return namespace_not_found(&ns.0);
             }
         } else {
             let bare = NamespaceId(ns_raw.to_string());
@@ -10012,7 +10121,7 @@ fn handle_compact_namespace(body: &[u8], tenant: &str, state: &AppState) -> Stri
                 if state.indexer.manifest_cloned(&scoped).is_some() {
                     scoped
                 } else {
-                    return json_error(404, &format!("namespace '{ns_raw}' not found"));
+                    return namespace_not_found(ns_raw);
                 }
             }
         }
@@ -10033,7 +10142,7 @@ fn handle_compact_namespace(body: &[u8], tenant: &str, state: &AppState) -> Stri
             }
             match compact_one(state, &shard, mode, opts.clone(), run_async) {
                 Ok(pass) => passes.push(pass),
-                Err((status, message)) => return json_error(status, &message),
+                Err((status, message)) => return api_error_status(status, &message),
             }
         }
         let body = serde_json::json!({
@@ -10051,7 +10160,7 @@ fn handle_compact_namespace(body: &[u8], tenant: &str, state: &AppState) -> Stri
     match compact_one(state, &ns, mode, opts, run_async) {
         Ok(body) if run_async => json_accepted(&body),
         Ok(body) => json_ok(&body),
-        Err((status, message)) => json_error(status, &message),
+        Err((status, message)) => api_error_status(status, &message),
     }
 }
 
@@ -10162,7 +10271,10 @@ fn handle_compaction_status(state: &AppState) -> String {
 fn handle_compaction_job(job_id: &str, state: &AppState) -> String {
     match state.compaction.job(job_id) {
         Some(job) => json_ok(&job),
-        None => json_error(404, &format!("compaction job '{job_id}' not found")),
+        None => api_error(
+            ErrorCode::NotFound,
+            &format!("compaction job '{job_id}' not found"),
+        ),
     }
 }
 
@@ -10652,16 +10764,19 @@ fn manifest_from_footers(footers: Vec<kosha_core::Footer>) -> kosha_core::Manife
 fn handle_import_namespace(body: &[u8], _tenant: &str, state: &AppState) -> String {
     #[cfg(not(feature = "s3"))]
     {
-        json_error(400, "import-namespace requires the s3 feature")
+        api_error(
+            ErrorCode::InvalidArgument,
+            "import-namespace requires the s3 feature",
+        )
     }
     #[cfg(feature = "s3")]
     {
         let req: serde_json::Value = match serde_json::from_slice(body) {
             Ok(v) => v,
-            Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
+            Err(e) => return api_error(ErrorCode::InvalidArgument, &format!("invalid JSON: {e}")),
         };
         let Some(ns_raw) = req.get("namespace").and_then(|v| v.as_str()) else {
-            return json_error(400, "missing 'namespace'");
+            return api_error(ErrorCode::InvalidArgument, "missing 'namespace'");
         };
         let overwrite = req
             .get("overwrite")
@@ -10673,8 +10788,8 @@ fn handle_import_namespace(body: &[u8], _tenant: &str, state: &AppState) -> Stri
             let published = state.controller.lock().unwrap().manifest_cloned(&ns);
             if let Some(m) = published.or_else(|| state.indexer.manifest_cloned(&ns)) {
                 if !m.segments.is_empty() {
-                    return json_error(
-                        409,
+                    return api_error(
+                        ErrorCode::Conflict,
                         &format!(
                             "namespace '{}' already has {} segment(s); pass \"overwrite\": true \
                              to replace its manifest",
@@ -10687,20 +10802,20 @@ fn handle_import_namespace(body: &[u8], _tenant: &str, state: &AppState) -> Stri
         }
 
         let Some(ref s3) = state.s3_storage else {
-            return json_error(400, "S3 not configured on this pod");
+            return api_error(ErrorCode::InvalidArgument, "S3 not configured on this pod");
         };
         // Segment ids are the namespace prefix's child "directories"
         // (paginated common-prefix listing — `list_with_sizes` filters out
         // nested keys and reads one page, so it can't enumerate segments).
         let mut seg_ids = match s3.list_child_dirs(&ns.0) {
             Ok(l) => l,
-            Err(e) => return json_error(500, &format!("S3 list failed: {e}")),
+            Err(e) => return api_error(ErrorCode::Internal, &format!("S3 list failed: {e}")),
         };
         seg_ids.sort();
         seg_ids.dedup();
         if seg_ids.is_empty() {
-            return json_error(
-                404,
+            return api_error(
+                ErrorCode::NotFound,
                 &format!("no segment directories found under '{}/' in S3", ns.0),
             );
         }
@@ -10727,8 +10842,8 @@ fn handle_import_namespace(body: &[u8], _tenant: &str, state: &AppState) -> Stri
         // which is exactly the silent-data-loss class this endpoint exists
         // to recover from.
         if !unreadable.is_empty() {
-            return json_error(
-                500,
+            return api_error(
+                ErrorCode::Internal,
                 &format!(
                     "{} of {} segment footer(s) unreadable ({}); refusing partial import",
                     unreadable.len(),
@@ -10928,7 +11043,11 @@ fn hydration_error_response(outcome: &HydrationOutcome) -> Option<String> {
     if !outcome.missing.is_empty() {
         let message = hydration_failed_message(&outcome.missing);
         eprintln!("ERROR: {message}{}", request_id());
-        return Some(json_error(503, &message));
+        return Some(
+            ApiError::new(ErrorCode::Unavailable, message)
+                .detail("reason", "hydration_failed")
+                .into_raw(),
+        );
     }
     None
 }
@@ -10995,7 +11114,12 @@ fn internal_segment_response(request_line: &str, state: &AppState) -> http::Resp
         let relative_path = url_decode(raw.split('?').next().unwrap_or(raw));
         let local_path = match state.cache.path_for(&relative_path) {
             Ok(p) => p,
-            Err(_) => return http::Response::from_raw(json_error(400, "invalid path")),
+            Err(_) => {
+                return http::Response::from_raw(api_error(
+                    ErrorCode::InvalidArgument,
+                    "invalid path",
+                ))
+            }
         };
         // Files land in the cache by rename, complete, so an open file is
         // a whole one; its length is fixed from here on.
@@ -11005,13 +11129,13 @@ fn internal_segment_response(request_line: &str, state: &AppState) -> http::Resp
             Ok((file, meta)) if meta.is_file() => {
                 http::Response::file(file, meta.len(), "application/octet-stream")
             }
-            _ => http::Response::from_raw(json_error(404, "not cached here")),
+            _ => http::Response::from_raw(api_error(ErrorCode::NotFound, "not cached here")),
         }
     }
     #[cfg(not(all(feature = "s3", feature = "postgres")))]
     {
         let _ = (request_line, state);
-        http::Response::from_raw(json_error(404, "not found"))
+        http::Response::from_raw(api_error(ErrorCode::NotFound, "not found"))
     }
 }
 
@@ -11170,23 +11294,68 @@ fn log_rerank(ns: &NamespaceId, call: &kosha_query::rerank::RerankCall) {
     );
 }
 
-/// Map a search failure onto the right HTTP status: load-shedding
-/// (`KoshaError::Overloaded`, see `kosha_query::MemoryLedger`) is a
-/// transient 429 the client should retry with backoff, not a 500; a
-/// control-store outage on a never-loaded namespace is a 503; an
-/// out-of-range request is a 400.
+/// Map a search failure onto its error code, every `KoshaError` variant
+/// explicitly (#350): load-shedding (`KoshaError::Overloaded`, see
+/// `kosha_query::MemoryLedger`) is a retryable 429; a control-store outage
+/// on a never-loaded namespace a retryable 503; a malformed query or filter
+/// a 400 (`InvalidFilter` was a 500 before #350); a missing namespace a
+/// 404 naming it without its tenant prefix.
 fn search_error_response(e: &KoshaError) -> String {
     match e {
         KoshaError::Overloaded(_) => {
             overload_shed_response("search_overloaded", &format!("search overloaded: {e}"))
         }
-        KoshaError::ControlPlane(_) => json_error(503, &format!("search unavailable: {e}")),
-        KoshaError::InvalidQuery(_) => json_error(400, &e.to_string()),
+        KoshaError::ControlPlane(_) => {
+            ApiError::new(ErrorCode::Unavailable, format!("search unavailable: {e}"))
+                .detail("reason", "control_store")
+                .into_raw()
+        }
+        KoshaError::InvalidQuery(_) | KoshaError::InvalidFilter(_) => {
+            api_error(ErrorCode::InvalidQuery, &e.to_string())
+        }
         // A query replica learns from the control store that the namespace
         // does not exist (never created, or deleted).
-        KoshaError::NamespaceNotFound(_) => json_error(404, &e.to_string()),
-        _ => json_error(500, &format!("search error: {e}")),
+        KoshaError::NamespaceNotFound(ns) => namespace_not_found(&ns.0),
+        KoshaError::NamespaceExists(_) => api_error(ErrorCode::AlreadyExists, &e.to_string()),
+        KoshaError::ManifestConflict { .. } => {
+            api_error(ErrorCode::WriteConflict, &format!("search error: {e}"))
+        }
+        KoshaError::Fenced { .. } => {
+            ApiError::new(ErrorCode::Unavailable, format!("search error: {e}"))
+                .detail("reason", "writer_lease")
+                .into_raw()
+        }
+        KoshaError::NotFound(_) => api_error(ErrorCode::NotFound, &e.to_string()),
+        KoshaError::SegmentNotFound(_)
+        | KoshaError::Io(_)
+        | KoshaError::Serde(_)
+        | KoshaError::CorruptSegment(_) => {
+            api_error(ErrorCode::Internal, &format!("search error: {e}"))
+        }
     }
+}
+
+/// The 503 for a control-store (Postgres) failure: retryable, with
+/// `details.reason: "control_store"`.
+fn control_store_unavailable(message: &str) -> String {
+    ApiError::new(ErrorCode::Unavailable, message)
+        .detail("reason", "control_store")
+        .into_raw()
+}
+
+/// The 404 for a namespace that does not exist. `namespace` may be the
+/// internal `<tenant>/<name>` id; the message names only `<name>`, so one
+/// tenant's errors never show a tenant id (#350).
+fn namespace_not_found(namespace: &str) -> String {
+    let name = namespace
+        .split_once('/')
+        .map_or(namespace, |(_, name)| name);
+    ApiError::new(
+        ErrorCode::NamespaceNotFound,
+        format!("namespace '{name}' not found"),
+    )
+    .detail("namespace", name)
+    .into_raw()
 }
 
 /// `202 Accepted` with a JSON body: a background job was started.
@@ -11198,78 +11367,14 @@ fn json_accepted<T: serde::Serialize>(value: &T) -> String {
     )
 }
 
-fn json_error(status_code: u16, message: &str) -> String {
-    // The reason for an error response; `request:` carries the rest.
-    eprintln!(
-        "WARN: request failed: status={status_code} {message}{}",
-        request_id()
-    );
-    let body = serde_json::json!({"error": message}).to_string();
-    let status_line = match status_code {
-        400 => "400 Bad Request",
-        401 => "401 Unauthorized",
-        403 => "403 Forbidden",
-        404 => "404 Not Found",
-        405 => "405 Method Not Allowed",
-        409 => "409 Conflict",
-        410 => "410 Gone",
-        413 => "413 Payload Too Large",
-        429 => "429 Too Many Requests",
-        500 => "500 Internal Server Error",
-        502 => "502 Bad Gateway",
-        503 => "503 Service Unavailable",
-        _ => "500 Internal Server Error",
-    };
-    format!(
-        "HTTP/1.1 {status_line}\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{body}",
-        body.len()
-    )
-}
-
-/// Returns *just* the JSON body (no HTTP headers) for an error response.
-/// Used by `authenticate()` which constructs its own HTTP response.
-fn json_error_body(status_code: u16, message: &str) -> String {
-    let body = serde_json::json!({"error": message}).to_string();
-    let status_line = match status_code {
-        403 => "403 Forbidden",
-        400 => "400 Bad Request",
-        401 => "401 Unauthorized",
-        404 => "404 Not Found",
-        500 => "500 Internal Server Error",
-        _ => "500 Internal Server Error",
-    };
-    format!(
-        "HTTP/1.1 {status_line}\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{body}",
-        body.len()
-    )
-}
-
 /// Build a raw HTTP response with an arbitrary status code and a body
 /// relayed verbatim (not re-serialized) — used by `forward_to_ingest` to
-/// pass through the ingest pod's actual status/body untouched. Unlike
-/// `json_error`, which always wraps its message in `{"error": ...}`, this
-/// must not alter the body at all: some existing clients (e.g. kosha_client)
-/// key off specific status codes like 404 in their own error handling, so
-/// silently coercing an unrecognized code to 500 the way `json_error`'s
-/// fallback does would be a real correctness bug for a proxy specifically.
+/// pass through the ingest pod's actual status/body untouched: it must not
+/// alter the body, nor coerce an unrecognized status.
 fn raw_response(status_code: u16, body: &str) -> String {
-    let reason = match status_code {
-        200 => "OK",
-        201 => "Created",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        409 => "Conflict",
-        410 => "Gone",
-        413 => "Payload Too Large",
-        429 => "Too Many Requests",
-        500 => "Internal Server Error",
-        503 => "Service Unavailable",
-        _ => "Response",
-    };
     format!(
-        "HTTP/1.1 {status_code} {reason}\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{body}",
+        "HTTP/1.1 {status_code} {}\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{body}",
+        api_error::reason_phrase(status_code),
         body.len()
     )
 }
@@ -21059,18 +21164,37 @@ mod tests {
         })
     }
 
+    /// A tenant-limit refusal in the #350 error model: rates are retryable
+    /// 429s with `Retry-After`; quotas are 403s and the body cap a 413,
+    /// neither retryable. Every one keeps the deprecated `reason` / `limit`.
     fn assert_rejected(response: &str, reason: &str) -> serde_json::Value {
-        assert_eq!(status_of(response), 429, "{response}");
-        let retry: u64 = header_of(response, "retry-after")
-            .expect("Retry-After header")
-            .parse()
-            .unwrap();
-        assert!(retry >= 1, "{response}");
         let body = body_of(response);
+        let (status, code) = match reason {
+            "namespace_quota_exceeded" | "doc_quota_exceeded" | "vector_dims_exceeded" => {
+                (403, reason)
+            }
+            "body_too_large" => (413, "payload_too_large"),
+            _ => (429, reason),
+        };
+        assert_eq!(status_of(response), status, "{response}");
+        assert_eq!(body["code"], code, "{response}");
         assert_eq!(body["reason"], reason, "{response}");
         assert!(body["error"].is_string());
         assert!(body["limit"].is_number());
-        assert!(body["retry_after_ms"].as_u64().unwrap() >= 1);
+        assert_eq!(body["details"]["limit"], body["limit"]);
+        if status == 429 {
+            assert_eq!(body["retryable"], true);
+            let retry: u64 = header_of(response, "retry-after")
+                .expect("Retry-After header")
+                .parse()
+                .unwrap();
+            assert!(retry >= 1, "{response}");
+            assert!(body["retry_after_ms"].as_u64().unwrap() >= 1);
+        } else {
+            assert_eq!(body["retryable"], false);
+            assert_eq!(header_of(response, "retry-after"), None, "{response}");
+            assert!(body.get("retry_after_ms").is_none());
+        }
         body
     }
 

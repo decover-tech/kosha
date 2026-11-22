@@ -367,8 +367,8 @@ impl AppState {
         if !self.unindexed_cap.exceeded(docs, bytes) {
             return None;
         }
-        let response = crate::json_error(
-            429,
+        let response = crate::api_error(
+            crate::ErrorCode::Overloaded,
             &format!(
                 "write backpressure: namespace '{}' has {docs} unindexed document(s) \
                  (~{bytes} bytes), at the cap (KOSHA_MAX_UNINDEXED_DOCS={}, \
@@ -501,8 +501,8 @@ impl AppState {
             let tail = self
                 .fetch_unindexed_tail(namespace, base.version, known)
                 .map_err(|e| {
-                    crate::json_error(
-                        503,
+                    crate::api_error(
+                        crate::ErrorCode::Unavailable,
                         &format!(
                             "strong consistency: cannot read the unindexed tail of '{}': {e} \
                              — retry, or search with \"consistency\": \"eventual\"",
@@ -535,8 +535,8 @@ impl AppState {
                 return Ok(Some(plain(base)));
             }
             let built = self.install_tail(namespace, &base, tail).map_err(|e| {
-                crate::json_error(
-                    500,
+                crate::api_error(
+                    crate::ErrorCode::Internal,
                     &format!(
                         "strong consistency: cannot build the unindexed tail of '{}': {e}",
                         namespace.0
@@ -566,8 +566,8 @@ impl AppState {
                 }
             }
         }
-        Err(crate::json_error(
-            503,
+        Err(crate::api_error(
+            crate::ErrorCode::Unavailable,
             &format!(
                 "strong consistency: the writer's unindexed tail of '{}' is relative to \
                  manifest version {writer} but this node searches version {local} (a \
@@ -733,7 +733,10 @@ impl AppState {
 /// if still current only a `not_modified` marker is returned).
 pub fn handle_internal_unindexed(namespace: &str, query: &str, state: &AppState) -> String {
     if state.ingest_host.is_some() {
-        return crate::json_error(404, "not a writer: this pod holds no unindexed writes");
+        return crate::api_error(
+            crate::ErrorCode::NotFound,
+            "not a writer: this pod holds no unindexed writes",
+        );
     }
     let mut manifest_version = None;
     let mut if_none_match = None;
@@ -743,7 +746,10 @@ pub fn handle_internal_unindexed(namespace: &str, query: &str, state: &AppState)
             "manifest_version" => match value.parse::<u64>() {
                 Ok(v) => manifest_version = Some(v),
                 Err(_) => {
-                    return crate::json_error(400, "'manifest_version' must be an integer");
+                    return crate::api_error(
+                        crate::ErrorCode::InvalidArgument,
+                        "'manifest_version' must be an integer",
+                    );
                 }
             },
             "if_none_match" => if_none_match = Some(crate::url_decode(value)),
@@ -756,8 +762,14 @@ pub fn handle_internal_unindexed(namespace: &str, query: &str, state: &AppState)
         .unindexed_tail(&namespace, manifest_version, if_none_match.as_deref())
     {
         Ok(Some(tail)) => crate::json_ok(&tail),
-        Ok(None) => crate::json_error(404, &format!("namespace '{}' not found", namespace.0)),
-        Err(e) => crate::json_error(500, &format!("unindexed tail error: {e}")),
+        Ok(None) => crate::api_error(
+            crate::ErrorCode::NotFound,
+            &format!("namespace '{}' not found", namespace.0),
+        ),
+        Err(e) => crate::api_error(
+            crate::ErrorCode::Internal,
+            &format!("unindexed tail error: {e}"),
+        ),
     }
 }
 

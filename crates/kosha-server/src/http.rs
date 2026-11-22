@@ -46,6 +46,8 @@ use std::task::{ready, Context, Poll};
 use std::time::Duration;
 
 use http_body_util::{BodyExt, LengthLimitError, Limited};
+
+use crate::api_error::{ApiError, ErrorCode};
 use hyper::body::{Bytes, Frame, Incoming, SizeHint};
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::server::conn::http1;
@@ -125,9 +127,18 @@ impl Response {
         }
     }
 
-    /// `{"error": message}` with the given status.
-    pub fn json_error(status: u16, message: &str) -> Self {
-        Self::json(status, serde_json::json!({ "error": message }).to_string())
+    /// An error response in the one error model (#350): `ErrorResponse`
+    /// body, `X-Request-Id`, `Kosha-Api-Version`, and `Retry-After` when
+    /// retryable. For failures before a request reaches the handler.
+    pub fn error(error: ApiError) -> Self {
+        let request_id = crate::api_error::current_request_id();
+        let mut response = Self::json(error.status(), error.body(&request_id).to_string());
+        response.headers = error.response_headers(&request_id);
+        response
+    }
+
+    fn error_code(code: ErrorCode, message: &str) -> Self {
+        Self::error(ApiError::new(code, message))
     }
 
     /// Stream `len` bytes of `file`, from its current position.
@@ -146,7 +157,7 @@ impl Response {
     /// sets framing itself and keeps the connection alive.
     pub fn from_raw(raw: String) -> Self {
         let Some(head_end) = raw.find("\r\n\r\n") else {
-            return Self::json_error(500, "malformed response");
+            return Self::error_code(ErrorCode::Internal, "malformed response");
         };
         let mut lines = raw[..head_end].split("\r\n");
         let status = lines
@@ -678,7 +689,9 @@ async fn serve_connection<I>(
 
 /// `503` with `Retry-After: 1`.
 fn busy(message: &str) -> Response {
-    Response::json_error(503, message).with_header("retry-after", "1")
+    Response::error(
+        ApiError::new(ErrorCode::Unavailable, message).detail("reason", "inflight_limit"),
+    )
 }
 
 async fn handle_request(
@@ -694,8 +707,8 @@ async fn handle_request(
         return Response::json(200, r#"{"status":"ok"}"#);
     }
     if shared.client_auth && !client_cert && path.starts_with("/internal/") {
-        return Response::json_error(
-            403,
+        return Response::error_code(
+            ErrorCode::PermissionDenied,
             "/internal/* requires a client certificate (KOSHA_TLS_CLIENT_CA_PATH)",
         );
     }
@@ -726,10 +739,15 @@ async fn handle_request(
         Ok(Err(e)) if e.downcast_ref::<LengthLimitError>().is_some() => {
             return too_large(declared.unwrap_or(0), config.max_body_bytes);
         }
-        Ok(Err(e)) => return Response::json_error(400, &format!("reading request body: {e}")),
+        Ok(Err(e)) => {
+            return Response::error_code(
+                ErrorCode::InvalidArgument,
+                &format!("reading request body: {e}"),
+            )
+        }
         Err(_) => {
-            return Response::json_error(
-                408,
+            return Response::error_code(
+                ErrorCode::RequestTimeout,
                 "request body not received in time (KOSHA_HTTP_IO_TIMEOUT_SECS)",
             )
         }
@@ -760,7 +778,7 @@ async fn handle_request(
         Ok(response) => response,
         Err(e) => {
             eprintln!("ERROR: request handler failed: {e}");
-            Response::json_error(500, "internal error")
+            Response::error_code(ErrorCode::Internal, "internal error")
         }
     }
 }
@@ -772,7 +790,7 @@ fn too_large(len: u64, max: usize) -> Response {
         format!("request body exceeds the {max}-byte limit (KOSHA_MAX_BODY_BYTES)")
     };
     eprintln!("WARN: request failed: status=413 {message}");
-    Response::json_error(413, &message)
+    Response::error(ApiError::new(ErrorCode::PayloadTooLarge, message).detail("scope", "pod"))
 }
 
 // ─── Write-stall timeout ────────────────────────────────────────────────────

@@ -16,7 +16,7 @@ option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_swagger) = {
     // The contract revision (ADR-350 §a): 1.MINOR.PATCH once v1 is GA, 0.9.x
     // until then. Independent of the crate version; kept equal to
     // `api_error::API_VERSION` by a test.
-    version: "0.9.0"
+    version: "0.10.0"
     description:
       "The public Kosha HTTP/JSON API. The OpenAPI document is the wire contract; "
       "proto3 canonical JSON is not (see docs/api/versioning.md). Every request carries "
@@ -63,6 +63,13 @@ option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_swagger) = {
     key: "401"
     value: {
       description: "unauthenticated"
+      schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+    }
+  }
+  responses: {
+    key: "402"
+    value: {
+      description: "payment_required (billing refuses the operation for the account's standing)"
       schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
     }
   }

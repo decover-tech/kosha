@@ -33,7 +33,7 @@ use kosha_control::orgs::{self, Actor, MemoryOrgStore, OrgError, OrgStore, Role}
 use serde_json::{json, Value};
 
 use crate::auth::KeyStore;
-use crate::{json_error, json_ok, url_decode};
+use crate::{api_error, api_error_status, json_ok, url_decode, ErrorCode};
 
 /// The header naming the user a request acts for.
 const ACTOR_HEADER: &str = "x-kosha-actor";
@@ -103,7 +103,7 @@ fn error_response(e: &OrgError) -> String {
         OrgError::Conflict(_) => 409,
         OrgError::Store(_) => 500,
     };
-    json_error(status, &e.to_string())
+    api_error_status(status, &e.to_string())
 }
 
 fn respond<T>(result: Result<T, OrgError>, body: impl FnOnce(T) -> Value) -> String {
@@ -340,7 +340,7 @@ fn dispatch(
                 },
             )
         }
-        _ => json_error(404, "not found"),
+        _ => api_error(ErrorCode::NotFound, "not found"),
     })
 }
 

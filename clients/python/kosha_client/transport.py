@@ -128,10 +128,21 @@ class Transport:
 
 
 class KoshaRequestError(Exception):
-    """Raised when a Kosha HTTP request fails."""
+    """Raised when a Kosha HTTP request fails.
+
+    ``code``, ``retryable``, ``retry_after_ms`` and ``request_id`` come from
+    the server's error body (docs/api/errors.md); branch on ``code``, never
+    on the human-readable ``error``. They are ``None`` / ``False`` for an
+    error that did not come from a Kosha server.
+    """
 
     def __init__(self, status_code: int, error: str, info: dict | None = None):
         self.status_code = status_code
         self.error = error
         self.info = info or {}
-        super().__init__(f"KoshaRequestError({status_code}): {error}")
+        self.code: str | None = self.info.get("code")
+        self.retryable: bool = bool(self.info.get("retryable", False))
+        self.retry_after_ms: int | None = self.info.get("retry_after_ms")
+        self.request_id: str | None = self.info.get("request_id")
+        detail = f" [{self.code}]" if self.code else ""
+        super().__init__(f"KoshaRequestError({status_code}){detail}: {error}")

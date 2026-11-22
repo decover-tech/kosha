@@ -207,3 +207,64 @@ fn spec_is_the_wire_contract() {
     let counts = &doc["components"]["schemas"]["v1IndexDocumentsResponse"]["properties"];
     assert_eq!(counts["indexed_count"]["type"], "integer");
 }
+
+fn request(method: &str, target: &str, headers: &[(&str, &str)]) -> http::Request {
+    http::Request {
+        method: method.into(),
+        target: target.into(),
+        headers: headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        body: Vec::new(),
+    }
+}
+
+/// Every response, success or error, carries `X-Request-Id` (the caller's,
+/// sanitized, or a generated one) and `Kosha-Api-Version`; an error body
+/// echoes the same id (#350, ADR-350 §a.2, §b).
+#[test]
+fn every_response_carries_request_id_and_api_version() {
+    let state = AppState::new(tests::test_dir());
+    let ok = dispatch(&state, request("GET", "/v1/healthz", &[]));
+    assert_eq!(ok.status(), 200);
+    assert_eq!(ok.header("kosha-api-version"), Some(api_error::API_VERSION));
+    assert_eq!(ok.header("x-request-id").map(str::len), Some(16));
+
+    let mut missing = dispatch(
+        &state,
+        request(
+            "GET",
+            "/v1/namespaces/nope/stats",
+            &[("x-request-id", "trace-42")],
+        ),
+    );
+    assert_eq!(missing.status(), 404);
+    assert_eq!(missing.header("x-request-id"), Some("trace-42"));
+    let body: serde_json::Value = serde_json::from_slice(&missing.body_bytes()).unwrap();
+    assert_eq!(body["code"], "namespace_not_found");
+    assert_eq!(body["request_id"], "trace-42");
+    assert_eq!(body["error"], "namespace 'nope' not found");
+    assert_eq!(body["retryable"], false);
+}
+
+/// A bad filter is the caller's error (400), not a 500.
+#[test]
+fn an_invalid_filter_is_a_400() {
+    let state = AppState::new(tests::test_dir());
+    let headers = HashMap::new();
+    let docs = serde_json::json!({"documents": [{"id": "1", "fields": [
+        {"name": "title", "field_type": "Text", "value": "hello"}]}]});
+    let line = "POST /v1/namespaces/f/documents HTTP/1.1\r\n";
+    let indexed = route(line, &headers, docs.to_string().as_bytes(), "t", &state);
+    assert_eq!(status_of(&indexed), 200, "{indexed}");
+    let search = serde_json::json!({"query_text": "hello", "filter": {"no_such_clause": {}}});
+    let line = "POST /v1/namespaces/f/search HTTP/1.1\r\n";
+    let response = route(line, &headers, search.to_string().as_bytes(), "t", &state);
+    assert_eq!(status_of(&response), 400, "{response}");
+    let code = body_of(&response)["code"].clone();
+    assert!(
+        code == "invalid_query" || code == "invalid_argument",
+        "{response}"
+    );
+}
