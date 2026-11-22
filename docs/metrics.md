@@ -75,6 +75,28 @@ plus `+Inf`.
 Values that already exist elsewhere in the server (cache bytes, NVMe evictions, checksum
 failures, queue depth) are read when Prometheus scrapes, not counted twice.
 
+The purge of deleted namespaces (`KOSHA_DELETION_PURGE_INTERVAL_MS`, #347) adds no family to
+`/metrics`. A segment directory it removes counts in `kosha_cache_evictions_total{cache="nvme"}`
+like any other explicit eviction. Its own counters are per pod, in the `deletion_purge` block of
+`GET /v1/stats`:
+
+| Field | Meaning |
+| --- | --- |
+| `enabled`, `interval_ms` | Whether the purge runs on this pod, and how often |
+| `caught_up` | Whether a pass since boot has read the deletion records to the end |
+| `last_pass_at_ms`, `watermark_ms` | When the last pass started (Unix ms, this pod's clock), and the newest `requested_at_ms` among the records handled |
+| `pending_sweeps` | Subjects waiting for another sweep: the repeat sweep after a deletion, or one that left something behind or failed |
+| `last_error` | The first error of the last pass, `null` when it had none |
+| `kosha_deletion_purge_passes_total` | Passes run |
+| `kosha_deletion_purge_records_total` | Deletion records handled for the first time |
+| `kosha_deletion_purge_sweeps_total` | Sweeps of one namespace or tenant, first and repeat sweeps together |
+| `kosha_deletion_purge_segment_dirs_removed_total`, `kosha_deletion_purge_bytes_removed_total` | Segment directories removed from the local disk, and their bytes |
+| `kosha_deletion_purge_parsed_segments_dropped_total` | Parsed segments dropped from memory |
+| `kosha_deletion_purge_deferred_total` | Directories or namespaces a sweep left for a later one (written to within the last 5 s, pinned, being fetched, or held by a writer's unpublished state) |
+| `kosha_deletion_purge_errors_total` | Passes or sweeps that failed (control store unreadable, a file that could not be removed) |
+| `kosha_deletion_resume_attempts_total`, `kosha_deletion_resume_completed_total` | Automatic retries of pending namespace records on a writer pod (`KOSHA_DELETION_RESUME_INTERVAL_MS`), and how many completed the record |
+| `kosha_deletion_resume_fenced_total` | Automatic retries skipped because the namespace's writer lease could not be taken (another writer pod holds it, or the lease store could not be reached) |
+
 Each cache keeps these figures per tenant (#342): the tenant is the first component of the
 `<tenant>/<name>` namespace id, and bare namespace ids from before tenants existed count as
 one shared `_legacy` tenant. Without tenant labels each `kosha_cache_*` family has one series

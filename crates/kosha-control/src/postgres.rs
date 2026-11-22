@@ -782,6 +782,15 @@ impl ControlStore for PgStore {
         self.rt.block_on(crate::deletion::list(&self.pool, filter))
     }
 
+    fn deletions_after(
+        &self,
+        after: Option<&kosha_core::deletion::DeletionPosition>,
+        limit: u32,
+    ) -> Result<Vec<DeletionRecord>, KoshaError> {
+        self.rt
+            .block_on(crate::deletion::list_after(&self.pool, after, limit))
+    }
+
     fn list_namespaces(&self) -> Vec<NamespaceId> {
         self.rt.block_on(async {
             let rows: Vec<(String,)> =

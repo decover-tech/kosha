@@ -288,6 +288,22 @@ pub trait ControlStore: Send + Sync {
             "this control store holds no deletion records".into(),
         ))
     }
+
+    /// Up to `limit` deletion records of any state, in
+    /// `(requested_at_ms, id)` order, strictly after `after` (from the
+    /// first record when `None`). For readers that work through every
+    /// record, such as each pod's cache purge (#347); see
+    /// [`deletion::DeletionPosition`] for what the order does not promise.
+    fn deletions_after(
+        &self,
+        after: Option<&deletion::DeletionPosition>,
+        limit: u32,
+    ) -> Result<Vec<deletion::DeletionRecord>, KoshaError> {
+        let _ = (after, limit);
+        Err(KoshaError::ControlPlane(
+            "this control store holds no deletion records".into(),
+        ))
+    }
 }
 
 /// The manifest version a new incarnation of a namespace starts at, given

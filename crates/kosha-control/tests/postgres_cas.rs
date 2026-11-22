@@ -658,6 +658,65 @@ fn with_database_replaces_only_the_database_name() {
     );
 }
 
+/// #347: each pod's cache purge pages through every deletion record, of
+/// any state, in `(requested_at_ms, id)` order, and re-reads a window
+/// behind the newest it has seen.
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn postgres_pages_through_deletion_records_in_position_order() {
+    use kosha_core::deletion::{DeletionPosition, DeletionRecord, NewDeletion};
+    let url = std::env::var("KOSHA_TEST_DATABASE_URL").expect("set a dedicated test database URL");
+    let mut store = PgStore::new(&url).unwrap();
+    let tenant = format!("page-test-{}", uuid::Uuid::new_v4());
+    let mut issued: Vec<DeletionRecord> = Vec::new();
+    for i in 0..5u64 {
+        let subject = format!("{tenant}/ns{i}");
+        let request = NewDeletion::namespace(&subject, Some(&tenant), None);
+        issued.push(store.begin_deletion(&request, i).unwrap());
+    }
+    store
+        .record_deletion_attempt(&issued[1].id, 0, None)
+        .unwrap();
+    let ours = |records: Vec<DeletionRecord>| -> Vec<DeletionRecord> {
+        records
+            .into_iter()
+            .filter(|r| r.tenant_id.as_deref() == Some(tenant.as_str()))
+            .collect()
+    };
+
+    // From the start, two at a time: the whole table in order, each record
+    // once (other tests' rows are in it too).
+    let mut all: Vec<DeletionRecord> = Vec::new();
+    let mut after: Option<DeletionPosition> = None;
+    loop {
+        let page = store.deletions_after(after.as_ref(), 2).unwrap();
+        assert!(page.len() <= 2);
+        let Some(last) = page.last() else { break };
+        after = Some(last.position());
+        all.extend(page);
+    }
+    let positions: Vec<DeletionPosition> = all.iter().map(DeletionRecord::position).collect();
+    let mut sorted = positions.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(positions, sorted, "ordered, no record twice");
+    let mine = ours(all);
+    assert_eq!(mine.len(), 5);
+    assert_eq!(mine.iter().filter(|r| r.is_completed()).count(), 1);
+
+    // A window: everything requested at or after a record's millisecond.
+    let oldest = issued.iter().map(|r| r.requested_at_ms).min().unwrap();
+    let window = ours(
+        store
+            .deletions_after(Some(&DeletionPosition::at_ms(oldest)), 1000)
+            .unwrap(),
+    );
+    assert_eq!(window.len(), 5);
+    // Strictly after the newest of ours: none of ours.
+    let newest = issued.iter().map(DeletionRecord::position).max().unwrap();
+    assert!(ours(store.deletions_after(Some(&newest), 1000).unwrap()).is_empty());
+}
+
 /// #347: the namespace's rows and its pending deletion record go in one
 /// transaction; the record completes only on an attempt without an error,
 /// and migration 004 leaves existing rows alone.

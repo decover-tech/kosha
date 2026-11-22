@@ -378,6 +378,18 @@ fn vector_value_dim(value: &str) -> Option<VectorValueDim> {
     })
 }
 
+/// What this node holds for a namespace, as [`Indexer::while_quiesced`]
+/// reads it.
+#[derive(Debug, Clone)]
+pub struct LocalNamespace {
+    /// The local manifest, including segments not yet published.
+    pub manifest: Manifest,
+    /// Whether anything here is not in the control store yet: a manifest
+    /// version that was never published, buffered or WAL-recovered writes,
+    /// or pending deletes.
+    pub unpublished: bool,
+}
+
 struct NamespaceHandle {
     mutation: Mutex<()>,
     writes: Mutex<()>,
@@ -2664,6 +2676,42 @@ impl Indexer {
         Ok(Some(shared))
     }
 
+    /// Run `sweep` while no write, flush, upsert, compaction or drop of
+    /// `namespace` is in flight on this node (the locks
+    /// [`Self::drop_namespace`] takes), handing it what this node holds for
+    /// the namespace at that moment; `None` when it is unknown here.
+    ///
+    /// For removing local files of a deleted incarnation (#347) without
+    /// touching the current one: under these locks every segment directory
+    /// this writer has produced for the namespace is listed by the manifest
+    /// in [`LocalNamespace`], published or not. A manifest a follower
+    /// installs ([`Self::restore_manifest`]) is not held back by them.
+    pub fn while_quiesced<R>(
+        &self,
+        namespace: &NamespaceId,
+        sweep: impl FnOnce(Option<LocalNamespace>) -> R,
+    ) -> R {
+        let handle = self.ns_handle(namespace);
+        let _writes = handle.writes.lock().unwrap();
+        let _compact = handle.compact.lock().unwrap();
+        let _mutation = handle.mutation.lock().unwrap();
+        let local = {
+            let state = handle.state.lock().unwrap();
+            state.known.then(|| LocalNamespace {
+                unpublished: state.published_version != state.manifest.version
+                    || state
+                        .buffer
+                        .as_ref()
+                        .is_some_and(|b| !b.documents.is_empty())
+                    || !state.tombstones.is_empty()
+                    || !state.recovered.is_empty()
+                    || !state.recovered_deletes.is_empty(),
+                manifest: state.manifest.clone(),
+            })
+        };
+        sweep(local)
+    }
+
     /// Forget a namespace this node only follows (a query replica's copy
     /// of a namespace deleted elsewhere): it reads as unknown until a
     /// manifest is restored for it again. Leaves the WAL alone, unlike
@@ -4034,6 +4082,40 @@ mod tests {
                 ("d4".to_string(), "four".to_string()),
             ]
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #347: the purge reads a namespace under the writer's locks.
+    #[test]
+    fn while_quiesced_reports_unknown_published_and_unpublished_namespaces() {
+        let dir = std::env::temp_dir().join(format!("kosha-quiesced-{}", uuid::Uuid::new_v4()));
+        let idx = Indexer::new(dir.clone());
+        let ns = NamespaceId("t/quiesced".into());
+        assert!(idx.while_quiesced(&ns, |local| local.is_none()));
+        // Asking does not make the namespace known.
+        assert!(idx.manifest_version(&ns).is_none());
+        assert!(!idx.namespaces().contains(&ns));
+
+        idx.restore_manifest(ns.clone(), Manifest::empty(4));
+        let local = idx.while_quiesced(&ns, |local| local).unwrap();
+        assert_eq!(local.manifest.version, 4);
+        assert!(!local.unpublished, "a followed manifest is published");
+
+        let doc = Document {
+            id: DocumentId("a".into()),
+            fields: vec![Field::text("text", "hello")],
+        };
+        idx.index_documents(ns.clone(), vec![doc]).unwrap();
+        assert!(
+            idx.while_quiesced(&ns, |local| local).unwrap().unpublished,
+            "a buffered write"
+        );
+        idx.flush_namespace(&ns).unwrap();
+        let local = idx.while_quiesced(&ns, |local| local).unwrap();
+        assert!(local.unpublished, "a flushed, unpublished segment");
+        assert_eq!(local.manifest.segments.len(), 1);
+        publish(&idx, &ns);
+        assert!(!idx.while_quiesced(&ns, |local| local).unwrap().unpublished);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
