@@ -624,6 +624,11 @@ to the shared `_legacy` cache tenant; such ids already configured keep working,
 and the server logs a warning at startup for any in `KOSHA_API_KEYS`.
 
 - Set `KOSHA_ADMIN_API_KEY` for `/v1/admin/*` and global `/stats` access.
+- Organizations, users with roles (owner, admin, member, read-only), projects,
+  the tenants they own and an audit log of control-plane actions are managed
+  under `/v1/admin/users` and `/v1/admin/orgs`; see
+  [docs/organizations.md](docs/organizations.md). Existing tenants and keys need
+  no migration.
 - Set a separate `KOSHA_INTERNAL_API_KEY` on every peer participating in segment
   hydration. Tenant API keys do not authorize admin or peer-file access.
 - Both service capabilities are disabled when their respective secret is unset.
@@ -883,7 +888,7 @@ the full contributor workflow: crate map, feature flags, benchmarks and PR conve
 The Postgres CAS integration test races independent writers and checks retries.
 Run it against a dedicated disposable database:
 
-    KOSHA_TEST_DATABASE_URL=postgres://... cargo test -p kosha-control --features postgres --test postgres_cas -- --ignored
+    KOSHA_TEST_DATABASE_URL=postgres://... cargo test -p kosha-control --features postgres --test postgres_cas --test orgs -- --ignored
 
 To measure single-document upsert write amplification against a real 500 MiB
 segment (including its stored filter payload):
