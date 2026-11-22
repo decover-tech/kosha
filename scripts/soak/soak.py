@@ -36,7 +36,9 @@ The driver preloads them, then for --duration seconds runs, concurrently:
               configured rate (--flood-qps). Its requests and 429s are
               counted apart from everything else, the other ("victim")
               tenants' query latency is reported on its own, and
-              --victim-p99-ms bounds it
+              --victim-p99-ms bounds it; --victim-max-429-rate and
+              --victim-max-error-rate (both 0 by default) bound the
+              victims' 429s and their 5xx/connection errors
 
 At the end it flushes everything and checks that every namespace's
 match_all count is exactly its live set, on the write pod (strong) and on
@@ -380,6 +382,20 @@ def evaluate(report: Dict, t: Dict) -> List[Dict]:
     if flood:
         fr = flood["requests"]
         gate("flood:limited", fr["429"] > 0, "%d of %d flood requests got 429 (none: the flood tenant has no query limit on the server)" % (fr["429"], fr["total"]))
+        # The victims must be served, not only fast when served: a p99 over
+        # the few 200s of a tenant that is mostly shed proves nothing.
+        vr = flood["victim"]["requests"]
+        vtotal = vr.get("total", 0)
+        gate("flood:victim-served", vr.get("ok", 0) > 0, "%d of %d queries of the other tenants returned 200" % (vr.get("ok", 0), vtotal))
+        bound = t.get("victim_max_429_rate")
+        if bound is not None and bound >= 0:
+            rate = vr.get("429", 0) / max(1, vtotal)
+            gate("flood:victim-429-rate", rate <= bound, "%d of %d queries of the other tenants got 429 (%.5f), bound %s" % (vr.get("429", 0), vtotal, rate, bound))
+        bound = t.get("victim_max_error_rate")
+        if bound is not None and bound >= 0:
+            bad = vr.get("5xx", 0) + vr.get("conn", 0)
+            rate = bad / max(1, vtotal)
+            gate("flood:victim-error-rate", rate <= bound, "%d of %d queries of the other tenants failed with 5xx or a connection error (%.5f), bound %s" % (bad, vtotal, rate, bound))
         if t.get("victim_p99_ms") is not None and t["victim_p99_ms"] >= 0:
             vl = flood["victim"]["latency"]
             gate("flood:victim-p99", vl["p99_ms"] is not None and vl["p99_ms"] <= t["victim_p99_ms"], "p99 %s ms, bound %s ms over %d queries of the other tenants" % (vl["p99_ms"], t["victim_p99_ms"], vl["count"]))
@@ -947,6 +963,8 @@ class Driver:
             report["flood"] = self.flood_report()
         thresholds = {
             "victim_p99_ms": a.victim_p99_ms,
+            "victim_max_429_rate": a.victim_max_429_rate,
+            "victim_max_error_rate": a.victim_max_error_rate,
             "max_p99_ms": a.max_p99_ms,
             # A `--duration 0` run only preloads: no queries or samples to gate.
             "max_visible_p99_s": a.max_visible_p99_s if a.duration > 0 else None,
@@ -1156,9 +1174,18 @@ def self_test() -> int:
             check("lost insert fails the exact count", not report["pass"] and not verdicts["exact-count"]["ok"], verdicts["exact-count"])
 
     # Flood mode (#341): gates on the victims only.
-    flood_rep = dict(rep, flood={"requests": {"total": 100, "429": 90}, "victim": {"latency": {"count": 9, "p99_ms": 80.0}}})
-    v = {x["check"]: x["ok"] for x in evaluate(flood_rep, {"victim_p99_ms": 100})}
-    check("evaluate: flood gates hold", v.get("flood:limited") is True and v.get("flood:victim-p99") is True, v)
+    flood_rep = dict(rep, flood={"requests": {"total": 100, "429": 90}, "victim": {"requests": {"total": 9, "ok": 9, "429": 0, "4xx": 0, "5xx": 0, "conn": 0}, "latency": {"count": 9, "p99_ms": 80.0}}})
+    v = {x["check"]: x["ok"] for x in evaluate(flood_rep, {"victim_p99_ms": 100, "victim_max_429_rate": 0, "victim_max_error_rate": 0})}
+    check("evaluate: flood gates hold", v.get("flood:limited") is True and v.get("flood:victim-p99") is True and v.get("flood:victim-served") is True and v.get("flood:victim-429-rate") is True and v.get("flood:victim-error-rate") is True, v)
+    # The #341 failure: the victims are mostly shed and the few 200s are fast.
+    shed_rep = dict(flood_rep, flood=dict(flood_rep["flood"], victim={"requests": {"total": 100, "ok": 5, "429": 95, "4xx": 0, "5xx": 0, "conn": 0}, "latency": {"count": 5, "p99_ms": 10.0}}))
+    v = {x["check"]: x["ok"] for x in evaluate(shed_rep, {"victim_p99_ms": 100, "victim_max_429_rate": 0, "victim_max_error_rate": 0})}
+    check("evaluate: shed victims fail the run though their p99 passes", v.get("flood:victim-p99") is True and v.get("flood:victim-429-rate") is False and v.get("flood:victim-error-rate") is True, v)
+    v = {x["check"]: x["ok"] for x in evaluate(shed_rep, {"victim_max_429_rate": 0.96, "victim_max_error_rate": -1})}
+    check("evaluate: the victim 429 bound is a rate, and -1 turns a victim gate off", v.get("flood:victim-429-rate") is True and "flood:victim-error-rate" not in v, v)
+    err_rep = dict(flood_rep, flood=dict(flood_rep["flood"], victim={"requests": {"total": 100, "ok": 0, "429": 0, "4xx": 0, "5xx": 60, "conn": 40}, "latency": {"count": 0, "p99_ms": None}}))
+    v = {x["check"]: x["ok"] for x in evaluate(err_rep, {"victim_max_429_rate": 0, "victim_max_error_rate": 0})}
+    check("evaluate: victims failing with 5xx or connection errors fail the run", v.get("flood:victim-error-rate") is False and v.get("flood:victim-served") is False and v.get("flood:victim-429-rate") is True, v)
     v = {x["check"]: x["ok"] for x in evaluate(flood_rep, {"victim_p99_ms": 50})}
     check("evaluate: victim p99 over the bound fails", v.get("flood:victim-p99") is False, v)
     flood_rep["flood"]["requests"]["429"] = 0
@@ -1194,6 +1221,7 @@ def self_test() -> int:
     check("flood run: flood requests are not in the run's totals", not any(k.startswith("flood") for k in report["requests_by_kind"]) and sum(sum(k.values()) for k in report["requests_by_kind"].values()) == report["requests"]["total"], report["requests"])
     check("flood run: victims are never 429 and never the flood tenant", victim.get("tenants") == ["t2"] and victim.get("requests", {}).get("429") == 0 and victim.get("requests", {}).get("ok", 0) > 0, victim)
     check("flood run: victim p99 reported and gated separately", victim.get("latency", {}).get("count", 0) > 0 and victim["latency"]["p99_ms"] is not None and verdicts.get("flood:victim-p99", {}).get("ok") is True and verdicts.get("flood:limited", {}).get("ok") is True, (victim.get("latency"), verdicts))
+    check("flood run: victim shed and error gates run by default and hold", all(verdicts.get(g, {}).get("ok") is True for g in ("flood:victim-served", "flood:victim-429-rate", "flood:victim-error-rate")), verdicts)
     args.victim_p99_ms = 0.0001
     check("flood run: a victim p99 over the bound fails the run", not all(x["ok"] for x in evaluate(report, {"victim_p99_ms": args.victim_p99_ms})))
     print("self-test: %s" % ("FAILED: " + ", ".join(failures) if failures else "all ok"))
@@ -1265,6 +1293,8 @@ def parse_args(argv: Optional[List[str]] = None):
     p.add_argument("--flood-multiplier", type=float, default=10, help="the flooder sends at this multiple of --flood-qps")
     p.add_argument("--flood-concurrency", type=int, default=64, help="flood searches in flight at most; beyond it they are dropped and counted")
     p.add_argument("--victim-p99-ms", type=float, default=-1, help="with --flood-tenant-key: p99 bound over the other tenants' queries during the flood; -1 = off")
+    p.add_argument("--victim-max-429-rate", type=float, default=0, help="with --flood-tenant-key: share of the other tenants' queries that may get 429 during the flood (the flood must not get them shed); -1 = off")
+    p.add_argument("--victim-max-error-rate", type=float, default=0, help="with --flood-tenant-key: share of the other tenants' queries that may fail with 5xx or a connection error during the flood; -1 = off")
     p.add_argument("--out", help="write the JSON report here")
     args = p.parse_args(argv)
     defaults = SMOKE if args.smoke else FULL

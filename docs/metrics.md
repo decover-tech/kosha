@@ -39,7 +39,7 @@ plus `+Inf`.
 | `kosha_search_duration_seconds` | histogram | none | Server-side wall-clock time of searches with outcome `ok`, from the handler's start to the response being ready. Includes result-cache hits |
 | `kosha_search_phase_seconds` | histogram | `phase` | Time a scored search spent in each phase. `queue`: waiting for a scoring slot. `hydrate`: making the segment files it needs local (near zero when warm). `score`: the scoring pass. The same numbers as `queue_ms`, `hydrate_ms` and `score_ms` in the `search timing:` log line. Result-cache hits are not observed |
 | `kosha_search_queue_depth` | gauge | none | Searches waiting for a scoring slot at scrape time |
-| `kosha_search_queue_rejections_total` | counter | none | Searches the scoring queue shed, whether because it was full or because the wait timed out. Each is also counted in `kosha_search_requests_total` as `rejected` or `timeout` |
+| `kosha_search_queue_rejections_total` | counter | none | Searches the scoring queue shed, whether because it was full (including a waiting search shed to make room for a tenant holding less of the full queue) or because the wait timed out. Each is also counted in `kosha_search_requests_total` as `rejected` or `timeout` |
 | `kosha_knn_degraded_segments_total` | counter | none | Segments a kNN search could not search by vector and skipped (the response's `knn_degraded_segments`, summed). Any increase means vector search silently returned fewer candidates |
 
 ### Writes

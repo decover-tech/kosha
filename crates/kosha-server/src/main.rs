@@ -6238,25 +6238,34 @@ impl SearchObservation {
                 "search overloaded: scoring queue is saturated — retry with backoff",
             ),
         };
-        let retry_after_ms = tenant_limits::QUEUE_SHED_RETRY_AFTER_MS;
-        eprintln!(
-            "WARN: request failed: status=429 reason={reason} {message}{}",
-            request_id()
-        );
-        let body = serde_json::json!({
-            "error": message,
-            "reason": reason,
-            "retry_after_ms": retry_after_ms,
-        })
-        .to_string();
-        retry_after(
-            format!(
-                "HTTP/1.1 429 Too Many Requests\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{body}",
-                body.len()
-            ),
-            retry_after_ms.div_ceil(1000).max(1),
-        )
+        overload_shed_response(reason, message)
     }
+}
+
+/// The 429 for a search the pod shed for a reason that is not a tenant
+/// limit (scoring queue, hydration ceiling, memory admission): the same
+/// contract as [`tenant_rejection`] minus `limit`, so every search 429
+/// carries `Retry-After` and a JSON body `{error, reason, retry_after_ms}`
+/// (#341). Not counted in `kosha_tenant_rejections_total`.
+fn overload_shed_response(reason: &str, message: &str) -> String {
+    let retry_after_ms = tenant_limits::QUEUE_SHED_RETRY_AFTER_MS;
+    eprintln!(
+        "WARN: request failed: status=429 reason={reason} {message}{}",
+        request_id()
+    );
+    let body = serde_json::json!({
+        "error": message,
+        "reason": reason,
+        "retry_after_ms": retry_after_ms,
+    })
+    .to_string();
+    retry_after(
+        format!(
+            "HTTP/1.1 429 Too Many Requests\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{body}",
+            body.len()
+        ),
+        retry_after_ms.div_ceil(1000).max(1),
+    )
 }
 
 /// Run one search handler and record its outcome and latency.
@@ -10947,8 +10956,8 @@ fn hydration_error_response(outcome: &HydrationOutcome) -> Option<String> {
 /// admission decision a server bug.
 #[cfg(feature = "s3")]
 fn hydration_shed_response() -> String {
-    json_error(
-        429,
+    overload_shed_response(
+        "search_hydration_limit",
         "search overloaded: this query needs more segment data than one request \
          may hydrate — the namespace is still warming, retry with backoff",
     )
@@ -11183,7 +11192,9 @@ fn log_rerank(ns: &NamespaceId, call: &kosha_query::rerank::RerankCall) {
 /// out-of-range request is a 400.
 fn search_error_response(e: &KoshaError) -> String {
     match e {
-        KoshaError::Overloaded(_) => json_error(429, &format!("search overloaded: {e}")),
+        KoshaError::Overloaded(_) => {
+            overload_shed_response("search_overloaded", &format!("search overloaded: {e}"))
+        }
         KoshaError::ControlPlane(_) => json_error(503, &format!("search unavailable: {e}")),
         KoshaError::InvalidQuery(_) => json_error(400, &e.to_string()),
         // A query replica learns from the control store that the namespace
@@ -15601,6 +15612,12 @@ mod tests {
         };
         let response = hydration_error_response(&shed).expect("shed must not proceed");
         assert!(response.starts_with("HTTP/1.1 429"), "got: {response}");
+        // The 429 contract (#341): `Retry-After` and a machine-readable reason.
+        assert!(response.contains("\r\nretry-after: 1\r\n"), "{response}");
+        let body = body_of(&response);
+        assert_eq!(body["reason"], "search_hydration_limit", "{response}");
+        assert!(body["error"].is_string(), "{response}");
+        assert!(body["retry_after_ms"].as_u64().unwrap() >= 1, "{response}");
 
         let failed = HydrationOutcome {
             missing: vec!["ns/seg-1".to_string()],
@@ -21342,6 +21359,84 @@ mod tests {
             rejections(state).iter().all(|s| s.value == 0.0),
             "a pod-wide shed is not a tenant rejection"
         );
+    }
+
+    /// A search refused by the memory ledger or a hydration budget
+    /// (`KoshaError::Overloaded`) follows the 429 contract too: `Retry-After`
+    /// and a machine-readable reason, not a bare error string.
+    #[test]
+    fn overloaded_search_error_has_retry_after_and_reason() {
+        let response = search_error_response(&KoshaError::Overloaded(
+            "timed out waiting for segment memory".into(),
+        ));
+        assert_eq!(status_of(&response), 429, "{response}");
+        assert_eq!(
+            header_of(&response, "retry-after").as_deref(),
+            Some("1"),
+            "{response}"
+        );
+        let body = body_of(&response);
+        assert_eq!(body["reason"], "search_overloaded", "{response}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("timed out waiting for segment memory"),
+            "{response}"
+        );
+        assert!(body["retry_after_ms"].as_u64().unwrap() >= 1, "{response}");
+        // Other search failures keep their status and carry no retry hint.
+        let invalid = search_error_response(&KoshaError::InvalidQuery("bad".into()));
+        assert_eq!(status_of(&invalid), 400, "{invalid}");
+        assert!(header_of(&invalid, "retry-after").is_none(), "{invalid}");
+    }
+
+    /// A tenant with no limits that fills every scoring slot and the whole
+    /// pod-wide queue (`KOSHA_SEARCH_QUEUE_DEPTH`) does not get another
+    /// tenant's search shed: the flooder gives up a queue place instead,
+    /// with the default `KOSHA_SEARCH_QUEUE_DEPTH_PER_TENANT` of 0.
+    #[test]
+    fn unlimited_tenant_filling_the_search_queue_does_not_shed_another_tenant() {
+        let mut state = test_state();
+        // One permit (held below), three waiters in all, no per-tenant cap.
+        state.search_semaphore =
+            fair_admission::FairSemaphore::new(1, 3, 0, Some(Duration::from_secs(30)));
+        seed_docs(&state, "noisy");
+        seed_docs(&state, "quiet");
+        let state = &state;
+        let held = state.search_semaphore.try_acquire("noisy", 1).unwrap();
+        std::thread::scope(|scope| {
+            let mut flood: Vec<_> = (0..3)
+                .map(|_| scope.spawn(|| search_docs(state, "noisy")))
+                .collect();
+            wait_for_waiters(state, 3);
+
+            let quiet = scope.spawn(|| search_docs(state, "quiet"));
+            // One flood search is shed for it, at once.
+            let t0 = Instant::now();
+            let shed = loop {
+                if let Some(i) = flood.iter().position(|h| h.is_finished()) {
+                    break flood.swap_remove(i).join().unwrap();
+                }
+                assert!(
+                    t0.elapsed() < Duration::from_secs(10),
+                    "no flood search shed"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            assert_eq!(status_of(&shed), 429, "{shed}");
+            assert_eq!(body_of(&shed)["reason"], "search_queue_full", "{shed}");
+            assert!(header_of(&shed, "retry-after").is_some(), "{shed}");
+            assert_eq!(state.search_semaphore.waiters(), 3);
+
+            drop(held);
+            let quiet = quiet.join().unwrap();
+            assert_eq!(status_of(&quiet), 200, "quiet tenant shed: {quiet}");
+            for h in flood {
+                let response = h.join().unwrap();
+                assert_eq!(status_of(&response), 200, "{response}");
+            }
+        });
     }
 
     /// The #341 "done when": a tenant flooding at 10x its query rate, from

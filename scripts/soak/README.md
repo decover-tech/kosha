@@ -41,7 +41,11 @@ Python 3.9+ standard library only.
   Flood requests have their own counters and are not part of the request totals or the 5xx
   and connection-error gates. The report's `flood` section holds the flooder's requests and
   429 rate, and under `victim` the other tenants' query counts, 429s and p50/p99 (overall and
-  per window). Write-to-visible samples are not taken from the flood tenant.
+  per window). The victim p99 covers only the queries that returned 200, so the victims'
+  429s, 5xx and connection errors have their own gates (`--victim-max-429-rate`,
+  `--victim-max-error-rate`, both 0 by default): a flood that gets the other tenants shed
+  fails the run even when the few that were served were fast. Write-to-visible samples are
+  not taken from the flood tenant.
 - **At the end**: the driver flushes every namespace. It then requires each `match_all` total
   to equal the live set exactly: on the write URL with a strong read, and on every query URL
   with an eventual read once the pod has caught up (`--final-timeout`).
@@ -56,7 +60,9 @@ Python 3.9+ standard library only.
 | `--max-conn-error-rate` | connection errors and timeouts / all requests | 0.01 |
 | `--max-segments` | segments of the large namespace at the end (0 = off) | 0 |
 | `--victim-p99-ms` | flood mode: p99 of the other tenants' queries during the flood | -1 (off) |
-| flood mode | the flooder got at least one 429 (otherwise the server has no limit on it) | |
+| `--victim-max-429-rate` | flood mode: 429 responses / the other tenants' queries during the flood | 0 |
+| `--victim-max-error-rate` | flood mode: 5xx responses and connection errors / the other tenants' queries during the flood | 0 |
+| flood mode | the flooder got at least one 429 (otherwise the server has no limit on it), and at least one query of the other tenants returned 200 | |
 | always | exact count everywhere, no uncertain namespace, every query class ran | |
 
 Set a gate to `-1` to turn it off. The report (`--out`) holds every verdict and the overall

@@ -174,19 +174,31 @@ Peers share cold segments through hydration leases when the binary has **s3** an
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
 | `KOSHA_MAX_CONCURRENT_SEARCHES` | Searches that run at once | `8` | searches |
-| `KOSHA_SEARCH_QUEUE_DEPTH` | Searches that may wait for a slot; beyond it requests are shed | 4 × `KOSHA_MAX_CONCURRENT_SEARCHES` (`32`) | searches |
+| `KOSHA_SEARCH_QUEUE_DEPTH` | Searches that may wait for a slot; beyond it requests are shed. A full queue is shared fairly: an arrival from a tenant holding less of it takes the place of the newest waiter of the tenant holding the most, which is shed instead | 4 × `KOSHA_MAX_CONCURRENT_SEARCHES` (`32`) | searches |
 | `KOSHA_SEARCH_QUEUE_TIMEOUT_MS` | How long a queued search waits for a slot; `0` waits without a deadline | `10000` | milliseconds |
 | `KOSHA_SEARCH_QUEUE_DEPTH_PER_TENANT` | Searches one tenant may have waiting for a slot; beyond it that tenant's searches are shed while other tenants still queue. Waiters are served round robin across tenants (#341, `fair_admission.rs`). `0`: only `KOSHA_SEARCH_QUEUE_DEPTH` applies | `0` | searches |
 | `KOSHA_SEGMENT_LIVE_MAX_BYTES` | Limit on live segment memory (cached plus pinned by running searches). Searches wait for memory above it | 2 × `KOSHA_SEGMENT_CACHE_MAX_BYTES` (8 GiB) | bytes |
 | `KOSHA_ADMISSION_TIMEOUT_MS` | How long a search waits for live memory before HTTP 429 | `15000` (`kosha_query::DEFAULT_ADMISSION_TIMEOUT`) | milliseconds |
 | `KOSHA_MAX_BODY_BYTES` | Largest accepted request body; HTTP 413 above it (`auth::max_body_bytes`) | `67108864` (64 MiB) | bytes |
 
-A search the scoring queue sheds gets HTTP 429 with `Retry-After: 1` and a JSON body
+A search the pod sheds gets HTTP 429 with `Retry-After: 1` and a JSON body
 `{"error", "reason", "retry_after_ms"}`. `reason` is `search_queue_full` (the whole queue is
 at `KOSHA_SEARCH_QUEUE_DEPTH`), `search_queue_timeout` (no slot within
-`KOSHA_SEARCH_QUEUE_TIMEOUT_MS`) or `tenant_queue_full` (the tenant is at
-`KOSHA_SEARCH_QUEUE_DEPTH_PER_TENANT`). The last one is a tenant rejection: its body also has
-`limit`, and it is counted in `kosha_tenant_rejections_total` (see Tenant limits below).
+`KOSHA_SEARCH_QUEUE_TIMEOUT_MS`), `tenant_queue_full` (the tenant is at
+`KOSHA_SEARCH_QUEUE_DEPTH_PER_TENANT`), `search_hydration_limit` (the query needs more
+segment data than one request may hydrate, `KOSHA_HYDRATE_REQUEST_MAX_BYTES`) or
+`search_overloaded` (no live memory within `KOSHA_ADMISSION_TIMEOUT_MS`, or another memory or
+hydration budget refused the search). `tenant_queue_full` is a tenant rejection: its body
+also has `limit`, and it is counted in `kosha_tenant_rejections_total` (see Tenant limits
+below).
+
+One tenant cannot use the queue bound to get another tenant's searches shed. When the queue
+is at `KOSHA_SEARCH_QUEUE_DEPTH` and a search arrives from a tenant with at least two fewer
+searches waiting than the tenant with the most, that tenant's newest waiting search is shed
+(`search_queue_full`) and the arrival queues in its place. An arrival is itself shed with
+`search_queue_full` only when its tenant already holds as large a share of the queue as any
+other. This needs no configuration; `KOSHA_SEARCH_QUEUE_DEPTH_PER_TENANT` additionally caps
+each tenant before the queue is full.
 
 ## Tenant limits
 
