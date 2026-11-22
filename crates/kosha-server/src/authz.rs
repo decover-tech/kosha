@@ -10,10 +10,17 @@
 //!
 //! Scopes by route:
 //!   - `read`: search, exists, namespace stats, reading a schema, listing
-//!     namespaces and branches.
+//!     namespaces and branches, and the tenant's own usage (`GET /v1/usage`)
+//!     and billing state (`GET /v1/billing`).
 //!   - `write`: index, replace, delete documents, flush.
 //!   - `admin`: create and delete namespaces and branches, change a
 //!     namespace's schema or shards.
+//!
+//! Usage and billing answer for the whole tenant (every namespace's usage,
+//! the plan, the invoices), so, like listing namespaces, a key restricted
+//! to specific namespaces is refused there whatever its scopes. The routes
+//! that delete a tenant or change its plan are under `/v1/admin/` and take
+//! the admin credential, never a tenant key.
 //!
 //! **Keep [`requirement`] in step with `route_inner`'s dispatch table.** A
 //! tenant route missing here is not left open: it classifies as
@@ -26,7 +33,7 @@ use kosha_control::Scope;
 /// Where a route names the namespace(s) it acts on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
-    /// The tenant as a whole (listing namespaces).
+    /// The tenant as a whole (listing namespaces, usage, billing).
     Tenant,
     /// Named in the path.
     Path(String),
@@ -90,6 +97,8 @@ pub fn requirement(method: &str, path: &str) -> Requirement {
     match (method, bare) {
         (_, "/healthz" | "/v1/healthz" | "/stats" | "/v1/stats") => Requirement::Open,
         ("GET", "/v1/namespaces") => scoped(Read, Target::Tenant),
+        // A tenant reading its own usage (#348) and billing state (#349).
+        ("GET", "/v1/usage" | "/v1/billing") => scoped(Read, Target::Tenant),
         ("POST", "/v1/namespaces") => scoped(Admin, Target::Body("namespace")),
         // Legacy unversioned routes.
         ("POST", "/search" | "/exists") => scoped(Read, Target::Body("namespace")),
@@ -164,7 +173,8 @@ pub fn authorize(
     let Some(wanted) = target_namespaces(&target, body) else {
         return Err(match target {
             Target::Tenant => {
-                "this API key is restricted to specific namespaces and cannot list all namespaces"
+                "this API key is restricted to specific namespaces and cannot use a route \
+                 that covers the whole tenant"
             }
             _ => "this API key is restricted to specific namespaces and the request names none",
         }
@@ -202,6 +212,9 @@ mod tests {
         ("GET", "/v1/namespaces/docs/branches", Scope::Read),
         ("GET", "/v1/namespaces/docs/stats", Scope::Read),
         ("GET", "/v1/namespaces", Scope::Read),
+        ("GET", "/v1/usage", Scope::Read),
+        ("GET", "/v1/usage?from=1&to=2", Scope::Read),
+        ("GET", "/v1/billing", Scope::Read),
         ("POST", "/search", Scope::Read),
         ("POST", "/exists", Scope::Read),
         ("GET", "/search?ns=docs&q=x", Scope::Read),
@@ -219,6 +232,94 @@ mod tests {
         ("POST", "/v1/namespaces/docs/branch", Scope::Admin),
         ("DELETE", "/v1/namespaces/docs/branch", Scope::Admin),
     ];
+
+    /// The routes of `ROUTES` that answer for the whole tenant.
+    const TENANT_WIDE: &[(&str, &str)] = &[
+        ("GET", "/v1/namespaces"),
+        ("GET", "/v1/usage"),
+        ("GET", "/v1/billing"),
+    ];
+
+    /// The `"METHOD /path` literals `route_inner` matches requests against,
+    /// as `(method, sample path)`. `extract_namespace(request_line,
+    /// "POST /v1/namespaces/", "/search")` becomes
+    /// `POST /v1/namespaces/docs/search`.
+    fn route_inner_literals() -> Vec<(String, String)> {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("\nfn route_inner(")
+            .expect("route_inner in main.rs");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").expect("the end of route_inner")];
+        let mut found = Vec::new();
+        // Every other piece of a split on '"' is the inside of a string
+        // literal (the table has no escaped quotes).
+        let literals: Vec<&str> = body.split('"').skip(1).step_by(2).collect();
+        for (i, literal) in literals.iter().enumerate() {
+            let Some((method, path)) = literal.split_once(' ') else {
+                continue;
+            };
+            if !["GET", "POST", "PUT", "PATCH", "DELETE"].contains(&method)
+                || !path.starts_with('/')
+            {
+                continue;
+            }
+            let path = path.trim_end_matches([' ', '?']);
+            let path = match path {
+                "/v1/namespaces/" => format!("{path}docs{}", literals[i + 1]),
+                _ => path.to_string(),
+            };
+            found.push((method.to_string(), path));
+        }
+        found
+    }
+
+    /// A route added to `route_inner` (or to the billing table it
+    /// delegates to) without a line in [`requirement`] would be refused
+    /// for every restricted key. This fails instead, naming the route.
+    #[test]
+    fn every_route_route_inner_matches_is_classified() {
+        let mut routes = route_inner_literals();
+        // The scan found the table, not a fragment of it.
+        assert!(routes.len() >= 30, "{routes:?}");
+        for expected in [
+            ("POST", "/v1/namespaces/docs/search"),
+            ("DELETE", "/v1/namespaces/docs/branch"),
+            ("GET", "/v1/usage"),
+            ("POST", "/index"),
+            ("GET", "/stats"),
+        ] {
+            assert!(
+                routes
+                    .iter()
+                    .any(|(m, p)| (m.as_str(), p.as_str()) == expected),
+                "{expected:?} not found in route_inner"
+            );
+        }
+        routes.extend(
+            crate::billing::ROUTES
+                .iter()
+                .map(|(method, path)| (method.to_string(), path.to_string())),
+        );
+        for (method, path) in &routes {
+            let needs = requirement(method, path);
+            assert_ne!(
+                needs,
+                Requirement::Unknown,
+                "{method} {path} is served but has no scope in authz::requirement"
+            );
+            // A tenant route is in the table the scope tests walk.
+            if let Requirement::Scoped { scope, .. } = needs {
+                assert!(
+                    ROUTES.iter().any(|&(m, p, s)| m == method
+                        && p.split('?').next() == Some(path.as_str())
+                        && s == scope),
+                    "{method} {path} ('{}') is missing from ROUTES",
+                    scope.as_str()
+                );
+            }
+        }
+    }
 
     #[test]
     fn each_route_needs_exactly_its_scope() {
@@ -278,7 +379,7 @@ mod tests {
         let docs_only = key(&all, Some(&["docs", "docs-branch"]));
         let other_only = key(&all, Some(&["other"]));
         for &(method, path, _) in ROUTES {
-            if path == "/v1/namespaces" && method == "GET" {
+            if TENANT_WIDE.contains(&(method, path.split('?').next().unwrap())) {
                 continue;
             }
             assert!(
@@ -297,8 +398,15 @@ mod tests {
     fn namespace_restricted_keys_fail_closed() {
         let all = [Scope::Read, Scope::Write, Scope::Admin];
         let docs = key(&all, Some(&["docs"]));
-        // Listing spans the tenant.
-        assert!(authorize(&docs, "GET", "/v1/namespaces", b"").is_err());
+        // Listing, usage and billing span the tenant: the answer would
+        // name namespaces (or money) the key was not given.
+        for &(method, path) in TENANT_WIDE {
+            let denied = authorize(&docs, method, path, b"").unwrap_err();
+            assert!(denied.contains("whole tenant"), "{method} {path}: {denied}");
+            // The same key without the namespace restriction may.
+            assert!(authorize(&key(&[Scope::Read], None), method, path, b"").is_ok());
+        }
+        assert!(authorize(&docs, "GET", "/v1/usage?from=1&to=2", b"").is_err());
         // A branch must be allowed by name as well as its parent.
         let branch = "/v1/namespaces/docs/branch";
         assert!(authorize(&docs, "POST", branch, br#"{"name":"scratch"}"#)
