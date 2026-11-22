@@ -10,7 +10,7 @@
 //!   eviction, byte-for-byte today's behaviour.
 //! - `KOSHA_CACHE_TRACE_PATH=<file>`: append one JSON line per search
 //!   describing what it read, for offline replay with
-//!   `scripts/research/cache_sim/cache_sim.py` (format documented there and
+//!   `scripts/bench/cache_sim/cache_sim.py` (format documented there and
 //!   in `docs/research/389-cost-tiering.md`). Independent of the policy, so
 //!   a trace can be recorded on the legacy baseline.
 //!
@@ -112,7 +112,7 @@ fn trace_sink() -> Option<&'static Mutex<std::io::LineWriter<std::fs::File>>> {
 /// What one search read, at the granularity the cache can use.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct QueryReads {
-    /// Segment directories relative to the data dir (`{ns}/{segment}`),
+    /// Segment directories relative to the data dir (`{tenant}/{ns}/{segment}`),
     /// manifest order.
     pub segments: Vec<String>,
     pub postings: bool,

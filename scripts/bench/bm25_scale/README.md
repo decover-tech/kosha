@@ -106,7 +106,7 @@ The `benchmark` workflow (`.github/workflows/benchmark.yml`) runs these
 scripts on the bench VM. Its inputs choose how the namespace gets warm,
 which vector snapshot to restore, and whether to keep the VM.
 
-### Warm gate (`warm_gate`: `queries` (default) or `preload`)
+### Warm gate (`warm_gate`: `queries` (default), `preload` or `timed`)
 
 `queries` follows turbopuffer's tpuf-benchmark (`pkg/bench/bench.go`).
 For hot runs, tpuf warms the namespace, then polls with the workload's own
@@ -176,6 +176,33 @@ is what the workflow builds, `queries` fails fast with
 restart with the boot preload, wait for `/readyz`, then run the cold and
 warm phases. On the original vector snapshot the boot preload takes about
 115 minutes, because the server preloads the whole ~249 GB namespace.
+
+`timed` (research #389) is for runs with a disk cache smaller than the
+working set, where `queries` cannot converge: a later query evicts what an
+earlier one needs, so "every query fully cached once" never happens.
+`run_phases.sh` then empties the local store (every arm starts cold, and
+the bound covers only the suite namespace), runs the workload unmeasured
+for `warm_fill_s` seconds, and measures only the no-result-cache phase,
+`phase_repeats` times (`warm_or_nocache_rN` / `knn_warm_nocache_rN`).
+S3 misses are part of the measured latency by design. It writes
+`footprint.tsv` (local bytes every 60 s) and `evictions.tsv` (files and
+MB the server evicted per stage, from its `disk cache evicted` lines).
+
+### Disk-cache experiment inputs (research #389)
+
+All default to what every earlier run used.
+
+| input | default | effect |
+| --- | --- | --- |
+| `cache_max_bytes` | `644245094400` | `KOSHA_CACHE_MAX_BYTES`. A smaller value needs `warm_gate=timed` and one suite per dispatch (the validate step refuses otherwise). |
+| `cache_policy` | `legacy` | `sieve` / `s3fifo` set `KOSHA_CACHE_POLICY`. |
+| `cache_accounting` | `legacy` | `exact` sets `KOSHA_CACHE_ACCOUNTING=exact`, so a legacy control counts files like the policies do. |
+| `cache_trace` | off | `KOSHA_CACHE_TRACE_PATH` on the container; the trace and an S3 size listing are archived as `server/cache-trace.jsonl.gz` and `server/s3-sizes.tsv.gz` for `scripts/bench/cache_sim/cache_sim.py replay --strip-prefix segments/`. |
+| `query_order` | `cycle` | `query_bench.py --order`: `shuffle` or `zipf` (seeded, the same sequence for every arm). |
+| `warm_fill_s`, `phase_repeats` | `900`, `1` | `timed` mode only. |
+
+Compare arms with `cache_sim.py p99ci --a <control raw-out files> --b <arm
+raw-out files>` (bootstrap CIs for p50/p99 and their difference).
 
 ### What each hit returns (`return_fields`: `ids` (default) or `all`)
 

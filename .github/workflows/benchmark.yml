@@ -29,6 +29,24 @@
 #     the same snapshot is kept per namespace, so warmup is ~minutes.
 #   preload: the earlier protocol: KOSHA_WARMUP_NAMESPACES boot preload
 #     gated on /readyz after a local wipe, then cold + warm phases.
+#   timed (research #389, bounded-cache runs): empties the local store
+#     (every arm starts cold and the bound covers only the suite
+#     namespace), runs the workload unmeasured for warm_fill_s, then
+#     measures the no-result-cache phase phase_repeats times, sampling the
+#     local footprint and the server evictions (run_phases.sh header).
+#
+# Disk-cache experiment inputs (research #389; defaults = today):
+#   cache_max_bytes   KOSHA_CACHE_MAX_BYTES (replaces the fixed 600 GiB).
+#   cache_policy      legacy | sieve | s3fifo -> KOSHA_CACHE_POLICY.
+#   cache_accounting  legacy | exact -> KOSHA_CACHE_ACCOUNTING (exact on a
+#                     legacy control matches the policies accounting).
+#   cache_trace       per-search read trace + S3 size listing, archived as
+#                     server/cache-trace.jsonl.gz and server/s3-sizes.tsv.gz
+#                     for scripts/bench/cache_sim/cache_sim.py.
+#   query_order       cycle | shuffle | zipf for query_bench.py --order.
+# A bound below the default only makes sense with warm_gate=timed and one
+# suite per dispatch (the bound covers the whole data dir); the validate
+# step refuses other combinations.
 #
 # Teardown policy mirrors the bench standing rule: destroy on success;
 # on failure the stack is KEPT for debugging (a summary line says so) —
@@ -74,7 +92,7 @@ on:
           a reused VM keeps its local cache). preload = the earlier
           KOSHA_WARMUP_NAMESPACES boot preload + cold and warm phases.
         type: choice
-        options: [queries, preload]
+        options: [queries, preload, timed]
         default: queries
       return_fields:
         description: >-
@@ -123,6 +141,47 @@ on:
       recall_sample:
         description: number of queries to check recall for (statistical sample, not the full query set)
         default: "100"
+      cache_max_bytes:
+        description: >-
+          research #389: KOSHA_CACHE_MAX_BYTES for the server (digits only).
+          Default 644245094400 (600 GiB) is the fixed value every earlier
+          run used. A smaller bound needs warm_gate=timed and suite bm25 or
+          vector, not both.
+        default: "644245094400"
+      cache_policy:
+        description: research #389 KOSHA_CACHE_POLICY. legacy = unset (today).
+        type: choice
+        options: [legacy, sieve, s3fifo]
+        default: legacy
+      cache_accounting:
+        description: >-
+          research #389 KOSHA_CACHE_ACCOUNTING. legacy = unset (today);
+          exact = count each cached file once on the legacy path, as the
+          policies do. Use exact on a legacy control arm.
+        type: choice
+        options: [legacy, exact]
+        default: legacy
+      cache_trace:
+        description: >-
+          research #389: write the per-search read trace
+          (KOSHA_CACHE_TRACE_PATH) and archive it with an S3 size listing
+          for cache_sim.py
+        type: boolean
+        default: false
+      warm_fill_s:
+        description: warm_gate=timed only - seconds of unmeasured workload before measuring
+        default: "900"
+      phase_repeats:
+        description: warm_gate=timed only - measured repeats of the no-result-cache phase (1-5)
+        default: "1"
+      query_order:
+        description: >-
+          query order for query_bench.py: cycle (today, a fixed loop over
+          the 1,677 queries), shuffle (seeded permutation per pass), zipf
+          (seeded skewed popularity)
+        type: choice
+        options: [cycle, shuffle, zipf]
+        default: cycle
       recall_num_candidates:
         description: >-
           whole-query kNN probe budget for the recall check (knn.num_candidates
@@ -145,12 +204,35 @@ env:
   VEC_SNAPSHOT: ${{ inputs.vector_snapshot || 'msmarco-10m-vec' }}
   WARM_GATE: ${{ inputs.warm_gate || 'queries' }}
   RETURN_FIELDS: ${{ inputs.return_fields || 'ids' }}
+  CACHE_MAX_BYTES: ${{ inputs.cache_max_bytes || '644245094400' }}
+  CACHE_POLICY: ${{ inputs.cache_policy || 'legacy' }}
+  CACHE_ACCOUNTING: ${{ inputs.cache_accounting || 'legacy' }}
+  CACHE_TRACE: ${{ inputs.cache_trace && 'true' || 'false' }}
+  WARM_FILL_S: ${{ inputs.warm_fill_s || '900' }}
+  PHASE_REPEATS: ${{ inputs.phase_repeats || '1' }}
+  QUERY_ORDER: ${{ inputs.query_order || 'cycle' }}
 
 jobs:
   bench:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
+      - name: Validate disk-cache experiment inputs
+        # Before any infrastructure: these values are pasted into the
+        # single-quoted remote scripts below, so only digits pass.
+        run: |
+          case "$CACHE_MAX_BYTES" in *[!0-9]*|'') echo "::error::cache_max_bytes must be digits, got: $CACHE_MAX_BYTES"; exit 1 ;; esac
+          case "$WARM_FILL_S" in *[!0-9]*|'') echo "::error::warm_fill_s must be digits, got: $WARM_FILL_S"; exit 1 ;; esac
+          case "$PHASE_REPEATS" in [1-5]) ;; *) echo "::error::phase_repeats must be 1-5, got: $PHASE_REPEATS"; exit 1 ;; esac
+          if [ "$CACHE_MAX_BYTES" != 644245094400 ]; then
+            # The bound covers the whole data dir (every namespace), and a
+            # cache smaller than the working set never lets every query
+            # come back fully cached, so the queries gate would spin.
+            [ "${{ inputs.suite }}" = both ] && { echo "::error::a non-default cache_max_bytes needs suite bm25 or vector, not both"; exit 1; }
+            [ "$WARM_GATE" = timed ] || { echo "::error::a non-default cache_max_bytes needs warm_gate=timed"; exit 1; }
+          fi
+          echo "cache: max_bytes=$CACHE_MAX_BYTES policy=$CACHE_POLICY accounting=$CACHE_ACCOUNTING trace=$CACHE_TRACE order=$QUERY_ORDER" >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/checkout@v4
 
       - uses: actions/checkout@v4
@@ -241,6 +323,18 @@ jobs:
               WARMUP_ARGS="-e KOSHA_WARMUP_NAMESPACES=default/msmarco-10m,default/msmarco-1m,default/msmarco-10m-vec"
             fi
             echo "warm gate: ${{ env.WARM_GATE }} (container args: ${WARMUP_ARGS:-none})"
+            # Research #389 disk-cache knobs. Defaults add nothing, so the
+            # container is created exactly as before.
+            # warm_gate=timed keeps the span-promotion-off args set above.
+            CACHE_ARGS=""
+            if [ "${{ env.CACHE_POLICY }}" != legacy ]; then CACHE_ARGS="-e KOSHA_CACHE_POLICY=${{ env.CACHE_POLICY }}"; fi
+            if [ "${{ env.CACHE_ACCOUNTING }}" = exact ]; then CACHE_ARGS="$CACHE_ARGS -e KOSHA_CACHE_ACCOUNTING=exact"; fi
+            sudo rm -rf /data/kosha/trace
+            if [ "${{ env.CACHE_TRACE }}" = true ]; then
+              sudo mkdir -p /data/kosha/trace && sudo chown 10001:10001 /data/kosha/trace
+              CACHE_ARGS="$CACHE_ARGS -e KOSHA_CACHE_TRACE_PATH=/var/cache/kosha/trace/cache-trace.jsonl"
+            fi
+            echo "disk cache: max_bytes=${{ env.CACHE_MAX_BYTES }} args: ${CACHE_ARGS:-none}"
             sudo docker run -d --name pg --network host -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=kosha \
               -v /data/pg:/var/lib/postgresql/data postgres:16
             # Bounded waits throughout: an unbounded `until` loop turns a
@@ -257,11 +351,11 @@ jobs:
               -e AWS_DEFAULT_REGION=us-east-1 -e KOSHA_FLUSH_THRESHOLD=50000 -e KOSHA_FLUSH_MAX_AGE_MS=0 -e KOSHA_COMPACTION_INTERVAL_MS=0 \
               -e KOSHA_HTTP_IO_TIMEOUT_SECS=1800 \
               -e KOSHA_CACHE_DIR=/var/cache/kosha -e KOSHA_DATA_DIR=/var/cache/kosha/data \
-              -e KOSHA_CACHE_MAX_BYTES=644245094400 -e KOSHA_SEGMENT_CACHE_MAX_BYTES=51539607552 \
+              -e KOSHA_CACHE_MAX_BYTES=${{ env.CACHE_MAX_BYTES }} -e KOSHA_SEGMENT_CACHE_MAX_BYTES=51539607552 \
               -e KOSHA_SEGMENT_LIVE_MAX_BYTES=68719476736 -e KOSHA_SCORING_HYDRATE_CONCURRENCY=64 \
               -e KOSHA_ADMIN_API_KEY=sk-bench-admin \
               -e KOSHA_DASHBOARD=on \
-              $WARMUP_ARGS \
+              $WARMUP_ARGS $CACHE_ARGS \
               -v /data/kosha:/var/cache/kosha kosha-server:bench
             sudo docker start kosha
             # /healthz: unauthenticated liveness. Global /stats is admin-only
@@ -293,6 +387,7 @@ jobs:
               ./snapshot_namespace.sh $BM25_NS"
           fi
           $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && WARM_GATE=$WARM_GATE RETURN_FIELDS=$RETURN_FIELDS \
+            QUERY_ORDER=$QUERY_ORDER WARM_FILL_S=$WARM_FILL_S PHASE_REPEATS=$PHASE_REPEATS \
             ./run_phases.sh bm25 $BM25_NS /data/results-ci/bm25 '${{ inputs.qps }}' '${{ inputs.duration }}'"
 
       - name: Vector suite
@@ -326,7 +421,8 @@ jobs:
           # volume), ~1h55m measured. queries: warm_gate.py hydrates only what
           # the workload reads, and nothing on a reused VM with a kept cache.
           $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && WARMUP_TIMEOUT_S=10800 WARM_GATE_TIMEOUT_S=10800 \
-            WARM_GATE=$WARM_GATE RETURN_FIELDS=$RETURN_FIELDS ./run_phases.sh vector $VEC_NS /data/results-ci/vector '${{ inputs.qps }}' '${{ inputs.duration }}'"
+            WARM_GATE=$WARM_GATE RETURN_FIELDS=$RETURN_FIELDS QUERY_ORDER=$QUERY_ORDER \
+            WARM_FILL_S=$WARM_FILL_S PHASE_REPEATS=$PHASE_REPEATS ./run_phases.sh vector $VEC_NS /data/results-ci/vector '${{ inputs.qps }}' '${{ inputs.duration }}'"
 
       - name: Recall check (real recall@k vs. brute-force ground truth)
         if: contains(fromJSON('["both","vector"]'), inputs.suite) && inputs.run_recall_check == true
@@ -360,10 +456,17 @@ jobs:
           $SSH "set -e
             sudo mkdir -p /data/results-ci/server && sudo chown -R \$(id -u):\$(id -g) /data/results-ci
             sudo docker logs --timestamps kosha 2>&1 | gzip > /data/results-ci/server/full.log.gz || true
+            if [ -f /data/kosha/trace/cache-trace.jsonl ]; then
+              sudo gzip -c /data/kosha/trace/cache-trace.jsonl > /data/results-ci/server/cache-trace.jsonl.gz || true
+              aws s3 ls --recursive s3://decoverai-bench-kosha-segments/segments/ \
+                | awk -v OFS='\t' '{print \$4, \$3}' | gzip > /data/results-ci/server/s3-sizes.tsv.gz || true
+            fi
             cat > /data/results-ci/meta.json <<META
           {\"run_id\": \"${{ github.run_id }}\", \"sha\": \"${{ github.sha }}\", \"ref\": \"${{ github.ref_name }}\",
            \"suite\": \"${{ inputs.suite }}\", \"mode\": \"${{ inputs.mode }}\", \"qps\": \"${{ inputs.qps }}\",
            \"duration\": \"${{ inputs.duration }}\", \"warm_gate\": \"$WARM_GATE\", \"vector_snapshot\": \"$VEC_SNAPSHOT\",
+           \"cache_max_bytes\": \"$CACHE_MAX_BYTES\", \"cache_policy\": \"$CACHE_POLICY\", \"cache_accounting\": \"$CACHE_ACCOUNTING\",
+           \"cache_trace\": \"$CACHE_TRACE\", \"query_order\": \"$QUERY_ORDER\", \"warm_fill_s\": \"$WARM_FILL_S\", \"phase_repeats\": \"$PHASE_REPEATS\",
            \"archived_at\": \"\$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}
           META
             aws s3 sync --only-show-errors /data/results-ci $DEST/"

@@ -107,6 +107,46 @@ def load_queries(path: Path) -> list[str]:
     return queries
 
 
+def query_order(n: int, order: str, seed: int, zipf_s: float, rank_seed: int = 389):
+    """qidx for the i-th request. cycle (default): i % n, the fixed loop
+    every earlier run used. shuffle: a seeded random permutation, re-drawn
+    each pass, so no query is a fixed distance from its repeat. zipf:
+    i.i.d. draws with P(rank r) ~ 1/r^s over a random ranking of the
+    queries, a skewed popularity mix (#389 cache-policy runs: a pure loop
+    is adversarial to FIFO/LRU and flattering to SIEVE/S3-FIFO). The
+    ranking comes from rank_seed, so the popular queries stay the same
+    across stages run with different draw seeds."""
+    import random as _random
+
+    if order == "cycle":
+        return lambda i: i % n
+    rng = _random.Random(seed)
+    if order == "shuffle":
+        state = {"pass": -1, "perm": []}
+
+        def shuffled(i: int) -> int:
+            p = i // n
+            if p != state["pass"]:
+                state["pass"] = p
+                state["perm"] = list(range(n))
+                rng.shuffle(state["perm"])
+            return state["perm"][i % n]
+
+        return shuffled
+    if order == "zipf":
+        ranking = list(range(n))
+        _random.Random(rank_seed).shuffle(ranking)
+        weights = [1.0 / (r + 1) ** zipf_s for r in range(n)]
+        cum, total = [], 0.0
+        for w in weights:
+            total += w
+            cum.append(total)
+        import bisect
+
+        return lambda _i: ranking[min(bisect.bisect_left(cum, rng.random() * total), n - 1)]
+    raise SystemExit(f"unknown --order {order}")
+
+
 def load_knn_vectors(path: Path, n_queries: int, dim: int = 1024) -> list[list[float]]:
     """queries_emb.f32 (dim-float32 records aligned with the queries file)."""
     import array as _array
@@ -223,6 +263,26 @@ def main() -> None:
         default=100,
         help="ANN candidate pool per query (tpuf-comparable default)",
     )
+    ap.add_argument(
+        "--order",
+        choices=["cycle", "shuffle", "zipf"],
+        default="cycle",
+        help="request order over the queries file: cycle (default, the fixed loop), "
+        "shuffle (seeded permutation per pass) or zipf (seeded skewed popularity)",
+    )
+    ap.add_argument(
+        "--order-seed",
+        type=int,
+        default=389,
+        help="seed for the shuffle / zipf draws; use a different one per stage",
+    )
+    ap.add_argument(
+        "--zipf-rank-seed",
+        type=int,
+        default=389,
+        help="seed for which queries are popular under --order zipf (keep fixed across stages)",
+    )
+    ap.add_argument("--zipf-s", type=float, default=1.0, help="zipf exponent for --order zipf")
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument(
         "--raw-out",
@@ -273,9 +333,12 @@ def main() -> None:
     threads: list[threading.Thread] = []
 
     interval = 1.0 / args.qps
+    next_qidx = query_order(
+        len(queries), args.order, args.order_seed, args.zipf_s, args.zipf_rank_seed
+    )
     print(
         f"phase={args.phase} qps={args.qps} topk={args.topk} "
-        f"duration={args.duration}s (~{int(args.qps * args.duration)} requests)"
+        f"duration={args.duration}s (~{int(args.qps * args.duration)} requests) order={args.order}"
     )
 
     start = time.time()
@@ -285,7 +348,7 @@ def main() -> None:
         now = time.time()
         if now < next_send:
             time.sleep(next_send - now)
-        qidx = i % len(queries)
+        qidx = next_qidx(i)
         query_text = queries[qidx]
         i += 1
         th = threading.Thread(
@@ -339,6 +402,7 @@ def main() -> None:
         "target_qps": args.qps,
         "achieved_qps": achieved_qps,
         "topk": args.topk,
+        "order": args.order,
         "duration_s": elapsed,
         "requests": i,
         "successes": len(results),

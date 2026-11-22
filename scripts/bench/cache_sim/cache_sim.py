@@ -11,6 +11,9 @@ Subcommands
 replay   Trace + file sizes -> hit ratio, GETs, bytes, $ per policy and size.
 logcost  Price what archived server logs say searches actually fetched
          (``search timing:`` lines): today's measured cost, no simulation.
+p99ci    Bootstrap confidence intervals for p99 (and p50) latency of two bench
+         arms from query_bench.py ``--raw-out`` files, and for their
+         difference: decides whether a bounded arm is "within noise".
 synth    Write a synthetic trace + sizes file (Zipf segments plus one-touch
          scans). For testing the tool only; numbers from it are not Kosha
          measurements.
@@ -21,26 +24,43 @@ Trace (``--trace``, JSONL, optionally .gz), written by the server when
 ``KOSHA_CACHE_TRACE_PATH`` is set (crates/kosha-server/src/cache_reads.rs),
 one line per successful search, format v1::
 
-    {"v": 1, "t_ms": 1763700000123, "ns": "msmarco",
-     "segs": ["msmarco/seg-a", ...],          # every segment searched
+    {"v": 1, "t_ms": 1763700000123, "ns": "default/msmarco",
+     "segs": ["default/msmarco/seg-a", ...],  # every segment dir searched
      "classes": ["scoring", "postings"],       # + "vectors" for kNN
      "postings": ["postings-3f.bin", ...],     # exact shards; null = all
-     "pages": ["msmarco/seg-a"]}               # doc stores read for the page
+     "pages": ["default/msmarco/seg-a"]}       # doc stores read for the page
+
+Segment directories are data-dir relative and, on the server, tenant
+scoped: ``{tenant}/{ns}/{segment}`` (#262). Older traces/tests use
+``{ns}/{segment}``; any depth works.
 
 Lines that do not parse as JSON (e.g. ``docker logs --timestamps`` output
 around them) are skipped, as is a leading timestamp before the ``{``.
 
-Sizes (``--sizes``, TSV, optionally .gz): ``<relative path>\\t<bytes>`` for
-every segment file, relative to the data dir, e.g. from the bench VM::
+Sizes (``--sizes``, TSV, optionally .gz): ``<path>\\t<bytes>`` for every
+segment file, ``<path>`` being ``<segment dir>/<file>`` relative to the
+data dir. Use the S3 segment listing, which holds every file whole::
 
-    sudo find /data/kosha/data -type f -printf '%P\\t%s\\n' | gzip > sizes.tsv.gz
+    aws s3 ls --recursive s3://<segment bucket>/segments/ \\
+      | awk '{print $4"\\t"$3}' | gzip > s3-sizes.tsv.gz
+    cache_sim.py replay --sizes s3-sizes.tsv.gz --strip-prefix segments/ ...
 
-or from S3: ``aws s3 ls --recursive s3://bucket/prefix/ | awk '{print $4"\\t"$3}'``
-(strip the prefix). Span-cache entries (``*.spans/...``) and temp files are
-ignored: the simulator models whole files. A trace line expands to the
-files of each named segment in the named classes (posting shards narrowed
-to the listed ones); files missing from the sizes listing are skipped and
-counted.
+(benchmark.yml writes this as ``server/s3-sizes.tsv.gz`` when
+``cache_trace`` is on). A listing of the *local* data dir is not enough:
+under ``warm_gate=queries``/``timed`` span promotion is off, so doc stores,
+posting shards and ``vector.idx`` reads are local only as
+``<file>.spans/<range>`` files, and a local listing would model the
+scoring files only. Span entries are therefore ignored by default
+(``--span-files skip``); ``--span-files sum`` instead sizes a file that
+has no whole-file entry by the sum of its cached spans (a lower bound,
+for when no S3 listing exists). ``.tmp.`` files are always ignored.
+
+A trace line expands to the files of each named segment in the named
+classes (posting shards narrowed to the listed ones). Segments missing
+from the sizes listing, and (segment, class) pairs that resolve to no
+file, are counted and reported; ``replay`` exits 2 when more than
+``--max-missing-frac`` (default 0.05) of the segment references are
+missing, so a path-layout mismatch cannot print all-zero rows silently.
 
 Server log (``logcost --log``): ``docker logs`` output, optionally .gz;
 only ``search timing:`` lines are read.
@@ -97,24 +117,70 @@ class SegmentFiles:
     by_class: dict = field(default_factory=lambda: collections.defaultdict(list))
 
 
-def load_sizes(path: str) -> dict:
+SPANS_SUFFIX = ".spans"
+
+
+def split_segment_path(rel: str):
+    """``<segment dir>/<file>[.spans/<range>]`` -> (segment dir, file, is_span).
+
+    The segment dir is everything before the segment-level file, at any
+    depth (``{tenant}/{ns}/{segment}`` on the server). None when the path
+    has no directory part.
+    """
+    comps = [c for c in rel.strip("/").split("/") if c]
+    for i, c in enumerate(comps[:-1]):
+        if c.endswith(SPANS_SUFFIX) and len(c) > len(SPANS_SUFFIX):
+            if i == 0:
+                return None
+            return "/".join(comps[:i]), c[: -len(SPANS_SUFFIX)], True
+    if len(comps) < 2:
+        return None
+    return "/".join(comps[:-1]), comps[-1], False
+
+
+def load_sizes(path: str, strip_prefix: str = "", span_files: str = "skip",
+               stats: collections.Counter | None = None) -> dict:
     """{segment dir: SegmentFiles} with (key, file name, size) per class."""
+    if span_files not in ("skip", "sum"):
+        raise ValueError(f"span_files must be skip or sum, got {span_files!r}")
+    stats = stats if stats is not None else collections.Counter()
     segs: dict = collections.defaultdict(SegmentFiles)
+    whole: set = set()
+    spans: dict = collections.Counter()
+    prefix = strip_prefix.strip("/")
     with _open(path) as f:
         for line in f:
             parts = line.rstrip("\n").split("\t")
             if len(parts) != 2:
                 continue
-            rel, size = parts[0].strip().lstrip("/"), parts[1].strip()
-            if ".spans/" in rel or ".tmp." in rel or not size.isdigit():
+            rel, size = parts[0].strip().strip("/"), parts[1].strip()
+            if prefix:
+                if rel != prefix and not rel.startswith(prefix + "/"):
+                    stats["sizes_outside_prefix"] += 1
+                    continue
+                rel = rel[len(prefix):].strip("/")
+            if ".tmp." in rel or not size.isdigit():
                 continue
-            comps = rel.split("/")
-            if len(comps) != 3:
+            split = split_segment_path(rel)
+            if split is None:
                 continue
-            cls = file_class(comps[2])
+            seg, name, is_span = split
+            if is_span:
+                spans[(seg, name)] += int(size)
+                stats["span_entries"] += 1
+                continue
+            cls = file_class(name)
             if cls is None:
                 continue
-            segs[f"{comps[0]}/{comps[1]}"].by_class[cls].append((rel, comps[2], int(size)))
+            whole.add((seg, name))
+            segs[seg].by_class[cls].append((f"{seg}/{name}", name, int(size)))
+    for (seg, name), total in spans.items():
+        if (seg, name) in whole:
+            continue
+        stats["span_only_files"] += 1
+        cls = file_class(name)
+        if span_files == "sum" and cls is not None:
+            segs[seg].by_class[cls].append((f"{seg}/{name}", name, total))
     return segs
 
 
@@ -156,21 +222,28 @@ def expand(rec: dict, sizes: dict, stats: collections.Counter) -> Query:
             objs.append((key, size))
 
     for seg in rec.get("segs") or []:
+        stats["segment_refs"] += 1
         files = sizes.get(seg)
         if files is None:
             stats["segments_missing_sizes"] += 1
             continue
         for cls in classes:
+            found = 0
             for key, name, size in files.by_class.get(cls, ()):
                 if cls == "postings" and shards is not None and name not in shards:
                     continue
                 add(key, size)
+                found += 1
+            stats[f"{cls}_resolved" if found else f"{cls}_unresolved"] += 1
     for seg in rec.get("pages") or []:
+        stats["segment_refs"] += 1
         files = sizes.get(seg)
         if files is None:
             stats["segments_missing_sizes"] += 1
             continue
-        for key, _name, size in files.by_class.get("docstore", ()):
+        found = files.by_class.get("docstore", ())
+        stats["docstore_resolved" if found else "docstore_unresolved"] += 1
+        for key, _name, size in found:
             add(key, size)
     return Query(int(rec.get("t_ms") or 0), objs)
 
@@ -600,13 +673,85 @@ def run_logcost(rows: list, c: Costs, duration: float | None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# p99ci: bootstrap CIs for bench arms (query_bench.py --raw-out files)
+
+
+def load_latencies(paths: list) -> tuple[list, int]:
+    """latency_ms of successful requests across raw-out files, plus errors."""
+    out, errors = [], 0
+    for path in paths:
+        with _open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("error") or rec.get("latency_ms") is None:
+                    errors += 1
+                    continue
+                out.append(float(rec["latency_ms"]))
+    return out, errors
+
+
+def pctl(sorted_vals: list, p: float) -> float:
+    """Linear-interpolated percentile (same rule as query_bench.py)."""
+    if not sorted_vals:
+        return float("nan")
+    k = (len(sorted_vals) - 1) * p
+    f = int(k)
+    c = min(f + 1, len(sorted_vals) - 1)
+    return sorted_vals[f] + (sorted_vals[c] - sorted_vals[f]) * (k - f)
+
+
+def bootstrap_ci(a: list, b: list | None, p: float, iters: int, seed: int, alpha: float = 0.05) -> dict:
+    """Percentile-bootstrap CI of pctl(a) (and of pctl(b) - pctl(a))."""
+    rng = random.Random(seed)
+    est_a = pctl(sorted(a), p)
+    samples_a, diffs = [], []
+    for _ in range(iters):
+        ra = sorted(rng.choices(a, k=len(a)))
+        va = pctl(ra, p)
+        samples_a.append(va)
+        if b is not None:
+            rb = sorted(rng.choices(b, k=len(b)))
+            diffs.append(pctl(rb, p) - va)
+    samples_a.sort()
+    diffs.sort()
+    lo, hi = alpha / 2, 1 - alpha / 2
+    out = {"a": est_a, "a_ci": [pctl(samples_a, lo), pctl(samples_a, hi)]}
+    if b is not None:
+        out["b"] = pctl(sorted(b), p)
+        out["diff_b_minus_a"] = out["b"] - est_a
+        out["diff_ci"] = [pctl(diffs, lo), pctl(diffs, hi)]
+    return out
+
+
+def run_p99ci(a_paths: list, b_paths: list, iters: int, seed: int) -> dict:
+    a, a_err = load_latencies(a_paths)
+    b, b_err = load_latencies(b_paths) if b_paths else ([], 0)
+    if not a or (b_paths and not b):
+        raise SystemExit("p99ci: an arm has no successful requests")
+    out = {"a_files": a_paths, "b_files": b_paths, "a_requests": len(a), "a_errors": a_err,
+           "b_requests": len(b), "b_errors": b_err, "iters": iters,
+           "a_tail_samples_p99": sum(1 for v in a if v >= pctl(sorted(a), 0.99))}
+    for name, p in (("p50", 0.50), ("p99", 0.99)):
+        out[name] = bootstrap_ci(a, b if b_paths else None, p, iters, seed)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # synth: a synthetic trace for exercising the tool (NOT Kosha data)
 
 
-def synth(n_queries: int, n_segments: int, qps: float, scan_every: int, seed: int):
+def synth(n_queries: int, n_segments: int, qps: float, scan_every: int, seed: int,
+          tenant: str = ""):
     rng = random.Random(seed)
     sizes, trace = [], []
-    hot_ns, cold_ns = "hot", "cold"
+    t_prefix = f"{tenant}/" if tenant else ""
+    hot_ns, cold_ns = f"{t_prefix}hot", f"{t_prefix}cold"
     for ns in (hot_ns, cold_ns):
         for s in range(n_segments):
             seg = f"{ns}/seg-{s:04d}"
@@ -631,7 +776,7 @@ def synth(n_queries: int, n_segments: int, qps: float, scan_every: int, seed: in
             shards = sorted({f"postings-{rng.choices(range(16), weights)[0]:02x}.bin" for _ in range(3)})
         page = [rng.choice(segs)]
         trace.append(
-            {"v": 1, "t_ms": t, "ns": segs[0].split("/")[0], "segs": segs,
+            {"v": 1, "t_ms": t, "ns": segs[0].rsplit("/", 1)[0], "segs": segs,
              "classes": ["scoring", "postings"], "postings": shards, "pages": page}
         )
     return sizes, trace
@@ -697,6 +842,15 @@ def main(argv=None) -> int:
                    help="leading share of the trace used to warm caches / estimate rates; "
                         "metrics cover the rest")
     r.add_argument("--json", help="also write rows as JSON here")
+    r.add_argument("--strip-prefix", default="",
+                   help="drop this leading path from every sizes entry (e.g. segments/ "
+                        "for an S3 listing)")
+    r.add_argument("--span-files", choices=["skip", "sum"], default="skip",
+                   help="span-cache entries: skip (default; use an S3 listing) or size a "
+                        "file with no whole-file entry by the sum of its spans")
+    r.add_argument("--max-missing-frac", type=float, default=0.05,
+                   help="exit 2 when more than this share of trace segment references "
+                        "has no sizes (layout or prefix mismatch)")
     add_cost_args(r)
 
     lc = sub.add_parser("logcost", help="price searches from search timing lines")
@@ -712,16 +866,36 @@ def main(argv=None) -> int:
     s.add_argument("--qps", type=float, default=8.0)
     s.add_argument("--scan-every", type=int, default=2)
     s.add_argument("--seed", type=int, default=389)
+    s.add_argument("--tenant", default="",
+                   help="prefix segment dirs with this tenant (the server layout)")
+
+    ci = sub.add_parser("p99ci", help="bootstrap CIs for p50/p99 of bench arms")
+    ci.add_argument("--a", required=True,
+                    help="comma list of query_bench --raw-out files (control arm, pooled)")
+    ci.add_argument("--b", default="", help="comma list for the compared arm (pooled)")
+    ci.add_argument("--iters", type=int, default=2000)
+    ci.add_argument("--seed", type=int, default=389)
+    ci.add_argument("--json")
 
     args = ap.parse_args(argv)
     if args.cmd == "synth":
-        sizes, trace = synth(args.queries, args.segments, args.qps, args.scan_every, args.seed)
+        sizes, trace = synth(args.queries, args.segments, args.qps, args.scan_every, args.seed,
+                             args.tenant)
         with open(args.sizes_out, "w") as f:
             for k, v in sizes:
                 f.write(f"{k}\t{v}\n")
         with open(args.trace_out, "w") as f:
             for rec in trace:
                 f.write(json.dumps(rec) + "\n")
+        return 0
+
+    if args.cmd == "p99ci":
+        out = run_p99ci([p for p in args.a.split(",") if p], [p for p in args.b.split(",") if p],
+                        args.iters, args.seed)
+        print(json.dumps(out, indent=2))
+        if args.json:
+            with open(args.json, "w") as f:
+                json.dump(out, f, indent=2)
         return 0
 
     c = costs_from(args)
@@ -733,11 +907,25 @@ def main(argv=None) -> int:
                 json.dump(out, f, indent=2)
         return 0
 
-    sizes = load_sizes(args.sizes)
+    size_stats: collections.Counter = collections.Counter()
+    sizes = load_sizes(args.sizes, args.strip_prefix, args.span_files, size_stats)
     queries, stats = load_trace(args.trace, sizes)
+    stats.update(size_stats)
     if not queries:
         print("no trace lines parsed", file=sys.stderr)
         return 1
+    refs = stats.get("segment_refs", 0)
+    missing = stats.get("segments_missing_sizes", 0)
+    if refs and missing / refs > args.max_missing_frac:
+        print(f"error: {missing}/{refs} trace segment references have no sizes "
+              f"(sizes listing covers {len(sizes)} segment dirs, e.g. "
+              f"{next(iter(sizes), None)!r}); check --strip-prefix and the path layout. "
+              f"{dict(stats)}", file=sys.stderr)
+        return 2
+    if stats.get("span_only_files") and args.span_files == "skip":
+        print(f"# warning: {stats['span_only_files']} files are present only as span-cache "
+              f"entries and are not modelled; use an S3 listing for whole-file sizes",
+              file=sys.stderr)
     ws = working_set_bytes(queries)
     caps = parse_capacities(args, ws)
     policies = [p.strip() for p in args.policies.split(",") if p.strip()]

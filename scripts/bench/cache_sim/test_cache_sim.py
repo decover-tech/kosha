@@ -157,5 +157,138 @@ class LogCostTests(unittest.TestCase):
         self.assertAlmostEqual(out["s3_dollars"], 6 * 4e-7)
 
 
+class TenantLayoutTests(unittest.TestCase):
+    """The server keeps segments under {tenant}/{ns}/{segment}/ (#262); the
+    first version only accepted {ns}/{segment}/{file} and printed all-zero
+    rows for real listings."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.trace = os.path.join(self.dir, "trace.jsonl")
+        with open(self.trace, "w") as f:
+            for i in range(20):
+                f.write(json.dumps({
+                    "v": 1, "t_ms": 1000 + i, "ns": "default/msmarco-10m",
+                    "segs": ["default/msmarco-10m/seg-a"], "classes": ["scoring", "postings"],
+                    "postings": ["postings-01.bin"], "pages": ["default/msmarco-10m/seg-a"],
+                }) + "\n")
+
+    def write_sizes(self, lines):
+        path = os.path.join(self.dir, "sizes.tsv")
+        with open(path, "w") as f:
+            f.write("".join(f"{k}\t{v}\n" for k, v in lines))
+        return path
+
+    def test_split_segment_path_any_depth(self):
+        self.assertEqual(cs.split_segment_path("default/ns/seg/footer.json"),
+                         ("default/ns/seg", "footer.json", False))
+        self.assertEqual(cs.split_segment_path("ns/seg/doc_store.bin.spans/00-10"),
+                         ("ns/seg", "doc_store.bin", True))
+        self.assertEqual(cs.split_segment_path("default/ns/seg/doc_store.bin.spans/00-10"),
+                         ("default/ns/seg", "doc_store.bin", True))
+        self.assertIsNone(cs.split_segment_path("footer.json"))
+
+    def test_s3_listing_with_prefix_resolves_every_class(self):
+        sizes_path = self.write_sizes([
+            ("segments/default/msmarco-10m/seg-a/footer.json", 100),
+            ("segments/default/msmarco-10m/seg-a/inverted.idx", 1000),
+            ("segments/default/msmarco-10m/seg-a/postings-01.bin", 5000),
+            ("segments/default/msmarco-10m/seg-a/postings-02.bin", 7000),
+            ("segments/default/msmarco-10m/seg-a/doc_store.bin", 9000),
+            ("other/x/y/z", 1),
+        ])
+        stats = cs.collections.Counter()
+        sizes = cs.load_sizes(sizes_path, strip_prefix="segments/", stats=stats)
+        self.assertEqual(stats["sizes_outside_prefix"], 1)
+        queries, qstats = cs.load_trace(self.trace, sizes)
+        keys = {k for k, _ in queries[0].objects}
+        self.assertEqual(keys, {
+            "default/msmarco-10m/seg-a/footer.json", "default/msmarco-10m/seg-a/inverted.idx",
+            "default/msmarco-10m/seg-a/postings-01.bin", "default/msmarco-10m/seg-a/doc_store.bin",
+        })
+        self.assertEqual(qstats.get("segments_missing_sizes", 0), 0)
+        self.assertEqual(qstats["docstore_resolved"], 20)
+        out = os.path.join(self.dir, "o.json")
+        self.assertEqual(cs.main(["replay", "--trace", self.trace, "--sizes", sizes_path,
+                                  "--strip-prefix", "segments/", "--capacity-gb", "1",
+                                  "--json", out]), 0)
+        with open(out) as f:
+            rows = json.load(f)["rows"]
+        self.assertTrue(all(r["queries"] > 0 for r in rows))
+        self.assertGreater(rows[0]["hit_ratio"], 0)
+
+    def test_layout_mismatch_exits_nonzero_instead_of_zero_rows(self):
+        # A listing whose paths do not match the trace's (here: the S3
+        # prefix left on) must fail loudly.
+        sizes_path = self.write_sizes([
+            ("segments/default/msmarco-10m/seg-a/footer.json", 100),
+        ])
+        self.assertEqual(cs.main(["replay", "--trace", self.trace, "--sizes", sizes_path,
+                                  "--capacity-gb", "1"]), 2)
+
+    def test_span_only_files_are_counted_and_optionally_summed(self):
+        # Local disk with span promotion off: doc store and shards exist
+        # only as spans.
+        lines = [
+            ("default/msmarco-10m/seg-a/footer.json", 100),
+            ("default/msmarco-10m/seg-a/doc_store.bin.spans/0000-0010", 16),
+            ("default/msmarco-10m/seg-a/doc_store.bin.spans/0020-0030", 16),
+            ("default/msmarco-10m/seg-a/postings-01.bin.spans/0000-0040", 64),
+        ]
+        sizes_path = self.write_sizes(lines)
+        stats = cs.collections.Counter()
+        skip = cs.load_sizes(sizes_path, stats=stats)
+        self.assertEqual(stats["span_only_files"], 2)
+        _, qstats = cs.load_trace(self.trace, skip)
+        self.assertEqual(qstats["docstore_unresolved"], 20)
+        self.assertEqual(qstats["postings_unresolved"], 20)
+        summed = cs.load_sizes(sizes_path, span_files="sum")
+        queries, qstats = cs.load_trace(self.trace, summed)
+        sz = dict(queries[0].objects)
+        self.assertEqual(sz["default/msmarco-10m/seg-a/doc_store.bin"], 32)
+        self.assertEqual(sz["default/msmarco-10m/seg-a/postings-01.bin"], 64)
+        self.assertEqual(qstats.get("docstore_unresolved", 0), 0)
+
+    def test_synth_tenant_round_trip(self):
+        t = os.path.join(self.dir, "s.jsonl")
+        s = os.path.join(self.dir, "s.tsv")
+        self.assertEqual(cs.main(["synth", "--trace-out", t, "--sizes-out", s, "--queries", "100",
+                                  "--segments", "3", "--tenant", "default"]), 0)
+        self.assertEqual(cs.main(["replay", "--trace", t, "--sizes", s,
+                                  "--capacity-frac", "0.3"]), 0)
+
+
+class P99CiTests(unittest.TestCase):
+    def write(self, name, lat, errors=0):
+        path = os.path.join(self.dir, name)
+        with gzip.open(path, "wt") as f:
+            for i, v in enumerate(lat):
+                f.write(json.dumps({"i": i, "latency_ms": v}) + "\n")
+            for _ in range(errors):
+                f.write(json.dumps({"latency_ms": 1.0, "error": "timeout"}) + "\n")
+        return path
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def test_identical_arms_ci_covers_zero_and_shifted_arm_does_not(self):
+        import random as _r
+        rng = _r.Random(1)
+        a = [rng.lognormvariate(3.4, 0.6) for _ in range(3000)]
+        b_same = [rng.lognormvariate(3.4, 0.6) for _ in range(3000)]
+        b_slow = [v * 2 for v in b_same]
+        pa = self.write("a.jsonl.gz", a, errors=3)
+        out = cs.run_p99ci([pa], [self.write("b.jsonl.gz", b_same)], 300, 7)
+        self.assertEqual(out["a_errors"], 3)
+        lo, hi = out["p99"]["diff_ci"]
+        self.assertLessEqual(lo, 0)
+        self.assertGreaterEqual(hi, 0)
+        out = cs.run_p99ci([pa], [self.write("c.jsonl.gz", b_slow)], 300, 7)
+        self.assertGreater(out["p99"]["diff_ci"][0], 0)
+        lo, hi = out["p99"]["a_ci"]
+        self.assertLessEqual(lo, out["p99"]["a"])
+        self.assertGreaterEqual(hi, out["p99"]["a"])
+
+
 if __name__ == "__main__":
     unittest.main()
