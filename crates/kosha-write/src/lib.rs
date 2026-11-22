@@ -522,6 +522,10 @@ pub struct Indexer {
     /// recursive-graph-bisection order (#385). `KOSHA_DOC_REORDER`,
     /// default off; see [`kosha_segment::DocReorder`].
     doc_reorder: kosha_segment::DocReorder,
+    /// Largest merged output (live docs) compaction reorders with BP;
+    /// `0` (the default) never. `KOSHA_DOC_REORDER_COMPACTION_MAX_DOCS`;
+    /// see [`kosha_segment::reorder::compaction_max_docs_from_env`].
+    doc_reorder_compaction_max_docs: u64,
 }
 
 impl Indexer {
@@ -573,6 +577,7 @@ impl Indexer {
             local_retired: Mutex::new(Vec::new()),
             instance: uuid::Uuid::new_v4().simple().to_string(),
             doc_reorder: kosha_segment::DocReorder::from_env(),
+            doc_reorder_compaction_max_docs: kosha_segment::reorder::compaction_max_docs_from_env(),
         };
 
         // Recover un-flushed documents from WAL on startup.
@@ -616,6 +621,14 @@ impl Indexer {
     /// (#385), regardless of `KOSHA_DOC_REORDER`.
     pub fn with_doc_reorder(mut self, mode: kosha_segment::DocReorder) -> Self {
         self.doc_reorder = mode;
+        self
+    }
+
+    /// Cap on the merged output (live docs) compaction reorders with BP
+    /// (#385), regardless of `KOSHA_DOC_REORDER_COMPACTION_MAX_DOCS`. `0`
+    /// never reorders; a larger merge streams in input order.
+    pub fn with_doc_reorder_compaction_max_docs(mut self, max_docs: u64) -> Self {
+        self.doc_reorder_compaction_max_docs = max_docs;
         self
     }
 
@@ -2011,7 +2024,29 @@ impl Indexer {
         let mut seq_remap: HashMap<(SegmentId, u32), u32> = HashMap::new();
         let mut next_new_seq: u32 = 0;
 
-        if self.doc_reorder == kosha_segment::DocReorder::Bp {
+        // #385: BP buffers the whole merged output in memory, so it only
+        // runs when explicitly opted in for compaction and the merge is
+        // small enough; otherwise the streaming path below (input order).
+        let bp_compaction = self.doc_reorder == kosha_segment::DocReorder::Bp && {
+            let planned_live: u64 = plan
+                .inputs
+                .iter()
+                .map(|e| {
+                    let dead = tombstones.get(&e.segment_id).map_or(0, |t| t.len()) as u64;
+                    (e.doc_count as u64).saturating_sub(dead)
+                })
+                .sum();
+            let cap = self.doc_reorder_compaction_max_docs;
+            if planned_live > cap {
+                eprintln!(
+                    "WARN: KOSHA_DOC_REORDER=bp but compaction of {} has {planned_live} live docs \
+                     > KOSHA_DOC_REORDER_COMPACTION_MAX_DOCS={cap}; merging in input order",
+                    namespace.0
+                );
+            }
+            planned_live <= cap
+        };
+        if bp_compaction {
             // #385: the merged output's doc_seqs follow recursive graph
             // bisection instead of input order. Every live input document
             // is buffered (memory: the whole merged output's stored
@@ -5926,7 +5961,8 @@ mod tests {
         let ns = NamespaceId("test".into());
         let idx = Indexer::new(dir.clone())
             .with_flush_threshold(40)
-            .with_doc_reorder(kosha_segment::DocReorder::Bp);
+            .with_doc_reorder(kosha_segment::DocReorder::Bp)
+            .with_doc_reorder_compaction_max_docs(u64::MAX);
         // Two topics, interleaved, so BP really moves documents.
         let docs: Vec<Document> = (0..120)
             .map(|i| Document {
@@ -5993,6 +6029,72 @@ mod tests {
             .collect();
         assert_eq!(deleted, want);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #385: BP compaction buffers the whole merged output, so it only runs
+    /// when the planned live doc count (input docs minus pre-merge
+    /// tombstones) is within `KOSHA_DOC_REORDER_COMPACTION_MAX_DOCS`; above
+    /// it, and by default (cap 0), compaction streams in input order.
+    #[test]
+    fn bp_compaction_falls_back_to_input_order_above_the_doc_cap() {
+        let run = |cap: Option<u64>| -> Vec<String> {
+            let dir = std::env::temp_dir().join(format!(
+                "kosha-test-compact-bp-cap-{}-{}",
+                cap.map_or("default".to_string(), |c| c.to_string()),
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let ns = NamespaceId("test".into());
+            let mut idx = Indexer::new(dir.clone())
+                .with_flush_threshold(40)
+                .with_doc_reorder(kosha_segment::DocReorder::Bp);
+            if let Some(cap) = cap {
+                idx = idx.with_doc_reorder_compaction_max_docs(cap);
+            }
+            let mut docs = (0..120).map(|i| Document {
+                id: DocumentId(format!("d{i:03}")),
+                fields: vec![
+                    Field::text(
+                        "title",
+                        if i % 2 == 0 {
+                            "alpha beta gamma delta"
+                        } else {
+                            "omega sigma kappa lambda"
+                        },
+                    ),
+                    Field::keyword("bucket", format!("b{}", i % 7)),
+                ],
+            });
+            for _ in 0..3 {
+                idx.index_documents(ns.clone(), docs.by_ref().take(40).collect())
+                    .unwrap();
+                idx.flush_namespace(&ns).unwrap();
+            }
+            let m = idx.manifest(&ns).unwrap();
+            let pre: FilterClause = serde_json::from_str(r#"{"term": {"bucket": "b0"}}"#).unwrap();
+            assert_eq!(idx.delete_by_query(&ns, &m, &pre).unwrap(), 18);
+            assert!(
+                idx.compact_namespace_with_options_impl(&ns, CompactOptions::full(), || {})
+                    .unwrap()
+                    .merged
+            );
+            let m = idx.manifest(&ns).unwrap();
+            let seg = &m.segments[0].segment_id;
+            let reader = kosha_segment::SegmentReader::open(dir.join("test").join(&seg.0)).unwrap();
+            let ids = (0..reader.doc_count())
+                .map(|s| reader.doc_record_full(s).unwrap().unwrap().doc_id.0)
+                .collect();
+            let _ = std::fs::remove_dir_all(&dir);
+            ids
+        };
+        let input_order: Vec<String> = (0..120)
+            .filter(|i| i % 7 != 0)
+            .map(|i| format!("d{i:03}"))
+            .collect();
+        // 120 docs - 18 pre-merge deletes = 102 live.
+        assert_eq!(run(Some(101)), input_order, "over the cap: streams");
+        assert_eq!(run(Some(0)), input_order, "cap 0: never reorders");
+        assert_ne!(run(Some(102)), input_order, "at the cap: reorders");
     }
 
     #[test]

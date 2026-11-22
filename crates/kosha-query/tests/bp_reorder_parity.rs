@@ -336,7 +336,8 @@ fn bp_reordered_segments_return_identical_top_k() {
         let ns = NamespaceId("c".into());
         let idx = Indexer::new(dir.clone())
             .with_flush_threshold(PARITY.per_segment)
-            .with_doc_reorder(mode);
+            .with_doc_reorder(mode)
+            .with_doc_reorder_compaction_max_docs(u64::MAX);
         let batch: Vec<Document> = docs
             .iter()
             .map(|(id, fields)| Document {

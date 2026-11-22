@@ -65,6 +65,39 @@ impl DocReorder {
     }
 }
 
+/// Largest merged output (live documents) compaction may reorder with BP
+/// (#385), from `KOSHA_DOC_REORDER_COMPACTION_MAX_DOCS`, read once.
+///
+/// BP compaction buffers every live input document (fields, sidecar
+/// vectors) in memory before it can write the first one, where the default
+/// path streams, so memory grows with the merged output. Default `0`:
+/// compaction never reorders, even with `KOSHA_DOC_REORDER=bp` (which then
+/// only affects `kosha-build-segments`). A positive value opts compaction
+/// in for merges of at most that many live documents; a larger merge falls
+/// back to the streaming path in input order, with a warning.
+pub fn compaction_max_docs_from_env() -> u64 {
+    static MAX: OnceLock<u64> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        parse_compaction_max_docs(
+            std::env::var("KOSHA_DOC_REORDER_COMPACTION_MAX_DOCS")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// Parses `KOSHA_DOC_REORDER_COMPACTION_MAX_DOCS`: unset, empty or invalid
+/// is `0` (compaction never reorders).
+pub fn parse_compaction_max_docs(raw: Option<&str>) -> u64 {
+    match raw.map(str::trim) {
+        None | Some("") => 0,
+        Some(v) => v.parse().unwrap_or_else(|_| {
+            eprintln!("WARN: KOSHA_DOC_REORDER_COMPACTION_MAX_DOCS={v} is not a count — using 0");
+            0
+        }),
+    }
+}
+
 /// Tuning for [`bp_order`]. The defaults follow PISA's `reorder-docids
 /// --recursive-graph-bisection` (20 iterations, stop when a partition is
 /// small).
@@ -362,6 +395,14 @@ mod tests {
         assert_eq!(DocReorder::parse(Some("off")), DocReorder::Off);
         assert_eq!(DocReorder::parse(Some("BP")), DocReorder::Bp);
         assert_eq!(DocReorder::parse(Some("graph")), DocReorder::Off);
+    }
+
+    #[test]
+    fn compaction_max_docs_defaults_to_zero() {
+        assert_eq!(parse_compaction_max_docs(None), 0);
+        assert_eq!(parse_compaction_max_docs(Some("")), 0);
+        assert_eq!(parse_compaction_max_docs(Some("lots")), 0);
+        assert_eq!(parse_compaction_max_docs(Some(" 250000 ")), 250_000);
     }
 
     fn is_permutation(order: &[u32]) -> bool {

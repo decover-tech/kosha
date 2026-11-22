@@ -69,6 +69,9 @@ SERVER_TIMINGS = False
 # (~100-200KB per top-10 kNN response), which also overflows the 64MB
 # result cache on the 1,677-query cycle.
 RETURN_FIELDS = "ids"
+# --raw-ids: also record each response's ranked doc_ids and scores in the
+# --raw-out records (#385 ranking parity, topk_parity.py).
+RAW_IDS = False
 
 
 def payload_for(namespace: str, query_text: str, topk: int, qidx: int = 0) -> dict:
@@ -185,6 +188,13 @@ def run_query(
             degraded_counts.append(degraded if degraded is not None else 0)
             if rec is not None:
                 rec.update(latency_ms=round(latency * 1000, 3), hits=hits)
+                if RAW_IDS:
+                    # Ranked ids and scores, so two runs over different
+                    # snapshots can be checked for identical top-k per
+                    # qidx (topk_parity.py, #385).
+                    res = body.get("results", [])
+                    rec["ids"] = [r.get("doc_id") for r in res]
+                    rec["scores"] = [r.get("score") for r in res]
                 if "timings" in body:
                     rec["server"] = body["timings"]
                 raw.append(rec)
@@ -262,6 +272,13 @@ def main() -> None:
         "including embeddings",
     )
     ap.add_argument(
+        "--raw-ids",
+        action="store_true",
+        help="with --raw-out, also record each response's ranked doc_ids and "
+        "scores (ids, scores), for an off-vs-on ranking parity check with "
+        "topk_parity.py (#385)",
+    )
+    ap.add_argument(
         "--stats-api-key",
         default=None,
         help="admin key for GET /stats: if set, read the server's "
@@ -271,11 +288,12 @@ def main() -> None:
         "queries the server during the phase",
     )
     args = ap.parse_args()
-    global OPERATOR, NO_CACHE, KNN_VECS, KNN_FIELD, KNN_NUM_CANDIDATES, SERVER_TIMINGS, RETURN_FIELDS
+    global OPERATOR, NO_CACHE, KNN_VECS, KNN_FIELD, KNN_NUM_CANDIDATES, SERVER_TIMINGS, RETURN_FIELDS, RAW_IDS
     OPERATOR = args.operator
     NO_CACHE = args.no_cache
     SERVER_TIMINGS = args.server_timings
     RETURN_FIELDS = args.return_fields
+    RAW_IDS = args.raw_ids
 
     queries = load_queries(args.queries_file)
 

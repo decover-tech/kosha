@@ -294,6 +294,29 @@ each phase and writes `scoring_blocks_decoded` and
 `scoring_blocks_decoded_per_request` to the phase JSON (absent against an
 older server). It is only per-query while nothing else queries the server.
 
+`run_phases.sh` also passes `--raw-ids`, so every `<phase>.requests.jsonl.gz`
+record carries the response's ranked `ids` and `scores`. Reordering must not
+change results; check it per query across the two snapshots' runs of the
+same phase:
+
+    topk_parity.py off/warm_or_nocache.requests.jsonl.gz bp/warm_or_nocache.requests.jsonl.gz
+
+It exits 0 only when at least one query was compared and every query
+answered in both logs returned the same ids in the same order (scores within
+`--score-rtol`, default 1e-6); a log recorded without `--raw-ids` is an
+error, not a pass.
+
+Both snapshots must be built by a ref that has the #385 builder *and* the
+harness's `bm25_snapshot` / `server_env` inputs. A builder without #385
+ignores `KOSHA_DOC_REORDER` and would write an ingest-order snapshot under
+the `bp` name, which later runs then reuse. The builder prints
+`doc reorder: bp` and a non-zero `(reorder Xs)` per segment when it really
+reorders; check the build log for both before trusting a `bp` snapshot.
+
+Compaction reorders only when `KOSHA_DOC_REORDER_COMPACTION_MAX_DOCS` is
+also set (default 0: never), because it buffers the merged output in
+memory; the bench runs with compaction off.
+
 ## Logs and tail analysis
 
 Every CI benchmark run (`.github/workflows/benchmark.yml`) archives its
