@@ -148,6 +148,12 @@ async fn migrate_once(pool: &sqlx::PgPool) -> Result<(), (sqlx::Error, &'static 
         .execute(&mut *tx)
         .await
         .map_err(|e| (e, "migration 003 failed"))?;
+    // Usage events (#348): additive, idempotent, same pattern as 001.
+    let migration = include_str!("../migrations/006_usage_events.sql");
+    sqlx::raw_sql(migration)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (e, "migration 006 failed"))?;
     tx.commit().await.map_err(|e| (e, FAILED))
 }
 

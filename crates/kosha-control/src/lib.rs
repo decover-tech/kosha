@@ -31,6 +31,12 @@ mod writer_lease;
 #[cfg(feature = "postgres")]
 pub use writer_lease::PgWriterLeaseStore;
 
+pub mod usage;
+pub use usage::{MemoryUsageStore, Meter, UsageEvent, UsageRow, UsageStore};
+
+#[cfg(feature = "postgres")]
+pub use usage::PgUsageStore;
+
 /// In-memory namespace registry and manifest store.
 ///
 /// Tracks namespaces and their current segment manifests. Not internally

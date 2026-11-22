@@ -516,6 +516,22 @@ provider. The API key is never logged or returned.
 | `KOSHA_EMBEDDING_TIMEOUT_MS` | Timeout of one provider request | `10000` | ms |
 | `KOSHA_EMBEDDING_BATCH_SIZE` | Texts per provider request | `64` | count |
 
+## Usage metering
+
+Read once at startup in `usage::UsageRecorder::from_env` and `usage::UsageConfig::from_env`
+(`crates/kosha-server/src/usage.rs`, #348). Each pod counts usage per tenant, namespace and
+meter, seals each window into events with deterministic ids and appends them to
+`kosha.usage_events` (migration `006_usage_events.sql`); writer pods also snapshot stored bytes
+hourly. Without a usage store the recorder is inert and `GET /v1/usage` answers 404. See
+[`usage-metering.md`](usage-metering.md) for the meters, the API and the loss bound.
+
+| Variable | Purpose | Default | Units |
+| --- | --- | --- | --- |
+| `KOSHA_USAGE` | `auto`: meter into Postgres when `DATABASE_URL` is set (**postgres**), else off. `postgres`: the same, warning when `DATABASE_URL` is missing. `memory`: an in-process store for single-node development, lost on restart. `off`: no metering | `auto` | mode |
+| `KOSHA_USAGE_FLUSH_SECS` | Length of a counting window. Windows are aligned to multiples of it on the wall clock; the flusher seals and appends each one just after it ends. Hard pod loss can lose at most the open window | `60` | seconds |
+| `KOSHA_USAGE_SNAPSHOT_SECS` | Period of the `storage_bytes` and `vector_dim_docs` snapshots | `3600` | seconds |
+| `KOSHA_USAGE_RECONCILE_TOLERANCE` | Drift between the latest `storage_bytes` snapshot and the live S3 prefix size above which `POST /v1/admin/usage/reconcile` reports a namespace. A fraction (`0.02`) or a percentage (`2%`) | `0.02` | fraction |
+
 ## CLI and Python client
 
 Read by `kosha` (`crates/kosha-cli`). The Python client (`clients/python`) reads
@@ -564,3 +580,4 @@ These do not start with `KOSHA_` but change server behavior:
 | `DATABASE_URL` | Postgres control plane and API-key registry (**postgres**). Required by `kosha-server migrate` |
 | `POD_IP` | This pod's IP, used as its peer-hydration address (**s3** + **postgres**) |
 | `AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, `AWS_REGION` | Fallbacks for the `KOSHA_S3_*` settings above |
+| `POD_NAME`, `HOSTNAME` | This pod's name in usage events' `source_pod` (first one set; `local` otherwise) |

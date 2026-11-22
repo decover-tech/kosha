@@ -71,6 +71,7 @@ mod segment_commit;
 mod segment_gc;
 mod tenant_limits;
 mod unindexed;
+mod usage;
 mod warm;
 mod warm_run;
 mod writer_lease;
@@ -468,6 +469,9 @@ struct AppState {
     unindexed: unindexed::UnindexedState,
     /// `KOSHA_DASHBOARD` and the per-namespace recent-query rings (#214).
     dashboard: dashboard::Dashboard,
+    /// Usage metering per tenant and namespace (#348). Inert without a
+    /// usage store (`KOSHA_USAGE`, `DATABASE_URL`).
+    usage: usage::UsageRecorder,
 }
 
 /// One cached merged manifest over a sharded namespace (#207).
@@ -1873,6 +1877,7 @@ impl AppState {
             unindexed_cap: unindexed::UnindexedCap::from_env(),
             unindexed: unindexed::UnindexedState::new(query_role),
             dashboard: dashboard::Dashboard::from_env(),
+            usage: usage::UsageRecorder::from_env(),
         }
     }
 
@@ -5572,6 +5577,7 @@ fn main() {
     state.spawn_writer_lease_renewer();
     state.spawn_manifest_refresher();
     state.spawn_local_gc();
+    state.spawn_usage();
     let listener = TcpListener::bind(&addr).expect("failed to bind HTTP listener");
     let config =
         http::Config::from_env(Duration::from_secs(io_timeout_secs), auth::max_body_bytes());
@@ -5600,6 +5606,7 @@ fn main() {
     // KOSHA_WRITER_LEASE_TTL_MS. Unflushed writes stay in the WAL, which the
     // next owner replays, exactly as after a crash.
     let released = state.writer_leases.release_all(&state.controller);
+    state.usage.shutdown();
     println!("kosha-server stopped; released {released} writer lease(s)");
     std::process::exit(0);
 }
@@ -5857,6 +5864,9 @@ fn serve_tenant_request(
             }
         }
     }
+    if let Some(response) = usage::route_tenant(request_line, tenant, state) {
+        return response;
+    }
     route(request_line, headers, body, tenant, state)
 }
 
@@ -6087,11 +6097,14 @@ struct SearchObservation {
     /// The tenant owning the searched namespace: whose queue the search
     /// waits in for a scoring slot (#341).
     tenant: std::cell::RefCell<String>,
+    /// The searched namespace id, for usage metering (#348).
+    searched: std::cell::RefCell<String>,
 }
 
 impl SearchObservation {
     fn namespace(&self, state: &AppState, ns: &NamespaceId) {
         *self.tenant.borrow_mut() = namespace_tenant(&ns.0).unwrap_or("").to_string();
+        *self.searched.borrow_mut() = ns.0.clone();
         if state.metrics.config.namespace_labels {
             *self.namespace.borrow_mut() = Some(ns.0.clone());
         }
@@ -6123,7 +6136,9 @@ fn observe_search(state: &AppState, run: impl FnOnce(&SearchObservation) -> Stri
         started.elapsed().as_secs_f64(),
         observation.namespace.borrow().as_deref(),
     );
-    response
+    state
+        .usage
+        .query(&observation.searched.take(), response, true)
 }
 
 /// One line per API request: who asked for what, the status returned and how
@@ -6583,6 +6598,10 @@ fn route_inner(
 
     if request_line.starts_with("POST /v1/admin/import-namespace") {
         return handle_import_namespace(body, tenant, state);
+    }
+
+    if let Some(response) = usage::route_admin(request_line, body, state) {
+        return response;
     }
 
     if request_line.starts_with("POST /v1/admin/gc ")
@@ -7141,6 +7160,7 @@ fn handle_delete_namespace(name: &str, tenant: &str, state: &AppState) -> String
             }
         }
     }
+    state.usage.record_namespace_deleted(&id.0);
     println!(
         "namespace deleted: ns={} version={} segments={} next_version={next_version}",
         id.0,
@@ -7194,6 +7214,9 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
     match write_routed(state, &ns, documents, index_into) {
         Ok(count) => {
             state.metrics.record_indexed(count as u64);
+            state
+                .usage
+                .record_write(&ns.0, body.len() as u64, count as u64);
             json_ok(&IndexResponse {
                 indexed_count: count,
                 namespace: ns,
@@ -7502,11 +7525,12 @@ fn handle_exists(body: &[u8], state: &AppState) -> String {
             missing.push(id.clone());
         }
     }
-    json_ok(&serde_json::json!({
+    let response = json_ok(&serde_json::json!({
         "namespace": request.namespace.0,
         "existing": present,
         "missing": missing,
-    }))
+    }));
+    state.usage.query(&request.namespace.0, response, false)
 }
 
 /// The subset of `ids` live in one (unsharded or shard) namespace. `Err`
@@ -7565,6 +7589,9 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
     match write_routed(state, &namespace, documents, replace_into) {
         Ok(count) => {
             state.metrics.record_indexed(count as u64);
+            state
+                .usage
+                .record_write(&namespace.0, body.len() as u64, count as u64);
             json_ok(&IndexResponse {
                 indexed_count: count,
                 namespace,

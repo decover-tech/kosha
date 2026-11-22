@@ -27,6 +27,7 @@ use prometheus_client::encoding::{DescriptorEncoder, EncodeMetric, MetricEncoder
 use prometheus_client::metrics::counter::{ConstCounter, Counter};
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::ConstGauge;
+use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::{MetricType, TypedMetric};
 use prometheus_client::registry::Registry;
 
@@ -449,6 +450,8 @@ pub(crate) struct Metrics {
     knn_degraded_segments: Counter,
     tenant_rejections: Family<Labels, Counter>,
     tenant_rejection_reasons: [Counter; 7],
+    /// `kosha_usage_reconcile_drift_ratio{tenant,namespace}` (#348).
+    usage_drift: Family<Labels, Gauge<f64, AtomicU64>>,
 }
 
 impl Default for Metrics {
@@ -577,6 +580,14 @@ impl Metrics {
         });
         registry.register_collector(Box::new(Arc::clone(&scrape)));
 
+        let usage_drift = Family::<Labels, Gauge<f64, AtomicU64>>::default();
+        registry.register(
+            "kosha_usage_reconcile_drift_ratio",
+            "Metered storage_bytes minus live S3 prefix bytes, over live bytes, per namespace \
+             at the last usage reconciliation",
+            usage_drift.clone(),
+        );
+
         Self {
             config,
             registry,
@@ -597,6 +608,7 @@ impl Metrics {
             knn_degraded_segments,
             tenant_rejections,
             tenant_rejection_reasons,
+            usage_drift,
         }
     }
 
@@ -687,6 +699,13 @@ impl Metrics {
 
     pub(crate) fn record_lease(&self, outcome: LeaseOutcome) {
         self.lease_outcomes[outcome as usize].inc();
+    }
+
+    /// One namespace's drift at a usage reconciliation (#348).
+    pub(crate) fn set_usage_reconcile_drift(&self, tenant: &str, namespace: &str, ratio: f64) {
+        self.usage_drift
+            .get_or_create(&labels(&[("tenant", tenant), ("namespace", namespace)]))
+            .set(ratio);
     }
 
     /// The registry in Prometheus text format (0.0.4), with `scrape` as

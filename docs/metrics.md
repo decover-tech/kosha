@@ -56,6 +56,12 @@ plus `+Inf`.
 | --- | --- | --- | --- |
 | `kosha_tenant_rejections_total` | counter | `reason` | Requests refused with HTTP 429 by a per-tenant limit or quota (#341, `KOSHA_TENANT_LIMITS_FILE`). `reason`: `tenant_qps_exceeded`, `tenant_concurrency_exceeded`, `tenant_write_rate_exceeded`, `namespace_quota_exceeded`, `doc_quota_exceeded`, `vector_dims_exceeded` or `body_too_large`, the same code as the response body's `reason`. A search refused here never reaches the scoring queue, so it is not counted in `kosha_search_requests_total`. Stays at zero without a limits file |
 
+### Usage metering
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `kosha_usage_reconcile_drift_ratio` | gauge | `tenant`, `namespace` | Set by `POST /v1/admin/usage/reconcile` (#348) for each namespace it checked: the latest metered `storage_bytes` snapshot minus the live S3 prefix size, divided by the live size (`1` or `-1` when one side is zero and the other is not). Only the pod that ran the reconciliation (the ingest pod) exports it; the series are absent until the first run. One series per reconciled namespace, labelled by tenant and namespace name |
+
 ### Caches and hydration
 
 | Metric | Type | Labels | Meaning |
