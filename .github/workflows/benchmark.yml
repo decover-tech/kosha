@@ -76,6 +76,15 @@ on:
         type: choice
         options: [queries, preload]
         default: queries
+      return_fields:
+        description: >-
+          what each hit returns. ids = doc_id + score only (source_includes
+          empty), as turbopuffer's benchmark queries do; all = every stored
+          field including the embedding (~100-200KB per top-10 kNN
+          response, which also overflows the result cache).
+        type: choice
+        options: [ids, all]
+        default: ids
       vector_snapshot:
         description: >-
           snapshot the vector suite restores into namespace msmarco-10m-vec.
@@ -135,6 +144,7 @@ env:
   VEC_NS: msmarco-10m-vec
   VEC_SNAPSHOT: ${{ inputs.vector_snapshot || 'msmarco-10m-vec' }}
   WARM_GATE: ${{ inputs.warm_gate || 'queries' }}
+  RETURN_FIELDS: ${{ inputs.return_fields || 'ids' }}
 
 jobs:
   bench:
@@ -282,7 +292,7 @@ jobs:
                 --compact-after --compact-mode full --compact-passes 12 && \
               ./snapshot_namespace.sh $BM25_NS"
           fi
-          $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && WARM_GATE=$WARM_GATE \
+          $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && WARM_GATE=$WARM_GATE RETURN_FIELDS=$RETURN_FIELDS \
             ./run_phases.sh bm25 $BM25_NS /data/results-ci/bm25 '${{ inputs.qps }}' '${{ inputs.duration }}'"
 
       - name: Vector suite
@@ -316,7 +326,7 @@ jobs:
           # volume), ~1h55m measured. queries: warm_gate.py hydrates only what
           # the workload reads, and nothing on a reused VM with a kept cache.
           $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && WARMUP_TIMEOUT_S=10800 WARM_GATE_TIMEOUT_S=10800 \
-            WARM_GATE=$WARM_GATE ./run_phases.sh vector $VEC_NS /data/results-ci/vector '${{ inputs.qps }}' '${{ inputs.duration }}'"
+            WARM_GATE=$WARM_GATE RETURN_FIELDS=$RETURN_FIELDS ./run_phases.sh vector $VEC_NS /data/results-ci/vector '${{ inputs.qps }}' '${{ inputs.duration }}'"
 
       - name: Recall check (real recall@k vs. brute-force ground truth)
         if: contains(fromJSON('["both","vector"]'), inputs.suite) && inputs.run_recall_check == true

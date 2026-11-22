@@ -72,6 +72,9 @@ def server_topk(
         "query_text": "",
         "max_results": k,
         "knn": {"field": field, "vector": vector, "k": k, "num_candidates": num_candidates},
+        # Only doc ids are compared; skip returning stored fields (the
+        # embedding alone is ~10-20KB of JSON per hit).
+        "source_includes": [],
     }
     resp = session.post(f"{host}/search", json=payload, headers=headers, timeout=timeout)
     resp.raise_for_status()

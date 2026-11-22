@@ -62,6 +62,13 @@ KNN_VECS = None
 KNN_FIELD = "text_emb"
 KNN_NUM_CANDIDATES = 100
 SERVER_TIMINGS = False
+# What each hit carries back. "ids" (default) asks for no stored fields
+# (source_includes: []), so a hit is just doc_id + score: what
+# turbopuffer's benchmark queries return (no include_attributes). "all"
+# returns every stored field, including the 1024-dim embedding as JSON
+# (~100-200KB per top-10 kNN response), which also overflows the 64MB
+# result cache on the 1,677-query cycle.
+RETURN_FIELDS = "ids"
 
 
 def payload_for(namespace: str, query_text: str, topk: int, qidx: int = 0) -> dict:
@@ -87,6 +94,8 @@ def payload_for(namespace: str, query_text: str, topk: int, qidx: int = 0) -> di
         # Server phase breakdown in the response (needs KOSHA_DASHBOARD on
         # the server; silently absent otherwise).
         payload["timings"] = True
+    if RETURN_FIELDS == "ids":
+        payload["source_includes"] = []
     return payload
 
 
@@ -228,11 +237,21 @@ def main() -> None:
         help="send timings=true so each response carries the server phase "
         "breakdown (requires KOSHA_DASHBOARD on the server)",
     )
+    ap.add_argument(
+        "--return",
+        dest="return_fields",
+        choices=["ids", "all"],
+        default="ids",
+        help="ids (default): hits carry doc_id + score only (source_includes: []), "
+        "as turbopuffer's benchmark queries do; all: every stored field, "
+        "including embeddings",
+    )
     args = ap.parse_args()
-    global OPERATOR, NO_CACHE, KNN_VECS, KNN_FIELD, KNN_NUM_CANDIDATES, SERVER_TIMINGS
+    global OPERATOR, NO_CACHE, KNN_VECS, KNN_FIELD, KNN_NUM_CANDIDATES, SERVER_TIMINGS, RETURN_FIELDS
     OPERATOR = args.operator
     NO_CACHE = args.no_cache
     SERVER_TIMINGS = args.server_timings
+    RETURN_FIELDS = args.return_fields
 
     queries = load_queries(args.queries_file)
 
