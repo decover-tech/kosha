@@ -36,6 +36,7 @@ mod embedding_server_tests;
 mod http;
 #[cfg(feature = "s3")]
 mod hydration_budget;
+mod internal_tls;
 mod manifest_follow;
 mod metrics;
 #[cfg(feature = "migrate")]
@@ -246,6 +247,10 @@ struct AppState {
     /// S3, not held onto).
     #[cfg(all(feature = "s3", feature = "postgres"))]
     peer_http_client: Option<reqwest::blocking::Client>,
+    /// `http` or `https` for peer segment fetches (`KOSHA_INTERNAL_TLS`,
+    /// see `internal_tls`).
+    #[cfg(all(feature = "s3", feature = "postgres"))]
+    peer_url_scheme: &'static str,
     /// Dedicated `KOSHA_INTERNAL_API_KEY` for pod-to-pod hydration. `None` disables peer fetches
     /// (falls back to S3, same as an unset `own_addr`).
     #[cfg(all(feature = "s3", feature = "postgres"))]
@@ -1623,10 +1628,18 @@ impl AppState {
         }
         let compaction_on_ingest =
             role::compaction_on_ingest(std::env::var("KOSHA_COMPACTION_ON_INGEST").ok().as_deref());
+        // TLS between pods (#343). Fails closed on a bad configuration.
+        let internal_tls = internal_tls::global();
+        println!("internal TLS: {}", internal_tls.describe());
         let write_http_client = ingest_host.as_ref().map(|h| {
+            match internal_tls.check_ingest_host(h) {
+                Ok(None) => {}
+                Ok(Some(warning)) => eprintln!("WARN: {warning}"),
+                Err(e) => fatal(&e),
+            }
             println!("write-path requests will be forwarded to ingest at {h}");
-            reqwest::blocking::Client::builder()
-                .pool_idle_timeout(http::INTERNAL_CLIENT_POOL_IDLE)
+            internal_tls
+                .client_builder()
                 .timeout(Duration::from_secs(
                     // Matches the server's own request I/O timeout
                     // (`KOSHA_HTTP_IO_TIMEOUT_SECS`). The previous default of 30 s
@@ -1684,8 +1697,8 @@ impl AppState {
         };
         #[cfg(all(feature = "s3", feature = "postgres"))]
         let peer_http_client = hydration_leases.as_ref().map(|_| {
-            reqwest::blocking::Client::builder()
-                .pool_idle_timeout(http::INTERNAL_CLIENT_POOL_IDLE)
+            internal_tls
+                .client_builder()
                 // Short: a peer that isn't answering quickly should be
                 // abandoned in favor of the S3 fallback, not held onto —
                 // see `fetch_from_peer`. The blocking client applies it to
@@ -1877,6 +1890,8 @@ impl AppState {
             own_addr,
             #[cfg(all(feature = "s3", feature = "postgres"))]
             peer_http_client,
+            #[cfg(all(feature = "s3", feature = "postgres"))]
+            peer_url_scheme: internal_tls.peer_scheme(),
             #[cfg(all(feature = "s3", feature = "postgres"))]
             internal_auth_key,
             self_ref: Weak::new(),
@@ -3714,7 +3729,10 @@ impl AppState {
             ));
         };
 
-        let url = format!("http://{peer_addr}/internal/segment/{logical_path}");
+        let url = format!(
+            "{}://{peer_addr}/internal/segment/{logical_path}",
+            self.peer_url_scheme
+        );
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut delay = Duration::from_millis(100);
         loop {
@@ -10811,7 +10829,7 @@ mod tests {
     }
 
     impl SharedManifestStore {
-        fn new(inner: Arc<Mutex<kosha_control::Controller>>) -> Self {
+        pub(crate) fn new(inner: Arc<Mutex<kosha_control::Controller>>) -> Self {
             Self {
                 inner,
                 lose_next_commit_reply: Default::default(),
@@ -19970,5 +19988,161 @@ mod tests {
         assert!(result.get("timings").is_none(), "{result}");
         let stats = body_of(&handle_namespace_stats("docs", "acme", &state));
         assert!(stats.get("recent_queries").is_none(), "{stats}");
+    }
+}
+
+/// TLS between pods (#343), end to end over real sockets with throwaway
+/// certificates: peer segment fetches and query→ingest forwarding.
+#[cfg(test)]
+mod internal_tls_tests {
+    use super::*;
+    use crate::internal_tls::{test_pki, InternalTls};
+    use crate::tests::SharedManifestStore;
+
+    /// Serve `state` over HTTPS with the PKI's server certificate; with
+    /// `mtls`, `/internal/*` also needs a client certificate from its CA.
+    fn serve_tls(state: Arc<AppState>, pki: &test_pki::Pki, mtls: bool) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut config = http::Config::new(Duration::from_secs(30), auth::max_body_bytes());
+        config.tls = Some((pki.server_cert.clone(), pki.server_key.clone()));
+        if mtls {
+            config.client_ca = Some(pki.ca.clone());
+        }
+        std::thread::spawn(move || {
+            serve_until(listener, state, config, std::future::pending())
+                .expect("HTTPS server failed")
+        });
+        addr
+    }
+
+    /// The internal TLS settings a pod would read from its environment.
+    fn internal_tls(
+        pki: &test_pki::Pki,
+        client_cert: bool,
+        server_name: Option<&str>,
+    ) -> InternalTls {
+        let path = |p: &std::path::Path| Some(p.to_str().unwrap().to_string());
+        InternalTls::from_lookup(|name| match name {
+            "KOSHA_INTERNAL_TLS" => Some("on".into()),
+            "KOSHA_INTERNAL_TLS_CA_PATH" => path(&pki.ca),
+            "KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH" if client_cert => path(&pki.client_cert),
+            "KOSHA_INTERNAL_TLS_CLIENT_KEY_PATH" if client_cert => path(&pki.client_key),
+            "KOSHA_INTERNAL_TLS_SERVER_NAME" => server_name.map(str::to_string),
+            _ => None,
+        })
+        .unwrap()
+    }
+
+    #[cfg(all(feature = "s3", feature = "postgres"))]
+    #[test]
+    fn peer_segment_fetch_runs_over_mutual_tls() {
+        let pki = test_pki::generate("peer-fetch");
+        let mut peer = AppState::new(tests::test_dir());
+        peer.internal_service_key = Some("peer-test-secret".into());
+        peer.cache
+            .put_bytes("ns/seg/doc_store.bin", b"peer bytes over tls")
+            .unwrap();
+        let addr = serve_tls(Arc::new(peer), &pki, true).to_string();
+
+        let requester = |tls: &InternalTls| {
+            let mut state = AppState::new(tests::test_dir());
+            state.internal_auth_key = Some("peer-test-secret".into());
+            state.peer_url_scheme = tls.peer_scheme();
+            state.peer_http_client = Some(
+                tls.client_builder()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .unwrap(),
+            );
+            state
+        };
+
+        // Peers are dialed by pod IP; the certificate is checked against
+        // the pinned KOSHA_INTERNAL_TLS_SERVER_NAME instead.
+        let tls = internal_tls(&pki, true, Some("kosha-internal"));
+        assert_eq!(tls.peer_scheme(), "https");
+        let state = requester(&tls);
+        let written = state
+            .fetch_from_peer(&addr, "ns/seg/doc_store.bin")
+            .expect("peer fetch over TLS should succeed");
+        assert_eq!(written, 19);
+        let local = state.cache.path_for("ns/seg/doc_store.bin").unwrap();
+        assert_eq!(std::fs::read(local).unwrap(), b"peer bytes over tls");
+
+        // No client certificate: the peer's mTLS check answers 403.
+        let state = requester(&internal_tls(&pki, false, Some("kosha-internal")));
+        let err = state
+            .fetch_from_peer(&addr, "ns/seg/doc_store.bin")
+            .unwrap_err();
+        assert!(err.to_string().contains("403"), "{err}");
+
+        // A pinned name the certificate does not carry fails verification.
+        let state = requester(&internal_tls(&pki, true, Some("someone-else")));
+        let err = state
+            .fetch_from_peer(&addr, "ns/seg/doc_store.bin")
+            .unwrap_err();
+        assert!(err.to_string().contains("unreachable"), "{err}");
+
+        // Plain HTTP against the TLS peer gets nothing usable.
+        let state = requester(&InternalTls::off());
+        assert_eq!(state.peer_url_scheme, "http");
+        assert!(state
+            .fetch_from_peer(&addr, "ns/seg/doc_store.bin")
+            .is_err());
+    }
+
+    #[test]
+    fn query_forwards_writes_to_ingest_over_tls() {
+        let pki = test_pki::generate("forward");
+        let shared = Arc::new(Mutex::new(kosha_control::Controller::new()));
+        let ingest = AppState::new(tests::test_dir());
+        *ingest.controller.lock().unwrap() = Box::new(SharedManifestStore::new(shared.clone()));
+        let ingest = Arc::new(ingest);
+        let ingest_addr = serve_tls(Arc::clone(&ingest), &pki, true);
+
+        let tls = internal_tls(&pki, true, None);
+        let ingest_host = format!("https://localhost:{}", ingest_addr.port());
+        assert_eq!(tls.check_ingest_host(&ingest_host), Ok(None));
+        let mut query = AppState::new(ingest.data_dir.clone());
+        *query.controller.lock().unwrap() = Box::new(SharedManifestStore::new(shared.clone()));
+        query.ingest_host = Some(ingest_host);
+        query.write_http_client = Some(
+            tls.client_builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+        );
+
+        let send = |method: &str, target: &str, body: serde_json::Value| {
+            let request = http::Request {
+                method: method.into(),
+                target: target.into(),
+                headers: HashMap::from([("content-type".into(), "application/json".into())]),
+                body: body.to_string().into_bytes(),
+            };
+            dispatch(&query, request)
+        };
+
+        let response = send(
+            "POST",
+            "/v1/namespaces",
+            serde_json::json!({"namespace": "docs"}),
+        );
+        assert_eq!(response.status(), 200, "{response:?}");
+        let ns = NamespaceId("dev/docs".into());
+        assert!(
+            ingest.indexer.manifest_version(&ns).is_some(),
+            "the create ran on the ingest node, over TLS"
+        );
+        let response = send(
+            "POST",
+            "/v1/namespaces/docs/documents",
+            serde_json::json!({"documents": [
+                {"id": "d1", "fields": [{"name": "title", "field_type": "Text", "value": "quick fox"}]}
+            ]}),
+        );
+        assert_eq!(response.status(), 200, "{response:?}");
+        assert_eq!(ingest.indexer.pending_doc_count(&ns), 1);
     }
 }

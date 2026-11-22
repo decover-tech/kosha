@@ -95,7 +95,12 @@ written with and stay readable (subject to the KMS permissions above).
   roll out the new value. New objects use the new key at once. Old objects keep the old key
   and stay readable as long as the role can still `kms:Decrypt` with it, so keep the old key
   enabled and in the IAM policy. Compaction rewrites segments into new objects, so the old
-  key's share of the data shrinks over time.
+  key's share of the data shrinks over time. The tenant map (including
+  `KOSHA_S3_TENANT_KMS_KEYS_FILE`) is read once at startup, so editing a mounted file takes
+  effect when the pods restart. The test
+  `rotating_a_tenant_key_applies_to_new_writes_and_old_objects_stay_readable` in
+  `s3_storage.rs` checks this: after a rotation, PUTs, multipart uploads and copies carry the
+  new key, and reads send no key at all.
 - **Hard cutover** (the old key must stop being used): after the rollout, re-encrypt the
   remaining objects in place, then disable the old key once nothing references it:
 
@@ -247,6 +252,7 @@ server lists them in a `WARN` at boot. `kosha-server migrate-namespace --from <b
 | `KOSHA_HTTP_SHUTDOWN_GRACE_SECS` | On SIGTERM or SIGINT the listener closes, idle connections close, and in-flight requests get this long to finish. The pod then releases its writer leases and exits | `25` | seconds |
 | `KOSHA_TLS_CERT_PATH` | PEM certificate chain. With `KOSHA_TLS_KEY_PATH`, the listener serves HTTPS only. Setting just one of the two is a startup error | unset (HTTP) | path |
 | `KOSHA_TLS_KEY_PATH` | PEM private key (PKCS#8, PKCS#1 or SEC1) for `KOSHA_TLS_CERT_PATH` | unset | path |
+| `KOSHA_TLS_CLIENT_CA_PATH` | PEM CA bundle for client certificates (mTLS, #343). A presented certificate must chain to it or the handshake fails, and `/internal/*` answers 403 on a connection that presented none. Other routes still accept clients without a certificate. Needs `KOSHA_TLS_CERT_PATH`/`KOSHA_TLS_KEY_PATH`, or the server refuses to start | unset (no client certificates) | path |
 | `KOSHA_AUTH` | `disabled` (or `off`, `false`, `0`, `none`) turns authentication off; every request becomes tenant `dev`. Local development only | enabled | flag |
 | `KOSHA_API_KEY` | One tenant API key, mapped to tenant `default` | unset | string |
 | `KOSHA_API_KEYS` | Comma-separated `key=tenant` pairs | unset | list |
@@ -259,11 +265,47 @@ The server refuses to start when no credential is configured (no env key, no adm
 key, no Postgres keys) unless `KOSHA_AUTH=disabled`.
 
 The server speaks HTTP/1.1 with keep-alive (#259): responses carry a `content-length` and the
-connection stays open for the next request. TLS covers client-facing traffic only. The internal
-clients take no CA configuration yet: peer hydration always connects over `http://` (so pods
-that share segments through hydration leases should not turn TLS on), and query-to-ingest
-forwarding to an `https://` `KOSHA_INGEST_HOST` trusts only the platform's roots. TLS between
-pods is tracked in #343.
+connection stays open for the next request. `KOSHA_TLS_CERT_PATH` turns HTTPS on for every
+route on the port, client-facing and `/internal/*` alike. The clients that call other pods are
+configured separately, in the next section.
+
+### TLS between pods
+
+Pod-to-pod traffic is peer hydration (`GET /internal/segment/...`, query pod to query pod) and
+ingest traffic (forwarded writes and the strong-consistency tail read, query pod to
+`KOSHA_INGEST_HOST`). The clients for both are built in `internal_tls.rs`
+(`InternalTls::from_lookup`), read once at startup. The settings **fail closed**: an unknown
+mode, a missing or unparsable file, half a client identity, or a TLS setting while the mode is
+`off` logs `FATAL: internal TLS: ...` and exits. The startup log prints
+`internal TLS: on (internal CA, client_cert=yes, server_name=kosha-internal)` or similar.
+
+| Variable | Purpose | Default | Units |
+| --- | --- | --- | --- |
+| `KOSHA_INTERNAL_TLS` | `off`: plain `http://` to peers, as before. `on`: peers are fetched over `https://` and verified against `KOSHA_INTERNAL_TLS_CA_PATH`, and an `https://` `KOSHA_INGEST_HOST` is verified the same way (an `http://` one logs a warning). `required`: as `on`, and the pod refuses to start with an `http://` `KOSHA_INGEST_HOST` or without `KOSHA_TLS_CERT_PATH` | `off` | enum |
+| `KOSHA_INTERNAL_TLS_CA_PATH` | PEM CA bundle peer certificates must chain to. Required unless `off`. Only this bundle is trusted for internal traffic, not the platform roots | unset | path |
+| `KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH` | PEM client certificate chain, presented to peers that ask for one (their `KOSHA_TLS_CLIENT_CA_PATH`). Set it together with `KOSHA_INTERNAL_TLS_CLIENT_KEY_PATH` or not at all | unset (no client certificate) | path |
+| `KOSHA_INTERNAL_TLS_CLIENT_KEY_PATH` | PEM private key for `KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH` | unset | path |
+| `KOSHA_INTERNAL_TLS_SERVER_NAME` | DNS name peer certificates are checked against instead of the host in the URL. Peers are dialed by pod IP (`POD_IP`), which a certificate issued ahead of time cannot list; with this set, one certificate with this DNS name serves every pod. Unset, a certificate must match the URL host (an IP SAN for peer fetches) | unset (URL host) | DNS name |
+
+To turn it on across a cluster:
+
+1. Issue a certificate signed by an internal CA whose SANs include the ingest Service name and
+   a fixed name such as `kosha-internal` (`k8s/base/certificate-internal-tls.example.yaml` is a
+   cert-manager example). The same certificate can serve as the client identity.
+2. Mount it on every pod and set `KOSHA_TLS_CERT_PATH`/`KOSHA_TLS_KEY_PATH` (server side) and
+   `KOSHA_INTERNAL_TLS=on`, `KOSHA_INTERNAL_TLS_CA_PATH`, `KOSHA_INTERNAL_TLS_SERVER_NAME`
+   (client side), and switch `KOSHA_INGEST_HOST` to `https://`. HTTPS is per port, so the
+   kubelet probes need `scheme: HTTPS` too.
+3. Optionally require mTLS on `/internal/*` with `KOSHA_TLS_CLIENT_CA_PATH` and give every pod
+   `KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH`/`KEY_PATH`. Roll the clients out first, then the
+   server setting.
+4. Set `KOSHA_INTERNAL_TLS=required` once every pod is on TLS.
+
+During a rollout, a pod on `on` that reaches a peer still serving plain HTTP fails that peer
+fetch and falls back to S3, so mixed pods cost extra S3 reads, not errors. Forwarded writes have
+no such fallback: switch `KOSHA_INGEST_HOST` to `https://` only after the ingest pod serves
+HTTPS. Certificates are
+read at startup; a renewed certificate takes effect when the pod restarts.
 
 `GET /internal/segment/...` streams the cached file as raw `application/octet-stream`. Peers on
 builds from before #259 send base64 with `x-kosha-encoding: base64`; the client still decodes

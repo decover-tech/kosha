@@ -21,6 +21,11 @@
 //!   to a peer uses O(chunk) memory whatever the file size.
 //! - **Optional TLS.** With `KOSHA_TLS_CERT_PATH` and `KOSHA_TLS_KEY_PATH`
 //!   set, the listener serves HTTPS (rustls).
+//! - **Optional mTLS on `/internal/*` (#343).** With `KOSHA_TLS_CLIENT_CA_PATH`
+//!   also set, a client certificate is verified against that CA during the
+//!   handshake (a bad one fails it), and a request for `/internal/*` on a
+//!   connection that presented none gets `403`. Other routes keep working
+//!   for clients without a certificate.
 //! - **Graceful shutdown.** When the shutdown future resolves (SIGTERM or
 //!   SIGINT in production, see [`os_shutdown_signal`]), the listener stops
 //!   accepting, idle connections close, and in-flight requests get up to
@@ -34,7 +39,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
@@ -339,6 +344,10 @@ pub(crate) struct Config {
     /// Certificate chain and private key, PEM (`KOSHA_TLS_CERT_PATH`,
     /// `KOSHA_TLS_KEY_PATH`).
     pub tls: Option<(PathBuf, PathBuf)>,
+    /// CA bundle client certificates are verified against
+    /// (`KOSHA_TLS_CLIENT_CA_PATH`). Requires `tls`. Set, `/internal/*`
+    /// needs a verified client certificate.
+    pub client_ca: Option<PathBuf>,
     /// Async worker threads; they only do socket I/O.
     pub worker_threads: usize,
 }
@@ -360,6 +369,7 @@ impl Config {
             shutdown_grace: Duration::from_secs(25),
             max_body_bytes,
             tls: None,
+            client_ca: None,
             worker_threads: cpus.clamp(2, 4),
         }
     }
@@ -394,36 +404,54 @@ impl Config {
                 std::process::exit(1);
             }
         };
+        config.client_ca = std::env::var("KOSHA_TLS_CLIENT_CA_PATH")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(PathBuf::from);
+        if config.client_ca.is_some() && config.tls.is_none() {
+            eprintln!(
+                "FATAL: KOSHA_TLS_CLIENT_CA_PATH needs KOSHA_TLS_CERT_PATH and KOSHA_TLS_KEY_PATH \
+                 (client certificates are only checked over TLS)"
+            );
+            std::process::exit(1);
+        }
         config
     }
 }
 
-/// Build the rustls acceptor from PEM files.
-fn tls_acceptor(cert_path: &PathBuf, key_path: &PathBuf) -> io::Result<tokio_rustls::TlsAcceptor> {
-    use rustls::pki_types::pem::PemObject;
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+/// Build the rustls acceptor from PEM files. With `client_ca`, a client
+/// certificate is optional but, when presented, must chain to that CA.
+fn tls_acceptor(
+    cert_path: &Path,
+    key_path: &Path,
+    client_ca: Option<&Path>,
+) -> io::Result<tokio_rustls::TlsAcceptor> {
+    use crate::internal_tls::{load_certs, load_key, load_roots};
 
     let invalid = |what: String| io::Error::new(io::ErrorKind::InvalidInput, what);
-    let cert_pem = std::fs::read(cert_path)
-        .map_err(|e| invalid(format!("read {}: {e}", cert_path.display())))?;
-    let certs = CertificateDer::pem_slice_iter(&cert_pem)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| invalid(format!("parse {}: {e}", cert_path.display())))?;
-    if certs.is_empty() {
-        return Err(invalid(format!(
-            "{} holds no certificate",
-            cert_path.display()
-        )));
-    }
-    let key_pem = std::fs::read(key_path)
-        .map_err(|e| invalid(format!("read {}: {e}", key_path.display())))?;
-    let key = PrivateKeyDer::from_pem_slice(&key_pem)
-        .map_err(|e| invalid(format!("parse {}: {e}", key_path.display())))?;
+    let certs = load_certs(cert_path).map_err(invalid)?;
+    let key = load_key(key_path).map_err(invalid)?;
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+    let builder = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
         .with_safe_default_protocol_versions()
-        .map_err(|e| invalid(format!("TLS protocol versions: {e}")))?
-        .with_no_client_auth()
+        .map_err(|e| invalid(format!("TLS protocol versions: {e}")))?;
+    let builder = match client_ca {
+        Some(ca) => {
+            let roots = load_roots(ca).map_err(invalid)?;
+            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                Arc::new(roots),
+                provider,
+            )
+            // Public routes stay open to clients without a
+            // certificate; `/internal/*` checks for one per request.
+            .allow_unauthenticated()
+            .build()
+            .map_err(|e| invalid(format!("KOSHA_TLS_CLIENT_CA_PATH: {e}")))?;
+            builder.with_client_cert_verifier(verifier)
+        }
+        None => builder.with_no_client_auth(),
+    };
+    let mut config = builder
         .with_single_cert(certs, key)
         .map_err(|e| invalid(format!("TLS certificate/key: {e}")))?;
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
@@ -464,6 +492,9 @@ struct Shared {
     handler: Handler,
     inflight: Arc<Semaphore>,
     tls: Option<tokio_rustls::TlsAcceptor>,
+    /// `/internal/*` needs a verified client certificate
+    /// (`KOSHA_TLS_CLIENT_CA_PATH`).
+    client_auth: bool,
 }
 
 /// Serve `listener` until `shutdown` resolves, then drain. Blocks the
@@ -475,9 +506,10 @@ pub(crate) fn run(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> io::Result<()> {
     let tls = match &config.tls {
-        Some((cert, key)) => Some(tls_acceptor(cert, key)?),
+        Some((cert, key)) => Some(tls_acceptor(cert, key, config.client_ca.as_deref())?),
         None => None,
     };
+    let client_auth = tls.is_some() && config.client_ca.is_some();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(config.worker_threads)
         // Handlers take at most `max_inflight` of these; the rest serve
@@ -491,6 +523,7 @@ pub(crate) fn run(
         config,
         handler,
         tls,
+        client_auth,
     });
     let result = runtime.block_on(accept_loop(listener, shared, shutdown));
     // Handlers still running past the grace period are abandoned, not
@@ -578,15 +611,26 @@ async fn accept_connection(
             let handshake =
                 tokio::time::timeout(shared.config.header_timeout, acceptor.accept(tcp)).await;
             if let Ok(Ok(tls)) = handshake {
-                serve_connection(tls, shared, stop).await;
+                // rustls has already verified a presented certificate
+                // against KOSHA_TLS_CLIENT_CA_PATH.
+                let client_cert = tls
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .is_some_and(|certs| !certs.is_empty());
+                serve_connection(tls, shared, stop, client_cert).await;
             }
         }
-        None => serve_connection(tcp, shared, stop).await,
+        None => serve_connection(tcp, shared, stop, false).await,
     }
 }
 
-async fn serve_connection<I>(io: I, shared: Arc<Shared>, stop: Option<watch::Receiver<bool>>)
-where
+async fn serve_connection<I>(
+    io: I,
+    shared: Arc<Shared>,
+    stop: Option<watch::Receiver<bool>>,
+    client_cert: bool,
+) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let over_capacity = stop.is_none();
@@ -599,7 +643,7 @@ where
                     busy("server at connection capacity (KOSHA_HTTP_MAX_CONNECTIONS)")
                         .with_header("connection", "close")
                 } else {
-                    handle_request(request, &shared).await
+                    handle_request(request, &shared, client_cert).await
                 };
                 Ok::<_, Infallible>(response.into_hyper())
             }
@@ -637,13 +681,23 @@ fn busy(message: &str) -> Response {
     Response::json_error(503, message).with_header("retry-after", "1")
 }
 
-async fn handle_request(request: hyper::Request<Incoming>, shared: &Shared) -> Response {
+async fn handle_request(
+    request: hyper::Request<Incoming>,
+    shared: &Shared,
+    client_cert: bool,
+) -> Response {
     let config = &shared.config;
     let path = request.uri().path();
     // Liveness answers on the async side, without an in-flight slot, so a
     // pod whose handlers are all busy still reports alive.
     if request.method() == hyper::Method::GET && (path == "/healthz" || path == "/v1/healthz") {
         return Response::json(200, r#"{"status":"ok"}"#);
+    }
+    if shared.client_auth && !client_cert && path.starts_with("/internal/") {
+        return Response::json_error(
+            403,
+            "/internal/* requires a client certificate (KOSHA_TLS_CLIENT_CA_PATH)",
+        );
     }
 
     // Reject an oversized body from its declared length, before reading
@@ -1256,5 +1310,63 @@ mod tests {
         let _ = plain.read_to_end(&mut out);
         assert!(!out.starts_with(b"HTTP/1.1 200"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #343: with `KOSHA_TLS_CLIENT_CA_PATH`, `/internal/*` needs a client
+    /// certificate from that CA; public routes do not; a certificate from
+    /// another CA fails the handshake.
+    #[test]
+    fn mtls_server_rejects_internal_requests_without_a_client_certificate() {
+        use crate::internal_tls::{test_pki, InternalTls};
+
+        let pki = test_pki::generate("mtls-server");
+        let mut config = test_config();
+        config.tls = Some((pki.server_cert.clone(), pki.server_key.clone()));
+        config.client_ca = Some(pki.ca.clone());
+        let server = TestServer::start(config, echo_handler());
+
+        let client = |cert: Option<(&std::path::Path, &std::path::Path)>, ca: &std::path::Path| {
+            let ca = ca.to_str().unwrap().to_string();
+            let (cert, key) = cert
+                .map(|(c, k)| {
+                    (
+                        Some(c.to_str().unwrap().to_string()),
+                        Some(k.to_str().unwrap().to_string()),
+                    )
+                })
+                .unwrap_or((None, None));
+            InternalTls::from_lookup(|name| match name {
+                "KOSHA_INTERNAL_TLS" => Some("on".into()),
+                "KOSHA_INTERNAL_TLS_CA_PATH" => Some(ca.clone()),
+                "KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH" => cert.clone(),
+                "KOSHA_INTERNAL_TLS_CLIENT_KEY_PATH" => key.clone(),
+                _ => None,
+            })
+            .unwrap()
+            .client_builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap()
+        };
+        let url = |path: &str| format!("https://localhost:{}{path}", server.addr.port());
+        let status = |client: &reqwest::blocking::Client, path: &str| {
+            client.get(url(path)).send().map(|r| r.status().as_u16())
+        };
+
+        let anonymous = client(None, &pki.ca);
+        assert_eq!(status(&anonymous, "/internal/segment/a/b").unwrap(), 403);
+        assert_eq!(status(&anonymous, "/v1/thing").unwrap(), 200);
+        assert_eq!(status(&anonymous, "/healthz").unwrap(), 200);
+
+        let peer = client(Some((&pki.client_cert, &pki.client_key)), &pki.ca);
+        assert_eq!(status(&peer, "/internal/segment/a/b").unwrap(), 200);
+
+        // A client certificate from an unrelated CA is refused outright.
+        let other = test_pki::generate("mtls-other");
+        let stranger = client(Some((&other.client_cert, &other.client_key)), &pki.ca);
+        assert!(status(&stranger, "/internal/segment/a/b").is_err());
+        // And a client that does not trust the server's CA never connects.
+        let untrusting = client(None, &other.ca);
+        assert!(status(&untrusting, "/v1/thing").is_err());
     }
 }
