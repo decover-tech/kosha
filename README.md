@@ -474,8 +474,9 @@ under the namespace's publication lock:
    records in it.
 3. Its local segment directory and per-namespace caches are removed.
 4. With S3 configured, every object under the namespace's prefix
-   (`{KOSHA_S3_PREFIX}/{tenant}/{ns}/`) is deleted before the response returns.
-   If that fails, the namespace is still deleted and the response says
+   (`{KOSHA_S3_PREFIX}/{tenant}/{ns}/`) is deleted before the response returns,
+   and the prefix is then listed again. If the delete fails or the listing is
+   not empty, the namespace is still deleted and the response says
    `"storage_reclaimed": false`; the leftover objects are unreferenced, and a
    re-created namespace never reuses their keys.
 
@@ -484,6 +485,53 @@ manifest for it: within one manifest refresh (`KOSHA_MANIFEST_REFRESH_MS`,
 default 500 ms), or at once for a search with `max_staleness_seconds: 0`. Their local disk copies of its segments are not removed
 eagerly; the LRU cache (`KOSHA_CACHE_MAX_BYTES`) evicts them. Re-creating the
 namespace, explicitly or by writing to it, starts it empty.
+
+**Deletion records.** Step 1 also writes a deletion record
+(`kosha.deletion_records` in Postgres, migration 004) in the same transaction
+that drops the namespace, and the response returns it as `deletion`:
+
+```json
+{"namespace": "docs", "acknowledged": true, "storage_reclaimed": true,
+ "deletion": {"id": "del-…", "scope": "namespace", "subject": "acme/docs",
+              "tenant_id": "acme", "state": "completed", "attempts": 1,
+              "objects_deleted": 42, "last_error": null,
+              "requested_at_ms": 1790000000000, "completed_at_ms": 1790000000412}}
+```
+
+A record is `pending` until step 4 has deleted the prefix **and** listed it
+empty; only then is it `completed`. A record holds identifiers and counters,
+never document content, and is kept as the evidence that the erasure finished.
+What `completed` covers is the control store, the ingest pod's memory, WAL and
+disk, and object storage. It does not cover the disk caches of other pods (see
+above).
+
+| Method and path | Notes |
+|---|---|
+| `GET /v1/admin/deletions` | Records, oldest first. Filters: `?state=pending\|completed`, `?tenant=<id>`, `?limit=<n>`. |
+| `GET /v1/admin/deletions/{id}` | One record. |
+| `POST /v1/admin/deletions/resume` | *write*. Retry every pending record (or `{"id": "…"}` for one). Returns the records and how many are still pending. |
+| `DELETE /v1/admin/tenants/{tenant}` | *write*. Delete a tenant; see below. |
+
+A pending namespace record whose namespace was re-created in the meantime is
+not retried: the new incarnation writes into the same prefix. It completes
+after that namespace is deleted again. With the in-memory control store (no
+`DATABASE_URL`) records last only as long as the process.
+
+**Deleting a tenant** (`DELETE /v1/admin/tenants/{tenant}`, admin key) needs
+the body `{"confirm": "<tenant>"}` and is permanent. In order: the tenant's
+API keys are deleted from `kosha.api_keys` (and from the ingest pod's key
+snapshot at once; other pods drop them on their next refresh,
+`KOSHA_API_KEY_REFRESH_SECS`), its branches are deleted, each namespace is
+deleted as above with its own record, and whatever is left under
+`{KOSHA_S3_PREFIX}/{tenant}/` is deleted and the prefix listed empty. The
+response is 200 with `"completed": true` when all of that held, and 202 with
+the reasons in `errors` when something is left; the tenant's own record then
+stays `pending` and `POST /v1/admin/deletions/resume` (or repeating the
+request) continues it. Keys set through `KOSHA_API_KEYS` / `KOSHA_API_KEY`
+cannot be removed at runtime, so a tenant that still has one stays pending
+until the deployment's environment changes. Tenant ids starting with `_` or
+`.` are refused, and so is a tenant whose id is also the name of an unscoped
+(pre-#262) namespace, which stores its segments under the same prefix.
 
 ## Late interaction
 
