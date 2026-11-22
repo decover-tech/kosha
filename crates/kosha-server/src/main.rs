@@ -55,6 +55,7 @@ mod metrics;
 mod migrate;
 #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
 mod namespace_migrate;
+mod org_admin;
 mod posting_spans;
 mod rerank;
 mod role;
@@ -106,6 +107,9 @@ struct AppState {
     /// the compaction scheduler.
     compaction_on_ingest: bool,
     admin_auth_key: Option<String>,
+    /// Organizations, users, projects and the audit log (#345), served
+    /// under `/v1/admin/users` and `/v1/admin/orgs`.
+    orgs: org_admin::OrgBackend,
     internal_service_key: Option<String>,
     publication_locks: Mutex<HashMap<NamespaceId, Arc<Mutex<()>>>>,
     /// Serializes namespace branch creation and deletion (#208), so a
@@ -1768,6 +1772,7 @@ impl AppState {
             admin_auth_key: std::env::var("KOSHA_ADMIN_API_KEY")
                 .ok()
                 .filter(|k| !k.is_empty()),
+            orgs: org_admin::OrgBackend::from_env(),
             internal_service_key: std::env::var("KOSHA_INTERNAL_API_KEY")
                 .ok()
                 .filter(|k| !k.is_empty()),
@@ -6311,6 +6316,10 @@ fn is_write_path(request_line: &str) -> bool {
     if request_line.starts_with("POST /v1/admin/") {
         return true;
     }
+    // The one admin DELETE: removing an organization member (#345).
+    if request_line.starts_with("DELETE /v1/admin/orgs/") {
+        return true;
+    }
     // Compaction jobs and scheduler state live on the write pod that runs
     // them; a query pod has none, so these reads are forwarded too.
     if request_line.starts_with("GET /v1/admin/compaction-") {
@@ -6445,6 +6454,25 @@ fn route(
     if path.starts_with("/v1/admin/") {
         if !service_authorized(headers, state.admin_auth_key.as_deref()) {
             return json_error(403, "admin credential required");
+        }
+        // Organizations, users, projects, audit log (#345).
+        let key_table = match auth::global() {
+            auth::Auth::Keys(keys) => Some(keys),
+            auth::Auth::Disabled => None,
+        };
+        if let Some(response) =
+            org_admin::handle(method, path, headers, body, &state.orgs, key_table)
+        {
+            return response;
+        }
+        // Every other admin route is the operator's and knows nothing of
+        // roles. A request that names a user must not reach one: it would
+        // run with the operator's powers (a key for any tenant, gc, ...).
+        if org_admin::names_actor(headers) {
+            return json_error(
+                403,
+                "this route is operator-only: it cannot be called with an 'x-kosha-actor' header",
+            );
         }
     } else if path.starts_with("/internal/") {
         if !service_authorized(headers, state.internal_service_key.as_deref()) {
@@ -10667,8 +10695,10 @@ fn handle_create_api_key(body: &[u8], _tenant: &str, state: &AppState) -> String
         let Some(pg) = store.pg() else {
             return json_error(500, "failed to connect to postgres");
         };
-        match pg.create_api_key(tenant_id, description) {
-            Ok(api_key) => {
+        // The key and its audit row (#345) commit together.
+        match kosha_control::orgs::create_operator_api_key(&*pg, tenant_id, description) {
+            Ok(key) => {
+                let api_key = key.api_key;
                 // Usable on this pod right away; other pods pick it up on
                 // their next key refresh.
                 store.insert_db_key(api_key.clone(), tenant_id.to_string());

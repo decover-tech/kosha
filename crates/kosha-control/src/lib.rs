@@ -13,6 +13,11 @@ use kosha_core::{ControlStore, KoshaError, Manifest, NamespaceId};
 mod namespace_rename;
 pub use namespace_rename::{rekey_manifest_references, NamespaceRename, RenameOutcome};
 
+pub mod orgs;
+
+#[cfg(feature = "postgres")]
+mod orgs_pg;
+
 #[cfg(feature = "postgres")]
 mod postgres;
 
