@@ -23,6 +23,16 @@ fn tenant_namespace(tenant: &str, namespace: &str) -> String {
     format!("{tenant}/{namespace}")
 }
 
+/// The tenant owning internal namespace `ns` (`{tenant}/...`), or `None`
+/// for a pre-#262 bare namespace.
+fn namespace_tenant(ns: &str) -> Option<&str> {
+    ns.split_once('/').map(|(tenant, _)| tenant)
+}
+
+/// The tenant `dispatch` assigns to the admin and internal service
+/// credentials. Operator traffic is never tenant-limited (#341).
+const SERVICE_TENANT: &str = "service";
+
 mod auth;
 mod branching;
 mod compaction_sched;
@@ -33,9 +43,11 @@ mod doc_store_fallback_tests;
 mod embedding;
 #[cfg(test)]
 mod embedding_server_tests;
+mod fair_admission;
 mod http;
 #[cfg(feature = "s3")]
 mod hydration_budget;
+mod internal_tls;
 mod manifest_follow;
 mod metrics;
 #[cfg(feature = "migrate")]
@@ -57,6 +69,7 @@ mod crash_points_tests;
 #[cfg_attr(not(feature = "s3"), allow(dead_code))]
 mod segment_commit;
 mod segment_gc;
+mod tenant_limits;
 mod unindexed;
 mod warm;
 mod warm_run;
@@ -222,7 +235,13 @@ struct AppState {
     /// scoring buffers) and keeps rayon from timeslicing across an unbounded
     /// number of concurrent scoring passes. Thread-per-connection means
     /// excess searches queue here rather than all running at once.
-    search_semaphore: Semaphore,
+    ///
+    /// Waiters queue per tenant and are served round robin (#341, see
+    /// [`fair_admission`]), so one tenant's burst cannot queue everyone.
+    search_semaphore: fair_admission::FairSemaphore,
+    /// Per-tenant quotas and rate limits (#341, `KOSHA_TENANT_LIMITS_FILE`).
+    /// Inert when no limits file is configured.
+    tenant_limits: tenant_limits::TenantLimiter,
     /// Cross-replica hydration coordinator (DESIGN.md §9 gap: N query
     /// replicas cold-starting on the same namespace independently re-fetch
     /// the same segments from S3). `None` when Postgres isn't configured —
@@ -246,6 +265,10 @@ struct AppState {
     /// S3, not held onto).
     #[cfg(all(feature = "s3", feature = "postgres"))]
     peer_http_client: Option<reqwest::blocking::Client>,
+    /// `http` or `https` for peer segment fetches (`KOSHA_INTERNAL_TLS`,
+    /// see `internal_tls`).
+    #[cfg(all(feature = "s3", feature = "postgres"))]
+    peer_url_scheme: &'static str,
     /// Dedicated `KOSHA_INTERNAL_API_KEY` for pod-to-pod hydration. `None` disables peer fetches
     /// (falls back to S3, same as an unset `own_addr`).
     #[cfg(all(feature = "s3", feature = "postgres"))]
@@ -483,131 +506,38 @@ struct SegmentFetch {
     cv: Condvar,
 }
 
-/// Minimal counting semaphore built on `Mutex`/`Condvar`.
-///
-/// Both users of this (S3 hydration, search admission) are synchronous from
-/// the caller's point of view — they run on the request-handling thread —
-/// so a blocking semaphore matches the rest of the file's concurrency
-/// model. (`std` has no built-in semaphore; pulling in
-/// `tokio::sync::Semaphore` would mean adding the `sync` feature to a crate
-/// that otherwise only uses tokio internally, behind a blocking boundary,
-/// to run S3 SDK futures.)
-#[derive(Default)]
-struct SemState {
-    permits: usize,
-    /// Requests currently blocked in `acquire*`. Bounding this is what
-    /// turns overload into shedding instead of unbounded queueing.
-    waiters: usize,
-}
-
+/// Minimal counting semaphore built on `Mutex`/`Condvar`, for S3
+/// hydration: synchronous from the caller's point of view (it runs on the
+/// request-handling thread), so a blocking semaphore matches the rest of the
+/// file's concurrency model. (`std` has no built-in semaphore; pulling in
+/// `tokio::sync::Semaphore` would mean running async code behind a blocking
+/// boundary.) Search admission uses [`fair_admission::FairSemaphore`]
+/// instead, which sheds and queues per tenant (#146, #341).
+#[cfg_attr(not(feature = "s3"), allow(dead_code))]
 struct Semaphore {
-    state: Mutex<SemState>,
+    permits: Mutex<usize>,
     cv: Condvar,
-    /// Max requests allowed to wait for a permit. `0` = unbounded (the
-    /// pre-#146 behavior).
-    max_waiters: usize,
-    /// How long a request may wait before being shed. `None` = forever.
-    wait_timeout: Option<Duration>,
 }
 
+#[cfg_attr(not(feature = "s3"), allow(dead_code))]
 impl Semaphore {
     fn new(permits: usize) -> Self {
-        Self::with_queue_limits(permits, 0, None)
-    }
-
-    fn with_queue_limits(
-        permits: usize,
-        max_waiters: usize,
-        wait_timeout: Option<Duration>,
-    ) -> Self {
         Self {
-            state: Mutex::new(SemState {
-                permits,
-                waiters: 0,
-            }),
+            permits: Mutex::new(permits),
             cv: Condvar::new(),
-            max_waiters,
-            wait_timeout,
         }
     }
 
     /// Block until a permit is available, then hold it until the returned
-    /// guard is dropped. Unbounded — kept for callers where waiting is
-    /// always preferable to failing.
+    /// guard is dropped. Unbounded: for callers where waiting is always
+    /// preferable to failing.
     fn acquire(&self) -> SemaphorePermit<'_> {
-        let mut st = self.state.lock().unwrap();
-        while st.permits == 0 {
-            st = self.cv.wait(st).unwrap();
+        let mut permits = self.permits.lock().unwrap();
+        while *permits == 0 {
+            permits = self.cv.wait(permits).unwrap();
         }
-        st.permits -= 1;
+        *permits -= 1;
         SemaphorePermit { sem: self }
-    }
-
-    /// Acquire a permit, or shed (`None`) if the queue is already too deep
-    /// or the wait exceeds `wait_timeout`.
-    ///
-    /// This is the I/O-side analogue of [`kosha_query::MemoryLedger`]'s
-    /// admission gate. The ledger bounds *bytes*; nothing bounded the
-    /// accumulation of work when the machine simply could not keep up.
-    /// Measured on the 10M vector namespace: with 8 permits and a service
-    /// time inflated by storage saturation, arrivals queued until
-    /// `queue_ms=118,942` against `score_ms=2,256` — every request waiting
-    /// two minutes for a result its client had long since abandoned, while
-    /// the box thrashed its disk and even sshd was starved of I/O.
-    ///
-    /// Failing fast is strictly better for everyone: the client gets a 429
-    /// it can retry with backoff (kosha_client already does), and the
-    /// server stops accepting work it has no capacity to finish. A queue
-    /// deeper than the service rate can drain is not throughput, it is
-    /// latency nobody asked for.
-    #[cfg(test)]
-    fn acquire_or_shed(&self) -> Option<SemaphorePermit<'_>> {
-        self.try_acquire().ok()
-    }
-
-    /// `acquire_or_shed` (see its doc above), saying why a shed request was
-    /// shed (`kosha_search_requests_total{outcome="rejected"|"timeout"}`).
-    fn try_acquire(&self) -> Result<SemaphorePermit<'_>, metrics::QueueShed> {
-        let mut st = self.state.lock().unwrap();
-        if st.permits > 0 {
-            st.permits -= 1;
-            return Ok(SemaphorePermit { sem: self });
-        }
-        // Fast-fail on a queue that is already saturated — waiting only to
-        // time out later would burn the client's deadline for nothing.
-        if self.max_waiters > 0 && st.waiters >= self.max_waiters {
-            return Err(metrics::QueueShed::Full);
-        }
-        let deadline = self.wait_timeout.map(|t| Instant::now() + t);
-        st.waiters += 1;
-        let outcome = loop {
-            if st.permits > 0 {
-                st.permits -= 1;
-                break true;
-            }
-            match deadline {
-                None => st = self.cv.wait(st).unwrap(),
-                Some(d) => {
-                    let now = Instant::now();
-                    if now >= d {
-                        break false;
-                    }
-                    let (guard, _) = self.cv.wait_timeout(st, d - now).unwrap();
-                    st = guard;
-                }
-            }
-        };
-        st.waiters -= 1;
-        if outcome {
-            Ok(SemaphorePermit { sem: self })
-        } else {
-            Err(metrics::QueueShed::Timeout)
-        }
-    }
-
-    /// Requests waiting for a permit right now (`kosha_search_queue_depth`).
-    fn waiters(&self) -> usize {
-        self.state.lock().unwrap().waiters
     }
 }
 
@@ -617,8 +547,7 @@ struct SemaphorePermit<'a> {
 
 impl Drop for SemaphorePermit<'_> {
     fn drop(&mut self) {
-        let mut st = self.sem.state.lock().unwrap();
-        st.permits += 1;
+        *self.sem.permits.lock().unwrap() += 1;
         self.sem.cv.notify_one();
     }
 }
@@ -648,6 +577,7 @@ struct HydrationOutcome {
     /// and every later, differently-filtered query silently scored
     /// against only that same stale subset forever (not self-healing —
     /// only a pod restart, which drops the cache, recovered it).
+    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
     bloom_pruned: bool,
     /// `true` when this request hit its hydration byte ceiling
     /// (`KOSHA_HYDRATE_REQUEST_MAX_BYTES`) or waited out the process-wide
@@ -656,7 +586,7 @@ struct HydrationOutcome {
     /// `missing` is populated either way — the files really aren't local —
     /// but the distinction matters to the client: a shed is load-shedding
     /// (HTTP 429, retry with backoff, the same contract
-    /// `Semaphore::acquire_or_shed` and `kosha_query::MemoryLedger` already
+    /// `FairSemaphore::try_acquire` and `kosha_query::MemoryLedger` already
     /// use), whereas a non-shed `missing` is a genuine S3 failure (HTTP
     /// 503). Reporting a shed as a 503 would tell a caller its data is
     /// broken when the server merely declined to pull multiple GB inside
@@ -801,6 +731,7 @@ impl HydrationVerdict {
     /// `needs_filters` is the query's filter column names, `None` when it
     /// needs no filter files at all. `knn_field` is the query's
     /// `knn.field`, `None` for a non-kNN query.
+    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
     fn covers(&self, needs_filters: Option<&FilterFields>, knn_field: Option<&str>) -> bool {
         let filters_ok = needs_filters.is_none_or(|fields| {
             self.filters_verified && fields.is_subset(&self.filter_fields_verified)
@@ -866,6 +797,7 @@ fn knn_files_complete(
 /// `knn.field` for a single-vector kNN (#204), and a key of its own for a
 /// late-interaction kNN (#205), whose pass hydrates the field's multivec
 /// files rather than its single-vector column. `None` without kNN.
+#[cfg_attr(not(feature = "s3"), allow(dead_code))]
 fn knn_verdict_key(query: &SearchQuery) -> Option<String> {
     query.knn.as_ref().map(|knn| {
         if knn.is_late_interaction() {
@@ -1410,6 +1342,7 @@ impl AppState {
         );
 
         // ── Control plane: in-memory or Postgres ─────────────────────────
+        #[cfg_attr(not(feature = "postgres"), allow(unused_mut))]
         let mut control_plane_kind: &'static str = "in-memory";
         let control_store: Box<dyn ControlStore> = if let Some(store) = options.control_store {
             store
@@ -1623,10 +1556,18 @@ impl AppState {
         }
         let compaction_on_ingest =
             role::compaction_on_ingest(std::env::var("KOSHA_COMPACTION_ON_INGEST").ok().as_deref());
+        // TLS between pods (#343). Fails closed on a bad configuration.
+        let internal_tls = internal_tls::global();
+        println!("internal TLS: {}", internal_tls.describe());
         let write_http_client = ingest_host.as_ref().map(|h| {
+            match internal_tls.check_ingest_host(h) {
+                Ok(None) => {}
+                Ok(Some(warning)) => eprintln!("WARN: {warning}"),
+                Err(e) => fatal(&e),
+            }
             println!("write-path requests will be forwarded to ingest at {h}");
-            reqwest::blocking::Client::builder()
-                .pool_idle_timeout(http::INTERNAL_CLIENT_POOL_IDLE)
+            internal_tls
+                .client_builder()
                 .timeout(Duration::from_secs(
                     // Matches the server's own request I/O timeout
                     // (`KOSHA_HTTP_IO_TIMEOUT_SECS`). The previous default of 30 s
@@ -1684,8 +1625,8 @@ impl AppState {
         };
         #[cfg(all(feature = "s3", feature = "postgres"))]
         let peer_http_client = hydration_leases.as_ref().map(|_| {
-            reqwest::blocking::Client::builder()
-                .pool_idle_timeout(http::INTERNAL_CLIENT_POOL_IDLE)
+            internal_tls
+                .client_builder()
                 // Short: a peer that isn't answering quickly should be
                 // abandoned in favor of the S3 fallback, not held onto —
                 // see `fetch_from_peer`. The blocking client applies it to
@@ -1761,6 +1702,18 @@ impl AppState {
             data_dir.clone(),
             posting_spans::config_from_env(),
         );
+
+        let tenant_limits = tenant_limits::TenantLimiter::from_env()
+            .unwrap_or_else(|e| fatal(&format!("tenant limits: {e}")));
+        // Every process-wide cache splits its budget between tenants by
+        // their plan weight, with `KOSHA_CACHE_TENANT_MIN_BYTES` as each
+        // active tenant's floor (#342).
+        let tenant_shares =
+            kosha_core::tenancy::TenantShares::from_env().with_weights(tenant_limits.weight_fn());
+        cache.set_tenant_shares(tenant_shares.clone());
+        searcher.set_tenant_shares(tenant_shares.clone());
+        let mut result_cache = ResultCache::new(result_cache_budget());
+        result_cache.shares = tenant_shares;
 
         Self {
             controller: Mutex::new(control_store),
@@ -1865,18 +1818,28 @@ impl AppState {
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(10_000);
-                Semaphore::with_queue_limits(
+                // Per-tenant share of the queue (#341). `0`: only the total
+                // bound applies.
+                let per_tenant = std::env::var("KOSHA_SEARCH_QUEUE_DEPTH_PER_TENANT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                fair_admission::FairSemaphore::new(
                     permits,
                     max_waiters,
+                    per_tenant,
                     (wait_ms > 0).then(|| Duration::from_millis(wait_ms)),
                 )
             },
+            tenant_limits,
             #[cfg(all(feature = "s3", feature = "postgres"))]
             hydration_leases,
             #[cfg(all(feature = "s3", feature = "postgres"))]
             own_addr,
             #[cfg(all(feature = "s3", feature = "postgres"))]
             peer_http_client,
+            #[cfg(all(feature = "s3", feature = "postgres"))]
+            peer_url_scheme: internal_tls.peer_scheme(),
             #[cfg(all(feature = "s3", feature = "postgres"))]
             internal_auth_key,
             self_ref: Weak::new(),
@@ -1888,7 +1851,7 @@ impl AppState {
             gc_stats: segment_gc::GcStats::default(),
             gc_lock: Mutex::new(()),
             completed_hydrations: Mutex::new(HashMap::new()),
-            result_cache: Mutex::new(ResultCache::new(result_cache_budget())),
+            result_cache: Mutex::new(result_cache),
             rerankers: rerank::RerankRegistry::from_env(),
             embedders: embedding::EmbedderRegistry::from_env(),
             posting_blob_presence: Mutex::new(HashMap::new()),
@@ -2775,6 +2738,7 @@ impl AppState {
     /// CAS against the version the control store holds right now. Never
     /// rebases: a concurrent publish wins and this fails with
     /// `ManifestConflict`, leaving both the store and the indexer alone.
+    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
     fn import_manifest(
         &self,
         ns: &NamespaceId,
@@ -2896,6 +2860,7 @@ impl AppState {
     /// Cache footers parsed during a search's hydration on the manifest(s)
     /// that list their segments. A merged sharded view's segment ids are
     /// `_shard-XXXX/{id}`: those footers belong to the shard namespace.
+    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
     fn remember_search_footers(
         &self,
         ns: &NamespaceId,
@@ -3714,7 +3679,10 @@ impl AppState {
             ));
         };
 
-        let url = format!("http://{peer_addr}/internal/segment/{logical_path}");
+        let url = format!(
+            "{}://{peer_addr}/internal/segment/{logical_path}",
+            self.peer_url_scheme
+        );
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut delay = Duration::from_millis(100);
         loop {
@@ -4234,13 +4202,22 @@ impl AppState {
         let filters_of = |p: &Path| filter_files.get(p).map(Vec::as_slice).unwrap_or(&[]);
         let mut outcome = HydrationOutcome::default();
         let (owned, waiting) = partition_for_hydration(&self.in_flight_segments, seg_paths, |p| {
-            Self::scoring_complete(
+            let complete = Self::scoring_complete(
                 p,
                 knn_field,
                 vectors_ranged,
                 filters_of(p),
                 manifest_footers.get(p).copied(),
-            )
+            );
+            // A search's segment found with its scoring files already local
+            // is a disk-cache hit for its tenant; one that must hydrate is a
+            // miss (#342, `kosha_cache_{hits,misses}{cache="nvme"}`).
+            if let Ok(rel) = p.strip_prefix(&self.data_dir) {
+                let rel = rel.to_string_lossy();
+                self.cache
+                    .record_lookup(kosha_core::tenancy::tenant_of_segment_dir(&rel), complete);
+            }
+            complete
         });
 
         if !owned.is_empty() {
@@ -4573,6 +4550,19 @@ impl AppState {
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
         outcome
+    }
+
+    /// A warm search whose cached hydration verdict covers its scoring set
+    /// never reaches `ensure_scoring_files_local`, where per-segment
+    /// `kosha_cache_{hits,misses}{cache="nvme"}` are otherwise counted, so
+    /// its segments are counted as hits here (#342).
+    #[cfg(feature = "s3")]
+    fn record_warm_nvme_hits(&self, ns: &NamespaceId, manifest: &kosha_core::Manifest) {
+        self.cache.record_lookups(
+            kosha_core::tenancy::tenant_of_namespace(&ns.0),
+            manifest.segments.len() as u64,
+            0,
+        );
     }
 
     /// Per-query posting-blob ensure for the cached-verdict fast path: the
@@ -5454,6 +5444,7 @@ fn posting_blob_cache_insert(
     }
 }
 
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
 fn redact_database_url(url: &str) -> String {
     // postgresql://user:password@host/db → postgresql://user:***@host/db
     if let Some((scheme_user, rest)) = url.split_once("://") {
@@ -5736,9 +5727,13 @@ fn dispatch(state: &AppState, request: http::Request) -> http::Response {
         {
             internal_segment_response(&request_line, state)
         }
-        (Ok(tenant), _, _) => {
-            http::Response::from_raw(route(&request_line, &headers, &body, tenant, state))
-        }
+        (Ok(tenant), _, _) => http::Response::from_raw(serve_tenant_request(
+            &request_line,
+            &headers,
+            &body,
+            tenant,
+            state,
+        )),
     };
     log_request(
         &request_line,
@@ -5777,6 +5772,23 @@ fn request_id() -> String {
     REQUEST_ID.with(|r| r.borrow().clone())
 }
 
+/// Every cache's per-tenant figures for `kosha_cache_*` (#342).
+fn cache_tenant_samples(state: &AppState) -> Vec<metrics::CacheTenantSample> {
+    let result = state.result_cache.lock().unwrap().tenants.stats();
+    [
+        ("nvme", state.cache.tenant_stats()),
+        ("segment", state.searcher.segment_cache_tenant_stats()),
+        ("result", result),
+    ]
+    .into_iter()
+    .flat_map(|(cache, stats)| {
+        stats
+            .into_iter()
+            .map(move |stats| metrics::CacheTenantSample { cache, stats })
+    })
+    .collect()
+}
+
 /// `GET /metrics`: the Prometheus text exposition of [`metrics::Metrics`],
 /// with the gauges and counters the server already keeps elsewhere read at
 /// scrape time. `KOSHA_METRICS=off` hides the route (404);
@@ -5803,12 +5815,259 @@ fn handle_metrics(state: &AppState, headers: &HashMap<String, String>) -> String
         segment_cache_bytes: state.searcher.segment_cache_bytes(),
         nvme_evictions: state.cache.eviction_generation(),
         segment_checksum_failures,
+        cache_tenants: cache_tenant_samples(state),
     });
     format!(
         "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: {}\r\n\r\n{body}",
         body.len(),
         metrics::CONTENT_TYPE,
     )
+}
+
+// ─── Per-tenant limits (#341) ──────────────────────────────────────────────
+
+/// [`route`] an authenticated request this pod handles itself, after its
+/// tenant's request-entry limits (#341): a search takes a qps token and a
+/// concurrent-query slot (held until the response is built); a write route
+/// is checked against the tenant's body size cap and write bytes per
+/// second. A query pod forwards writes before this runs, so write limits
+/// are enforced where writes execute: on the ingest pod.
+fn serve_tenant_request(
+    request_line: &str,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+    tenant: &str,
+    state: &AppState,
+) -> String {
+    let mut _query_slot = None;
+    if tenant_is_limited(state, tenant) {
+        if is_search_route(request_line) {
+            match state.tenant_limits.admit_query(tenant) {
+                Ok(slot) => _query_slot = Some(slot),
+                Err(rejection) => return tenant_rejection(state, tenant, &rejection),
+            }
+        } else if is_write_path(request_line) {
+            if let Err(rejection) = state.tenant_limits.admit_write_body(tenant, body.len()) {
+                return tenant_rejection(state, tenant, &rejection);
+            }
+        }
+    }
+    route(request_line, headers, body, tenant, state)
+}
+
+/// Whether `tenant`'s requests are subject to tenant limits at all.
+fn tenant_is_limited(state: &AppState, tenant: &str) -> bool {
+    state.tenant_limits.enabled() && tenant != SERVICE_TENANT
+}
+
+/// A search route, in any of its forms: `POST /v1/namespaces/{ns}/search`,
+/// and the legacy `POST /search` and `GET /search?...`.
+fn is_search_route(request_line: &str) -> bool {
+    parse_method_and_path(request_line).is_some_and(|(method, path)| {
+        let path = path.split('?').next().unwrap_or(path);
+        ((method == "POST" || method == "GET") && path == "/search")
+            || (method == "POST"
+                && path
+                    .strip_prefix("/v1/namespaces/")
+                    .and_then(|rest| rest.strip_suffix("/search"))
+                    .is_some_and(|ns| !ns.is_empty() && !ns.contains('/')))
+    })
+}
+
+/// The 429 for a request refused by a tenant limit: `Retry-After` plus a
+/// JSON body `{error, reason, limit, retry_after_ms}`. Counted in
+/// `kosha_tenant_rejections_total`.
+fn tenant_rejection(
+    state: &AppState,
+    tenant: &str,
+    rejection: &tenant_limits::Rejection,
+) -> String {
+    state
+        .metrics
+        .record_tenant_rejection(rejection.reason, tenant);
+    eprintln!(
+        "WARN: request refused: status=429 tenant={tenant} reason={} limit={} retry_after_ms={}{}",
+        rejection.reason.as_str(),
+        rejection.limit,
+        rejection.retry_after_ms,
+        request_id()
+    );
+    let body = rejection.body().to_string();
+    retry_after(
+        format!(
+            "HTTP/1.1 429 Too Many Requests\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{body}",
+            body.len()
+        ),
+        rejection.retry_after_secs(),
+    )
+}
+
+/// The tenant whose limits apply to writes into `ns`, with its limits.
+/// `None` when nothing limits it (no limits configured, a bare namespace,
+/// or operator traffic).
+fn write_limits(
+    state: &AppState,
+    ns: &NamespaceId,
+) -> Option<(String, tenant_limits::TenantLimits)> {
+    let tenant = namespace_tenant(&ns.0)?;
+    if !tenant_is_limited(state, tenant) {
+        return None;
+    }
+    let limits = state.tenant_limits.limits(tenant)?;
+    Some((tenant.to_string(), limits))
+}
+
+/// Whether `ns` does not exist yet, so writing to (or creating) it would
+/// add a namespace.
+fn namespace_is_new(state: &AppState, ns: &NamespaceId) -> bool {
+    state.indexer.manifest_version(ns).is_none()
+        && !state.controller.lock().unwrap().has_namespace(ns)
+}
+
+/// Namespaces `tenant` holds: top-level names only, as `GET /v1/namespaces`
+/// lists them (shards and branches are not counted).
+fn tenant_namespace_count(state: &AppState, tenant: &str) -> u64 {
+    let prefix = format!("{tenant}/");
+    let all = state.controller.lock().unwrap().list_namespaces();
+    let mut names: Vec<&str> = all
+        .iter()
+        .filter_map(|ns| ns.0.strip_prefix(&prefix))
+        .filter(|name| !name.is_empty() && !name.contains('/'))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names.len() as u64
+}
+
+/// The namespace quota: refuse to add `ns` when its tenant already holds
+/// `namespaces` of them. Checked on explicit creation and on the first
+/// write that would auto-create a namespace. Per pod and approximate under
+/// concurrent creations.
+fn check_namespace_quota(state: &AppState, ns: &NamespaceId) -> Result<(), String> {
+    let Some((tenant, limits)) = write_limits(state, ns) else {
+        return Ok(());
+    };
+    let Some(max) = limits.namespaces else {
+        return Ok(());
+    };
+    if namespace_is_new(state, ns) && tenant_namespace_count(state, &tenant) >= max {
+        return Err(tenant_rejection(
+            state,
+            &tenant,
+            &tenant_limits::Rejection::quota(tenant_limits::RejectReason::NamespaceQuota, max),
+        ));
+    }
+    Ok(())
+}
+
+/// Documents in `ns`: committed and not deleted, plus writes not yet
+/// flushed (over every shard of a sharded namespace). An estimate: an
+/// unflushed upsert of an existing id counts twice until it is flushed.
+fn namespace_doc_estimate(state: &AppState, ns: &NamespaceId) -> u64 {
+    let shards = state.indexer.shard_count(ns);
+    let committed = state.indexer.manifest_shared(ns).map_or(0, |m| {
+        let m = match shards {
+            Some(_) => state.sharded_view(ns, m),
+            None => m,
+        };
+        let docs: u64 = m.segments.iter().map(|s| s.doc_count as u64).sum();
+        let deleted: u64 = m.deletion_vectors.values().map(|v| v.count).sum();
+        docs.saturating_sub(deleted)
+    });
+    let mut pending = state.indexer.pending_doc_count(ns) as u64;
+    if let Some(count) = shards {
+        for shard in kosha_core::sharding::shard_namespaces(ns, count) {
+            pending += state.indexer.pending_doc_count(&shard) as u64;
+        }
+    }
+    committed + pending
+}
+
+/// The widest vector in `documents` (a bag of vectors counts its widest).
+fn widest_vector(documents: &[kosha_core::Document]) -> usize {
+    documents
+        .iter()
+        .flat_map(|doc| doc.fields.iter())
+        .filter(|f| f.field_type == kosha_core::FieldType::Vector)
+        .map(|f| {
+            if let Ok(v) = serde_json::from_str::<Vec<f32>>(&f.value) {
+                v.len()
+            } else if let Ok(bag) = serde_json::from_str::<Vec<Vec<f32>>>(&f.value) {
+                bag.iter().map(Vec::len).max().unwrap_or(0)
+            } else {
+                0
+            }
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// The vector dimension limit for `documents` bound for `ns`.
+fn check_vector_dims(
+    state: &AppState,
+    ns: &NamespaceId,
+    documents: &[kosha_core::Document],
+) -> Result<(), String> {
+    let Some((tenant, limits)) = write_limits(state, ns) else {
+        return Ok(());
+    };
+    let Some(max) = limits.vector_dims else {
+        return Ok(());
+    };
+    if widest_vector(documents) > max as usize {
+        return Err(tenant_rejection(
+            state,
+            &tenant,
+            &tenant_limits::Rejection::quota(
+                tenant_limits::RejectReason::VectorDims,
+                u64::from(max),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Per-tenant write limits for an index or replace of `documents` into
+/// `ns` (#341), before they are embedded: the namespace quota (a write
+/// auto-creates its namespace), the documents-per-namespace quota, vector
+/// dimensions of supplied vectors, then the write docs per second. `Err`
+/// carries the ready-to-send 429.
+fn check_document_write(
+    state: &AppState,
+    ns: &NamespaceId,
+    documents: &[kosha_core::Document],
+) -> Result<(), String> {
+    let Some((tenant, limits)) = write_limits(state, ns) else {
+        return Ok(());
+    };
+    check_namespace_quota(state, ns)?;
+    if let Some(max) = limits.docs_per_namespace {
+        if namespace_doc_estimate(state, ns) + documents.len() as u64 > max {
+            return Err(tenant_rejection(
+                state,
+                &tenant,
+                &tenant_limits::Rejection::quota(tenant_limits::RejectReason::DocQuota, max),
+            ));
+        }
+    }
+    check_vector_dims(state, ns, documents)?;
+    state
+        .tenant_limits
+        .admit_write_docs(&tenant, documents.len())
+        .map_err(|rejection| tenant_rejection(state, &tenant, &rejection))
+}
+
+/// The vector dimension limit again after native embedding (#209), for a
+/// namespace whose schema embeds text: the model's vectors count too.
+fn check_embedded_dims(
+    state: &AppState,
+    ns: &NamespaceId,
+    documents: &[kosha_core::Document],
+) -> Result<(), String> {
+    if write_limits(state, ns).is_none() || state.indexer.embedded_fields(ns).is_none() {
+        return Ok(());
+    }
+    check_vector_dims(state, ns, documents)
 }
 
 /// Per-request search bookkeeping for `kosha_search_requests_total`, filled
@@ -5820,18 +6079,24 @@ struct SearchObservation {
     /// The searched namespace, recorded only with
     /// `KOSHA_METRICS_NAMESPACE_LABELS=on`.
     namespace: std::cell::RefCell<Option<String>>,
+    /// The tenant owning the searched namespace: whose queue the search
+    /// waits in for a scoring slot (#341).
+    tenant: std::cell::RefCell<String>,
 }
 
 impl SearchObservation {
     fn namespace(&self, state: &AppState, ns: &NamespaceId) {
+        *self.tenant.borrow_mut() = namespace_tenant(&ns.0).unwrap_or("").to_string();
         if state.metrics.config.namespace_labels {
             *self.namespace.borrow_mut() = Some(ns.0.clone());
         }
     }
 
-    /// Acquire a scoring slot, recording a shed.
-    fn scoring_slot<'a>(&self, state: &'a AppState) -> Option<SemaphorePermit<'a>> {
-        match state.search_semaphore.try_acquire() {
+    /// Acquire a scoring slot in the tenant's fair queue, recording a shed.
+    fn scoring_slot<'a>(&self, state: &'a AppState) -> Option<fair_admission::FairPermit<'a>> {
+        let tenant = self.tenant.borrow();
+        let weight = state.tenant_limits.weight(&tenant);
+        match state.search_semaphore.try_acquire(&tenant, weight) {
             Ok(slot) => Some(slot),
             Err(why) => {
                 self.shed.set(Some(why));
@@ -6054,10 +6319,13 @@ fn service_authorized(headers: &HashMap<String, String>, expected: Option<&str>)
         .is_some_and(|expected| request_key(headers) == Some(expected))
 }
 
+/// A tenant id, or a namespace or branch name a tenant supplies. Names
+/// starting with `_` or `.` are reserved for internal and legacy layouts
+/// (`<tenant>/_shard-NNNN` would otherwise be accounted to the shared
+/// `_legacy` tenant — see [`kosha_core::tenancy::is_reserved_name`]).
 fn valid_namespace_component(name: &str) -> bool {
     !name.is_empty()
-        && name != "."
-        && name != ".."
+        && !kosha_core::tenancy::is_reserved_name(name)
         && !name
             .chars()
             .any(|c| c == '/' || c == '\\' || c.is_control())
@@ -6568,6 +6836,9 @@ fn handle_create_namespace(body: &[u8], tenant: &str, state: &AppState) -> Strin
     let typed_schema: kosha_core::NamespaceSchema =
         serde_json::from_value(schema.clone()).unwrap_or_default();
     let id = NamespaceId(tenant_namespace(tenant, name));
+    if let Err(response) = check_namespace_quota(state, &id) {
+        return response;
+    }
 
     let lock = state.publication_lock(&id);
     let guard = lock.lock().unwrap();
@@ -6890,7 +7161,13 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
 
     let ns = request.namespace;
     let mut documents = request.documents;
+    if let Err(response) = check_document_write(state, &ns, &documents) {
+        return response;
+    }
     if let Err(response) = embed_documents(state, &ns, &mut documents) {
+        return response;
+    }
+    if let Err(response) = check_embedded_dims(state, &ns, &documents) {
         return response;
     }
     match write_routed(state, &ns, documents, index_into) {
@@ -7255,7 +7532,13 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
     };
     let namespace = request.namespace;
     let mut documents = request.documents;
+    if let Err(response) = check_document_write(state, &namespace, &documents) {
+        return response;
+    }
     if let Err(response) = embed_documents(state, &namespace, &mut documents) {
+        return response;
+    }
+    if let Err(response) = check_embedded_dims(state, &namespace, &documents) {
         return response;
     }
     match write_routed(state, &namespace, documents, replace_into) {
@@ -7898,6 +8181,7 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
             // shards as zero hits (non-deterministically per pod). It is
             // sub-ms when the shards are already local: one metadata stat
             // per term-shard per split segment.
+            state.record_warm_nvme_hits(&ns, manifest);
             state.ensure_query_posting_blobs(&ns, manifest, search_query, &hydration_request)
         } else {
             let outcome =
@@ -7949,7 +8233,7 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     // waiting on S3 doesn't also hold a scoring slot.
     let t_queue = Instant::now();
     let Some(slot) = obs.scoring_slot(state) else {
-        // Shed rather than queue: see `Semaphore::acquire_or_shed`.
+        // Shed rather than queue: see `FairSemaphore::try_acquire`.
         return json_error(
             429,
             "search overloaded: scoring queue is saturated — retry with backoff",
@@ -8193,6 +8477,12 @@ fn canonical_query_for_cache(query: &SearchQuery) -> Option<String> {
 /// last-use tick with linear-scan eviction (entry counts are small at
 /// realistic budgets). Response strings are cached verbatim, so a hit is
 /// one map lookup plus a clone.
+///
+/// Tenants (#342): the key's namespace is the full `<tenant>/<name>` id,
+/// so two tenants with the same namespace name and query never share an
+/// entry. Bytes are accounted per tenant, and eviction takes the least
+/// recently used entry of the tenant furthest over its weighted share of
+/// the budget (see [`kosha_core::tenancy::TenantShares`]).
 struct ResultCache {
     entries: HashMap<(String, u64, String), ResultCacheEntry>,
     bytes: usize,
@@ -8200,6 +8490,8 @@ struct ResultCache {
     tick: u64,
     hits: u64,
     misses: u64,
+    tenants: kosha_core::tenancy::TenantLedger,
+    shares: kosha_core::tenancy::TenantShares,
 }
 
 struct ResultCacheEntry {
@@ -8217,18 +8509,23 @@ impl ResultCache {
             tick: 0,
             hits: 0,
             misses: 0,
+            tenants: Default::default(),
+            shares: kosha_core::tenancy::TenantShares::from_env(),
         }
     }
 
     fn lookup(&mut self, key: &(String, u64, String)) -> Option<String> {
         self.tick += 1;
         let tick = self.tick;
+        let tenant = kosha_core::tenancy::tenant_of_namespace(&key.0);
         if let Some(e) = self.entries.get_mut(key) {
             e.last_used = tick;
             self.hits += 1;
+            self.tenants.hit(tenant);
             Some(e.resp.clone())
         } else {
             self.misses += 1;
+            self.tenants.miss(tenant);
             None
         }
     }
@@ -8243,6 +8540,31 @@ impl ResultCache {
             keep
         });
         self.bytes -= freed;
+        self.tenants.sub_bytes(
+            kosha_core::tenancy::tenant_of_namespace(namespace),
+            freed as u64,
+        );
+    }
+
+    /// The next entry to evict: the least recently used entry of the
+    /// tenant furthest over its share (#342).
+    fn next_victim(&self) -> Option<(String, u64, String)> {
+        let mut oldest: HashMap<&str, (&(String, u64, String), &ResultCacheEntry)> = HashMap::new();
+        for (key, entry) in &self.entries {
+            let tenant = kosha_core::tenancy::tenant_of_namespace(&key.0);
+            let slot = oldest.entry(tenant).or_insert((key, entry));
+            if entry.last_used < slot.1.last_used {
+                *slot = (key, entry);
+            }
+        }
+        let usage = self.tenants.usage();
+        self.shares
+            .pick_victim(self.budget as u64, &usage, |t| {
+                oldest.get(t).map(|(_, e)| e.bytes as u64)
+            })
+            .and_then(|t| oldest.get(t))
+            .or_else(|| oldest.values().min_by_key(|(_, e)| e.last_used))
+            .map(|(k, _)| (*k).clone())
     }
 
     fn insert(&mut self, key: (String, u64, String), resp: &str) {
@@ -8255,11 +8577,14 @@ impl ResultCache {
         if entry_bytes > self.budget / 4 {
             return;
         }
+        let tenant = kosha_core::tenancy::tenant_of_namespace(&key.0).to_string();
         if let Some(old) = self.entries.remove(&key) {
             self.bytes -= old.bytes;
+            self.tenants.sub_bytes(&tenant, old.bytes as u64);
         }
         self.tick += 1;
         self.bytes += entry_bytes;
+        self.tenants.add_bytes(&tenant, entry_bytes as u64);
         self.entries.insert(
             key,
             ResultCacheEntry {
@@ -8269,16 +8594,14 @@ impl ResultCache {
             },
         );
         while self.bytes > self.budget {
-            let Some(oldest) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, e)| e.last_used)
-                .map(|(k, _)| k.clone())
-            else {
+            let Some(victim) = self.next_victim() else {
                 break;
             };
-            if let Some(e) = self.entries.remove(&oldest) {
+            if let Some(e) = self.entries.remove(&victim) {
                 self.bytes -= e.bytes;
+                let tenant = kosha_core::tenancy::tenant_of_namespace(&victim.0);
+                self.tenants.sub_bytes(tenant, e.bytes as u64);
+                self.tenants.evicted(tenant);
             }
         }
     }
@@ -8470,6 +8793,7 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
         let outcome = if cached_covers {
             // Posting blobs are per-query and outside the cached verdict —
             // see `handle_search_post` for the full rationale.
+            state.record_warm_nvme_hits(&ns, manifest);
             state.ensure_query_posting_blobs(&ns, manifest, &query, &hydration_request)
         } else {
             let outcome =
@@ -8501,7 +8825,7 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
     // waiting on S3 doesn't also hold a scoring slot.
     let t_queue = Instant::now();
     let Some(_slot) = obs.scoring_slot(state) else {
-        // Shed rather than queue: see `Semaphore::acquire_or_shed`.
+        // Shed rather than queue: see `FairSemaphore::try_acquire`.
         return json_error(
             429,
             "search overloaded: scoring queue is saturated — retry with backoff",
@@ -10026,6 +10350,7 @@ fn run_compaction_scheduler_tick(state: &Arc<AppState>, now: Instant) -> Vec<Nam
 /// by segment id (deterministic regardless of S3 listing order), doc counts
 /// from the footers themselves, version 1 (imports start a fresh version
 /// history — the old one is what was lost).
+#[cfg_attr(not(feature = "s3"), allow(dead_code))]
 fn manifest_from_footers(footers: Vec<kosha_core::Footer>) -> kosha_core::Manifest {
     let mut footers = footers;
     footers.sort_by(|a, b| a.segment_id.0.cmp(&b.segment_id.0));
@@ -10233,6 +10558,7 @@ fn handle_create_api_key(body: &[u8], _tenant: &str, state: &AppState) -> String
 
     #[cfg(not(feature = "postgres"))]
     {
+        let _ = state;
         let _ = tenant_id;
         let _ = description;
         json_error(
@@ -10392,7 +10718,7 @@ fn posting_blob_files_for_query<'a>(
 ///
 /// Both search handlers share this so the shed/failure distinction can't
 /// drift between them: a shed is load-shedding (429, retry with backoff —
-/// the same contract `Semaphore::acquire_or_shed` and
+/// the same contract `FairSemaphore::try_acquire` and
 /// `kosha_query::MemoryLedger` already use), a non-shed `missing` list is a
 /// genuine S3 failure (503). The shed check comes first because a shed
 /// request also has a non-empty `missing` list — it stopped fetching on
@@ -10733,6 +11059,7 @@ mod tests {
     use std::fs;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpStream;
+    use std::path::Path;
 
     #[derive(Clone)]
     pub(crate) struct SharedManifestStore {
@@ -10821,7 +11148,7 @@ mod tests {
     }
 
     impl SharedManifestStore {
-        fn new(inner: Arc<Mutex<kosha_control::Controller>>) -> Self {
+        pub(crate) fn new(inner: Arc<Mutex<kosha_control::Controller>>) -> Self {
             Self {
                 inner,
                 lose_next_commit_reply: Default::default(),
@@ -10863,6 +11190,62 @@ mod tests {
         serde_json::json!({"documents": [
             {"id": id, "fields": [{"name": "title", "field_type": "Text", "value": text}]}
         ]})
+    }
+
+    /// #342: a warm search served from the cached hydration verdict still
+    /// counts its segments as NVMe hits for its tenant.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn warm_searches_count_nvme_hits_for_their_tenant() {
+        let state = test_state();
+        let ok = |resp: String| {
+            assert_eq!(status_of(&resp), 200, "{resp}");
+        };
+        ok(v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/docs/documents",
+            one_doc("d1", "quick fox"),
+        ));
+        ok(v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/docs/flush",
+            serde_json::json!({}),
+        ));
+        let nvme_hits = || {
+            state
+                .cache
+                .tenant_stats()
+                .into_iter()
+                .find(|s| s.tenant == "acme")
+                .map_or(0, |s| s.hits)
+        };
+        let search = |text: &str| {
+            ok(v1(
+                &state,
+                "acme",
+                "POST /v1/namespaces/docs/search",
+                serde_json::json!({"query_text": text}),
+            ))
+        };
+        // The first (unpruned) pass verifies the scoring set and caches the
+        // verdict; the second, a different query so the result cache does
+        // not answer it, is served from that verdict.
+        search("");
+        assert!(state
+            .completed_hydrations
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|(ns, _)| ns == "acme/docs"));
+        let after_first = nvme_hits();
+        search("quick");
+        assert!(
+            nvme_hits() > after_first,
+            "the warm search counted its segment as a hit ({after_first} → {})",
+            nvme_hits()
+        );
     }
 
     #[test]
@@ -10916,10 +11299,25 @@ mod tests {
             serde_json::json!({"namespace": ".."}),
             serde_json::json!({"namespace": 7}),
             serde_json::json!({}),
+            // Reserved: `acme/_shard-0001` would be accounted to `_legacy`.
+            serde_json::json!({"namespace": "_shard-0001"}),
+            serde_json::json!({"namespace": "_internal"}),
+            serde_json::json!({"namespace": ".hidden"}),
         ] {
             let resp = create("acme", bad.clone());
             assert_eq!(status_of(&resp), 400, "{bad} → {resp}");
         }
+        // Nor can a tenant reach one through a namespace route, and a
+        // tenant id with a reserved prefix is refused outright.
+        let shard_route = v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/_shard-0001/search",
+            serde_json::json!({"query_text": "x"}),
+        );
+        assert_eq!(status_of(&shard_route), 400, "{shard_route}");
+        let bad_tenant = create("_legacy", serde_json::json!({"namespace": "docs"}));
+        assert_eq!(status_of(&bad_tenant), 403, "{bad_tenant}");
         let not_json = route(
             "POST /v1/namespaces HTTP/1.1\r\n",
             &HashMap::new(),
@@ -11357,6 +11755,7 @@ mod tests {
             .same_contents(&legacy));
     }
 
+    #[cfg(feature = "s3")]
     #[test]
     fn tiny_upsert_segments_only_hydrate_shards_present_in_the_toc() {
         let state = test_state();
@@ -13567,6 +13966,7 @@ mod tests {
     /// will read: every analysis reading of the query (#220) and its
     /// per-field keys and norms (#249). Fuzzy and wildcard terms are only
     /// known per segment, so those read whole shards (no terms).
+    #[cfg(feature = "s3")]
     #[test]
     fn posting_terms_follow_analysis_and_per_field_keys() {
         let terms = |json: &str| {
@@ -13980,19 +14380,20 @@ mod tests {
         // score_ms=2,256. Every one of those requests was waiting two
         // minutes for a result its client had already given up on, while
         // the box thrashed. Overload must shed, not queue.
-        let sem = Arc::new(Semaphore::with_queue_limits(
+        let sem = Arc::new(fair_admission::FairSemaphore::new(
             1,
             2,
+            0,
             Some(Duration::from_millis(50)),
         ));
 
         // The only permit is taken; two waiters may queue behind it.
-        let held = sem.acquire_or_shed().expect("first acquire must succeed");
+        let held = sem.try_acquire("t", 1).expect("first acquire must succeed");
 
         let mut waiting = Vec::new();
         for _ in 0..2 {
             let s = Arc::clone(&sem);
-            waiting.push(std::thread::spawn(move || s.acquire_or_shed().is_some()));
+            waiting.push(std::thread::spawn(move || s.try_acquire("t", 1).is_ok()));
         }
         // Let both reach the wait loop so the queue is genuinely full.
         let t0 = Instant::now();
@@ -14005,7 +14406,7 @@ mod tests {
         // not made to burn its deadline first.
         let t = Instant::now();
         assert!(
-            sem.acquire_or_shed().is_none(),
+            sem.try_acquire("t", 1).is_err(),
             "arrival beyond the queue bound must be shed"
         );
         assert!(
@@ -14022,7 +14423,7 @@ mod tests {
         // Once the permit comes back, service resumes normally.
         drop(held);
         assert!(
-            sem.acquire_or_shed().is_some(),
+            sem.try_acquire("t", 1).is_ok(),
             "a freed permit must be acquirable again"
         );
     }
@@ -14280,6 +14681,7 @@ mod tests {
         assert_eq!(to_fetch, vec![("ns/seg-1/postings-02.bin".to_string(), 0)]);
     }
 
+    #[cfg(feature = "s3")]
     #[test]
     fn plan_posting_blob_fetch_skips_stat_for_cached_pairs() {
         use std::cell::Cell;
@@ -14528,6 +14930,7 @@ mod tests {
         assert!(chunk_by_byte_budget(&[], 100).is_empty());
     }
 
+    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
     fn test_footer(id: &str, docs: u32, format_version: u32) -> kosha_core::Footer {
         kosha_core::Footer {
             segment_id: kosha_core::SegmentId(id.into()),
@@ -15117,7 +15520,8 @@ mod tests {
     fn queue_timeout_search_is_counted() {
         let mut state = test_state();
         // No permits and no queue: every scored search is shed at once.
-        state.search_semaphore = Semaphore::with_queue_limits(0, 1, Some(Duration::from_millis(1)));
+        state.search_semaphore =
+            fair_admission::FairSemaphore::new(0, 1, 0, Some(Duration::from_millis(1)));
         let ns = NamespaceId("t/docs".into());
         state
             .indexer
@@ -19983,5 +20387,553 @@ mod tests {
         assert!(result.get("timings").is_none(), "{result}");
         let stats = body_of(&handle_namespace_stats("docs", "acme", &state));
         assert!(stats.get("recent_queries").is_none(), "{stats}");
+    }
+    // ─── Per-tenant cache isolation (#342) ────────────────────────────────
+
+    /// Two tenants with the same namespace name and the same query get
+    /// separate result-cache entries: neither can be served the other's
+    /// cached response, on the first search or on a repeat.
+    #[test]
+    fn result_cache_never_serves_one_tenant_another_tenants_entry() {
+        let state = test_state();
+        for (tenant, doc, text) in [
+            ("acme", "acme-doc", "breach of contract by acme"),
+            ("globex", "globex-doc", "breach of contract by globex"),
+        ] {
+            let indexed = v1(
+                &state,
+                tenant,
+                "POST /v1/namespaces/docs/documents",
+                one_doc(doc, text),
+            );
+            assert_eq!(status_of(&indexed), 200, "{indexed}");
+            let flushed = v1(
+                &state,
+                tenant,
+                "POST /v1/namespaces/docs/flush",
+                serde_json::json!({}),
+            );
+            assert_eq!(status_of(&flushed), 200, "{flushed}");
+        }
+        let search = |tenant: &str| -> Vec<String> {
+            let resp = v1(
+                &state,
+                tenant,
+                "POST /v1/namespaces/docs/search",
+                serde_json::json!({"query_text": "breach contract"}),
+            );
+            assert_eq!(status_of(&resp), 200, "{resp}");
+            body_of(&resp)["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["doc_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        for _ in 0..2 {
+            assert_eq!(search("acme"), ["acme-doc"]);
+            assert_eq!(search("globex"), ["globex-doc"]);
+        }
+        let cache = state.result_cache.lock().unwrap();
+        let mut namespaces: Vec<&str> = cache.entries.keys().map(|k| k.0.as_str()).collect();
+        namespaces.sort_unstable();
+        assert_eq!(namespaces, ["acme/docs", "globex/docs"]);
+        assert_eq!(
+            (cache.hits, cache.misses),
+            (2, 2),
+            "each tenant hit its own"
+        );
+        let stats = cache.tenants.stats();
+        assert_eq!(stats.len(), 2);
+        assert!(stats
+            .iter()
+            .all(|s| s.hits == 1 && s.misses == 1 && s.bytes > 0));
+    }
+
+    /// One tenant filling the result cache evicts its own entries, not a
+    /// quieter tenant's, while that tenant is under its share.
+    #[test]
+    fn result_cache_evicts_from_the_tenant_over_its_share() {
+        let mut c = ResultCache::new(10_000);
+        c.shares = kosha_core::tenancy::TenantShares::new(1_000);
+        for i in 0..5 {
+            c.insert(rc_key("beta/docs", 1, &format!("q{i}")), &"x".repeat(200));
+        }
+        for i in 0..200 {
+            c.insert(rc_key("acme/big", 1, &format!("q{i}")), &"x".repeat(200));
+        }
+        assert!(c.bytes <= 10_000);
+        for i in 0..5 {
+            assert!(
+                c.lookup(&rc_key("beta/docs", 1, &format!("q{i}")))
+                    .is_some(),
+                "beta's entry q{i} survived acme's flood"
+            );
+        }
+        let stats = c.tenants.stats();
+        let acme = stats.iter().find(|s| s.tenant == "acme").unwrap();
+        let beta = stats.iter().find(|s| s.tenant == "beta").unwrap();
+        assert!(acme.evictions > 0);
+        assert_eq!(beta.evictions, 0);
+        assert_eq!(acme.bytes + beta.bytes, c.bytes as u64);
+    }
+
+    // ─── Per-tenant quotas and rate limits (#341) ────────────────────────
+
+    fn limited_state(json: &str) -> AppState {
+        let mut state = test_state();
+        let config = tenant_limits::LimitsConfig::parse(json, None).unwrap();
+        state.tenant_limits = tenant_limits::TenantLimiter::new(Arc::new(
+            tenant_limits::ConfigLimitsProvider::from_config(config),
+        ));
+        state
+    }
+
+    /// One authenticated request as `tenant`, through the tenant limits.
+    fn as_tenant(state: &AppState, tenant: &str, line: &str, body: serde_json::Value) -> String {
+        let bytes = if body.is_null() {
+            Vec::new()
+        } else {
+            serde_json::to_vec(&body).unwrap()
+        };
+        serve_tenant_request(
+            &format!("{line} HTTP/1.1"),
+            &HashMap::new(),
+            &bytes,
+            tenant,
+            state,
+        )
+    }
+
+    fn header_of(response: &str, name: &str) -> Option<String> {
+        let (head, _) = response.split_once("\r\n\r\n")?;
+        head.split("\r\n").skip(1).find_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            k.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| v.trim().to_string())
+        })
+    }
+
+    fn assert_rejected(response: &str, reason: &str) -> serde_json::Value {
+        assert_eq!(status_of(response), 429, "{response}");
+        let retry: u64 = header_of(response, "retry-after")
+            .expect("Retry-After header")
+            .parse()
+            .unwrap();
+        assert!(retry >= 1, "{response}");
+        let body = body_of(response);
+        assert_eq!(body["reason"], reason, "{response}");
+        assert!(body["error"].is_string());
+        assert!(body["limit"].is_number());
+        assert!(body["retry_after_ms"].as_u64().unwrap() >= 1);
+        body
+    }
+
+    fn rejections(state: &AppState) -> Vec<metrics::tests::Sample> {
+        let text = state.metrics.render(&metrics::Scrape::default());
+        metrics::tests::parse_exposition(&text)
+            .unwrap()
+            .into_iter()
+            .filter(|s| s.name == "kosha_tenant_rejections_total")
+            .collect()
+    }
+
+    fn search_docs(state: &AppState, tenant: &str) -> String {
+        as_tenant(
+            state,
+            tenant,
+            "POST /v1/namespaces/docs/search",
+            serde_json::json!({"query_text": "hello"}),
+        )
+    }
+
+    #[test]
+    fn tenant_over_its_qps_gets_429_while_another_tenant_is_served() {
+        let state = limited_state(
+            r#"{"default_plan": "free", "plans": {"free": {"qps": 2}},
+                "tenants": {"big": {"qps": 1000}}}"#,
+        );
+        for tenant in ["small", "big"] {
+            let created = as_tenant(
+                &state,
+                tenant,
+                "POST /v1/namespaces",
+                serde_json::json!({"namespace": "docs"}),
+            );
+            assert_eq!(status_of(&created), 200, "{created}");
+        }
+        assert_eq!(status_of(&search_docs(&state, "small")), 200);
+        assert_eq!(status_of(&search_docs(&state, "small")), 200);
+        let refused = search_docs(&state, "small");
+        let body = assert_rejected(&refused, "tenant_qps_exceeded");
+        assert_eq!(body["limit"], 2);
+        assert!(body["retry_after_ms"].as_u64().unwrap() <= 500);
+        // The legacy route form is a search too.
+        let legacy = as_tenant(
+            &state,
+            "small",
+            "POST /search",
+            serde_json::json!({"namespace": "docs", "query_text": "x"}),
+        );
+        assert_rejected(&legacy, "tenant_qps_exceeded");
+        // Another tenant is served meanwhile.
+        for _ in 0..10 {
+            let ok = search_docs(&state, "big");
+            assert_eq!(status_of(&ok), 200, "{ok}");
+        }
+        // Non-search reads are not charged to the qps bucket.
+        let stats = as_tenant(
+            &state,
+            "small",
+            "GET /v1/namespaces/docs/stats",
+            serde_json::Value::Null,
+        );
+        assert_eq!(status_of(&stats), 200, "{stats}");
+        let counted = metrics::tests::value(
+            &rejections(&state),
+            "kosha_tenant_rejections_total",
+            &[("reason", "tenant_qps_exceeded")],
+        );
+        assert_eq!(counted, Some(2.0));
+    }
+
+    /// Through `dispatch`, as the HTTP server calls it: the 429 carries the
+    /// `Retry-After` header and the reason.
+    #[test]
+    fn tenant_qps_rejection_through_dispatch() {
+        // Unit tests run with auth disabled: every request is tenant `dev`.
+        let state = limited_state(r#"{"tenants": {"dev": {"qps": 1}}}"#);
+        let create = dispatch(
+            &state,
+            test_request("POST /v1/namespaces HTTP/1.1\r\n\r\n{\"namespace\":\"docs\"}"),
+        );
+        assert_eq!(create.status(), 200);
+        let search = || {
+            dispatch(
+                &state,
+                test_request(
+                    "POST /v1/namespaces/docs/search HTTP/1.1\r\n\r\n{\"query_text\":\"x\"}",
+                ),
+            )
+        };
+        assert_eq!(search().status(), 200);
+        let mut refused = search();
+        assert_eq!(refused.status(), 429);
+        assert_eq!(refused.header("retry-after"), Some("1"));
+        let body: serde_json::Value = serde_json::from_slice(&refused.body_bytes()).unwrap();
+        assert_eq!(body["reason"], "tenant_qps_exceeded");
+        assert_eq!(body["limit"], 1);
+    }
+
+    #[test]
+    fn namespace_doc_and_dims_quotas_are_rejected_on_ingest() {
+        let state = limited_state(
+            r#"{"default_plan": "p", "plans": {"p": {"namespaces": 1,
+                "docs_per_namespace": 2, "vector_dims": 3, "max_body_bytes": 4096}}}"#,
+        );
+        let create = |name: &str| {
+            as_tenant(
+                &state,
+                "acme",
+                "POST /v1/namespaces",
+                serde_json::json!({"namespace": name}),
+            )
+        };
+        assert_eq!(status_of(&create("one")), 200);
+        assert_rejected(&create("two"), "namespace_quota_exceeded");
+        // A first write would auto-create a namespace: same quota.
+        let auto = as_tenant(
+            &state,
+            "acme",
+            "POST /v1/namespaces/three/documents",
+            one_doc("d1", "hello"),
+        );
+        assert_rejected(&auto, "namespace_quota_exceeded");
+        // Re-creating an existing namespace is still the usual 409.
+        assert_eq!(status_of(&create("one")), 409);
+        // Another tenant has its own quota.
+        let other = as_tenant(
+            &state,
+            "globex",
+            "POST /v1/namespaces",
+            serde_json::json!({"namespace": "two"}),
+        );
+        assert_eq!(status_of(&other), 200, "{other}");
+
+        let index = |body: serde_json::Value| {
+            as_tenant(&state, "acme", "POST /v1/namespaces/one/documents", body)
+        };
+        let two_docs = serde_json::json!({"documents": [
+            {"id": "a", "fields": [{"name": "title", "field_type": "Text", "value": "x"}]},
+            {"id": "b", "fields": [{"name": "title", "field_type": "Text", "value": "y"}]}
+        ]});
+        assert_eq!(status_of(&index(two_docs)), 200);
+        let body = assert_rejected(&index(one_doc("c", "z")), "doc_quota_exceeded");
+        assert_eq!(body["limit"], 2);
+        // Still over after a flush: committed documents count.
+        let flush = as_tenant(
+            &state,
+            "acme",
+            "POST /v1/namespaces/one/flush",
+            serde_json::json!({}),
+        );
+        assert_eq!(status_of(&flush), 200, "{flush}");
+        assert_rejected(&index(one_doc("c", "z")), "doc_quota_exceeded");
+
+        let vector = |id: &str, dims: usize| {
+            let v: Vec<f32> = (0..dims).map(|i| i as f32).collect();
+            serde_json::json!({"documents": [{"id": id, "fields": [
+                {"name": "emb", "field_type": "Vector", "value": serde_json::to_string(&v).unwrap()}
+            ]}]})
+        };
+        let globex_write = |body: serde_json::Value| {
+            as_tenant(&state, "globex", "POST /v1/namespaces/two/documents", body)
+        };
+        let body = assert_rejected(&globex_write(vector("v1", 4)), "vector_dims_exceeded");
+        assert_eq!(body["limit"], 3);
+        let fits = globex_write(vector("v2", 3));
+        assert_eq!(status_of(&fits), 200, "{fits}");
+
+        let big = globex_write(one_doc("big", &"x".repeat(5000)));
+        let body = assert_rejected(&big, "body_too_large");
+        assert_eq!(body["limit"], 4096);
+    }
+
+    #[test]
+    fn tenant_write_rate_is_limited_per_tenant() {
+        let state =
+            limited_state(r#"{"default_plan": "p", "plans": {"p": {"write_docs_per_sec": 2}}}"#);
+        let index = |tenant: &str, id: &str| {
+            as_tenant(
+                &state,
+                tenant,
+                "POST /v1/namespaces/docs/documents",
+                one_doc(id, "hello"),
+            )
+        };
+        assert_eq!(status_of(&index("a", "1")), 200);
+        assert_eq!(status_of(&index("a", "2")), 200);
+        assert_rejected(&index("a", "3"), "tenant_write_rate_exceeded");
+        assert_eq!(status_of(&index("b", "1")), 200);
+    }
+
+    #[test]
+    fn operator_traffic_is_never_tenant_limited() {
+        let state =
+            limited_state(r#"{"default_plan": "p", "plans": {"p": {"qps": 1, "namespaces": 0}}}"#);
+        assert!(!tenant_is_limited(&state, SERVICE_TENANT));
+        assert!(tenant_is_limited(&state, "acme"));
+        assert!(write_limits(&state, &NamespaceId("service/docs".into())).is_none());
+        assert!(write_limits(&state, &NamespaceId("bare".into())).is_none());
+        let created = as_tenant(
+            &state,
+            SERVICE_TENANT,
+            "POST /v1/namespaces",
+            serde_json::json!({"namespace": "docs"}),
+        );
+        assert_eq!(status_of(&created), 200, "{created}");
+    }
+
+    #[test]
+    fn without_limits_config_nothing_is_limited() {
+        let state = test_state();
+        assert!(!state.tenant_limits.enabled());
+        for i in 0..30 {
+            let created = as_tenant(
+                &state,
+                "acme",
+                "POST /v1/namespaces",
+                serde_json::json!({"namespace": format!("ns{i}")}),
+            );
+            assert_eq!(status_of(&created), 200, "{created}");
+        }
+        for i in 0..50 {
+            let indexed = as_tenant(
+                &state,
+                "acme",
+                "POST /v1/namespaces/ns0/documents",
+                one_doc(&format!("d{i}"), "hello"),
+            );
+            assert_eq!(status_of(&indexed), 200, "{indexed}");
+        }
+        for _ in 0..100 {
+            let found = as_tenant(
+                &state,
+                "acme",
+                "POST /v1/namespaces/ns0/search",
+                serde_json::json!({"query_text": "hello"}),
+            );
+            assert_eq!(status_of(&found), 200, "{found}");
+        }
+        assert!(rejections(&state).iter().all(|s| s.value == 0.0));
+    }
+
+    #[test]
+    fn search_route_classification() {
+        assert!(is_search_route("POST /v1/namespaces/docs/search HTTP/1.1"));
+        assert!(is_search_route("POST /search HTTP/1.1"));
+        assert!(is_search_route("GET /search?ns=docs&q=x HTTP/1.1"));
+        assert!(!is_search_route(
+            "POST /v1/namespaces/docs/documents HTTP/1.1"
+        ));
+        assert!(!is_search_route("GET /v1/namespaces/docs/stats HTTP/1.1"));
+        assert!(!is_search_route("POST /v1/namespaces/a/b/search HTTP/1.1"));
+    }
+}
+
+/// TLS between pods (#343), end to end over real sockets with throwaway
+/// certificates: peer segment fetches and query→ingest forwarding.
+#[cfg(test)]
+mod internal_tls_tests {
+    use super::*;
+    use crate::internal_tls::{test_pki, InternalTls};
+    use crate::tests::SharedManifestStore;
+
+    /// Serve `state` over HTTPS with the PKI's server certificate; with
+    /// `mtls`, `/internal/*` also needs a client certificate from its CA.
+    fn serve_tls(state: Arc<AppState>, pki: &test_pki::Pki, mtls: bool) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut config = http::Config::new(Duration::from_secs(30), auth::max_body_bytes());
+        config.tls = Some((pki.server_cert.clone(), pki.server_key.clone()));
+        if mtls {
+            config.client_ca = Some(pki.ca.clone());
+        }
+        std::thread::spawn(move || {
+            serve_until(listener, state, config, std::future::pending())
+                .expect("HTTPS server failed")
+        });
+        addr
+    }
+
+    /// The internal TLS settings a pod would read from its environment.
+    fn internal_tls(
+        pki: &test_pki::Pki,
+        client_cert: bool,
+        server_name: Option<&str>,
+    ) -> InternalTls {
+        let path = |p: &std::path::Path| Some(p.to_str().unwrap().to_string());
+        InternalTls::from_lookup(|name| match name {
+            "KOSHA_INTERNAL_TLS" => Some("on".into()),
+            "KOSHA_INTERNAL_TLS_CA_PATH" => path(&pki.ca),
+            "KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH" if client_cert => path(&pki.client_cert),
+            "KOSHA_INTERNAL_TLS_CLIENT_KEY_PATH" if client_cert => path(&pki.client_key),
+            "KOSHA_INTERNAL_TLS_SERVER_NAME" => server_name.map(str::to_string),
+            _ => None,
+        })
+        .unwrap()
+    }
+
+    #[cfg(all(feature = "s3", feature = "postgres"))]
+    #[test]
+    fn peer_segment_fetch_runs_over_mutual_tls() {
+        let pki = test_pki::generate("peer-fetch");
+        let mut peer = AppState::new(tests::test_dir());
+        peer.internal_service_key = Some("peer-test-secret".into());
+        peer.cache
+            .put_bytes("ns/seg/doc_store.bin", b"peer bytes over tls")
+            .unwrap();
+        let addr = serve_tls(Arc::new(peer), &pki, true).to_string();
+
+        let requester = |tls: &InternalTls| {
+            let mut state = AppState::new(tests::test_dir());
+            state.internal_auth_key = Some("peer-test-secret".into());
+            state.peer_url_scheme = tls.peer_scheme();
+            state.peer_http_client = Some(
+                tls.client_builder()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .unwrap(),
+            );
+            state
+        };
+
+        // Peers are dialed by pod IP; the certificate is checked against
+        // the pinned KOSHA_INTERNAL_TLS_SERVER_NAME instead.
+        let tls = internal_tls(&pki, true, Some("kosha-internal"));
+        assert_eq!(tls.peer_scheme(), "https");
+        let state = requester(&tls);
+        let written = state
+            .fetch_from_peer(&addr, "ns/seg/doc_store.bin")
+            .expect("peer fetch over TLS should succeed");
+        assert_eq!(written, 19);
+        let local = state.cache.path_for("ns/seg/doc_store.bin").unwrap();
+        assert_eq!(std::fs::read(local).unwrap(), b"peer bytes over tls");
+
+        // No client certificate: the peer's mTLS check answers 403.
+        let state = requester(&internal_tls(&pki, false, Some("kosha-internal")));
+        let err = state
+            .fetch_from_peer(&addr, "ns/seg/doc_store.bin")
+            .unwrap_err();
+        assert!(err.to_string().contains("403"), "{err}");
+
+        // A pinned name the certificate does not carry fails verification.
+        let state = requester(&internal_tls(&pki, true, Some("someone-else")));
+        let err = state
+            .fetch_from_peer(&addr, "ns/seg/doc_store.bin")
+            .unwrap_err();
+        assert!(err.to_string().contains("unreachable"), "{err}");
+
+        // Plain HTTP against the TLS peer gets nothing usable.
+        let state = requester(&InternalTls::off());
+        assert_eq!(state.peer_url_scheme, "http");
+        assert!(state
+            .fetch_from_peer(&addr, "ns/seg/doc_store.bin")
+            .is_err());
+    }
+
+    #[test]
+    fn query_forwards_writes_to_ingest_over_tls() {
+        let pki = test_pki::generate("forward");
+        let shared = Arc::new(Mutex::new(kosha_control::Controller::new()));
+        let ingest = AppState::new(tests::test_dir());
+        *ingest.controller.lock().unwrap() = Box::new(SharedManifestStore::new(shared.clone()));
+        let ingest = Arc::new(ingest);
+        let ingest_addr = serve_tls(Arc::clone(&ingest), &pki, true);
+
+        let tls = internal_tls(&pki, true, None);
+        let ingest_host = format!("https://localhost:{}", ingest_addr.port());
+        assert_eq!(tls.check_ingest_host(&ingest_host), Ok(None));
+        let mut query = AppState::new(ingest.data_dir.clone());
+        *query.controller.lock().unwrap() = Box::new(SharedManifestStore::new(shared.clone()));
+        query.ingest_host = Some(ingest_host);
+        query.write_http_client = Some(
+            tls.client_builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+        );
+
+        let send = |method: &str, target: &str, body: serde_json::Value| {
+            let request = http::Request {
+                method: method.into(),
+                target: target.into(),
+                headers: HashMap::from([("content-type".into(), "application/json".into())]),
+                body: body.to_string().into_bytes(),
+            };
+            dispatch(&query, request)
+        };
+
+        let response = send(
+            "POST",
+            "/v1/namespaces",
+            serde_json::json!({"namespace": "docs"}),
+        );
+        assert_eq!(response.status(), 200, "{response:?}");
+        let ns = NamespaceId("dev/docs".into());
+        assert!(
+            ingest.indexer.manifest_version(&ns).is_some(),
+            "the create ran on the ingest node, over TLS"
+        );
+        let response = send(
+            "POST",
+            "/v1/namespaces/docs/documents",
+            serde_json::json!({"documents": [
+                {"id": "d1", "fields": [{"name": "title", "field_type": "Text", "value": "quick fox"}]}
+            ]}),
+        );
+        assert_eq!(response.status(), 200, "{response:?}");
+        assert_eq!(ingest.indexer.pending_doc_count(&ns), 1);
     }
 }

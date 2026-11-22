@@ -139,6 +139,13 @@ spec:
           volumeMounts:
             - name: cache
               mountPath: /var/cache/kosha
+            # TLS between pods (#343): the certificate Secret, if one exists
+            # (see certificate-internal-tls.example.yaml). Mounting it does
+            # nothing on its own; the KOSHA_TLS_* / KOSHA_INTERNAL_TLS_*
+            # settings in configmap.yaml turn it on.
+            - name: internal-tls
+              mountPath: /etc/kosha/tls
+              readOnly: true
       volumes:
         # No hostPath here — this tier is stateless and interchangeable, so
         # each pod's cache is a private, disposable emptyDir. A cold start
@@ -147,3 +154,9 @@ spec:
         # tied to a specific node like the ingest pod's instance store.
         - name: cache
           emptyDir: {}
+        - name: internal-tls
+          secret:
+            secretName: kosha-internal-tls
+            # Optional so clusters without the Secret still start; with
+            # KOSHA_INTERNAL_TLS on, a missing file stops the pod instead.
+            optional: true

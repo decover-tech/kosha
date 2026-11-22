@@ -349,6 +349,74 @@ the relative cutoff then falls back to `min_probes`; SPANN's own rule is
 Cost: about `duration` + 8 minutes per point once the ground truth is
 cached (estimate, not measured).
 
+### Experiment inputs (`server_env`, `rustflags`, `bm25_snapshot`, `knn_budget_fraction`)
+
+These inputs serve the research track (#260): one dispatch measures one
+flag or build setting against the baseline. All four are optional. Left
+empty (the default), the run behaves exactly as before: the same
+`docker build` command, the same container env, the same snapshots.
+A first step, "Validate experiment inputs", checks them before anything
+is provisioned, so a rejected value costs nothing and fails the run
+with an `::error::` line.
+
+| input | default | effect | accepted values |
+|---|---|---|---|
+| `server_env` | empty | extra `-e KEY=VALUE` flags on the kosha container, after the standard bench env (so a repeated key, e.g. `KOSHA_CACHE_MAX_BYTES`, overrides it) | space-separated pairs, each `^[A-Z0-9_]+=[A-Za-z0-9._:/,-]*$` |
+| `rustflags` | empty | `--build-arg KOSHA_RUSTFLAGS=...` on the server image build; the Dockerfile exports it as `RUSTFLAGS` for `cargo chef cook` and `cargo build` only when non-empty | letters, digits, space and `= + , . _ : -`, e.g. `-C target-cpu=x86-64-v3` |
+| `bm25_snapshot` | `msmarco-<bm25_docs>` | snapshot the BM25 suite restores into `msmarco-<bm25_docs>`; one that does not exist yet is built offline first (see below) | `^[a-z0-9.-]+$`, restore mode only |
+| `knn_budget_fraction` | empty (server default 0.05) | `-e KOSHA_KNN_BUDGET_FRACTION=<x>` | a number with 0 < x <= 1; do not also set the key in `server_env` |
+
+No value may contain quotes, `$`, backticks, `;`, `|`, `&`, redirections
+or globs. The validated values are spliced into the remote scripts, so
+these rules are what keeps them safe.
+
+Examples:
+
+```
+# kNN probe budget sweep point
+knn_budget_fraction=0.02 suite=vector
+
+# a new code path behind an env flag, plus a cache size override
+server_env="KOSHA_SOME_FLAG=1 KOSHA_SEGMENT_CACHE_MAX_BYTES=34359738368"
+
+# x86-64-v3 build of the server (AVX2/FMA/BMI2)
+rustflags="-C target-cpu=x86-64-v3"
+
+# BM25 on a snapshot built with a new segment format flag
+bm25_snapshot=msmarco-10m-fmtv2 server_env="KOSHA_SOME_FORMAT_FLAG=2" suite=bm25
+```
+
+Details and caveats:
+
+- **New snapshots.** When `bm25_snapshot` names a snapshot that does not
+  exist, the BM25 step runs `SNAPSHOT_NAME=<name> build_and_import.sh
+  msmarco-<bm25_docs>` (first 1M docs when `bm25_docs=1m`) and then
+  restores it. The same rule as the vector side applies: an existing
+  snapshot is never overwritten, and the default name keeps its old
+  behaviour (the 1M snapshot is still built on its first run, without
+  `server_env`). `server_env` reaches the offline builder container
+  through `build_and_import.sh`'s `BUILD_DOCKER_ENV` (validated again
+  there), for both a new `bm25_snapshot` and a `build_vector_snapshot`
+  build, so a format flag applies when the segments are written as
+  well as when they are read. `rustflags` applies only to the server
+  image. The offline builder is built without it.
+- **Kept VM.** The local cache is reused when the snapshot identity
+  matches (see above), whatever `server_env` says. That is right for
+  flags that change only how segments are read or queried. A flag that
+  changes what the server writes to its local cache needs a VM that
+  has not cached that snapshot yet. Run the previous dispatch with
+  `keep_vm` off, or use a different snapshot name.
+- **Rebuilds.** A new `rustflags` value invalidates the dependency cook
+  layer, so that run does a full release build.
+- **Records.** `meta.json` in the S3 run archive also records
+  `bm25_snapshot`, `server_env_args` (the normalized `-e` flags,
+  including `knn_budget_fraction`) and `rustflags`. When any of them is
+  set, the job summary prints an `experiment:` line under the heading.
+- **Input count.** `workflow_dispatch` now has 17 inputs. GitHub's limit
+  is 25 (it used to be 10; this workflow already had 13 before these
+  four and dispatches fine).
+  Further experiment knobs go in `server_env` rather than new inputs.
+
 ## Logs and tail analysis
 
 Every CI benchmark run (`.github/workflows/benchmark.yml`) archives its
@@ -378,3 +446,36 @@ It splits client latency into server time vs time outside the engine,
 breaks the p99+ requests down by server phase, tells query-intrinsic cost
 (same queries slow every time) from contention (slow once, fast on
 repeats), and shows the tail by minute and by requests in flight.
+
+## Offline representation recall (`repr_recall_sim.py`, #383)
+
+`repr_recall_sim.py` asks, with no server and no ANN index, how much
+recall@k survives when the shortlist is picked with a smaller
+representation (a d-dim prefix, int8 codes, or sign bits) and then
+rescored with the full vector. It is brute force over an in-memory sample
+and is **not** a bound on Kosha's recall in either direction: it has no
+IVF probing, and by default R is one global shortlist, while Kosha
+rescores `k * KOSHA_VECTOR_RESCORE_FACTOR` candidates per segment.
+`--segments N` splits the sample into N shards and takes R per shard,
+which is closer to the engine; the mapping to the factor is still not
+measured. It prints bytes per vector for the search representation and
+"total x", which adds the f32 rescore vector in `doc_vectors.bin`
+(capped at 2x while that store is f32). It reads the same `emb-*.f32` /
+`queries_emb.f32` files as `recall_check.py`, or `.npy`:
+
+```bash
+python3 repr_recall_sim.py --docs /data/corpus/emb-00000.f32 \
+    --docs /data/corpus/emb-00001.f32 --docs-limit 200000 \
+    --queries /data/queries_emb.f32 --dim 1024 \
+    --truncate 512,256,128 --shortlist 10,40,100,200 \
+    --segments 1,4 --out sim.json
+```
+
+`fetch_te3s_dbpedia.py` (needs `pyarrow` and `huggingface_hub`) writes
+the `text-embedding-3-small` sample used in the doc: 1000 held-out
+DBpedia documents as queries (seed 383) and the other 99,000 as the
+corpus. Those are doc-to-doc neighbours, not queries over passages.
+
+Memory is roughly 5x the f32 sample (a copy per representation), so
+about 4 GB at 100k x 1024. Results and caveats are in
+`docs/research/383-matryoshka-binary.md`.

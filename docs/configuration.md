@@ -95,7 +95,12 @@ written with and stay readable (subject to the KMS permissions above).
   roll out the new value. New objects use the new key at once. Old objects keep the old key
   and stay readable as long as the role can still `kms:Decrypt` with it, so keep the old key
   enabled and in the IAM policy. Compaction rewrites segments into new objects, so the old
-  key's share of the data shrinks over time.
+  key's share of the data shrinks over time. The tenant map (including
+  `KOSHA_S3_TENANT_KMS_KEYS_FILE`) is read once at startup, so editing a mounted file takes
+  effect when the pods restart. The test
+  `rotating_a_tenant_key_applies_to_new_writes_and_old_objects_stay_readable` in
+  `s3_storage.rs` checks this: after a rotation, PUTs, multipart uploads and copies carry the
+  new key, and reads send no key at all.
 - **Hard cutover** (the old key must stop being used): after the rollout, re-encrypt the
   remaining objects in place, then disable the old key once nothing references it:
 
@@ -130,7 +135,8 @@ See `k8s/README.md` ("Encryption at rest") for an IAM policy and a StorageClass 
 
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
-| `KOSHA_CACHE_MAX_BYTES` | Size bound for the on-disk (NVMe) segment-file cache; least recently used files are evicted past it (`AppState::new`) | unset (unbounded) | bytes |
+| `KOSHA_CACHE_MAX_BYTES` | Size bound for the on-disk (NVMe) segment-file cache; past it, files are evicted least recently used first from the tenant furthest over its share (`AppState::new`) | unset (unbounded) | bytes |
+| `KOSHA_CACHE_TENANT_MIN_BYTES` | Guaranteed floor per active tenant in every process-wide cache: NVMe, parsed segments and results (#342, `kosha_core::tenancy`). Each cache splits its budget across the tenants holding bytes in it by weight (the tenant's plan `weight` from `KOSHA_TENANT_LIMITS_FILE`, default 1), evicts from the tenant furthest over its share, and never takes a tenant below this floor while another tenant can give. Capped at an equal split of the cache's budget, so the floors always fit. Bare pre-tenant namespace ids share one `_legacy` tenant | `67108864` (64 MiB) | bytes |
 | `KOSHA_SEGMENT_CACHE_CAPACITY` | Parsed segments kept in memory across queries | `4096` (`kosha_query::DEFAULT_SEGMENT_CACHE_CAPACITY`) | segments |
 | `KOSHA_SEGMENT_CACHE_MAX_BYTES` | Approximate memory budget for those cached parsed segments | `4294967296` (4 GiB) | bytes |
 | `KOSHA_RESULT_CACHE_MAX_BYTES` | Whole-response cache for `POST /search`; `0` disables (`result_cache_budget`) | `67108864` (64 MiB) | bytes |
@@ -147,6 +153,7 @@ All **s3**. Read in `AppState::new` (`crates/kosha-server/src/main.rs`).
 | `KOSHA_SCORING_HYDRATE_CONCURRENCY` | Parallel GETs for small files: the scoring set, footer prefetch and page doc stores | `64` | requests |
 | `KOSHA_MAX_CONCURRENT_HYDRATIONS` | Independent hydration operations in flight per process | `4` | operations |
 | `KOSHA_HYDRATE_BYTE_BUDGET` | Process-wide cap on in-flight hydration bytes; also the pre-GET chunk size | `1073741824` (1 GiB) | bytes |
+| `KOSHA_HYDRATE_TENANT_MAX_INFLIGHT_BYTES` | Cap on one tenant's in-flight hydration bytes, so one tenant's cold start cannot hold all of the pod's S3 bandwidth (#342, `hydration_budget.rs`). Work-conserving: the cap binds only while another tenant holds or waits for hydration budget, so a lone tenant (or a pod serving only pre-#262 bare namespaces) may use the whole budget. A single object larger than the cap is admitted when it fits the global budget and no other tenant is waiting | half of `KOSHA_HYDRATE_BYTE_BUDGET` | bytes |
 | `KOSHA_HYDRATE_REQUEST_MAX_BYTES` | Bytes one search may hydrate before it is shed | `2147483648` (2 GiB) | bytes |
 | `KOSHA_DOC_STORE_READ_MODE` | How a page's documents are fetched: `ranged` (GETs for just those documents' byte spans in `doc_store.bin` / `doc_vectors.bin`, #245) or `whole` (the whole files, the pre-#245 path) (`doc_spans.rs`) | `ranged` | enum |
 | `KOSHA_DOC_SPAN_COALESCE_GAP_BYTES` | Ranged doc-store reads: spans of one file at most this far apart share a GET. The `KOSHA_DOC_SPAN` prefix names this group | `65536` (64 KiB) | bytes |
@@ -166,9 +173,63 @@ Peers share cold segments through hydration leases when the binary has **s3** an
 | `KOSHA_MAX_CONCURRENT_SEARCHES` | Searches that run at once | `8` | searches |
 | `KOSHA_SEARCH_QUEUE_DEPTH` | Searches that may wait for a slot; beyond it requests are shed | 4 × `KOSHA_MAX_CONCURRENT_SEARCHES` (`32`) | searches |
 | `KOSHA_SEARCH_QUEUE_TIMEOUT_MS` | How long a queued search waits for a slot; `0` waits without a deadline | `10000` | milliseconds |
+| `KOSHA_SEARCH_QUEUE_DEPTH_PER_TENANT` | Searches one tenant may have waiting for a slot; beyond it that tenant's searches are shed while other tenants still queue. Waiters are served round robin across tenants (#341, `fair_admission.rs`). `0`: only `KOSHA_SEARCH_QUEUE_DEPTH` applies | `0` | searches |
 | `KOSHA_SEGMENT_LIVE_MAX_BYTES` | Limit on live segment memory (cached plus pinned by running searches). Searches wait for memory above it | 2 × `KOSHA_SEGMENT_CACHE_MAX_BYTES` (8 GiB) | bytes |
 | `KOSHA_ADMISSION_TIMEOUT_MS` | How long a search waits for live memory before HTTP 429 | `15000` (`kosha_query::DEFAULT_ADMISSION_TIMEOUT`) | milliseconds |
 | `KOSHA_MAX_BODY_BYTES` | Largest accepted request body; HTTP 413 above it (`auth::max_body_bytes`) | `67108864` (64 MiB) | bytes |
+
+## Tenant limits
+
+Per-tenant quotas and rate limits (#341, `tenant_limits.rs`). Without
+`KOSHA_TENANT_LIMITS_FILE` nothing is limited. Limits are enforced per pod: query limits on the
+pod that serves the search, write limits on the pod that executes the write (the ingest pod; a
+query pod forwards writes first). Operator traffic (the admin and internal service credentials)
+is never limited. A request over a limit gets HTTP 429 with `Retry-After` and a JSON body
+`{"error", "reason", "limit", "retry_after_ms"}`, where `reason` is one of
+`tenant_qps_exceeded`, `tenant_concurrency_exceeded`, `tenant_write_rate_exceeded`,
+`namespace_quota_exceeded`, `doc_quota_exceeded`, `vector_dims_exceeded` or `body_too_large`.
+Rate limits give the time until the token bucket holds the request; quotas give 60 seconds.
+Each refusal is counted in `kosha_tenant_rejections_total` (see `metrics.md`).
+
+| Variable | Purpose | Default | Units |
+| --- | --- | --- | --- |
+| `KOSHA_TENANT_LIMITS_FILE` | JSON file of plans and per-tenant overrides (format below). A file that cannot be read or parsed at startup stops the pod | unset (no limits) | path |
+| `KOSHA_TENANT_DEFAULT_PLAN` | Plan for tenants without one of their own; overrides the file's `default_plan`. Requires `KOSHA_TENANT_LIMITS_FILE` | file's `default_plan` | plan name |
+| `KOSHA_TENANT_LIMITS_RELOAD_SECS` | How often the file is re-read. A reload that fails keeps the previous limits. `0` never reloads | `30` | seconds |
+
+The file:
+
+```json
+{
+  "default_plan": "standard",
+  "plans": {
+    "standard": {"qps": 50, "concurrent_queries": 8, "write_docs_per_sec": 2000,
+                 "write_bytes_per_sec": 16777216, "namespaces": 100,
+                 "docs_per_namespace": 10000000, "vector_dims": 4096,
+                 "max_body_bytes": 33554432, "weight": 1}
+  },
+  "tenants": {"acme": {"plan": "standard", "qps": 200, "weight": 4}}
+}
+```
+
+A tenant's limits are its plan's (its own `plan`, else the default plan) with its `tenants`
+fields laid over them. A tenant with no plan and no entry is unlimited, and so is any field
+left out.
+
+| Field | Limits | Checked |
+| --- | --- | --- |
+| `qps` | Searches per second; the bucket holds one second's worth | each search, after authentication |
+| `concurrent_queries` | Searches in flight at once | each search |
+| `write_docs_per_sec` | Documents per second in index and replace requests. A batch bigger than one second's worth is admitted from a full bucket and paid for afterwards | each index or replace |
+| `write_bytes_per_sec` | Request body bytes per second on write routes | each write request |
+| `max_body_bytes` | Largest write request body, under the pod-wide `KOSHA_MAX_BODY_BYTES` | each write request |
+| `namespaces` | Namespaces the tenant holds (top-level; shards and branches not counted) | namespace creation, and a write that would auto-create one |
+| `docs_per_namespace` | Documents in a namespace: committed and not deleted plus not yet flushed. An unflushed upsert of an existing id counts twice until flushed | each index or replace |
+| `vector_dims` | Widest vector a document may carry, supplied or produced by native embedding | each index or replace |
+| `weight` | Permits per round-robin turn in the search queue (default 1) | search admission |
+
+Limits stored in the control plane, cluster-wide rate limits across replicas and per-namespace
+storage quotas are not implemented yet (Phase H).
 
 ## Query and relevance
 
@@ -250,6 +311,7 @@ server lists them in a `WARN` at boot. `kosha-server migrate-namespace --from <b
 | `KOSHA_HTTP_SHUTDOWN_GRACE_SECS` | On SIGTERM or SIGINT the listener closes, idle connections close, and in-flight requests get this long to finish. The pod then releases its writer leases and exits | `25` | seconds |
 | `KOSHA_TLS_CERT_PATH` | PEM certificate chain. With `KOSHA_TLS_KEY_PATH`, the listener serves HTTPS only. Setting just one of the two is a startup error | unset (HTTP) | path |
 | `KOSHA_TLS_KEY_PATH` | PEM private key (PKCS#8, PKCS#1 or SEC1) for `KOSHA_TLS_CERT_PATH` | unset | path |
+| `KOSHA_TLS_CLIENT_CA_PATH` | PEM CA bundle for client certificates (mTLS, #343). A presented certificate must chain to it or the handshake fails, and `/internal/*` answers 403 on a connection that presented none. Other routes still accept clients without a certificate. Needs `KOSHA_TLS_CERT_PATH`/`KOSHA_TLS_KEY_PATH`, or the server refuses to start | unset (no client certificates) | path |
 | `KOSHA_AUTH` | `disabled` (or `off`, `false`, `0`, `none`) turns authentication off; every request becomes tenant `dev`. Local development only | enabled | flag |
 | `KOSHA_API_KEY` | One tenant API key, mapped to tenant `default` | unset | string |
 | `KOSHA_API_KEYS` | Comma-separated `key=tenant` pairs | unset | list |
@@ -262,11 +324,47 @@ The server refuses to start when no credential is configured (no env key, no adm
 key, no Postgres keys) unless `KOSHA_AUTH=disabled`.
 
 The server speaks HTTP/1.1 with keep-alive (#259): responses carry a `content-length` and the
-connection stays open for the next request. TLS covers client-facing traffic only. The internal
-clients take no CA configuration yet: peer hydration always connects over `http://` (so pods
-that share segments through hydration leases should not turn TLS on), and query-to-ingest
-forwarding to an `https://` `KOSHA_INGEST_HOST` trusts only the platform's roots. TLS between
-pods is tracked in #343.
+connection stays open for the next request. `KOSHA_TLS_CERT_PATH` turns HTTPS on for every
+route on the port, client-facing and `/internal/*` alike. The clients that call other pods are
+configured separately, in the next section.
+
+### TLS between pods
+
+Pod-to-pod traffic is peer hydration (`GET /internal/segment/...`, query pod to query pod) and
+ingest traffic (forwarded writes and the strong-consistency tail read, query pod to
+`KOSHA_INGEST_HOST`). The clients for both are built in `internal_tls.rs`
+(`InternalTls::from_lookup`), read once at startup. The settings **fail closed**: an unknown
+mode, a missing or unparsable file, half a client identity, or a TLS setting while the mode is
+`off` logs `FATAL: internal TLS: ...` and exits. The startup log prints
+`internal TLS: on (internal CA, client_cert=yes, server_name=kosha-internal)` or similar.
+
+| Variable | Purpose | Default | Units |
+| --- | --- | --- | --- |
+| `KOSHA_INTERNAL_TLS` | `off`: plain `http://` to peers, as before. `on`: peers are fetched over `https://` and verified against `KOSHA_INTERNAL_TLS_CA_PATH`, and an `https://` `KOSHA_INGEST_HOST` is verified the same way (an `http://` one logs a warning). `required`: as `on`, and the pod refuses to start with an `http://` `KOSHA_INGEST_HOST` or without `KOSHA_TLS_CERT_PATH` | `off` | enum |
+| `KOSHA_INTERNAL_TLS_CA_PATH` | PEM CA bundle peer certificates must chain to. Required unless `off`. Only this bundle is trusted for internal traffic, not the platform roots | unset | path |
+| `KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH` | PEM client certificate chain, presented to peers that ask for one (their `KOSHA_TLS_CLIENT_CA_PATH`). Set it together with `KOSHA_INTERNAL_TLS_CLIENT_KEY_PATH` or not at all | unset (no client certificate) | path |
+| `KOSHA_INTERNAL_TLS_CLIENT_KEY_PATH` | PEM private key for `KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH` | unset | path |
+| `KOSHA_INTERNAL_TLS_SERVER_NAME` | DNS name peer certificates are checked against instead of the host in the URL. Peers are dialed by pod IP (`POD_IP`), which a certificate issued ahead of time cannot list; with this set, one certificate with this DNS name serves every pod. Unset, a certificate must match the URL host (an IP SAN for peer fetches) | unset (URL host) | DNS name |
+
+To turn it on across a cluster:
+
+1. Issue a certificate signed by an internal CA whose SANs include the ingest Service name and
+   a fixed name such as `kosha-internal` (`k8s/base/certificate-internal-tls.example.yaml` is a
+   cert-manager example). The same certificate can serve as the client identity.
+2. Mount it on every pod and set `KOSHA_TLS_CERT_PATH`/`KOSHA_TLS_KEY_PATH` (server side) and
+   `KOSHA_INTERNAL_TLS=on`, `KOSHA_INTERNAL_TLS_CA_PATH`, `KOSHA_INTERNAL_TLS_SERVER_NAME`
+   (client side), and switch `KOSHA_INGEST_HOST` to `https://`. HTTPS is per port, so the
+   kubelet probes need `scheme: HTTPS` too.
+3. Optionally require mTLS on `/internal/*` with `KOSHA_TLS_CLIENT_CA_PATH` and give every pod
+   `KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH`/`KEY_PATH`. Roll the clients out first, then the
+   server setting.
+4. Set `KOSHA_INTERNAL_TLS=required` once every pod is on TLS.
+
+During a rollout, a pod on `on` that reaches a peer still serving plain HTTP fails that peer
+fetch and falls back to S3, so mixed pods cost extra S3 reads, not errors. Forwarded writes have
+no such fallback: switch `KOSHA_INGEST_HOST` to `https://` only after the ingest pod serves
+HTTPS. Certificates are
+read at startup; a renewed certificate takes effect when the pod restarts.
 
 `GET /internal/segment/...` streams the cached file as raw `application/octet-stream`. Peers on
 builds from before #259 send base64 with `x-kosha-encoding: base64`; the client still decodes
@@ -282,6 +380,7 @@ that, so a rolling upgrade with mixed peers works.
 | `KOSHA_METRICS` | `off` (or `false`, `0`) makes `GET /metrics` return 404 | on | flag |
 | `KOSHA_METRICS_AUTH` | `admin` requires the `KOSHA_ADMIN_API_KEY` credential on `GET /metrics` (403 without it). `none` (or unset) leaves it open, like `/healthz`. Any other value is treated as `admin` | `none` | `none` \| `admin` |
 | `KOSHA_METRICS_NAMESPACE_LABELS` | `on` (or `true`, `1`) adds a `namespace` label to `kosha_search_requests_total`. One series per namespace and outcome, and it publishes tenant namespace names to whoever can scrape. See `metrics.md` | off | flag |
+| `KOSHA_METRICS_TENANT_LABELS` | `on` (or `true`, `1`) adds a `tenant` label to `kosha_tenant_rejections_total` and the `kosha_cache_*` families (#342). One series per tenant and reason (or cache), and it publishes tenant ids to whoever can scrape. See `metrics.md` | off | flag |
 
 ## Roles
 
