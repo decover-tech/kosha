@@ -15,8 +15,8 @@ use std::collections::HashSet;
 
 use common::{brute_force_topk, recall_at_k};
 use kosha_vector_spfresh::{
-    cosine_similarity, mean_vector, nearest_centroids, ClusterIndex, ClusterIndexConfig,
-    DeterministicRng, PostingSnapshot, VectorIndexError,
+    cosine_distance, cosine_similarity, mean_vector, nearest_centroids, normalize_in_place,
+    ClusterIndex, ClusterIndexConfig, DeterministicRng, PostingSnapshot, VectorIndexError,
 };
 
 const SEEDS: u64 = 5;
@@ -174,6 +174,57 @@ fn recall(idx: &ClusterIndex, live: &[(u32, Vec<f32>)], qs: &[Vec<f32>], fractio
     total / qs.len() as f64
 }
 
+/// [`recall`] with kosha-query's radius-aware probe order: postings
+/// ranked by `max(0, d(q, centroid) - radius)`, a lower bound on the
+/// distance to any member, so loose postings (large radii) cost probes.
+fn radius_recall(
+    snap: &[PostingSnapshot],
+    live: &[(u32, Vec<f32>)],
+    qs: &[Vec<f32>],
+    fraction: f64,
+) -> f64 {
+    let nprobe = ((snap.len() as f64 * fraction).ceil() as usize).max(1);
+    let mut total = 0.0;
+    for q in qs {
+        let truth = brute_force_topk(live, q, 10);
+        let mut order: Vec<(usize, f32)> = snap
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i, (cosine_distance(q, &p.centroid) - p.radius).max(0.0)))
+            .collect();
+        order.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+        let mut hits: Vec<(u32, f32)> = order[..nprobe]
+            .iter()
+            .flat_map(|(i, _)| snap[*i].entries.iter())
+            .map(|(id, v)| (*id, cosine_similarity(q, v)))
+            .collect();
+        hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        hits.truncate(10);
+        total += recall_at_k(&hits, &truth);
+    }
+    total / qs.len() as f64
+}
+
+fn radius_quantile(snap: &[PostingSnapshot], q: f64) -> f32 {
+    let mut r: Vec<f32> = snap.iter().map(|p| p.radius).collect();
+    r.sort_by(f32::total_cmp);
+    r.get(((r.len() as f64 * q) as usize).min(r.len().saturating_sub(1)))
+        .copied()
+        .unwrap_or(0.0)
+}
+
+fn median_radius(snap: &[PostingSnapshot]) -> f32 {
+    radius_quantile(snap, 0.5)
+}
+
+fn refine(cfg: &ClusterIndexConfig, on: bool) -> ClusterIndexConfig {
+    let mut cfg = cfg.clone();
+    if !on {
+        cfg.build_refine_rounds = 0;
+    }
+    cfg
+}
+
 fn assert_same_ids(idx: &ClusterIndex, live: &[(u32, Vec<f32>)]) {
     let got: HashSet<u32> = idx.ids().into_iter().collect();
     let want: HashSet<u32> = live.iter().map(|(id, _)| *id).collect();
@@ -223,6 +274,123 @@ fn one_compaction_recall_matches_rebuild_within_half_a_point() {
             "fraction {fraction}: lire recall {l:.4} is more than 0.5pt below rebuild {r:.4}"
         );
     }
+}
+
+/// Build refinement (#253): bisection leaves far members in postings, so
+/// their radii are loose and a radius-aware probe at the 5% floor budget
+/// misses neighbours. Refinement must tighten the median radius, raise
+/// that recall, and keep the index well-formed: every vector in exactly
+/// one posting, sizes within bounds.
+#[test]
+fn build_refinement_tightens_radii_and_raises_radius_aware_recall() {
+    let dim = 32;
+    // Unit-normalized, as kosha-segment builds them.
+    let unit = |mut v: Vec<f32>| {
+        normalize_in_place(&mut v);
+        v
+    };
+    let live: Vec<(u32, Vec<f32>)> = mixture(8_000, dim, 40, 0, 0.0, 1)
+        .into_iter()
+        .map(|(id, v)| (id, unit(v)))
+        .collect();
+    let qs: Vec<Vec<f32>> = queries(dim, 0.0).into_iter().map(unit).collect();
+    let (mut off_r, mut on_r, mut off_rad, mut on_rad) = (0.0, 0.0, 0.0, 0.0);
+    for seed in 0..SEEDS {
+        let cfg = config(dim, seed);
+        let plain = ClusterIndex::build(&live, refine(&cfg, false)).unwrap();
+        let refined = ClusterIndex::build(&live, refine(&cfg, true)).unwrap();
+        assert_same_ids(&refined, &live);
+        for size in refined.posting_sizes() {
+            assert!(
+                (cfg.min_posting_size..=cfg.max_posting_size).contains(&size),
+                "posting size {size} outside [{}, {}]",
+                cfg.min_posting_size,
+                cfg.max_posting_size
+            );
+        }
+        let (ps, rs) = (plain.snapshot(), refined.snapshot());
+        off_r += radius_recall(&ps, &live, &qs, 0.05);
+        on_r += radius_recall(&rs, &live, &qs, 0.05);
+        off_rad += median_radius(&ps) as f64;
+        on_rad += median_radius(&rs) as f64;
+    }
+    let n = SEEDS as f64;
+    let (off_r, on_r, off_rad, on_rad) = (off_r / n, on_r / n, off_rad / n, on_rad / n);
+    eprintln!(
+        "radius-aware recall@10 at 5%: off {off_r:.4}, on {on_r:.4}; median radius off {off_rad:.3}, on {on_rad:.3}"
+    );
+    assert!(
+        on_rad < off_rad * 0.95,
+        "median radius {on_rad:.3} vs {off_rad:.3}"
+    );
+    assert!(
+        on_r >= 0.95,
+        "recall with refinement {on_r:.4} (off {off_r:.4})"
+    );
+    assert!(on_r >= off_r + 0.2, "recall {on_r:.4} vs {off_r:.4}");
+}
+
+/// `build_refine_rounds = 0` is the plain bisection build: deterministic,
+/// and no rebalance after it (the refinement is the only difference).
+#[test]
+fn build_refinement_off_is_deterministic_and_on_is_too() {
+    let dim = 16;
+    let live = mixture(3_000, dim, 20, 0, 0.0, 9);
+    for on in [false, true] {
+        let cfg = refine(&config(dim, 4), on);
+        let a = ClusterIndex::build(&live, cfg.clone()).unwrap().snapshot();
+        let b = ClusterIndex::build(&live, cfg).unwrap().snapshot();
+        assert_eq!(a, b, "refine {on}: same input and seed, same index");
+    }
+}
+
+/// Absorbing loose vectors goes through the coarse centroid index once the
+/// index has 256+ postings: each vector must still land in its exact
+/// nearest posting almost always, and in exactly one posting.
+#[test]
+fn absorb_through_the_centroid_index_matches_exact_nearest_posting() {
+    let dim = 32;
+    let big = mixture(40_000, dim, 40, 0, 0.0, 1);
+    let cfg = config(dim, 0);
+    let seeds = ClusterIndex::build(&big, cfg.clone()).unwrap().snapshot();
+    assert!(seeds.len() >= 256, "{} postings", seeds.len());
+    let centroids: Vec<Vec<f32>> = seeds.iter().map(|p| p.centroid.clone()).collect();
+    let mut idx = ClusterIndex::from_postings(seeds, cfg).unwrap();
+    let fresh = mixture(2_000, dim, 40, 40_000, 0.0, 2);
+    let loose: Vec<PostingSnapshot> = fresh
+        .iter()
+        .map(|(id, v)| PostingSnapshot {
+            centroid: v.clone(),
+            entries: vec![(*id, v.clone())],
+            radius: 0.0,
+        })
+        .collect();
+    assert_eq!(
+        idx.absorb_postings(loose, ABSORB_CANDIDATES).unwrap(),
+        2_000
+    );
+    let live: Vec<(u32, Vec<f32>)> = big.iter().chain(fresh.iter()).cloned().collect();
+    assert_same_ids(&idx, &live);
+    // `absorb_postings` creates no postings, so snapshot order is the
+    // seeds' order.
+    let snap = idx.snapshot();
+    assert_eq!(snap.len(), centroids.len());
+    let mut owner = std::collections::HashMap::new();
+    for (i, p) in snap.iter().enumerate() {
+        for (id, _) in &p.entries {
+            owner.insert(*id, i);
+        }
+    }
+    let agree = fresh
+        .iter()
+        .filter(|(id, v)| nearest_centroids(&centroids, v, 1)[0] == owner[id])
+        .count();
+    let agree = agree as f64 / fresh.len() as f64;
+    eprintln!("absorbed into the exact nearest posting: {agree:.4}");
+    assert!(
+        agree >= 0.97,
+        "only {agree:.4} absorbed into the exact nearest posting"
+    );
 }
 
 /// A tiered merge: four inputs of equal size, each clustered on its own
@@ -434,51 +602,107 @@ fn rebalance_of_untouched_postings_does_nothing() {
 }
 
 /// Wall-clock numbers for the PR / README (`cargo test --release -p
-/// kosha-vector-spfresh --test compaction_merge -- --ignored --nocapture`):
-/// compaction's index step, rebuild vs lire, one big input plus `pct`%
-/// changed vectors. The criterion version is `benches/build_query_cost.rs`
-/// (`compaction_vector_index`).
+/// kosha-vector-spfresh --test compaction_merge -- --ignored --nocapture`).
+///
+/// 1. From-scratch build with refinement off and on (#253): build time,
+///    median posting radius, radius-aware recall@10 at the 5% floor.
+///    Vectors are unit-normalized, as kosha-segment builds them.
+/// 2. Compaction's index step, rebuild vs lire, one big input plus `pct`%
+///    changed vectors, with the big input built with refinement off and
+///    on. Absorption goes through the coarse centroid index either way.
+///
+/// The criterion version is `benches/build_query_cost.rs`
+/// (`build_cost`, `compaction_vector_index`).
 #[test]
 #[ignore]
 fn compaction_cost_report() {
     let dim = 128;
+    let unit = |vs: Vec<(u32, Vec<f32>)>| -> Vec<(u32, Vec<f32>)> {
+        vs.into_iter()
+            .map(|(id, mut v)| {
+                normalize_in_place(&mut v);
+                (id, v)
+            })
+            .collect()
+    };
+    let qs: Vec<Vec<f32>> = unit(mixture(200, dim, 200, 0, 0.0, 999))
+        .into_iter()
+        .map(|(_, v)| v)
+        .collect();
+    for n in [1_000usize, 2_000, 5_000, 10_000, 100_000, 200_000] {
+        let live = unit(mixture(n, dim, 200, 0, 0.0, 1));
+        let reps = if n <= 10_000 { 5 } else { 1 };
+        let mut line = format!("build n={n} dim={dim}:");
+        let mut times = [0.0f64; 2];
+        for (i, on) in [false, true].into_iter().enumerate() {
+            let cfg = refine(&config(dim, 0), on);
+            // Best of `reps`: these are milliseconds at flush sizes.
+            let mut best = f64::INFINITY;
+            let mut idx = None;
+            for _ in 0..reps {
+                let t = std::time::Instant::now();
+                let built = ClusterIndex::build(&live, cfg.clone()).unwrap();
+                best = best.min(t.elapsed().as_secs_f64() * 1e3);
+                idx = Some(built);
+            }
+            times[i] = best;
+            let snap = idx.unwrap().snapshot();
+            let r = radius_recall(&snap, &live, &qs, 0.05);
+            line += &format!(
+                " refine {} {best:.1} ms, {} postings, radius p50 {:.3} p90 {:.3}, recall@10@5% {r:.3};",
+                if on { "on" } else { "off" },
+                snap.len(),
+                median_radius(&snap),
+                radius_quantile(&snap, 0.9)
+            );
+        }
+        eprintln!(
+            "{line} overhead {:+.0}%",
+            (times[1] / times[0] - 1.0) * 100.0
+        );
+    }
     for n in [10_000usize, 50_000, 100_000, 200_000] {
         for pct in [1usize, 5] {
-            let cfg = config(dim, 0);
-            let big = mixture(n, dim, 200, 0, 0.0, 1);
-            let changed = n * pct / 100;
-            let mut rng = DeterministicRng::new(3);
-            let mut deleted = HashSet::new();
-            while deleted.len() < changed {
-                deleted.insert(rng.next_usize(n) as u32);
-            }
-            let fresh = mixture(changed, dim, 200, n as u32, 0.0, 2);
-            let live: Vec<(u32, Vec<f32>)> = big
-                .iter()
-                .filter(|(id, _)| !deleted.contains(id))
-                .chain(fresh.iter())
-                .cloned()
-                .collect();
-            let snapshot = ClusterIndex::build(&big, cfg.clone()).unwrap().snapshot();
+            for on in [false, true] {
+                let cfg = refine(&config(dim, 0), on);
+                let big = unit(mixture(n, dim, 200, 0, 0.0, 1));
+                let changed = n * pct / 100;
+                let mut rng = DeterministicRng::new(3);
+                let mut deleted = HashSet::new();
+                while deleted.len() < changed {
+                    deleted.insert(rng.next_usize(n) as u32);
+                }
+                let fresh = unit(mixture(changed, dim, 200, n as u32, 0.0, 2));
+                let live: Vec<(u32, Vec<f32>)> = big
+                    .iter()
+                    .filter(|(id, _)| !deleted.contains(id))
+                    .chain(fresh.iter())
+                    .cloned()
+                    .collect();
+                let snapshot = ClusterIndex::build(&big, cfg.clone()).unwrap().snapshot();
 
-            let t = std::time::Instant::now();
-            let rebuilt = ClusterIndex::build(&live, cfg.clone()).unwrap();
-            let rebuild = t.elapsed();
-            let t = std::time::Instant::now();
-            let merged = lire_merge(
-                vec![Input::Postings(snapshot), Input::Vectors(fresh)],
-                &deleted,
-                &cfg,
-            );
-            let lire = t.elapsed();
-            eprintln!(
-                "n={n} dim={dim} changed={pct}%: rebuild {:.0} ms ({} postings), lire {:.0} ms ({} postings), {:.1}x",
-                rebuild.as_secs_f64() * 1e3,
-                rebuilt.active_posting_count(),
-                lire.as_secs_f64() * 1e3,
-                merged.active_posting_count(),
-                rebuild.as_secs_f64() / lire.as_secs_f64()
-            );
+                let t = std::time::Instant::now();
+                let rebuilt = ClusterIndex::build(&live, cfg.clone()).unwrap();
+                let rebuild = t.elapsed();
+                let t = std::time::Instant::now();
+                let merged = lire_merge(
+                    vec![Input::Postings(snapshot), Input::Vectors(fresh)],
+                    &deleted,
+                    &cfg,
+                );
+                let lire = t.elapsed();
+                eprintln!(
+                    "n={n} dim={dim} changed={pct}% refine {}: rebuild {:.0} ms ({} postings, median radius {:.3}), lire {:.0} ms ({} postings, median radius {:.3}), {:.1}x",
+                    if on { "on" } else { "off" },
+                    rebuild.as_secs_f64() * 1e3,
+                    rebuilt.active_posting_count(),
+                    median_radius(&rebuilt.snapshot()),
+                    lire.as_secs_f64() * 1e3,
+                    merged.active_posting_count(),
+                    median_radius(&merged.snapshot()),
+                    rebuild.as_secs_f64() / lire.as_secs_f64()
+                );
+            }
         }
     }
     // Worst case for LIRE: a tiered merge of four equal inputs, where

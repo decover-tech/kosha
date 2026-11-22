@@ -122,6 +122,8 @@ spec:
             # the pod. Still under the 24 GiB disk cache budget above.
             - name: KOSHA_HYDRATE_REQUEST_MAX_BYTES
               value: "8589934592"
+<<<<<<< ours
+=======
             # Decoded vector postings kept per segment: 2 GiB (default 32 MiB).
             # A compacted segment's postings decode to up to 1.7 GB, and a
             # semantic query examines hundreds of them, so with the default
@@ -138,6 +140,7 @@ spec:
             # every time, at 76 ms p50 with the cache above.
             - name: KOSHA_KNN_BUDGET_FRACTION
               value: "0.32"
+>>>>>>> theirs
           resources:
             requests:
               cpu: "2"

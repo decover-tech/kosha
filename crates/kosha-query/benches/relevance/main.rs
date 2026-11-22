@@ -60,11 +60,15 @@ const SELECTIVITIES: [(&str, f64); 5] = [
     ("0.1%", 0.001),
 ];
 /// Engine settings recorded in the report when set.
-const RECORDED_ENV: [&str; 4] = [
+const RECORDED_ENV: [&str; 7] = [
     "KOSHA_KNN_BUDGET_FRACTION",
     "KOSHA_KNN_EXACT_THRESHOLD",
     "KOSHA_KNN_EXACT_FRACTION",
     "KOSHA_RELEVANCE_NUM_CANDIDATES",
+    // #384 experiments (off by default).
+    "KOSHA_KNN_RELATIVE_CUTOFF_EPS",
+    "KOSHA_KNN_RELATIVE_MIN_PROBES",
+    "KOSHA_KNN_PROBE_RADIUS_ALPHA",
 ];
 
 struct Query {

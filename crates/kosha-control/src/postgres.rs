@@ -83,6 +83,74 @@ fn empty_manifest(version: u64) -> Manifest {
     Manifest::empty(version)
 }
 
+/// Key of the transaction-scoped advisory lock that serializes the inline
+/// schema migration (#330): the ASCII bytes of "kosha_mg" as a big-endian
+/// i64. Any fixed value works as long as every migrator uses the same one.
+const MIGRATION_LOCK_KEY: i64 = i64::from_be_bytes(*b"kosha_mg");
+
+/// SQLSTATEs a concurrent `CREATE ... IF NOT EXISTS` can still raise when
+/// the other migrator does not take `MIGRATION_LOCK_KEY` (an older binary
+/// mid-rollout, or `make db-migrate` run by hand through psql): Postgres
+/// checks "if not exists" before inserting the catalog row, so the loser of
+/// that race gets a unique violation on a catalog index (23505) or a
+/// duplicate schema/table (42P06/42P07) instead of a no-op.
+const MIGRATION_RACE_SQLSTATES: [&str; 3] = ["23505", "42P06", "42P07"];
+
+fn is_migration_race(e: &sqlx::Error) -> bool {
+    e.as_database_error()
+        .and_then(|db| db.code())
+        .is_some_and(|code| MIGRATION_RACE_SQLSTATES.contains(&code.as_ref()))
+}
+
+/// Apply the embedded migrations (001, then 003) in one transaction on one
+/// connection, holding a transaction-scoped advisory lock for its duration.
+///
+/// Concurrent constructors against a fresh database (several pods booting
+/// at once, or the API-key loader and the manifest store in one pod) used
+/// to race inside `CREATE SCHEMA IF NOT EXISTS` and fail with a duplicate
+/// key on `pg_namespace` (#330). With the lock they queue up: the first
+/// creates everything and commits (which releases the lock), the rest find
+/// it all present and their statements are no-ops. Every statement in
+/// 001/003 is valid inside a transaction (no `CREATE INDEX CONCURRENTLY`,
+/// no `VACUUM`), and running both in one transaction also means a failure
+/// leaves no half-applied schema behind.
+///
+/// A migrator that does not take the lock can still race with us, so a
+/// failure with one of `MIGRATION_RACE_SQLSTATES` is retried once: by then
+/// the other side has committed and the retry is all no-ops.
+async fn run_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
+    match migrate_once(pool).await {
+        Err((e, _)) if is_migration_race(&e) => migrate_once(pool).await,
+        other => other,
+    }
+    .map_err(|(e, which)| format!("{which}: {e}"))
+}
+
+/// One locked migration attempt. The error carries the message prefix the
+/// caller reports: "migration failed" for 001 and the lock/transaction
+/// plumbing, "migration 003 failed" for 003.
+async fn migrate_once(pool: &sqlx::PgPool) -> Result<(), (sqlx::Error, &'static str)> {
+    const FAILED: &str = "migration failed";
+    let mut tx = pool.begin().await.map_err(|e| (e, FAILED))?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(MIGRATION_LOCK_KEY)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (e, FAILED))?;
+    let migration = include_str!("../migrations/001_create_kosha_tables.sql");
+    sqlx::raw_sql(migration)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (e, FAILED))?;
+    // Writer leases (#254): additive, idempotent, same pattern as 001.
+    let migration = include_str!("../migrations/003_writer_leases.sql");
+    sqlx::raw_sql(migration)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (e, "migration 003 failed"))?;
+    tx.commit().await.map_err(|e| (e, FAILED))
+}
+
 impl PgStore {
     /// Create a new Postgres-backed store.
     ///
@@ -103,14 +171,9 @@ impl PgStore {
             )
             .map_err(|e| format!("failed to connect to postgres: {e}"))?;
 
-        // Run migration inline (no external migrator dependency).
-        let migration = include_str!("../migrations/001_create_kosha_tables.sql");
-        rt.block_on(sqlx::raw_sql(migration).execute(&pool))
-            .map_err(|e| format!("migration failed: {e}"))?;
-        // Writer leases (#254): additive, idempotent, same pattern as 001.
-        let migration = include_str!("../migrations/003_writer_leases.sql");
-        rt.block_on(sqlx::raw_sql(migration).execute(&pool))
-            .map_err(|e| format!("migration 003 failed: {e}"))?;
+        // Run migrations inline (no external migrator dependency), serialized
+        // across processes by an advisory lock (#330).
+        rt.block_on(run_migrations(&pool))?;
 
         Ok(Self { pool, rt })
     }
@@ -624,6 +687,14 @@ impl ControlStore for PgStore {
 
             row.0 as usize
         })
+    }
+}
+
+impl PgStore {
+    /// The pool and the runtime that owns it, for sibling modules that
+    /// run their own transactions (`namespace_rename`).
+    pub(crate) fn pool_and_runtime(&self) -> (&sqlx::PgPool, &tokio::runtime::Runtime) {
+        (&self.pool, &self.rt)
     }
 }
 

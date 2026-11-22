@@ -92,6 +92,14 @@ service KoshaService {
     };
   }
 
+  // The caller's namespaces (issue #214). Shard and other internal
+  // namespaces are left out.
+  rpc ListNamespaces(ListNamespacesRequest) returns (ListNamespacesResponse) {
+    option (google.api.http) = {
+      get: "/v1/namespaces"
+    };
+  }
+
   // Set a namespace's schema (issue #220): per-field analyzers for segments
   // written from now on. Existing segments keep the analysis recorded in
   // their footers and stay searchable with it.
@@ -216,6 +224,20 @@ message CreateNamespaceResponse {
   int64 segment_count = 4;
   int64 version = 5;
   int64 created_at = 6;  // Unix timestamp (seconds)
+}
+
+message ListNamespacesRequest {}
+
+message ListedNamespace {
+  string name = 1;
+  // Unset when this node could not load the namespace's manifest.
+  optional int64 documents = 2;
+  optional int64 segments = 3;
+  optional int64 manifest_version = 4;
+}
+
+message ListNamespacesResponse {
+  repeated ListedNamespace namespaces = 1;
 }
 
 message DeleteNamespaceRequest {

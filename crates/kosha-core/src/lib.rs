@@ -14,10 +14,13 @@ use serde::{Deserialize, Serialize};
 
 pub mod datetime;
 pub mod histogram;
-pub use histogram::{AggDateHistogram, AggHistogram, DurationValue};
+pub use histogram::{
+    AggDateHistogram, AggHistogram, DateHistogramBounds, DurationValue, HistogramBounds,
+};
 pub mod docset;
 pub mod nested;
 pub mod sharding;
+pub mod tenancy;
 pub use analysis::{
     AnalysisConfig, AnalyzerSpec, EmbeddingSpec, FieldSchema, NamespaceSchema, SegmentAnalysis,
     TokenFilterSpec, TokenizerKind,
@@ -1391,22 +1394,19 @@ fn reject_unsupported_histogram_options(
     let Some(obj) = body.as_object() else {
         return Ok(());
     };
-    for option in [
-        "time_zone",
-        "extended_bounds",
-        "hard_bounds",
-        "keyed",
-        "order",
-        "missing",
-        "format",
-    ] {
+    for option in ["keyed", "order", "missing", "format"] {
         if obj.contains_key(option) {
             return Err(format!(
-                "in `{kind}` aggregation: `{option}` is not supported yet (bucket boundaries \
-                 are UTC, buckets are sorted by key ascending, and gaps are filled between \
-                 the lowest and highest non-empty bucket)"
+                "in `{kind}` aggregation: `{option}` is not supported yet (buckets are sorted \
+                 by key ascending, documents without a value are not counted, and \
+                 `key_as_string` is RFC 3339)"
             ));
         }
+    }
+    if kind == "histogram" && obj.contains_key("time_zone") {
+        return Err(
+            "in `histogram` aggregation: `time_zone` applies only to `date_histogram`".into(),
+        );
     }
     if kind == "date_histogram" && obj.contains_key("interval") {
         return Err(
@@ -2030,6 +2030,38 @@ pub struct Footer {
     /// stay byte-identical to before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub multi_vectors: Vec<MultiVectorField>,
+    /// How `doc_store.bin` records are compressed (research #388). `None`
+    /// — every segment written before #388, and every segment written
+    /// since without `KOSHA_DOC_STORE_COMPRESSION=zstd` — means records
+    /// are stored raw, exactly as before; nothing is serialized then, so
+    /// such footers stay byte-identical. `Some` means each record is its
+    /// own zstd frame (or kept raw when compression would not shrink it),
+    /// the per-segment dictionary sits in the `doc_store.offsets` trailer,
+    /// and `doc_store.offsets` spans are of the stored (compressed) bytes,
+    /// so ranged page reads still fetch only the records they need.
+    /// Readers that predate #388 ignore this field and fail to parse such
+    /// records ("truncated or malformed"): roll back only after compacting
+    /// with `KOSHA_DOC_STORE_COMPRESSION=none`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_store_compression: Option<DocStoreCompression>,
+}
+
+/// `Footer::doc_store_compression` (research #388).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocStoreCompression {
+    /// Codec id. Only [`DocStoreCompression::ZSTD_DICT`] exists; a reader
+    /// refuses to open a segment naming any other codec rather than guess.
+    pub codec: String,
+    /// zstd level the records were compressed at (informational).
+    pub level: i32,
+    /// Length of the trained dictionary in the `doc_store.offsets`
+    /// trailer; `0` means plain zstd without a dictionary.
+    pub dict_bytes: u32,
+}
+
+impl DocStoreCompression {
+    /// Per-record zstd frames with a per-segment trained dictionary.
+    pub const ZSTD_DICT: &'static str = "zstd-dict";
 }
 
 /// Value type of one filter column (#244). A field name can appear with
@@ -2202,6 +2234,11 @@ pub enum VectorQuantization {
     /// Scalar-quantized entries: one `f32` scale per vector and `dim`
     /// signed bytes, ~4x smaller than `f32`.
     I8,
+    /// RaBitQ 1-bit codes against the posting centroid: two `f32`s and one
+    /// bit per (power-of-two padded) dimension, ~30x smaller than `f32` at
+    /// embedding dimensions.
+    #[serde(rename = "rabitq")]
+    RaBitQ,
 }
 
 impl VectorQuantization {
@@ -2209,11 +2246,13 @@ impl VectorQuantization {
         *self == VectorQuantization::F32
     }
 
-    /// Parses `f32` / `i8` (case-insensitive); `None` for anything else.
+    /// Parses `f32` / `i8` / `rabitq` (case-insensitive); `None` for
+    /// anything else.
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "f32" => Some(Self::F32),
             "i8" | "int8" => Some(Self::I8),
+            "rabitq" => Some(Self::RaBitQ),
             _ => None,
         }
     }
@@ -2222,6 +2261,7 @@ impl VectorQuantization {
         match self {
             Self::F32 => "f32",
             Self::I8 => "i8",
+            Self::RaBitQ => "rabitq",
         }
     }
 }
@@ -4579,6 +4619,7 @@ mod tests {
             fuzzy_bloom: None,
             vector_fields: None,
             multi_vectors: Vec::new(),
+            doc_store_compression: None,
         }
     }
 
@@ -5254,12 +5295,20 @@ mod aggregation_parsing {
                 "in `histogram` aggregation",
             ),
             (
-                r#"{"histogram":{"field":"b","interval":1,"extended_bounds":{"min":0,"max":9}}}"#,
-                "`extended_bounds` is not supported yet",
+                r#"{"histogram":{"field":"b","interval":1,"extended_bounds":{"min":9,"max":0}}}"#,
+                "`extended_bounds` `min` (9) is greater than `max` (0)",
             ),
             (
-                r#"{"histogram":{"field":"b","interval":1,"hard_bounds":{"min":0,"max":9}}}"#,
-                "`hard_bounds` is not supported yet",
+                r#"{"histogram":{"field":"b","interval":1,"hard_bounds":{"min":"a"}}}"#,
+                "in `histogram` aggregation",
+            ),
+            (
+                r#"{"histogram":{"field":"b","interval":1,"time_zone":"UTC"}}"#,
+                "`time_zone` applies only to `date_histogram`",
+            ),
+            (
+                r#"{"histogram":{"field":"b","interval":1,"keyed":true}}"#,
+                "`keyed` is not supported yet",
             ),
             (
                 r#"{"histogram":{"field":"b","interval":1,"bogus":1}}"#,
@@ -5282,16 +5331,12 @@ mod aggregation_parsing {
                 "in `date_histogram` aggregation",
             ),
             (
-                r#"{"date_histogram":{"field":"t","calendar_interval":"1M"}}"#,
-                "use `fixed_interval`",
+                r#"{"date_histogram":{"field":"t","calendar_interval":"2M"}}"#,
+                "calendar intervals take a single unit",
             ),
             (
-                r#"{"date_histogram":{"field":"t","calendar_interval":"1y"}}"#,
-                "use `fixed_interval`",
-            ),
-            (
-                r#"{"date_histogram":{"field":"t","calendar_interval":"1q"}}"#,
-                "use `fixed_interval`",
+                r#"{"date_histogram":{"field":"t","fixed_interval":"1M"}}"#,
+                "use `calendar_interval`",
             ),
             (
                 r#"{"date_histogram":{"field":"t"}}"#,
@@ -5302,8 +5347,20 @@ mod aggregation_parsing {
                 "use `fixed_interval`",
             ),
             (
-                r#"{"date_histogram":{"field":"t","fixed_interval":"1h","time_zone":"Europe/Paris"}}"#,
-                "`time_zone` is not supported yet",
+                r#"{"date_histogram":{"field":"t","fixed_interval":"1h","time_zone":"Europe/Atlantis"}}"#,
+                "unknown `time_zone` \"Europe/Atlantis\"",
+            ),
+            (
+                r#"{"date_histogram":{"field":"t","fixed_interval":"1h","hard_bounds":{"min":"2024-02-01","max":"2024-01-01"}}}"#,
+                "`hard_bounds` `min` (2024-02-01T00:00:00.000Z) is after `max`",
+            ),
+            (
+                r#"{"date_histogram":{"field":"t","fixed_interval":"1h","extended_bounds":{"min":"soon"}}}"#,
+                "`extended_bounds` `min` must be a date",
+            ),
+            (
+                r#"{"date_histogram":{"field":"t","fixed_interval":"1h","format":"yyyy"}}"#,
+                "`format` is not supported yet",
             ),
             (
                 r#"{"date_histogram":{"field":"t","fixed_interval":"1h","offset":"soon"}}"#,
