@@ -40,6 +40,15 @@
 //! another tenant's namespaces (a tenant whose id equals the bare name), so
 //! nothing here ever deletes the prefix wholesale.
 //!
+//! A rollout moves every bare namespace at once with the batch modes:
+//! `--map <file>` (one `bare=tenant/name` per line, or JSON) or
+//! `--all-unreachable --tenant <t>` (every bare id `b` to `<t>/<b>`). A batch
+//! runs the steps above namespace by namespace, keeps going past one it
+//! refuses, prints a summary table and exits non-zero if it refused any.
+//! `--verify` re-checks a finished migration read-only: each destination
+//! exists with its segments' objects, the bare id is gone, and no bare id
+//! is left unreachable.
+//!
 //! Segment ids are opaque directory names and keep their names. The
 //! manifest names namespaces in three places (branch parent, branch segment
 //! homes, deletion-vector homes); the rename rewrites those that name
@@ -57,8 +66,14 @@ use kosha_core::{ControlStore, KoshaError, Manifest, NamespaceId};
 use kosha_write::wal::WalStore;
 
 const USAGE: &str = "usage: kosha-server migrate-namespace --from <bare> --to <tenant>/<name> \
-[--dry-run] [--keep-source] [--skip-wal-check]\n       \
-kosha-server migrate-namespace --list-unreachable";
+[--dry-run] [--keep-source] [--skip-wal-check]
+       kosha-server migrate-namespace (--map <file> | --all-unreachable --tenant <tenant>) \
+[--dry-run] [--keep-source] [--skip-wal-check]
+       kosha-server migrate-namespace --verify (--from <bare> --to <tenant>/<name> | --map <file> \
+| --all-unreachable)
+       kosha-server migrate-namespace --list-unreachable
+A map file holds one `bare=tenant/name` per line (`#` comments), or JSON: \
+{\"bare\": \"tenant/name\", ...} or [{\"from\": \"bare\", \"to\": \"tenant/name\"}, ...].";
 
 /// Writer-lease TTL the migration holds; renewed while copying.
 const LEASE_TTL: Duration = Duration::from_secs(300);
@@ -80,7 +95,23 @@ pub(crate) struct Args {
     /// bare namespace), so that WAL must hold no such file by then. Prefer
     /// mounting the WAL and running without this flag.
     pub skip_wal_check: bool,
+    /// Batch: move every `bare=tenant/name` pair in this file.
+    pub map: Option<PathBuf>,
+    /// Batch: move every bare namespace `b` to `<tenant>/<b>`.
+    pub all_unreachable: bool,
+    pub tenant: Option<String>,
+    /// Re-check a finished migration instead of running one.
+    pub verify: bool,
 }
+
+impl Args {
+    pub(crate) fn is_batch(&self) -> bool {
+        self.map.is_some() || self.all_unreachable
+    }
+}
+
+/// One namespace to move: `(bare id, <tenant>/<name>)`.
+pub(crate) type Pair = (NamespaceId, NamespaceId);
 
 /// A namespace id without a tenant: written before #262, unreachable
 /// through `/v1/namespaces/...`.
@@ -94,6 +125,27 @@ fn valid_component(part: &str) -> bool {
         && part != ".."
         && !part.starts_with('_')
         && !part.chars().any(|c| c.is_control() || c == '\\')
+}
+
+/// `from` is a bare id and `to` is `<tenant>/<name>`.
+fn validate_pair(from: &NamespaceId, to: &NamespaceId) -> Result<(), String> {
+    if !is_bare(from) || !valid_component(&from.0) {
+        return Err(format!(
+            "--from {:?} must be a bare (pre-#262) namespace id, without a tenant",
+            from.0
+        ));
+    }
+    match to.0.split_once('/') {
+        Some((tenant, name))
+            if valid_component(tenant) && valid_component(name) && !name.contains('/') =>
+        {
+            Ok(())
+        }
+        _ => Err(format!(
+            "--to {:?} must be <tenant>/<name>, one tenant and one name",
+            to.0
+        )),
+    }
 }
 
 /// Parse `migrate-namespace`'s arguments (after the subcommand).
@@ -115,6 +167,10 @@ pub(crate) fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args,
         match flag.as_str() {
             "--from" => parsed.from = Some(NamespaceId(value("--from")?)),
             "--to" => parsed.to = Some(NamespaceId(value("--to")?)),
+            "--map" => parsed.map = Some(PathBuf::from(value("--map")?)),
+            "--tenant" => parsed.tenant = Some(value("--tenant")?),
+            "--all-unreachable" => parsed.all_unreachable = true,
+            "--verify" => parsed.verify = true,
             "--dry-run" => parsed.dry_run = true,
             "--keep-source" => parsed.keep_source = true,
             "--list-unreachable" => parsed.list_unreachable = true,
@@ -126,26 +182,120 @@ pub(crate) fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args,
     if parsed.list_unreachable {
         return Ok(parsed);
     }
-    let (Some(from), Some(to)) = (&parsed.from, &parsed.to) else {
-        return Err(format!("--from and --to are required\n{USAGE}"));
-    };
-    if !is_bare(from) || !valid_component(&from.0) {
+    let single = parsed.from.is_some() || parsed.to.is_some();
+    let modes = [single, parsed.map.is_some(), parsed.all_unreachable]
+        .iter()
+        .filter(|m| **m)
+        .count();
+    if modes > 1 {
         return Err(format!(
-            "--from {:?} must be a bare (pre-#262) namespace id, without a tenant",
-            from.0
+            "use one of --from/--to, --map or --all-unreachable\n{USAGE}"
         ));
     }
-    match to.0.split_once('/') {
-        Some((tenant, name))
-            if valid_component(tenant) && valid_component(name) && !name.contains('/') => {}
-        _ => {
-            return Err(format!(
-                "--to {:?} must be <tenant>/<name>, one tenant and one name",
-                to.0
-            ))
-        }
+    if parsed.tenant.is_some() && !parsed.all_unreachable {
+        return Err(format!("--tenant goes with --all-unreachable\n{USAGE}"));
     }
+    if parsed.verify && (parsed.dry_run || parsed.keep_source || parsed.skip_wal_check) {
+        return Err(format!(
+            "--verify only reads; it takes no --dry-run, --keep-source or --skip-wal-check\n{USAGE}"
+        ));
+    }
+    if parsed.all_unreachable {
+        match &parsed.tenant {
+            Some(tenant) if valid_component(tenant) && !tenant.contains('/') => {}
+            Some(tenant) => return Err(format!("--tenant {tenant:?} is not a valid tenant id")),
+            // Verifying only checks that no bare id is left.
+            None if parsed.verify => {}
+            None => return Err(format!("--all-unreachable needs --tenant\n{USAGE}")),
+        }
+        return Ok(parsed);
+    }
+    if parsed.map.is_some() {
+        return Ok(parsed);
+    }
+    let (Some(from), Some(to)) = (&parsed.from, &parsed.to) else {
+        return Err(format!(
+            "--from and --to (or --map, or --all-unreachable) are required\n{USAGE}"
+        ));
+    };
+    validate_pair(from, to)?;
     Ok(parsed)
+}
+
+/// Parse a `--map` file: one `bare=tenant/name` per line (blank lines and
+/// `#` comments skipped), or JSON, either `{"bare": "tenant/name", ...}`
+/// or `[{"from": "bare", "to": "tenant/name"}, ...]`. Every pair is
+/// validated, and no bare id or destination may appear twice.
+pub(crate) fn parse_map(text: &str) -> Result<Vec<Pair>, String> {
+    let trimmed = text.trim_start();
+    let raw: Vec<(String, String, String)> = if trimmed.starts_with('{') {
+        let object: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(text).map_err(|e| format!("map file: {e}"))?;
+        object
+            .into_iter()
+            .map(|(from, to)| match to {
+                serde_json::Value::String(to) => Ok((format!("key {from:?}"), from, to)),
+                other => Err(format!("map file: {from:?} maps to {other}, not a string")),
+            })
+            .collect::<Result<_, _>>()?
+    } else if trimmed.starts_with('[') {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Entry {
+            from: String,
+            to: String,
+        }
+        let entries: Vec<Entry> =
+            serde_json::from_str(text).map_err(|e| format!("map file: {e}"))?;
+        entries
+            .into_iter()
+            .enumerate()
+            .map(|(i, e)| (format!("entry {}", i + 1), e.from, e.to))
+            .collect()
+    } else {
+        let mut raw = Vec::new();
+        for (number, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (from, to) = line.split_once('=').ok_or_else(|| {
+                format!(
+                    "map file line {}: {line:?} is not bare=tenant/name",
+                    number + 1
+                )
+            })?;
+            raw.push((
+                format!("line {}", number + 1),
+                from.trim().to_owned(),
+                to.trim().to_owned(),
+            ));
+        }
+        raw
+    };
+    let mut pairs = Vec::new();
+    let (mut sources, mut targets) = (BTreeSet::new(), BTreeSet::new());
+    for (at, from, to) in raw {
+        let (from, to) = (NamespaceId(from), NamespaceId(to));
+        validate_pair(&from, &to).map_err(|e| format!("map file {at}: {e}"))?;
+        if !sources.insert(from.0.clone()) {
+            return Err(format!("map file {at}: {:?} is mapped twice", from.0));
+        }
+        if !targets.insert(to.0.clone()) {
+            return Err(format!("map file {at}: two namespaces map to {:?}", to.0));
+        }
+        pairs.push((from, to));
+    }
+    if pairs.is_empty() {
+        return Err("map file holds no bare=tenant/name pairs".into());
+    }
+    Ok(pairs)
+}
+
+fn load_map(path: &Path) -> Result<Vec<Pair>, String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    parse_map(&text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Bare namespace ids no tenant can reach, sorted.
@@ -165,8 +315,8 @@ pub(crate) fn warn_unreachable_bare_namespaces(ids: &[NamespaceId]) {
     let names: Vec<&str> = bare.iter().map(|id| id.0.as_str()).collect();
     eprintln!(
         "WARN: {} namespace(s) predate tenant scoping (#262) and are unreachable through \
-         /v1/namespaces: {}. Move each with `kosha-server migrate-namespace --from <bare> \
-         --to <tenant>/<name>` (k8s/README.md, \"Migrating pre-#262 namespaces\").",
+         /v1/namespaces: {}. Move them with `kosha-server migrate-namespace --from <bare> \
+         --to <tenant>/<name>`, or all at once with `--map <file>` (k8s/README.md, \"Migrating pre-#262 namespaces\").",
         bare.len(),
         names.join(", ")
     );
@@ -1205,6 +1355,468 @@ where
     Ok((report, outcome.lease_token))
 }
 
+// ─── Batch and verify ────────────────────────────────────────────────────────
+
+/// What a batch did with one namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    Moved,
+    /// `--dry-run`: the plan passed every check a dry run makes.
+    WouldMove,
+    /// Nothing left to do (already migrated).
+    Skipped,
+    /// Refused or failed; the reason is the row's detail.
+    Refused,
+}
+
+impl Outcome {
+    fn label(&self) -> &'static str {
+        match self {
+            Outcome::Moved => "moved",
+            Outcome::WouldMove => "would move",
+            Outcome::Skipped => "skipped",
+            Outcome::Refused => "refused",
+        }
+    }
+}
+
+/// One line of the batch summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BatchRow {
+    pub from: NamespaceId,
+    pub to: NamespaceId,
+    pub outcome: Outcome,
+    pub documents: u64,
+    pub objects: usize,
+    pub detail: String,
+}
+
+/// The pairs a batch or `--verify` covers: the `--map` file, every bare
+/// namespace mapped to `<tenant>/<bare>`, or the single `--from`/`--to`.
+fn resolve_pairs(ctrl: &dyn ControlStore, args: &Args) -> Result<Vec<Pair>, String> {
+    if let Some(path) = &args.map {
+        return load_map(path);
+    }
+    if args.all_unreachable {
+        let bare = unreachable_bare_namespaces(&ctrl.list_namespaces());
+        return Ok(match &args.tenant {
+            Some(tenant) => bare
+                .into_iter()
+                .map(|b| {
+                    let to = NamespaceId(format!("{tenant}/{}", b.0));
+                    (b, to)
+                })
+                .collect(),
+            // `--verify --all-unreachable`: no destination to check, only
+            // that nothing bare is left (each one left fails as a row).
+            None => bare.into_iter().map(|b| (b.clone(), b)).collect(),
+        });
+    }
+    match (&args.from, &args.to) {
+        (Some(from), Some(to)) => Ok(vec![(from.clone(), to.clone())]),
+        _ => Err(format!("--from and --to are required\n{USAGE}")),
+    }
+}
+
+/// Run [`migrate`] for each pair in order, continuing past a namespace it
+/// refuses, then print the summary table.
+pub(crate) fn migrate_batch<C>(
+    ctrl: &mut C,
+    objects: &dyn SegmentObjects,
+    wal: Option<&[Arc<dyn WalStore>]>,
+    pairs: &[Pair],
+    args: &Args,
+    out: &mut dyn Write,
+) -> Vec<BatchRow>
+where
+    C: ControlStore + NamespaceRename,
+{
+    let _ = writeln!(
+        out,
+        "migrate-namespace batch: {} namespace(s) ({}){}",
+        pairs.len(),
+        objects.describe(),
+        if args.dry_run { " [dry run]" } else { "" }
+    );
+    let mut rows = Vec::with_capacity(pairs.len());
+    for (index, (from, to)) in pairs.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "\n[{}/{}] {} -> {}",
+            index + 1,
+            pairs.len(),
+            from.0,
+            to.0
+        );
+        let one = Args {
+            from: Some(from.clone()),
+            to: Some(to.clone()),
+            dry_run: args.dry_run,
+            keep_source: args.keep_source,
+            skip_wal_check: args.skip_wal_check,
+            ..Default::default()
+        };
+        let row = match validate_pair(from, to)
+            .and_then(|()| migrate(ctrl, objects, wal, &one, out))
+        {
+            Ok(report) => {
+                let (outcome, detail) =
+                    if report.resumed && (report.objects == 0 || args.keep_source) {
+                        (
+                            Outcome::Skipped,
+                            if report.objects == 0 {
+                                "already migrated".to_owned()
+                            } else {
+                                format!("already migrated; {} source objects kept", report.objects)
+                            },
+                        )
+                    } else if args.dry_run {
+                        let detail = if report.resumed {
+                            format!(
+                                "already re-keyed; would delete {} source objects",
+                                report.objects
+                            )
+                        } else {
+                            format!("{} bytes to copy", report.bytes)
+                        };
+                        (Outcome::WouldMove, detail)
+                    } else if report.resumed {
+                        (
+                            Outcome::Moved,
+                            format!("resumed; deleted {} source objects", report.deleted),
+                        )
+                    } else {
+                        (
+                            Outcome::Moved,
+                            format!("copied {}, deleted {}", report.copied, report.deleted),
+                        )
+                    };
+                BatchRow {
+                    from: from.clone(),
+                    to: to.clone(),
+                    outcome,
+                    documents: report.documents,
+                    objects: report.objects,
+                    detail,
+                }
+            }
+            Err(reason) => {
+                let _ = writeln!(out, "refused: {reason}");
+                BatchRow {
+                    from: from.clone(),
+                    to: to.clone(),
+                    outcome: Outcome::Refused,
+                    documents: 0,
+                    objects: 0,
+                    detail: reason,
+                }
+            }
+        };
+        rows.push(row);
+    }
+    print_batch_summary(&rows, args.dry_run, out);
+    rows
+}
+
+/// Left-aligned columns, two spaces apart. A detail is cut at its first
+/// line so a multi-line reason keeps the table readable.
+fn print_table(header: &[&str], rows: &[Vec<String>], out: &mut dyn Write) {
+    let mut widths: Vec<usize> = header.iter().map(|h| h.len()).collect();
+    for row in rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let line = |cells: Vec<&str>| -> String {
+        let last = cells.len() - 1;
+        cells
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| {
+                if i == last {
+                    (*cell).to_owned()
+                } else {
+                    format!("{cell:<width$}", width = widths[i])
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+    let _ = writeln!(out, "{}", line(header.to_vec()));
+    for row in rows {
+        let _ = writeln!(out, "{}", line(row.iter().map(String::as_str).collect()));
+    }
+}
+
+fn first_line(text: &str) -> String {
+    text.lines().next().unwrap_or_default().to_owned()
+}
+
+fn print_batch_summary(rows: &[BatchRow], dry_run: bool, out: &mut dyn Write) {
+    let _ = writeln!(
+        out,
+        "\nsummary{}:",
+        if dry_run {
+            " [dry run, nothing changed]"
+        } else {
+            ""
+        }
+    );
+    let cells: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| {
+            vec![
+                r.from.0.clone(),
+                r.to.0.clone(),
+                r.outcome.label().to_owned(),
+                r.documents.to_string(),
+                r.objects.to_string(),
+                first_line(&r.detail),
+            ]
+        })
+        .collect();
+    print_table(
+        &["FROM", "TO", "RESULT", "DOCS", "OBJECTS", "DETAIL"],
+        &cells,
+        out,
+    );
+    let count = |o: Outcome| rows.iter().filter(|r| r.outcome == o).count();
+    let _ = writeln!(
+        out,
+        "{} moved, {} would move, {} skipped, {} refused",
+        count(Outcome::Moved),
+        count(Outcome::WouldMove),
+        count(Outcome::Skipped),
+        count(Outcome::Refused)
+    );
+}
+
+/// One line of the `--verify` report; `problem` set means it failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerifyRow {
+    pub from: NamespaceId,
+    pub to: NamespaceId,
+    pub documents: u64,
+    pub segments: usize,
+    pub problem: Option<String>,
+    pub note: Option<String>,
+}
+
+/// Re-check one finished move: `from` has no manifest, `to` has one whose
+/// document count is the sum of its segments', and every segment it lists
+/// (other than those inherited from a branch parent) has objects under
+/// `{to}/`. Source objects still under `{from}/` (a `--keep-source` run)
+/// are noted, not failed.
+fn verify_pair(
+    ctrl: &dyn ControlStore,
+    objects: &dyn SegmentObjects,
+    from: &NamespaceId,
+    to: &NamespaceId,
+) -> VerifyRow {
+    let mut row = VerifyRow {
+        from: from.clone(),
+        to: to.clone(),
+        documents: 0,
+        segments: 0,
+        problem: None,
+        note: None,
+    };
+    let manifest = |id: &NamespaceId| {
+        ctrl.try_manifest_cloned(id)
+            .map_err(|e| format!("reading {}'s manifest: {e}", id.0))
+    };
+    match manifest(from) {
+        Err(e) => {
+            row.problem = Some(e);
+            return row;
+        }
+        Ok(Some(_)) => {
+            row.problem = Some(format!(
+                "{} is still in the control plane (not migrated)",
+                from.0
+            ));
+            return row;
+        }
+        Ok(None) => {}
+    }
+    let target = match manifest(to) {
+        Err(e) => {
+            row.problem = Some(e);
+            return row;
+        }
+        Ok(None) => {
+            row.problem = Some(format!("{} does not exist", to.0));
+            return row;
+        }
+        Ok(Some(target)) => target,
+    };
+    row.documents = documents(&target);
+    let own: BTreeSet<String> = target
+        .segments
+        .iter()
+        .filter(|s| !target.is_inherited_segment(to, &s.segment_id))
+        .map(|s| s.segment_id.0.clone())
+        .collect();
+    row.segments = own.len();
+    let per_segment = |ns: &NamespaceId| -> Result<HashMap<String, usize>, String> {
+        let mut counts = HashMap::new();
+        for (rel, _) in objects.list(&ns.0)? {
+            if let Some((segment, _)) = rel.split_once('/') {
+                if own.contains(segment) {
+                    *counts.entry(segment.to_owned()).or_insert(0) += 1;
+                }
+            }
+        }
+        Ok(counts)
+    };
+    let at_target = match per_segment(to) {
+        Ok(counts) => counts,
+        Err(e) => {
+            row.problem = Some(e);
+            return row;
+        }
+    };
+    let missing: Vec<&String> = own.iter().filter(|s| !at_target.contains_key(*s)).collect();
+    if let Some(first) = missing.first() {
+        row.problem = Some(format!(
+            "{} of {} segments have no objects under {}/ (first: {first})",
+            missing.len(),
+            own.len(),
+            to.0
+        ));
+        return row;
+    }
+    match per_segment(from) {
+        Ok(left) if !left.is_empty() => {
+            row.note = Some(format!(
+                "{} source objects still under {}/ (--keep-source; rerun the move without it to \
+                 delete them)",
+                left.values().sum::<usize>(),
+                from.0
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => row.problem = Some(e),
+    }
+    row
+}
+
+/// `--verify`: re-check each pair, then that no bare namespace is left.
+/// Returns the rows and the bare ids still unreachable.
+pub(crate) fn verify(
+    ctrl: &dyn ControlStore,
+    objects: &dyn SegmentObjects,
+    pairs: &[Pair],
+    out: &mut dyn Write,
+) -> (Vec<VerifyRow>, Vec<NamespaceId>) {
+    let _ = writeln!(
+        out,
+        "migrate-namespace verify: {} namespace(s) ({})",
+        pairs.len(),
+        objects.describe()
+    );
+    let rows: Vec<VerifyRow> = pairs
+        .iter()
+        .map(|(from, to)| verify_pair(ctrl, objects, from, to))
+        .collect();
+    let cells: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| {
+            vec![
+                r.from.0.clone(),
+                r.to.0.clone(),
+                if r.problem.is_some() { "FAILED" } else { "ok" }.to_owned(),
+                r.documents.to_string(),
+                r.segments.to_string(),
+                first_line(r.problem.as_deref().or(r.note.as_deref()).unwrap_or("")),
+            ]
+        })
+        .collect();
+    print_table(
+        &["FROM", "TO", "RESULT", "DOCS", "SEGMENTS", "DETAIL"],
+        &cells,
+        out,
+    );
+    let bare = unreachable_bare_namespaces(&ctrl.list_namespaces());
+    if bare.is_empty() {
+        let _ = writeln!(out, "unreachable bare namespaces: none");
+    } else {
+        let names: Vec<&str> = bare.iter().map(|b| b.0.as_str()).collect();
+        let _ = writeln!(
+            out,
+            "unreachable bare namespaces: {} ({})",
+            bare.len(),
+            names.join(", ")
+        );
+    }
+    (rows, bare)
+}
+
+/// Run what `args` asks for over a connected control plane and segment
+/// store: one move, a batch, or `--verify`. A batch that refused any
+/// namespace and a failed verify are errors (non-zero exit).
+pub(crate) fn execute<C>(
+    ctrl: &mut C,
+    objects: &dyn SegmentObjects,
+    wal: Option<&[Arc<dyn WalStore>]>,
+    args: &Args,
+    out: &mut dyn Write,
+) -> Result<(), String>
+where
+    C: ControlStore + NamespaceRename,
+{
+    if args.verify {
+        let pairs = resolve_pairs(ctrl, args)?;
+        let (rows, bare) = verify(ctrl, objects, &pairs, out);
+        let failed = rows.iter().filter(|r| r.problem.is_some()).count();
+        if failed > 0 || !bare.is_empty() {
+            return Err(format!(
+                "verify failed: {failed} of {} namespace(s) failed, {} bare namespace(s) still \
+                 unreachable",
+                rows.len(),
+                bare.len()
+            ));
+        }
+        let _ = writeln!(out, "verify: OK");
+        return Ok(());
+    }
+    if args.is_batch() {
+        let pairs = resolve_pairs(ctrl, args)?;
+        if pairs.is_empty() {
+            let _ = writeln!(out, "no bare namespaces to migrate");
+            return Ok(());
+        }
+        let rows = migrate_batch(ctrl, objects, wal, &pairs, args, out);
+        let refused = rows
+            .iter()
+            .filter(|r| r.outcome == Outcome::Refused)
+            .count();
+        if refused > 0 {
+            return Err(format!(
+                "{refused} of {} namespace(s) refused; fix them and rerun the batch (finished \
+                 ones are skipped)",
+                rows.len()
+            ));
+        }
+        return Ok(());
+    }
+    let report = migrate(ctrl, objects, wal, args, out)?;
+    if args.dry_run {
+        let _ = writeln!(out, "dry run: nothing changed");
+    } else {
+        let _ = writeln!(
+            out,
+            "done: {} documents now under {}; copied {} of {} objects, deleted {}",
+            report.documents,
+            args.to.as_ref().map_or("", |t| t.0.as_str()),
+            report.copied,
+            report.objects,
+            report.deleted
+        );
+    }
+    Ok(())
+}
+
 // ─── Command line ────────────────────────────────────────────────────────────
 
 /// `kosha-server migrate-namespace ...`: run and return the exit code.
@@ -1248,19 +1860,26 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         if let Some(config) = crate::s3_storage::S3Config::from_env() {
             let s3 = connect_s3(config)?;
             let objects = s3_objects::S3Objects::new(&s3)?;
-            let wal = wal_streams(&args, &data_dir, Some(&s3))?;
-            let report = migrate(&mut ctrl, &objects, wal.as_deref(), &args, &mut stdout)?;
-            return finish(report, &args);
+            // `--verify` only reads the control plane and the segments.
+            let wal = if args.verify {
+                None
+            } else {
+                wal_streams(&args, &data_dir, Some(&s3))?
+            };
+            return execute(&mut ctrl, &objects, wal.as_deref(), &args, &mut stdout);
         }
         let objects = LocalObjects::new(data_dir.clone());
-        let wal = wal_streams(
-            &args,
-            &data_dir,
-            #[cfg(feature = "s3")]
-            None,
-        )?;
-        let report = migrate(&mut ctrl, &objects, wal.as_deref(), &args, &mut stdout)?;
-        finish(report, &args)
+        let wal = if args.verify {
+            None
+        } else {
+            wal_streams(
+                &args,
+                &data_dir,
+                #[cfg(feature = "s3")]
+                None,
+            )?
+        };
+        execute(&mut ctrl, &objects, wal.as_deref(), &args, &mut stdout)
     }
     #[cfg(not(feature = "postgres"))]
     {
@@ -1271,23 +1890,6 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
                 .into(),
         )
     }
-}
-
-#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
-fn finish(report: Report, args: &Args) -> Result<(), String> {
-    if args.dry_run {
-        println!("dry run: nothing changed");
-    } else {
-        println!(
-            "done: {} documents now under {}; copied {} of {} objects, deleted {}",
-            report.documents,
-            args.to.as_ref().map_or("", |t| t.0.as_str()),
-            report.copied,
-            report.objects,
-            report.deleted
-        );
-    }
-    Ok(())
 }
 
 #[cfg(all(feature = "s3", feature = "postgres"))]
@@ -1938,6 +2540,294 @@ mod tests {
         assert_eq!(
             objects.list("corpus").unwrap(),
             vec![("seg-000001/doc_store.bin".to_string(), 5)]
+        );
+    }
+
+    #[test]
+    fn parses_batch_and_verify_flags() {
+        let parsed = args(&["--map", "/etc/map.txt", "--dry-run", "--keep-source"]).unwrap();
+        assert_eq!(parsed.map, Some(PathBuf::from("/etc/map.txt")));
+        assert!(parsed.is_batch() && parsed.dry_run && parsed.keep_source);
+        let parsed = args(&["--all-unreachable", "--tenant=acme", "--skip-wal-check"]).unwrap();
+        assert!(parsed.all_unreachable && parsed.is_batch() && parsed.skip_wal_check);
+        assert_eq!(parsed.tenant.as_deref(), Some("acme"));
+        let parsed = args(&["--verify", "--map=m.json"]).unwrap();
+        assert!(parsed.verify && parsed.map.is_some());
+        let parsed = args(&["--verify", "--from", "c", "--to", "t/c"]).unwrap();
+        assert!(parsed.verify && !parsed.is_batch());
+        // Verifying `--all-unreachable` needs no tenant: it checks no bare
+        // id is left.
+        assert!(args(&["--verify", "--all-unreachable"]).unwrap().verify);
+
+        for bad in [
+            &["--all-unreachable"][..],
+            &["--all-unreachable", "--tenant", "a/b"],
+            &["--all-unreachable", "--tenant", "_internal"],
+            &["--tenant", "acme"],
+            &["--map", "m", "--tenant", "acme"],
+            &["--map", "m", "--from", "c", "--to", "t/c"],
+            &["--map", "m", "--all-unreachable", "--tenant", "acme"],
+            &["--map"],
+            &["--verify", "--map", "m", "--dry-run"],
+            &["--verify", "--map", "m", "--keep-source"],
+            &["--verify", "--map", "m", "--skip-wal-check"],
+            &["--verify"],
+            &["--dry-run"],
+        ] {
+            assert!(args(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn parses_map_files_as_lines_or_json() {
+        let pairs = parse_map("# rollout\n\nalpha = acme/alpha\nbeta=globex/b\n").unwrap();
+        assert_eq!(
+            pairs,
+            vec![
+                (ns("alpha"), ns("acme/alpha")),
+                (ns("beta"), ns("globex/b"))
+            ]
+        );
+        let object = parse_map(r#"{"alpha": "acme/alpha", "beta": "globex/b"}"#).unwrap();
+        assert_eq!(object, pairs);
+        let array = parse_map(
+            r#"[{"from": "alpha", "to": "acme/alpha"}, {"from": "beta", "to": "globex/b"}]"#,
+        )
+        .unwrap();
+        assert_eq!(array, pairs);
+
+        for (bad, why) in [
+            ("alpha acme/alpha", "is not bare=tenant/name"),
+            ("alpha=acme", "must be <tenant>/<name>"),
+            ("acme/x=acme/y", "must be a bare"),
+            ("alpha=acme/a\nalpha=acme/b", "mapped twice"),
+            ("alpha=acme/a\nbeta=acme/a", "two namespaces map to"),
+            ("# nothing\n", "no bare=tenant/name pairs"),
+            (r#"{"alpha": 3}"#, "not a string"),
+            (r#"[{"from": "alpha"}]"#, "missing field"),
+        ] {
+            let err = parse_map(bad).unwrap_err();
+            assert!(err.contains(why), "{bad:?}: {err}");
+        }
+    }
+
+    /// A bare namespace with one committed segment on local disk.
+    fn bare_with_segment(dir: &Path, control: &mut Controller, bare: &str, docs: u32) {
+        for path in ["seg-000001/doc_store.bin", "seg-000001/_COMMIT"] {
+            let file = dir.join(bare).join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, b"bytes").unwrap();
+        }
+        control
+            .save_manifest(&ns(bare), &manifest_with(1, &[("seg-000001", docs)]))
+            .unwrap();
+    }
+
+    fn printed(out: Vec<u8>) -> String {
+        String::from_utf8(out).unwrap()
+    }
+
+    /// A dry run over the whole batch changes nothing: no lease, no copy,
+    /// no rename.
+    #[test]
+    fn batch_dry_run_changes_nothing() {
+        let dir = crate::tests::test_dir();
+        let objects = LocalObjects::new(dir.clone());
+        let mut control = Controller::new();
+        bare_with_segment(&dir, &mut control, "alpha", 3);
+        bare_with_segment(&dir, &mut control, "beta", 5);
+        control.create_namespace(ns("acme/docs")).unwrap();
+        let batch = args(&[
+            "--all-unreachable",
+            "--tenant",
+            "acme",
+            "--dry-run",
+            "--skip-wal-check",
+        ])
+        .unwrap();
+
+        let mut out = Vec::new();
+        execute(&mut control, &objects, None, &batch, &mut out).unwrap();
+        let text = printed(out);
+        assert!(text.contains("[dry run, nothing changed]"), "{text}");
+        assert!(
+            text.contains("0 moved, 2 would move, 0 skipped, 0 refused"),
+            "{text}"
+        );
+        assert!(text.contains("alpha  acme/alpha  would move  3"), "{text}");
+
+        assert!(control.has_namespace(&ns("alpha")) && control.has_namespace(&ns("beta")));
+        assert!(!control.has_namespace(&ns("acme/alpha")));
+        assert!(!control.has_namespace(&ns("acme/beta")));
+        assert!(objects.list("acme/alpha").unwrap().is_empty());
+        assert!(objects.list("acme/beta").unwrap().is_empty());
+        assert_eq!(objects.list("alpha").unwrap().len(), 2);
+        // No lease was taken.
+        assert!(control
+            .acquire_writer_lease(&ns("alpha"), "ingest", Duration::from_secs(1))
+            .is_some());
+    }
+
+    /// A batch from a map file over the local storage path: one namespace
+    /// is refused (a live writer holds its lease), the other moves, the
+    /// batch reports both and fails; `--verify` then flags the one left.
+    /// Once the writer is gone, rerunning the batch skips the finished one
+    /// and moves the other, and verify passes.
+    #[test]
+    fn batch_moves_one_refuses_the_other_and_verify_reports_it() {
+        let dir = crate::tests::test_dir();
+        let objects = LocalObjects::new(dir.clone());
+        let mut control = Controller::new();
+        bare_with_segment(&dir, &mut control, "alpha", 3);
+        bare_with_segment(&dir, &mut control, "beta", 5);
+        let map = dir.join("rollout.map");
+        std::fs::write(&map, "alpha=acme/alpha\nbeta=globex/beta\n").unwrap();
+        let wal_dir = dir.join("_wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        let wal: Vec<Arc<dyn WalStore>> =
+            vec![Arc::new(kosha_write::wal::LocalWalStore::new(wal_dir))];
+        let batch = Args {
+            map: Some(map.clone()),
+            ..Default::default()
+        };
+        let verify_args = Args {
+            map: Some(map),
+            verify: true,
+            ..Default::default()
+        };
+
+        let token = control
+            .acquire_writer_lease(&ns("alpha"), "ingest-0", Duration::from_secs(60))
+            .unwrap();
+        let mut out = Vec::new();
+        let err = execute(&mut control, &objects, Some(&wal), &batch, &mut out).unwrap_err();
+        assert!(err.contains("1 of 2 namespace(s) refused"), "{err}");
+        let text = printed(out);
+        assert!(
+            text.contains("1 moved, 0 would move, 0 skipped, 1 refused"),
+            "{text}"
+        );
+        assert!(
+            text.contains("refused: a live writer holds the writer lease on alpha"),
+            "{text}"
+        );
+        let refused_row = text
+            .lines()
+            .find(|l| l.starts_with("alpha ") && l.contains("refused"))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(refused_row.contains("live writer"), "{refused_row}");
+        assert!(text
+            .lines()
+            .any(|l| l.starts_with("beta ") && l.contains(" moved ")));
+        // alpha untouched, beta moved.
+        assert!(control.has_namespace(&ns("alpha")));
+        assert!(!control.has_namespace(&ns("acme/alpha")));
+        assert!(objects.list("acme/alpha").unwrap().is_empty());
+        assert!(!control.has_namespace(&ns("beta")));
+        assert!(control.has_namespace(&ns("globex/beta")));
+        assert!(objects.list("beta").unwrap().is_empty());
+        assert_eq!(objects.list("globex/beta").unwrap().len(), 2);
+
+        // Verify flags alpha, passes beta, and lists alpha as unreachable.
+        let mut out = Vec::new();
+        let err = execute(&mut control, &objects, None, &verify_args, &mut out).unwrap_err();
+        assert!(err.contains("1 of 2 namespace(s) failed, 1 bare"), "{err}");
+        let text = printed(out);
+        assert!(
+            text.contains(
+                "alpha  acme/alpha   FAILED  0     0         alpha is still in the control plane"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("beta   globex/beta  ok      5     1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("unreachable bare namespaces: 1 (alpha)"),
+            "{text}"
+        );
+
+        // The writer stops; the rerun skips beta and moves alpha.
+        control.release_writer_lease(&ns("alpha"), "ingest-0", token);
+        let mut out = Vec::new();
+        execute(&mut control, &objects, Some(&wal), &batch, &mut out).unwrap();
+        let text = printed(out);
+        assert!(
+            text.contains("1 moved, 0 would move, 1 skipped, 0 refused"),
+            "{text}"
+        );
+        assert!(text
+            .lines()
+            .any(|l| l.starts_with("beta ") && l.contains("already migrated")));
+
+        let mut out = Vec::new();
+        execute(&mut control, &objects, None, &verify_args, &mut out).unwrap();
+        let text = printed(out);
+        assert!(
+            text.contains("alpha  acme/alpha   ok      3     1"),
+            "{text}"
+        );
+        assert!(text.contains("unreachable bare namespaces: none"), "{text}");
+        assert!(text.contains("verify: OK"), "{text}");
+    }
+
+    /// An unflushed WAL tail refuses that namespace only; verify fails on a
+    /// destination whose segment objects are gone and notes kept sources.
+    #[test]
+    fn batch_refuses_a_wal_tail_and_verify_checks_segments() {
+        let dir = crate::tests::test_dir();
+        let objects = LocalObjects::new(dir.clone());
+        let mut control = Controller::new();
+        bare_with_segment(&dir, &mut control, "alpha", 3);
+        bare_with_segment(&dir, &mut control, "beta", 5);
+        let wal_dir = dir.join("_wal");
+        kosha_write::wal::WalWriter::new(wal_dir.clone())
+            .append(
+                &ns("alpha"),
+                &[Document {
+                    id: DocumentId("late".into()),
+                    fields: vec![Field::text("text", "x")],
+                }],
+            )
+            .unwrap();
+        let wal: Vec<Arc<dyn WalStore>> =
+            vec![Arc::new(kosha_write::wal::LocalWalStore::new(wal_dir))];
+        let batch = args(&["--all-unreachable", "--tenant", "acme", "--keep-source"]).unwrap();
+        let mut out = Vec::new();
+        let err = execute(&mut control, &objects, Some(&wal), &batch, &mut out).unwrap_err();
+        assert!(err.contains("1 of 2"), "{err}");
+        let text = printed(out);
+        assert!(text.contains("past its manifest checkpoint"), "{text}");
+        assert!(control.has_namespace(&ns("acme/beta")));
+        assert!(control.has_namespace(&ns("alpha")));
+
+        // beta's sources were kept: verify passes it with a note.
+        let check = args(&["--verify", "--from", "beta", "--to", "acme/beta"]).unwrap();
+        let mut out = Vec::new();
+        execute(&mut control, &objects, None, &check, &mut out).unwrap_err();
+        let text = printed(out);
+        assert!(
+            text.contains("2 source objects still under beta/"),
+            "{text}"
+        );
+        assert!(text.contains("acme/beta  ok"), "{text}");
+
+        // A destination missing its segment objects fails.
+        std::fs::remove_dir_all(dir.join("acme/beta/seg-000001")).unwrap();
+        let (rows, bare) = verify(
+            &control,
+            &objects,
+            &[(ns("beta"), ns("acme/beta"))],
+            &mut Vec::new(),
+        );
+        assert_eq!(bare, vec![ns("alpha")]);
+        assert!(
+            rows[0]
+                .problem
+                .as_deref()
+                .is_some_and(|p| p.contains("1 of 1 segments have no objects under acme/beta/")),
+            "{rows:?}"
         );
     }
 }
