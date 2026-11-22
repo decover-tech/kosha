@@ -344,7 +344,7 @@ loses the events appended since the last flush.
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
 | `KOSHA_USAGE_METERING` | `on`, `true` or `1` turns usage metering on for this pod | off | flag |
-| `KOSHA_USAGE_SPOOL_DIR` | Directory of the local event spool. Put it on a persistent volume to keep undelivered events across pod replacement | `<KOSHA_DATA_DIR>/_usage` | path |
+| `KOSHA_USAGE_SPOOL_DIR` | Directory of the local event spool. Put it on a persistent volume to keep undelivered events across pod replacement. One directory per running pod: a starting pod takes over every spool file it finds, so two live pods sharing a directory lose events | `<KOSHA_DATA_DIR>/_usage` | path |
 | `KOSHA_USAGE_SPOOL_MAX_BYTES` | Cap on undelivered events on disk; further events are dropped and counted | `268435456` | bytes |
 | `KOSHA_USAGE_FLUSH_MS` | How often the spool is delivered to the store. Minimum 100 | `5000` | milliseconds |
 | `KOSHA_USAGE_SNAPSHOT_TICK_MS` | How often a writer checks for namespaces without a `stored_bytes` snapshot this hour (one object listing per namespace per hour). Minimum 1000 | `300000` | milliseconds |

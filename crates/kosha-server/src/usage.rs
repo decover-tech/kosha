@@ -40,6 +40,11 @@
 //! - Host crash, or a pod replaced with an empty disk: events appended
 //!   since the last flush are lost (at most one flush interval, plus
 //!   whatever was waiting on an unreachable store).
+//!
+//! The spool directory belongs to one running process. A process adopts
+//! every `active-*` file it finds at startup as a dead predecessor's, so two
+//! live processes on one directory would each send and delete the file the
+//! other is still appending to, losing those appends.
 
 use super::*;
 use kosha_control::usage::{
@@ -768,7 +773,16 @@ pub(crate) fn handle_usage(
     let namespaces: Vec<NamespaceUsage> =
         match usage_summary(meter.store.as_ref(), tenant, from_ms, to_ms) {
             Ok(usage) => usage,
-            Err(e) => return json_error(503, &format!("usage store unavailable: {e}")),
+            Err(e) => {
+                // The store's error text (driver and SQL detail) is for the
+                // operator: logged, and shown on the admin route only.
+                eprintln!("WARN: usage metering: read failed: {e}");
+                return if admin {
+                    json_error(503, &format!("usage store unavailable: {e}"))
+                } else {
+                    json_error(503, "usage store unavailable")
+                };
+            }
         };
     let mut total = NamespaceUsage::default();
     for usage in &namespaces {

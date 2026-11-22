@@ -14,6 +14,7 @@ struct FlakyStore {
     inner: MemoryUsageStore,
     down: AtomicBool,
     lose_next_reply: AtomicBool,
+    reads_down: AtomicBool,
     record_calls: AtomicU64,
 }
 
@@ -35,6 +36,11 @@ impl UsageStore for FlakyStore {
         from_ms: u64,
         to_ms: u64,
     ) -> Result<Vec<kosha_control::usage::UsageBucket>, KoshaError> {
+        if self.reads_down.load(Ordering::SeqCst) {
+            return Err(KoshaError::ControlPlane(
+                "injected: relation kosha.usage_events".into(),
+            ));
+        }
         self.inner.hourly(tenant, from_ms, to_ms)
     }
     fn latest_between(
@@ -692,6 +698,20 @@ fn the_read_api_is_tenant_scoped_and_the_admin_view_is_not() {
     assert_eq!(one["tenant"], "globex");
     assert_eq!(one["total"]["queries"], 0);
     assert_eq!(one["total"]["documents_written"], 1);
+}
+
+/// A failed read answers 503; the store's own error text reaches the admin
+/// route only, never a tenant.
+#[test]
+fn a_store_read_failure_does_not_show_a_tenant_the_store_error() {
+    let (state, store) = metered_state();
+    store.reads_down.store(true, Ordering::SeqCst);
+    let tenant = call(&state, "acme", "GET /v1/usage", serde_json::Value::Null);
+    assert_eq!(status_of(&tenant), 503, "{tenant}");
+    assert!(!tenant.contains("injected"), "{tenant}");
+    let admin = usage::handle_admin_usage("GET /v1/admin/usage HTTP/1.1\r\n", &state);
+    assert_eq!(status_of(&admin), 503, "{admin}");
+    assert!(admin.contains("injected"), "{admin}");
 }
 
 /// Metering is opt-in: a default server emits nothing, creates no spool
