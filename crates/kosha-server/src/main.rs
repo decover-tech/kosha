@@ -3586,6 +3586,28 @@ impl AppState {
         (files, bytes)
     }
 
+    /// Pin every segment directory of `manifest` in the disk cache until
+    /// the returned guard drops.
+    fn pin_segments(&self, ns: &NamespaceId, manifest: &kosha_core::Manifest) -> SegmentPins<'_> {
+        let keys: Vec<String> = manifest
+            .segments
+            .iter()
+            .filter_map(|entry| {
+                let dir = manifest.segment_dir(&self.data_dir, ns, &entry.segment_id);
+                dir.strip_prefix(&self.data_dir)
+                    .ok()
+                    .map(|rel| rel.to_string_lossy().into_owned())
+            })
+            .collect();
+        for key in &keys {
+            self.cache.pin(key);
+        }
+        SegmentPins {
+            cache: &self.cache,
+            keys,
+        }
+    }
+
     /// Fetch a batch of `(logical_path, projected_size_bytes)` pairs into
     /// the local cache, using cross-replica lease coordination when it's
     /// configured (`hydration_leases`) so a segment cold across the whole
@@ -5836,6 +5858,11 @@ fn cache_tenant_samples(state: &AppState) -> Vec<metrics::CacheTenantSample> {
         ("nvme", state.cache.tenant_stats()),
         ("segment", state.searcher.segment_cache_tenant_stats()),
         ("result", result),
+        (
+            "corpus_stats",
+            state.searcher.corpus_stats_cache_tenant_stats(),
+        ),
+        ("ceiling", state.searcher.ceiling_cache_tenant_stats()),
     ]
     .into_iter()
     .flat_map(|(cache, stats)| {
@@ -6376,16 +6403,32 @@ fn service_authorized(headers: &HashMap<String, String>, expected: Option<&str>)
         .is_some_and(|expected| request_key(headers) == Some(expected))
 }
 
-/// A tenant id, or a namespace or branch name a tenant supplies. Names
-/// starting with `_` or `.` are reserved for internal and legacy layouts
-/// (`<tenant>/_shard-NNNN` would otherwise be accounted to the shared
-/// `_legacy` tenant — see [`kosha_core::tenancy::is_reserved_name`]).
-fn valid_namespace_component(name: &str) -> bool {
+/// A tenant id as presented on a request: non-empty, not `.` or `..`, and
+/// free of separators and control characters.
+fn valid_name_component(name: &str) -> bool {
     !name.is_empty()
-        && !kosha_core::tenancy::is_reserved_name(name)
+        && name != "."
+        && name != ".."
         && !name
             .chars()
             .any(|c| c == '/' || c == '\\' || c.is_control())
+}
+
+/// A namespace or branch name a tenant supplies: a valid component that is
+/// not a shard component (`_shard-NNNN`). Stored as `<tenant>/_shard-0001`
+/// it would be read as a shard of the bare namespace `<tenant>` (and
+/// accounted to `_legacy`) — see [`kosha_core::tenancy::is_reserved_name`].
+/// Other names starting with `_` or `.` stay valid, so namespaces created
+/// before #342 remain reachable.
+fn valid_namespace_component(name: &str) -> bool {
+    valid_name_component(name) && !kosha_core::tenancy::is_reserved_name(name)
+}
+
+/// A tenant id for a newly registered API key. Ids starting with `_` or `.`
+/// are reserved: every namespace under them is accounted to the shared
+/// `_legacy` tenant. Existing keys are not re-checked per request.
+fn valid_new_tenant_id(tenant: &str) -> bool {
+    valid_name_component(tenant) && !tenant.starts_with('_') && !tenant.starts_with('.')
 }
 
 /// Authorize before dispatch, including compatibility and internal routes.
@@ -6408,7 +6451,7 @@ fn route(
             return json_error(403, "internal service credential required");
         }
     } else {
-        if !valid_namespace_component(tenant) {
+        if !valid_name_component(tenant) {
             return json_error(403, "invalid tenant");
         }
         if let Some(rest) = path.strip_prefix("/v1/namespaces/") {
@@ -8201,6 +8244,11 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     // See `hydration_budget`.
     #[cfg(feature = "s3")]
     let hydration_request = Arc::new(RequestHydration::new(state.hydrate_request_max_bytes));
+    // Hold this search's segments in the disk cache until it returns: once
+    // the working set reaches KOSHA_CACHE_MAX_BYTES, files fetched for it
+    // otherwise evicted files it had just checked, and it failed with
+    // "segment hydration failed".
+    let _segment_pins = state.pin_segments(&ns, manifest);
     // Read stamp for the disk-cache policy (#389): files this search
     // hydrates do not count its own read as a re-read. 0 when off.
     let cache_read_at = state.begin_cache_read();
@@ -8836,6 +8884,11 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
     // See `hydration_budget`.
     #[cfg(feature = "s3")]
     let hydration_request = Arc::new(RequestHydration::new(state.hydrate_request_max_bytes));
+    // Hold this search's segments in the disk cache until it returns: once
+    // the working set reaches KOSHA_CACHE_MAX_BYTES, files fetched for it
+    // otherwise evicted files it had just checked, and it failed with
+    // "segment hydration failed".
+    let _segment_pins = state.pin_segments(&ns, manifest);
 
     let cache_read_at = state.begin_cache_read();
     let t_hydrate = Instant::now();
@@ -10588,6 +10641,13 @@ fn handle_create_api_key(body: &[u8], _tenant: &str, state: &AppState) -> String
         Some(t) => t,
         None => return json_error(400, "missing 'tenant_id'"),
     };
+    if !valid_new_tenant_id(tenant_id) {
+        return json_error(
+            400,
+            "invalid 'tenant_id' (must be non-empty, without '/', '\\' or control \
+             characters, and not start with '_' or '.')",
+        );
+    }
 
     let description = req
         .get("description")
@@ -10797,7 +10857,9 @@ fn hydration_error_response(outcome: &HydrationOutcome) -> Option<String> {
         return Some(hydration_shed_response());
     }
     if !outcome.missing.is_empty() {
-        return Some(json_error(503, &hydration_failed_message(&outcome.missing)));
+        let message = hydration_failed_message(&outcome.missing);
+        eprintln!("ERROR: {message}{}", request_id());
+        return Some(json_error(503, &message));
     }
     None
 }
@@ -10892,6 +10954,20 @@ fn json_ok<T: serde::Serialize>(value: &T) -> String {
         "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{body}",
         body.len()
     )
+}
+
+/// Disk-cache pins on a search's segment directories, released on drop.
+struct SegmentPins<'a> {
+    cache: &'a Cache,
+    keys: Vec<String>,
+}
+
+impl Drop for SegmentPins<'_> {
+    fn drop(&mut self) {
+        for key in &self.keys {
+            self.cache.unpin(key);
+        }
+    }
 }
 
 /// One structured line per search request — the cold-read baseline
@@ -11345,6 +11421,60 @@ mod tests {
         );
     }
 
+    /// #342 review: a namespace with a leading `_` (written before the
+    /// shard-name reservation, which covers only `_shard-NNNN`) stays
+    /// writable, searchable and deletable, and a tenant id with a leading
+    /// `_` is not locked out. Only new API keys refuse such tenant ids.
+    #[test]
+    fn underscore_namespaces_and_tenants_stay_reachable() {
+        let state = test_state();
+        let ok = |resp: String| {
+            assert_eq!(status_of(&resp), 200, "{resp}");
+            body_of(&resp)
+        };
+        for tenant in ["acme", "_ops"] {
+            ok(v1(
+                &state,
+                tenant,
+                "POST /v1/namespaces/_staging/documents",
+                one_doc("d1", "quick fox"),
+            ));
+            ok(v1(
+                &state,
+                tenant,
+                "POST /v1/namespaces/_staging/flush",
+                serde_json::json!({}),
+            ));
+            let found = ok(v1(
+                &state,
+                tenant,
+                "POST /v1/namespaces/_staging/search",
+                serde_json::json!({"query_text": "quick"}),
+            ));
+            assert_eq!(found["total_hits"], 1, "{tenant}");
+            ok(v1(
+                &state,
+                tenant,
+                "GET /v1/namespaces/_staging/stats",
+                serde_json::Value::Null,
+            ));
+            let deleted = ok(v1(
+                &state,
+                tenant,
+                "DELETE /v1/namespaces/_staging",
+                serde_json::Value::Null,
+            ));
+            assert_eq!(deleted["namespace"], "_staging");
+        }
+        assert!(valid_new_tenant_id("acme"));
+        assert!(!valid_new_tenant_id("_ops"));
+        assert!(!valid_new_tenant_id(".x"));
+        assert!(!valid_new_tenant_id("a/b"));
+        assert!(valid_name_component("_ops"));
+        assert!(valid_namespace_component("_staging"));
+        assert!(!valid_namespace_component("_shard-0001"));
+    }
+
     #[test]
     fn namespace_create_conflicts_validates_and_is_tenant_scoped() {
         let state = test_state();
@@ -11396,16 +11526,14 @@ mod tests {
             serde_json::json!({"namespace": ".."}),
             serde_json::json!({"namespace": 7}),
             serde_json::json!({}),
-            // Reserved: `acme/_shard-0001` would be accounted to `_legacy`.
+            // Reserved: `acme/_shard-0001` is the layout of a shard of the
+            // bare namespace `acme` (and is accounted to `_legacy`).
             serde_json::json!({"namespace": "_shard-0001"}),
-            serde_json::json!({"namespace": "_internal"}),
-            serde_json::json!({"namespace": ".hidden"}),
         ] {
             let resp = create("acme", bad.clone());
             assert_eq!(status_of(&resp), 400, "{bad} → {resp}");
         }
-        // Nor can a tenant reach one through a namespace route, and a
-        // tenant id with a reserved prefix is refused outright.
+        // Nor can a tenant reach one through a namespace route.
         let shard_route = v1(
             &state,
             "acme",
@@ -11413,8 +11541,15 @@ mod tests {
             serde_json::json!({"query_text": "x"}),
         );
         assert_eq!(status_of(&shard_route), 400, "{shard_route}");
-        let bad_tenant = create("_legacy", serde_json::json!({"namespace": "docs"}));
-        assert_eq!(status_of(&bad_tenant), 403, "{bad_tenant}");
+        // Only the shard shape is reserved: other names with a leading `_`
+        // or `.` are still created, and an existing tenant id with a
+        // leading `_` still authenticates.
+        for name in ["_internal", ".hidden"] {
+            let resp = create("acme", serde_json::json!({"namespace": name}));
+            assert_eq!(status_of(&resp), 200, "{name} → {resp}");
+        }
+        let underscore_tenant = create("_ops", serde_json::json!({"namespace": "docs"}));
+        assert_eq!(status_of(&underscore_tenant), 200, "{underscore_tenant}");
         let not_json = route(
             "POST /v1/namespaces HTTP/1.1\r\n",
             &HashMap::new(),

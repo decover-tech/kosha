@@ -841,8 +841,8 @@ impl TwoTierAnalyzer<'_> {
                 let rest = top_k_by(&mut all, k, |c| (c.lb, (c.seg, c.doc)));
                 let mut rest_ub = [f64::NEG_INFINITY; NB];
                 for c in &rest {
-                    for b in 0..NB {
-                        rest_ub[b] = rest_ub[b].max(c.ub[b]);
+                    for (slot, ub) in rest_ub.iter_mut().zip(c.ub.iter()) {
+                        *slot = slot.max(*ub);
                     }
                 }
                 fractions.push(SegFraction {
@@ -1480,10 +1480,10 @@ pub fn footprint(segments: &[Segment], config: &Config) -> Result<Footprint, Kos
                         .collect();
                     let masks = head_masks(&keys, &sizes);
                     let weight_total: f64 = list.iter().map(|&(_, tf)| 1.0 + tf as f64).sum();
-                    for j in 0..nf {
+                    for (j, &size) in sizes.iter().enumerate().take(nf) {
                         let bit = 1u8 << j;
                         let ff = &mut fp.fractions[j];
-                        ff.head_postings += sizes[j] as u64;
+                        ff.head_postings += size as u64;
                         let pick = |head: bool| {
                             list.iter()
                                 .zip(&masks)

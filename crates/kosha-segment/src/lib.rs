@@ -6479,6 +6479,25 @@ pub fn footer_vector_field_status(footer: &Footer, field: &str) -> Option<Vector
 /// lazy v2 vector index.
 pub type BudgetedKnnResult = Option<Result<(Vec<(u32, f64)>, usize), KoshaError>>;
 
+/// What a restricted, globally budgeted kNN probe does once its budget is
+/// spent and it has found fewer than `k` accepted documents (see
+/// [`SegmentReader::knn_search_within_filtered`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KnnRefill {
+    /// Keep probing outward until `k` are found or the segment is read in
+    /// full, even in a segment the budget chose no posting from. For a
+    /// filter: the budget was sized without knowing where the filter's
+    /// documents are, so any segment may hold the only ones that pass.
+    #[default]
+    Always,
+    /// Keep probing only in a segment the budget chose at least one posting
+    /// from. For a restriction that is deleted documents alone: a segment
+    /// outside the global cutoff is skipped exactly as it would be with no
+    /// deletes, instead of being probed for `k` hits just because it holds
+    /// a tombstone.
+    BudgetedSegments,
+}
+
 /// How much of a column a kNN probe reads (#381, see
 /// [`SegmentReader::knn_candidates_fetching`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -6489,6 +6508,7 @@ pub enum KnnProbeBudget {
     Within {
         max_distance: f32,
         max_probes: usize,
+        refill: KnnRefill,
     },
     /// The per-segment fallback: the `nprobe` nearest centroids.
     Nprobe(usize),
@@ -7666,7 +7686,16 @@ impl SegmentReader {
     ) -> BudgetedKnnResult {
         let field = self.default_vector_field()?;
         let vi = field.lazy.as_ref()?;
-        Some(self.knn_search_within_lazy(vi, query, k, max_distance, max_probes, None, None))
+        Some(self.knn_search_within_lazy(
+            vi,
+            query,
+            k,
+            max_distance,
+            max_probes,
+            None,
+            KnnRefill::Always,
+            None,
+        ))
     }
 
     /// [`Self::knn_search_within`] over `field`'s column (#204), restricted
@@ -7685,6 +7714,9 @@ impl SegmentReader {
     /// read in full. A selective filter therefore costs more I/O in the
     /// segments that hold its documents, and always returns them: the
     /// alternative is an empty or short page for a filter that does match.
+    /// This is [`KnnRefill::Always`]; a caller whose restriction is deleted
+    /// documents alone passes [`KnnRefill::BudgetedSegments`] to
+    /// [`Self::knn_search_within_filtered_fetching`] instead.
     pub fn knn_search_within_filtered(
         &self,
         field: &str,
@@ -7701,6 +7733,7 @@ impl SegmentReader {
             max_distance,
             max_probes,
             accept,
+            KnnRefill::Always,
             None,
         )
     }
@@ -7719,6 +7752,7 @@ impl SegmentReader {
         max_distance: f32,
         max_probes: usize,
         accept: Option<&dyn Fn(u32) -> bool>,
+        refill: KnnRefill,
         fetch: Option<VectorSpanFetch<'_>>,
     ) -> BudgetedKnnResult {
         let index = match self.vector_field(field) {
@@ -7729,7 +7763,16 @@ impl SegmentReader {
         if let Err(e) = Self::check_query_dim(vi, field, query) {
             return Some(Err(e));
         }
-        Some(self.knn_search_within_lazy(vi, query, k, max_distance, max_probes, accept, fetch))
+        Some(self.knn_search_within_lazy(
+            vi,
+            query,
+            k,
+            max_distance,
+            max_probes,
+            accept,
+            refill,
+            fetch,
+        ))
     }
 
     /// The candidates half of a kNN probe over `field`'s column, for
@@ -7771,7 +7814,17 @@ impl SegmentReader {
             KnnProbeBudget::Within {
                 max_distance,
                 max_probes,
-            } => self.probe_within_lazy(vi, query, k, max_distance, max_probes, accept, fetch),
+                refill,
+            } => self.probe_within_lazy(
+                vi,
+                query,
+                k,
+                max_distance,
+                max_probes,
+                accept,
+                refill,
+                fetch,
+            ),
             KnnProbeBudget::Nprobe(nprobe) => {
                 let mut unit = query.to_vec();
                 if vi.unit_norm {
@@ -8087,10 +8140,19 @@ impl SegmentReader {
         max_distance: f32,
         max_probes: usize,
         accept: Option<&dyn Fn(u32) -> bool>,
+        refill: KnnRefill,
         fetch: Option<VectorSpanFetch<'_>>,
     ) -> Result<(Vec<(u32, f64)>, usize), KoshaError> {
-        let probed =
-            self.probe_within_lazy(vi, query, k, max_distance, max_probes, accept, fetch)?;
+        let probed = self.probe_within_lazy(
+            vi,
+            query,
+            k,
+            max_distance,
+            max_probes,
+            accept,
+            refill,
+            fetch,
+        )?;
         Ok((
             self.finish_probe(vi, query, probed.scored, &probed.errors, k),
             probed.postings,
@@ -8108,6 +8170,7 @@ impl SegmentReader {
         max_distance: f32,
         max_probes: usize,
         accept: Option<&dyn Fn(u32) -> bool>,
+        refill: KnnRefill,
         fetch: Option<VectorSpanFetch<'_>>,
     ) -> Result<ProbedCandidates, KoshaError> {
         // Rank this segment's qualifying postings nearest-first (by lower
@@ -8141,8 +8204,13 @@ impl SegmentReader {
             if position >= budgeted {
                 // Past the budget. Without a restriction this is where the
                 // probe ends. With one, keep going only while the page is
-                // still short (see the doc comment on the public wrapper).
-                if accept.is_none() || scored.len() >= k {
+                // still short (see the doc comment on the public wrapper),
+                // and, when the restriction is deletes alone, only in a
+                // segment the budget reached at all (see `KnnRefill`).
+                if accept.is_none()
+                    || scored.len() >= k
+                    || (refill == KnnRefill::BudgetedSegments && budgeted == 0)
+                {
                     break;
                 }
                 if (position - budgeted) % VECTOR_PREFETCH_CHUNK == 0 {

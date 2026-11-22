@@ -421,6 +421,10 @@ impl Drop for AdmissionPermit {
 /// [`kosha_core::tenancy`]) and evicts from the tenant furthest over its
 /// weighted share of `max_bytes`, least recently used first within that
 /// tenant, never taking a tenant below its floor while another can give.
+/// When the entry-count bound is the one exceeded, shares and the floor
+/// are counted in entries instead (the byte floor over the average entry
+/// size the budget allows), so a tenant opening many tiny segments evicts
+/// its own entries rather than another tenant's few large ones.
 /// Cache key: `(namespace, segment_id, load_vectors)`.
 type SegmentCacheKey = (String, String, bool);
 
@@ -575,7 +579,20 @@ impl SegmentCache {
             }
             // Stale recency keys (entry already gone) are dropped as found.
             recency.retain(|k| entries.contains_key(k));
-            let usage = tenants.usage();
+            // Which bound binds decides the currency of the tenant shares:
+            // past the entry bound (and not the byte bound), a tenant
+            // holding many tiny segments is the one over its share, not
+            // the one holding the most bytes (#342).
+            let by_entries = entries.len() > self.capacity && total <= self.max_bytes;
+            let usage: Vec<(&str, u64)> = if by_entries {
+                let mut counts: HashMap<&str, u64> = HashMap::new();
+                for key in entries.keys() {
+                    *counts.entry(tenant_of_namespace(&key.0)).or_insert(0) += 1;
+                }
+                counts.into_iter().collect()
+            } else {
+                tenants.usage()
+            };
             // One pass: each active tenant's least recently used idle entry.
             let mut oldest: HashMap<&str, (usize, u64)> = HashMap::new();
             let mut first_idle: Option<usize> = None;
@@ -595,10 +612,22 @@ impl SegmentCache {
                     }
                 }
             }
-            let victim = shares
-                .pick_victim(self.max_bytes, &usage, |t| {
+            let picked = if by_entries {
+                // The byte floor in entries: the floor's worth of entries
+                // of the average size the budget allows, at least one.
+                let avg_entry = (self.max_bytes / self.capacity.max(1) as u64).max(1);
+                let floor_entries = (shares.min_bytes() / avg_entry).max(1);
+                shares.clone().with_min_bytes(floor_entries).pick_victim(
+                    self.capacity as u64,
+                    &usage,
+                    |t| oldest.get(t).map(|_| 1),
+                )
+            } else {
+                shares.pick_victim(self.max_bytes, &usage, |t| {
                     oldest.get(t).map(|(_, size)| *size)
                 })
+            };
+            let victim = picked
                 .and_then(|t| oldest.get(t).map(|(pos, _)| *pos))
                 .or(first_idle);
             drop(oldest);
@@ -1455,19 +1484,46 @@ struct CorpusStatsCache {
     entries: Mutex<HashMap<CorpusKey, Arc<CorpusEntry>>>,
     /// Weights for [`make_room_by_tenant`] (#342).
     shares: std::sync::RwLock<TenantShares>,
+    /// Per-tenant hits, misses and evictions (#342). Bytes are not tracked:
+    /// the cache is bounded by entry count. Lock order: `entries`, then
+    /// `tenants`.
+    tenants: Mutex<TenantLedger>,
 }
 
 impl CorpusStatsCache {
     fn get(&self, key: &CorpusKey) -> Option<Arc<CorpusEntry>> {
-        self.entries.lock().unwrap().get(key).cloned()
+        let hit = self.entries.lock().unwrap().get(key).cloned();
+        record_lookup(&self.tenants, &key.0, hit.is_some());
+        hit
     }
 
     fn insert(&self, key: CorpusKey, entry: Arc<CorpusEntry>) -> Arc<CorpusEntry> {
         let mut entries = self.entries.lock().unwrap();
         entries.retain(|k, _| corpus_entry_survives(k, &key));
         let shares = self.shares.read().unwrap_or_else(|e| e.into_inner());
-        make_room_by_tenant(&mut entries, CORPUS_STATS_MAX_ENTRIES, &shares);
+        let mut tenants = self.tenants.lock().unwrap();
+        make_room_by_tenant(
+            &mut entries,
+            CORPUS_STATS_MAX_ENTRIES,
+            &shares,
+            &mut tenants,
+        );
         Arc::clone(entries.entry(key).or_insert(entry))
+    }
+
+    fn tenant_stats(&self) -> Vec<TenantCacheStats> {
+        self.tenants.lock().unwrap().stats()
+    }
+}
+
+/// Count a lookup in a manifest-level cache against its namespace's tenant.
+fn record_lookup(ledger: &Mutex<TenantLedger>, namespace: &str, hit: bool) {
+    let mut ledger = ledger.lock().unwrap();
+    let tenant = tenant_of_namespace(namespace);
+    if hit {
+        ledger.hit(tenant);
+    } else {
+        ledger.miss(tenant);
     }
 }
 
@@ -1475,8 +1531,14 @@ impl CorpusStatsCache {
 /// `max` entries (#342): remove entries, oldest manifest version first,
 /// from the tenant holding the most entries relative to its weighted share
 /// of `max`, instead of clearing every tenant's entries at once. Each
-/// active tenant keeps at least one entry while another can give.
-fn make_room_by_tenant<V>(entries: &mut HashMap<CorpusKey, V>, max: usize, shares: &TenantShares) {
+/// active tenant keeps at least one entry while another can give. Each
+/// removal counts as an eviction of its tenant in `ledger`.
+fn make_room_by_tenant<V>(
+    entries: &mut HashMap<CorpusKey, V>,
+    max: usize,
+    shares: &TenantShares,
+    ledger: &mut TenantLedger,
+) {
     let shares = shares.clone().with_min_bytes(1);
     while !entries.is_empty() && entries.len() >= max {
         let mut counts: HashMap<&str, u64> = HashMap::new();
@@ -1499,6 +1561,7 @@ fn make_room_by_tenant<V>(entries: &mut HashMap<CorpusKey, V>, max: usize, share
         match victim {
             Some(key) => {
                 entries.remove(&key);
+                ledger.evicted(tenant_of_namespace(&key.0));
             }
             None => break,
         }
@@ -1600,19 +1663,33 @@ struct CeilingCache {
     entries: Mutex<HashMap<CorpusKey, Arc<CeilingEntry>>>,
     /// Weights for [`make_room_by_tenant`] (#342).
     shares: std::sync::RwLock<TenantShares>,
+    /// Per-tenant hits, misses and evictions, as in [`CorpusStatsCache`].
+    tenants: Mutex<TenantLedger>,
 }
 
 impl CeilingCache {
     fn get(&self, key: &CorpusKey) -> Option<Arc<CeilingEntry>> {
-        self.entries.lock().unwrap().get(key).cloned()
+        let hit = self.entries.lock().unwrap().get(key).cloned();
+        record_lookup(&self.tenants, &key.0, hit.is_some());
+        hit
     }
 
     fn insert(&self, key: CorpusKey, entry: Arc<CeilingEntry>) -> Arc<CeilingEntry> {
         let mut entries = self.entries.lock().unwrap();
         entries.retain(|k, _| corpus_entry_survives(k, &key));
         let shares = self.shares.read().unwrap_or_else(|e| e.into_inner());
-        make_room_by_tenant(&mut entries, CEILING_CACHE_MAX_ENTRIES, &shares);
+        let mut tenants = self.tenants.lock().unwrap();
+        make_room_by_tenant(
+            &mut entries,
+            CEILING_CACHE_MAX_ENTRIES,
+            &shares,
+            &mut tenants,
+        );
         Arc::clone(entries.entry(key).or_insert(entry))
+    }
+
+    fn tenant_stats(&self) -> Vec<TenantCacheStats> {
+        self.tenants.lock().unwrap().stats()
     }
 }
 
@@ -2066,15 +2143,62 @@ pub fn apply_highlight(
     pre_tag: &str,
     post_tag: &str,
 ) -> String {
-    let mut result = text.to_string();
+    // Lowercasing can change a character's UTF-8 length ("İ" is 2 bytes,
+    // its lowercase is 3), so an offset found in the lowercased text is not
+    // an offset into `text`. `bounds` records, for every character of
+    // `text`, where its lowercase form starts in `lowered` and where the
+    // character itself starts in `text`, so a match is mapped back to whole
+    // characters of the original.
+    let mut lowered = String::with_capacity(text.len());
+    let mut bounds: Vec<(usize, usize)> = Vec::with_capacity(text.len() + 1);
+    for (orig, c) in text.char_indices() {
+        bounds.push((lowered.len(), orig));
+        lowered.extend(c.to_lowercase());
+    }
+    bounds.push((lowered.len(), text.len()));
+    // Original-text byte range of the characters covering lowered[ls..le).
+    let to_original = |ls: usize, le: usize| -> (usize, usize) {
+        let first = bounds.partition_point(|&(l, _)| l <= ls) - 1;
+        let last = bounds.partition_point(|&(l, _)| l < le);
+        (bounds[first].1, bounds[last].1)
+    };
+
+    // One span per term: its first occurrence that does not overlap a span
+    // already taken. Spans are found on the untouched text and applied in a
+    // single pass, so a later term can never match inside an inserted tag.
+    let mut spans: Vec<(usize, usize)> = Vec::new();
     for term in query_terms {
-        let lower = term.to_lowercase();
-        if let Some(start) = result.to_lowercase().find(&lower) {
-            let (before, rest) = result.split_at(start);
-            let (matched, after) = rest.split_at(lower.len());
-            result = format!("{}{}{}{}{}", before, pre_tag, matched, post_tag, after);
+        let needle = term.to_lowercase();
+        if needle.is_empty() {
+            continue;
+        }
+        let mut from = 0;
+        while let Some(found) = lowered[from..].find(&needle) {
+            let ls = from + found;
+            let (start, end) = to_original(ls, ls + needle.len());
+            if spans.iter().all(|&(s, e)| end <= s || start >= e) {
+                spans.push((start, end));
+                break;
+            }
+            // Step one character forward in the lowered text.
+            from = ls + lowered[ls..].chars().next().map_or(1, char::len_utf8);
         }
     }
+    if spans.is_empty() {
+        return text.to_string();
+    }
+    spans.sort_unstable();
+    let mut result =
+        String::with_capacity(text.len() + spans.len() * (pre_tag.len() + post_tag.len()));
+    let mut cursor = 0;
+    for (start, end) in spans {
+        result.push_str(&text[cursor..start]);
+        result.push_str(pre_tag);
+        result.push_str(&text[start..end]);
+        result.push_str(post_tag);
+        cursor = end;
+    }
+    result.push_str(&text[cursor..]);
     result
 }
 
@@ -2824,6 +2948,19 @@ impl Searcher {
         self.segment_cache.tenant_stats()
     }
 
+    /// Per-tenant hits, misses and evictions of the corpus-statistics
+    /// cache (#342), for `kosha_cache_*{cache="corpus_stats",tenant}`.
+    /// Bounded by entry count, so its bytes are not tracked.
+    pub fn corpus_stats_cache_tenant_stats(&self) -> Vec<TenantCacheStats> {
+        self.corpus_stats.tenant_stats()
+    }
+
+    /// Per-tenant hits, misses and evictions of the score-ceiling cache
+    /// (#342), for `kosha_cache_*{cache="ceiling",tenant}`.
+    pub fn ceiling_cache_tenant_stats(&self) -> Vec<TenantCacheStats> {
+        self.ceilings.tenant_stats()
+    }
+
     /// Set how the in-memory caches (parsed segments, corpus statistics,
     /// score ceilings) split their budgets between tenants (#342). The
     /// default comes from `KOSHA_CACHE_TENANT_MIN_BYTES` with equal
@@ -3264,9 +3401,12 @@ impl Searcher {
         debug_assert!(query.limit_per.is_none());
         let fetch_k = knn.k;
         let budget = match cutoff {
+            // This pass runs unfiltered requests only, so the one
+            // restriction a segment can have is its deleted documents.
             Some((max_distance, max_probes)) => kosha_segment::KnnProbeBudget::Within {
                 max_distance,
                 max_probes,
+                refill: kosha_segment::KnnRefill::BudgetedSegments,
             },
             None => kosha_segment::KnnProbeBudget::Nprobe(knn.num_candidates),
         };
@@ -4303,6 +4443,7 @@ impl Searcher {
         // segment with no deletes pays one predictable branch per posting
         // and never calls into the set lookups at all.
         let restricted = filter_set.is_some() || segment_tombstones.is_some();
+        let filtered = filter_set.is_some();
         let rejected = |doc_seq: u32| -> bool { restricted && !accept(doc_seq) };
 
         // Columnar segments (#244) aggregate and sort straight from their
@@ -5572,6 +5713,16 @@ impl Searcher {
                     && accept(doc_seq)
             };
             let knn_restricted = restricted || knn_filter_set.is_some();
+            // A filter can put its only passing documents in a segment the
+            // global budget chose nothing from, so a filtered probe refills
+            // everywhere. Deleted documents alone do not move the nearest
+            // neighbours to another segment: a segment outside the cutoff
+            // stays unprobed, as it would be with no tombstone in it.
+            let knn_refill = if filtered || knn_filter_set.is_some() {
+                kosha_segment::KnnRefill::Always
+            } else {
+                kosha_segment::KnnRefill::BudgetedSegments
+            };
             let knn_accept_dyn: Option<&dyn Fn(u32) -> bool> = if knn_restricted {
                 Some(&knn_accept)
             } else {
@@ -5736,6 +5887,7 @@ impl Searcher {
                                 cutoff,
                                 effective_budget,
                                 knn_accept_dyn,
+                                knn_refill,
                                 vector_fetch,
                             )
                             .map(|r| {
@@ -9624,6 +9776,59 @@ mod tests {
         assert!(d.highlight.is_none() && d.highlights.is_none());
     }
 
+    /// Lowercasing "İ" grows it from 2 to 3 bytes, so an offset found in
+    /// the lowercased text used to land past the end of the original (or
+    /// inside a character) and panic.
+    #[test]
+    fn apply_highlight_maps_offsets_through_case_folding() {
+        let t = |s: &str| vec![s.to_string()];
+        assert_eq!(
+            apply_highlight("İstanbul café", &t("café"), "<b>", "</b>"),
+            "İstanbul <b>café</b>"
+        );
+        assert_eq!(
+            apply_highlight("İİİİ the contract", &t("contract"), "<b>", "</b>"),
+            "İİİİ the <b>contract</b>"
+        );
+        assert_eq!(
+            apply_highlight("İstanbul hukuk bürosu", &t("hukuk"), "<em>", "</em>"),
+            "İstanbul <em>hukuk</em> bürosu"
+        );
+        // A match on the expanded character marks the whole character.
+        assert_eq!(apply_highlight("İstanbul", &t("i"), "[", "]"), "[İ]stanbul");
+        assert_eq!(
+            apply_highlight("STRASSE Straße", &t("straße"), "[", "]"),
+            "STRASSE [Straße]"
+        );
+        assert_eq!(apply_highlight("abc", &t(""), "[", "]"), "abc");
+    }
+
+    /// A later term must not match inside the tag inserted for an earlier
+    /// one, and overlapping matches must not nest.
+    #[test]
+    fn apply_highlight_never_matches_inserted_tags() {
+        let terms = |ts: &[&str]| ts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            apply_highlight("plan b for the plan", &terms(&["plan", "b"]), "<b>", "</b>"),
+            "<b>plan</b> <b>b</b> for the plan"
+        );
+        assert_eq!(
+            apply_highlight(
+                "contract member",
+                &terms(&["contract", "em"]),
+                "<em>",
+                "</em>"
+            ),
+            "<em>contract</em> m<em>em</em>ber"
+        );
+        // "tract" overlaps the span taken by "contract" and has no other
+        // occurrence, so it adds nothing.
+        assert_eq!(
+            apply_highlight("contract", &terms(&["contract", "tract"]), "[", "]"),
+            "[contract]"
+        );
+    }
+
     fn mk_query(text: &str, max: usize) -> SearchQuery {
         SearchQuery {
             query_text: text.into(),
@@ -11666,6 +11871,52 @@ mod tests {
     }
 
     #[test]
+    fn segment_cache_entry_bound_evicts_the_tenant_with_the_most_entries() {
+        // #342 review: when the entry-count bound binds (tiny upserts leave
+        // many small segments), tenant A flooding tiny segments must evict
+        // its own entries, not tenant B's few large ones.
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-segment-cache-entry-bound-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut writer = SegmentWriter::new(SegmentId("s".into()), dir.clone());
+        writer.add_document(DocumentId("d".into()), vec![Field::text("t", "alpha")]);
+        writer.finalize(Bm25Params::default()).unwrap();
+        let ledger = Arc::new(MemoryLedger::new(u64::MAX, Duration::from_secs(1)));
+        let segment = || {
+            Arc::new(TrackedSegment::new(
+                SegmentReader::open(dir.clone()).unwrap(),
+                100,
+                Arc::clone(&ledger),
+            ))
+        };
+        let key = |ns: &str, i: usize| (ns.to_string(), format!("seg-{i}"), false);
+        // 100 entries / 100,000 bytes: 1,000 bytes per entry on average,
+        // so the 10,000-byte floor is 10 entries.
+        let cache = SegmentCache::new(100, 100_000);
+        *cache.shares.write().unwrap() = TenantShares::new(10_000);
+        for i in 0..20 {
+            cache.insert(key("beta/docs", i), segment(), 1_000);
+        }
+        for i in 0..500 {
+            cache.insert(key("acme/tiny", i), segment(), 1);
+            assert!(cache.entries.lock().unwrap().len() <= 100);
+        }
+        let stats = cache.tenant_stats();
+        let beta = stats.iter().find(|s| s.tenant == "beta").unwrap();
+        assert_eq!(beta.bytes, 20_000, "B is under its share of entries");
+        assert_eq!(beta.evictions, 0);
+        let hits = (0..20)
+            .filter(|i| cache.get(&key("beta/docs", *i)).is_some())
+            .count();
+        assert_eq!(hits, 20, "B's warm hit rate stays at 100%");
+        let acme = stats.iter().find(|s| s.tenant == "acme").unwrap();
+        assert_eq!(acme.evictions, 420);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn manifest_caches_make_room_from_the_busiest_tenant() {
         // #342: a tenant cycling through many namespaces used to clear
         // every tenant's corpus statistics once the cache filled.
@@ -11674,8 +11925,12 @@ mod tests {
         for i in 0..9 {
             entries.insert((format!("acme/ns-{i}"), i, 0, false), ());
         }
-        make_room_by_tenant(&mut entries, 10, &TenantShares::default());
+        let mut ledger = TenantLedger::default();
+        make_room_by_tenant(&mut entries, 10, &TenantShares::default(), &mut ledger);
         assert_eq!(entries.len(), 9);
+        let stats = ledger.stats();
+        assert_eq!(stats.len(), 1);
+        assert_eq!((stats[0].tenant.as_str(), stats[0].evictions), ("acme", 1));
         assert!(entries.contains_key(&("beta/docs".into(), 7, 0, false)));
         assert!(
             !entries.contains_key(&("acme/ns-0".into(), 0, 0, false)),

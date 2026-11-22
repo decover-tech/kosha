@@ -122,6 +122,12 @@ spec:
             # the pod. Still under the 24 GiB disk cache budget above.
             - name: KOSHA_HYDRATE_REQUEST_MAX_BYTES
               value: "8589934592"
+            # Boot warm-up keeps at most 12 GiB local; the rest is fetched on
+            # demand. Unbounded, a pod warming a namespace that had grown to
+            # two matters filled its node's 50 GB root disk (DiskPressure,
+            # evicted, 22 replacements rejected).
+            - name: KOSHA_WARMUP_BUDGET_BYTES
+              value: "12G"
           resources:
             requests:
               cpu: "2"

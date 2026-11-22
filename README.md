@@ -614,6 +614,15 @@ rejected. Legacy callers that previously accessed bare stored namespaces need
 an explicit migration to tenant-scoped namespaces; this change does not rename
 existing data automatically.
 
+A namespace or branch name is a single path component: non-empty, not `.` or
+`..`, and free of `/`, `\` and control characters. Names of the exact form
+`_shard-NNNN` (four digits) are reserved, because `<tenant>/_shard-0001` is the
+storage layout of a shard of the bare namespace `<tenant>`. Other names starting
+with `_` or `.` are allowed. New API keys (`POST /v1/admin/api-keys`) refuse a
+tenant id starting with `_` or `.`, since namespaces under it would be accounted
+to the shared `_legacy` cache tenant; such ids already configured keep working,
+and the server logs a warning at startup for any in `KOSHA_API_KEYS`.
+
 - Set `KOSHA_ADMIN_API_KEY` for `/v1/admin/*` and global `/stats` access.
 - Set a separate `KOSHA_INTERNAL_API_KEY` on every peer participating in segment
   hydration. Tenant API keys do not authorize admin or peer-file access.

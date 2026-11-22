@@ -1,0 +1,17 @@
+# The indexer compacts; merging a 1.8M-chunk matter's segments was
+# OOMKilled at the base 4Gi limit (staging, 2026-11-22).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kosha-indexer
+  namespace: kosha
+spec:
+  template:
+    spec:
+      containers:
+        - name: kosha
+          resources:
+            requests:
+              memory: "4Gi"
+            limits:
+              memory: "16Gi"

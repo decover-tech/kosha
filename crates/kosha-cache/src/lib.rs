@@ -19,7 +19,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::time::SystemTime;
 
@@ -29,7 +29,30 @@ use kosha_core::tenancy::{
 };
 use kosha_core::KoshaError;
 
+/// The tenant of a directory key: a segment directory
+/// (`{namespace}/{segment}`) or a per-file span-cache directory
+/// (`{namespace}/{segment}/{file}.spans`), which is named like the file it
+/// caches spans of and belongs to that file's namespace.
+fn tenant_of_dir_key(key: &str) -> &str {
+    if key.trim_end_matches('/').ends_with(".spans") {
+        tenant_of_file_key(key)
+    } else {
+        tenant_of_segment_dir(key)
+    }
+}
+
 mod policy;
+
+/// Whether `key` holds a pin, either itself or through a directory that
+/// contains it: a search pins its segments' directories so no file it is
+/// using can be evicted mid-request.
+pub(crate) fn held(pinned: &HashMap<String, usize>, key: &str) -> bool {
+    let key = key.trim_start_matches('/');
+    pinned.contains_key(key)
+        || key
+            .match_indices('/')
+            .any(|(i, _)| pinned.contains_key(&key[..i]))
+}
 use policy::PolicyState;
 pub use policy::{CachePolicy, Classifier, ReadHint, CLASS_ANY};
 
@@ -196,7 +219,7 @@ impl Recency {
         self.by_tenant
             .get(tenant)?
             .iter()
-            .find(|k| !pinned.contains_key(k.as_str()))
+            .find(|k| !held(pinned, k))
     }
 }
 
@@ -229,6 +252,9 @@ pub struct Cache {
     /// Bumped once per file/dir actually removed by `evict` — see
     /// `eviction_generation()`.
     eviction_generation: AtomicU64,
+    /// Whether the last `enforce_limit` ended over `max_bytes` because every
+    /// remaining file was pinned. Logged on each change, not on every write.
+    over_budget: AtomicBool,
     /// Cache keys ordered oldest-touched (front) to most-recently-touched
     /// (back). Touched on both read and write.
     recency: Mutex<Recency>,
@@ -327,6 +353,7 @@ impl Cache {
             max_bytes: options.max_bytes,
             total_bytes: AtomicU64::new(total_bytes),
             eviction_generation: AtomicU64::new(0),
+            over_budget: AtomicBool::new(false),
             recency: Mutex::new(Recency::from_order(recency)),
             pinned: Mutex::new(HashMap::new()),
             tracked: Mutex::new(tracked),
@@ -529,7 +556,9 @@ impl Cache {
         }
     }
 
-    /// True if `key` currently has at least one outstanding pin.
+    /// True if `key` currently has at least one outstanding pin. A pin on a
+    /// directory (`pin("ns/segment")`) also holds every file under it
+    /// against eviction; see [`held`].
     pub fn is_pinned(&self, key: &str) -> bool {
         self.pinned.lock().unwrap().contains_key(key)
     }
@@ -585,10 +614,7 @@ impl Cache {
         // No tenant holding bytes has anything evictable: fall back to the
         // least recently used unpinned key overall (say, an untracked
         // zero-byte file).
-        let fallback = recency
-            .iter()
-            .find(|k| !pinned.contains_key(k.as_str()))
-            .cloned();
+        let fallback = recency.iter().find(|k| !held(&pinned, k)).cloned();
         fallback
     }
 
@@ -628,6 +654,21 @@ impl Cache {
                 before.saturating_sub(now) as f64 / 1048576.0,
                 now as f64 / 1048576.0,
                 max as f64 / 1048576.0
+            );
+        }
+        let now = self.total_bytes.load(Ordering::Relaxed);
+        let over = now > max;
+        if self.over_budget.swap(over, Ordering::Relaxed) != over {
+            println!(
+                "disk cache {}: size_mb={:.1} max_mb={:.1} pinned_keys={}",
+                if over {
+                    "over budget, every remaining file is pinned by in-flight work"
+                } else {
+                    "back within budget"
+                },
+                now as f64 / 1048576.0,
+                max as f64 / 1048576.0,
+                self.pinned.lock().unwrap().len()
             );
         }
     }
@@ -772,7 +813,7 @@ impl Cache {
         } else if path.is_dir() {
             removed = dir_size(&path);
             std::fs::remove_dir_all(&path)?;
-            tenant = Some(tenant_of_segment_dir(key));
+            tenant = Some(tenant_of_dir_key(key));
         }
         // Only bytes the cache counted leave the totals: a directory can
         // hold files written by something that never reported them (an
@@ -847,7 +888,7 @@ impl Cache {
                 freed += tracked.forget(&rel);
             }
         }
-        tracked.tenants.evicted(tenant_of_segment_dir(&key));
+        tracked.tenants.evicted(tenant_of_dir_key(&key));
         drop(tracked);
         drop(pinned);
         drop(recency);
@@ -1220,6 +1261,37 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn a_pinned_directory_holds_every_file_under_it() {
+        let dir = std::env::temp_dir().join("kosha-test-cache-pin-dir");
+        let _ = fs::remove_dir_all(&dir);
+        let cache = Cache::with_max_bytes(dir.clone(), Some(200));
+
+        cache
+            .put_bytes("ns/seg-a/inverted.idx", &[0u8; 60])
+            .unwrap();
+        cache.put_bytes("ns/seg-a/filters.bin", &[0u8; 60]).unwrap();
+        cache.pin("ns/seg-a");
+        cache
+            .put_bytes("ns/seg-b/inverted.idx", &[0u8; 60])
+            .unwrap();
+        // 240 > 200: both seg-a files are older, but the directory pin holds
+        // them, so seg-b's file is the one to go.
+        cache
+            .put_bytes("ns/seg-c/inverted.idx", &[0u8; 60])
+            .unwrap();
+        assert!(cache.get("ns/seg-a/inverted.idx").is_some());
+        assert!(cache.get("ns/seg-a/filters.bin").is_some());
+        assert!(cache.get("ns/seg-b/inverted.idx").is_none());
+        // A directory pin matches whole path components: "ns/seg" does not
+        // hold "ns/seg-a/...".
+        let pinned = HashMap::from([("ns/seg".to_string(), 1)]);
+        assert!(held(&pinned, "ns/seg/inverted.idx"));
+        assert!(!held(&pinned, "ns/seg-a/inverted.idx"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// #242: compaction evicts a superseded segment directory. A pin on any
     /// file under it must block the eviction; otherwise the directory goes,
     /// its file keys leave the LRU list, and the running total drops only
@@ -1268,6 +1340,62 @@ mod tests {
         // already-gone directory is a no-op.
         assert!(cache.get("ns/seg-a2/doc_store.bin").is_some());
         assert_eq!(cache.evict_dir_unless_pinned("ns/seg-a").unwrap(), Some(0));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #342 review: evicting a span-cache directory
+    /// (`{ns}/{seg}/{file}.spans`) counts against the file's tenant, not a
+    /// pseudo-tenant named after a bare namespace.
+    #[test]
+    fn span_dir_evictions_count_against_the_files_tenant() {
+        assert_eq!(tenant_of_dir_key("docs/seg/doc_store.bin.spans"), "_legacy");
+        assert_eq!(tenant_of_dir_key("docs/_shard-0001/seg/x.spans"), "_legacy");
+        assert_eq!(
+            tenant_of_dir_key("acme/docs/seg/doc_store.bin.spans"),
+            "acme"
+        );
+        assert_eq!(tenant_of_dir_key("acme/docs/seg"), "acme");
+        assert_eq!(tenant_of_dir_key("docs/seg"), "_legacy");
+
+        let dir =
+            std::env::temp_dir().join(format!("kosha-test-cache-span-dir-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let cache = Cache::new(dir.clone());
+        cache
+            .put_bytes("docs/seg-1/doc_store.bin.spans/0-10", &[0u8; 10])
+            .unwrap();
+        cache
+            .put_bytes("acme/docs/seg-1/postings-00.bin.spans/0-4", &[0u8; 4])
+            .unwrap();
+        cache
+            .put_bytes("acme/docs/seg-2/doc_store.bin.spans/0-4", &[0u8; 4])
+            .unwrap();
+        assert_eq!(
+            cache
+                .evict_dir_unless_pinned("docs/seg-1/doc_store.bin.spans")
+                .unwrap(),
+            Some(10)
+        );
+        assert_eq!(
+            cache
+                .evict_dir_unless_pinned("acme/docs/seg-1/postings-00.bin.spans")
+                .unwrap(),
+            Some(4)
+        );
+        cache.evict("acme/docs/seg-2/doc_store.bin.spans").unwrap();
+        let stats = cache.tenant_stats();
+        let evictions = |t: &str| {
+            stats
+                .iter()
+                .find(|s| s.tenant == t)
+                .map_or(0, |s| s.evictions)
+        };
+        assert_eq!(evictions("_legacy"), 1);
+        assert_eq!(evictions("acme"), 2);
+        assert!(
+            stats.iter().all(|s| s.tenant != "docs"),
+            "no pseudo-tenant: {stats:?}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
