@@ -10829,7 +10829,9 @@ fn hydration_error_response(outcome: &HydrationOutcome) -> Option<String> {
         return Some(hydration_shed_response());
     }
     if !outcome.missing.is_empty() {
-        return Some(json_error(503, &hydration_failed_message(&outcome.missing)));
+        let message = hydration_failed_message(&outcome.missing);
+        eprintln!("ERROR: {message}{}", request_id());
+        return Some(json_error(503, &message));
     }
     None
 }
