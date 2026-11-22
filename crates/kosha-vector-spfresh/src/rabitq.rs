@@ -200,7 +200,7 @@ impl RaBitQQuery {
         let y = rotation.apply(unit_query);
         let bytes = rotation.code_bytes();
         let mut lut = vec![0.0f32; bytes * 256];
-        for (j, table) in lut.chunks_exact_mut(256).enumerate() {
+        for (j, table) in lut.as_chunks_mut::<256>().0.iter_mut().enumerate() {
             let lane = &y[j * 8..j * 8 + 8];
             for m in 1..256usize {
                 let low = m.trailing_zeros() as usize;
@@ -219,7 +219,7 @@ impl RaBitQQuery {
     /// `⟨ō, Rq⟩` for a code: `(2·Σ_{set} y_i - Σ y_i) / √D`.
     fn quantized_ip(&self, bits: &[u8]) -> f32 {
         let mut set = 0.0f32;
-        for (table, &b) in self.lut.chunks_exact(256).zip(bits) {
+        for (table, &b) in self.lut.as_chunks::<256>().0.iter().zip(bits) {
             set += table[b as usize];
         }
         (2.0 * set - self.total) * self.inv_sqrt_padded
