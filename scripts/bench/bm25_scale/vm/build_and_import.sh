@@ -10,6 +10,11 @@
 #   MAX_DOCS=1000000 ./build_and_import.sh msmarco-1m   # first 1M docs
 #   SNAPSHOT_NAME=msmarco-10m-vec-sidecar ./build_and_import.sh msmarco-10m-vec --with-embeddings
 #
+# BUILD_ARGS (default: empty) are extra kosha-build-segments flags, e.g.
+#   BUILD_ARGS="--cluster-layout namespace" for cluster-aligned segments
+#   (#380, research). Restricted to [A-Za-z0-9 =._-]. Pair it with a new
+#   SNAPSHOT_NAME: a snapshot built with other flags is a different corpus.
+#
 # SNAPSHOT_NAME (default: the namespace) names the snapshot this writes;
 # restore it with restore_namespace.sh <namespace> <snapshot-name>. An
 # existing snapshot is never overwritten unless SNAPSHOT_OVERWRITE=1:
@@ -47,6 +52,10 @@ NS="${1:?usage: [MAX_DOCS=N] [SNAPSHOT_NAME=name] build_and_import.sh <namespace
 SNAPSHOT_NAME="${SNAPSHOT_NAME:-$NS}"
 WITH_EMB="${2:-}"
 MAX_DOCS="${MAX_DOCS:-0}"
+BUILD_ARGS="${BUILD_ARGS:-}"
+case "$BUILD_ARGS" in
+  *[!A-Za-z0-9\ =._-]*) echo "::error::BUILD_ARGS may only contain [A-Za-z0-9 =._-], got: $BUILD_ARGS"; exit 1 ;;
+esac
 TENANT="${KOSHA_TENANT:-default}"
 SCOPED="$TENANT/$NS"
 TXT_CACHE=s3://decoverai-bench-corpus-cache/msmarco-10m
@@ -79,8 +88,8 @@ sudo docker run --rm -v /data:/data kosha-builder:bench sh -c "
   cargo build --release --locked -p kosha-build-segments &&
   ./target/release/kosha-build-segments \
     --shards-dir /data/corpus-txt $EMB_ARGS \
-    --namespace '$NS' --out-dir /data/segments-out --max-docs $MAX_DOCS"
-echo "BUILD-COMPLETE $NS (max_docs=$MAX_DOCS)"
+    --namespace '$NS' --out-dir /data/segments-out --max-docs $MAX_DOCS $BUILD_ARGS"
+echo "BUILD-COMPLETE $NS (max_docs=$MAX_DOCS build_args=$BUILD_ARGS)"
 
 echo "uploading segments..."
 marker_clear bucket "$NS"

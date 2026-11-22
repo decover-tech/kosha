@@ -17,6 +17,13 @@
 //!
 //! Embedding shards are consumed in lockstep with text shards and every
 //! doc's id is verified against the `.ids` sidecar — misalignment aborts.
+//!
+//! `--cluster-layout namespace` (#380, research, default off) assigns
+//! documents to segments by vector region instead of input order: see
+//! [`head`] (default) and [`cluster`]. The segment format is the same either way.
+
+mod cluster;
+mod head;
 
 use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
@@ -69,6 +76,42 @@ struct Args {
     bm25_k1: f64,
     #[arg(long, default_value_t = 0.75)]
     bm25_b: f64,
+    /// How documents are assigned to segments. `input` (default): cut the
+    /// corpus into `--docs-per-segment` runs in input order, as always.
+    /// `namespace` (#380, research): route every document through a
+    /// namespace-level clustering trained on a sample of the embeddings
+    /// (`--cluster-method`), so each segment holds one region of the vector
+    /// space. Needs `--embeddings-dir`. Segments use the unchanged format.
+    #[arg(long, default_value = "input")]
+    cluster_layout: String,
+    /// `head` (default): two-level spherical k-means head of
+    /// `--cluster-head-per-segment` clusters per segment, packed whole into
+    /// segments in a nearest-neighbour order. `tree`: balanced hyperplane
+    /// partition tree with exactly equal leaves (can cut a dense region).
+    #[arg(long, default_value = "head")]
+    cluster_method: String,
+    /// Head clusters per segment for `--cluster-method head`
+    #[arg(long, default_value_t = 16)]
+    cluster_head_per_segment: usize,
+    /// Segments (leaves) for `--cluster-layout namespace`; 0 = one per
+    /// `--docs-per-segment` documents, the same count `input` produces.
+    #[arg(long, default_value_t = 0)]
+    cluster_leaves: usize,
+    /// Embeddings sampled (evenly strided over the corpus) for training
+    #[arg(long, default_value_t = 131_072)]
+    cluster_sample: usize,
+    /// k-means (head) or balanced 2-means (tree) iterations
+    #[arg(long, default_value_t = 10)]
+    cluster_iters: usize,
+    #[arg(long, default_value_t = 380)]
+    cluster_seed: u64,
+    /// Where routed documents are spilled (one file per leaf) between the
+    /// routing pass and the segment builds; default
+    /// `<out_dir>/<namespace>.cluster-spill`. Needs about the corpus's text
+    /// plus f32 vector size free; each leaf's file is deleted once its
+    /// segment has been handed to a builder.
+    #[arg(long)]
+    spill_dir: Option<PathBuf>,
 }
 
 #[derive(serde::Deserialize)]
@@ -178,8 +221,281 @@ impl EmbReader {
 
 type Batch = (usize, Vec<(DocumentId, Vec<Field>)>);
 
+/// Unit-normalized embeddings at `sample` evenly strided positions of the
+/// first `limit` (0 = all) vectors across the `emb-*.f32` shards, read by
+/// seeking, plus the number of vectors considered.
+fn sample_embeddings(
+    dir: &Path,
+    dim: usize,
+    limit: usize,
+    sample: usize,
+) -> (Vec<Vec<f32>>, usize) {
+    use std::io::{Seek, SeekFrom};
+    let row = (dim * 4) as u64;
+    let shards: Vec<(PathBuf, usize)> = sorted_files(dir, "emb-", ".f32")
+        .into_iter()
+        .map(|f| {
+            let len = std::fs::metadata(&f).map(|m| m.len()).unwrap_or(0);
+            (f, (len / row) as usize)
+        })
+        .collect();
+    let mut total: usize = shards.iter().map(|s| s.1).sum();
+    if limit > 0 {
+        total = total.min(limit);
+    }
+    let take = sample.min(total);
+    let mut out = Vec::with_capacity(take);
+    let (mut shard, mut shard_start) = (0usize, 0usize);
+    let mut file: Option<std::fs::File> = None;
+    let mut buf = vec![0u8; dim * 4];
+    for i in 0..take {
+        let global = (i as u128 * total as u128 / take as u128) as usize;
+        while global >= shard_start + shards[shard].1 {
+            shard_start += shards[shard].1;
+            shard += 1;
+            file = None;
+        }
+        let f = file.get_or_insert_with(|| {
+            std::fs::File::open(&shards[shard].0)
+                .unwrap_or_else(|e| panic!("open {}: {e}", shards[shard].0.display()))
+        });
+        f.seek(SeekFrom::Start((global - shard_start) as u64 * row))
+            .expect("seek embedding shard");
+        f.read_exact(&mut buf).expect("read embedding sample");
+        let mut v: Vec<f32> = buf
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect();
+        cluster::normalize(&mut v);
+        out.push(v);
+    }
+    (out, total)
+}
+
+/// Streams the text shards (and embeddings in lockstep, verifying ids),
+/// calling `emit` per document until the corpus or `max_docs` runs out.
+/// Returns the number of documents emitted.
+fn stream_corpus(args: &Args, mut emit: impl FnMut(String, String, Option<Vec<f32>>)) -> usize {
+    let mut emb = args
+        .embeddings_dir
+        .as_deref()
+        .map(|dir| EmbReader::new(dir, args.emb_dim));
+    let mut total = 0usize;
+    for shard in sorted_files(&args.shards_dir, "shard-", ".ndjson") {
+        let file =
+            std::fs::File::open(&shard).unwrap_or_else(|e| panic!("open {}: {e}", shard.display()));
+        for line in std::io::BufReader::with_capacity(8 << 20, file).lines() {
+            let line = line.expect("read shard line");
+            if line.is_empty() {
+                continue;
+            }
+            let doc: ShardDoc = serde_json::from_str(&line)
+                .unwrap_or_else(|e| panic!("bad ndjson in {}: {e}", shard.display()));
+            let vector = emb.as_mut().map(|emb| {
+                let (emb_id, vec) = emb
+                    .next_record()
+                    .expect("embeddings exhausted before text corpus");
+                assert!(
+                    emb_id == doc.id,
+                    "embedding/text misalignment: text doc {:?} paired with embedding {:?}",
+                    doc.id,
+                    emb_id
+                );
+                vec
+            });
+            emit(doc.id, doc.text, vector);
+            total += 1;
+            if args.max_docs > 0 && total >= args.max_docs {
+                return total;
+            }
+        }
+    }
+    total
+}
+
+fn doc_fields(args: &Args, text: &str, vector: Option<Vec<f32>>) -> Vec<Field> {
+    let mut fields = vec![Field::text("text", text)];
+    if let Some(vec) = vector {
+        fields.push(Field::vector(args.vector_field.clone(), vec));
+    }
+    fields
+}
+
+/// A trained namespace-level router: document vector -> segment (leaf).
+enum Router {
+    Tree(cluster::ClusterTree),
+    Head(head::Head),
+}
+
+impl Router {
+    fn route(&self, v: &[f32]) -> usize {
+        match self {
+            Router::Tree(t) => t.route(v),
+            Router::Head(h) => h.route(v),
+        }
+    }
+
+    fn write_json(&self, path: &Path, extra: serde_json::Value) -> std::io::Result<()> {
+        match self {
+            Router::Tree(t) => t.write_json(path, extra),
+            Router::Head(h) => h.write_json(path, extra),
+        }
+    }
+}
+
+/// `--cluster-layout namespace`: train the router, route and spill
+/// every document by leaf, then send each non-empty leaf to the builders
+/// as one segment, in leaf order. Returns `(documents, segments)`.
+fn dispatch_namespace_clustered(args: &Args, tx: &mpsc::SyncSender<Batch>) -> (usize, usize) {
+    let emb_dir = args
+        .embeddings_dir
+        .as_deref()
+        .expect("--cluster-layout namespace needs --embeddings-dir");
+    let t = std::time::Instant::now();
+    let (sample, corpus) =
+        sample_embeddings(emb_dir, args.emb_dim, args.max_docs, args.cluster_sample);
+    let sampled = sample.len();
+    let leaves = if args.cluster_leaves > 0 {
+        args.cluster_leaves
+    } else {
+        corpus.div_ceil(args.docs_per_segment.max(1)).max(1)
+    };
+    let router = match args.cluster_method.as_str() {
+        "tree" => Router::Tree(cluster::ClusterTree::build(
+            &sample,
+            args.emb_dim,
+            cluster::TreeParams {
+                leaves,
+                iters: args.cluster_iters,
+                seed: args.cluster_seed,
+            },
+        )),
+        "head" => Router::Head(head::Head::build(
+            &sample,
+            args.emb_dim,
+            head::HeadParams {
+                leaves,
+                clusters: leaves * args.cluster_head_per_segment.max(1),
+                iters: args.cluster_iters,
+                seed: args.cluster_seed,
+            },
+        )),
+        other => panic!("--cluster-method {other:?}: expected head or tree"),
+    };
+    drop(sample);
+    println!(
+        "cluster {}: {leaves} leaves{} from a {sampled}-vector sample of {corpus} in {:.1}s",
+        args.cluster_method,
+        match &router {
+            Router::Head(h) => format!(", {} head clusters", h.clusters()),
+            Router::Tree(_) => String::new(),
+        },
+        t.elapsed().as_secs_f64()
+    );
+
+    let spill_dir = args.spill_dir.clone().unwrap_or_else(|| {
+        args.out_dir
+            .join(format!("{}.cluster-spill", args.namespace))
+    });
+    std::fs::create_dir_all(&spill_dir).expect("create spill dir");
+    let spill_path = |leaf: usize| spill_dir.join(format!("leaf-{leaf:06}.bin"));
+    let mut spills: Vec<std::io::BufWriter<std::fs::File>> = (0..leaves)
+        .map(|leaf| {
+            std::io::BufWriter::with_capacity(
+                256 << 10,
+                std::fs::File::create(spill_path(leaf)).expect("create spill file"),
+            )
+        })
+        .collect();
+    let mut leaf_docs = vec![0usize; leaves];
+    let t = std::time::Instant::now();
+    let total = stream_corpus(args, |id, text, vector| {
+        let vector = vector.expect("embeddings present");
+        let leaf = router.route(&vector);
+        leaf_docs[leaf] += 1;
+        cluster::write_record(&mut spills[leaf], &id, &text, &vector).expect("write spill");
+    });
+    for mut w in spills {
+        std::io::Write::flush(&mut w).expect("flush spill");
+    }
+    let (min, max) = (
+        leaf_docs.iter().min().copied().unwrap_or(0),
+        leaf_docs.iter().max().copied().unwrap_or(0),
+    );
+    println!(
+        "routed {total} docs into {leaves} leaves in {:.1}s (docs/leaf min {min}, max {max}, mean {:.0})",
+        t.elapsed().as_secs_f64(),
+        total as f64 / leaves as f64
+    );
+
+    // Leaf order = router order: neighbouring segment ids hold neighbouring
+    // regions. Empty leaves produce no segment; ids stay contiguous.
+    let mut seg_idx = 0usize;
+    let mut leaf_segment: Vec<Option<usize>> = vec![None; leaves];
+    for (leaf, slot) in leaf_segment.iter_mut().enumerate() {
+        let path = spill_path(leaf);
+        let bytes = std::fs::read(&path).expect("read spill");
+        let _ = std::fs::remove_file(&path);
+        if bytes.is_empty() {
+            continue;
+        }
+        let docs: Vec<(DocumentId, Vec<Field>)> = cluster::read_records(&bytes, args.emb_dim)
+            .into_iter()
+            .map(|(id, text, vec)| (DocumentId(id), doc_fields(args, &text, Some(vec))))
+            .collect();
+        drop(bytes);
+        *slot = Some(seg_idx);
+        tx.send((seg_idx, docs)).unwrap();
+        seg_idx += 1;
+    }
+    let _ = std::fs::remove_dir(&spill_dir);
+
+    let tree_path = args.out_dir.join(format!(
+        "{}.cluster-{}.json",
+        args.namespace, args.cluster_method
+    ));
+    router
+        .write_json(
+            &tree_path,
+            serde_json::json!({
+                "namespace": args.namespace,
+                "docs": total,
+                "sample": sampled,
+                "iters": args.cluster_iters,
+                "seed": args.cluster_seed,
+                "leaf_docs": leaf_docs,
+                "leaf_segment": leaf_segment,
+                "segment_id_format": format!("{}-offline-{{:06}}", args.namespace),
+            }),
+        )
+        .expect("write cluster tree");
+    println!(
+        "cluster {} written to {} (outside the namespace dir: not uploaded)",
+        args.cluster_method,
+        tree_path.display()
+    );
+    (total, seg_idx)
+}
+
 fn main() {
     let args = Args::parse();
+    match args.cluster_layout.as_str() {
+        "input" => {}
+        "namespace" => {
+            assert!(
+                args.embeddings_dir.is_some(),
+                "--cluster-layout namespace needs --embeddings-dir"
+            );
+            assert!(
+                matches!(args.cluster_method.as_str(), "head" | "tree"),
+                "--cluster-method {:?}: expected head or tree",
+                args.cluster_method
+            );
+        }
+        other => panic!("--cluster-layout {other:?}: expected input or namespace"),
+    }
     let threads = if args.threads == 0 {
         std::thread::available_parallelism()
             .map(|n| n.get())
@@ -243,52 +559,28 @@ fn main() {
         .collect();
 
     // ── stream shards, verify embedding alignment, dispatch batches ──────
-    let mut emb = args
-        .embeddings_dir
-        .as_deref()
-        .map(|dir| EmbReader::new(dir, args.emb_dim));
-    let mut batch: Vec<(DocumentId, Vec<Field>)> = Vec::with_capacity(args.docs_per_segment);
-    let mut seg_idx = 0usize;
-    let mut total = 0usize;
-    'outer: for shard in sorted_files(&args.shards_dir, "shard-", ".ndjson") {
-        let file =
-            std::fs::File::open(&shard).unwrap_or_else(|e| panic!("open {}: {e}", shard.display()));
-        for line in std::io::BufReader::with_capacity(8 << 20, file).lines() {
-            let line = line.expect("read shard line");
-            if line.is_empty() {
-                continue;
-            }
-            let doc: ShardDoc = serde_json::from_str(&line)
-                .unwrap_or_else(|e| panic!("bad ndjson in {}: {e}", shard.display()));
-            let mut fields = vec![Field::text("text", &doc.text)];
-            if let Some(ref mut emb) = emb {
-                let (emb_id, vec) = emb
-                    .next_record()
-                    .expect("embeddings exhausted before text corpus");
-                assert!(
-                    emb_id == doc.id,
-                    "embedding/text misalignment: text doc {:?} paired with embedding {:?}",
-                    doc.id,
-                    emb_id
-                );
-                fields.push(Field::vector(args.vector_field.clone(), vec));
-            }
-            batch.push((DocumentId(doc.id), fields));
-            total += 1;
-            if batch.len() >= args.docs_per_segment {
-                tx.send((seg_idx, std::mem::take(&mut batch))).unwrap();
+    let (total, seg_idx) = match args.cluster_layout.as_str() {
+        "input" => {
+            let mut batch: Vec<(DocumentId, Vec<Field>)> =
+                Vec::with_capacity(args.docs_per_segment);
+            let mut seg_idx = 0usize;
+            let total = stream_corpus(&args, |id, text, vector| {
+                batch.push((DocumentId(id), doc_fields(&args, &text, vector)));
+                if batch.len() >= args.docs_per_segment {
+                    tx.send((seg_idx, std::mem::take(&mut batch))).unwrap();
+                    seg_idx += 1;
+                    batch.reserve(args.docs_per_segment);
+                }
+            });
+            if !batch.is_empty() {
+                tx.send((seg_idx, batch)).unwrap();
                 seg_idx += 1;
-                batch.reserve(args.docs_per_segment);
             }
-            if args.max_docs > 0 && total >= args.max_docs {
-                break 'outer;
-            }
+            (total, seg_idx)
         }
-    }
-    if !batch.is_empty() {
-        tx.send((seg_idx, batch)).unwrap();
-        seg_idx += 1;
-    }
+        "namespace" => dispatch_namespace_clustered(&args, &tx),
+        other => panic!("--cluster-layout {other:?}: expected input or namespace"),
+    };
     drop(tx);
     let built: usize = workers.into_iter().map(|w| w.join().unwrap()).sum();
     assert_eq!(built, seg_idx, "worker/segment count mismatch");

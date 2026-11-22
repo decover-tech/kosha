@@ -102,6 +102,14 @@ on:
           against the 350-minute job limit, and prefer suite=vector.
         type: boolean
         default: false
+      build_segments_args:
+        description: >-
+          extra kosha-build-segments flags for a build_vector_snapshot
+          rebuild (research #380), e.g. "--cluster-layout namespace" for
+          cluster-aligned segments. Empty = the default builder. Only used
+          when build_vector_snapshot builds a new snapshot; characters
+          limited to [A-Za-z0-9 =._-].
+        default: ""
       keep_vm:
         description: >-
           keep the bench VM stack after a successful run too, so the next
@@ -143,6 +151,7 @@ env:
   BM25_NS: msmarco-${{ inputs.bm25_docs || '10m' }}
   VEC_NS: msmarco-10m-vec
   VEC_SNAPSHOT: ${{ inputs.vector_snapshot || 'msmarco-10m-vec' }}
+  BUILD_SEGMENTS_ARGS: ${{ inputs.build_segments_args || '' }}
   WARM_GATE: ${{ inputs.warm_gate || 'queries' }}
   RETURN_FIELDS: ${{ inputs.return_fields || 'ids' }}
 
@@ -303,6 +312,9 @@ jobs:
           case "$VEC_SNAPSHOT" in
             *[!a-z0-9.-]*|'') echo "::error::vector_snapshot must match [a-z0-9.-]+, got: $VEC_SNAPSHOT"; exit 1 ;;
           esac
+          case "$BUILD_SEGMENTS_ARGS" in
+            *[!A-Za-z0-9\ =._-]*) echo "::error::build_segments_args may only contain [A-Za-z0-9 =._-], got: $BUILD_SEGMENTS_ARGS"; exit 1 ;;
+          esac
           if [ '${{ inputs.mode }}' = 'restore' ]; then
             if [ '${{ inputs.build_vector_snapshot }}' = 'true' ]; then
               # Opt-in offline rebuild under a NEW snapshot name; existing
@@ -314,7 +326,7 @@ jobs:
               $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && \
                 if aws s3 ls s3://decoverai-bench-corpus-cache/snapshots/$VEC_SNAPSHOT/pg-kosha.sql.gz >/dev/null 2>&1; then \
                   echo snapshot $VEC_SNAPSHOT exists, not rebuilding; \
-                else SNAPSHOT_NAME=$VEC_SNAPSHOT ./build_and_import.sh $VEC_NS --with-embeddings; fi"
+                else BUILD_ARGS='$BUILD_SEGMENTS_ARGS' SNAPSHOT_NAME=$VEC_SNAPSHOT ./build_and_import.sh $VEC_NS --with-embeddings; fi"
             fi
             $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && ./restore_namespace.sh $VEC_NS $VEC_SNAPSHOT"
           else

@@ -2326,6 +2326,13 @@ pub struct SearchPhaseStats {
     /// Under the global probe budget it should land near
     /// `num_candidates` for the whole query. Zero for non-kNN queries.
     pub knn_postings_probed: usize,
+    /// Segments in which this kNN query hydrated at least one posting (or,
+    /// on the per-segment fallback, ran a probe at all). Observability only
+    /// (#380): with per-segment clustering every segment holds centroids
+    /// near every query, so this tracks the segment count; with
+    /// cluster-aligned segments it should fall to the few segments that
+    /// own the query's region. Zero for non-kNN queries.
+    pub knn_segments_probed: usize,
     /// Segment directories holding at least one document of the returned
     /// page, deduplicated, in page order: the segments whose doc store this
     /// search read. The server's access tracker (#213) counts these as
@@ -2400,6 +2407,8 @@ struct OpenStatsCollector {
     /// Vector postings hydrated across segments (kNN only) — see
     /// [`SearchPhaseStats::knn_postings_probed`].
     knn_postings: AtomicUsize,
+    /// See [`SearchPhaseStats::knn_segments_probed`].
+    knn_segments: AtomicUsize,
     /// See [`SearchPhaseStats::wand_docs_scored`].
     wand_docs_scored: AtomicUsize,
     /// See [`SearchPhaseStats::wand_segments_skipped`].
@@ -4995,6 +5004,9 @@ impl Searcher {
                         open_stats
                             .knn_postings
                             .fetch_add(found.postings_probed, Ordering::Relaxed);
+                        if found.postings_probed > 0 {
+                            open_stats.knn_segments.fetch_add(1, Ordering::Relaxed);
+                        }
                         late_results = Some(found.hits);
                     }
                     Err(e @ KoshaError::InvalidQuery(_)) => return Err(e),
@@ -5061,6 +5073,9 @@ impl Searcher {
                             open_stats
                                 .knn_postings
                                 .fetch_add(exact.postings_hydrated, Ordering::Relaxed);
+                            if exact.postings_hydrated > 0 || exact.vectors_scored > 0 {
+                                open_stats.knn_segments.fetch_add(1, Ordering::Relaxed);
+                            }
                             open_stats
                                 .knn_exact_vectors
                                 .fetch_add(exact.vectors_scored, Ordering::Relaxed);
@@ -5092,6 +5107,9 @@ impl Searcher {
                             .map(|r| {
                                 r.map(|(results, probes)| {
                                     open_stats.knn_postings.fetch_add(probes, Ordering::Relaxed);
+                                    if probes > 0 {
+                                        open_stats.knn_segments.fetch_add(1, Ordering::Relaxed);
+                                    }
                                     results
                                 })
                             }),
@@ -5113,6 +5131,7 @@ impl Searcher {
                                     open_stats
                                         .knn_postings
                                         .fetch_add(knn.num_candidates, Ordering::Relaxed);
+                                    open_stats.knn_segments.fetch_add(1, Ordering::Relaxed);
                                 })
                             }),
                     };
@@ -5863,6 +5882,7 @@ impl Searcher {
             as f64
             / 1e6;
         phase_stats.knn_postings_probed = open_stats.knn_postings.load(Ordering::Relaxed);
+        phase_stats.knn_segments_probed = open_stats.knn_segments.load(Ordering::Relaxed);
         phase_stats.knn_exact_vectors = open_stats.knn_exact_vectors.load(Ordering::Relaxed);
         let t_materialize = Instant::now();
 
