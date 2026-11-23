@@ -548,8 +548,10 @@ impl ShardView {
 /// `ensure_segments_local`'s in-flight registry. `done` flips to `true`
 /// exactly once, when the owning caller's fetch attempt finishes —
 /// successfully or not; waiters only learn the actual outcome by re-checking
-/// `AppState::segment_is_complete` themselves afterward, same as the owner
-/// does, so a failed fetch is never mistaken for a successful one.
+/// their own completeness predicate afterward, so a failed fetch is never
+/// mistaken for a successful one, and a segment still incomplete for them
+/// (the owner fetched a different file set) goes back through ownership
+/// (`hydrate_single_flight`).
 #[cfg(feature = "s3")]
 struct SegmentFetch {
     done: Mutex<bool>,
@@ -1116,6 +1118,129 @@ fn wait_for(waiting: &[Arc<SegmentFetch>]) {
             request_id()
         );
     }
+}
+
+/// Most partition rounds one hydration call runs. Single-flight is keyed by
+/// segment only, but an owner fetches only the files *its* request needs,
+/// so a waiter can find a segment still incomplete by its own predicate
+/// once the owner is done (an unfiltered search owning what a filtered kNN
+/// waits on leaves the filter and vector files unfetched). The waiter then
+/// takes those segments back through ownership and fetches its own gap. A
+/// round can make a request wait again behind another request that owned
+/// the retry first, possibly of a third shape, so three rounds cover three
+/// distinct shapes colliding on one segment. The bound keeps a pathological
+/// churn of shapes from looping: what is still incomplete after it is
+/// reported missing, as before.
+#[cfg(feature = "s3")]
+const HYDRATION_ROUNDS: usize = 3;
+
+/// How a request took part in a segment's single-flight hydration, named
+/// in the log line for a segment that is still missing afterwards.
+#[cfg(feature = "s3")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum HydrationRole {
+    /// This request fetched it.
+    Owned,
+    /// This request waited on another one's fetch (of hydration `owner`).
+    Waited { owner: &'static str },
+    /// It waited on another one's fetch, then fetched what was still missing.
+    OwnedAfterWaiting { owner: &'static str },
+}
+
+#[cfg(feature = "s3")]
+impl std::fmt::Display for HydrationRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Owned => f.write_str("owned"),
+            Self::Waited { owner } => write!(f, "waited on a {owner} fetch"),
+            Self::OwnedAfterWaiting { owner } => {
+                write!(f, "waited on a {owner} fetch, then owned the refetch")
+            }
+        }
+    }
+}
+
+/// The check a segment fails in `AppState::scoring_gap`, for the log line
+/// of a segment a search must fail on.
+#[cfg(feature = "s3")]
+#[derive(Debug, PartialEq)]
+enum ScoringGap<'a> {
+    Footer,
+    InvertedIdx,
+    FilterFile(&'a str),
+    /// Neither `doc_store.bin` nor a `doc_store.offsets` the reader accepts.
+    DocAccess,
+    /// The kNN field's vector files (`knn_files_complete`).
+    KnnFiles(&'a str),
+}
+
+#[cfg(feature = "s3")]
+impl std::fmt::Display for ScoringGap<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Footer => f.write_str("footer.json"),
+            Self::InvertedIdx => f.write_str("inverted.idx"),
+            Self::FilterFile(name) => write!(f, "filter file {name}"),
+            Self::DocAccess => {
+                f.write_str("doc_store (no doc_store.bin, no usable doc_store.offsets)")
+            }
+            Self::KnnFiles(field) => write!(f, "vector files of kNN field '{field}'"),
+        }
+    }
+}
+
+/// Single-flight hydration of `seg_paths`: own and `fetch` what nobody is
+/// fetching, wait for the rest, then take any waited segment that is still
+/// incomplete by `is_complete` back through ownership (up to
+/// [`HYDRATION_ROUNDS`] rounds) instead of leaving it to the other request's
+/// file set. `fetch` returns the bytes it moved (for waiters' slow-wait log
+/// line); `complete_owned` is called for every batch it was given, whatever
+/// it did. `is_complete`'s flag is true in the first round only, so a
+/// predicate that counts cache lookups counts each segment once. `give_up`
+/// stops the retries (a shed request must not fetch more).
+///
+/// Returns how this request took part in each segment that was incomplete
+/// when it got to it; empty, and allocation-free, when all were complete.
+#[cfg(feature = "s3")]
+fn hydrate_single_flight(
+    in_flight: &Mutex<HashMap<PathBuf, Arc<SegmentFetch>>>,
+    seg_paths: &[PathBuf],
+    owner: &'static str,
+    is_complete: impl Fn(&Path, bool) -> bool,
+    mut fetch: impl FnMut(&OwnedFetches) -> u64,
+    give_up: impl Fn() -> bool,
+) -> HashMap<PathBuf, HydrationRole> {
+    let mut roles: HashMap<PathBuf, HydrationRole> = HashMap::new();
+    let mut retry: Vec<PathBuf> = Vec::new();
+    for round in 0..HYDRATION_ROUNDS {
+        let pending = if round == 0 { seg_paths } else { &retry };
+        let (owned, waiting) =
+            partition_for_hydration(in_flight, pending, owner, |p| is_complete(p, round == 0));
+        if !owned.is_empty() {
+            let bytes = fetch(&owned);
+            complete_owned(in_flight, &owned, bytes);
+            for (p, _) in &owned {
+                let role = match roles.get(p) {
+                    Some(&HydrationRole::Waited { owner: by }) => {
+                        HydrationRole::OwnedAfterWaiting { owner: by }
+                    }
+                    _ => HydrationRole::Owned,
+                };
+                roles.insert(p.clone(), role);
+            }
+        }
+        wait_for(&waiting);
+        for w in &waiting {
+            roles.insert(w.seg_path.clone(), HydrationRole::Waited { owner: w.owner });
+        }
+        // Waited segments go round again; the next partition skips those the
+        // owner's fetch did complete for this request too.
+        retry = waiting.iter().map(|w| w.seg_path.clone()).collect();
+        if retry.is_empty() || give_up() {
+            break;
+        }
+    }
+    roles
 }
 
 /// Greedily group `(path, size)` pairs into batches whose total projected
@@ -3501,9 +3626,10 @@ impl AppState {
     /// Concurrent callers racing on the same not-yet-cached segment(s) are
     /// coalesced via `in_flight_segments`: only the first ("owner") actually
     /// hits S3 for a given segment, and the rest ("waiters") block until the
-    /// owner finishes, then fall through to the same `segment_is_complete`
-    /// recheck the owner uses — so a failed fetch is visible to waiters too,
-    /// not silently treated as success. `hydration_semaphore` additionally
+    /// owner finishes, then recheck `segment_is_complete` and fetch what is
+    /// still missing themselves (`hydrate_single_flight`) — so a failed or
+    /// narrower fetch is visible to waiters too, not silently treated as
+    /// success. `hydration_semaphore` additionally
     /// bounds how many *owner* hydration batches run at once, server-wide.
     ///
     /// `needs_vectors` gates whether each segment's `vector.idx` is fetched
@@ -3537,104 +3663,108 @@ impl AppState {
         let request = RequestHydration::unlimited();
 
         let mut outcome = HydrationOutcome::default();
-        let (owned, waiting) = partition_for_hydration(
+        // A waiter behind a scoring-set owner (a search) finds the segment
+        // incomplete by this predicate afterwards and fetches the rest
+        // itself in the next round (see `hydrate_single_flight`).
+        hydrate_single_flight(
             &self.in_flight_segments,
             seg_paths,
             HYDRATE_OWNER_SEGMENTS,
-            |p| Self::segment_is_complete(p, needs_vectors),
-        );
+            |p, _| Self::segment_is_complete(p, needs_vectors),
+            |owned| {
+                let bytes_before = outcome.bytes_fetched;
+                // Bound total concurrent hydration *operations* server-wide —
+                // released as soon as this operation's fetch is done, before
+                // waiters below get to run.
+                let _permit = self.hydration_semaphore.acquire("full_segment");
 
-        if !owned.is_empty() {
-            // Bound total concurrent hydration *operations* server-wide —
-            // released as soon as this operation's fetch is done, before
-            // waiters below get to run.
-            let _permit = self.hydration_semaphore.acquire("full_segment");
-
-            let mut logical_paths: Vec<(String, u64)> = Vec::new();
-            for (seg_path, _) in &owned {
-                let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
-                    continue;
-                };
-                let s3_prefix = rel_path.to_string_lossy().into_owned();
-                match s3.list_with_sizes(&s3_prefix) {
-                    Ok(files) if !files.is_empty() => {
-                        logical_paths.extend(
-                            files
-                                .into_iter()
-                                .filter(|(name, _size)| hydration_wants_file(name, needs_vectors))
-                                .map(|(name, size)| (format!("{s3_prefix}/{name}"), size)),
-                        );
-                    }
-                    Ok(_) => {
-                        eprintln!("WARN: no S3 objects found for segment {s3_prefix}");
-                    }
-                    Err(e) => {
-                        eprintln!("WARN: S3 list failed for segment {s3_prefix}: {e}");
+                let mut logical_paths: Vec<(String, u64)> = Vec::new();
+                for (seg_path, _) in owned {
+                    let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
+                        continue;
+                    };
+                    let s3_prefix = rel_path.to_string_lossy().into_owned();
+                    match s3.list_with_sizes(&s3_prefix) {
+                        Ok(files) if !files.is_empty() => {
+                            logical_paths.extend(
+                                files
+                                    .into_iter()
+                                    .filter(|(name, _size)| {
+                                        hydration_wants_file(name, needs_vectors)
+                                    })
+                                    .map(|(name, size)| (format!("{s3_prefix}/{name}"), size)),
+                            );
+                        }
+                        Ok(_) => {
+                            eprintln!("WARN: no S3 objects found for segment {s3_prefix}");
+                        }
+                        Err(e) => {
+                            eprintln!("WARN: S3 list failed for segment {s3_prefix}: {e}");
+                        }
                     }
                 }
-            }
 
-            if !logical_paths.is_empty() {
-                println!(
+                if !logical_paths.is_empty() {
+                    println!(
                     "cache miss: hydrating {} file(s) across {} segment(s) from S3 (fan-out={}, byte-budget={})",
                     logical_paths.len(),
                     owned.len(),
                     self.hydrate_concurrency,
                     self.hydrate_byte_budget
                 );
-                outcome.files_fetched += logical_paths.len();
-                outcome.bytes_fetched += logical_paths.iter().map(|(_, size)| size).sum::<u64>();
-                // Routed through `hydrate_files`, which pins the batch
-                // against cache eviction for its whole duration (#62's
-                // convergence fix) and coordinates the fetch across
-                // replicas when the lease store is configured. Full-segment
-                // fetches keep the conservative fan-out — batches here can
-                // include multi-hundred-MB doc stores.
-                // Files already on disk before this call were verified (or
-                // trusted) when they first landed; only check what this call
-                // actually fetches, so a warm segment isn't re-read in full.
-                let fetched: Vec<(String, u64)> = logical_paths
-                    .iter()
-                    .filter(|(p, _)| !file_present_nonempty(&self.data_dir.join(p)))
-                    .cloned()
-                    .collect();
-                self.hydrate_files(s3, &logical_paths, self.hydrate_concurrency, &request);
-
-                // Check freshly fetched files against the segment's `_COMMIT`
-                // (#231). A mismatch is deleted and refetched once. If it
-                // still mismatches, it is deleted again, so the segment
-                // reports as incomplete (`outcome.missing`) and the caller
-                // fails the request instead of serving corrupt bytes.
-                let bad = verify_fetched_against_commit(&self.data_dir, &fetched);
-                if !bad.is_empty() {
-                    self.segment_checksum_failures
-                        .fetch_add(bad.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                    let retry: Vec<(String, u64)> = fetched
+                    outcome.files_fetched += logical_paths.len();
+                    outcome.bytes_fetched +=
+                        logical_paths.iter().map(|(_, size)| size).sum::<u64>();
+                    // Routed through `hydrate_files`, which pins the batch
+                    // against cache eviction for its whole duration (#62's
+                    // convergence fix) and coordinates the fetch across
+                    // replicas when the lease store is configured. Full-segment
+                    // fetches keep the conservative fan-out — batches here can
+                    // include multi-hundred-MB doc stores.
+                    // Files already on disk before this call were verified (or
+                    // trusted) when they first landed; only check what this call
+                    // actually fetches, so a warm segment isn't re-read in full.
+                    let fetched: Vec<(String, u64)> = logical_paths
                         .iter()
-                        .filter(|(p, _)| bad.contains(p))
+                        .filter(|(p, _)| !file_present_nonempty(&self.data_dir.join(p)))
                         .cloned()
                         .collect();
-                    self.hydrate_files(s3, &retry, self.hydrate_concurrency, &request);
-                    let still_bad = verify_fetched_against_commit(&self.data_dir, &retry);
-                    if !still_bad.is_empty() {
-                        self.segment_checksum_failures.fetch_add(
-                            still_bad.len() as u64,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                        eprintln!(
+                    self.hydrate_files(s3, &logical_paths, self.hydrate_concurrency, &request);
+
+                    // Check freshly fetched files against the segment's `_COMMIT`
+                    // (#231). A mismatch is deleted and refetched once. If it
+                    // still mismatches, it is deleted again, so the segment
+                    // reports as incomplete (`outcome.missing`) and the caller
+                    // fails the request instead of serving corrupt bytes.
+                    let bad = verify_fetched_against_commit(&self.data_dir, &fetched);
+                    if !bad.is_empty() {
+                        self.segment_checksum_failures
+                            .fetch_add(bad.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                        let retry: Vec<(String, u64)> = fetched
+                            .iter()
+                            .filter(|(p, _)| bad.contains(p))
+                            .cloned()
+                            .collect();
+                        self.hydrate_files(s3, &retry, self.hydrate_concurrency, &request);
+                        let still_bad = verify_fetched_against_commit(&self.data_dir, &retry);
+                        if !still_bad.is_empty() {
+                            self.segment_checksum_failures.fetch_add(
+                                still_bad.len() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            eprintln!(
                             "ERROR: segment file(s) fail their _COMMIT checksum after refetch, \
                              refusing to serve: {}",
                             still_bad.join(", ")
                         );
+                        }
                     }
                 }
-            }
 
-            drop(_permit);
-            complete_owned(&self.in_flight_segments, &owned, outcome.bytes_fetched);
-        }
-
-        wait_for(&waiting);
+                outcome.bytes_fetched - bytes_before
+            },
+            || false,
+        );
 
         // `missing` is what no caller can read past: a core file. A segment
         // whose vector files still are not local after a fetch that asked
@@ -4582,6 +4712,7 @@ impl AppState {
             &filter_files,
             &manifest_footers,
             request,
+            true,
         );
         let postings_outcome = self.ensure_query_postings(
             ns,
@@ -4656,6 +4787,7 @@ impl AppState {
                 &HashMap::new(),
                 &manifest_footers,
                 request,
+                false, // best effort: a miss does not fail the search
             );
             let stats_postings = self.ensure_query_postings(
                 ns,
@@ -4742,23 +4874,43 @@ impl AppState {
         filter_files: &[String],
         manifest_footer: Option<&kosha_core::Footer>,
     ) -> bool {
+        Self::scoring_gap(
+            seg_path,
+            knn_field,
+            vectors_ranged,
+            filter_files,
+            manifest_footer,
+        )
+        .is_none()
+    }
+
+    /// The first check of [`Self::scoring_complete`] that `seg_path` fails,
+    /// or `None` when it is complete.
+    #[cfg(feature = "s3")]
+    fn scoring_gap<'a>(
+        seg_path: &Path,
+        knn_field: Option<&'a str>,
+        vectors_ranged: bool,
+        filter_files: &'a [String],
+        manifest_footer: Option<&kosha_core::Footer>,
+    ) -> Option<ScoringGap<'a>> {
         if manifest_footer.is_none() && !file_present_nonempty(&seg_path.join("footer.json")) {
-            return false;
+            return Some(ScoringGap::Footer);
         }
         if !file_present_nonempty(&seg_path.join("inverted.idx")) {
-            return false;
+            return Some(ScoringGap::InvertedIdx);
         }
-        if !filter_files
+        if let Some(f) = filter_files
             .iter()
-            .all(|f| file_present_nonempty(&seg_path.join(f)))
+            .find(|f| !file_present_nonempty(&seg_path.join(f)))
         {
-            return false;
+            return Some(ScoringGap::FilterFile(f));
         }
         let doc_access_ok = file_present_nonempty(&seg_path.join("doc_store.bin"))
             || (file_present_nonempty(&seg_path.join("doc_store.offsets"))
                 && kosha_segment::doc_store_offsets_plausible(seg_path, manifest_footer));
         if !doc_access_ok {
-            return false;
+            return Some(ScoringGap::DocAccess);
         }
         // `vector.offsets` is required only where it exists: legacy flat
         // segments never have one. A clustered segment without it is served
@@ -4774,10 +4926,10 @@ impl AppState {
                 }
             };
             if !knn_files_complete(seg_path, footer, field, vectors_ranged) {
-                return false;
+                return Some(ScoringGap::KnnFiles(field));
             }
         }
-        true
+        None
     }
 
     /// Best-effort: the `doc_vectors.bin` header of every scoring segment a
@@ -4872,12 +5024,14 @@ impl AppState {
     /// same namespace share one fetch, and the same `hydration_semaphore`
     /// bounds server-wide concurrent hydration operations.
     ///
-    /// A compaction/merge caller that is a *waiter* behind a search owner
-    /// here only sees scoring-set files fetched; it then reports those
-    /// segments as not-yet-complete via its own full-segment predicate and
-    /// the admin path surfaces per-segment errors (its existing tolerance
-    /// for partial S3 fetches) rather than reading a partial corpus — same
-    /// graceful-degradation contract those admin paths already have.
+    /// A waiter behind an owner that needed a different file set (an
+    /// unfiltered search ahead of a filtered kNN, or a search ahead of a
+    /// compaction) finds the segment still incomplete by its own predicate
+    /// afterwards and fetches the rest itself (`hydrate_single_flight`);
+    /// only what is incomplete after that is reported `missing`. With
+    /// `log_missing` (a set whose miss fails the request) one WARN then names
+    /// the count and the first few segments with the failed check and this
+    /// request's role.
     #[cfg(feature = "s3")]
     fn ensure_scoring_files_local(
         &self,
@@ -4886,6 +5040,7 @@ impl AppState {
         filter_files: &HashMap<PathBuf, Vec<String>>,
         manifest_footers: &HashMap<PathBuf, &kosha_core::Footer>,
         request: &Arc<RequestHydration>,
+        log_missing: bool,
     ) -> HydrationOutcome {
         let Some(ref s3) = self.s3_storage else {
             return HydrationOutcome::default();
@@ -4894,11 +5049,11 @@ impl AppState {
         let vectors_ranged = self.posting_read_mode == doc_spans::ReadMode::Ranged;
         let filters_of = |p: &Path| filter_files.get(p).map(Vec::as_slice).unwrap_or(&[]);
         let mut outcome = HydrationOutcome::default();
-        let (owned, waiting) = partition_for_hydration(
+        let roles = hydrate_single_flight(
             &self.in_flight_segments,
             seg_paths,
             HYDRATE_OWNER_SCORING,
-            |p| {
+            |p, first_round| {
                 let complete = Self::scoring_complete(
                     p,
                     knn_field,
@@ -4909,347 +5064,368 @@ impl AppState {
                 // A search's segment found with its scoring files already local
                 // is a disk-cache hit for its tenant; one that must hydrate is a
                 // miss (#342, `kosha_cache_{hits,misses}{cache="nvme"}`).
-                if let Ok(rel) = p.strip_prefix(&self.data_dir) {
+                if let (true, Ok(rel)) = (first_round, p.strip_prefix(&self.data_dir)) {
                     let rel = rel.to_string_lossy();
                     self.cache
                         .record_lookup(kosha_core::tenancy::tenant_of_segment_dir(&rel), complete);
                 }
                 complete
             },
-        );
+            |owned| {
+                let bytes_before = outcome.bytes_fetched;
+                let _permit = self.hydration_semaphore.acquire("scoring_set");
 
-        if !owned.is_empty() {
-            let _permit = self.hydration_semaphore.acquire("scoring_set");
-
-            // Which vector files a kNN needs is read from each segment's
-            // footer (#204), so a footer known neither from the manifest nor
-            // locally must be fetched before the list below is built.
-            if knn_field.is_some() {
-                let without_footer: Vec<PathBuf> = owned
-                    .iter()
-                    .map(|(p, _)| p.clone())
-                    .filter(|p| {
-                        !manifest_footers.contains_key(p)
-                            && !file_present_nonempty(&p.join("footer.json"))
-                    })
-                    .collect();
-                if !without_footer.is_empty() {
-                    let (files, bytes) =
-                        self.ensure_files_local(&without_footer, "footer.json", request);
-                    outcome.files_fetched += files;
-                    outcome.bytes_fetched += bytes;
-                }
-            }
-
-            // Sizes are unknown without a per-segment LIST round trip —
-            // avoiding that round trip is half the point of this path (file
-            // names are known a priori). 0 sizes mean `chunk_by_byte_budget`
-            // cannot chunk this batch at all: every file below lands in one
-            // chunk, fanned out `scoring_hydrate_concurrency` (64) wide.
-            //
-            // That used to be waved off as "the scoring set excludes the
-            // bulk doc stores, so per-file sizes are small." It isn't:
-            // `inverted.idx` grows with a segment's vocabulary, and one cold
-            // search on staging pulled 177 files / 4,974 MB through here
-            // (~28 MB average) in a single chunk. Volume on this path is
-            // instead bounded by `hydration_budget`, from each response's
-            // `Content-Length` — see the `hydrate_byte_budget` field docs.
-            let mut logical_paths: Vec<(String, u64)> = Vec::new();
-            // Segments sent to score with only their offsets sidecar. Each
-            // is checked after the fetch below: a sidecar that is missing
-            // from S3 or that the reader would reject falls back to
-            // `doc_store.bin` (#179, #184).
-            let mut lazy_segments: Vec<&PathBuf> = Vec::new();
-            // Legacy segments whose `doc_vectors.bin` header a kNN needs,
-            // with their object prefix: fetched by range after this round.
-            let mut doc_vector_headers: Vec<(&Path, String)> = Vec::new();
-            for (seg_path, _) in &owned {
-                let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
-                    continue;
-                };
-                let s3_prefix = rel_path.to_string_lossy().into_owned();
-
-                // `footer.json` is needed only for legacy manifests that do
-                // not carry a footer snapshot.
-                if !manifest_footers.contains_key(seg_path)
-                    && !file_present_nonempty(&seg_path.join("footer.json"))
-                {
-                    logical_paths.push((format!("{s3_prefix}/footer.json"), 0));
-                }
-                if !file_present_nonempty(&seg_path.join("inverted.idx")) {
-                    logical_paths.push((format!("{s3_prefix}/inverted.idx"), 0));
-                }
-                // Only the filter files this query reads: a columnar
-                // segment's TOC plus the columns the query names (#244),
-                // in the same round as the other scoring files.
-                for file in filters_of(seg_path) {
-                    if !file_present_nonempty(&seg_path.join(file)) {
-                        logical_paths.push((format!("{s3_prefix}/{file}"), 0));
+                // Which vector files a kNN needs is read from each segment's
+                // footer (#204), so a footer known neither from the manifest nor
+                // locally must be fetched before the list below is built.
+                if knn_field.is_some() {
+                    let without_footer: Vec<PathBuf> = owned
+                        .iter()
+                        .map(|(p, _)| p.clone())
+                        .filter(|p| {
+                            !manifest_footers.contains_key(p)
+                                && !file_present_nonempty(&p.join("footer.json"))
+                        })
+                        .collect();
+                    if !without_footer.is_empty() {
+                        let (files, bytes) =
+                            self.ensure_files_local(&without_footer, "footer.json", request);
+                        outcome.files_fetched += files;
+                        outcome.bytes_fetched += bytes;
                     }
                 }
 
-                // doc_store: Lazy segments need only the offsets sidecar;
-                // legacy (format_version 0) segments need the full
-                // doc_store.bin because eager open parses it. See
-                // `segment_is_lazy_capable` for how that is decided and
-                // what it used to get wrong.
-                let has_offsets = file_present_nonempty(&seg_path.join("doc_store.offsets"));
-                let has_doc_store = file_present_nonempty(&seg_path.join("doc_store.bin"));
-                let lazy_capable = has_offsets
-                    || segment_is_lazy_capable(
-                        manifest_footers.get(seg_path).map(|f| f.format_version),
-                        || {
-                            SegmentReader::read_footer(seg_path)
-                                .ok()
-                                .map(|ft| ft.format_version)
-                        },
-                    );
-                if lazy_capable {
-                    if !has_offsets {
-                        logical_paths.push((format!("{s3_prefix}/doc_store.offsets"), 0));
-                    }
-                    if !has_doc_store {
-                        lazy_segments.push(seg_path);
-                    }
-                } else if !has_doc_store {
-                    logical_paths.push((format!("{s3_prefix}/doc_store.bin"), 0));
-                }
-
-                // Only the queried column's files (#204), as the segment's
-                // footer lists them. Ranged mode (#245) fetches a clustered
-                // column's offsets sidecar only: its probed postings are
-                // read by range during the search, and the idx file is
-                // fetched whole only for a column that turns out to have no
-                // sidecar (below). A legacy segment's `vector.offsets`
-                // exists only for the clustered format, and there is no
-                // footer signal to predict that (vector.idx is
-                // deliberately self-describing), so it is always attempted:
-                // a segment that doesn't have one just shows up as a
-                // per-file miss in `s3.read_many`'s accounting, not a
-                // hydration failure. Without the sidecar the lazy path
-                // never activates for S3-backed segments, and every kNN
-                // query silently takes the (still correct, just slower)
-                // eager fallback.
-                if let Some(field) = knn_field {
-                    let local_footer;
-                    let footer = match manifest_footers.get(seg_path) {
-                        Some(footer) => Some(*footer),
-                        None => {
-                            local_footer = SegmentReader::read_footer(seg_path).ok();
-                            local_footer.as_ref()
-                        }
-                    };
-                    for column in kosha_segment::knn_vector_columns(footer, field) {
-                        let mut files: Vec<&str> = Vec::new();
-                        if let Some(offsets) = &column.offsets_file {
-                            files.push(offsets);
-                        }
-                        if !vectors_ranged || column.offsets_file.is_none() {
-                            files.push(&column.idx_file);
-                        }
-                        for file in files {
-                            if !file_present_nonempty(&seg_path.join(file)) {
-                                logical_paths.push((format!("{s3_prefix}/{file}"), 0));
-                            }
-                        }
-                    }
-                    // Only the header of a legacy `doc_vectors.bin` (its
-                    // field table binds the unnamed index), by range below:
-                    // the whole file is as large as the index itself. With
-                    // global rescoring on (#381), a quantized column's
-                    // header too (see `knn_wants_doc_vectors_header`).
-                    if knn_wants_doc_vectors_header(footer, field)
-                        && !doc_spans::doc_vectors_header_local(seg_path)
-                    {
-                        doc_vector_headers.push((seg_path.as_path(), s3_prefix.clone()));
-                    }
-                }
-            }
-
-            if !logical_paths.is_empty() {
-                println!(
-                    "cache miss: hydrating {} scoring file(s) across {} segment(s) \
-                     (fan-out={}); doc stores deferred to page materialize for Lazy segments",
-                    logical_paths.len(),
-                    owned.len(),
-                    self.scoring_hydrate_concurrency
-                );
-                self.hydrate_files(
-                    s3,
-                    &logical_paths,
-                    self.scoring_hydrate_concurrency,
-                    request,
-                );
-                outcome.rounds += 1;
-                // Bytes counted post-fetch (sizes weren't known up front);
-                // every path here was absent before the fetch, so this
-                // counts only what this call actually moved.
-                for (path, _) in &logical_paths {
-                    if let Ok(m) = std::fs::metadata(self.data_dir.join(path)) {
-                        outcome.files_fetched += 1;
-                        outcome.bytes_fetched += m.len();
-                    }
-                }
-            }
-
-            // Legacy `doc_vectors.bin` headers, by range into the span
-            // cache (the reader binds the unnamed index from that span).
-            if !doc_vector_headers.is_empty() && !request.is_shed() {
-                let fetcher = doc_spans::S3RangeFetcher {
-                    s3,
-                    concurrency: self.scoring_hydrate_concurrency,
-                    budget: &self.hydration_budget,
-                    request,
-                };
-                let targets: Vec<(&Path, &str)> = doc_vector_headers
-                    .iter()
-                    .map(|(dir, rel)| (*dir, rel.as_str()))
-                    .collect();
-                let fetched =
-                    doc_spans::fetch_doc_vectors_headers(&targets, &fetcher, &self.span_writes);
-                outcome.rounds += fetched.rounds;
-                outcome.shed |= fetched.shed;
-                for seg in &fetched.segments {
-                    outcome.bytes_fetched += seg.bytes;
-                    if seg.status == doc_spans::HeaderStatus::Cached {
-                        outcome.files_fetched += 1;
-                    }
-                }
-            }
-
-            // Ranged mode: a segment with no `vector.offsets` is a legacy
-            // flat (or unclustered) one, searched by exact scan of the whole
-            // `vector.idx`. One more round, for those segments only.
-            if let (Some(field), true) = (knn_field, vectors_ranged) {
-                let mut legacy: Vec<(String, u64)> = Vec::new();
-                for (p, _) in &owned {
-                    let Ok(rel) = p.strip_prefix(&self.data_dir) else {
+                // Sizes are unknown without a per-segment LIST round trip —
+                // avoiding that round trip is half the point of this path (file
+                // names are known a priori). 0 sizes mean `chunk_by_byte_budget`
+                // cannot chunk this batch at all: every file below lands in one
+                // chunk, fanned out `scoring_hydrate_concurrency` (64) wide.
+                //
+                // That used to be waved off as "the scoring set excludes the
+                // bulk doc stores, so per-file sizes are small." It isn't:
+                // `inverted.idx` grows with a segment's vocabulary, and one cold
+                // search on staging pulled 177 files / 4,974 MB through here
+                // (~28 MB average) in a single chunk. Volume on this path is
+                // instead bounded by `hydration_budget`, from each response's
+                // `Content-Length` — see the `hydrate_byte_budget` field docs.
+                let mut logical_paths: Vec<(String, u64)> = Vec::new();
+                // Segments sent to score with only their offsets sidecar. Each
+                // is checked after the fetch below: a sidecar that is missing
+                // from S3 or that the reader would reject falls back to
+                // `doc_store.bin` (#179, #184).
+                let mut lazy_segments: Vec<&PathBuf> = Vec::new();
+                // Legacy segments whose `doc_vectors.bin` header a kNN needs,
+                // with their object prefix: fetched by range after this round.
+                let mut doc_vector_headers: Vec<(&Path, String)> = Vec::new();
+                for (seg_path, _) in owned {
+                    let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
                         continue;
                     };
-                    let local_footer;
-                    let footer = match manifest_footers.get(p) {
-                        Some(footer) => Some(*footer),
-                        None => {
-                            local_footer = SegmentReader::read_footer(p).ok();
-                            local_footer.as_ref()
+                    let s3_prefix = rel_path.to_string_lossy().into_owned();
+
+                    // `footer.json` is needed only for legacy manifests that do
+                    // not carry a footer snapshot.
+                    if !manifest_footers.contains_key(seg_path)
+                        && !file_present_nonempty(&seg_path.join("footer.json"))
+                    {
+                        logical_paths.push((format!("{s3_prefix}/footer.json"), 0));
+                    }
+                    if !file_present_nonempty(&seg_path.join("inverted.idx")) {
+                        logical_paths.push((format!("{s3_prefix}/inverted.idx"), 0));
+                    }
+                    // Only the filter files this query reads: a columnar
+                    // segment's TOC plus the columns the query names (#244),
+                    // in the same round as the other scoring files.
+                    for file in filters_of(seg_path) {
+                        if !file_present_nonempty(&seg_path.join(file)) {
+                            logical_paths.push((format!("{s3_prefix}/{file}"), 0));
                         }
-                    };
-                    for column in kosha_segment::knn_vector_columns(footer, field) {
-                        let Some(offsets) = &column.offsets_file else {
-                            continue;
+                    }
+
+                    // doc_store: Lazy segments need only the offsets sidecar;
+                    // legacy (format_version 0) segments need the full
+                    // doc_store.bin because eager open parses it. See
+                    // `segment_is_lazy_capable` for how that is decided and
+                    // what it used to get wrong.
+                    let has_offsets = file_present_nonempty(&seg_path.join("doc_store.offsets"));
+                    let has_doc_store = file_present_nonempty(&seg_path.join("doc_store.bin"));
+                    let lazy_capable = has_offsets
+                        || segment_is_lazy_capable(
+                            manifest_footers.get(seg_path).map(|f| f.format_version),
+                            || {
+                                SegmentReader::read_footer(seg_path)
+                                    .ok()
+                                    .map(|ft| ft.format_version)
+                            },
+                        );
+                    if lazy_capable {
+                        if !has_offsets {
+                            logical_paths.push((format!("{s3_prefix}/doc_store.offsets"), 0));
+                        }
+                        if !has_doc_store {
+                            lazy_segments.push(seg_path);
+                        }
+                    } else if !has_doc_store {
+                        logical_paths.push((format!("{s3_prefix}/doc_store.bin"), 0));
+                    }
+
+                    // Only the queried column's files (#204), as the segment's
+                    // footer lists them. Ranged mode (#245) fetches a clustered
+                    // column's offsets sidecar only: its probed postings are
+                    // read by range during the search, and the idx file is
+                    // fetched whole only for a column that turns out to have no
+                    // sidecar (below). A legacy segment's `vector.offsets`
+                    // exists only for the clustered format, and there is no
+                    // footer signal to predict that (vector.idx is
+                    // deliberately self-describing), so it is always attempted:
+                    // a segment that doesn't have one just shows up as a
+                    // per-file miss in `s3.read_many`'s accounting, not a
+                    // hydration failure. Without the sidecar the lazy path
+                    // never activates for S3-backed segments, and every kNN
+                    // query silently takes the (still correct, just slower)
+                    // eager fallback.
+                    if let Some(field) = knn_field {
+                        let local_footer;
+                        let footer = match manifest_footers.get(seg_path) {
+                            Some(footer) => Some(*footer),
+                            None => {
+                                local_footer = SegmentReader::read_footer(seg_path).ok();
+                                local_footer.as_ref()
+                            }
                         };
-                        if !file_present_nonempty(&p.join(offsets))
-                            && !file_present_nonempty(&p.join(&column.idx_file))
+                        for column in kosha_segment::knn_vector_columns(footer, field) {
+                            let mut files: Vec<&str> = Vec::new();
+                            if let Some(offsets) = &column.offsets_file {
+                                files.push(offsets);
+                            }
+                            if !vectors_ranged || column.offsets_file.is_none() {
+                                files.push(&column.idx_file);
+                            }
+                            for file in files {
+                                if !file_present_nonempty(&seg_path.join(file)) {
+                                    logical_paths.push((format!("{s3_prefix}/{file}"), 0));
+                                }
+                            }
+                        }
+                        // Only the header of a legacy `doc_vectors.bin` (its
+                        // field table binds the unnamed index), by range below:
+                        // the whole file is as large as the index itself. With
+                        // global rescoring on (#381), a quantized column's
+                        // header too (see `knn_wants_doc_vectors_header`).
+                        if knn_wants_doc_vectors_header(footer, field)
+                            && !doc_spans::doc_vectors_header_local(seg_path)
                         {
-                            legacy.push((
-                                format!("{}/{}", rel.to_string_lossy(), column.idx_file),
-                                0,
-                            ));
+                            doc_vector_headers.push((seg_path.as_path(), s3_prefix.clone()));
                         }
                     }
                 }
-                if !legacy.is_empty() {
-                    self.hydrate_files(s3, &legacy, self.scoring_hydrate_concurrency, request);
+
+                if !logical_paths.is_empty() {
+                    println!(
+                        "cache miss: hydrating {} scoring file(s) across {} segment(s) \
+                     (fan-out={}); doc stores deferred to page materialize for Lazy segments",
+                        logical_paths.len(),
+                        owned.len(),
+                        self.scoring_hydrate_concurrency
+                    );
+                    self.hydrate_files(
+                        s3,
+                        &logical_paths,
+                        self.scoring_hydrate_concurrency,
+                        request,
+                    );
                     outcome.rounds += 1;
-                    for (path, _) in &legacy {
+                    // Bytes counted post-fetch (sizes weren't known up front);
+                    // every path here was absent before the fetch, so this
+                    // counts only what this call actually moved.
+                    for (path, _) in &logical_paths {
                         if let Ok(m) = std::fs::metadata(self.data_dir.join(path)) {
                             outcome.files_fetched += 1;
                             outcome.bytes_fetched += m.len();
                         }
                     }
                 }
-            }
 
-            // Doc-store fallback (#179, #184). A Lazy segment goes to
-            // scoring with only `doc_store.offsets`; `doc_store.bin` is
-            // deferred to page materialize. That is only safe if the reader
-            // will actually use the sidecar. Two ways it won't:
-            //
-            // * The sidecar is not in S3 (a partial upload, or a legacy
-            //   segment whose manifest footer claimed otherwise), or the GET
-            //   failed. The segment would reach scoring with neither
-            //   doc-store file, the one state the reader can't open, and the
-            //   whole search used to 503 with "segment hydration failed".
-            // * The sidecar is there but fails the reader's sanity check
-            //   (doc-count mismatch, truncation). The reader falls back to
-            //   parsing `doc_store.bin`, which was never fetched, and the
-            //   search used to 500 with "No such file or directory".
-            //
-            // Either way, fetch `doc_store.bin` for that segment and serve
-            // the search. It is the expensive path, and it self-heals: once
-            // the bulk file is local, later queries are served from disk.
-            // `footer.json` comes along for a rejected sidecar so the reader
-            // can check the manifest's cached footer against the segment's
-            // own (see `kosha_segment::doc_store_opens_lazily`).
-            let mut fallback_paths: Vec<(String, u64)> = Vec::new();
-            // A shed request skipped its fetches on purpose; its sidecars
-            // are absent because nothing asked for them, and it must not
-            // go on to pull bulk doc stores either.
-            let lazy_segments = if request.is_shed() {
-                Vec::new()
-            } else {
-                lazy_segments
-            };
-            for seg_path in lazy_segments {
-                let manifest_footer = manifest_footers.get(seg_path).copied();
-                let Some(reason) = doc_store_fallback_reason(seg_path, manifest_footer) else {
-                    continue;
+                // Legacy `doc_vectors.bin` headers, by range into the span
+                // cache (the reader binds the unnamed index from that span).
+                if !doc_vector_headers.is_empty() && !request.is_shed() {
+                    let fetcher = doc_spans::S3RangeFetcher {
+                        s3,
+                        concurrency: self.scoring_hydrate_concurrency,
+                        budget: &self.hydration_budget,
+                        request,
+                    };
+                    let targets: Vec<(&Path, &str)> = doc_vector_headers
+                        .iter()
+                        .map(|(dir, rel)| (*dir, rel.as_str()))
+                        .collect();
+                    let fetched =
+                        doc_spans::fetch_doc_vectors_headers(&targets, &fetcher, &self.span_writes);
+                    outcome.rounds += fetched.rounds;
+                    outcome.shed |= fetched.shed;
+                    for seg in &fetched.segments {
+                        outcome.bytes_fetched += seg.bytes;
+                        if seg.status == doc_spans::HeaderStatus::Cached {
+                            outcome.files_fetched += 1;
+                        }
+                    }
+                }
+
+                // Ranged mode: a segment with no `vector.offsets` is a legacy
+                // flat (or unclustered) one, searched by exact scan of the whole
+                // `vector.idx`. One more round, for those segments only.
+                if let (Some(field), true) = (knn_field, vectors_ranged) {
+                    let mut legacy: Vec<(String, u64)> = Vec::new();
+                    for (p, _) in owned {
+                        let Ok(rel) = p.strip_prefix(&self.data_dir) else {
+                            continue;
+                        };
+                        let local_footer;
+                        let footer = match manifest_footers.get(p) {
+                            Some(footer) => Some(*footer),
+                            None => {
+                                local_footer = SegmentReader::read_footer(p).ok();
+                                local_footer.as_ref()
+                            }
+                        };
+                        for column in kosha_segment::knn_vector_columns(footer, field) {
+                            let Some(offsets) = &column.offsets_file else {
+                                continue;
+                            };
+                            if !file_present_nonempty(&p.join(offsets))
+                                && !file_present_nonempty(&p.join(&column.idx_file))
+                            {
+                                legacy.push((
+                                    format!("{}/{}", rel.to_string_lossy(), column.idx_file),
+                                    0,
+                                ));
+                            }
+                        }
+                    }
+                    if !legacy.is_empty() {
+                        self.hydrate_files(s3, &legacy, self.scoring_hydrate_concurrency, request);
+                        outcome.rounds += 1;
+                        for (path, _) in &legacy {
+                            if let Ok(m) = std::fs::metadata(self.data_dir.join(path)) {
+                                outcome.files_fetched += 1;
+                                outcome.bytes_fetched += m.len();
+                            }
+                        }
+                    }
+                }
+
+                // Doc-store fallback (#179, #184). A Lazy segment goes to
+                // scoring with only `doc_store.offsets`; `doc_store.bin` is
+                // deferred to page materialize. That is only safe if the reader
+                // will actually use the sidecar. Two ways it won't:
+                //
+                // * The sidecar is not in S3 (a partial upload, or a legacy
+                //   segment whose manifest footer claimed otherwise), or the GET
+                //   failed. The segment would reach scoring with neither
+                //   doc-store file, the one state the reader can't open, and the
+                //   whole search used to 503 with "segment hydration failed".
+                // * The sidecar is there but fails the reader's sanity check
+                //   (doc-count mismatch, truncation). The reader falls back to
+                //   parsing `doc_store.bin`, which was never fetched, and the
+                //   search used to 500 with "No such file or directory".
+                //
+                // Either way, fetch `doc_store.bin` for that segment and serve
+                // the search. It is the expensive path, and it self-heals: once
+                // the bulk file is local, later queries are served from disk.
+                // `footer.json` comes along for a rejected sidecar so the reader
+                // can check the manifest's cached footer against the segment's
+                // own (see `kosha_segment::doc_store_opens_lazily`).
+                let mut fallback_paths: Vec<(String, u64)> = Vec::new();
+                // A shed request skipped its fetches on purpose; its sidecars
+                // are absent because nothing asked for them, and it must not
+                // go on to pull bulk doc stores either.
+                let lazy_segments = if request.is_shed() {
+                    Vec::new()
+                } else {
+                    lazy_segments
                 };
-                let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
-                    continue;
-                };
-                let s3_prefix = rel_path.to_string_lossy().into_owned();
-                eprintln!(
+                for seg_path in lazy_segments {
+                    let manifest_footer = manifest_footers.get(seg_path).copied();
+                    let Some(reason) = doc_store_fallback_reason(seg_path, manifest_footer) else {
+                        continue;
+                    };
+                    let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
+                        continue;
+                    };
+                    let s3_prefix = rel_path.to_string_lossy().into_owned();
+                    eprintln!(
                     "WARN: segment {s3_prefix}: {}; falling back to the eager doc_store.bin path \
                      for this search. Repair the sidecar with \
                      POST /v1/admin/backfill-offset-tables, otherwise every cold query on this \
                      segment pays for the full doc store.",
                     reason.describe()
                 );
-                self.doc_store_fallbacks
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                fallback_paths.push((format!("{s3_prefix}/doc_store.bin"), 0));
-                if reason == DocStoreFallbackReason::Rejected
-                    && !file_present_nonempty(&seg_path.join("footer.json"))
-                {
-                    fallback_paths.push((format!("{s3_prefix}/footer.json"), 0));
-                }
-            }
-            if !fallback_paths.is_empty() {
-                self.hydrate_files(
-                    s3,
-                    &fallback_paths,
-                    self.scoring_hydrate_concurrency,
-                    request,
-                );
-                for (path, _) in &fallback_paths {
-                    if let Ok(m) = std::fs::metadata(self.data_dir.join(path)) {
-                        outcome.files_fetched += 1;
-                        outcome.bytes_fetched += m.len();
+                    self.doc_store_fallbacks
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    fallback_paths.push((format!("{s3_prefix}/doc_store.bin"), 0));
+                    if reason == DocStoreFallbackReason::Rejected
+                        && !file_present_nonempty(&seg_path.join("footer.json"))
+                    {
+                        fallback_paths.push((format!("{s3_prefix}/footer.json"), 0));
                     }
                 }
+                if !fallback_paths.is_empty() {
+                    self.hydrate_files(
+                        s3,
+                        &fallback_paths,
+                        self.scoring_hydrate_concurrency,
+                        request,
+                    );
+                    for (path, _) in &fallback_paths {
+                        if let Ok(m) = std::fs::metadata(self.data_dir.join(path)) {
+                            outcome.files_fetched += 1;
+                            outcome.bytes_fetched += m.len();
+                        }
+                    }
+                }
+
+                outcome.bytes_fetched - bytes_before
+            },
+            || request.is_shed(),
+        );
+
+        // Rare path (a required set fails the request with it): say which
+        // check failed and how this request took part in the fetch, so a 503
+        // can be read from the log without a reproduction (finding 28). One
+        // line per request, naming the first few segments. Not for a shed
+        // request (its 429 says why) or a best-effort set.
+        const LOGGED_SEGMENTS: usize = 3;
+        let mut detail: Vec<String> = Vec::new();
+        for p in seg_paths {
+            let Some(gap) = Self::scoring_gap(
+                p,
+                knn_field,
+                vectors_ranged,
+                filters_of(p),
+                manifest_footers.get(p).copied(),
+            ) else {
+                continue;
+            };
+            let Ok(rel) = p.strip_prefix(&self.data_dir) else {
+                continue;
+            };
+            if log_missing && detail.len() < LOGGED_SEGMENTS {
+                let role = roles.get(p).map_or_else(
+                    || "found complete, then lost".to_string(),
+                    |r| r.to_string(),
+                );
+                detail.push(format!("{} (missing={gap}, role={role})", rel.display()));
             }
-
-            drop(_permit);
-            complete_owned(&self.in_flight_segments, &owned, outcome.bytes_fetched);
+            outcome.missing.push(rel.to_string_lossy().into_owned());
         }
-
-        wait_for(&waiting);
-
-        outcome.missing = seg_paths
-            .iter()
-            .filter(|p| {
-                !Self::scoring_complete(
-                    p,
-                    knn_field,
-                    vectors_ranged,
-                    filters_of(p),
-                    manifest_footers.get(*p).copied(),
-                )
-            })
-            .filter_map(|p| p.strip_prefix(&self.data_dir).ok())
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
+        if log_missing && !outcome.missing.is_empty() && !request.is_shed() {
+            eprintln!(
+                "WARN: scoring set incomplete after hydration: segments={} first: {}{}",
+                outcome.missing.len(),
+                detail.join("; "),
+                request_id()
+            );
+        }
         outcome
     }
 
@@ -17719,6 +17895,345 @@ mod tests {
             "in-flight entry must be removed after completion so a future cache miss can retry"
         );
         assert!(hydrated.load(Ordering::SeqCst));
+    }
+
+    /// Block until `entry` has `n` holders: the in-flight map, the owner's
+    /// batch, and one per waiter that has partitioned onto it.
+    #[cfg(feature = "s3")]
+    fn wait_for_holders(entry: &Arc<SegmentFetch>, n: usize) {
+        let t0 = Instant::now();
+        while Arc::strong_count(entry) < n {
+            assert!(t0.elapsed() < Duration::from_secs(10), "no waiter arrived");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Finding 28 (run9, two 503s "segment hydration failed for 12
+    /// segment(s)"): single-flight is keyed by segment, but the owner
+    /// fetches only what its own request needs. Owner A needs file X;
+    /// waiter B needs X and Y. Before the fix B woke up after A, found Y
+    /// absent and reported the segment missing without ever fetching it.
+    /// Now B takes the segment back through ownership and fetches Y.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn waiter_fetches_what_the_owner_did_not_need() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+
+        let in_flight: Mutex<HashMap<PathBuf, Arc<SegmentFetch>>> = Mutex::new(HashMap::new());
+        let (x, y) = (AtomicBool::new(false), AtomicBool::new(false));
+        let seg = PathBuf::from("ns/seg-1");
+        let (claimed_tx, claimed_rx) = mpsc::channel();
+
+        let b_roles = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                hydrate_single_flight(
+                    &in_flight,
+                    std::slice::from_ref(&seg),
+                    HYDRATE_OWNER_SCORING,
+                    |_, _| x.load(Ordering::SeqCst),
+                    |owned| {
+                        claimed_tx.send(()).unwrap();
+                        // Hold the fetch until B is waiting on it.
+                        wait_for_holders(&owned[0].1, 3);
+                        x.store(true, Ordering::SeqCst); // A fetches only X
+                        0
+                    },
+                    || false,
+                );
+            });
+            claimed_rx.recv().unwrap();
+            let b = scope.spawn(|| {
+                hydrate_single_flight(
+                    &in_flight,
+                    std::slice::from_ref(&seg),
+                    HYDRATE_OWNER_SCORING,
+                    |_, _| x.load(Ordering::SeqCst) && y.load(Ordering::SeqCst),
+                    |_| {
+                        y.store(true, Ordering::SeqCst); // B's own gap
+                        0
+                    },
+                    || false,
+                )
+            });
+            b.join().unwrap()
+        });
+
+        assert!(
+            y.load(Ordering::SeqCst),
+            "B must fetch Y itself, not report the segment missing"
+        );
+        assert_eq!(
+            b_roles.get(&seg),
+            Some(&HydrationRole::OwnedAfterWaiting {
+                owner: HYDRATE_OWNER_SCORING
+            })
+        );
+        assert!(in_flight.lock().unwrap().is_empty());
+    }
+
+    /// The warm path: every segment complete, nothing partitioned, fetched,
+    /// waited on or recorded.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn single_flight_on_complete_segments_does_nothing() {
+        let in_flight: Mutex<HashMap<PathBuf, Arc<SegmentFetch>>> = Mutex::new(HashMap::new());
+        let segs = [PathBuf::from("ns/a"), PathBuf::from("ns/b")];
+        let roles = hydrate_single_flight(
+            &in_flight,
+            &segs,
+            HYDRATE_OWNER_SCORING,
+            |_, _| true,
+            |_| panic!("nothing to fetch"),
+            || false,
+        );
+        assert!(roles.is_empty());
+        assert!(in_flight.lock().unwrap().is_empty());
+    }
+
+    /// A cold query node over a fake bucket of two segments written by
+    /// `writer` (configured by `configure`, documents from `fields(i)`),
+    /// with the writer's footers on the manifest. Returns the bucket, the
+    /// node, its segment dirs and their footers.
+    #[cfg(feature = "s3")]
+    fn single_flight_node(
+        ns: &str,
+        configure: impl Fn(kosha_segment::SegmentWriter) -> kosha_segment::SegmentWriter,
+        fields: impl Fn(u32) -> Vec<Field>,
+    ) -> (
+        crate::doc_store_fallback_tests::FakeS3,
+        AppState,
+        kosha_core::Manifest,
+        Vec<PathBuf>,
+    ) {
+        use crate::doc_store_fallback_tests::{cold_node, temp_dir, FakeS3};
+
+        // A manifest of two segments, from the indexer...
+        let writer = AppState::new(temp_dir("sf-writer"));
+        let id = NamespaceId(ns.into());
+        for batch in 0..2 {
+            let docs = (0..6)
+                .map(|i| Document {
+                    id: DocumentId(format!("d{batch}-{i}")),
+                    fields: vec![Field::text("text", format!("contract clause {i}"))],
+                })
+                .collect();
+            writer.indexer.index_documents(id.clone(), docs).unwrap();
+            writer.indexer.flush_namespace(&id).unwrap();
+        }
+        let mut manifest = writer.indexer.manifest_cloned(&id).unwrap();
+        // ...whose segments in the bucket are written in the shape under test.
+        let bucket = temp_dir("sf-bucket");
+        for (batch, entry) in manifest.segments.iter().enumerate() {
+            let mut w = configure(kosha_segment::SegmentWriter::new(
+                entry.segment_id.clone(),
+                bucket.join(ns).join(&entry.segment_id.0),
+            ));
+            for i in 0..entry.doc_count {
+                w.add_document(DocumentId(format!("d{batch}-{i}")), fields(i));
+            }
+            let footer = w.finalize(kosha_core::Bm25Params::default()).unwrap();
+            manifest
+                .segment_footers
+                .insert(entry.segment_id.clone(), Arc::new(footer));
+        }
+        let s3 = FakeS3::start(bucket);
+        let state = cold_node(&s3, ns, manifest.clone());
+        let seg_paths = manifest
+            .segments
+            .iter()
+            .map(|e| manifest.segment_dir(&state.data_dir, &id, &e.segment_id))
+            .collect();
+        (s3, state, manifest, seg_paths)
+    }
+
+    /// Each segment dir's manifest footer.
+    #[cfg(feature = "s3")]
+    fn footers_of<'a>(
+        manifest: &'a kosha_core::Manifest,
+        seg_paths: &[PathBuf],
+    ) -> HashMap<PathBuf, &'a kosha_core::Footer> {
+        manifest
+            .segments
+            .iter()
+            .zip(seg_paths)
+            .filter_map(|(e, p)| {
+                manifest
+                    .segment_footer(&e.segment_id)
+                    .map(|f| (p.clone(), f))
+            })
+            .collect()
+    }
+
+    /// Run `waiter` (an `ensure_scoring_files_local` call) while an
+    /// unfiltered keyword search owns every segment's scoring hydration:
+    /// the owner claims them all, waits until `waiter` is waiting on each,
+    /// lands only what its own round fetches (`footer.json`, `inverted.idx`,
+    /// `doc_store.offsets`), then completes. Returns the waiter's outcome.
+    #[cfg(feature = "s3")]
+    fn behind_unfiltered_owner(
+        s3: &crate::doc_store_fallback_tests::FakeS3,
+        state: &AppState,
+        seg_paths: &[PathBuf],
+        footers: &HashMap<PathBuf, &kosha_core::Footer>,
+        waiter: impl FnOnce() -> HydrationOutcome + Send,
+    ) -> HydrationOutcome {
+        let (owned, waiting) = partition_for_hydration(
+            &state.in_flight_segments,
+            seg_paths,
+            HYDRATE_OWNER_SCORING,
+            |_| false,
+        );
+        assert_eq!((owned.len(), waiting.len()), (seg_paths.len(), 0));
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(waiter);
+            for (_, entry) in &owned {
+                wait_for_holders(entry, 3);
+            }
+            for p in seg_paths {
+                let rel = p.strip_prefix(&state.data_dir).unwrap();
+                fs::create_dir_all(p).unwrap();
+                for f in ["footer.json", "inverted.idx", "doc_store.offsets"] {
+                    fs::copy(s3.root.join(rel).join(f), p.join(f)).unwrap();
+                }
+                assert!(AppState::scoring_complete(
+                    p,
+                    None,
+                    false,
+                    &[],
+                    footers.get(p).copied()
+                ));
+            }
+            complete_owned(&state.in_flight_segments, &owned, 0);
+            waiter.join().unwrap()
+        })
+    }
+
+    /// Finding 28, filter shape: a filtered search waiting behind an
+    /// unfiltered owner finds `filters.toc` and its column absent (the
+    /// owner never fetches filter files). Before the fix it reported every
+    /// segment missing; now it fetches the filter files itself.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn filtered_waiter_behind_unfiltered_owner_fetches_its_filter_files() {
+        // Columnar-filter segments (#244), as staging writes them.
+        let (s3, state, manifest, seg_paths) = single_flight_node(
+            "singleflight-filters",
+            |w| w.with_filters_write_version(2),
+            |i| {
+                vec![
+                    Field::text("text", format!("contract clause {i}")),
+                    Field::keyword("matterId", format!("m{}", i % 2)),
+                ]
+            },
+        );
+        let footers = footers_of(&manifest, &seg_paths);
+        let query: SearchQuery = serde_json::from_value(serde_json::json!({
+            "query_text": "contract",
+            "filter": {"term": {"matterId.keyword": "m1"}}
+        }))
+        .unwrap();
+        let fields = query_filter_fields(&query).expect("a filtered query reads filter files");
+        let filter_files: HashMap<PathBuf, Vec<String>> = seg_paths
+            .iter()
+            .map(|p| {
+                let files = segment_filter_files(footers.get(p).copied(), p, &fields);
+                assert_eq!(files.len(), 2, "filters.toc and the matterId column");
+                assert_eq!(files[0], kosha_core::FILTERS_TOC_FILE);
+                (p.clone(), files)
+            })
+            .collect();
+
+        let outcome = behind_unfiltered_owner(&s3, &state, &seg_paths, &footers, || {
+            state.ensure_scoring_files_local(
+                &seg_paths,
+                None,
+                &filter_files,
+                &footers,
+                &Arc::new(RequestHydration::new(u64::MAX)),
+                true,
+            )
+        });
+
+        assert!(
+            outcome.missing.is_empty(),
+            "the filtered search must fetch its filter files, not fail on: {:?}",
+            outcome.missing
+        );
+        for (p, files) in &filter_files {
+            for f in files {
+                assert!(file_present_nonempty(&p.join(f)), "{f} of {}", p.display());
+            }
+        }
+    }
+
+    /// Finding 28 as it happened on run9's ld9nd: an unfiltered keyword
+    /// search (rid ev95429290-14094) owned the 12 scoring segments and
+    /// fetched no vector files; two unfiltered kNN searches waiting on it
+    /// (-14099, -14105) then found the kNN column's files absent and 503'd
+    /// 0.3 s after the owner finished, without a fetch of their own. Now the
+    /// kNN waiter fetches its column files itself, in both posting read
+    /// modes (ranged: `vector.offsets`; whole: also `vector.idx`).
+    #[cfg(feature = "s3")]
+    #[test]
+    fn knn_waiter_behind_keyword_owner_fetches_its_vector_files() {
+        for mode in [doc_spans::ReadMode::Ranged, doc_spans::ReadMode::Whole] {
+            let (s3, mut state, manifest, seg_paths) = single_flight_node(
+                "singleflight-knn",
+                |w| w.with_vector_store_mode(kosha_segment::VectorStoreMode::Sidecar),
+                |i| {
+                    vec![
+                        Field::text("text", format!("contract clause {i}")),
+                        Field::vector("emb", vec![1.0, i as f32, 0.5, 0.0]),
+                    ]
+                },
+            );
+            state.posting_read_mode = mode;
+            let ranged = mode == doc_spans::ReadMode::Ranged;
+            let footers = footers_of(&manifest, &seg_paths);
+            for p in &seg_paths {
+                assert!(
+                    !kosha_segment::knn_vector_columns(footers.get(p).copied(), "emb").is_empty(),
+                    "segments carry an 'emb' column"
+                );
+            }
+
+            let outcome = behind_unfiltered_owner(&s3, &state, &seg_paths, &footers, || {
+                state.ensure_scoring_files_local(
+                    &seg_paths,
+                    Some("emb"),
+                    &HashMap::new(),
+                    &footers,
+                    &Arc::new(RequestHydration::new(u64::MAX)),
+                    true,
+                )
+            });
+
+            assert!(
+                outcome.missing.is_empty(),
+                "{mode:?}: the kNN search must fetch its vector files, not fail on: {:?}",
+                outcome.missing
+            );
+            for p in &seg_paths {
+                let footer = footers.get(p).copied();
+                for column in kosha_segment::knn_vector_columns(footer, "emb") {
+                    let local = |f: &str| file_present_nonempty(&p.join(f));
+                    assert!(
+                        column.offsets_file.as_deref().is_some_and(local)
+                            || local(&column.idx_file),
+                        "{mode:?}: a vector file of 'emb' in {}",
+                        p.display()
+                    );
+                }
+                assert!(AppState::scoring_complete(
+                    p,
+                    Some("emb"),
+                    ranged,
+                    &[],
+                    footer
+                ));
+            }
+        }
     }
 
     // ── bloom_pruned: a filtered query's hydration success must not be
