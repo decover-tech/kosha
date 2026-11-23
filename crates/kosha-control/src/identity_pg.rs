@@ -288,11 +288,7 @@ impl IdentityTx for PgTx<'_> {
             .map_err(store_error)
     }
 
-    fn identity_user(
-        &mut self,
-        provider: &str,
-        subject: &str,
-    ) -> Result<Option<String>, OrgError> {
+    fn identity_user(&mut self, provider: &str, subject: &str) -> Result<Option<String>, OrgError> {
         let row: Option<(String,)> = self
             .rt
             .block_on(
@@ -369,7 +365,11 @@ impl IdentityTx for PgTx<'_> {
         );
         let row: Option<(String, String, String, i64)> = self
             .rt
-            .block_on(sqlx::query_as(&sql).bind(slug).fetch_optional(&mut *self.tx))
+            .block_on(
+                sqlx::query_as(&sql)
+                    .bind(slug)
+                    .fetch_optional(&mut *self.tx),
+            )
             .map_err(store_error)?;
         Ok(row.map(|(id, slug, name, created_at_ms)| Organization {
             id,
@@ -562,7 +562,16 @@ impl IdentityTx for PgTx<'_> {
         Ok(rows
             .into_iter()
             .map(
-                |(key_id, tenant_id, description, scopes, created_at, expires_at, last_used_at, created_by)| {
+                |(
+                    key_id,
+                    tenant_id,
+                    description,
+                    scopes,
+                    created_at,
+                    expires_at,
+                    last_used_at,
+                    created_by,
+                )| {
                     OrgApiKey {
                         key_id,
                         tenant_id,

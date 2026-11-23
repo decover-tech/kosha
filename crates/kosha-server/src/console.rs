@@ -88,7 +88,9 @@ fn flag(name: &str) -> Result<bool, String> {
     {
         "" | "off" | "false" | "0" | "no" | "disabled" => Ok(false),
         "on" | "true" | "1" | "yes" | "enabled" => Ok(true),
-        other => Err(format!("invalid {name} '{other}' (expected enabled or disabled)")),
+        other => Err(format!(
+            "invalid {name} '{other}' (expected enabled or disabled)"
+        )),
     }
 }
 
@@ -139,7 +141,11 @@ impl RateLimiter {
         let mut windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
         if windows.len() >= MAX_COUNTERS {
             windows.retain(|k, (w, _)| {
-                let secs = k.rsplit('|').next().and_then(|s| s.parse().ok()).unwrap_or(1);
+                let secs = k
+                    .rsplit('|')
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1);
                 *w == now / secs
             });
             if windows.len() >= MAX_COUNTERS {
@@ -180,6 +186,11 @@ pub(crate) struct Console {
     oidc: OidcClient,
     limiter: RateLimiter,
     client_ip_header: Option<String>,
+    /// Accept `http://` OIDC issuers (tests with a local fake provider).
+    /// Otherwise an organization's issuer must be `https://`: the server
+    /// fetches it, and plain-HTTP local services must not be reachable that
+    /// way.
+    allow_http_issuers: bool,
 }
 
 impl Console {
@@ -198,6 +209,7 @@ impl Console {
             oidc: OidcClient::new(),
             limiter: RateLimiter::new(),
             client_ip_header: None,
+            allow_http_issuers: false,
         }
     }
 
@@ -210,6 +222,7 @@ impl Console {
             public_url: public_url.to_string(),
             mailer,
             secret_key: Some(SecretKey::parse(&"42".repeat(32)).unwrap()),
+            allow_http_issuers: true,
             ..Self::disabled()
         }
     }
@@ -314,6 +327,7 @@ impl Console {
             oidc: OidcClient::new(),
             limiter: RateLimiter::new(),
             client_ip_header: env("KOSHA_CONSOLE_CLIENT_IP_HEADER").map(|h| h.to_ascii_lowercase()),
+            allow_http_issuers: false,
         };
         println!(
             "console: enabled at {}/console (sign-up {}, mailer {mailer_description}, \
@@ -481,8 +495,12 @@ fn required<'a>(body: &'a Value, name: &str) -> Result<&'a str, http::Response> 
 }
 
 fn role_field(body: &Value) -> Result<Role, http::Response> {
-    Role::parse(required(body, "role")?)
-        .ok_or_else(|| error(400, "invalid 'role': one of owner, admin, member, read-only"))
+    Role::parse(required(body, "role")?).ok_or_else(|| {
+        error(
+            400,
+            "invalid 'role': one of owner, admin, member, read-only",
+        )
+    })
 }
 
 /// The client address the attempt limits count by.
@@ -518,12 +536,7 @@ fn check_csrf(console: &Console, req: &Req<'_>) -> Result<(), http::Response> {
     Ok(())
 }
 
-fn limit(
-    console: &Console,
-    key: &str,
-    per: u32,
-    window_secs: u64,
-) -> Result<(), http::Response> {
+fn limit(console: &Console, key: &str, per: u32, window_secs: u64) -> Result<(), http::Response> {
     console
         .limiter
         .check(key, per, window_secs)
@@ -813,8 +826,9 @@ impl Ctx<'_> {
     }
 
     fn open_session(&self, user: &orgs::User, method: &str) -> Answer {
-        let token = identity::create_session(self.store, &user.id, method, self.console.session_ttl_ms)
-            .map_err(|e| org_error(&e))?;
+        let token =
+            identity::create_session(self.store, &user.id, method, self.console.session_ttl_ms)
+                .map_err(|e| org_error(&e))?;
         Ok(reply_with(
             200,
             &json!({ "user": user, "auth_method": method }),
@@ -864,7 +878,12 @@ impl Ctx<'_> {
         let body = self.req.json()?;
         let token = required(&body, "token")?;
         let password = required(&body, "password")?;
-        limit(self.console, &format!("reset-confirm-ip:{}", self.ip()), 30, 3600)?;
+        limit(
+            self.console,
+            &format!("reset-confirm-ip:{}", self.ip()),
+            30,
+            3600,
+        )?;
         identity::finish_password_reset(self.store, token, password).map_err(|e| org_error(&e))?;
         Ok(reply(200, json!({ "password_changed": true })))
     }
@@ -987,10 +1006,7 @@ impl Ctx<'_> {
         let clear = clear_cookie(OAUTH_COOKIE, "/v1/console");
         let fail = |message: &str| {
             redirect(
-                &format!(
-                    "/console#/login?error={}",
-                    console_oauth::encode(message)
-                ),
+                &format!("/console#/login?error={}", console_oauth::encode(message)),
                 std::slice::from_ref(&clear),
             )
         };
@@ -1032,7 +1048,8 @@ impl Ctx<'_> {
         if !constant_time_eq(cookie.as_bytes(), state.as_bytes()) {
             return Err("this sign-in was started in another browser; start again".into());
         }
-        let flow = identity::finish_login_flow(self.store, &state).map_err(|e| e.to_string())?;
+        let flow =
+            identity::finish_login_flow(self.store, &state).map_err(|e| public_message(&e))?;
         if flow.provider != provider {
             return Err("sign-in provider mismatch; start again".into());
         }
@@ -1045,10 +1062,21 @@ impl Ctx<'_> {
         };
         match provider {
             "google" => {
-                let g = self.console.google.as_ref().ok_or("Google sign-in is off")?;
+                let g = self
+                    .console
+                    .google
+                    .as_ref()
+                    .ok_or("Google sign-in is off")?;
                 let d = oidc.discover(&g.issuer).map_err(log)?;
                 let id_token = oidc
-                    .exchange_code(&d, &g.client_id, &g.client_secret, &code, &redirect_uri, &flow.pkce_verifier)
+                    .exchange_code(
+                        &d,
+                        &g.client_id,
+                        &g.client_secret,
+                        &code,
+                        &redirect_uri,
+                        &flow.pkce_verifier,
+                    )
                     .map_err(log)?;
                 let issuers = [g.issuer.as_str(), "accounts.google.com"];
                 let v = oidc
@@ -1058,7 +1086,11 @@ impl Ctx<'_> {
                 Ok((user, "google".into(), "/console#/".into()))
             }
             "github" => {
-                let gh = self.console.github.as_ref().ok_or("GitHub sign-in is off")?;
+                let gh = self
+                    .console
+                    .github
+                    .as_ref()
+                    .ok_or("GitHub sign-in is off")?;
                 let v = oidc
                     .github_user(gh, &code, &redirect_uri, &flow.pkce_verifier)
                     .map_err(log)?;
@@ -1067,14 +1099,27 @@ impl Ctx<'_> {
             }
             "sso" => {
                 let org_id = flow.org_id.clone().ok_or("missing organization")?;
-                let key = self.console.secret_key.as_ref().ok_or("single sign-on is off")?;
+                let key = self
+                    .console
+                    .secret_key
+                    .as_ref()
+                    .ok_or("single sign-on is off")?;
                 let config = identity::sso_config_for_login(self.store, &org_id)
-                    .map_err(|e| e.to_string())?
+                    .map_err(|e| public_message(&e))?
                     .ok_or("this organization has no single sign-on")?;
-                let secret = key.open(&org_id, &config.client_secret_sealed).map_err(log)?;
+                let secret = key
+                    .open(&org_id, &config.client_secret_sealed)
+                    .map_err(log)?;
                 let d: Discovery = oidc.discover(&config.issuer).map_err(log)?;
                 let id_token = oidc
-                    .exchange_code(&d, &config.client_id, &secret, &code, &redirect_uri, &flow.pkce_verifier)
+                    .exchange_code(
+                        &d,
+                        &config.client_id,
+                        &secret,
+                        &code,
+                        &redirect_uri,
+                        &flow.pkce_verifier,
+                    )
                     .map_err(log)?;
                 let issuers = [config.issuer.as_str()];
                 let v = oidc
@@ -1091,7 +1136,7 @@ impl Ctx<'_> {
                         display_name: v.name,
                     },
                 )
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| public_message(&e))?;
                 Ok((user, provider, format!("/console#/orgs/{org_id}")))
             }
             _ => Err("unknown sign-in provider".into()),
@@ -1105,8 +1150,8 @@ impl Ctx<'_> {
         v: console_oauth::VerifiedUser,
     ) -> Result<orgs::User, String> {
         let email = v.email.trim().to_lowercase();
-        let allow_create = self.console.signup
-            && identity::domain_allowed(&email, &self.console.signup_domains);
+        let allow_create =
+            self.console.signup && identity::domain_allowed(&email, &self.console.signup_domains);
         identity::external_login(
             self.store,
             &ExternalIdentity {
@@ -1117,7 +1162,7 @@ impl Ctx<'_> {
             },
             allow_create,
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| public_message(&e))
     }
 
     // ── Signed-in user ──────────────────────────────────────────────────
@@ -1186,8 +1231,8 @@ impl Ctx<'_> {
             ("DELETE", ["members", user]) => {
                 // Safe default: a removed member's console keys stop working.
                 let revoke_keys = self.req.query("revoke_keys").as_deref() != Some("false");
-                let removed = identity::remove_member(store, &actor, org, user, revoke_keys)
-                    .map_err(oe)?;
+                let removed =
+                    identity::remove_member(store, &actor, org, user, revoke_keys).map_err(oe)?;
                 for key in &removed.revoked_keys {
                     self.forget_key(key);
                 }
@@ -1240,7 +1285,10 @@ impl Ctx<'_> {
                 let number = |name: &str| -> Result<Option<i64>, http::Response> {
                     self.req
                         .query(name)
-                        .map(|v| v.parse::<i64>().map_err(|_| error(400, &format!("invalid '{name}'"))))
+                        .map(|v| {
+                            v.parse::<i64>()
+                                .map_err(|_| error(400, &format!("invalid '{name}'")))
+                        })
                         .transpose()
                 };
                 let limit = number("limit")?.map(|n| n.clamp(1, i64::from(orgs::MAX_LIST)) as u32);
@@ -1268,8 +1316,8 @@ impl Ctx<'_> {
         let email = required(&body, "email")?;
         let role = role_field(&body)?;
         limit(self.console, &format!("invite-org:{org}"), 50, 3600)?;
-        let invite =
-            identity::invite_member(self.store, actor, org, email, role).map_err(|e| org_error(&e))?;
+        let invite = identity::invite_member(self.store, actor, org, email, role)
+            .map_err(|e| org_error(&e))?;
         self.mail(
             &invite.email,
             &format!("You are invited to {} on Kosha", invite.org.name),
@@ -1419,7 +1467,9 @@ impl Ctx<'_> {
                 .iter()
                 .filter_map(|k| {
                     let v = self.req.query(k)?;
-                    v.bytes().all(|b| b.is_ascii_digit()).then(|| format!("{k}={v}"))
+                    v.bytes()
+                        .all(|b| b.is_ascii_digit())
+                        .then(|| format!("{k}={v}"))
                 })
                 .collect();
             if !window.is_empty() {
@@ -1437,8 +1487,7 @@ impl Ctx<'_> {
             .unwrap_or(500);
         let mut value: Value = serde_json::from_str(body).unwrap_or(Value::Null);
         if what == "billing" && status == 200 {
-            value["actions"] = billing_actions(self.state, org, &tenant)
-                .unwrap_or(Value::Null);
+            value["actions"] = billing_actions(self.state, org, &tenant).unwrap_or(Value::Null);
         }
         Ok(reply(status, value))
     }
@@ -1493,6 +1542,9 @@ impl Ctx<'_> {
             Some(Value::Bool(b)) => *b,
             Some(_) => return Err(error(400, "'sso_required' must be a boolean")),
         };
+        if !self.console.allow_http_issuers && !issuer.trim().starts_with("https://") {
+            return Err(error(400, "'issuer' must be an https:// URL"));
+        }
         // Authorize before contacting the issuer, so a non-admin cannot make
         // the server fetch URLs of their choosing.
         identity::get_sso_config(self.store, actor, org).map_err(|e| org_error(&e))?;
@@ -1517,9 +1569,24 @@ impl Ctx<'_> {
     }
 }
 
+/// An error as a sign-in failure page may show it: a store failure's
+/// detail is logged, not put in a URL.
+fn public_message(e: &OrgError) -> String {
+    match e {
+        OrgError::Store(m) => {
+            eprintln!("ERROR: console: control plane: {m}");
+            "sign-in failed; try again".into()
+        }
+        other => other.to_string(),
+    }
+}
+
 fn provider_down(e: &str) -> http::Response {
     eprintln!("WARN: console: identity provider: {e}");
-    error(502, "the identity provider could not be reached; try again later")
+    error(
+        502,
+        "the identity provider could not be reached; try again later",
+    )
 }
 
 fn orgs_now_ms() -> i64 {

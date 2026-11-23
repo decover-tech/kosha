@@ -96,7 +96,11 @@ impl SecretKey {
                 &mut buf,
             )
             .expect("AES-GCM seal");
-        format!("v1:{}:{}", STANDARD.encode(nonce_bytes), STANDARD.encode(buf))
+        format!(
+            "v1:{}:{}",
+            STANDARD.encode(nonce_bytes),
+            STANDARD.encode(buf)
+        )
     }
 
     pub(crate) fn open(&self, context: &str, sealed: &str) -> Result<String, String> {

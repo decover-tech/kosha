@@ -16,11 +16,11 @@ mod deletion;
 mod namespace_rename;
 pub use namespace_rename::{rekey_manifest_references, NamespaceRename, RenameOutcome};
 
-pub mod orgs;
 /// Sign-up, sessions, identities and SSO for the console (#345 part 2).
 pub mod identity;
 #[cfg(feature = "postgres")]
 mod identity_pg;
+pub mod orgs;
 
 pub mod api_keys;
 #[cfg(feature = "postgres")]

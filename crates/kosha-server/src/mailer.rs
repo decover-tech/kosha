@@ -19,7 +19,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -54,7 +54,9 @@ pub struct LogMailer;
 
 impl Mailer for LogMailer {
     fn send(&self, to: &str, subject: &str, text_body: &str) -> Result<(), String> {
-        println!("mail (KOSHA_MAILER=log) to={to} subject={subject:?}\n{text_body}\n-- end of mail");
+        println!(
+            "mail (KOSHA_MAILER=log) to={to} subject={subject:?}\n{text_body}\n-- end of mail"
+        );
         Ok(())
     }
 }
@@ -63,7 +65,7 @@ impl Mailer for LogMailer {
 #[cfg(test)]
 #[derive(Default)]
 pub struct CapturingMailer {
-    sent: Mutex<Vec<(String, String, String)>>,
+    sent: std::sync::Mutex<Vec<(String, String, String)>>,
 }
 
 #[cfg(test)]
@@ -138,7 +140,9 @@ impl SmtpMailer {
             (Some(u), Some(p)) => Some((u, p)),
             (None, None) => None,
             _ => {
-                return Err("set both KOSHA_SMTP_USERNAME and KOSHA_SMTP_PASSWORD, or neither".into())
+                return Err(
+                    "set both KOSHA_SMTP_USERNAME and KOSHA_SMTP_PASSWORD, or neither".into(),
+                )
             }
         };
         let tls_config = platform_tls_config()?;
@@ -210,8 +214,8 @@ impl SmtpMailer {
             command(&mut conn, ehlo, 250)?;
         }
         if let Some((user, password)) = &self.credentials {
-            let plain = base64::engine::general_purpose::STANDARD
-                .encode(format!("\0{user}\0{password}"));
+            let plain =
+                base64::engine::general_purpose::STANDARD.encode(format!("\0{user}\0{password}"));
             command(&mut conn, &format!("AUTH PLAIN {plain}\r\n"), 235)
                 .map_err(|_| "SMTP authentication failed".to_string())?;
         }
@@ -329,7 +333,9 @@ fn command(conn: &mut Conn, line: &str, code: u16) -> Result<(), String> {
 /// spaces, angle brackets or line breaks.
 fn check_address(address: &str) -> Result<(), String> {
     let ok = address.len() <= 254
-        && address.split_once('@').is_some_and(|(l, d)| !l.is_empty() && !d.is_empty())
+        && address
+            .split_once('@')
+            .is_some_and(|(l, d)| !l.is_empty() && !d.is_empty())
         && !address
             .chars()
             .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '<' | '>' | ',' | ';'));

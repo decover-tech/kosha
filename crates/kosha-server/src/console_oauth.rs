@@ -259,7 +259,10 @@ impl OidcClient {
         // An unknown kid: the provider may have rotated its keys. Refetch,
         // but not more than once per interval, so tokens with made-up kids
         // cannot make us hammer the provider.
-        if entry.forced.is_some_and(|at| at.elapsed() < REFETCH_INTERVAL) {
+        if entry
+            .forced
+            .is_some_and(|at| at.elapsed() < REFETCH_INTERVAL)
+        {
             return Err(missing());
         }
         find(&self.fetch_jwks(uri, Some(Instant::now()))?).ok_or_else(missing)
@@ -414,7 +417,12 @@ impl OidcClient {
 }
 
 /// Check a token's signature with a JWK.
-fn verify_signature(alg: &str, jwk: &Value, message: &[u8], signature: &[u8]) -> Result<(), String> {
+fn verify_signature(
+    alg: &str,
+    jwk: &Value,
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), String> {
     use aws_lc_rs::signature;
     let field = |name: &str| {
         jwk.get(name)
@@ -437,11 +445,7 @@ fn verify_signature(alg: &str, jwk: &Value, message: &[u8], signature: &[u8]) ->
             };
             let (n, e) = (strip(field("n")?), strip(field("e")?));
             signature::RsaPublicKeyComponents { n: &n, e: &e }
-                .verify(
-                    &signature::RSA_PKCS1_2048_8192_SHA256,
-                    message,
-                    signature,
-                )
+                .verify(&signature::RSA_PKCS1_2048_8192_SHA256, message, signature)
                 .is_ok()
         }
         ("ES256", Some("EC")) => {
@@ -503,7 +507,9 @@ fn check_claims(
     if !constant_time_eq(token_nonce.as_bytes(), nonce.as_bytes()) {
         return Err("the ID token's nonce does not match this sign-in".into());
     }
-    let subject = string("sub").filter(|s| !s.is_empty()).ok_or("ID token has no 'sub'")?;
+    let subject = string("sub")
+        .filter(|s| !s.is_empty())
+        .ok_or("ID token has no 'sub'")?;
     let email = string("email").ok_or("the provider did not share an email address")?;
     let verified = match claims.get("email_verified") {
         Some(Value::Bool(v)) => *v,
@@ -536,7 +542,8 @@ pub(crate) mod tests {
         pub url: String,
     }
 
-    type HandlerFn = dyn Fn(&str, &str, &HashMap<String, String>, &str) -> (u16, String) + Send + Sync;
+    type HandlerFn =
+        dyn Fn(&str, &str, &HashMap<String, String>, &str) -> (u16, String) + Send + Sync;
 
     impl FakeHttp {
         pub(crate) fn start(handler: Arc<HandlerFn>) -> FakeHttp {
@@ -695,7 +702,10 @@ pub(crate) mod tests {
                 ),
                 "/jwks" => {
                     *fetches.lock().unwrap() += 1;
-                    (200, serde_json::json!({ "keys": *keys.lock().unwrap() }).to_string())
+                    (
+                        200,
+                        serde_json::json!({ "keys": *keys.lock().unwrap() }).to_string(),
+                    )
                 }
                 _ => (404, "{}".into()),
             }
@@ -714,7 +724,8 @@ pub(crate) mod tests {
         let d = client.discover(&idp.url).unwrap();
         assert_eq!(d.jwks_uri, format!("{}/jwks", idp.url));
         let iss = [idp.url.as_str()];
-        let verify = |token: &str| client.verify_id_token(token, &d, &iss, "client-1", "n-1", now());
+        let verify =
+            |token: &str| client.verify_id_token(token, &d, &iss, "client-1", "n-1", now());
 
         let good = key.id_token(&claims(&idp.url));
         let user = verify(&good).unwrap();
@@ -737,7 +748,10 @@ pub(crate) mod tests {
             ("email_verified", serde_json::json!(false)),
             ("sub", serde_json::json!("")),
         ] {
-            assert!(verify(&with(field, value.clone())).is_err(), "{field}={value}");
+            assert!(
+                verify(&with(field, value.clone())).is_err(),
+                "{field}={value}"
+            );
         }
         assert!(verify(&with("aud", serde_json::json!(["client-1", "other"]))).is_ok());
         let mut c = claims(&idp.url);
@@ -757,7 +771,10 @@ pub(crate) mod tests {
             b64url(claims(&idp.url).to_string().as_bytes())
         );
         assert!(verify(&none).is_err());
-        let hs = key.sign(&serde_json::json!({"alg": "HS256", "kid": "k1"}), &claims(&idp.url));
+        let hs = key.sign(
+            &serde_json::json!({"alg": "HS256", "kid": "k1"}),
+            &claims(&idp.url),
+        );
         assert!(verify(&hs).is_err());
         let stranger = TestKey::new("k1");
         assert!(verify(&stranger.id_token(&claims(&idp.url))).is_err());
@@ -802,10 +819,16 @@ pub(crate) mod tests {
                 ("POST", "/login/oauth/access_token") => {
                     assert!(body.contains("code_verifier=v-1"), "{body}");
                     assert!(body.contains("code=c-1"), "{body}");
-                    (200, r#"{"access_token":"gho_1","token_type":"bearer"}"#.into())
+                    (
+                        200,
+                        r#"{"access_token":"gho_1","token_type":"bearer"}"#.into(),
+                    )
                 }
                 ("GET", "/user") => {
-                    assert_eq!(headers.get("authorization").map(String::as_str), Some("Bearer gho_1"));
+                    assert_eq!(
+                        headers.get("authorization").map(String::as_str),
+                        Some("Bearer gho_1")
+                    );
                     (200, r#"{"id":42,"login":"ada","name":null}"#.into())
                 }
                 ("GET", "/user/emails") => (200, list.lock().unwrap().to_string()),
@@ -854,7 +877,9 @@ pub(crate) mod tests {
             },
         );
         assert!(url.starts_with("https://idp.example/auth?response_type=code&client_id=c%201&"));
-        assert!(url.contains("redirect_uri=https%3A%2F%2Fkosha.example%2Fv1%2Fconsole%2Foauth%2Fgoogle%2Fcallback"));
+        assert!(url.contains(
+            "redirect_uri=https%3A%2F%2Fkosha.example%2Fv1%2Fconsole%2Foauth%2Fgoogle%2Fcallback"
+        ));
         assert!(url.contains("&scope=openid%20email%20profile&state=s&code_challenge=ch&code_challenge_method=S256&nonce=n"));
     }
 }

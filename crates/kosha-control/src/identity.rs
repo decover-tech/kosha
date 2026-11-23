@@ -89,8 +89,7 @@ fn check_password(password: &str) -> Result<(), OrgError> {
 pub fn hash_password(password: &str) -> Result<String, OrgError> {
     use argon2::password_hash::{PasswordHasher, SaltString};
     let mut salt = [0u8; 16];
-    getrandom::getrandom(&mut salt)
-        .map_err(|e| OrgError::Store(format!("random salt: {e}")))?;
+    getrandom::getrandom(&mut salt).map_err(|e| OrgError::Store(format!("random salt: {e}")))?;
     let salt = SaltString::encode_b64(&salt).map_err(|e| OrgError::Store(e.to_string()))?;
     argon2::Argon2::default()
         .hash_password(password.as_bytes(), &salt)
@@ -287,8 +286,7 @@ pub trait IdentityTx: OrgTx {
     fn touch_session(&mut self, token_hash: &str, now_ms: i64) -> Result<(), OrgError>;
     fn revoke_session(&mut self, token_hash: &str) -> Result<(), OrgError>;
     fn revoke_user_sessions(&mut self, user_id: &str) -> Result<(), OrgError>;
-    fn identity_user(&mut self, provider: &str, subject: &str)
-        -> Result<Option<String>, OrgError>;
+    fn identity_user(&mut self, provider: &str, subject: &str) -> Result<Option<String>, OrgError>;
     fn insert_identity(
         &mut self,
         provider: &str,
@@ -778,7 +776,9 @@ pub fn external_login(
     let email = normalize_email(&identity.email)?;
     check_text("subject", &identity.subject, MAX_NAME_LEN, true)?;
     let display_name = clean_name(&identity.display_name);
-    run(store, |tx| external_login_tx(tx, identity, &email, &display_name, allow_create))
+    run(store, |tx| {
+        external_login_tx(tx, identity, &email, &display_name, allow_create)
+    })
 }
 
 /// A provider's display name, made safe to store: no control characters,
@@ -1596,11 +1596,7 @@ impl IdentityTx for orgs::MemoryState {
         Ok(())
     }
 
-    fn identity_user(
-        &mut self,
-        provider: &str,
-        subject: &str,
-    ) -> Result<Option<String>, OrgError> {
+    fn identity_user(&mut self, provider: &str, subject: &str) -> Result<Option<String>, OrgError> {
         Ok(self
             .identity
             .identities
@@ -1636,7 +1632,12 @@ impl IdentityTx for orgs::MemoryState {
     }
 
     fn sso_config(&mut self, org_id: &str) -> Result<Option<SsoConfig>, OrgError> {
-        Ok(self.identity.sso.iter().find(|c| c.org_id == org_id).cloned())
+        Ok(self
+            .identity
+            .sso
+            .iter()
+            .find(|c| c.org_id == org_id)
+            .cloned())
     }
 
     fn put_sso_config(&mut self, config: &SsoConfig) -> Result<(), OrgError> {

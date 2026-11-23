@@ -39,7 +39,9 @@ fn sign_up_verify_and_login(store: &dyn IdentityStore) {
         Err(OrgError::Invalid(_))
     ));
     assert_eq!(
-        identity::password_login(store, &email, PASSWORD).unwrap().id,
+        identity::password_login(store, &email, PASSWORD)
+            .unwrap()
+            .id,
         user.id
     );
     assert_eq!(
@@ -54,16 +56,25 @@ fn sign_up_verify_and_login(store: &dyn IdentityStore) {
     // Sessions: live, then revoked.
     let session = identity::create_session(store, &user.id, "password", 3_600_000).unwrap();
     let (s, u) = identity::session(store, &session, 60_000).unwrap().unwrap();
-    assert_eq!((s.auth_method.as_str(), u.id.as_str()), ("password", user.id.as_str()));
-    assert!(identity::session(store, "not-a-session", 60_000).unwrap().is_none());
+    assert_eq!(
+        (s.auth_method.as_str(), u.id.as_str()),
+        ("password", user.id.as_str())
+    );
+    assert!(identity::session(store, "not-a-session", 60_000)
+        .unwrap()
+        .is_none());
     // An idle timeout of zero ends it.
     assert!(identity::session(store, &session, 0).unwrap().is_none());
     identity::revoke_session(store, &session).unwrap();
-    assert!(identity::session(store, &session, 60_000).unwrap().is_none());
+    assert!(identity::session(store, &session, 60_000)
+        .unwrap()
+        .is_none());
 
     // Reset: single use, ends sessions, the old password stops working.
     let other = identity::create_session(store, &user.id, "password", 3_600_000).unwrap();
-    let (_, reset) = identity::start_password_reset(store, &email).unwrap().unwrap();
+    let (_, reset) = identity::start_password_reset(store, &email)
+        .unwrap()
+        .unwrap();
     assert!(identity::start_password_reset(store, "ghost@example.com")
         .unwrap()
         .is_none());
@@ -108,8 +119,14 @@ fn keys_invites_and_sso(store: &dyn IdentityStore) {
     let owner_email = format!("own-{}@example.com", unique());
     let (owner, _) = signed_up(store, &owner_email);
     let owner_actor = Actor::User(owner.id.clone());
-    let org = orgs::create_org(store, &owner_actor, &format!("org-{}", unique()), "Org", None)
-        .unwrap();
+    let org = orgs::create_org(
+        store,
+        &owner_actor,
+        &format!("org-{}", unique()),
+        "Org",
+        None,
+    )
+    .unwrap();
     let tenant = orgs::link_tenant(store, &owner_actor, &org.id, None, None).unwrap();
 
     // Invite a member: the invite works once, for its address only.
@@ -143,8 +160,7 @@ fn keys_invites_and_sso(store: &dyn IdentityStore) {
     let keys = identity::list_org_api_keys(store, &owner_actor, &org.id).unwrap();
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].created_by.as_deref(), Some(member.id.as_str()));
-    let removed =
-        identity::remove_member(store, &owner_actor, &org.id, &member.id, true).unwrap();
+    let removed = identity::remove_member(store, &owner_actor, &org.id, &member.id, true).unwrap();
     assert_eq!(removed.revoked_keys, vec![key.listed.key_id.clone()]);
     assert!(identity::list_org_api_keys(store, &owner_actor, &org.id)
         .unwrap()
@@ -199,7 +215,10 @@ fn keys_invites_and_sso(store: &dyn IdentityStore) {
         "sso.configured",
         "namespace.deleted",
     ] {
-        assert!(actions.iter().any(|a| a == expected), "{expected}: {actions:?}");
+        assert!(
+            actions.iter().any(|a| a == expected),
+            "{expected}: {actions:?}"
+        );
     }
 }
 

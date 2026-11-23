@@ -476,9 +476,17 @@
     );
   }
 
-  async function keysTab(ctx) {
+  // `created`: a key just made, shown once above the form.
+  async function keysTab(ctx, created) {
     const [keys, tenants] = await Promise.all([api("GET", ctx.base + "/api-keys"), tenantsOf(ctx)]);
     const shown = el("div");
+    if (created) {
+      shown.append(
+        notice("warn", "Copy this key now. It is not shown again."),
+        el("code", { class: "secret" }, created.api_key),
+        el("p", { class: "muted" }, "Use it as Authorization: Bearer <key> on the /v1/namespaces API.")
+      );
+    }
     const rows = keys.api_keys.map((k) => {
       const mine = k.created_by && k.created_by === me.user.id;
       const revoke = el("button", { type: "button", class: "danger", disabled: !(ctx.manage || (mine && ctx.role !== "read-only")) }, "Revoke");
@@ -508,12 +516,7 @@
               const body = { tenant_id: v.tenant_id, description: v.description, scopes: v.scopes.split(",") };
               if (v.expires) body.expires_in_days = Number(v.expires);
               const created = await api("POST", ctx.base + "/api-keys", body);
-              await keysTab(ctx);
-              shown.replaceChildren(
-                notice("warn", "Copy this key now. It is not shown again."),
-                el("code", { class: "secret" }, created.api_key),
-                el("p", { class: "muted" }, "Use it as Authorization: Bearer <key> on the /v1/namespaces API.")
-              );
+              await keysTab(ctx, created);
               return "";
             },
             "Create key"

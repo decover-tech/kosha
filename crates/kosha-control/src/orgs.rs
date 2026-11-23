@@ -361,7 +361,12 @@ fn check_slug(what: &str, slug: &str) -> Result<(), OrgError> {
     }
 }
 
-pub(crate) fn check_text(what: &str, value: &str, max: usize, required: bool) -> Result<(), OrgError> {
+pub(crate) fn check_text(
+    what: &str,
+    value: &str,
+    max: usize,
+    required: bool,
+) -> Result<(), OrgError> {
     if required && value.trim().is_empty() {
         return Err(OrgError::Invalid(format!("'{what}' must not be empty")));
     }
@@ -421,14 +426,22 @@ fn require_operator(actor: &Actor, what: &str) -> Result<(), OrgError> {
     }
 }
 
-pub(crate) fn require_org(tx: &mut dyn OrgTx, org_id: &str, lock: bool) -> Result<Organization, OrgError> {
+pub(crate) fn require_org(
+    tx: &mut dyn OrgTx,
+    org_id: &str,
+    lock: bool,
+) -> Result<Organization, OrgError> {
     tx.org(org_id, lock)?
         .ok_or_else(|| OrgError::NotFound(format!("organization '{org_id}' not found")))
 }
 
 /// The actor's role in the organization: `None` for the operator, who is
 /// not bound by roles. A user who is not a member is refused.
-pub(crate) fn actor_role(tx: &mut dyn OrgTx, actor: &Actor, org_id: &str) -> Result<Option<Role>, OrgError> {
+pub(crate) fn actor_role(
+    tx: &mut dyn OrgTx,
+    actor: &Actor,
+    org_id: &str,
+) -> Result<Option<Role>, OrgError> {
     match actor.user_id() {
         None => Ok(None),
         Some(user_id) => tx

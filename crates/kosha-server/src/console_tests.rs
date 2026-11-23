@@ -52,7 +52,10 @@ impl Server {
             .find(|(t, _, b)| t == to && b.contains(&marker))
             .unwrap_or_else(|| panic!("no {page} mail to {to}: {:?}", self.mail.sent()));
         let at = body.find(&marker).unwrap() + marker.len();
-        body[at..].chars().take_while(char::is_ascii_hexdigit).collect()
+        body[at..]
+            .chars()
+            .take_while(char::is_ascii_hexdigit)
+            .collect()
     }
 
     fn mails_to(&self, to: &str) -> Vec<(String, String)> {
@@ -125,7 +128,11 @@ impl Browser<'_> {
             (http::PEER_IP_HEADER.to_string(), self.ip.clone()),
         ]);
         if !self.cookies.is_empty() {
-            let jar: Vec<String> = self.cookies.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            let jar: Vec<String> = self
+                .cookies
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect();
             headers.insert("cookie".into(), jar.join("; "));
         }
         let body = if body.is_null() {
@@ -136,7 +143,10 @@ impl Browser<'_> {
         let ((status, value), set, location) =
             send(&self.server.state, method, path, headers, body);
         for cookie in set {
-            assert!(cookie.contains("HttpOnly") && cookie.contains("Secure"), "{cookie}");
+            assert!(
+                cookie.contains("HttpOnly") && cookie.contains("Secure"),
+                "{cookie}"
+            );
             assert!(cookie.contains("SameSite=Lax"), "{cookie}");
             let pair = cookie.split(';').next().unwrap();
             let (name, value) = pair.split_once('=').unwrap();
@@ -156,7 +166,10 @@ impl Browser<'_> {
 
     fn ok(&mut self, method: &str, path: &str, body: Value) -> Value {
         let (status, value) = self.call(method, path, body);
-        assert!(status == 200 || status == 202, "{method} {path}: {status} {value}");
+        assert!(
+            status == 200 || status == 202,
+            "{method} {path}: {status} {value}"
+        );
         value
     }
 
@@ -169,7 +182,11 @@ impl Browser<'_> {
         );
         assert_eq!(status, 202, "{body}");
         let token = self.server.token_from_mail(email, "verify");
-        self.ok("POST", "/v1/console/verify-email", json!({ "token": token }));
+        self.ok(
+            "POST",
+            "/v1/console/verify-email",
+            json!({ "token": token }),
+        );
         self.ok(
             "POST",
             "/v1/console/login",
@@ -203,10 +220,19 @@ fn an_outside_user_goes_from_sign_up_to_a_search_hit() {
         json!({ "email": "ada@example.com", "password": PASSWORD }),
     );
     assert_eq!((status, &body["reason"]), (403, &json!("email_unverified")));
-    ada.ok("POST", "/v1/console/verify-email", json!({ "token": token }));
+    ada.ok(
+        "POST",
+        "/v1/console/verify-email",
+        json!({ "token": token }),
+    );
     // The link works once.
     assert_eq!(
-        ada.call("POST", "/v1/console/verify-email", json!({ "token": token })).0,
+        ada.call(
+            "POST",
+            "/v1/console/verify-email",
+            json!({ "token": token })
+        )
+        .0,
         400
     );
 
@@ -458,19 +484,33 @@ fn state_changing_requests_need_the_csrf_header_and_our_origin() {
     let mut ada = server.browser();
     ada.join("ada@example.com");
     let cookie = format!("{SESSION_COOKIE}={}", ada.cookies[SESSION_COOKIE]);
-    let body = json!({ "slug": "acme", "name": "Acme" }).to_string().into_bytes();
+    let body = json!({ "slug": "acme", "name": "Acme" })
+        .to_string()
+        .into_bytes();
     let attempt = |extra: &[(&str, &str)]| {
         let mut headers = HashMap::from([("cookie".to_string(), cookie.clone())]);
         for (k, v) in extra {
             headers.insert(k.to_string(), v.to_string());
         }
-        send(&server.state, "POST", "/v1/console/orgs", headers, body.clone())
-            .0
-             .0
+        send(
+            &server.state,
+            "POST",
+            "/v1/console/orgs",
+            headers,
+            body.clone(),
+        )
+        .0
+         .0
     };
     assert_eq!(attempt(&[]), 403, "no header");
-    assert_eq!(attempt(&[(CSRF_HEADER, "1"), ("origin", "https://evil.example")]), 403);
-    assert_eq!(attempt(&[(CSRF_HEADER, "1"), ("sec-fetch-site", "cross-site")]), 403);
+    assert_eq!(
+        attempt(&[(CSRF_HEADER, "1"), ("origin", "https://evil.example")]),
+        403
+    );
+    assert_eq!(
+        attempt(&[(CSRF_HEADER, "1"), ("sec-fetch-site", "cross-site")]),
+        403
+    );
     assert_eq!(attempt(&[(CSRF_HEADER, "1"), ("origin", PUBLIC)]), 200);
     // Reads need a session, not the header.
     let ((status, _), _, _) = send(
@@ -494,7 +534,10 @@ fn sign_up_is_off_by_default_and_can_be_limited_to_domains() {
     );
     assert_eq!(status, 403);
     assert!(closed.mail.sent().is_empty());
-    assert_eq!(b.call("GET", "/v1/console/config", Value::Null).1["signup"], json!(false));
+    assert_eq!(
+        b.call("GET", "/v1/console/config", Value::Null).1["signup"],
+        json!(false)
+    );
 
     let corp = Server::with(|c| c.with_signup(true, &["corp.example"]));
     let mut b = corp.browser();
@@ -580,7 +623,10 @@ fn console_assets_load_nothing_from_elsewhere() {
     assert!(!INDEX_HTML.contains("<script>"));
     assert!(!INDEX_HTML.contains("<style"));
     assert!(!INDEX_HTML.contains(" style="));
-    assert!(!APP_JS.contains("innerHTML"), "build DOM nodes, not HTML strings");
+    assert!(
+        !APP_JS.contains("innerHTML"),
+        "build DOM nodes, not HTML strings"
+    );
     assert!(!APP_JS.contains("eval("));
 }
 
@@ -591,15 +637,18 @@ fn invited_members_join_and_their_keys_go_when_they_leave() {
     let server = Server::with(|c| c.with_signup(false, &[]));
     // The first user comes from the operator (sign-up is off) and sets a
     // password with a reset link.
-    let admin = HashMap::from([
-        ("authorization".to_string(), "Bearer admin-secret".to_string()),
-    ]);
+    let admin = HashMap::from([(
+        "authorization".to_string(),
+        "Bearer admin-secret".to_string(),
+    )]);
     let ((status, _), _, _) = send(
         &server.state,
         "POST",
         "/v1/admin/users",
         admin,
-        json!({ "email": "ada@example.com" }).to_string().into_bytes(),
+        json!({ "email": "ada@example.com" })
+            .to_string()
+            .into_bytes(),
     );
     assert_eq!(status, 200);
     let mut ada = server.browser();
@@ -619,7 +668,11 @@ fn invited_members_join_and_their_keys_go_when_they_leave() {
         "/v1/console/login",
         json!({ "email": "ada@example.com", "password": PASSWORD }),
     );
-    let org = ada.ok("POST", "/v1/console/orgs", json!({ "slug": "acme", "name": "Acme" }));
+    let org = ada.ok(
+        "POST",
+        "/v1/console/orgs",
+        json!({ "slug": "acme", "name": "Acme" }),
+    );
     let base = format!("/v1/console/orgs/{}", org["id"].as_str().unwrap());
     let tenant = ada.ok("POST", &format!("{base}/tenants"), Value::Null);
     let tenant_id = tenant["tenant_id"].as_str().unwrap();
@@ -646,17 +699,29 @@ fn invited_members_join_and_their_keys_go_when_they_leave() {
         );
         assert_eq!(status, 202, "{body}");
         let verify = server.token_from_mail(email, "verify");
-        member.ok("POST", "/v1/console/verify-email", json!({ "token": verify }));
+        member.ok(
+            "POST",
+            "/v1/console/verify-email",
+            json!({ "token": verify }),
+        );
         member.ok(
             "POST",
             "/v1/console/login",
             json!({ "email": email, "password": PASSWORD }),
         );
-        let joined = member.ok("POST", "/v1/console/invites/accept", json!({ "token": invite }));
+        let joined = member.ok(
+            "POST",
+            "/v1/console/invites/accept",
+            json!({ "token": invite }),
+        );
         assert_eq!(joined["role"], json!("member"));
         assert_eq!(
             member
-                .call("POST", "/v1/console/invites/accept", json!({ "token": invite }))
+                .call(
+                    "POST",
+                    "/v1/console/invites/accept",
+                    json!({ "token": invite })
+                )
                 .0,
             400,
             "an invite works once"
@@ -683,13 +748,27 @@ fn invited_members_join_and_their_keys_go_when_they_leave() {
         let adas_id = adas["key"]["key_id"].as_str().unwrap();
         assert_eq!(
             member
-                .call("POST", &format!("{base}/api-keys/{adas_id}/revoke"), Value::Null)
+                .call(
+                    "POST",
+                    &format!("{base}/api-keys/{adas_id}/revoke"),
+                    Value::Null
+                )
                 .0,
             403
         );
         // Members cannot manage members or read the audit log.
-        assert_eq!(member.call("GET", &format!("{base}/audit-log"), Value::Null).0, 403);
-        assert_eq!(server.data(&api_key, "GET", "/v1/namespaces", Value::Null).0, 200);
+        assert_eq!(
+            member
+                .call("GET", &format!("{base}/audit-log"), Value::Null)
+                .0,
+            403
+        );
+        assert_eq!(
+            server
+                .data(&api_key, "GET", "/v1/namespaces", Value::Null)
+                .0,
+            200
+        );
 
         let query = if keep_keys { "?revoke_keys=false" } else { "" };
         let removed = ada.ok(
@@ -697,7 +776,9 @@ fn invited_members_join_and_their_keys_go_when_they_leave() {
             &format!("{base}/members/{user_id}{query}"),
             Value::Null,
         );
-        let status = server.data(&api_key, "GET", "/v1/namespaces", Value::Null).0;
+        let status = server
+            .data(&api_key, "GET", "/v1/namespaces", Value::Null)
+            .0;
         if keep_keys {
             assert_eq!(removed["revoked_keys"], json!([]));
             assert_eq!(status, 200);
@@ -716,34 +797,62 @@ fn roles_bound_what_the_console_can_do() {
     ada.join("ada@example.com");
     let mut ro = server.browser();
     ro.join("ro@example.com");
-    let org = ada.ok("POST", "/v1/console/orgs", json!({ "slug": "acme", "name": "Acme" }));
+    let org = ada.ok(
+        "POST",
+        "/v1/console/orgs",
+        json!({ "slug": "acme", "name": "Acme" }),
+    );
     let base = format!("/v1/console/orgs/{}", org["id"].as_str().unwrap());
     let tenant = ada.ok("POST", &format!("{base}/tenants"), Value::Null);
     // An outsider sees nothing.
     assert_eq!(ro.call("GET", &base, Value::Null).0, 403);
-    assert_eq!(ro.call("GET", &format!("{base}/api-keys"), Value::Null).0, 403);
+    assert_eq!(
+        ro.call("GET", &format!("{base}/api-keys"), Value::Null).0,
+        403
+    );
     ada.ok(
         "POST",
         &format!("{base}/invites"),
         json!({ "email": "ro@example.com", "role": "read-only" }),
     );
     let invite = server.token_from_mail("ro@example.com", "invite");
-    ro.ok("POST", "/v1/console/invites/accept", json!({ "token": invite }));
+    ro.ok(
+        "POST",
+        "/v1/console/invites/accept",
+        json!({ "token": invite }),
+    );
     // Read-only reads, never writes.
     ro.ok("GET", &format!("{base}/api-keys"), Value::Null);
     ro.ok("GET", &format!("{base}/members"), Value::Null);
     for (method, path, body) in [
-        ("POST", format!("{base}/api-keys"), json!({ "tenant_id": tenant["tenant_id"] })),
+        (
+            "POST",
+            format!("{base}/api-keys"),
+            json!({ "tenant_id": tenant["tenant_id"] }),
+        ),
         ("POST", format!("{base}/tenants"), Value::Null),
-        ("POST", format!("{base}/projects"), json!({ "slug": "p", "name": "P" })),
-        ("POST", format!("{base}/invites"), json!({ "email": "x@example.com", "role": "member" })),
+        (
+            "POST",
+            format!("{base}/projects"),
+            json!({ "slug": "p", "name": "P" }),
+        ),
+        (
+            "POST",
+            format!("{base}/invites"),
+            json!({ "email": "x@example.com", "role": "member" }),
+        ),
         ("GET", format!("{base}/sso"), Value::Null),
     ] {
         assert_eq!(ro.call(method, &path, body).0, 403, "{method} {path}");
     }
     // Users never pick tenant ids.
     assert_eq!(
-        ada.call("POST", &format!("{base}/tenants"), json!({ "tenant_id": "victim" })).0,
+        ada.call(
+            "POST",
+            &format!("{base}/tenants"),
+            json!({ "tenant_id": "victim" })
+        )
+        .0,
         400
     );
 }
@@ -820,17 +929,15 @@ impl FakeIdp {
     }
 
     /// Run a browser through start → provider → callback.
-    fn sign_in(
-        &self,
-        browser: &mut Browser<'_>,
-        start: &str,
-        who: Value,
-    ) -> (u16, Option<String>) {
+    fn sign_in(&self, browser: &mut Browser<'_>, start: &str, who: Value) -> (u16, Option<String>) {
         *self.who.lock().unwrap() = who;
         let (status, body, location) = browser.request("GET", start, Value::Null);
         assert_eq!(status, 302, "{body}");
         let location = location.unwrap();
-        assert!(location.starts_with(&format!("{}/authorize?", self.http.url)), "{location}");
+        assert!(
+            location.starts_with(&format!("{}/authorize?", self.http.url)),
+            "{location}"
+        );
         assert_eq!(query_param(&location, "code_challenge_method"), "S256");
         *self.expect.lock().unwrap() = (
             query_param(&location, "code_challenge"),
@@ -864,7 +971,9 @@ fn google_sign_in_creates_or_links_users_by_verified_email() {
         })
     });
     assert_eq!(
-        server.browser().ok("GET", "/v1/console/config", Value::Null)["providers"]["google"],
+        server
+            .browser()
+            .ok("GET", "/v1/console/config", Value::Null)["providers"]["google"],
         json!(true)
     );
 
@@ -879,7 +988,10 @@ fn google_sign_in_creates_or_links_users_by_verified_email() {
     let me = pat.ok("GET", "/v1/console/me", Value::Null);
     assert_eq!(me["user"]["email"], json!("pat@example.com"));
     assert_eq!(me["auth_method"], json!("google"));
-    assert!(!pat.cookies.contains_key("kosha_oauth"), "flow cookie cleared");
+    assert!(
+        !pat.cookies.contains_key("kosha_oauth"),
+        "flow cookie cleared"
+    );
 
     // Someone registered ada@ with a password but never verified it; Ada
     // then signs in with Google: she gets the account, they lose the password.
@@ -900,7 +1012,11 @@ fn google_sign_in_creates_or_links_users_by_verified_email() {
         json!("ada@example.com")
     );
     let verify = server.token_from_mail("ada@example.com", "verify");
-    squatter.call("POST", "/v1/console/verify-email", json!({ "token": verify }));
+    squatter.call(
+        "POST",
+        "/v1/console/verify-email",
+        json!({ "token": verify }),
+    );
     assert_eq!(
         squatter
             .call(
@@ -934,8 +1050,7 @@ fn a_callback_must_come_back_to_the_browser_that_started_it() {
     });
     // The attacker starts a sign-in and hands the callback to a victim.
     let mut attacker = server.browser();
-    let (_, _, location) =
-        attacker.request("GET", "/v1/console/oauth/google/start", Value::Null);
+    let (_, _, location) = attacker.request("GET", "/v1/console/oauth/google/start", Value::Null);
     let state = query_param(&location.unwrap(), "state");
     let mut victim = server.browser();
     let (status, _, location) = victim.request(
@@ -950,14 +1065,16 @@ fn a_callback_must_come_back_to_the_browser_that_started_it() {
 
 #[test]
 fn github_sign_in_uses_the_verified_primary_address() {
-    let gh = FakeHttp::start(Arc::new(|method, path, _headers, _body| match (method, path) {
-        ("POST", "/login/oauth/access_token") => (200, r#"{"access_token":"gho_1"}"#.into()),
-        ("GET", "/user") => (200, r#"{"id":77,"login":"pat","name":"Pat"}"#.into()),
-        ("GET", "/user/emails") => (
-            200,
-            r#"[{"email":"pat@example.com","primary":true,"verified":true}]"#.into(),
-        ),
-        _ => (404, "{}".into()),
+    let gh = FakeHttp::start(Arc::new(|method, path, _headers, _body| {
+        match (method, path) {
+            ("POST", "/login/oauth/access_token") => (200, r#"{"access_token":"gho_1"}"#.into()),
+            ("GET", "/user") => (200, r#"{"id":77,"login":"pat","name":"Pat"}"#.into()),
+            ("GET", "/user/emails") => (
+                200,
+                r#"[{"email":"pat@example.com","primary":true,"verified":true}]"#.into(),
+            ),
+            _ => (404, "{}".into()),
+        }
     }));
     let url = gh.url.clone();
     let server = Server::with(|c| {
@@ -1002,10 +1119,18 @@ fn organization_sso_is_scoped_to_its_organization() {
     let server = Server::new();
     let mut ada = server.browser();
     ada.join("ada@acme.example");
-    let org = ada.ok("POST", "/v1/console/orgs", json!({ "slug": "acme", "name": "Acme" }));
+    let org = ada.ok(
+        "POST",
+        "/v1/console/orgs",
+        json!({ "slug": "acme", "name": "Acme" }),
+    );
     let org_id = org["id"].as_str().unwrap().to_string();
     let base = format!("/v1/console/orgs/{org_id}");
-    let other = ada.ok("POST", "/v1/console/orgs", json!({ "slug": "other", "name": "Other" }));
+    let other = ada.ok(
+        "POST",
+        "/v1/console/orgs",
+        json!({ "slug": "other", "name": "Other" }),
+    );
     let other_base = format!("/v1/console/orgs/{}", other["id"].as_str().unwrap());
     let sso = ada.ok(
         "POST",
@@ -1018,7 +1143,10 @@ fn organization_sso_is_scoped_to_its_organization() {
         }),
     );
     assert_eq!(sso["configured"], json!(true));
-    assert_eq!(sso["redirect_uri"], json!(format!("{PUBLIC}/v1/console/sso/callback")));
+    assert_eq!(
+        sso["redirect_uri"],
+        json!(format!("{PUBLIC}/v1/console/sso/callback"))
+    );
     assert!(!sso.to_string().contains("acme-secret"));
 
     // A newcomer in the domain: a just-in-time read-only member.
@@ -1036,7 +1164,12 @@ fn organization_sso_is_scoped_to_its_organization() {
     kim.ok("GET", &base, Value::Null);
     // The session cannot create organizations.
     assert_eq!(
-        kim.call("POST", "/v1/console/orgs", json!({ "slug": "kim", "name": "K" })).0,
+        kim.call(
+            "POST",
+            "/v1/console/orgs",
+            json!({ "slug": "kim", "name": "K" })
+        )
+        .0,
         403
     );
 
@@ -1075,7 +1208,11 @@ fn organization_sso_is_scoped_to_its_organization() {
         json!({ "email": "bo@acme.example", "role": "admin" }),
     );
     let invite = server.token_from_mail("bo@acme.example", "invite");
-    bo.ok("POST", "/v1/console/invites/accept", json!({ "token": invite }));
+    bo.ok(
+        "POST",
+        "/v1/console/invites/accept",
+        json!({ "token": invite }),
+    );
     // Only an owner may require SSO.
     assert_eq!(
         bo.call(
