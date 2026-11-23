@@ -694,7 +694,11 @@ jobs:
             echo "| phase | p50 ms | p90 ms | p99 ms | requests | errors |"
             echo "|---|---|---|---|---|---|"
             # knn_sweep/ (#384) has its own table, appended below.
-            find results -name '*.json' ! -name 'recall.json' ! -name 'meta.json' ! -path 'results/knn_sweep/*' ! -path '*/two_tier/*' | sort | while read -r f; do
+            # snapshot-build-info.json (written when the restored snapshot
+            # has a build-info.json) is provenance, not a phase: without the
+            # exclusion the table step failed with KeyError 'p50_ms' and
+            # marked a finished run as failed.
+            find results -name '*.json' ! -name 'recall.json' ! -name 'meta.json' ! -name 'snapshot-build-info.json' ! -path 'results/knn_sweep/*' ! -path '*/two_tier/*' | sort | while read -r f; do
               python3 - "$f" << 'EOF'
           import json, sys
           d = json.load(open(sys.argv[1]))

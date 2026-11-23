@@ -38,7 +38,7 @@ impl Lcg {
 type PlanView = (
     u32,
     Option<KnnCutoffRule>,
-    Vec<(Vec<u32>, u32, usize, usize)>,
+    Vec<Option<(Vec<u32>, u32, usize, usize)>>,
 );
 
 fn view(plan: &KnnRankedPostings) -> PlanView {
@@ -47,13 +47,15 @@ fn view(plan: &KnnRankedPostings) -> PlanView {
         plan.rule,
         plan.rankings
             .iter()
-            .map(|r: &KnnSegmentRanking| {
-                (
-                    r.budgeted().to_vec(),
-                    r.max_distance().to_bits(),
-                    r.max_probes(),
-                    r.postings(),
-                )
+            .map(|r: &Option<KnnSegmentRanking>| {
+                r.as_ref().map(|r| {
+                    (
+                        r.budgeted().to_vec(),
+                        r.max_distance().to_bits(),
+                        r.max_probes(),
+                        r.postings(),
+                    )
+                })
             })
             .collect(),
     )
@@ -97,6 +99,18 @@ struct Synthetic {
     bounds: Option<KnnCentroidScoreBounds>,
     /// Postings asked for through `scores_for`.
     scored: AtomicUsize,
+    /// Which methods fail, as for a segment whose column went away after
+    /// it was counted (then the bounds are gone too).
+    fail: Fail,
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+enum Fail {
+    #[default]
+    Never,
+    /// `scores_for` only.
+    Subset,
+    Always,
 }
 
 impl KnnPlanSource for Synthetic {
@@ -104,17 +118,18 @@ impl KnnPlanSource for Synthetic {
         self.scores.len()
     }
 
-    fn scores(&self) -> Vec<f32> {
-        self.scores.clone()
+    fn scores(&self) -> Option<Vec<f32>> {
+        (self.fail != Fail::Always).then(|| self.scores.clone())
     }
 
-    fn scores_for(&self, postings: &[u32]) -> Vec<f32> {
+    fn scores_for(&self, postings: &[u32]) -> Option<Vec<f32>> {
         self.scored.fetch_add(postings.len(), Ordering::Relaxed);
-        postings.iter().map(|&i| self.scores[i as usize]).collect()
+        (self.fail == Fail::Never)
+            .then(|| postings.iter().map(|&i| self.scores[i as usize]).collect())
     }
 
     fn score_bounds(&self) -> Option<KnnCentroidScoreBounds> {
-        self.bounds.clone()
+        self.bounds.clone().filter(|_| self.fail != Fail::Always)
     }
 }
 
@@ -159,6 +174,7 @@ fn synthetic(rng: &mut Lcg, tight: bool, grid: bool) -> Synthetic {
         scores,
         bounds,
         scored: AtomicUsize::new(0),
+        fail: Fail::Never,
     }
 }
 
@@ -208,6 +224,7 @@ fn a_nan_anywhere_falls_back_to_the_single_stage_plan() {
         scores,
         bounds: Some(KnnCentroidScoreBounds { lower, upper }),
         scored: AtomicUsize::new(0),
+        fail: Fail::Never,
     };
     let scores = vec![0.1f32, 0.2, 0.3, 0.4];
     let exact = scores.clone();
@@ -228,6 +245,86 @@ fn a_nan_anywhere_falls_back_to_the_single_stage_plan() {
             assert_eq!(view(&two), view(&single), "case {i}, budget {budget}");
         }
     }
+}
+
+#[test]
+fn a_segment_that_cannot_be_scored_leaves_the_plan_instead_of_taking_no_postings() {
+    // A source whose column went away after it was counted used to score
+    // every posting INFINITY: it got a ranking with no postings, so the
+    // segment was never probed and the search still answered 200. It must
+    // instead get no ranking (the segment then ranks its own postings
+    // under the cutoff, as before #469), and the cutoff must be the one
+    // the other sources alone give.
+    let mut rng = Lcg(0xFA11);
+    let mut checked = 0usize;
+    for round in 0..300 {
+        let mut sources: Vec<Synthetic> = (0..2 + rng.below(6))
+            .map(|_| synthetic(&mut rng, round % 2 == 0, round % 3 != 0))
+            .collect();
+        let broken = rng.below(sources.len());
+        let fail = if round % 2 == 0 {
+            Fail::Always
+        } else {
+            Fail::Subset
+        };
+        for budget in budgets(sources.iter().map(|s| s.postings()).sum()) {
+            for two_stage in [false, true] {
+                sources[broken].fail = Fail::Never;
+                let healthy: Vec<Synthetic> = sources
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, _)| i != broken)
+                    .map(|(_, s)| Synthetic {
+                        scores: s.scores.clone(),
+                        bounds: s.bounds.clone(),
+                        scored: AtomicUsize::new(0),
+                        fail: Fail::Never,
+                    })
+                    .collect();
+                let without = knn_rank_postings(&healthy, budget, None, two_stage);
+                let whole = knn_rank_postings(&sources, budget, None, two_stage);
+                sources[broken].fail = fail;
+                let plan = knn_rank_postings(&sources, budget, None, two_stage);
+                let mut view_plan = view(&plan);
+                match fail {
+                    // `scores_for` alone failing redoes the plan
+                    // single-stage, which needs only `scores`: same plan.
+                    Fail::Subset => assert_eq!(view_plan, view(&whole), "round {round}"),
+                    _ => {
+                        assert!(view_plan.2[broken].is_none(), "round {round}: no ranking");
+                        view_plan.2.remove(broken);
+                        assert_eq!(view_plan, view(&without), "round {round}, budget {budget}");
+                        // Redone single-stage: every healthy posting scored.
+                        let healthy_total: usize = healthy.iter().map(|s| s.postings()).sum();
+                        assert_eq!(plan.exact_centroids, healthy_total);
+                    }
+                }
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 1_000, "{checked}");
+}
+
+#[test]
+fn the_unscorable_segment_warning_is_rate_limited_and_counts_what_it_held_back() {
+    let limit = RateLimitedWarn::new(3600);
+    let mut held_back = None;
+    assert!(limit.warn(|n| {
+        held_back = Some(n);
+        String::from("first")
+    }));
+    assert_eq!(held_back, Some(0));
+    for _ in 0..5 {
+        assert!(!limit.warn(|_| unreachable!("inside the interval")));
+    }
+    // Past the interval the next line reports the five held back.
+    limit.next_secs.store(0, Ordering::Relaxed);
+    assert!(limit.warn(|n| {
+        held_back = Some(n);
+        String::from("second")
+    }));
+    assert_eq!(held_back, Some(5));
 }
 
 // ── real segments ─────────────────────────────────────────────────────
@@ -660,12 +757,12 @@ impl KnnPlanSource for MatrixSource<'_> {
         self.matrix.postings()
     }
 
-    fn scores(&self) -> Vec<f32> {
-        self.matrix.scores(self.query, self.alpha)
+    fn scores(&self) -> Option<Vec<f32>> {
+        Some(self.matrix.scores(self.query, self.alpha))
     }
 
-    fn scores_for(&self, postings: &[u32]) -> Vec<f32> {
-        self.matrix.scores_for(self.query, postings, self.alpha)
+    fn scores_for(&self, postings: &[u32]) -> Option<Vec<f32>> {
+        Some(self.matrix.scores_for(self.query, postings, self.alpha))
     }
 
     fn score_bounds(&self) -> Option<KnnCentroidScoreBounds> {

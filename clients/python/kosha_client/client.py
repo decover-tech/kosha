@@ -943,7 +943,7 @@ class KoshaClient:
     # under a bucket aggregation; any other sub-aggregation is refused
     # rather than ignored: the caller would read buckets that are not there.
     _BUCKET_AGG_TYPES = ("terms", "composite", "histogram", "date_histogram")
-    _METRIC_AGG_TYPES = ("min", "max", "sum", "avg", "value_count")
+    _METRIC_AGG_TYPES = ("min", "max", "sum", "avg", "value_count", "percentiles")
     _AGG_TYPES = ("cardinality", *_BUCKET_AGG_TYPES, *_METRIC_AGG_TYPES)
 
     @classmethod

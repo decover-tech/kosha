@@ -81,8 +81,13 @@ pub(crate) struct BatchOutcome {
 /// re-warm and persistence logic runs in tests against a directory that
 /// stands in for S3 (the same approach as `CompactionStorage`).
 pub(crate) trait WarmStorage {
-    /// Bytes per `(segment, class)` of a namespace in object storage.
-    fn class_sizes(&self, ns: &NamespaceId) -> Result<HashMap<(String, FileClass), u64>, String>;
+    /// A namespace's objects in object storage: `<segment>/<file>` and
+    /// size.
+    fn list_objects(&self, ns: &NamespaceId) -> Result<Vec<(String, u64)>, String>;
+    /// Make `footer.json` local for every segment `manifest` carries no
+    /// footer for, so the pass can plan from footers (see
+    /// [`warm_fetches`]). Returns the files and bytes downloaded.
+    fn fetch_footers(&self, ns: &NamespaceId, manifest: &kosha_core::Manifest) -> (u64, u64);
     /// Make `class` local for `segments` of `ns`. Holds a hydration permit
     /// for at most this one batch.
     fn warm_batch(
@@ -119,8 +124,41 @@ pub(crate) fn group_class_sizes(
     out
 }
 
-/// [`group_class_sizes`] over a local namespace directory.
-pub(crate) fn local_class_sizes(ns_dir: &Path) -> HashMap<(String, FileClass), u64> {
+/// Whether warm-up downloads `file` of `segment`: the one decision behind
+/// both the bytes a pass plans for ([`warm_class_sizes`]) and what its
+/// batches fetch (`AppState::warm_batch_s3`), taken from the same footer —
+/// `manifest`'s copy, which [`AppState::run_warm_pass`] loads before
+/// planning. Planning from anything else charged the budget for files
+/// that were never downloaded and warmed fewer segments than it could.
+///
+/// - `doc_vectors.bin` only where readers need it whole
+///   ([`kosha_segment::doc_vectors_kept_whole`]); an f32 sidecar is read by
+///   range. With no footer it is not fetched, as the fetch has always done.
+/// - Filter files never: the scaffolding probe is unfiltered, so the
+///   scoring batch leaves them for the first filtered search.
+pub(crate) fn warm_fetches(manifest: &kosha_core::Manifest, segment: &str, file: &str) -> bool {
+    if file == kosha_segment::DOC_VECTORS_FILE {
+        return manifest
+            .segment_footer(&kosha_core::SegmentId(segment.to_string()))
+            .is_some_and(kosha_segment::doc_vectors_kept_whole);
+    }
+    !(file == kosha_core::FILTERS_BIN_FILE || kosha_core::is_filter_column_file(file))
+}
+
+/// [`group_class_sizes`] of the files warm-up downloads ([`warm_fetches`]).
+pub(crate) fn warm_class_sizes(
+    objects: Vec<(String, u64)>,
+    manifest: &kosha_core::Manifest,
+) -> HashMap<(String, FileClass), u64> {
+    group_class_sizes(objects.into_iter().filter(|(relative, _)| {
+        relative
+            .split_once('/')
+            .is_none_or(|(segment, file)| warm_fetches(manifest, segment, file))
+    }))
+}
+
+/// The objects (`<segment>/<file>`, size) of a local namespace directory.
+pub(crate) fn local_objects(ns_dir: &Path) -> Vec<(String, u64)> {
     let mut objects = Vec::new();
     if let Ok(segments) = std::fs::read_dir(ns_dir) {
         for seg in segments.flatten() {
@@ -140,40 +178,30 @@ pub(crate) fn local_class_sizes(ns_dir: &Path) -> HashMap<(String, FileClass), u
             }
         }
     }
-    group_class_sizes(objects)
+    objects
 }
 
 impl WarmStorage for AppState {
-    fn class_sizes(&self, ns: &NamespaceId) -> Result<HashMap<(String, FileClass), u64>, String> {
+    fn list_objects(&self, ns: &NamespaceId) -> Result<Vec<(String, u64)>, String> {
         #[cfg(feature = "s3")]
         if let Some(ref s3) = self.s3_storage {
-            // A `doc_vectors.bin` that warming leaves remote (f32 columns,
-            // see `kosha_segment::doc_vectors_kept_whole`) is no part of
-            // the bytes it plans for. Kept when the manifest has no footer
-            // to tell: over-counting only warms less.
-            let manifest = self.indexer.manifest_shared(ns);
-            let remote_sidecar = |relative: &str| {
-                let Some((segment, kosha_segment::DOC_VECTORS_FILE)) = relative.split_once('/')
-                else {
-                    return false;
-                };
-                manifest
-                    .as_ref()
-                    .and_then(|m| m.segment_footer(&kosha_core::SegmentId(segment.to_string())))
-                    .is_some_and(|footer| !kosha_segment::doc_vectors_kept_whole(footer))
-            };
             return s3
                 .list_namespace_objects(&ns.0)
-                .map(|objects| {
-                    group_class_sizes(
-                        objects
-                            .into_iter()
-                            .filter(|(relative, _)| !remote_sidecar(relative)),
-                    )
-                })
                 .map_err(|e| format!("S3 size listing for '{}' failed: {e}", ns.0));
         }
-        Ok(local_class_sizes(&self.data_dir.join(&ns.0)))
+        Ok(local_objects(&self.data_dir.join(&ns.0)))
+    }
+
+    fn fetch_footers(&self, ns: &NamespaceId, manifest: &kosha_core::Manifest) -> (u64, u64) {
+        #[cfg(feature = "s3")]
+        if self.s3_storage.is_some() {
+            let (files, bytes) =
+                self.fetch_missing_footers(ns, manifest, &RequestHydration::unlimited());
+            return (files as u64, bytes);
+        }
+        // Local-only mode: every `footer.json` is already local.
+        let _ = (ns, manifest);
+        (0, 0)
     }
 
     fn warm_batch(
@@ -350,15 +378,19 @@ impl AppState {
                 }
             }
             FileClass::DocStore => {
+                // `doc_vectors.bin` by the decision the plan counted it by.
+                let segment_of: HashMap<&Path, &str> = seg_paths
+                    .iter()
+                    .map(PathBuf::as_path)
+                    .zip(segments.iter().map(String::as_str))
+                    .collect();
                 let (files, bytes) = {
                     let _permit = self.hydration_semaphore.acquire("warm_doc_store");
-                    // `doc_vectors.bin` only where readers need it whole
-                    // (quantized columns); f32 sidecars are read by range.
-                    self.ensure_doc_store_local(
-                        &seg_paths,
-                        &request,
-                        kosha_segment::segment_keeps_doc_vectors_whole,
-                    )
+                    self.ensure_doc_store_local(&seg_paths, &request, |seg| {
+                        segment_of.get(seg).is_some_and(|segment| {
+                            warm_fetches(manifest, segment, kosha_segment::DOC_VECTORS_FILE)
+                        })
+                    })
                 };
                 let mut missing = 0;
                 for seg in &seg_paths {
@@ -542,6 +574,8 @@ impl AppState {
         // segment's scaffolding lands, the search path's hydration verdict
         // can be recorded, as the static warmup did.
         let mut whole: HashSet<String> = HashSet::new();
+        // `footer.json` downloads per namespace, reported after the plan.
+        let mut footer_fetches: Vec<(String, u64, u64)> = Vec::new();
         // A sharded namespace (#207) holds its segments in its shards,
         // ordinary namespaces nested under its prefix: warm each of them.
         let specs: Vec<WarmSpec> = specs
@@ -572,7 +606,7 @@ impl AppState {
             })
             .collect();
         for spec in specs {
-            let Some(manifest) = self.indexer.manifest_shared(&spec.ns) else {
+            let Some(mut manifest) = self.indexer.manifest_shared(&spec.ns) else {
                 report
                     .errors
                     .push(format!("namespace '{}' not found; skipped", spec.ns.0));
@@ -581,8 +615,21 @@ impl AppState {
             if manifest.segments.is_empty() {
                 continue;
             }
-            let sizes = match storage.class_sizes(&spec.ns) {
-                Ok(s) => s,
+            // Plan from footers (`warm_fetches`). A query pod's manifest
+            // comes without them (#241) until a search caches them, so a
+            // boot pass loads them first: the footer phase every first
+            // search runs anyway, one `footer.json` per segment.
+            let (files, bytes) = storage.fetch_footers(&spec.ns, &manifest);
+            if files > 0 {
+                footer_fetches.push((spec.ns.0.clone(), files, bytes));
+            }
+            if !self.remember_local_footers(&spec.ns, &manifest).is_empty() {
+                if let Some(with_footers) = self.indexer.manifest_shared(&spec.ns) {
+                    manifest = with_footers;
+                }
+            }
+            let sizes = match storage.list_objects(&spec.ns) {
+                Ok(objects) => warm_class_sizes(objects, &manifest),
                 Err(e) => {
                     report.errors.push(format!("{e}; '{}' skipped", spec.ns.0));
                     continue;
@@ -611,6 +658,13 @@ impl AppState {
 
         let plan = crate::warm::plan(&candidates, available);
         report.add_plan(&plan);
+        for (ns_name, files, bytes) in footer_fetches {
+            report.fetched_files += files;
+            report.fetched_bytes += bytes;
+            let s = report.summary_mut(&ns_name);
+            s.fetched_files += files;
+            s.fetched_bytes += bytes;
+        }
 
         // Namespaces whose vector indexes this pass warmed.
         let mut vector_namespaces: Vec<&str> = Vec::new();

@@ -93,17 +93,61 @@ request and response shapes:
   `doc_count`.
 - With no matching values, `min`, `max` and `avg` return `{"value": null}`;
   `sum` and `value_count` return `0`.
+- `percentiles` reads the same values as `min` / `max` (see "Percentiles"
+  below).
 - Sub-aggregations (`aggs` or `aggregations` beside `terms`, `composite`,
-  `histogram` or `date_histogram`) may only be metrics (`min`, `max`, `sum`, `avg`, `value_count`); their results
+  `histogram` or `date_histogram`) may only be metrics (`min`, `max`, `sum`,
+  `avg`, `value_count`, `percentiles`); their results
   appear inside each bucket under the sub-aggregation's name. Nesting a bucket
   aggregation, or putting `aggs` under a metric, is a 400.
-- Partial results — bucket counts, and `(count, sum, min, max)` for metrics —
-  are merged across segments before anything is finished, so `avg` is the
-  merged sum over the merged count, not an average of per-segment averages.
+- Partial results — bucket counts, `(count, sum, min, max)` for metrics, and
+  the values or sketch for `percentiles` — are merged across segments before
+  anything is finished, so `avg` is the merged sum over the merged count, not
+  an average of per-segment averages.
 - An aggregation-only request (`max_results: 0`) never reads the document
   store.
-- Not supported yet: `stats`, `percentiles`, `range` buckets, `missing` /
+- Not supported yet: `stats`, `percentile_ranks`, `range` buckets, `missing` /
   `script` / `format` options.
+
+#### Percentiles
+
+```json
+{"query_text": "", "filter": {"match_all": {}}, "max_results": 0,
+ "aggs": {
+   "latency": {"percentiles": {"field": "tookMs", "percents": [50, 95, 99]}},
+   "by_route": {"terms": {"field": "route"},
+                "aggs": {"p": {"percentiles": {"field": "tookMs", "percents": [99]}}}}}}
+```
+
+```json
+{"aggregations": {
+   "latency": {"values": {"50.0": 12.0, "95.0": 48.5, "99.0": 130.2}},
+   "by_route": {"buckets": [{"key": "/search", "doc_count": 9120,
+                             "p": {"values": {"99.0": 141.7}}}]}}}
+```
+
+- `percents` defaults to `[1, 5, 25, 50, 75, 95, 99]`; each must be in
+  `[0, 100]` and there may be at most 100. `keyed: false` returns
+  `"values": [{"key": 50.0, "value": 12.0}, ...]` instead of the object.
+- Values are read as for `min` / `max`: `Integer` and `Float` fields, `Date`
+  fields as epoch milliseconds (each value then also comes as text, under
+  `"50.0_as_string"`, or `value_as_string` with `keyed: false`), and each
+  element of a list value. A document without the field is skipped. With no
+  values every requested percentile is `null`.
+- **Accuracy.** Up to 4,096 values (per aggregation, or per bucket for a
+  sub-aggregation) the result is exact: the values are sorted and a
+  percentile is interpolated linearly between the two closest ranks, so the
+  50th percentile of `10, 20, 30, 40` is `25`. Past that the values go into a
+  DDSketch and each reported value is within 1% (relative) of a true value
+  at that rank; the 0th and 100th percentiles stay the exact minimum and
+  maximum. Elasticsearch uses t-digest, so its estimates on large inputs
+  differ slightly from these.
+- **Deterministic.** The result depends only on the set of matched values,
+  not on how they are split across segments or the order segments are
+  merged in, so compaction does not change it.
+- A 400 is returned for an empty `percents`, a percentile outside
+  `[0, 100]`, and the not-yet-supported `tdigest`, `hdr`, `missing`,
+  `script` and `format`.
 
 #### Histograms
 

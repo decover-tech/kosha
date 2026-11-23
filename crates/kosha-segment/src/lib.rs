@@ -1686,8 +1686,11 @@ pub const VECTOR_IDX_FILE: &str = "vector.idx";
 /// slot `n`, #204) it is about to read but does not hold locally (#245).
 /// After it returns,
 /// those ranges should be readable from the whole file or the span cache
-/// (`span_cache`); any still missing fail the search as an IO error.
-pub type VectorSpanFetch<'a> = &'a (dyn Fn(&Path, &str, &[(u64, u64)]) + Sync);
+/// (`span_cache`) for as long as the reader keeps the returned holds (the
+/// fetched spans that are only in memory, see `span_cache::PendingSpan`);
+/// any still missing fail the search as an IO error.
+pub type VectorSpanFetch<'a> =
+    &'a (dyn Fn(&Path, &str, &[(u64, u64)]) -> span_cache::SpanHolds + Sync);
 
 /// Postings fetched per call when a restricted kNN probe runs past its
 /// budget (see `knn_search_within_filtered`).
@@ -2048,6 +2051,26 @@ pub fn vector_index_files(segment_dir: &Path) -> Vec<String> {
             .collect(),
         None => vec!["vector.idx".to_string(), "vector.offsets".to_string()],
     }
+}
+
+/// Whether every vector file `footer` says the segment has is local: each
+/// column's idx file, its offsets sidecar where the writer emitted one,
+/// and `doc_vectors.bin` when vectors are stored there (#243). For callers
+/// that need a segment's vectors in full (merges, rewrites), as
+/// [`filter_columns::filter_files_present`] is for its filter index.
+///
+/// A legacy footer (no `vector_fields`) cannot say whether the segment has
+/// a vector index, so only its `doc_vectors.bin` is checked: requiring
+/// `vector.idx` there would make every vectorless legacy segment
+/// permanently incomplete.
+pub fn vector_files_present(segment_dir: &Path, footer: &Footer) -> bool {
+    let present = |name: &str| segment_dir.join(name).is_file();
+    footer
+        .vector_fields
+        .iter()
+        .flatten()
+        .all(|meta| present(&meta.idx_file()) && (!meta.offsets || present(&meta.offsets_file())))
+        && (!footer.doc_vectors || present(DOC_VECTORS_FILE))
 }
 
 /// Parses a v2 `vector.idx`'s header only — `(dim, total_count, version)`.
@@ -8643,15 +8666,17 @@ impl SegmentReader {
 
     /// Hand `fetch` the ranges of the column's idx file for the postings in
     /// `range_idxs` that are neither decoded in memory nor readable
-    /// locally, in one call.
+    /// locally, in one call. The caller keeps the returned holds until it
+    /// has scanned those postings.
+    #[must_use = "the fetched postings are readable only while the holds live"]
     fn prefetch_vector_postings(
         &self,
         vi: &LazyVectorIndex,
         range_idxs: impl IntoIterator<Item = usize>,
         fetch: Option<VectorSpanFetch<'_>>,
-    ) {
+    ) -> span_cache::SpanHolds {
         let Some(fetch) = fetch else {
-            return;
+            return span_cache::SpanHolds::new();
         };
         let whole_len = fs::metadata(&vi.vector_idx_path)
             .ok()
@@ -8679,9 +8704,10 @@ impl SegmentReader {
                 missing.push((offset, end));
             }
         }
-        if !missing.is_empty() {
-            fetch(&self.segment_dir, &vi.idx_file, &missing);
+        if missing.is_empty() {
+            return span_cache::SpanHolds::new();
         }
+        fetch(&self.segment_dir, &vi.idx_file, &missing)
     }
 
     /// A query vector must have its column's dimension: scoring vectors of
@@ -9344,7 +9370,9 @@ impl SegmentReader {
                     .collect();
                 if !missing.is_empty() {
                     out.ranged_spans = missing.len();
-                    fetch(&self.segment_dir, DOC_VECTORS_FILE, &missing);
+                    // The reloaded index holds whatever the fetch left only
+                    // in memory, for as long as the reads below need it.
+                    let _held = fetch(&self.segment_dir, DOC_VECTORS_FILE, &missing);
                     local = span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE);
                 }
             }
@@ -9453,7 +9481,7 @@ impl SegmentReader {
             return Some(Ok(result));
         }
         // No usable sidecar: every posting, filtered while it is scored.
-        self.prefetch_vector_postings(vi, 0..vi.ranges.len(), fetch);
+        let _held = self.prefetch_vector_postings(vi, 0..vi.ranges.len(), fetch);
         // A quantized column scores approximately here (it has no exact
         // vectors without the sidecar).
         let mut sink = CandidateSink::new(vi, k);
@@ -9574,7 +9602,9 @@ impl SegmentReader {
                     .filter(|&(start, end)| !spans.covers(start, end))
                     .collect();
                 if !missing.is_empty() {
-                    fetch(&self.segment_dir, DOC_VECTORS_FILE, &missing);
+                    // Held until the vectors below are read: the reloaded
+                    // index sees what the fetch left only in memory.
+                    let _held = fetch(&self.segment_dir, DOC_VECTORS_FILE, &missing);
                     spans = span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE);
                 }
             }
@@ -9678,7 +9708,8 @@ impl SegmentReader {
             }
         };
         let budgeted = ranking.budgeted.len();
-        self.prefetch_vector_postings(vi, ranking.budgeted.iter().map(|&i| i as usize), fetch);
+        let mut held =
+            self.prefetch_vector_postings(vi, ranking.budgeted.iter().map(|&i| i as usize), fetch);
 
         let mut probes = 0usize;
         let mut sink = CandidateSink::new(vi, k);
@@ -9728,7 +9759,8 @@ impl SegmentReader {
                 if (position - budgeted) % VECTOR_PREFETCH_CHUNK == 0 {
                     let chunk =
                         &ranked[position..(position + VECTOR_PREFETCH_CHUNK).min(ranked.len())];
-                    self.prefetch_vector_postings(
+                    // Every posting held so far has been scanned.
+                    held = self.prefetch_vector_postings(
                         vi,
                         chunk.iter().map(|&(i, _)| i as usize),
                         fetch,
@@ -9743,6 +9775,7 @@ impl SegmentReader {
                 )?;
             }
         }
+        drop(held);
         let (scored, errors) = sink.finish();
         Ok(ProbedCandidates {
             scored,
@@ -9819,7 +9852,8 @@ impl SegmentReader {
             kosha_vector_spfresh::nearest_centroids_rows(&vi.centroids, vi.dim, query, rank)
         };
         let budgeted = nprobe.min(candidates.len());
-        self.prefetch_vector_postings(vi, candidates[..budgeted].iter().copied(), fetch);
+        let mut held =
+            self.prefetch_vector_postings(vi, candidates[..budgeted].iter().copied(), fetch);
         let mut sink = CandidateSink::new(vi, k);
         // `query` is already unit-normalized for every unit-norm column,
         // which includes every quantized one.
@@ -9834,7 +9868,8 @@ impl SegmentReader {
             if position >= budgeted && (position - budgeted) % VECTOR_PREFETCH_CHUNK == 0 {
                 let chunk =
                     &candidates[position..(position + VECTOR_PREFETCH_CHUNK).min(candidates.len())];
-                self.prefetch_vector_postings(vi, chunk.iter().copied(), fetch);
+                // Every posting held so far has been scanned.
+                held = self.prefetch_vector_postings(vi, chunk.iter().copied(), fetch);
             }
             postings += 1;
             self.scan_posting(
@@ -9850,6 +9885,7 @@ impl SegmentReader {
                 |id, sim, err| sink.push(id, sim, err),
             )?;
         }
+        drop(held);
         let (scored, errors) = sink.finish();
         Ok(ProbedCandidates {
             scored,
@@ -15796,6 +15832,7 @@ mod global_rescore_tests {
             for &(s, e) in ranges {
                 put(s, e);
             }
+            span_cache::SpanHolds::new()
         };
         let fetched = reader.knn_exact_scores_fetching("emb", &query, &seqs, Some(&fetch));
         assert!(fetched.ranged);

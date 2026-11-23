@@ -61,6 +61,8 @@ mod namespace_deletion;
 mod namespace_migrate;
 mod operator_admin;
 mod org_admin;
+#[cfg(all(test, feature = "s3"))]
+mod posting_presence_tests;
 mod posting_spans;
 mod rerank;
 mod role;
@@ -81,6 +83,7 @@ mod segment_commit;
 mod segment_gc;
 #[cfg(all(test, feature = "s3"))]
 mod segment_pin_tests;
+mod span_writes;
 mod tenant_limits;
 mod unindexed;
 mod usage;
@@ -91,6 +94,7 @@ mod usage_reconcile_tests;
 mod usage_tests;
 mod warm;
 mod warm_run;
+mod writeback;
 mod writer_lease;
 #[cfg(test)]
 mod writer_lease_tests;
@@ -106,8 +110,18 @@ use kosha_query::DocStoreHydrator;
 #[cfg(feature = "s3")]
 use kosha_query::PageSegment;
 use kosha_query::Searcher;
+#[cfg(feature = "s3")]
+use kosha_segment::span_cache::SpanHolds;
 use kosha_segment::SegmentReader;
 use kosha_write::Indexer;
+
+/// Longest the boot warm-up waits for its writes to reach the cache disk
+/// before reporting ready anyway (see `AppState::finish_warmup`): above the
+/// ≈ 46 s that the kernel's dirty limit allows at 125 MiB/s, so it only
+/// fires on a disk (or an `emptyDir` node filesystem) slower or busier
+/// than that.
+#[cfg_attr(not(feature = "s3"), allow(dead_code))]
+const WARMUP_FLUSH_TIMEOUT: Duration = Duration::from_secs(120);
 
 // ─── Application state ──────────────────────────────────────────────────────
 
@@ -252,6 +266,10 @@ struct AppState {
     posting_promotions: doc_spans::PromotionQueue,
     /// Process totals of posting bytes fetched, for `GET /stats`.
     posting_reads: posting_spans::PostingReadCounters,
+    /// Writes of fetched spans into the span cache, drained by the
+    /// `kosha-span-writer` thread so no request (or rayon scoring task)
+    /// writes to disk. See [`span_writes`].
+    span_writes: span_writes::SpanWriteQueue,
     /// Ceiling on concurrent `/search` executions
     /// (`KOSHA_MAX_CONCURRENT_SEARCHES`, default 8). Complements the
     /// searcher's own live-bytes admission gate (`kosha_query::MemoryLedger`):
@@ -402,9 +420,10 @@ struct AppState {
     /// fetched). A positive verdict here that outlives a real eviction —
     /// `self.cache` LRU-evicts under `KOSHA_CACHE_MAX_BYTES` pressure — must
     /// therefore never be trusted past that eviction. Every stored entry is
-    /// stamped with `self.cache.eviction_generation()` as of the moment it
+    /// stamped with `self.presence_generation()` (the cache's eviction
+    /// generation plus failed span writes, see there) as of the moment it
     /// was verified, and a read compares that stamp against the *current*
-    /// generation: any eviction anywhere (not just of this exact file —
+    /// generation: any eviction (or failed span write) anywhere (not just of this exact file —
     /// tracking that precisely isn't worth the plumbing given how rare
     /// eviction is relative to query volume) invalidates the snapshot,
     /// falling back to a real stat. See `Cache::eviction_generation`'s doc
@@ -1257,9 +1276,16 @@ fn retry_after(response: String, secs: u64) -> String {
 /// on the footer anyway.
 #[cfg(feature = "s3")]
 fn filter_index_complete(seg_dir: &Path) -> bool {
-    match SegmentReader::read_footer(seg_dir) {
-        Ok(footer) => kosha_segment::filter_columns::filter_files_present(seg_dir, &footer),
-        Err(_) => seg_dir.join(kosha_core::FILTERS_BIN_FILE).is_file(),
+    filter_index_complete_for(seg_dir, SegmentReader::read_footer(seg_dir).ok().as_ref())
+}
+
+/// [`filter_index_complete`] with the local footer already parsed (`None`:
+/// unreadable).
+#[cfg(feature = "s3")]
+fn filter_index_complete_for(seg_dir: &Path, footer: Option<&kosha_core::Footer>) -> bool {
+    match footer {
+        Some(footer) => kosha_segment::filter_columns::filter_files_present(seg_dir, footer),
+        None => seg_dir.join(kosha_core::FILTERS_BIN_FILE).is_file(),
     }
 }
 
@@ -2062,6 +2088,10 @@ impl AppState {
             #[cfg(feature = "s3")]
             posting_promotions: doc_spans::PromotionQueue::default(),
             posting_reads: posting_spans::PostingReadCounters::default(),
+            span_writes: span_writes::SpanWriteQueue::new(
+                span_writes::SPAN_WRITE_QUEUE_BYTES,
+                span_writes::SPAN_HELD_BYTES,
+            ),
             search_semaphore: {
                 let permits = std::env::var("KOSHA_MAX_CONCURRENT_SEARCHES")
                     .ok()
@@ -2198,15 +2228,93 @@ impl AppState {
                 .spawn(move || {
                     let start = Instant::now();
                     state.run_boot_warmup(&*state);
-                    state
-                        .warmup_complete
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                    println!(
-                        "warmup: complete in {:.1}s — pod is ready",
-                        start.elapsed().as_secs_f64()
-                    );
+                    let data_dir = state.data_dir.clone();
+                    state.finish_warmup(start, WARMUP_FLUSH_TIMEOUT, move || {
+                        writeback::sync_filesystem(&data_dir)
+                    });
                 })
                 .expect("failed to spawn warmup thread");
+        }
+    }
+
+    /// The end of the boot warm-up: wait (at most `timeout`) for `flush`
+    /// to put what warm-up wrote on disk, then mark the pod ready.
+    ///
+    /// The warm-up's files are buffered writes. Flipping ready with them
+    /// still dirty (4.4–5.1 GB measured on staging, about the kernel's
+    /// dirty limit) handed the first user requests a disk that needed 41–52
+    /// s more to drain at 125 MiB/s, during which the kernel throttled every
+    /// thread that wrote. Each warm file's writeback starts as it lands
+    /// (`writeback`), so what is left to wait for here is the tail the disk
+    /// had not caught up with: never more than the kernel's dirty limit
+    /// (≈ 6 GB on a query pod, ≈ 46 s at 125 MiB/s), ≈ 1.1 GB (≈ 9 s) on
+    /// the measured warm-up. `syncfs` flushes the whole filesystem holding
+    /// the cache: on a dedicated cache volume (staging) only this pod's
+    /// writes, on an `emptyDir` (prod, finding 10) the node's root
+    /// filesystem, other pods' dirty data included, hence the timeout. A
+    /// flush that fails or overruns is logged and the pod goes ready
+    /// anyway (fail-open, as for the warm-up itself).
+    #[cfg_attr(not(any(test, feature = "s3")), allow(dead_code))]
+    fn finish_warmup(
+        &self,
+        start: Instant,
+        timeout: Duration,
+        flush: impl FnOnce() -> std::io::Result<()> + Send + 'static,
+    ) {
+        let mb = |b: u64| b / (1 << 20);
+        let before = writeback::dirty_bytes();
+        match before {
+            Some((dirty, wb)) => println!(
+                "warmup: flushing the cache disk before going ready (node dirty {} MB + \
+                 writeback {} MB; at most {}s)",
+                mb(dirty),
+                mb(wb),
+                timeout.as_secs()
+            ),
+            None => println!(
+                "warmup: flushing the cache disk before going ready (at most {}s)",
+                timeout.as_secs()
+            ),
+        }
+        let flushed = Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("kosha-warmup-flush".into())
+            .spawn(move || {
+                // The receiver is gone only after a timeout, already logged.
+                let _ = tx.send(flush());
+            });
+        let outcome = match spawned {
+            Ok(_) => rx.recv_timeout(timeout),
+            Err(e) => Ok(Err(e)),
+        };
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                eprintln!("WARN: warmup: flushing the cache disk failed: {e}; going ready anyway")
+            }
+            Err(_) => eprintln!(
+                "WARN: warmup: the cache disk flush did not finish within {}s; going ready \
+                 with writes still draining",
+                timeout.as_secs()
+            ),
+        }
+        let flush_s = flushed.elapsed().as_secs_f64();
+        let after = writeback::dirty_bytes();
+        self.warmup_complete
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        match after {
+            Some((dirty, wb)) => println!(
+                "warmup: complete in {:.1}s — pod is ready (cache flush {flush_s:.1}s; node \
+                 dirty {} MB + writeback {} MB now)",
+                start.elapsed().as_secs_f64(),
+                mb(dirty),
+                mb(wb)
+            ),
+            None => println!(
+                "warmup: complete in {:.1}s — pod is ready (cache flush {flush_s:.1}s)",
+                start.elapsed().as_secs_f64()
+            ),
         }
     }
 
@@ -2698,6 +2806,19 @@ impl AppState {
         reports
     }
 
+    /// The generation `posting_blob_presence` entries are stamped with and
+    /// checked against: the disk cache's eviction generation plus the span
+    /// writes that failed. A term is confirmed present as soon as its span
+    /// write is queued (see `posting_spans`), so a write that later fails
+    /// must invalidate, like an eviction, whatever was confirmed on its
+    /// strength. Both counters only grow, so their sum moves on either.
+    #[cfg(feature = "s3")]
+    fn presence_generation(&self) -> u64 {
+        self.cache
+            .eviction_generation()
+            .wrapping_add(self.span_writes.failures())
+    }
+
     /// Readiness-gate predicate used by the `/readyz` handler: true when no
     /// warmup is configured or it has finished (success or fail-open). Not a
     /// health signal — liveness stays on `/healthz`.
@@ -3128,7 +3249,6 @@ impl AppState {
     /// Cache footers parsed during a search's hydration on the manifest(s)
     /// that list their segments. A merged sharded view's segment ids are
     /// `_shard-XXXX/{id}`: those footers belong to the shard namespace.
-    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
     fn remember_search_footers(
         &self,
         ns: &NamespaceId,
@@ -3319,12 +3439,41 @@ impl AppState {
     #[cfg(feature = "s3")]
     const REQUIRED_SEGMENT_FILES: [&'static str; 3] = segment_commit::REQUIRED_SEGMENT_FILES;
 
+    /// What of a segment is on local disk, for a full-segment caller
+    /// (`ensure_segments_local`): `None` when a core file
+    /// (`REQUIRED_SEGMENT_FILES`, the filter index) is missing, otherwise
+    /// whether every vector file its footer lists is local too
+    /// ([`kosha_segment::vector_files_present`]). One footer parse serves
+    /// both answers.
     #[cfg(feature = "s3")]
-    fn segment_is_complete(seg_path: &Path) -> bool {
-        Self::REQUIRED_SEGMENT_FILES
+    fn segment_local_files(seg_path: &Path) -> Option<bool> {
+        if !Self::REQUIRED_SEGMENT_FILES
             .iter()
             .all(|f| seg_path.join(f).is_file())
-            && filter_index_complete(seg_path)
+        {
+            return None;
+        }
+        let footer = SegmentReader::read_footer(seg_path).ok();
+        if !filter_index_complete_for(seg_path, footer.as_ref()) {
+            return None;
+        }
+        Some(
+            footer
+                .as_ref()
+                .is_none_or(|f| kosha_segment::vector_files_present(seg_path, f)),
+        )
+    }
+
+    /// Whether a segment is local in full for a caller that does
+    /// (`needs_vectors`) or does not need its vectors. Without the
+    /// `needs_vectors` half, a segment a lexical caller hydrated (no vector
+    /// index) passed as complete for a caller that needs vectors, which then
+    /// never fetched them: every merge re-clustered those inputs' vectors
+    /// from scratch instead of reusing their postings, until the local copy
+    /// was evicted (finding 29).
+    #[cfg(feature = "s3")]
+    fn segment_is_complete(seg_path: &Path, needs_vectors: bool) -> bool {
+        Self::segment_local_files(seg_path).is_some_and(|vectors| vectors || !needs_vectors)
     }
 
     /// Ensure every listed segment directory is available locally, fanning
@@ -3368,6 +3517,9 @@ impl AppState {
     /// guaranteed never to open. Pass `true` from any caller that must
     /// preserve a segment's full fidelity (index/replace/compact/admin
     /// rewrite paths); the search path passes `query.knn.is_some()`.
+    /// It also decides which local copies count as already complete
+    /// ([`AppState::segment_is_complete`]): one hydrated without vectors is
+    /// re-fetched for a caller that needs them.
     #[cfg(feature = "s3")]
     fn ensure_segments_local(
         &self,
@@ -3389,7 +3541,7 @@ impl AppState {
             &self.in_flight_segments,
             seg_paths,
             HYDRATE_OWNER_SEGMENTS,
-            Self::segment_is_complete,
+            |p| Self::segment_is_complete(p, needs_vectors),
         );
 
         if !owned.is_empty() {
@@ -3484,12 +3636,36 @@ impl AppState {
 
         wait_for(&waiting);
 
-        outcome.missing = seg_paths
-            .iter()
-            .filter(|p| !Self::segment_is_complete(p))
-            .filter_map(|p| p.strip_prefix(&self.data_dir).ok())
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
+        // `missing` is what no caller can read past: a core file. A segment
+        // whose vector files still are not local after a fetch that asked
+        // for them (S3 lacks them, or this call waited behind a lexical
+        // owner) is logged rather than failed: none of these callers reads
+        // the vector index — writes and merges take vectors from the doc
+        // store / `doc_vectors.bin`, and a merge whose `doc_vectors.bin`
+        // is missing fails when it reads it — so failing them here would
+        // turn a slower merge into a write outage. A later call fetches it.
+        let rel = |p: &PathBuf| {
+            p.strip_prefix(&self.data_dir)
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        };
+        let mut without_vectors = Vec::new();
+        for path in seg_paths {
+            match Self::segment_local_files(path) {
+                None => outcome.missing.extend(rel(path)),
+                Some(false) if needs_vectors => without_vectors.extend(rel(path)),
+                Some(_) => {}
+            }
+        }
+        if !without_vectors.is_empty() {
+            eprintln!(
+                "WARN: {} segment(s) hydrated for a caller that needs vectors still lack \
+                 vector files their footer lists: {}{}",
+                without_vectors.len(),
+                without_vectors.join(", "),
+                request_id()
+            );
+        }
         outcome
     }
 
@@ -3687,8 +3863,10 @@ impl AppState {
                 };
                 let outcome = {
                     let _permit = self.hydration_semaphore.acquire("page_docs");
-                    self.span_hydrator.hydrate(pages, &fetcher, &self.cache)
+                    self.span_hydrator
+                        .hydrate(pages, &fetcher, &self.span_writes)
                 };
+                request.hold_spans(outcome.held);
                 stats.rounds = outcome.rounds;
                 stats.ranged_gets = outcome.gets;
                 stats.ranged_bytes = outcome.bytes;
@@ -4160,7 +4338,7 @@ impl AppState {
 
         let written = (|| -> Result<u64, KoshaError> {
             use std::io::Write;
-            let mut file = std::fs::File::create(&tmp)?;
+            let file = std::fs::File::create(&tmp)?;
             let written = if legacy_base64 {
                 let encoded = resp
                     .text()
@@ -4169,12 +4347,19 @@ impl AppState {
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(encoded.trim())
                     .map_err(|e| KoshaError::NotFound(format!("base64 decode: {e}")))?;
-                file.write_all(&bytes)?;
+                let mut out = writeback::ChunkedWriteback::new(&file, 0);
+                out.write_all(&bytes)?;
+                out.finish();
                 bytes.len() as u64
             } else {
-                let mut out = std::io::BufWriter::with_capacity(256 * 1024, &mut file);
+                // Each 16 MiB written is handed to the writeback thread as
+                // it lands (see `writeback`), never advised from this thread.
+                let mut out = std::io::BufWriter::with_capacity(
+                    256 * 1024,
+                    writeback::ChunkedWriteback::new(&file, 0),
+                );
                 let n = std::io::copy(&mut resp, &mut out)?;
-                out.flush()?;
+                out.into_inner().map_err(|e| e.into_error())?.finish();
                 if let Some(expected) = declared.filter(|expected| *expected != n) {
                     return Err(KoshaError::NotFound(format!(
                         "short body: {n} of {expected} bytes"
@@ -4198,6 +4383,82 @@ impl AppState {
                 Err(e)
             }
         }
+    }
+
+    /// The footer phase's fetch: `footer.json` for every `manifest`
+    /// segment the manifest carries no footer for. A local copy that does
+    /// not match the CRC the manifest records for a rewritten footer (bloom
+    /// rebuild) is the old one and is removed first, so it is fetched
+    /// again. Returns the files and bytes downloaded.
+    #[cfg(feature = "s3")]
+    fn fetch_missing_footers(
+        &self,
+        ns: &NamespaceId,
+        manifest: &kosha_core::Manifest,
+        request: &Arc<RequestHydration>,
+    ) -> (usize, u64) {
+        let mut missing = Vec::new();
+        for entry in &manifest.segments {
+            if manifest.segment_footer(&entry.segment_id).is_some() {
+                continue;
+            }
+            let seg_path = manifest.segment_dir(&self.data_dir, ns, &entry.segment_id);
+            if let Some(&expected) = manifest.footer_crc32.get(&entry.segment_id) {
+                let path = seg_path.join("footer.json");
+                if let Ok(bytes) = std::fs::read(&path) {
+                    if crc32fast::hash(&bytes) != expected {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+            missing.push(seg_path);
+        }
+        self.ensure_files_local(&missing, "footer.json", request)
+    }
+
+    /// Parse the local `footer.json` of every `manifest` segment the
+    /// manifest carries no footer for, and cache each on the in-memory
+    /// manifest(s): later queries (and later manifest versions, via
+    /// `restore_manifest`'s carry-over) skip both the fetch and the parse.
+    /// Returns the footers parsed. A file that is missing, unparsable, not
+    /// the CRC-recorded rewrite or of another segment is left out.
+    fn remember_local_footers(
+        &self,
+        ns: &NamespaceId,
+        manifest: &kosha_core::Manifest,
+    ) -> HashMap<kosha_core::SegmentId, Arc<kosha_core::Footer>> {
+        let footers: HashMap<kosha_core::SegmentId, Arc<kosha_core::Footer>> = manifest
+            .segments
+            .iter()
+            .filter(|entry| manifest.segment_footer(&entry.segment_id).is_none())
+            .filter_map(|entry| {
+                let seg_path = manifest.segment_dir(&self.data_dir, ns, &entry.segment_id);
+                let bytes = std::fs::read(seg_path.join("footer.json")).ok()?;
+                // Still not the recorded rewrite (e.g. S3 fetch failed and
+                // left nothing usable): don't cache or prune with it.
+                if manifest
+                    .footer_crc32
+                    .get(&entry.segment_id)
+                    .is_some_and(|&expected| crc32fast::hash(&bytes) != expected)
+                {
+                    return None;
+                }
+                let footer: kosha_core::Footer = serde_json::from_slice(&bytes).ok()?;
+                // A footer.json from a different segment id (a corrupt or
+                // misplaced file) must not be cached under this id. In a
+                // merged sharded view (#207) the entry id carries the
+                // shard's path component; the footer keeps the shard-local
+                // id it was written with.
+                let own_id = kosha_core::sharding::split_merged_segment_id(&entry.segment_id)
+                    .map_or_else(|| entry.segment_id.clone(), |(_, local)| local);
+                (footer.segment_id == entry.segment_id || footer.segment_id == own_id)
+                    .then(|| (entry.segment_id.clone(), Arc::new(footer)))
+            })
+            .collect();
+        if !footers.is_empty() {
+            self.remember_search_footers(ns, &footers);
+        }
+        footers
     }
 
     /// Hydrate only the **scoring set** for segments that might match the
@@ -4246,77 +4507,11 @@ impl AppState {
             .map(|entry| manifest.segment_dir(&self.data_dir, ns, &entry.segment_id))
             .collect();
 
-        let missing_manifest_footer_paths: Vec<PathBuf> = manifest
-            .segments
-            .iter()
-            .filter(|entry| manifest.segment_footer(&entry.segment_id).is_none())
-            .map(|entry| manifest.segment_dir(&self.data_dir, ns, &entry.segment_id))
-            .collect();
-
-        // A footer rewritten after commit (bloom rebuild) is recorded by CRC
-        // in the manifest. A local copy that doesn't match is the old one:
-        // remove it so the hydration below fetches the current file.
-        for entry in &manifest.segments {
-            let Some(&expected) = manifest.footer_crc32.get(&entry.segment_id) else {
-                continue;
-            };
-            if manifest.segment_footer(&entry.segment_id).is_some() {
-                continue;
-            }
-            let path = manifest
-                .segment_dir(&self.data_dir, ns, &entry.segment_id)
-                .join("footer.json");
-            if let Ok(bytes) = std::fs::read(&path) {
-                if crc32fast::hash(&bytes) != expected {
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
-        }
-
-        // New manifests carry the search footer metadata inline, so cold
-        // search can skip the footer-first S3 phase entirely. Legacy
-        // manifests fall back to hydrating footer.json for pruning and
-        // format detection.
-        let (footer_files, footer_bytes) =
-            self.ensure_files_local(&missing_manifest_footer_paths, "footer.json", request);
-
-        // Persisted manifests no longer carry footers (#241), so the
-        // fallback above is now the normal path for segments this pod has
-        // not seen yet. Parse each such footer once and cache it on the
-        // in-memory manifest: later queries (and later manifest versions,
-        // via `restore_manifest`'s carry-over) skip both the S3 fetch and
-        // the local parse for it.
-        let fetched_footers: HashMap<kosha_core::SegmentId, Arc<kosha_core::Footer>> = manifest
-            .segments
-            .iter()
-            .filter(|entry| manifest.segment_footer(&entry.segment_id).is_none())
-            .filter_map(|entry| {
-                let seg_path = manifest.segment_dir(&self.data_dir, ns, &entry.segment_id);
-                let bytes = std::fs::read(seg_path.join("footer.json")).ok()?;
-                // Still not the recorded rewrite (e.g. S3 fetch failed and
-                // left nothing usable): don't cache or prune with it.
-                if manifest
-                    .footer_crc32
-                    .get(&entry.segment_id)
-                    .is_some_and(|&expected| crc32fast::hash(&bytes) != expected)
-                {
-                    return None;
-                }
-                let footer: kosha_core::Footer = serde_json::from_slice(&bytes).ok()?;
-                // A footer.json from a different segment id (a corrupt or
-                // misplaced file) must not be cached under this id. In a
-                // merged sharded view (#207) the entry id carries the
-                // shard's path component; the footer keeps the shard-local
-                // id it was written with.
-                let own_id = kosha_core::sharding::split_merged_segment_id(&entry.segment_id)
-                    .map_or_else(|| entry.segment_id.clone(), |(_, local)| local);
-                (footer.segment_id == entry.segment_id || footer.segment_id == own_id)
-                    .then(|| (entry.segment_id.clone(), Arc::new(footer)))
-            })
-            .collect();
-        if !fetched_footers.is_empty() {
-            self.remember_search_footers(ns, &fetched_footers);
-        }
+        // Persisted manifests no longer carry footers (#241): the footer
+        // phase fetches `footer.json` for segments this pod has not seen
+        // yet and caches each parsed footer on the in-memory manifest.
+        let (footer_files, footer_bytes) = self.fetch_missing_footers(ns, manifest, request);
+        let fetched_footers = self.remember_local_footers(ns, manifest);
 
         let segment_footer = |entry: &kosha_core::ManifestEntry| {
             manifest
@@ -4648,7 +4843,7 @@ impl AppState {
                 &refs,
                 |i| targets[i].2,
                 &fetcher,
-                &self.cache,
+                &self.span_writes,
             )
         };
         outcome.rounds += fetched.rounds;
@@ -4910,7 +5105,8 @@ impl AppState {
                     .iter()
                     .map(|(dir, rel)| (*dir, rel.as_str()))
                     .collect();
-                let fetched = doc_spans::fetch_doc_vectors_headers(&targets, &fetcher, &self.cache);
+                let fetched =
+                    doc_spans::fetch_doc_vectors_headers(&targets, &fetcher, &self.span_writes);
                 outcome.rounds += fetched.rounds;
                 outcome.shed |= fetched.shed;
                 for seg in &fetched.segments {
@@ -5205,7 +5401,7 @@ impl AppState {
 
         // Presence cache first: a warm repeat confirms every term of every
         // segment here without opening a footer or a TOC.
-        let eviction_gen = self.cache.eviction_generation();
+        let eviction_gen = self.presence_generation();
         let cached = {
             let cache = self.posting_blob_presence.lock().unwrap();
             posting_blob_cache_lookup(&cache, &ns.0, manifest.version, eviction_gen)
@@ -5221,6 +5417,7 @@ impl AppState {
             .collect();
         let mut ranged: Vec<PathBuf> = Vec::new();
         let mut whole: Vec<PathBuf> = Vec::new();
+        let mut shards_local: Vec<(String, String)> = Vec::new();
         for seg in seg_paths {
             let Ok(rel) = seg.strip_prefix(&self.data_dir) else {
                 continue;
@@ -5233,6 +5430,19 @@ impl AppState {
                 keys.iter().all(|k| set.contains(k))
                     || posting_files.iter().all(|f| set.contains(f))
             }) {
+                continue;
+            }
+            // Every shard the terms hash to is already a whole local file
+            // (warmed, promoted, or fetched whole): the postings are local,
+            // confirmed by name with one stat per shard. Without this, a
+            // presence miss sent the segment to `ranged`, which reads and
+            // decodes the whole `inverted.idx` (8 MB decoded for one staging
+            // segment) only to find the shards local.
+            if posting_files
+                .iter()
+                .all(|f| file_present_nonempty(&seg.join(f)))
+            {
+                shards_local.extend(posting_files.iter().map(|f| (rel.to_string(), f.clone())));
                 continue;
             }
             let raw = seg
@@ -5253,6 +5463,15 @@ impl AppState {
             }
         }
 
+        if !shards_local.is_empty() {
+            // The same generation every other presence stamp uses: a stamp
+            // that disagreed (after one failed span write) would make each
+            // insert wipe the other's and the namespace entry never hit.
+            let write_gen = self.presence_generation();
+            let mut cache = self.posting_blob_presence.lock().unwrap();
+            posting_blob_cache_insert(&mut cache, &ns.0, manifest.version, write_gen, shards_local);
+        }
+
         let mut outcome = HydrationOutcome::default();
         let mut stats = posting_spans::PostingFetchStats::default();
         if !ranged.is_empty() {
@@ -5265,8 +5484,9 @@ impl AppState {
             let o = {
                 let _permit = self.hydration_semaphore.acquire("posting_spans");
                 self.posting_span_hydrator
-                    .hydrate(&ranged, terms, &fetcher, &self.cache)
+                    .hydrate(&ranged, terms, &fetcher, &self.span_writes)
             };
+            request.hold_spans(o.held);
             stats.rounds += o.rounds;
             stats.ranged_gets += o.gets;
             stats.ranged_bytes += o.bytes;
@@ -5278,7 +5498,10 @@ impl AppState {
                 self.posting_promotions.push(shard);
             }
             if !o.confirmed.is_empty() {
-                let write_gen = self.cache.eviction_generation();
+                // Stamped with the generation from before the fetch: a queued
+                // span write that fails after it moved the generation, so
+                // these confirmations must not outlive that failure.
+                let write_gen = eviction_gen;
                 let mut cache = self.posting_blob_presence.lock().unwrap();
                 posting_blob_cache_insert(
                     &mut cache,
@@ -5350,7 +5573,9 @@ impl AppState {
     /// fetch the probed kNN postings' `vector.idx` ranges of one segment
     /// into the span cache (#245). A range that fails (not shed) falls back
     /// to the whole `vector.idx`, so the probe still reads every posting it
-    /// needs; anything still missing marks the segment degraded.
+    /// needs; anything still missing marks the segment degraded. Returns
+    /// the spans the probe must hold while it reads them (see
+    /// [`kosha_query::VectorSpanFetch`]).
     #[cfg(feature = "s3")]
     fn hydrate_vector_postings(
         &self,
@@ -5359,17 +5584,17 @@ impl AppState {
         ranges: &[(u64, u64)],
         request: &Arc<RequestHydration>,
         rid: &str,
-    ) -> posting_spans::PostingFetchStats {
+    ) -> (posting_spans::PostingFetchStats, SpanHolds) {
         let mut stats = posting_spans::PostingFetchStats::default();
         let Some(ref s3) = self.s3_storage else {
-            return stats;
+            return (stats, SpanHolds::new());
         };
         let Some(rel) = seg
             .strip_prefix(&self.data_dir)
             .ok()
             .map(|p| p.to_string_lossy().replace('\\', "/"))
         else {
-            return stats;
+            return (stats, SpanHolds::new());
         };
         let fetcher = doc_spans::S3RangeFetcher {
             s3,
@@ -5384,7 +5609,7 @@ impl AppState {
             ranges,
             self.posting_span_hydrator.coalesce_gap(),
             &fetcher,
-            &self.cache,
+            &self.span_writes,
         );
         stats.rounds = u64::from(o.gets > 0);
         stats.ranged_gets = o.gets;
@@ -5410,7 +5635,38 @@ impl AppState {
             );
         }
         self.posting_reads.record(&stats);
-        stats
+        (stats, o.held)
+    }
+
+    /// Start the thread that writes fetched spans into the span cache (see
+    /// [`span_writes`]). Only the S3 tier fetches spans.
+    fn spawn_span_writer(self: &Arc<Self>) {
+        #[cfg(feature = "s3")]
+        {
+            if self.s3_storage.is_none() {
+                return;
+            }
+            let weak = Arc::downgrade(self);
+            std::thread::Builder::new()
+                .name("kosha-span-writer".into())
+                .spawn(move || loop {
+                    let Some(state) = weak.upgrade() else { return };
+                    if let Some(job) = state.span_writes.pop_timeout(Duration::from_secs(1)) {
+                        // A panic in one write must not stop the thread
+                        // (every later span would stay queued, counted as
+                        // cached, forever): `write` counts it as a failed
+                        // write, which invalidates presence, and frees its
+                        // queue bytes while unwinding.
+                        let wrote = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            state.span_writes.write(&state.cache, job)
+                        }));
+                        if wrote.is_err() {
+                            eprintln!("ERROR: span writer: a span write panicked; continuing");
+                        }
+                    }
+                })
+                .expect("failed to spawn span writer thread");
+        }
     }
 
     /// Start the thread that promotes hot posting shards from ranged reads
@@ -5499,7 +5755,7 @@ impl AppState {
         // yields an empty map, i.e. this degrades to the pre-cache full
         // stat sweep, never a false "present." See the field's doc comment
         // for why the eviction-generation check exists.
-        let eviction_gen = self.cache.eviction_generation();
+        let eviction_gen = self.presence_generation();
         let cached = {
             let cache = self.posting_blob_presence.lock().unwrap();
             posting_blob_cache_lookup(&cache, &ns.0, manifest_version, eviction_gen)
@@ -5617,7 +5873,7 @@ impl AppState {
         // which is still correct — every stamped pair was itself verified
         // by a real stat taken during this call, at or after that point.
         if !newly_confirmed.is_empty() {
-            let write_gen = self.cache.eviction_generation();
+            let write_gen = self.presence_generation();
             let mut cache = self.posting_blob_presence.lock().unwrap();
             posting_blob_cache_insert(
                 &mut cache,
@@ -6162,6 +6418,7 @@ fn main() {
     // Bind the listener first so a slow warmup doesn't delay the port;
     // `/readyz` keeps HPA/kube endpoints from sending traffic while it
     // runs (Tier 1 O2). Liveness (`/healthz`) is unaffected.
+    state.spawn_span_writer();
     state.spawn_warmup();
     state.spawn_rewarmer();
     state.spawn_warm_set_persister();
@@ -6470,6 +6727,7 @@ fn handle_metrics(state: &AppState, headers: &HashMap<String, String>) -> String
         nvme_evictions: state.cache.eviction_generation(),
         segment_checksum_failures,
         cache_tenants: cache_tenant_samples(state),
+        span_writes: state.span_writes.stats(),
     });
     format!(
         "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: {}\r\n\r\n{body}",
@@ -8736,6 +8994,7 @@ fn handle_stats(state: &AppState) -> String {
         "s3_prefix": s3_prefix,
         "doc_store_reads": state.doc_store_reads.to_json(state.doc_read_mode),
         "posting_reads": state.posting_reads.to_json(state.posting_read_mode),
+        "span_writes": state.span_writes.to_json(),
         // Process-wide count of scoring blocks varint-decoded (#385); a
         // bench diffs it around a run for blocks decoded per query.
         "scoring_blocks_decoded": kosha_segment::scoring_blocks_decoded(),
@@ -9094,8 +9353,10 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     let vector_fetch_stats = Mutex::new(posting_spans::PostingFetchStats::default());
     #[cfg(feature = "s3")]
     let fetch_vectors = |seg: &Path, file: &str, ranges: &[(u64, u64)]| {
-        let stats = state.hydrate_vector_postings(seg, file, ranges, &hydration_request, &rid);
+        let (stats, held) =
+            state.hydrate_vector_postings(seg, file, ranges, &hydration_request, &rid);
         vector_fetch_stats.lock().unwrap().add(&stats);
+        held
     };
     #[cfg(feature = "s3")]
     let vector_fetch: Option<kosha_query::VectorSpanFetch<'_>> = Some(&fetch_vectors);
@@ -9726,8 +9987,10 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
     let vector_fetch_stats = Mutex::new(posting_spans::PostingFetchStats::default());
     #[cfg(feature = "s3")]
     let fetch_vectors = |seg: &Path, file: &str, ranges: &[(u64, u64)]| {
-        let stats = state.hydrate_vector_postings(seg, file, ranges, &hydration_request, &rid);
+        let (stats, held) =
+            state.hydrate_vector_postings(seg, file, ranges, &hydration_request, &rid);
         vector_fetch_stats.lock().unwrap().add(&stats);
+        held
     };
     #[cfg(feature = "s3")]
     let vector_fetch: Option<kosha_query::VectorSpanFetch<'_>> = Some(&fetch_vectors);
@@ -11857,7 +12120,7 @@ fn log_search_timing(
         "search timing: ns={} total_ms={:.1} wall_ms={:.1} hydrate_ms={:.1} hydrate_files={} \
          hydrate_mb={:.1} queue_ms={:.1} admit_ms={:.1} bm25_stats={} bm25_stats_ms={:.2} \
          score_ms={:.1} materialize_ms={:.1} opens_cold={} opens_cached={} \
-         open_total_ms={:.1} knn_postings={} knn_segments={} knn_centroids={} knn_plan_ms={:.1} knn_plan_exact_centroids={} knn_plan_prep_ms={:.2} knn_plan_s1_ms={:.2} knn_plan_sel_ms={:.2} knn_plan_s2_ms={:.2} knn_plan_rank_ms={:.2} knn_mode={} knn_exact_vectors={} \
+         open_total_ms={:.1} knn_postings={} knn_segments={} knn_centroids={} knn_plan_ms={:.1} knn_plan_exact_centroids={} knn_mode={} knn_exact_vectors={} \
          knn_filtered={} knn_degraded={} hits={} page_gets={} \
          page_ranged_kb={:.1} page_whole_files={} page_whole_mb={:.1} s3_rounds={} \
          s3_bytes={} postings_gets={} postings_ranged_kb={:.1} postings_whole_files={} \
@@ -11883,11 +12146,6 @@ fn log_search_timing(
         phases.knn_centroids_scanned,
         phases.knn_plan_ms,
         phases.knn_plan_exact_centroids,
-        phases.knn_plan_split_ms[0],
-        phases.knn_plan_split_ms[1],
-        phases.knn_plan_split_ms[2],
-        phases.knn_plan_split_ms[3],
-        phases.knn_plan_split_ms[4],
         phases.knn_mode.map_or("-", |mode| mode.as_str()),
         phases.knn_exact_vectors,
         phases
@@ -14328,6 +14586,93 @@ mod tests {
     }
 
     #[test]
+    fn percentiles_over_http_and_bad_percents_are_400() {
+        let state = test_state();
+        let ns = NamespaceId("pctns".into());
+        let doc = |id: &str, kind: &str, ms: i64| Document {
+            id: DocumentId(id.into()),
+            fields: vec![
+                Field::text("text", "request"),
+                Field::keyword("kind", kind),
+                Field::integer("ms", ms),
+            ],
+        };
+        // Two flushes, so the percentiles merge across two segments.
+        for batch in [
+            vec![
+                doc("1", "read", 10),
+                doc("2", "read", 20),
+                doc("3", "write", 100),
+            ],
+            vec![
+                doc("4", "read", 30),
+                doc("5", "read", 40),
+                doc("6", "write", 300),
+            ],
+        ] {
+            state.indexer.index_documents(ns.clone(), batch).unwrap();
+            state.indexer.flush_namespace(&ns).unwrap();
+        }
+        state.publish_namespace(&ns).unwrap();
+
+        let post = |aggs: &str| {
+            let body = format!(
+                r#"{{"namespace":"pctns","query_text":"request","max_results":0,"aggs":{aggs}}}"#
+            );
+            handle_search_post(body.as_bytes(), &state)
+        };
+        let resp = post(
+            r#"{"latency":{"percentiles":{"field":"ms","percents":[0,50,100]}},
+                "as_list":{"percentiles":{"field":"ms","percents":[50],"keyed":false}},
+                "by_kind":{"terms":{"field":"kind"},
+                           "aggs":{"p":{"percentiles":{"field":"ms","percents":[50]}}}}}"#,
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let v: serde_json::Value =
+            serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+        let aggs = &v["aggregations"];
+        // Sorted: 10, 20, 30, 40, 100, 300. The median interpolates
+        // between 30 and 40.
+        assert_eq!(
+            aggs["latency"],
+            serde_json::json!({"values": {"0.0": 10.0, "50.0": 35.0, "100.0": 300.0}}),
+            "{v}"
+        );
+        assert_eq!(
+            aggs["as_list"],
+            serde_json::json!({"values": [{"key": 50.0, "value": 35.0}]}),
+            "{v}"
+        );
+        assert_eq!(
+            aggs["by_kind"],
+            serde_json::json!({"buckets": [
+                {"key": "read", "doc_count": 4, "p": {"values": {"50.0": 25.0}}},
+                {"key": "write", "doc_count": 2, "p": {"values": {"50.0": 200.0}}},
+            ]}),
+            "{v}"
+        );
+
+        for (aggs, needle) in [
+            (
+                r#"{"x":{"percentiles":{"field":"ms","percents":[101]}}}"#,
+                "between 0 and 100",
+            ),
+            (
+                r#"{"x":{"percentiles":{"field":"ms","percents":[]}}}"#,
+                "must not be empty",
+            ),
+            (
+                r#"{"x":{"percentiles":{"field":"ms","tdigest":{"compression":200}}}}"#,
+                "`tdigest` is not supported yet",
+            ),
+        ] {
+            let resp = post(aggs);
+            assert!(resp.starts_with("HTTP/1.1 400"), "{aggs}: {resp}");
+            assert!(resp.contains(needle), "{aggs}: {resp}");
+        }
+    }
+
+    #[test]
     fn histogram_aggregations_over_http_and_bad_intervals_are_400() {
         // Issue #219: `histogram` / `date_histogram` over `/search`, and a
         // garbage interval or unsupported calendar interval is a 400;
@@ -15795,7 +16140,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         assert!(
-            !AppState::segment_is_complete(&dir),
+            !AppState::segment_is_complete(&dir, false),
             "empty dir must not count as complete"
         );
 
@@ -15803,16 +16148,64 @@ mod tests {
             fs::write(dir.join(f), b"x").unwrap();
         }
         assert!(
-            !AppState::segment_is_complete(&dir),
+            !AppState::segment_is_complete(&dir, false),
             "missing filters.bin must still be incomplete"
         );
 
         fs::write(dir.join("filters.bin"), b"x").unwrap();
         assert!(
-            AppState::segment_is_complete(&dir),
+            AppState::segment_is_complete(&dir, false),
             "all four core files present (vector.idx not required) must be complete"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Finding 29: a caller that needs vectors does not count a segment as
+    /// complete until every vector file its footer lists is local — each
+    /// column's idx and offsets file and `doc_vectors.bin` — while a
+    /// lexical caller still does without them.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn segment_is_complete_requires_vector_files_only_when_vectors_are_needed() {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-segment-complete-vectors-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut w =
+            kosha_segment::SegmentWriter::new(kosha_core::SegmentId("v".into()), dir.clone());
+        for i in 0..4 {
+            w.add_document(
+                DocumentId(format!("d{i}")),
+                vec![
+                    Field::text("text", "x"),
+                    Field::vector("title_emb", vec![1.0, i as f32]),
+                    Field::vector("body_emb", vec![1.0, 0.0, i as f32]),
+                ],
+            );
+        }
+        let footer = w.finalize(Default::default()).unwrap();
+        assert!(footer.doc_vectors);
+        let mut vector_files = kosha_segment::vector_index_files(&dir);
+        assert_eq!(vector_files.len(), 4, "two columns, idx + offsets each");
+        vector_files.push(kosha_segment::DOC_VECTORS_FILE.to_string());
+        assert!(AppState::segment_is_complete(&dir, false));
+        assert!(AppState::segment_is_complete(&dir, true));
+
+        for name in &vector_files {
+            let stash = dir.join("stash");
+            fs::rename(dir.join(name), &stash).unwrap();
+            assert!(
+                AppState::segment_is_complete(&dir, false),
+                "{name}: a lexical caller does not need it"
+            );
+            assert!(
+                !AppState::segment_is_complete(&dir, true),
+                "{name}: a caller that needs vectors must fetch it"
+            );
+            fs::rename(&stash, dir.join(name)).unwrap();
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -15838,18 +16231,18 @@ mod tests {
         );
         let footer = w.finalize(kosha_core::Bm25Params::default()).unwrap();
         assert!(!dir.join("filters.bin").exists());
-        assert!(AppState::segment_is_complete(&dir));
+        assert!(AppState::segment_is_complete(&dir, false));
         let col = footer.filter_columns.as_ref().unwrap()[1].file_name();
         let stash = dir.join("col.stash");
         fs::rename(dir.join(&col), &stash).unwrap();
         assert!(
-            !AppState::segment_is_complete(&dir),
+            !AppState::segment_is_complete(&dir, false),
             "a missing column makes a columnar segment incomplete"
         );
         fs::rename(&stash, dir.join(&col)).unwrap();
         fs::remove_file(dir.join("filters.toc")).unwrap();
         assert!(
-            !AppState::segment_is_complete(&dir),
+            !AppState::segment_is_complete(&dir, false),
             "so does a missing TOC"
         );
         let _ = fs::remove_dir_all(&dir);
@@ -16210,6 +16603,78 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A landed promotion (posting shard or doc store) drops spans that the
+    /// whole file now supersedes: nothing became less local, so the
+    /// namespace's posting presence verdicts, other segments' included,
+    /// must survive it. Every one used to be wiped, and each following
+    /// distinct keyword query re-planned every segment from its
+    /// `inverted.idx` (~450 ms on staging, run8). A real eviction still
+    /// invalidates them.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn a_landed_promotion_keeps_posting_presence_and_an_eviction_does_not() {
+        let state = test_state();
+        let seg_a = state.data_dir.join("ns/seg-a");
+        state
+            .cache
+            .put_bytes("ns/seg-a/postings-00.bin.spans/0-10", &[1u8; 10])
+            .unwrap();
+        state
+            .cache
+            .put_bytes("ns/seg-a/postings-00.bin", &[1u8; 64])
+            .unwrap();
+        state
+            .cache
+            .put_bytes("ns/seg-a/doc_store.bin.spans/0-10", &[1u8; 10])
+            .unwrap();
+        state
+            .cache
+            .put_bytes("ns/seg-a/doc_store.bin", &[1u8; 64])
+            .unwrap();
+        state
+            .cache
+            .put_bytes("ns/seg-b/postings-01.bin", &[1u8; 64])
+            .unwrap();
+        let confirmed = |state: &AppState| {
+            let cache = state.posting_blob_presence.lock().unwrap();
+            posting_blob_cache_lookup(&cache, "ns", 1, state.presence_generation())
+                .get("ns/seg-b")
+                .is_some_and(|set| set.contains("postings-01.bin"))
+        };
+        posting_blob_cache_insert(
+            &mut state.posting_blob_presence.lock().unwrap(),
+            "ns",
+            1,
+            state.presence_generation(),
+            vec![("ns/seg-b".into(), "postings-01.bin".into())],
+        );
+        assert!(confirmed(&state));
+
+        state.posting_span_hydrator.finish_promotion(
+            &state.cache,
+            &seg_a.join("postings-00.bin"),
+            true,
+        );
+        state
+            .span_hydrator
+            .finish_promotion(&state.cache, &seg_a, true);
+        assert!(
+            !seg_a.join("postings-00.bin.spans").exists(),
+            "spans dropped"
+        );
+        assert!(!seg_a.join("doc_store.bin.spans").exists(), "spans dropped");
+        assert!(
+            confirmed(&state),
+            "a landed promotion must not invalidate other segments' presence"
+        );
+
+        state.cache.evict("ns/seg-b/postings-01.bin").unwrap();
+        assert!(
+            !confirmed(&state),
+            "a real eviction must invalidate the presence verdicts"
+        );
     }
 
     #[cfg(feature = "s3")]
@@ -19742,6 +20207,84 @@ mod tests {
         dir
     }
 
+    /// A term is confirmed present as soon as its span write is queued; a
+    /// write that then fails moves the presence generation, so that
+    /// confirmation (stamped before the fetch) is no longer trusted and the
+    /// next query re-checks the disk instead of scoring a missing span.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn a_failed_span_write_invalidates_posting_presence() {
+        let state = test_state();
+        let seg = state.data_dir.join("ns/seg");
+        fs::create_dir_all(&seg).unwrap();
+        let generation = state.presence_generation();
+        assert!(state
+            .span_writes
+            .persist(&seg, "ns/seg", "postings-01.bin", 0, vec![1; 10])
+            .is_none());
+        let confirmed = vec![("ns/seg".to_string(), "w1".to_string())];
+        {
+            let mut cache = state.posting_blob_presence.lock().unwrap();
+            posting_blob_cache_insert(&mut cache, "ns", 1, generation, confirmed);
+            let current = state.presence_generation();
+            assert!(!posting_blob_cache_lookup(&cache, "ns", 1, current).is_empty());
+        }
+        // The segment goes away before the writer runs: the write fails.
+        fs::remove_dir_all(&seg).unwrap();
+        state.span_writes.drain(&state.cache);
+        assert_eq!(state.span_writes.failures(), 1);
+        let cache = state.posting_blob_presence.lock().unwrap();
+        let current = state.presence_generation();
+        assert_ne!(current, generation);
+        assert!(posting_blob_cache_lookup(&cache, "ns", 1, current).is_empty());
+    }
+
+    /// Readiness waits for the warm-up's writes to reach disk: the pod is
+    /// not ready while the flush runs, and is once it returns, also when
+    /// it fails (fail-open, like the warm-up).
+    #[test]
+    fn readiness_waits_for_the_warmup_flush() {
+        for fails in [false, true] {
+            let state = test_state();
+            state
+                .warmup_complete
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            let ready = Arc::clone(&state.warmup_complete);
+            let flushed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let saw = Arc::clone(&flushed);
+            state.finish_warmup(Instant::now(), Duration::from_secs(60), move || {
+                assert!(
+                    !ready.load(std::sync::atomic::Ordering::SeqCst),
+                    "ready before the warm-up flush ran"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+                saw.store(true, std::sync::atomic::Ordering::SeqCst);
+                if fails {
+                    Err(std::io::Error::other("injected"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(
+                flushed.load(std::sync::atomic::Ordering::SeqCst),
+                "waited for it"
+            );
+            assert!(state.is_ready());
+        }
+        // A flush that overruns its timeout: ready at the timeout.
+        let state = test_state();
+        state
+            .warmup_complete
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let t = Instant::now();
+        state.finish_warmup(Instant::now(), Duration::from_millis(100), || {
+            std::thread::sleep(Duration::from_secs(5));
+            Ok(())
+        });
+        assert!(state.is_ready());
+        assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
+    }
+
     // ─── Multi-field highlighting (#195) ─────────────────────────────────
 
     fn highlight_state(ns: &str) -> AppState {
@@ -20637,17 +21180,35 @@ mod tests {
     }
 
     impl warm_run::WarmStorage for MirrorStorage {
-        fn class_sizes(
-            &self,
-            ns: &NamespaceId,
-        ) -> Result<HashMap<(String, warm::FileClass), u64>, String> {
-            Ok(warm_run::local_class_sizes(&self.remote.join(&ns.0)))
+        fn list_objects(&self, ns: &NamespaceId) -> Result<Vec<(String, u64)>, String> {
+            Ok(warm_run::local_objects(&self.remote.join(&ns.0)))
+        }
+
+        fn fetch_footers(&self, ns: &NamespaceId, manifest: &kosha_core::Manifest) -> (u64, u64) {
+            let mut o = (0, 0);
+            for entry in &manifest.segments {
+                let seg = &entry.segment_id.0;
+                let to = self.local.join(&ns.0).join(seg);
+                if manifest.segment_footer(&entry.segment_id).is_some()
+                    || to.join("footer.json").exists()
+                {
+                    continue;
+                }
+                fs::create_dir_all(&to).unwrap();
+                o.1 += fs::copy(
+                    self.remote.join(&ns.0).join(seg).join("footer.json"),
+                    to.join("footer.json"),
+                )
+                .unwrap();
+                o.0 += 1;
+            }
+            o
         }
 
         fn warm_batch(
             &self,
             ns: &NamespaceId,
-            _manifest: &kosha_core::Manifest,
+            manifest: &kosha_core::Manifest,
             class: warm::FileClass,
             segments: &[String],
         ) -> warm_run::BatchOutcome {
@@ -20662,7 +21223,11 @@ mod tests {
                     // scaffolding so the segment opens.
                     let c = warm::FileClass::of_file(&name).unwrap_or(warm::FileClass::Scoring);
                     let dest = to.join(&name);
-                    if c != class || !f.path().is_file() || dest.exists() {
+                    if c != class
+                        || !f.path().is_file()
+                        || dest.exists()
+                        || !warm_run::warm_fetches(manifest, seg, &name)
+                    {
                         continue;
                     }
                     o.bytes += fs::copy(f.path(), &dest).unwrap();
@@ -20805,15 +21370,19 @@ mod tests {
                 .manifest(&ns)
                 .map(|m| m.version)
         );
-        // ...and every file of the merged segment is local.
+        // ...and every file of the merged segment that warm-up downloads
+        // is local; the filter files the unfiltered probe never fetches
+        // (`warm_run::warm_fetches`) are left to the first filtered search.
+        let installed = query.indexer.manifest_shared(&ns).unwrap();
         for f in fs::read_dir(ingest.data_dir.join(&ns.0).join(&merged[0]))
             .unwrap()
             .flatten()
         {
-            assert!(
-                merged_dir.join(f.file_name()).is_file(),
-                "{:?} not warmed",
-                f.file_name()
+            let name = f.file_name().to_string_lossy().into_owned();
+            assert_eq!(
+                merged_dir.join(&name).is_file(),
+                warm_run::warm_fetches(&installed, &merged[0], &name),
+                "{name}"
             );
         }
         // The idle namespace's new segment stays cold until queried.
@@ -20946,7 +21515,12 @@ mod tests {
         let shared = shared_store();
         let ingest = warm_ingest(&shared, &["big"]);
         let ns = seed_segments(&ingest, "big", 3);
-        let sizes = warm_run::local_class_sizes(&ingest.data_dir.join(&ns.0));
+        // The bytes warm-up downloads (`warm_run::warm_fetches`).
+        let stored = shared.inner.lock().unwrap().manifest(&ns).unwrap().clone();
+        let sizes = warm_run::warm_class_sizes(
+            warm_run::local_objects(&ingest.data_dir.join(&ns.0)),
+            &stored,
+        );
         let scoring: u64 = sizes
             .iter()
             .filter(|((_, c), _)| *c == warm::FileClass::Scoring)
@@ -21018,6 +21592,108 @@ mod tests {
         assert_eq!(rewarm.warmed_items, 0);
         assert!(rewarm.skipped_items > 0);
         assert_eq!(pod.warmup_status_json()["rewarms"][0]["warmed_items"], 0);
+    }
+
+    /// Finding 26: a boot pass plans its budget from the files it
+    /// downloads. A query pod's manifest arrives without footers (#241), so
+    /// the plan used to count every f32 `doc_vectors.bin` (never fetched,
+    /// #454) and every `filters.bin` (the unfiltered scaffolding probe never
+    /// fetches it) and skipped segments the budget had room for. Quantized
+    /// and legacy segments still need their sidecar whole: counted and
+    /// fetched.
+    #[test]
+    fn boot_plan_counts_only_the_files_warmup_fetches() {
+        use kosha_core::VectorQuantization::{F32, I8};
+        let shared = shared_store();
+        let ingest = warm_ingest(&shared, &["vec"]);
+        let ns = seed_segments(&ingest, "vec", 4);
+        let segments = stored_segments(&shared, &ns);
+        let remote = ingest.data_dir.join(&ns.0);
+        // Each published segment rewritten with a sidecar vector column:
+        // two f32, one i8 and one legacy (a footer listing no columns).
+        for (i, seg) in segments.iter().enumerate() {
+            let dir = remote.join(seg);
+            fs::remove_dir_all(&dir).unwrap();
+            let mut w =
+                kosha_segment::SegmentWriter::new(kosha_core::SegmentId(seg.clone()), dir.clone())
+                    .with_vector_store_mode(kosha_segment::VectorStoreMode::Sidecar)
+                    .with_vector_quantization(kosha_segment::VectorQuantizationConfig::all(
+                        if i == 2 { I8 } else { F32 },
+                    ));
+            for d in 0..64 {
+                w.add_document(
+                    DocumentId(format!("d{d}")),
+                    vec![
+                        Field::text("title", format!("segment {i} doc {d}")),
+                        Field::keyword("matter_id", format!("m{}", d % 4)),
+                        Field::vector("emb", (0..32).map(|k| (d * 32 + k) as f32).collect()),
+                    ],
+                );
+            }
+            w.finalize(Default::default()).unwrap();
+            if i == 3 {
+                let path = dir.join("footer.json");
+                let mut footer: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                footer["vector_fields"] = serde_json::Value::Null;
+                fs::write(&path, serde_json::to_vec(&footer).unwrap()).unwrap();
+            }
+        }
+        // A query pod reads the manifest from Postgres, which stores no
+        // footers (#241, `skip_serializing`): nor does this shared store.
+        shared
+            .inner
+            .lock()
+            .unwrap()
+            .manifest_mut(&ns)
+            .unwrap()
+            .segment_footers
+            .clear();
+        let objects = warm_run::local_objects(&remote);
+        let size = |seg: &str, file: &str| {
+            objects
+                .iter()
+                .find(|(rel, _)| *rel == format!("{seg}/{file}"))
+                .map(|(_, b)| *b)
+                .unwrap_or_else(|| panic!("{seg}/{file} not written"))
+        };
+        let listed: u64 = warm_run::group_class_sizes(objects.clone()).values().sum();
+        let not_fetched: u64 = size(&segments[0], kosha_segment::DOC_VECTORS_FILE)
+            + size(&segments[1], kosha_segment::DOC_VECTORS_FILE)
+            + segments
+                .iter()
+                .map(|s| size(s, kosha_core::FILTERS_BIN_FILE))
+                .sum::<u64>();
+        let fetched = listed - not_fetched;
+
+        // A budget that holds exactly the files warm-up downloads.
+        let mut pod = warm_query_replica(&shared);
+        pod.warmup_namespaces = vec![ns.0.clone()];
+        pod.warming = warm_run::Warming::new(
+            warm::WarmConfig {
+                budget_bytes: Some(fetched),
+                ..Default::default()
+            },
+            warm::AccessConfig::default(),
+        );
+        let storage = MirrorStorage::new(&ingest.data_dir, &pod.data_dir, &scratch_dir("wf"));
+        let report = pod.run_boot_warmup(&storage);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.skipped_items, 0, "{:?}", report.skipped);
+        assert_eq!(report.warmed_items, 4 * 4, "every class of every segment");
+        assert_eq!(report.warmed_bytes, fetched, "planned");
+        assert_eq!(report.fetched_bytes, fetched, "planned == fetched");
+        for (i, seg) in segments.iter().enumerate() {
+            let dir = pod.data_dir.join(&ns.0).join(seg);
+            assert!(dir.join(kosha_segment::DOC_STORE_FILE).is_file(), "{seg}");
+            assert_eq!(
+                dir.join(kosha_segment::DOC_VECTORS_FILE).is_file(),
+                i >= 2,
+                "{seg}: doc_vectors.bin only for the quantized and legacy segments"
+            );
+            assert!(!dir.join(kosha_core::FILTERS_BIN_FILE).exists(), "{seg}");
+        }
     }
 
     #[test]

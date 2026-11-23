@@ -1348,6 +1348,10 @@ pub enum Aggregation {
     ValueCount {
         value_count: AggMetric,
     },
+    /// Percentiles of the field's values over the matched documents.
+    Percentiles {
+        percentiles: AggPercentiles,
+    },
     /// Fixed-width numeric buckets (issue #219).
     Histogram {
         histogram: AggHistogram,
@@ -1372,6 +1376,7 @@ pub enum MetricKind {
     Sum,
     Avg,
     ValueCount,
+    Percentiles,
 }
 
 impl MetricKind {
@@ -1383,6 +1388,7 @@ impl MetricKind {
             MetricKind::Sum => "sum",
             MetricKind::Avg => "avg",
             MetricKind::ValueCount => "value_count",
+            MetricKind::Percentiles => "percentiles",
         }
     }
 }
@@ -1395,8 +1401,85 @@ pub struct AggMetric {
     pub field: String,
 }
 
+/// Body of a `percentiles` aggregation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AggPercentiles {
+    pub field: String,
+    /// Percentiles to return, each in `[0, 100]`. Defaults to
+    /// Elasticsearch's `[1, 5, 25, 50, 75, 95, 99]`.
+    #[serde(default = "default_percents")]
+    pub percents: Vec<f64>,
+    /// `true` (the default) returns `values` as an object keyed by
+    /// percentile; `false` returns a list of `{key, value}`.
+    #[serde(default = "default_keyed", skip_serializing_if = "is_true")]
+    pub keyed: bool,
+}
+
+fn default_percents() -> Vec<f64> {
+    vec![1.0, 5.0, 25.0, 50.0, 75.0, 95.0, 99.0]
+}
+
+fn default_keyed() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+/// Most percentiles one `percentiles` aggregation may ask for.
+pub const MAX_PERCENTS: usize = 100;
+
+impl AggPercentiles {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.percents.is_empty() {
+            return Err("`percents` must not be empty".into());
+        }
+        if self.percents.len() > MAX_PERCENTS {
+            return Err(format!(
+                "`percents` has {} entries; at most {MAX_PERCENTS} are allowed",
+                self.percents.len()
+            ));
+        }
+        for p in &self.percents {
+            if !p.is_finite() || !(0.0..=100.0).contains(p) {
+                return Err(format!("`percents` must be between 0 and 100, got {p}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The key Elasticsearch writes a percentile under: `"50.0"`, `"99.9"`.
+    pub fn key(percent: f64) -> String {
+        if percent.fract() == 0.0 {
+            format!("{percent:.1}")
+        } else {
+            format!("{percent}")
+        }
+    }
+}
+
+/// Elasticsearch `percentiles` options Kosha does not implement. They get a
+/// specific message instead of serde's generic unknown-field one.
+fn reject_unsupported_percentiles_options(body: &serde_json::Value) -> Result<(), String> {
+    let Some(obj) = body.as_object() else {
+        return Ok(());
+    };
+    for option in ["tdigest", "hdr", "missing", "script", "format"] {
+        if obj.contains_key(option) {
+            return Err(format!(
+                "in `percentiles` aggregation: `{option}` is not supported yet (values are \
+                 exact up to a few thousand values and estimated to within 1% beyond that; \
+                 documents without the field are skipped)"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Aggregation type keys `Aggregation` accepts, as reported in parse errors.
-const AGGREGATION_KEYS: [&str; 10] = [
+const AGGREGATION_KEYS: [&str; 11] = [
     "terms",
     "cardinality",
     "composite",
@@ -1407,17 +1490,23 @@ const AGGREGATION_KEYS: [&str; 10] = [
     "sum",
     "avg",
     "value_count",
+    "percentiles",
 ];
 
 impl Aggregation {
-    /// The metric kind and body when this is a metric aggregation.
-    pub fn metric(&self) -> Option<(MetricKind, &AggMetric)> {
+    /// The metric kind and field when this is a metric aggregation.
+    pub fn metric(&self) -> Option<(MetricKind, &str)> {
         match self {
-            Aggregation::Min { min } => Some((MetricKind::Min, min)),
-            Aggregation::Max { max } => Some((MetricKind::Max, max)),
-            Aggregation::Sum { sum } => Some((MetricKind::Sum, sum)),
-            Aggregation::Avg { avg } => Some((MetricKind::Avg, avg)),
-            Aggregation::ValueCount { value_count } => Some((MetricKind::ValueCount, value_count)),
+            Aggregation::Min { min } => Some((MetricKind::Min, &min.field)),
+            Aggregation::Max { max } => Some((MetricKind::Max, &max.field)),
+            Aggregation::Sum { sum } => Some((MetricKind::Sum, &sum.field)),
+            Aggregation::Avg { avg } => Some((MetricKind::Avg, &avg.field)),
+            Aggregation::ValueCount { value_count } => {
+                Some((MetricKind::ValueCount, &value_count.field))
+            }
+            Aggregation::Percentiles { percentiles } => {
+                Some((MetricKind::Percentiles, &percentiles.field))
+            }
             _ => None,
         }
     }
@@ -1455,6 +1544,7 @@ impl Aggregation {
             Aggregation::DateHistogram { date_histogram, .. } => {
                 date_histogram.validate().map_err(in_agg)?
             }
+            Aggregation::Percentiles { percentiles } => percentiles.validate().map_err(in_agg)?,
             _ => {}
         }
         if let Some(subs) = self.sub_aggregations() {
@@ -1462,6 +1552,7 @@ impl Aggregation {
                 if sub.metric().is_none() {
                     return Err(nested_bucket_error(name, sub_name, sub.type_name()));
                 }
+                sub.validate(sub_name)?;
             }
         }
         Ok(())
@@ -1509,8 +1600,8 @@ fn reject_unsupported_histogram_options(
 fn nested_bucket_error(parent: &str, name: &str, kind: &str) -> String {
     format!(
         "sub-aggregation `{name}` of `{parent}` is a `{kind}` aggregation; only metric \
-         aggregations (min, max, sum, avg, value_count) can be nested under a bucket \
-         aggregation"
+         aggregations (min, max, sum, avg, value_count, percentiles) can be nested under a \
+         bucket aggregation"
     )
 }
 
@@ -1628,6 +1719,14 @@ impl<'de> Deserialize<'de> for Aggregation {
             "value_count" => Ok(Aggregation::ValueCount {
                 value_count: body(&key, inner)?,
             }),
+            "percentiles" => {
+                reject_unsupported_percentiles_options(&inner).map_err(D::Error::custom)?;
+                let percentiles: AggPercentiles = body(&key, inner)?;
+                percentiles
+                    .validate()
+                    .map_err(|e| D::Error::custom(format!("in `percentiles` aggregation: {e}")))?;
+                Ok(Aggregation::Percentiles { percentiles })
+            }
             "histogram" => {
                 reject_unsupported_histogram_options(&key, &inner).map_err(D::Error::custom)?;
                 let histogram: AggHistogram = body(&key, inner)?;
@@ -1654,7 +1753,7 @@ impl<'de> Deserialize<'de> for Aggregation {
                 let hint = match other {
                     "stats"
                     | "extended_stats"
-                    | "percentiles"
+                    | "percentile_ranks"
                     | "auto_date_histogram"
                     | "variable_width_histogram"
                     | "range"
@@ -3984,8 +4083,8 @@ impl SearchQuery {
                 Aggregation::Histogram { histogram, .. } => add(&histogram.field),
                 Aggregation::DateHistogram { date_histogram, .. } => add(&date_histogram.field),
                 _ => {
-                    if let Some((_, metric)) = agg.metric() {
-                        add(&metric.field);
+                    if let Some((_, field)) = agg.metric() {
+                        add(field);
                     }
                 }
             }
@@ -5306,12 +5405,142 @@ mod aggregation_parsing {
             ),
         ] {
             let agg = parse(json).unwrap();
-            let (parsed_kind, metric) = agg.metric().unwrap();
+            let (parsed_kind, field) = agg.metric().unwrap();
             assert_eq!(parsed_kind, kind);
-            assert_eq!(metric.field, "price");
+            assert_eq!(field, "price");
             assert_eq!(agg.type_name(), kind.name());
             assert_eq!(serde_json::to_string(&agg).unwrap(), json);
         }
+    }
+
+    #[test]
+    fn percentiles_parse_with_defaults_and_round_trip() {
+        let agg = parse(r#"{"percentiles":{"field":"latency"}}"#).unwrap();
+        let (kind, field) = agg.metric().unwrap();
+        assert_eq!(kind, MetricKind::Percentiles);
+        assert_eq!(field, "latency");
+        assert_eq!(agg.type_name(), "percentiles");
+        let Aggregation::Percentiles { percentiles } = &agg else {
+            panic!("expected percentiles");
+        };
+        assert_eq!(
+            percentiles.percents,
+            [1.0, 5.0, 25.0, 50.0, 75.0, 95.0, 99.0]
+        );
+        assert!(percentiles.keyed);
+        // Round trip: defaults are written out, `keyed: true` is not.
+        let json = serde_json::to_string(&agg).unwrap();
+        assert!(!json.contains("keyed"), "{json}");
+        let again = parse(&json).unwrap();
+        assert_eq!(serde_json::to_string(&again).unwrap(), json);
+
+        let agg =
+            parse(r#"{"percentiles":{"field":"latency","percents":[50,99.9],"keyed":false}}"#)
+                .unwrap();
+        let Aggregation::Percentiles { percentiles } = &agg else {
+            panic!("expected percentiles");
+        };
+        assert_eq!(percentiles.percents, [50.0, 99.9]);
+        assert!(!percentiles.keyed);
+        assert!(serde_json::to_string(&agg)
+            .unwrap()
+            .contains(r#""keyed":false"#));
+    }
+
+    #[test]
+    fn percentile_keys_match_elasticsearch() {
+        for (percent, key) in [
+            (1.0, "1.0"),
+            (50.0, "50.0"),
+            (99.9, "99.9"),
+            (99.99, "99.99"),
+            (0.0, "0.0"),
+            (100.0, "100.0"),
+        ] {
+            assert_eq!(AggPercentiles::key(percent), key);
+        }
+    }
+
+    #[test]
+    fn invalid_percentiles_are_rejected() {
+        for (json, needle) in [
+            (
+                r#"{"percentiles":{"field":"a","percents":[]}}"#,
+                "must not be empty",
+            ),
+            (
+                r#"{"percentiles":{"field":"a","percents":[50,101]}}"#,
+                "between 0 and 100",
+            ),
+            (
+                r#"{"percentiles":{"field":"a","percents":[-1]}}"#,
+                "between 0 and 100",
+            ),
+            (
+                r#"{"percentiles":{"field":"a","tdigest":{"compression":200}}}"#,
+                "`tdigest` is not supported yet",
+            ),
+            (
+                r#"{"percentiles":{"field":"a","hdr":{"number_of_significant_value_digits":3}}}"#,
+                "`hdr` is not supported yet",
+            ),
+            (
+                r#"{"percentiles":{"field":"a","missing":0}}"#,
+                "`missing` is not supported yet",
+            ),
+            (
+                r#"{"percentiles":{"field":"a","percent":[50]}}"#,
+                "in `percentiles` aggregation",
+            ),
+            (r#"{"percentiles":{}}"#, "in `percentiles` aggregation"),
+            (
+                r#"{"percentiles":{"field":"a"},"aggs":{"m":{"min":{"field":"a"}}}}"#,
+                "cannot have sub-aggregations",
+            ),
+        ] {
+            let err = parse(json).unwrap_err().to_string();
+            assert!(err.contains(needle), "{json}: {err}");
+        }
+        let too_many: Vec<u32> = (0..=MAX_PERCENTS as u32).map(|i| i % 100).collect();
+        let err = parse(
+            &serde_json::json!({"percentiles": {"field": "a", "percents": too_many}}).to_string(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("at most 100"), "{err}");
+
+        // A value built in code is checked by `validate`, also when nested.
+        let nested = Aggregation::Terms {
+            terms: AggTerms {
+                field: "c".into(),
+                size: 10,
+            },
+            aggs: Some(
+                [(
+                    "p".to_string(),
+                    Aggregation::Percentiles {
+                        percentiles: AggPercentiles {
+                            field: "a".into(),
+                            percents: vec![150.0],
+                            keyed: true,
+                        },
+                    },
+                )]
+                .into(),
+            ),
+        };
+        let err = nested.validate("by_c").unwrap_err();
+        assert!(err.contains("between 0 and 100"), "{err}");
+    }
+
+    #[test]
+    fn percentiles_nest_under_bucket_aggregations() {
+        let agg = parse(
+            r#"{"terms":{"field":"c"},"aggs":{"p":{"percentiles":{"field":"a","percents":[50]}}}}"#,
+        )
+        .unwrap();
+        let subs = agg.sub_aggregations().unwrap();
+        assert_eq!(subs["p"].metric().unwrap().0, MetricKind::Percentiles);
     }
 
     #[test]
