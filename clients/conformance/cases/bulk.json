@@ -1,0 +1,66 @@
+[
+  {
+    "id": "bulk.batches_by_count",
+    "description": "250 documents at 40 per batch are 7 batches, all searchable after.",
+    "covers": ["KoshaService_IndexDocuments", "KoshaService_Search"],
+    "setup": [
+      { "op": "create_namespace", "args": { "schema": { "fields": { "title": { "type": "text", "stored": true, "indexed": true } } } } }
+    ],
+    "steps": [
+      {
+        "op": "bulk_index",
+        "args": { "documents": { "generate": { "count": 250, "id": "b{i:04}", "fields": { "title": { "type": "Text", "value": "bulk {i}" } } } }, "max_docs_per_batch": 40 },
+        "expect": { "indexed": 250, "batches": 7, "failed_ids": [] }
+      },
+      {
+        "op": "search_all",
+        "args": { "body": { "query_text": "bulk" }, "page_size": 100 },
+        "expect": { "ids": { "generate": { "count": 250, "id": "b{i:04}" } } }
+      }
+    ]
+  },
+  {
+    "id": "bulk.byte_cap",
+    "description": "A batch closes at max_bytes_per_batch before max_docs_per_batch.",
+    "covers": ["KoshaService_IndexDocuments"],
+    "setup": [
+      { "op": "create_namespace", "args": { "schema": { "fields": { "title": { "type": "text", "stored": true, "indexed": true } } } } }
+    ],
+    "steps": [
+      {
+        "op": "bulk_index",
+        "args": {
+          "documents": { "generate": { "count": 10, "id": "c{i:02}", "fields": { "title": { "type": "Text", "value": "about one hundred bytes of text padding padding padding {i:03}" } } } },
+          "max_bytes_per_batch": 300,
+          "concurrency": 1
+        },
+        "expect": { "indexed": 10, "batches": 5 }
+      }
+    ]
+  },
+  {
+    "id": "bulk.failed_batch",
+    "description": "A batch over the tenant's body limit fails alone (413, never retried) and reports its ids; other batches land.",
+    "covers": ["KoshaService_IndexDocuments"],
+    "tenant": "small",
+    "setup": [
+      { "op": "create_namespace", "args": { "schema": { "fields": { "title": { "type": "text", "stored": true, "indexed": true } } } } }
+    ],
+    "steps": [
+      {
+        "op": "bulk_index",
+        "args": {
+          "documents": [
+            { "id": "ok1", "fields": [{ "name": "title", "field_type": "Text", "value": "small" }] },
+            { "id": "big", "fields": [{ "name": "title", "field_type": "Text", "value": "$BIG" }] },
+            { "id": "ok2", "fields": [{ "name": "title", "field_type": "Text", "value": "small" }] }
+          ],
+          "max_docs_per_batch": 1,
+          "concurrency": 1,
+          "on_error": "continue"
+        },
+        "expect": { "indexed": 2, "batches": 3, "failed_ids": ["big"] }
+      }
+    ]
+  }
+]
