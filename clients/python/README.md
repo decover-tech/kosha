@@ -46,6 +46,19 @@ Kosha HTTP API. As the API stabilises, the hand-written code will shrink to just
 
 ## Changelog
 
+### 0.2.11.2
+
+Keep-alive on top of 0.2.11.1 (which it includes); nothing else from 0.2.12+ is included.
+
+- Connections are kept alive and reused, instead of one connection (one DNS lookup, one TCP
+  handshake) per request. A process keeps at most 10 idle connections per host, for 15 s
+  idle (the server closes at 30 s) and 60 s in total, so new server pods get traffic; all
+  clients for the same host share them, and the pool is thread-safe and reset in a forked
+  child. A read whose reused connection turns out closed is resent once on a new
+  connection; a write takes the connection-error retry. Timeouts and errors are those of
+  `urlopen` as before. A host that the `*_proxy` environment sends through a proxy still
+  uses `urlopen` per request.
+
 ### 0.2.11.1
 
 Retry-only release on top of 0.2.11; nothing else from 0.2.12+ is included.
