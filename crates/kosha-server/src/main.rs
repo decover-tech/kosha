@@ -11135,8 +11135,27 @@ impl Drop for SegmentPins<'_> {
     }
 }
 
-/// One structured line per search request — the cold-read baseline
-/// instrument (Day 1 of the cold-read plan). Greppable as
+/// `KOSHA_SLOW_SEARCH_LOG_MS`: a search logs its `search timing:` line only
+/// when its `total_ms` is at least this (default 1000; `0` logs every
+/// search). Read once, like the other knobs in this file.
+fn slow_search_log_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        parse_slow_search_log_ms(std::env::var("KOSHA_SLOW_SEARCH_LOG_MS").ok().as_deref())
+    })
+}
+
+/// Unset or unparseable falls back to the 1000 ms default.
+fn parse_slow_search_log_ms(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse().ok()).unwrap_or(1000)
+}
+
+fn search_timing_logged(total_ms: f64, threshold_ms: u64) -> bool {
+    total_ms >= threshold_ms as f64
+}
+
+/// One structured line per slow search request (`KOSHA_SLOW_SEARCH_LOG_MS`,
+/// see [`slow_search_log_ms`]); the cold-read baseline instrument. Greppable as
 /// `search timing:`; every phase is wall-clock ms except `open_total_ms`
 /// (summed across rayon workers — read with `opens_cold` as average
 /// cold-open cost). `hydrate_files`/`hydrate_mb` count only this request's
@@ -11161,6 +11180,11 @@ fn log_search_timing(
         + phases.score_wall_ms
         + phases.materialize_wall_ms
         + phases.knn_rescore_ms;
+    // Decided before any of the line is formatted: a fast search allocates
+    // nothing here.
+    if !search_timing_logged(total_ms, slow_search_log_ms()) {
+        return;
+    }
     // Global bound-driven kNN rescoring (#381) logs its counters only when
     // it ran (`KOSHA_KNN_GLOBAL_RESCORE`), so the line is unchanged by
     // default.
@@ -15088,6 +15112,23 @@ mod tests {
         for bad in ["yes", "enabled", "2", "onn"] {
             assert!(admission_tenant_shares_flag(Some(bad)).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn slow_search_log_threshold() {
+        assert_eq!(parse_slow_search_log_ms(None), 1000);
+        assert_eq!(parse_slow_search_log_ms(Some("garbage")), 1000);
+        assert_eq!(parse_slow_search_log_ms(Some("-5")), 1000);
+        assert_eq!(parse_slow_search_log_ms(Some("250")), 250);
+        let default = parse_slow_search_log_ms(None);
+        assert!(!search_timing_logged(12.5, default));
+        assert!(!search_timing_logged(999.9, default));
+        assert!(search_timing_logged(1000.0, default));
+        assert!(search_timing_logged(4321.0, default));
+        // 0 logs every search, including a 0 ms one.
+        let all = parse_slow_search_log_ms(Some("0"));
+        assert!(search_timing_logged(0.0, all));
+        assert!(search_timing_logged(0.3, all));
     }
 
     #[test]

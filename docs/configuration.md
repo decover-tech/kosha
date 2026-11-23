@@ -665,6 +665,7 @@ that, so a rolling upgrade with mixed peers works.
 | `KOSHA_METRICS_AUTH` | `admin` requires the `KOSHA_ADMIN_API_KEY` credential on `GET /metrics` (403 without it). `none` (or unset) leaves it open, like `/healthz`. Any other value is treated as `admin` | `none` | `none` \| `admin` |
 | `KOSHA_METRICS_NAMESPACE_LABELS` | `on` (or `true`, `1`) adds a `namespace` label to `kosha_search_requests_total`. One series per namespace and outcome, and it publishes tenant namespace names to whoever can scrape. See `metrics.md` | off | flag |
 | `KOSHA_METRICS_TENANT_LABELS` | `on` (or `true`, `1`) adds a `tenant` label to `kosha_tenant_rejections_total` and the `kosha_cache_*` families (#342). One series per tenant and reason (or cache), and it publishes tenant ids to whoever can scrape. See `metrics.md` | off | flag |
+| `KOSHA_SLOW_SEARCH_LOG_MS` | A search prints its `search timing:` log line (per-phase ms, S3 fetches, kNN counters) only when the line's `total_ms` is at least this. `0` prints it for every search, as before; set it when a bench or eval reads those lines. Read once in `main.rs` (`slow_search_log_ms`); an unparseable value falls back to the default | `1000` | ms |
 
 ## Roles
 
