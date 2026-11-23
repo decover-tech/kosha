@@ -1,1 +1,116 @@
-
+:root {
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --text: #1c2330;
+  --muted: #5d6778;
+  --border: #dde1e7;
+  --accent: #2f5bd3;
+  --accent-text: #ffffff;
+  --bad: #b3261e;
+  --bad-bg: #fdecea;
+  --ok: #1d6b45;
+  --ok-bg: #e6f4ec;
+  --warn-bg: #fff6e0;
+  --warn: #7a5300;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151b;
+    --panel: #1a1f27;
+    --text: #e4e8ef;
+    --muted: #9aa4b5;
+    --border: #2c3340;
+    --accent: #7c9cf5;
+    --accent-text: #0d1220;
+    --bad: #ff8a80;
+    --bad-bg: #3a1714;
+    --ok: #7fd8a8;
+    --ok-bg: #133024;
+    --warn-bg: #33290f;
+    --warn: #f3cf7a;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 20px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+.brand { font-weight: 700; font-size: 16px; color: var(--text); }
+.spacer { flex: 1; }
+.whoami { color: var(--muted); display: flex; gap: 10px; align-items: center; }
+.org-switcher select { min-width: 180px; }
+main { max-width: 1040px; margin: 24px auto; padding: 0 20px; }
+.foot { max-width: 1040px; margin: 32px auto; padding: 0 20px; color: var(--muted); font-size: 12px; }
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 18px 20px;
+  margin-bottom: 16px;
+}
+.narrow { max-width: 420px; margin: 40px auto; }
+h1 { font-size: 20px; margin: 0 0 12px; }
+h2 { font-size: 16px; margin: 0 0 10px; }
+p.muted, .muted { color: var(--muted); }
+form.stack { display: flex; flex-direction: column; gap: 10px; }
+form.inline { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; margin-top: 10px; }
+label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
+label.check { flex-direction: row; align-items: center; gap: 6px; color: var(--text); }
+input, select, textarea {
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 9px;
+}
+button {
+  font: inherit;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: var(--accent-text);
+  border-radius: 6px;
+  padding: 7px 14px;
+  cursor: pointer;
+}
+button.secondary { background: transparent; color: var(--accent); }
+button.danger { background: transparent; color: var(--bad); border-color: var(--bad); }
+button:disabled { opacity: 0.5; cursor: default; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.tabs { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
+.tabs a { padding: 8px 12px; color: var(--muted); border-bottom: 2px solid transparent; }
+.tabs a.active { color: var(--text); border-bottom-color: var(--accent); }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { font-weight: 600; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.03em; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+code, .mono { font-family: var(--mono); font-size: 12.5px; }
+.notice { padding: 10px 12px; border-radius: 6px; margin-bottom: 12px; }
+.notice.error { background: var(--bad-bg); color: var(--bad); }
+.notice.ok { background: var(--ok-bg); color: var(--ok); }
+.notice.warn { background: var(--warn-bg); color: var(--warn); }
+.secret {
+  display: block;
+  font-family: var(--mono);
+  padding: 10px;
+  background: var(--warn-bg);
+  color: var(--warn);
+  border-radius: 6px;
+  word-break: break-all;
+  user-select: all;
+}
+.divider { text-align: center; color: var(--muted); margin: 8px 0; }
+.empty { color: var(--muted); padding: 8px 0; }
