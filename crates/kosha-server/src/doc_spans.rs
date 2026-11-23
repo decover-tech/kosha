@@ -492,7 +492,13 @@ impl SpanHydrator {
     /// still how its vectors are read. Either way the
     /// segment's heat resets, so a failed promotion may be retried after
     /// another threshold's worth of reads.
-    pub fn finish_promotion(&self, cache: &Cache, segment_dir: &Path, landed: bool) {
+    pub fn finish_promotion(
+        &self,
+        cache: &Cache,
+        writes: &SpanWriteQueue,
+        segment_dir: &Path,
+        landed: bool,
+    ) {
         self.promoting.lock().unwrap().remove(segment_dir);
         self.heat.lock().unwrap().remove(segment_dir);
         if !landed {
@@ -506,7 +512,7 @@ impl SpanHydrator {
                 continue;
             }
             let key = format!("{rel}/{file}{}", span_cache::SPANS_SUFFIX);
-            if let Err(e) = cache.drop_superseded_dir_unless_pinned(&key) {
+            if let Err(e) = writes.drop_superseded(cache, &key) {
                 eprintln!("WARN: failed to drop span cache {key}: {e}");
             }
         }
@@ -1363,7 +1369,7 @@ mod tests {
             seg.join(DOC_STORE_FILE),
         )
         .unwrap();
-        hydrator.finish_promotion(&cache, &seg, true);
+        hydrator.finish_promotion(&cache, &SpanWriteQueue::new(0, 0), &seg, true);
         assert!(!span_cache::spans_dir(&seg, DOC_STORE_FILE).exists());
         assert_eq!(
             cache.total_size(),
@@ -1414,7 +1420,7 @@ mod tests {
         )
         .unwrap();
         let before = cache.total_size();
-        hydrator.finish_promotion(&cache, &seg, true);
+        hydrator.finish_promotion(&cache, &SpanWriteQueue::new(0, 0), &seg, true);
         assert!(!span_cache::spans_dir(&seg, DOC_STORE_FILE).exists());
         assert_eq!(
             SpanIndex::load(&seg, DOC_VECTORS_FILE).total_bytes(),

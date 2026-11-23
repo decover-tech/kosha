@@ -4092,7 +4092,7 @@ impl AppState {
         );
         let landed = doc_store_promotion_landed(seg);
         self.span_hydrator
-            .finish_promotion(&self.cache, seg, landed);
+            .finish_promotion(&self.cache, &self.span_writes, seg, landed);
         if landed {
             self.doc_store_reads.promotion_done();
             self.doc_store_reads.record(&doc_spans::PageFetchStats {
@@ -5886,7 +5886,7 @@ impl AppState {
             self.ensure_files_local(&[seg.to_path_buf()], &file, &RequestHydration::background());
         let landed = file_present_nonempty(shard);
         self.posting_span_hydrator
-            .finish_promotion(&self.cache, shard, landed);
+            .finish_promotion(&self.cache, &self.span_writes, shard, landed);
         if landed {
             self.posting_reads.promotion_done();
             self.posting_reads
@@ -16830,12 +16830,13 @@ mod tests {
 
         state.posting_span_hydrator.finish_promotion(
             &state.cache,
+            &state.span_writes,
             &seg_a.join("postings-00.bin"),
             true,
         );
         state
             .span_hydrator
-            .finish_promotion(&state.cache, &seg_a, true);
+            .finish_promotion(&state.cache, &state.span_writes, &seg_a, true);
         assert!(
             !seg_a.join("postings-00.bin.spans").exists(),
             "spans dropped"

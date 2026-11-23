@@ -364,6 +364,7 @@ impl AppState {
                             if spans.exists() && file_present_nonempty(&shard) {
                                 self.posting_span_hydrator.finish_promotion(
                                     &self.cache,
+                                    &self.span_writes,
                                     &shard,
                                     true,
                                 );
@@ -395,7 +396,12 @@ impl AppState {
                 let mut missing = 0;
                 for seg in &seg_paths {
                     if crate::doc_store_promotion_landed(seg) {
-                        self.span_hydrator.finish_promotion(&self.cache, seg, true);
+                        self.span_hydrator.finish_promotion(
+                            &self.cache,
+                            &self.span_writes,
+                            seg,
+                            true,
+                        );
                     } else {
                         missing += 1;
                     }
@@ -438,8 +444,12 @@ impl AppState {
                     for seg in segs {
                         let idx = seg.join(file);
                         if file_present_nonempty(&idx) {
-                            self.posting_span_hydrator
-                                .finish_promotion(&self.cache, &idx, true);
+                            self.posting_span_hydrator.finish_promotion(
+                                &self.cache,
+                                &self.span_writes,
+                                &idx,
+                                true,
+                            );
                         } else {
                             missing += 1;
                         }
