@@ -4902,6 +4902,9 @@ impl AppState {
             outcome.files_fetched += stats.files_fetched;
             outcome.bytes_fetched += stats.bytes_fetched;
         }
+        // A shed anywhere above, the best-effort stats fetch included, is a
+        // 429, as on the cold path.
+        outcome.set_shed(request);
         outcome
     }
 

@@ -280,3 +280,24 @@ fn the_warm_path_fetches_no_postings_of_skipped_segments() {
         "fetched for segments the search skips: {fetched:?}"
     );
 }
+
+/// A request that crosses its hydration ceiling while fetching the
+/// stats-only segments' postings on the warm path is shed (429), as on the
+/// cold path, not answered 200 with per-segment statistics.
+#[test]
+fn a_shed_during_warm_stats_postings_is_a_429() {
+    let (s3, manifest) = uploaded_matters();
+    let mut state = node(&s3, &manifest, None);
+    // Caches the verdict that sends the searches below down the warm path.
+    assert_eq!(post(&state, serde_json::json!({"query_text": ""})).0, 200);
+    // "alpha document": only matter 0's segment scores (AND term pruning);
+    // the others hold "document", so namespace statistics read them for
+    // its `df`, and per-segment statistics do not.
+    let query = |stats: &str| serde_json::json!({"query_text": "alpha document", "bm25_params": {"stats": stats}});
+    assert_eq!(post(&state, query("segment")), (200, expected("alpha")));
+    // Everything the scored segment needs is local now: a request may
+    // fetch nothing more, so only the stats-only postings can shed it.
+    state.hydrate_request_max_bytes = 0;
+    assert_eq!(post(&state, query("segment")), (200, expected("alpha")));
+    assert_eq!(post(&state, query("namespace")).0, 429);
+}
