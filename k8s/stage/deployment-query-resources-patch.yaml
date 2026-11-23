@@ -87,8 +87,8 @@ spec:
               value: "17179869184"
             # 64 GiB on the pod's own 100 GiB EBS volume (see volumes
             # below): two matters' segments no longer fit in 24 GiB, so the
-            # cache evicted continuously. The headroom covers files pinned
-            # by in-flight searches, which may take the cache past this cap.
+            # cache evicted continuously. This cap is NOT a hard bound on
+            # the volume: see the OPEN RISK note at `volumes` below.
             - name: KOSHA_CACHE_MAX_BYTES
               value: "68719476736"
             # Live-bytes watermark W (cache-resident + pinned by in-flight
@@ -125,11 +125,12 @@ spec:
             # Trade-offs of dropping it: (1) the manifest refresher no longer
             # prefetches a new version's scoring set before swapping it in,
             # so the first search after a compaction pays that fetch;
-            # (2) it was originally added so full-namespace match_all scans
-            # (backend's catchup_es_to_kosha.py) were not shed with 429 on a
-            # cold pod at the then 2 GiB per-request budget. The budget is
-            # now 8 GiB (KOSHA_HYDRATE_REQUEST_MAX_BYTES below); whether such
-            # a scan fits in it on a cold pod has not been re-measured.
+            # (2) it was originally added for backend's delta catch-up
+            # (catchup_es_to_kosha.py, CronJob every 20 min): match_all +
+            # sort _id + search_after with no matter filter, so each page
+            # needs the scoring files of every segment in the namespace and
+            # is shed with 429 on a cold pod. LATENT: that CronJob is
+            # suspended on staging; it will fail if re-enabled as is.
             # Posting blobs on (the code default). They were switched off when
             # the namespace had 206,756 of them and warming held /readyz for
             # ~25 minutes; compaction has since left 256 per segment (1,536
@@ -187,8 +188,20 @@ spec:
       # deleted with it, instead of an emptyDir on the node's 50 GB root
       # disk: warming two matters filled that disk (DiskPressure, the pod
       # evicted, 22 replacements rejected on the same node).
-      # 100Gi = KOSHA_CACHE_MAX_BYTES (64 GiB) + headroom for files pinned
-      # by in-flight searches over the cap. `emptyDir: null` removes base's
+      # 100Gi holds the 64 GiB KOSHA_CACHE_MAX_BYTES cap plus some
+      # overshoot. OPEN RISK, not a bound: every search pins every segment
+      # dir of its namespace's manifest (pin_segments in kosha-server
+      # main.rs), and all Decover matters share one namespace, so while any
+      # search is in flight nothing in the cache is evictable. Overshoot is
+      # then limited only by what overlapping searches fetch: worst wave
+      # 8 concurrent searches x 8 GiB (KOSHA_HYDRATE_REQUEST_MAX_BYTES) =
+      # 64 GiB on top of a full 64 GiB cache = 128 GiB, against ~93-95 GiB
+      # writable by uid 10001 (ext4 reserves 5% for root). A separate fix
+      # to pin only the segments a search hydrates is in progress; until
+      # then a full volume makes cache writes fail with ENOSPC (the volume
+      # is not counted as ephemeral-storage, so the kubelet does not evict
+      # the pod); how searches surface that has not been tested.
+      # `emptyDir: null` removes base's
       # emptyDir from this strategic-merge patch (a volume has one source).
       # The storage class is the cluster's EBS class, as in
       # scripts/eval/k8s/collector.yaml. Cost: one gp3 100 GiB volume per
