@@ -366,8 +366,12 @@ Notes:
   adding `--limit 500 --namespace migration-smoke` and retaining exactly one
   `--index`.
 - Regenerate the manifest after CLI/Job changes with
-  `make migration-job-manifest`. OpenSearch host/IAM for that Job are
-  environment-specific — edit or regenerate before use.
+  `make migration-job-manifest MIGRATION_INDICES="<index> ..."` (the exact
+  index names or aliases to copy; nothing is defaulted). OpenSearch host/IAM
+  for that Job are environment-specific — edit or regenerate before use.
+- To copy through the public `/v1` API instead (no S3 or Postgres access),
+  use `scripts/copy_es_to_kosha.py`; see
+  [docs/migration/from-elasticsearch.md](../docs/migration/from-elasticsearch.md).
 
 ## Migrating pre-#262 namespaces
 

@@ -1,0 +1,2083 @@
+{
+  "describes": "kosha-client (Python): its translation of OpenSearch / Elasticsearch request bodies into Kosha's native /v1 API, and how that API answers them. Kosha has no server-side OpenSearch endpoint (_search, _bulk). The TypeScript and Go SDKs send native /v1 bodies only and do not translate the DSL.",
+  "generated_from": "scripts/conformance/dsl/cases.yaml",
+  "generated_by": "scripts/conformance/dsl/run.py",
+  "summary": {
+    "query": {
+      "supported": 10,
+      "partial": 6,
+      "rejected": 13
+    },
+    "filter": {
+      "supported": 10,
+      "partial": 1,
+      "rejected": 3
+    },
+    "aggregation": {
+      "supported": 6,
+      "partial": 1,
+      "rejected": 3
+    },
+    "sort": {
+      "supported": 2,
+      "partial": 2,
+      "rejected": 0
+    },
+    "paging": {
+      "supported": 3,
+      "partial": 0,
+      "rejected": 0
+    },
+    "body_key": {
+      "supported": 7,
+      "partial": 4,
+      "rejected": 0
+    },
+    "index_api": {
+      "supported": 9,
+      "partial": 9,
+      "rejected": 2
+    }
+  },
+  "cases": [
+    {
+      "id": "query.match_all",
+      "category": "query",
+      "construct": "match_all alone, or no query",
+      "outcome": "partial",
+      "note": "Inside a bool next to other clauses it adds nothing, as in Elasticsearch.",
+      "divergence": "On its own (and likewise a body with no `query`) it matches no documents, so aggregations over it are empty too: the translator drops it, and a Kosha search with neither query text nor a filter matches nothing. Write it as a filter, `{\"bool\": {\"filter\": [{\"match_all\": {}}]}}`, to match every document.",
+      "verified": "live",
+      "es_body": {
+        "query": {
+          "match_all": {}
+        }
+      }
+    },
+    {
+      "id": "query.match_all.as_filter",
+      "category": "query",
+      "construct": "match_all as a bool filter (match every document)",
+      "outcome": "supported",
+      "note": "Matches every document; the way to list or aggregate over a whole index.",
+      "verified": "exact",
+      "es_body": {
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "match_all": {}
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "query.match",
+      "category": "query",
+      "construct": "match",
+      "outcome": "supported",
+      "note": "The field restricts the search (Kosha `fields`). `operator` defaults to `or`, as in Elasticsearch.",
+      "verified": "live",
+      "es_body": {
+        "query": {
+          "match": {
+            "title": "w0001"
+          }
+        }
+      }
+    },
+    {
+      "id": "query.match.operator_and",
+      "category": "query",
+      "construct": "match with operator and",
+      "outcome": "supported",
+      "note": "Every term must match.",
+      "verified": "live",
+      "es_body": {
+        "query": {
+          "match": {
+            "body": {
+              "query": "w0000 w0001",
+              "operator": "and"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "query.match.boost",
+      "category": "query",
+      "construct": "match with boost",
+      "outcome": "supported",
+      "note": "The same text in several fields is one Kosha query over those fields, each keeping its boost (`title^3`).",
+      "verified": "live",
+      "es_body": {
+        "query": {
+          "bool": {
+            "should": [
+              {
+                "match": {
+                  "title": {
+                    "query": "w0002",
+                    "boost": 3
+                  }
+                }
+              },
+              {
+                "match": {
+                  "body": "w0002"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "query.match.unsupported_options",
+      "category": "query",
+      "construct": "match with fuzziness, minimum_should_match, analyzer, ...",
+      "outcome": "rejected",
+      "note": "Only `query`, `operator` and `boost` are understood. Any other option is refused rather than ignored.",
+      "rejected_by": "client",
+      "verified": "client",
+      "es_body": {
+        "query": {
+          "match": {
+            "body": {
+              "query": "w0001",
+              "fuzziness": "AUTO"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "query.multi_match",
+      "category": "query",
+      "construct": "multi_match (best_fields, most_fields, cross_fields)",
+      "outcome": "partial",
+      "note": "Field boosts are kept.",
+      "divergence": "Every type is scored as `most_fields`: the sum of each field's boosted BM25. The matching documents are the same; the ranking differs from `best_fields` (the default) and `cross_fields`.",
+      "verified": "live",
+      "es_body": {
+        "query": {
+          "multi_match": {
+            "query": "w0003",
+            "fields": [
+              "title^2",
+              "body"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "query.multi_match.all_fields",
+      "category": "query",
+      "construct": "multi_match over every field (`*`, `_all`)",
+      "outcome": "supported",
+      "note": "Searches every Text field.",
+      "verified": "exact",
+      "es_body": {
+        "query": {
+          "multi_match": {
+            "query": "w0004 w0005",
+            "fields": [
+              "*"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "query.multi_match.phrase_type",
+      "category": "query",
+      "construct": "multi_match type phrase, phrase_prefix, bool_prefix",
+      "outcome": "rejected",
+      "note": "Use `match_phrase` per field instead.",
+      "rejected_by": "client",
+      "verified": "client",
+      "es_body": {
+        "query": {
+          "multi_match": {
+            "query": "w0000 w0001",
+            "type": "phrase",
+            "fields": [
+              "title"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "query.match_phrase",
+      "category": "query",
+      "construct": "match_phrase (with slop)",
+      "outcome": "supported",
+      "note": "The same phrase in several fields (a bool should) searches any of them.",
+      "verified": "live",
+      "es_body": {
+        "query": {
+          "match_phrase": {
+            "title": {
+              "query": "w0000 w0001",
+              "slop": 1
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "query.match_phrase.two_phrases",
+      "category": "query",
+      "construct": "two different phrases in one query",
+      "outcome": "rejected",
+      "note": "A Kosha query holds one phrase.",
+      "rejected_by": "client",
+      "verified": "client",
+      "es_body": {
+        "query": {
+          "bool": {
+            "must": [
+              {
+                "match_phrase": {
+                  "title": "w0000 w0001"
+                }
+              },
+              {
+                "match_phrase": {
+                  "body": "w0002 w0003"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "query.wildcard",
+      "category": "query",
+      "construct": "wildcard",
+      "outcome": "partial",
+      "note": "One wildcard per query, with `*` and `?`.",
+      "divergence": "The field is not applied: the pattern matches terms of every Text field, and keyword fields are never matched (this case names the keyword `status` and matches body text). Case-insensitive unless the clause sets `case_insensitive: false`; Elasticsearch is case-sensitive by default. Known engine bug: the part of a pattern before its first `*` is not anchored, so `op*` also matches `co-op`.",
+      "verified": "live",
+      "es_body": {
+        "query": {
+          "wildcard": {
+            "status": "w00*"
+          }
+        }
+      }
+    },
+    {
+      "id": "query.knn",
+      "category": "query",
+      "construct": "knn (vector, k, num_candidates, filter)",
+      "outcome": "supported",
+      "note": "The filter runs inside the vector search, so a filtered search still returns up to k hits.",
+      "verified": "live",
+      "es_body": {
+        "size": 5,
+        "query": {
+          "knn": {
+            "emb": {
+              "vector": [
+                0.5,
+                0.5,
+                0.5,
+                0.5,
+                0.5,
+                0.5,
+                0.5,
+                0.5
+              ],
+              "k": 5,
+              "filter": {
+                "term": {
+                  "status": "open"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "query.knn.query_text",
+      "category": "query",
+      "construct": "knn with query_text (server-side embedding)",
+      "outcome": "supported",
+      "note": "The server embeds the text with the model the namespace schema declares for the field (native embedding).",
+      "verified": "client",
+      "es_body": {
+        "query": {
+          "knn": {
+            "emb": {
+              "query_text": "breach of contract",
+              "k": 10
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "query.function_score",
+      "category": "query",
+      "construct": "function_score",
+      "outcome": "partial",
+      "note": "The inner query is translated as usual.",
+      "divergence": "`functions`, `boost_mode` and `score_mode` are ignored: hits are the inner query's, ranked by plain BM25.",
+      "verified": "exact",
+      "es_body": {
+        "query": {
+          "function_score": {
+            "query": {
+              "multi_match": {
+                "query": "w0006",
+                "fields": [
+                  "*"
+                ]
+              }
+            },
+            "functions": [
+              {
+                "field_value_factor": {
+                  "field": "priority"
+                }
+              }
+            ],
+            "boost_mode": "multiply"
+          }
+        }
+      }
+    },
+    {
+      "id": "query.bool",
+      "category": "query",
+      "construct": "bool with must and filter",
+      "outcome": "supported",
+      "note": "Required text plus a filter tree.",
+      "verified": "exact",
+      "es_body": {
+        "query": {
+          "bool": {
+            "must": [
+              {
+                "multi_match": {
+                  "query": "w0007",
+                  "fields": [
+                    "*"
+                  ]
+                }
+              }
+            ],
+            "filter": [
+              {
+                "term": {
+                  "status": "open"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "query.bool.optional_should",
+      "category": "query",
+      "construct": "bool should next to must (score-only clauses)",
+      "outcome": "partial",
+      "note": "Optional clauses never change which documents match, in Elasticsearch or in Kosha.",
+      "divergence": "The optional clauses are dropped, so they do not raise the score of the documents that also match them.",
+      "verified": "exact",
+      "es_body": {
+        "query": {
+          "bool": {
+            "must": [
+              {
+                "multi_match": {
+                  "query": "w0008",
+                  "fields": [
+                    "*"
+                  ]
+                }
+              }
+            ],
+            "should": [
+              {
+                "term": {
+                  "status": "open"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "query.bool.should_text",
+      "category": "query",
+      "construct": "bool should over text (at least one)",
+      "outcome": "supported",
+      "note": "One Kosha query with operator `or`.",
+      "verified": "exact",
+      "es_body": {
+        "query": {
+          "bool": {
+            "should": [
+              {
+                "multi_match": {
+                  "query": "w0009",
+                  "fields": [
+                    "*"
+                  ]
+                }
+              },
+              {
+                "multi_match": {
+                  "query": "w0010",
+                  "fields": [
+                    "*"
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "query.bool.must_not_text",
+      "category": "query",
+      "construct": "bool must_not over text",
+      "outcome": "rejected",
+      "note": "Only a filter can be negated; Kosha has no \"text must not match\".",
+      "rejected_by": "client",
+      "verified": "client",
+      "es_body": {
+        "query": {
+          "bool": {
+            "must": [
+              {
+                "match": {
+                  "title": "w0000"
+                }
+              }
+            ],
+            "must_not": [
+              {
+                "match": {
+                  "body": "w0001"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "query.bool.text_or_filter",
+      "category": "query",
+      "construct": "bool should mixing text and filters",
+      "outcome": "rejected",
+      "note": "Text OR a filter has no Kosha equivalent.",
+      "rejected_by": "client",
+      "verified": "client",
+      "es_body": {
+        "query": {
+          "bool": {
+            "should": [
+              {
+                "match": {
+                  "title": "w0000"
+                }
+              },
+              {
+                "term": {
+                  "status": "open"
+                }
+              }
+            ],
+            "minimum_should_match": 1
+          }
+        }
+      }
+    },
+    {
+      "id": "query.bool.msm_over_text",
+      "category": "query",
+      "construct": "bool minimum_should_match > 1 over text",
+      "outcome": "rejected",
+      "note": "Use `operator: and` when every term is required.",
+      "rejected_by": "client",
+      "verified": "client",
+      "es_body": {
+        "query": {
+          "bool": {
+            "should": [
+              {
+                "match": {
+                  "title": "w0000"
+                }
+              },
+              {
+                "match": {
+                  "title": "w0001"
+                }
+              },
+              {
+                "match": {
+                  "title": "w0002"
+                }
+              }
+            ],
+            "minimum_should_match": 2
+          }
+        }
+      }
+    },
+    {
+      "id": "query.term_level",
+      "category": "query",
+      "construct": "term, terms, range, exists, prefix in query context",
+      "outcome": "partial",
+      "note": "The clause runs as a Kosha filter and matches the same documents.",
+      "divergence": "Hits get a small length-normalised constant score instead of Elasticsearch's term score (or constant 1.0), so ties are ordered differently.",
+      "verified": "exact",
+      "es_body": {
+        "query": {
+          "term": {
+            "status": "closed"
+          }
+        }
+      }
+    },
+    {
+      "id": "query.nested",
+      "category": "query",
+      "construct": "nested, has_child, has_parent",
+      "outcome": "rejected",
+      "note": "Kosha has no nested documents; an object field's leaves are indexed under dotted paths instead.",
+      "rejected_by": "client",
+      "verified": "client",
+      "es_body": {
+        "query": {
+          "nested": {
+            "path": "comments",
+            "query": {
+              "match": {
+                "comments.text": "w0000"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "query.query_string",
+      "category": "query",
+      "construct": "query_string, simple_query_string",
+      "outcome": "rejected",
+      "note": "Rewrite as match / bool clauses.",
+      "rejected_by": "client",
+      "verified": "client",
+      "es_body": {
+        "query": {
+          "query_string": {
+            "query": "title:w0000 AND body:w0001"
+          }
+        }
+      }
+    },
+    {
+      "id": "query.fuzzy",
+      "category": "query",
+      "construct": "fuzzy, regexp, match_phrase_prefix, match_bool_prefix",
+      "outcome": "rejected",
+      "note": "No fuzzy or regular-expression matching.",
+      "rejected_by": "client",
+      "verified": "client",
+      "es_body": {
+        "query": {
+          "fuzzy": {
+            "title": "w0000"
+          }
+        }
+      }
+    },
+    {
+      "id": "query.ids",
+      "category": "query",
+      "construct": "ids, and term / terms / prefix on _id",
+      "outcome": "rejected",
+      "note": "Use `client.get` / `client.mget` to fetch by id.",
+      "rejected_by": "client",
+      "verified": "client",
+      "es_body": {
+        "query": {
+          "ids": {
+            "values": [
+              "d000001"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "query.constant_score",
+      "category": "query",
+      "construct": "constant_score, dis_max, boosting",
+      "outcome": "rejected",
+      "note": "Put the clause in a bool `filter` instead.",
+      "rejected_by": "client",
+      "verified": "client",
+      "es_body": {
+        "query": {
+          "constant_score": {
+            "filter": {
+              "term": {
+                "status": "open"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "query.script_score",
+      "category": "query",
+      "construct": "script_score, script, more_like_this, span_*, intervals",
+      "outcome": "rejected",
+      "note": "No scripting, similarity or positional span queries.",
+      "rejected_by": "client",
+      "verified": "client",
+      "es_body": {
+        "query": {
+          "script_score": {
+            "query": {
+              "match_all": {}
+            },
+            "script": {
+              "source": "1"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "query.geo_distance",
+      "category": "query",
+      "construct": "geo_distance, geo_bounding_box, geo_shape",
+      "outcome": "rejected",
+      "note": "Not translated by the client, although the native /v1 filter has geo_distance; send a native body for geo search.",
+      "rejected_by": "client",
+      "verified": "client",
+      "es_body": {
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "geo_distance": {
+                  "distance": "10km",
+                  "location": {
+                    "lat": 40.0,
+                    "lon": -70.0
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "filter.term",
+      "category": "filter",
+      "construct": "term",
+      "outcome": "supported",
+      "note": "Values compare as strings; booleans become \"true\"/\"false\".",
+      "verified": "exact",
+      "es_body": {
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "term": {
+                  "status": "open"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "filter.term.boolean",
+      "category": "filter",
+      "construct": "term on a boolean",
+      "outcome": "supported",
+      "note": "`true` is sent as \"true\", the way the client stores booleans.",
+      "verified": "exact",
+      "es_body": {
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "term": {
+                  "archived": true
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "filter.term.id",
+      "category": "filter",
+      "construct": "term / terms / prefix on _id",
+      "outcome": "rejected",
+      "note": "Document ids are not filterable; use `client.get` / `client.mget`.",
+      "rejected_by": "client",
+      "verified": "client",
+      "es_body": {
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "term": {
+                  "_id": "d000001"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "filter.terms",
+      "category": "filter",
+      "construct": "terms",
+      "outcome": "supported",
+      "note": "Matches any value; a multi-valued field matches if any of its values does.",
+      "verified": "exact",
+      "es_body": {
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "terms": {
+                  "owner": [
+                    "owner01",
+                    "owner02"
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "filter.terms.multivalued",
+      "category": "filter",
+      "construct": "terms on a multi-valued keyword",
+      "outcome": "supported",
+      "note": "A document matches if any of its values is listed.",
+      "verified": "exact",
+      "es_body": {
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "terms": {
+                  "tags": [
+                    "sealed",
+                    "exhibit"
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "filter.range.numeric",
+      "category": "filter",
+      "construct": "range on a number (gt, gte, lt, lte)",
+      "outcome": "supported",
+      "note": "Numeric on Integer and Float fields.",
+      "verified": "exact",
+      "es_body": {
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "range": {
+                  "priority": {
+                    "gte": 3,
+                    "lt": 6
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "filter.range.date",
+      "category": "filter",
+      "construct": "range on a date",
+      "outcome": "supported",
+      "note": "ISO-8601 dates compare chronologically.",
+      "verified": "exact",
+      "es_body": {
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "range": {
+                  "filed": {
+                    "gte": "2020-01-01",
+                    "lte": "2022-12-31"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "filter.range.options",
+      "category": "filter",
+      "construct": "range with format, time_zone, relation",
+      "outcome": "partial",
+      "note": "The bounds are applied.",
+      "divergence": "`format`, `time_zone` and `relation` are dropped: bounds are compared as given, with no date math or time-zone shift. Any other option is refused.",
+      "verified": "exact",
+      "es_body": {
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "range": {
+                  "filed": {
+                    "gte": "2020-01-01",
+                    "format": "yyyy-MM-dd",
+                    "time_zone": "+05:00"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "filter.exists",
+      "category": "filter",
+      "construct": "exists",
+      "outcome": "supported",
+      "note": "Matches documents that have the field.",
+      "verified": "live",
+      "es_body": {
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "exists": {
+                  "field": "tags"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "filter.prefix",
+      "category": "filter",
+      "construct": "prefix (short and long form, case_insensitive)",
+      "outcome": "supported",
+      "note": "Case-sensitive by default, as in Elasticsearch. `boost` and `rewrite` are ignored; other options are refused.",
+      "verified": "live",
+      "es_body": {
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "prefix": {
+                  "owner": {
+                    "value": "OWNER0",
+                    "case_insensitive": true
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "filter.match_all",
+      "category": "filter",
+      "construct": "match_all as a filter",
+      "outcome": "supported",
+      "note": "A no-op next to other clauses.",
+      "verified": "exact",
+      "es_body": {
+        "query": {
+          "bool": {
+            "must": [
+              {
+                "multi_match": {
+                  "query": "w0011",
+                  "fields": [
+                    "*"
+                  ]
+                }
+              }
+            ],
+            "filter": [
+              {
+                "match_all": {}
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "filter.bool",
+      "category": "filter",
+      "construct": "nested bool (must, filter, must_not, should)",
+      "outcome": "supported",
+      "note": "Any depth. `should` follows Elasticsearch: required (at least one) when the bool has no must/filter, optional otherwise.",
+      "verified": "exact",
+      "es_body": {
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "bool": {
+                  "must_not": [
+                    {
+                      "term": {
+                        "status": "withdrawn"
+                      }
+                    }
+                  ],
+                  "should": [
+                    {
+                      "range": {
+                        "priority": {
+                          "gte": 10
+                        }
+                      }
+                    },
+                    {
+                      "terms": {
+                        "owner": [
+                          "owner00",
+                          "owner03"
+                        ]
+                      }
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "filter.bool.msm_percent",
+      "category": "filter",
+      "construct": "minimum_should_match as a percentage or combination",
+      "outcome": "rejected",
+      "note": "Only an integer count.",
+      "rejected_by": "client",
+      "verified": "client",
+      "es_body": {
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "bool": {
+                  "should": [
+                    {
+                      "term": {
+                        "status": "open"
+                      }
+                    },
+                    {
+                      "term": {
+                        "status": "closed"
+                      }
+                    }
+                  ],
+                  "minimum_should_match": "75%"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "filter.unsupported",
+      "category": "filter",
+      "construct": "nested, regexp, wildcard, script, geo_* as filters",
+      "outcome": "rejected",
+      "note": "Refused, never dropped; dropping a filter would return documents the caller excluded.",
+      "rejected_by": "client",
+      "verified": "client",
+      "es_body": {
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "regexp": {
+                  "status": "op.*"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "aggregation.terms",
+      "category": "aggregation",
+      "construct": "terms",
+      "outcome": "supported",
+      "note": "Buckets over keyword values.",
+      "verified": "live",
+      "es_body": {
+        "size": 0,
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "exists": {
+                  "field": "status"
+                }
+              }
+            ]
+          }
+        },
+        "aggs": {
+          "by_status": {
+            "terms": {
+              "field": "status"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "aggregation.terms.metric_sub",
+      "category": "aggregation",
+      "construct": "metric sub-aggregations under a bucket aggregation",
+      "outcome": "supported",
+      "note": "min, max, sum, avg and value_count can be nested under terms, composite, histogram and date_histogram.",
+      "verified": "live",
+      "es_body": {
+        "size": 0,
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "exists": {
+                  "field": "status"
+                }
+              }
+            ]
+          }
+        },
+        "aggs": {
+          "by_status": {
+            "terms": {
+              "field": "status"
+            },
+            "aggs": {
+              "top_amount": {
+                "max": {
+                  "field": "amount"
+                }
+              },
+              "mean_priority": {
+                "avg": {
+                  "field": "priority"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "aggregation.bucket_sub",
+      "category": "aggregation",
+      "construct": "bucket sub-aggregations (terms under terms, ...)",
+      "outcome": "rejected",
+      "note": "Refused rather than ignored; the caller would read buckets that are not there.",
+      "rejected_by": "client",
+      "verified": "client",
+      "es_body": {
+        "size": 0,
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "exists": {
+                  "field": "status"
+                }
+              }
+            ]
+          }
+        },
+        "aggs": {
+          "by_status": {
+            "terms": {
+              "field": "status"
+            },
+            "aggs": {
+              "by_owner": {
+                "terms": {
+                  "field": "owner"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "aggregation.composite",
+      "category": "aggregation",
+      "construct": "composite",
+      "outcome": "partial",
+      "note": "Paginate with `after`.",
+      "divergence": "`size` is required; Elasticsearch defaults it to 10.",
+      "verified": "live",
+      "es_body": {
+        "size": 0,
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "exists": {
+                  "field": "status"
+                }
+              }
+            ]
+          }
+        },
+        "aggs": {
+          "pairs": {
+            "composite": {
+              "size": 10,
+              "sources": [
+                {
+                  "st": {
+                    "terms": {
+                      "field": "status"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "aggregation.composite.no_size",
+      "category": "aggregation",
+      "construct": "composite without size",
+      "outcome": "rejected",
+      "note": "The server answers 400 (missing field `size`).",
+      "rejected_by": "server",
+      "verified": "live",
+      "es_body": {
+        "size": 0,
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "exists": {
+                  "field": "status"
+                }
+              }
+            ]
+          }
+        },
+        "aggs": {
+          "pairs": {
+            "composite": {
+              "sources": [
+                {
+                  "st": {
+                    "terms": {
+                      "field": "status"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "aggregation.histogram",
+      "category": "aggregation",
+      "construct": "histogram",
+      "outcome": "supported",
+      "note": "Numeric buckets.",
+      "verified": "live",
+      "es_body": {
+        "size": 0,
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "exists": {
+                  "field": "status"
+                }
+              }
+            ]
+          }
+        },
+        "aggs": {
+          "prio": {
+            "histogram": {
+              "field": "priority",
+              "interval": 4
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "aggregation.date_histogram",
+      "category": "aggregation",
+      "construct": "date_histogram (calendar_interval, fixed_interval, time_zone, bounds)",
+      "outcome": "supported",
+      "note": "Options are passed through to the server.",
+      "verified": "live",
+      "es_body": {
+        "size": 0,
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "exists": {
+                  "field": "status"
+                }
+              }
+            ]
+          }
+        },
+        "aggs": {
+          "per_year": {
+            "date_histogram": {
+              "field": "filed",
+              "calendar_interval": "year"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "aggregation.cardinality",
+      "category": "aggregation",
+      "construct": "cardinality",
+      "outcome": "supported",
+      "note": "Top level only; it takes no sub-aggregations.",
+      "verified": "live",
+      "es_body": {
+        "size": 0,
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "exists": {
+                  "field": "status"
+                }
+              }
+            ]
+          }
+        },
+        "aggs": {
+          "owners": {
+            "cardinality": {
+              "field": "owner"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "aggregation.metrics",
+      "category": "aggregation",
+      "construct": "min, max, sum, avg, value_count",
+      "outcome": "supported",
+      "note": "Single-value metrics.",
+      "verified": "live",
+      "es_body": {
+        "size": 0,
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "exists": {
+                  "field": "status"
+                }
+              }
+            ]
+          }
+        },
+        "aggs": {
+          "lo": {
+            "min": {
+              "field": "priority"
+            }
+          },
+          "hi": {
+            "max": {
+              "field": "priority"
+            }
+          },
+          "total": {
+            "sum": {
+              "field": "amount"
+            }
+          },
+          "mean": {
+            "avg": {
+              "field": "amount"
+            }
+          },
+          "n": {
+            "value_count": {
+              "field": "status"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "aggregation.unsupported",
+      "category": "aggregation",
+      "construct": "stats, percentiles, top_hits, filter(s), range, significant_terms, nested, ...",
+      "outcome": "rejected",
+      "note": "Any other aggregation type is refused by name.",
+      "rejected_by": "client",
+      "verified": "client",
+      "es_body": {
+        "size": 0,
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "exists": {
+                  "field": "status"
+                }
+              }
+            ]
+          }
+        },
+        "aggs": {
+          "s": {
+            "stats": {
+              "field": "amount"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sort.field",
+      "category": "sort",
+      "construct": "sort by a field (asc / desc, string or object form)",
+      "outcome": "supported",
+      "note": "Numeric fields sort numerically, others as strings; ties break by `_id`.",
+      "verified": "exact",
+      "es_body": {
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "range": {
+                  "priority": {
+                    "gte": 1
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "sort": [
+          {
+            "priority": {
+              "order": "desc"
+            }
+          },
+          {
+            "owner": "asc"
+          }
+        ]
+      }
+    },
+    {
+      "id": "sort.score_and_id",
+      "category": "sort",
+      "construct": "sort by _score and _id",
+      "outcome": "supported",
+      "note": "`_score` sorts by BM25; `_id` sorts by document id.",
+      "verified": "exact",
+      "es_body": {
+        "query": {
+          "multi_match": {
+            "query": "w0012",
+            "fields": [
+              "*"
+            ]
+          }
+        },
+        "sort": [
+          {
+            "_score": "desc"
+          },
+          {
+            "_id": "asc"
+          }
+        ]
+      }
+    },
+    {
+      "id": "sort.doc",
+      "category": "sort",
+      "construct": "sort by _doc",
+      "outcome": "partial",
+      "note": "Stable, so it still walks a result set exactly once.",
+      "divergence": "`_doc` (index order) becomes `_id` ascending.",
+      "verified": "exact",
+      "es_body": {
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "range": {
+                  "priority": {
+                    "gte": 1
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "sort": [
+          "_doc"
+        ]
+      }
+    },
+    {
+      "id": "sort.options",
+      "category": "sort",
+      "construct": "sort with missing, mode, unmapped_type, nested",
+      "outcome": "partial",
+      "note": "Field and order are applied.",
+      "divergence": "The other options are dropped: a document without the field sorts first, and a multi-valued field sorts by its first value.",
+      "verified": "exact",
+      "es_body": {
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "range": {
+                  "priority": {
+                    "gte": 1
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "sort": [
+          {
+            "tags": {
+              "order": "asc",
+              "missing": "_last",
+              "mode": "min"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "paging.from_size",
+      "category": "paging",
+      "construct": "from / size",
+      "outcome": "supported",
+      "note": "Offset paging.",
+      "verified": "exact",
+      "es_body": {
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "range": {
+                  "priority": {
+                    "gte": 1
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "from": 20,
+        "size": 15,
+        "sort": [
+          {
+            "_id": "asc"
+          }
+        ]
+      }
+    },
+    {
+      "id": "paging.search_after",
+      "category": "paging",
+      "construct": "search_after",
+      "outcome": "supported",
+      "note": "Cursor paging; values are sent as strings and `from` is reset to 0.",
+      "verified": "exact",
+      "es_body": {
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "range": {
+                  "priority": {
+                    "gte": 1
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "size": 10,
+        "sort": [
+          {
+            "_id": "asc"
+          }
+        ],
+        "search_after": [
+          "d000100"
+        ]
+      }
+    },
+    {
+      "id": "paging.track_total_hits",
+      "category": "paging",
+      "construct": "track_total_hits (true or a number)",
+      "outcome": "supported",
+      "note": "`true` counts exactly; a number caps the count, and `total.relation` reports whether it was reached. Without it the server's default cap applies.",
+      "verified": "live",
+      "es_body": {
+        "query": {
+          "multi_match": {
+            "query": "w0000",
+            "fields": [
+              "*"
+            ]
+          }
+        },
+        "size": 1,
+        "track_total_hits": 50
+      }
+    },
+    {
+      "id": "body_key.query",
+      "category": "body_key",
+      "construct": "query",
+      "outcome": "supported",
+      "note": "See the query DSL and filter rows.",
+      "verified": "exact",
+      "es_body": {
+        "query": {
+          "multi_match": {
+            "query": "w0013",
+            "fields": [
+              "*"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "body_key.knn",
+      "category": "body_key",
+      "construct": "top-level knn",
+      "outcome": "supported",
+      "note": "The older top-level form; the same as `query.knn`.",
+      "verified": "live",
+      "es_body": {
+        "size": 3,
+        "knn": {
+          "emb": {
+            "vector": [
+              0.1,
+              0.2,
+              0.3,
+              0.4,
+              0.5,
+              0.6,
+              0.7,
+              0.8
+            ],
+            "k": 3
+          }
+        }
+      }
+    },
+    {
+      "id": "body_key.post_filter",
+      "category": "body_key",
+      "construct": "post_filter",
+      "outcome": "partial",
+      "note": "The hits are the same as in Elasticsearch.",
+      "divergence": "It is merged into the main filter, so aggregations are computed over the post-filtered hits too; Elasticsearch computes them before post_filter.",
+      "verified": "live",
+      "es_body": {
+        "size": 0,
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "exists": {
+                  "field": "status"
+                }
+              }
+            ]
+          }
+        },
+        "post_filter": {
+          "term": {
+            "status": "open"
+          }
+        },
+        "aggs": {
+          "by_status": {
+            "terms": {
+              "field": "status"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "body_key.aggs",
+      "category": "body_key",
+      "construct": "aggs / aggregations",
+      "outcome": "supported",
+      "note": "Both spellings; sent as Kosha `aggs`. See the aggregation rows.",
+      "verified": "live",
+      "es_body": {
+        "size": 0,
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "exists": {
+                  "field": "status"
+                }
+              }
+            ]
+          }
+        },
+        "aggregations": {
+          "by_status": {
+            "terms": {
+              "field": "status"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "body_key.source",
+      "category": "body_key",
+      "construct": "_source (false, a field list, includes / excludes)",
+      "outcome": "supported",
+      "note": "Filters the stored fields returned with each hit.",
+      "verified": "live",
+      "es_body": {
+        "query": {
+          "multi_match": {
+            "query": "w0014",
+            "fields": [
+              "*"
+            ]
+          }
+        },
+        "_source": {
+          "includes": [
+            "title",
+            "status"
+          ]
+        }
+      }
+    },
+    {
+      "id": "body_key.highlight",
+      "category": "body_key",
+      "construct": "highlight",
+      "outcome": "partial",
+      "note": "Every listed field is highlighted with its own or the top-level tags.",
+      "divergence": "Other highlighter options (`number_of_fragments`, `fragment_size`, `type`, ...) are dropped; they change only the markup, never which documents match.",
+      "verified": "live",
+      "es_body": {
+        "query": {
+          "match": {
+            "title": "w0000"
+          }
+        },
+        "highlight": {
+          "pre_tags": [
+            "<b>"
+          ],
+          "post_tags": [
+            "</b>"
+          ],
+          "fields": {
+            "title": {
+              "number_of_fragments": 2
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "body_key.collapse",
+      "category": "body_key",
+      "construct": "collapse",
+      "outcome": "supported",
+      "note": "One hit per value of the field. `inner_hits` and `max_concurrent_group_searches` are refused.",
+      "verified": "live",
+      "es_body": {
+        "query": {
+          "multi_match": {
+            "query": "w0000",
+            "fields": [
+              "*"
+            ]
+          }
+        },
+        "collapse": {
+          "field": "status"
+        },
+        "size": 10
+      }
+    },
+    {
+      "id": "body_key.request_cache",
+      "category": "body_key",
+      "construct": "request_cache",
+      "outcome": "supported",
+      "note": "`false` bypasses Kosha's response cache (`no_cache`).",
+      "verified": "exact",
+      "es_body": {
+        "query": {
+          "multi_match": {
+            "query": "w0015",
+            "fields": [
+              "*"
+            ]
+          }
+        },
+        "request_cache": false
+      }
+    },
+    {
+      "id": "body_key.rerank",
+      "category": "body_key",
+      "construct": "rerank (Kosha extension)",
+      "outcome": "supported",
+      "note": "Not Elasticsearch DSL. Asks the server to rerank the top hits with an external model; see `KoshaClient.rerank_spec`.",
+      "verified": "client",
+      "es_body": {
+        "query": {
+          "match": {
+            "title": "w0000"
+          }
+        },
+        "rerank": {
+          "provider": "cohere",
+          "model": "rerank-v3.5",
+          "field": "body",
+          "top_n": 20
+        }
+      }
+    },
+    {
+      "id": "body_key.min_score",
+      "category": "body_key",
+      "construct": "min_score",
+      "outcome": "partial",
+      "note": "Not sent to Kosha.",
+      "divergence": "Ignored without an error; hits below the threshold are returned.",
+      "verified": "exact",
+      "es_body": {
+        "query": {
+          "multi_match": {
+            "query": "w0000",
+            "fields": [
+              "*"
+            ]
+          }
+        },
+        "min_score": 50
+      }
+    },
+    {
+      "id": "body_key.ignored",
+      "category": "body_key",
+      "construct": "suggest, rescore, script_fields, terminate_after, timeout, explain, profile, ...",
+      "outcome": "partial",
+      "note": "Not sent to Kosha.",
+      "divergence": "Every top-level key not listed above is ignored without an error: no suggestions, no rescoring, no early termination.",
+      "verified": "exact",
+      "es_body": {
+        "query": {
+          "multi_match": {
+            "query": "w0016",
+            "fields": [
+              "*"
+            ]
+          }
+        },
+        "suggest": {
+          "s": {
+            "text": "w0016",
+            "term": {
+              "field": "title"
+            }
+          }
+        },
+        "rescore": {
+          "window_size": 10,
+          "query": {
+            "rescore_query": {
+              "match": {
+                "body": "w0001"
+              }
+            }
+          }
+        },
+        "terminate_after": 1
+      }
+    },
+    {
+      "id": "api.indices.create",
+      "category": "index_api",
+      "construct": "indices.create (with mappings)",
+      "outcome": "partial",
+      "note": "Creates the namespace (`POST /v1/namespaces`); plain mapping types become the namespace schema.",
+      "divergence": "`settings` are ignored (no shards, replicas or refresh interval), and object, nested and multi-field mappings are left out of the schema. A text field's `analyzer` is passed through, and the server refuses a name it does not have (language analyzers, custom analyzers) with a 400.",
+      "verified": "live",
+      "api": "indices.create"
+    },
+    {
+      "id": "api.indices.exists",
+      "category": "index_api",
+      "construct": "indices.exists",
+      "outcome": "supported",
+      "note": "True when every named namespace exists.",
+      "verified": "live",
+      "api": "indices.exists"
+    },
+    {
+      "id": "api.indices.get_mapping",
+      "category": "index_api",
+      "construct": "indices.get_mapping, indices.get",
+      "outcome": "supported",
+      "note": "The schema's fields with ES types; a namespace without a schema has empty properties. Fields are never guessed.",
+      "verified": "live",
+      "api": "indices.get_mapping"
+    },
+    {
+      "id": "api.indices.get_settings",
+      "category": "index_api",
+      "construct": "indices.get_settings",
+      "outcome": "partial",
+      "note": "Returns the index name.",
+      "divergence": "Nothing else is reported; Kosha has no shard, replica or refresh settings.",
+      "verified": "live",
+      "api": "indices.get_settings"
+    },
+    {
+      "id": "api.indices.put_mapping",
+      "category": "index_api",
+      "construct": "indices.put_mapping, indices.put_settings",
+      "outcome": "partial",
+      "note": "Acknowledged.",
+      "divergence": "A no-op; the schema is unchanged. Set the schema when creating the namespace.",
+      "verified": "live",
+      "api": "indices.put_mapping"
+    },
+    {
+      "id": "api.indices.refresh",
+      "category": "index_api",
+      "construct": "indices.refresh",
+      "outcome": "supported",
+      "note": "Makes every write searchable now (a flush).",
+      "verified": "live",
+      "api": "indices.refresh"
+    },
+    {
+      "id": "api.indices.flush",
+      "category": "index_api",
+      "construct": "indices.flush, indices.close",
+      "outcome": "partial",
+      "note": "Acknowledged.",
+      "divergence": "Both are no-ops; use `indices.refresh` to make writes searchable.",
+      "verified": "live",
+      "api": "indices.flush"
+    },
+    {
+      "id": "api.indices.delete",
+      "category": "index_api",
+      "construct": "indices.delete",
+      "outcome": "supported",
+      "note": "Deletes the namespace and its data. `ignore_unavailable` and `ignore=404` are honoured.",
+      "verified": "live",
+      "api": "indices.delete"
+    },
+    {
+      "id": "api.index",
+      "category": "index_api",
+      "construct": "index (one document)",
+      "outcome": "supported",
+      "note": "Upserts by id. `refresh=true` / `wait_for` makes it searchable on return.",
+      "verified": "live",
+      "api": "index"
+    },
+    {
+      "id": "api.bulk",
+      "category": "index_api",
+      "construct": "bulk / helpers.bulk",
+      "outcome": "partial",
+      "note": "index, create and update (partial `doc` merge) actions.",
+      "divergence": "`delete` actions are not applied: each comes back as an item error with status 501.",
+      "verified": "live",
+      "api": "bulk"
+    },
+    {
+      "id": "api.get",
+      "category": "index_api",
+      "construct": "get, mget",
+      "outcome": "partial",
+      "note": "A one-hit search per id, so it sees what search sees.",
+      "divergence": "A missing document returns `found: false` instead of raising NotFoundError.",
+      "verified": "live",
+      "api": "get"
+    },
+    {
+      "id": "api.count",
+      "category": "index_api",
+      "construct": "count",
+      "outcome": "partial",
+      "note": "Counts the documents matching the query, exactly.",
+      "divergence": "Without a query (or with `match_all`) it counts 0, for the reason in the `match_all` row; pass `{\"query\": {\"bool\": {\"filter\": [{\"match_all\": {}}]}}}` to count every document.",
+      "verified": "live",
+      "api": "count"
+    },
+    {
+      "id": "api.msearch",
+      "category": "index_api",
+      "construct": "msearch",
+      "outcome": "supported",
+      "note": "Runs as one search per body, in order; a failed search becomes an error item and the others still run.",
+      "verified": "live",
+      "api": "msearch"
+    },
+    {
+      "id": "api.search",
+      "category": "index_api",
+      "construct": "search",
+      "outcome": "supported",
+      "note": "The translator described by every row above; the response has the OpenSearch shape.",
+      "verified": "live",
+      "api": "search"
+    },
+    {
+      "id": "api.update",
+      "category": "index_api",
+      "construct": "update (doc)",
+      "outcome": "partial",
+      "note": "Merges the partial `doc` into the stored document.",
+      "divergence": "`script`, `upsert` and `doc_as_upsert` are not interpreted.",
+      "verified": "live",
+      "api": "update"
+    },
+    {
+      "id": "api.delete_by_query",
+      "category": "index_api",
+      "construct": "delete_by_query",
+      "outcome": "supported",
+      "note": "The query must translate as a filter; a text query is refused rather than over-deleting.",
+      "verified": "live",
+      "api": "delete_by_query"
+    },
+    {
+      "id": "api.update_by_query",
+      "category": "index_api",
+      "construct": "update_by_query, tasks.get",
+      "outcome": "partial",
+      "note": "Runs synchronously, or as a task polled with `tasks.get`.",
+      "divergence": "Only simple assignments (`ctx._source.f = 'v'` or another field) and `params.<map>[_did]` lookups are understood; other Painless is refused. Tasks live in the client process.",
+      "verified": "live",
+      "api": "update_by_query"
+    },
+    {
+      "id": "api.scroll",
+      "category": "index_api",
+      "construct": "scroll, clear_scroll",
+      "outcome": "rejected",
+      "note": "`scroll` raises NotImplementedError; walk results with `search_after` (or from / size). `clear_scroll` is a no-op.",
+      "rejected_by": "client",
+      "verified": "live",
+      "api": "scroll"
+    },
+    {
+      "id": "api.ping",
+      "category": "index_api",
+      "construct": "ping",
+      "outcome": "supported",
+      "note": "True when the server answers.",
+      "verified": "live",
+      "api": "ping"
+    },
+    {
+      "id": "api.not_implemented",
+      "category": "index_api",
+      "construct": "delete (by id), exists, create, reindex, aliases, point in time, ...",
+      "outcome": "rejected",
+      "note": "Not on KoshaClient (AttributeError). There is no delete by id (`delete_by_query` takes a filter on fields, not `_id`); copy indices with scripts/copy_es_to_kosha.py.",
+      "rejected_by": "client",
+      "verified": "client",
+      "api": "not_implemented"
+    }
+  ]
+}

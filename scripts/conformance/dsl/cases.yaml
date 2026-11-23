@@ -1,0 +1,951 @@
+# OpenSearch / Elasticsearch DSL compatibility cases.
+#
+# Every row of docs/compat/opensearch.{md,json} comes from one case here.
+# scripts/conformance/dsl/run.py translates each `es_body` with kosha-client
+# (Python), sends the result to a live server's native /v1 API and checks the
+# declared outcome before it writes the matrix, so the matrix cannot claim
+# what the code does not do. Edit this file, then run `make compat-matrix`.
+#
+# Fields:
+#   id          unique, stable; shown in the matrix
+#   category    query | filter | aggregation | sort | paging | body_key | index_api
+#   construct   what the row is about, as a reader would search for it
+#   kinds       registry entries this case covers: query/filter clause kinds,
+#               aggregation types and top-level body keys (see the registries
+#               at the top of clients/python/kosha_client/client.py), or the
+#               client method for index_api. Each kind must appear as a key
+#               in es_body. tests/test_dsl_registry.py checks that every
+#               registered kind has a case.
+#   outcome     supported | partial | rejected
+#   note        one or two sentences for the matrix
+#   divergence  required for partial: how the result differs from
+#               Elasticsearch; the runner checks it where it can (`expect`)
+#   es_body     the search body (DSL categories)
+#   api         index_api only: the client method, checked by a function in
+#               run.py (API_CHECKS)
+#   rejected_by client (default: KoshaRequestError 400 "unsupported by
+#               Kosha", nothing sent) or server (translated, server answers 4xx)
+#   live        false: checked at translation only (needs something CI does
+#               not have, such as an embedding model); `live_reason` says why
+#   expect      extra checks, all optional:
+#                 translated: {dotted.path: value}   the translated native body
+#                 translated_absent: [dotted.path]
+#                 hits / min_hits / max_hits: total_hits bounds
+#                 response_nonempty: [dotted.path]   in the /v1 response
+#                 hits_where: {field: value}         every hit has field == value
+#                 distinct: field                    no two hits share field
+#                 oracle: false                      skip the reference-model
+#                                                    comparison
+#
+# The corpus is scripts/conformance/corpus.py (seed 1): Text title/body over
+# the vocabulary w0000..w1499, Keyword status/owner/tags, Integer priority
+# (1-12), Float amount, Date filed, Boolean archived, plus an 8-dim Vector
+# `emb` added by the runner. A translated body without `fields`, phrase,
+# wildcard, kNN or aggregations is also compared exactly (ids, totals, BM25
+# scores) against the reference model in scripts/conformance/oracle.py.
+
+# ─── Query DSL ──────────────────────────────────────────────────────────────
+
+- id: query.match_all
+  category: query
+  construct: match_all alone, or no query
+  kinds: [match_all]
+  outcome: partial
+  es_body: {query: {match_all: {}}}
+  note: Inside a bool next to other clauses it adds nothing, as in Elasticsearch.
+  divergence: >-
+    On its own (and likewise a body with no `query`) it matches no
+    documents, so aggregations over it are empty too: the translator drops
+    it, and a Kosha search with neither query text nor a filter matches
+    nothing. Write it as a filter, `{"bool": {"filter": [{"match_all": {}}]}}`,
+    to match every document.
+  expect: {hits: 0, oracle: false}
+
+- id: query.match_all.as_filter
+  category: query
+  construct: "match_all as a bool filter (match every document)"
+  kinds: [match_all, bool]
+  outcome: supported
+  es_body: {query: {bool: {filter: [{match_all: {}}]}}}
+  note: Matches every document; the way to list or aggregate over a whole index.
+  expect:
+    translated: {filter.bool.must.0.match_all: {}}
+    hits: 400
+
+- id: query.match
+  category: query
+  construct: match
+  kinds: [match]
+  outcome: supported
+  es_body: {query: {match: {title: w0001}}}
+  note: The field restricts the search (Kosha `fields`). `operator` defaults to `or`, as in Elasticsearch.
+  expect:
+    translated: {query_text: w0001, operator: or, fields: [title]}
+    min_hits: 1
+
+- id: query.match.operator_and
+  category: query
+  construct: match with operator and
+  kinds: [match]
+  outcome: supported
+  es_body: {query: {match: {body: {query: w0000 w0001, operator: and}}}}
+  note: Every term must match.
+  expect:
+    translated: {operator: and}
+    min_hits: 1
+
+- id: query.match.boost
+  category: query
+  construct: match with boost
+  kinds: [match]
+  outcome: supported
+  es_body: {query: {bool: {should: [{match: {title: {query: w0002, boost: 3}}}, {match: {body: w0002}}]}}}
+  note: The same text in several fields is one Kosha query over those fields, each keeping its boost (`title^3`).
+  expect:
+    translated: {query_text: w0002, fields: ["title^3", body]}
+    min_hits: 1
+
+- id: query.match.unsupported_options
+  category: query
+  construct: match with fuzziness, minimum_should_match, analyzer, ...
+  kinds: [match]
+  outcome: rejected
+  es_body: {query: {match: {body: {query: w0001, fuzziness: AUTO}}}}
+  note: Only `query`, `operator` and `boost` are understood. Any other option is refused rather than ignored.
+
+- id: query.multi_match
+  category: query
+  construct: multi_match (best_fields, most_fields, cross_fields)
+  kinds: [multi_match]
+  outcome: partial
+  es_body: {query: {multi_match: {query: w0003, fields: ["title^2", body]}}}
+  note: Field boosts are kept.
+  divergence: >-
+    Every type is scored as `most_fields`: the sum of each field's boosted
+    BM25. The matching documents are the same; the ranking differs from
+    `best_fields` (the default) and `cross_fields`.
+  expect:
+    translated: {query_text: w0003, fields: ["title^2", body]}
+    min_hits: 1
+
+- id: query.multi_match.all_fields
+  category: query
+  construct: multi_match over every field (`*`, `_all`)
+  kinds: [multi_match]
+  outcome: supported
+  es_body: {query: {multi_match: {query: w0004 w0005, fields: ["*"]}}}
+  note: Searches every Text field.
+  expect:
+    translated_absent: [fields]
+
+- id: query.multi_match.phrase_type
+  category: query
+  construct: multi_match type phrase, phrase_prefix, bool_prefix
+  kinds: [multi_match]
+  outcome: rejected
+  es_body: {query: {multi_match: {query: w0000 w0001, type: phrase, fields: [title]}}}
+  note: Use `match_phrase` per field instead.
+
+- id: query.match_phrase
+  category: query
+  construct: match_phrase (with slop)
+  kinds: [match_phrase]
+  outcome: supported
+  es_body: {query: {match_phrase: {title: {query: w0000 w0001, slop: 1}}}}
+  note: The same phrase in several fields (a bool should) searches any of them.
+  expect:
+    translated: {match_phrase.field: title, match_phrase.phrase: w0000 w0001, match_phrase.slop: 1}
+    min_hits: 1
+
+- id: query.match_phrase.two_phrases
+  category: query
+  construct: two different phrases in one query
+  kinds: [match_phrase]
+  outcome: rejected
+  es_body: {query: {bool: {must: [{match_phrase: {title: w0000 w0001}}, {match_phrase: {body: w0002 w0003}}]}}}
+  note: A Kosha query holds one phrase.
+
+- id: query.wildcard
+  category: query
+  construct: wildcard
+  kinds: [wildcard]
+  outcome: partial
+  es_body: {query: {wildcard: {status: "w00*"}}}
+  note: One wildcard per query, with `*` and `?`.
+  divergence: >-
+    The field is not applied: the pattern matches terms of every Text field,
+    and keyword fields are never matched (this case names the keyword
+    `status` and matches body text). Case-insensitive unless the clause sets
+    `case_insensitive: false`; Elasticsearch is case-sensitive by default.
+    Known engine bug: the part of a pattern before its first `*` is not
+    anchored, so `op*` also matches `co-op`.
+  expect:
+    translated: {wildcard.field: status, wildcard.pattern: "w00*", wildcard.case_insensitive: true}
+    min_hits: 1
+
+- id: query.knn
+  category: query
+  construct: knn (vector, k, num_candidates, filter)
+  kinds: [knn]
+  outcome: supported
+  es_body: {size: 5, query: {knn: {emb: {vector: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5], k: 5, filter: {term: {status: open}}}}}}
+  note: The filter runs inside the vector search, so a filtered search still returns up to k hits.
+  expect:
+    translated: {knn.field: emb, knn.k: 5}
+    min_hits: 1
+    max_hits: 5
+    hits_where: {status: open}
+
+- id: query.knn.query_text
+  category: query
+  construct: knn with query_text (server-side embedding)
+  kinds: [knn]
+  outcome: supported
+  es_body: {query: {knn: {emb: {query_text: breach of contract, k: 10}}}}
+  note: The server embeds the text with the model the namespace schema declares for the field (native embedding).
+  live: false
+  live_reason: needs an embedding model configured on the server
+  expect:
+    translated: {knn.query_text: breach of contract}
+    translated_absent: [knn.vector]
+
+- id: query.function_score
+  category: query
+  construct: function_score
+  kinds: [function_score]
+  outcome: partial
+  es_body: {query: {function_score: {query: {multi_match: {query: w0006, fields: ["*"]}}, functions: [{field_value_factor: {field: priority}}], boost_mode: multiply}}}
+  note: The inner query is translated as usual.
+  divergence: >-
+    `functions`, `boost_mode` and `score_mode` are ignored: hits are the
+    inner query's, ranked by plain BM25.
+
+- id: query.bool
+  category: query
+  construct: bool with must and filter
+  kinds: [bool]
+  outcome: supported
+  es_body: {query: {bool: {must: [{multi_match: {query: w0007, fields: ["*"]}}], filter: [{term: {status: open}}]}}}
+  note: Required text plus a filter tree.
+
+- id: query.bool.optional_should
+  category: query
+  construct: bool should next to must (score-only clauses)
+  kinds: [bool]
+  outcome: partial
+  es_body: {query: {bool: {must: [{multi_match: {query: w0008, fields: ["*"]}}], should: [{term: {status: open}}]}}}
+  note: Optional clauses never change which documents match, in Elasticsearch or in Kosha.
+  divergence: >-
+    The optional clauses are dropped, so they do not raise the score of the
+    documents that also match them.
+  expect:
+    translated_absent: [filter]
+
+- id: query.bool.should_text
+  category: query
+  construct: bool should over text (at least one)
+  kinds: [bool]
+  outcome: supported
+  es_body: {query: {bool: {should: [{multi_match: {query: w0009, fields: ["*"]}}, {multi_match: {query: w0010, fields: ["*"]}}]}}}
+  note: One Kosha query with operator `or`.
+  expect:
+    translated: {query_text: w0009 w0010, operator: or}
+
+- id: query.bool.must_not_text
+  category: query
+  construct: bool must_not over text
+  kinds: [bool]
+  outcome: rejected
+  es_body: {query: {bool: {must: [{match: {title: w0000}}], must_not: [{match: {body: w0001}}]}}}
+  note: Only a filter can be negated; Kosha has no "text must not match".
+
+- id: query.bool.text_or_filter
+  category: query
+  construct: bool should mixing text and filters
+  kinds: [bool]
+  outcome: rejected
+  es_body: {query: {bool: {should: [{match: {title: w0000}}, {term: {status: open}}], minimum_should_match: 1}}}
+  note: Text OR a filter has no Kosha equivalent.
+
+- id: query.bool.msm_over_text
+  category: query
+  construct: bool minimum_should_match > 1 over text
+  kinds: [bool]
+  outcome: rejected
+  es_body: {query: {bool: {should: [{match: {title: w0000}}, {match: {title: w0001}}, {match: {title: w0002}}], minimum_should_match: 2}}}
+  note: "Use `operator: and` when every term is required."
+
+- id: query.term_level
+  category: query
+  construct: term, terms, range, exists, prefix in query context
+  kinds: [term]
+  outcome: partial
+  es_body: {query: {term: {status: closed}}}
+  note: The clause runs as a Kosha filter and matches the same documents.
+  divergence: >-
+    Hits get a small length-normalised constant score instead of
+    Elasticsearch's term score (or constant 1.0), so ties are ordered
+    differently.
+  expect:
+    translated: {filter.term.status: closed, query_text: ""}
+
+- id: query.nested
+  category: query
+  construct: nested, has_child, has_parent
+  outcome: rejected
+  es_body: {query: {nested: {path: comments, query: {match: {comments.text: w0000}}}}}
+  note: Kosha has no nested documents; an object field's leaves are indexed under dotted paths instead.
+
+- id: query.query_string
+  category: query
+  construct: query_string, simple_query_string
+  outcome: rejected
+  es_body: {query: {query_string: {query: "title:w0000 AND body:w0001"}}}
+  note: Rewrite as match / bool clauses.
+
+- id: query.fuzzy
+  category: query
+  construct: fuzzy, regexp, match_phrase_prefix, match_bool_prefix
+  outcome: rejected
+  es_body: {query: {fuzzy: {title: w0000}}}
+  note: No fuzzy or regular-expression matching.
+
+- id: query.ids
+  category: query
+  construct: ids, and term / terms / prefix on _id
+  outcome: rejected
+  es_body: {query: {ids: {values: [d000001]}}}
+  note: Use `client.get` / `client.mget` to fetch by id.
+
+- id: query.constant_score
+  category: query
+  construct: constant_score, dis_max, boosting
+  outcome: rejected
+  es_body: {query: {constant_score: {filter: {term: {status: open}}}}}
+  note: Put the clause in a bool `filter` instead.
+
+- id: query.script_score
+  category: query
+  construct: script_score, script, more_like_this, span_*, intervals
+  outcome: rejected
+  es_body: {query: {script_score: {query: {match_all: {}}, script: {source: "1"}}}}
+  note: No scripting, similarity or positional span queries.
+
+- id: query.geo_distance
+  category: query
+  construct: geo_distance, geo_bounding_box, geo_shape
+  outcome: rejected
+  es_body: {query: {bool: {filter: [{geo_distance: {distance: 10km, location: {lat: 40.0, lon: -70.0}}}]}}}
+  note: Not translated by the client, although the native /v1 filter has geo_distance; send a native body for geo search.
+
+# ─── Filters (bool filter context) ──────────────────────────────────────────
+
+- id: filter.term
+  category: filter
+  construct: term
+  kinds: [term, bool]
+  outcome: supported
+  es_body: {query: {bool: {filter: [{term: {status: open}}]}}}
+  note: Values compare as strings; booleans become "true"/"false".
+
+- id: filter.term.boolean
+  category: filter
+  construct: term on a boolean
+  kinds: [term, bool]
+  outcome: supported
+  es_body: {query: {bool: {filter: [{term: {archived: true}}]}}}
+  note: "`true` is sent as \"true\", the way the client stores booleans."
+  expect:
+    translated: {filter.bool.must.0.term.archived: "true"}
+
+- id: filter.term.id
+  category: filter
+  construct: term / terms / prefix on _id
+  kinds: [term, bool]
+  outcome: rejected
+  es_body: {query: {bool: {filter: [{term: {_id: d000001}}]}}}
+  note: Document ids are not filterable; use `client.get` / `client.mget`.
+
+- id: filter.terms
+  category: filter
+  construct: terms
+  kinds: [terms, bool]
+  outcome: supported
+  es_body: {query: {bool: {filter: [{terms: {owner: [owner01, owner02]}}]}}}
+  note: Matches any value; a multi-valued field matches if any of its values does.
+
+- id: filter.terms.multivalued
+  category: filter
+  construct: terms on a multi-valued keyword
+  kinds: [terms, bool]
+  outcome: supported
+  es_body: {query: {bool: {filter: [{terms: {tags: [sealed, exhibit]}}]}}}
+  note: A document matches if any of its values is listed.
+
+- id: filter.range.numeric
+  category: filter
+  construct: range on a number (gt, gte, lt, lte)
+  kinds: [range, bool]
+  outcome: supported
+  es_body: {query: {bool: {filter: [{range: {priority: {gte: 3, lt: 6}}}]}}}
+  note: Numeric on Integer and Float fields.
+
+- id: filter.range.date
+  category: filter
+  construct: range on a date
+  kinds: [range, bool]
+  outcome: supported
+  es_body: {query: {bool: {filter: [{range: {filed: {gte: "2020-01-01", lte: "2022-12-31"}}}]}}}
+  note: ISO-8601 dates compare chronologically.
+
+- id: filter.range.options
+  category: filter
+  construct: range with format, time_zone, relation
+  kinds: [range, bool]
+  outcome: partial
+  es_body: {query: {bool: {filter: [{range: {filed: {gte: "2020-01-01", format: yyyy-MM-dd, time_zone: "+05:00"}}}]}}}
+  note: The bounds are applied.
+  divergence: >-
+    `format`, `time_zone` and `relation` are dropped: bounds are compared as
+    given, with no date math or time-zone shift. Any other option is refused.
+  expect:
+    translated: {filter.bool.must.0.range.filed: {gte: "2020-01-01"}}
+
+- id: filter.exists
+  category: filter
+  construct: exists
+  kinds: [exists, bool]
+  outcome: supported
+  es_body: {query: {bool: {filter: [{exists: {field: tags}}]}}}
+  note: Matches documents that have the field.
+  expect: {min_hits: 1}
+
+- id: filter.prefix
+  category: filter
+  construct: prefix (short and long form, case_insensitive)
+  kinds: [prefix, bool]
+  outcome: supported
+  es_body: {query: {bool: {filter: [{prefix: {owner: {value: OWNER0, case_insensitive: true}}}]}}}
+  note: Case-sensitive by default, as in Elasticsearch. `boost` and `rewrite` are ignored; other options are refused.
+  expect:
+    translated: {filter.bool.must.0.prefix.owner.case_insensitive: true}
+    min_hits: 1
+
+- id: filter.match_all
+  category: filter
+  construct: match_all as a filter
+  kinds: [match_all, bool]
+  outcome: supported
+  es_body: {query: {bool: {must: [{multi_match: {query: w0011, fields: ["*"]}}], filter: [{match_all: {}}]}}}
+  note: A no-op next to other clauses.
+
+- id: filter.bool
+  category: filter
+  construct: nested bool (must, filter, must_not, should)
+  kinds: [bool, term, range, terms]
+  outcome: supported
+  es_body:
+    query:
+      bool:
+        filter:
+          - bool:
+              must_not: [{term: {status: withdrawn}}]
+              should: [{range: {priority: {gte: 10}}}, {terms: {owner: [owner00, owner03]}}]
+  note: >-
+    Any depth. `should` follows Elasticsearch: required (at least one) when
+    the bool has no must/filter, optional otherwise.
+
+- id: filter.bool.msm_percent
+  category: filter
+  construct: minimum_should_match as a percentage or combination
+  kinds: [bool, term]
+  outcome: rejected
+  es_body: {query: {bool: {filter: [{bool: {should: [{term: {status: open}}, {term: {status: closed}}], minimum_should_match: "75%"}}]}}}
+  note: Only an integer count.
+
+- id: filter.unsupported
+  category: filter
+  construct: nested, regexp, wildcard, script, geo_* as filters
+  outcome: rejected
+  es_body: {query: {bool: {filter: [{regexp: {status: "op.*"}}]}}}
+  note: Refused, never dropped; dropping a filter would return documents the caller excluded.
+
+# ─── Aggregations ───────────────────────────────────────────────────────────
+
+- id: aggregation.terms
+  category: aggregation
+  construct: terms
+  kinds: [terms, aggs]
+  outcome: supported
+  es_body: {size: 0, query: {bool: {filter: [{exists: {field: status}}]}}, aggs: {by_status: {terms: {field: status}}}}
+  note: Buckets over keyword values.
+  expect:
+    response_nonempty: [aggregations.by_status.buckets]
+
+- id: aggregation.terms.metric_sub
+  category: aggregation
+  construct: metric sub-aggregations under a bucket aggregation
+  kinds: [terms, max, avg]
+  outcome: supported
+  es_body: {size: 0, query: {bool: {filter: [{exists: {field: status}}]}}, aggs: {by_status: {terms: {field: status}, aggs: {top_amount: {max: {field: amount}}, mean_priority: {avg: {field: priority}}}}}}
+  note: min, max, sum, avg and value_count can be nested under terms, composite, histogram and date_histogram.
+  expect:
+    response_nonempty: [aggregations.by_status.buckets]
+
+- id: aggregation.bucket_sub
+  category: aggregation
+  construct: bucket sub-aggregations (terms under terms, ...)
+  kinds: [terms]
+  outcome: rejected
+  es_body: {size: 0, query: {bool: {filter: [{exists: {field: status}}]}}, aggs: {by_status: {terms: {field: status}, aggs: {by_owner: {terms: {field: owner}}}}}}
+  note: Refused rather than ignored; the caller would read buckets that are not there.
+
+- id: aggregation.composite
+  category: aggregation
+  construct: composite
+  kinds: [composite]
+  outcome: partial
+  es_body: {size: 0, query: {bool: {filter: [{exists: {field: status}}]}}, aggs: {pairs: {composite: {size: 10, sources: [{st: {terms: {field: status}}}]}}}}
+  note: Paginate with `after`.
+  divergence: "`size` is required; Elasticsearch defaults it to 10."
+  expect:
+    response_nonempty: [aggregations.pairs.buckets]
+
+- id: aggregation.composite.no_size
+  category: aggregation
+  construct: composite without size
+  kinds: [composite]
+  outcome: rejected
+  rejected_by: server
+  es_body: {size: 0, query: {bool: {filter: [{exists: {field: status}}]}}, aggs: {pairs: {composite: {sources: [{st: {terms: {field: status}}}]}}}}
+  note: The server answers 400 (missing field `size`).
+
+- id: aggregation.histogram
+  category: aggregation
+  construct: histogram
+  kinds: [histogram]
+  outcome: supported
+  es_body: {size: 0, query: {bool: {filter: [{exists: {field: status}}]}}, aggs: {prio: {histogram: {field: priority, interval: 4}}}}
+  note: Numeric buckets.
+  expect:
+    response_nonempty: [aggregations.prio.buckets]
+
+- id: aggregation.date_histogram
+  category: aggregation
+  construct: date_histogram (calendar_interval, fixed_interval, time_zone, bounds)
+  kinds: [date_histogram]
+  outcome: supported
+  es_body: {size: 0, query: {bool: {filter: [{exists: {field: status}}]}}, aggs: {per_year: {date_histogram: {field: filed, calendar_interval: year}}}}
+  note: Options are passed through to the server.
+  expect:
+    response_nonempty: [aggregations.per_year.buckets]
+
+- id: aggregation.cardinality
+  category: aggregation
+  construct: cardinality
+  kinds: [cardinality]
+  outcome: supported
+  es_body: {size: 0, query: {bool: {filter: [{exists: {field: status}}]}}, aggs: {owners: {cardinality: {field: owner}}}}
+  note: Top level only; it takes no sub-aggregations.
+  expect:
+    response_nonempty: [aggregations.owners]
+
+- id: aggregation.metrics
+  category: aggregation
+  construct: min, max, sum, avg, value_count
+  kinds: [min, max, sum, avg, value_count]
+  outcome: supported
+  es_body: {size: 0, query: {bool: {filter: [{exists: {field: status}}]}}, aggs: {lo: {min: {field: priority}}, hi: {max: {field: priority}}, total: {sum: {field: amount}}, mean: {avg: {field: amount}}, n: {value_count: {field: status}}}}
+  note: Single-value metrics.
+  expect:
+    response_nonempty: [aggregations.lo.value, aggregations.hi.value, aggregations.n.value]
+
+- id: aggregation.unsupported
+  category: aggregation
+  construct: stats, percentiles, top_hits, filter(s), range, significant_terms, nested, ...
+  outcome: rejected
+  es_body: {size: 0, query: {bool: {filter: [{exists: {field: status}}]}}, aggs: {s: {stats: {field: amount}}}}
+  note: Any other aggregation type is refused by name.
+
+# ─── Sort ───────────────────────────────────────────────────────────────────
+
+- id: sort.field
+  category: sort
+  construct: sort by a field (asc / desc, string or object form)
+  kinds: [sort]
+  outcome: supported
+  es_body: {query: {bool: {filter: [{range: {priority: {gte: 1}}}]}}, sort: [{priority: {order: desc}}, {owner: asc}]}
+  note: Numeric fields sort numerically, others as strings; ties break by `_id`.
+  expect:
+    translated: {sort: [{priority: {order: desc}}, {owner: {order: asc}}]}
+
+- id: sort.score_and_id
+  category: sort
+  construct: sort by _score and _id
+  kinds: [sort]
+  outcome: supported
+  es_body: {query: {multi_match: {query: w0012, fields: ["*"]}}, sort: [{_score: desc}, {_id: asc}]}
+  note: "`_score` sorts by BM25; `_id` sorts by document id."
+
+- id: sort.doc
+  category: sort
+  construct: sort by _doc
+  kinds: [sort]
+  outcome: partial
+  es_body: {query: {bool: {filter: [{range: {priority: {gte: 1}}}]}}, sort: [_doc]}
+  note: Stable, so it still walks a result set exactly once.
+  divergence: "`_doc` (index order) becomes `_id` ascending."
+  expect:
+    translated: {sort: [{_id: {order: asc}}]}
+
+- id: sort.options
+  category: sort
+  construct: sort with missing, mode, unmapped_type, nested
+  kinds: [sort]
+  outcome: partial
+  es_body: {query: {bool: {filter: [{range: {priority: {gte: 1}}}]}}, sort: [{tags: {order: asc, missing: _last, mode: min}}]}
+  note: Field and order are applied.
+  divergence: >-
+    The other options are dropped: a document without the field sorts first,
+    and a multi-valued field sorts by its first value.
+  expect:
+    translated: {sort: [{tags: {order: asc}}]}
+
+# ─── Paging and totals ──────────────────────────────────────────────────────
+
+- id: paging.from_size
+  category: paging
+  construct: from / size
+  kinds: [from, size]
+  outcome: supported
+  es_body: {query: {bool: {filter: [{range: {priority: {gte: 1}}}]}}, from: 20, size: 15, sort: [{_id: asc}]}
+  note: Offset paging.
+
+- id: paging.search_after
+  category: paging
+  construct: search_after
+  kinds: [search_after]
+  outcome: supported
+  es_body: {query: {bool: {filter: [{range: {priority: {gte: 1}}}]}}, size: 10, sort: [{_id: asc}], search_after: [d000100]}
+  note: Cursor paging; values are sent as strings and `from` is reset to 0.
+
+- id: paging.track_total_hits
+  category: paging
+  construct: track_total_hits (true or a number)
+  kinds: [track_total_hits]
+  outcome: supported
+  es_body: {query: {multi_match: {query: w0000, fields: ["*"]}}, size: 1, track_total_hits: 50}
+  note: "`true` counts exactly; a number caps the count, and `total.relation` reports whether it was reached. Without it the server's default cap applies."
+  expect:
+    translated: {total_hits_cap: 50}
+    oracle: false
+
+# ─── Top-level search body keys ─────────────────────────────────────────────
+
+- id: body_key.query
+  category: body_key
+  construct: query
+  kinds: [query]
+  outcome: supported
+  es_body: {query: {multi_match: {query: w0013, fields: ["*"]}}}
+  note: See the query DSL and filter rows.
+
+- id: body_key.knn
+  category: body_key
+  construct: top-level knn
+  kinds: [knn]
+  outcome: supported
+  es_body: {size: 3, knn: {emb: {vector: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8], k: 3}}}
+  note: The older top-level form; the same as `query.knn`.
+  expect:
+    min_hits: 1
+    max_hits: 3
+
+- id: body_key.post_filter
+  category: body_key
+  construct: post_filter
+  kinds: [post_filter]
+  outcome: partial
+  es_body: {size: 0, query: {bool: {filter: [{exists: {field: status}}]}}, post_filter: {term: {status: open}}, aggs: {by_status: {terms: {field: status}}}}
+  note: The hits are the same as in Elasticsearch.
+  divergence: >-
+    It is merged into the main filter, so aggregations are computed over the
+    post-filtered hits too; Elasticsearch computes them before post_filter.
+  expect:
+    translated: {filter.bool.must.1.term.status: open}
+    response_len: {aggregations.by_status.buckets: 1}
+
+- id: body_key.aggs
+  category: body_key
+  construct: aggs / aggregations
+  kinds: [aggregations]
+  outcome: supported
+  es_body: {size: 0, query: {bool: {filter: [{exists: {field: status}}]}}, aggregations: {by_status: {terms: {field: status}}}}
+  note: Both spellings; sent as Kosha `aggs`. See the aggregation rows.
+  expect:
+    response_nonempty: [aggregations.by_status.buckets]
+
+- id: body_key.source
+  category: body_key
+  construct: _source (false, a field list, includes / excludes)
+  kinds: [_source]
+  outcome: supported
+  es_body: {query: {multi_match: {query: w0014, fields: ["*"]}}, _source: {includes: [title, status]}}
+  note: Filters the stored fields returned with each hit.
+  expect:
+    translated: {source_includes: [title, status]}
+    min_hits: 1
+    oracle: false
+
+- id: body_key.highlight
+  category: body_key
+  construct: highlight
+  kinds: [highlight]
+  outcome: partial
+  es_body: {query: {match: {title: w0000}}, highlight: {pre_tags: ["<b>"], post_tags: ["</b>"], fields: {title: {number_of_fragments: 2}}}}
+  note: Every listed field is highlighted with its own or the top-level tags.
+  divergence: >-
+    Other highlighter options (`number_of_fragments`, `fragment_size`,
+    `type`, ...) are dropped; they change only the markup, never which
+    documents match.
+  expect:
+    translated: {highlight.fields.title: {}, highlight.pre_tags: ["<b>"]}
+    min_hits: 1
+    response_nonempty: [results.0.highlight.title]
+
+- id: body_key.collapse
+  category: body_key
+  construct: collapse
+  kinds: [collapse]
+  outcome: supported
+  es_body: {query: {multi_match: {query: w0000, fields: ["*"]}}, collapse: {field: status}, size: 10}
+  note: One hit per value of the field. `inner_hits` and `max_concurrent_group_searches` are refused.
+  expect:
+    min_hits: 1
+    distinct: status
+    oracle: false
+
+- id: body_key.request_cache
+  category: body_key
+  construct: request_cache
+  kinds: [request_cache]
+  outcome: supported
+  es_body: {query: {multi_match: {query: w0015, fields: ["*"]}}, request_cache: false}
+  note: "`false` bypasses Kosha's response cache (`no_cache`)."
+  expect:
+    translated: {no_cache: true}
+
+- id: body_key.rerank
+  category: body_key
+  construct: rerank (Kosha extension)
+  kinds: [rerank]
+  outcome: supported
+  es_body: {query: {match: {title: w0000}}, rerank: {provider: cohere, model: rerank-v3.5, field: body, top_n: 20}}
+  note: Not Elasticsearch DSL. Asks the server to rerank the top hits with an external model; see `KoshaClient.rerank_spec`.
+  live: false
+  live_reason: needs a rerank provider configured on the server
+  expect:
+    translated: {rerank.provider: cohere, rerank.field: body}
+
+- id: body_key.min_score
+  category: body_key
+  construct: min_score
+  outcome: partial
+  es_body: {query: {multi_match: {query: w0000, fields: ["*"]}}, min_score: 50}
+  note: Not sent to Kosha.
+  divergence: Ignored without an error; hits below the threshold are returned.
+  expect:
+    translated_absent: [min_score]
+    min_hits: 1
+
+- id: body_key.ignored
+  category: body_key
+  construct: suggest, rescore, script_fields, terminate_after, timeout, explain, profile, ...
+  outcome: partial
+  es_body: {query: {multi_match: {query: w0016, fields: ["*"]}}, suggest: {s: {text: w0016, term: {field: title}}}, rescore: {window_size: 10, query: {rescore_query: {match: {body: w0001}}}}, terminate_after: 1}
+  note: Not sent to Kosha.
+  divergence: >-
+    Every top-level key not listed above is ignored without an error: no
+    suggestions, no rescoring, no early termination.
+  expect:
+    translated_absent: [suggest, rescore, terminate_after]
+
+# ─── Index and document APIs (KoshaClient methods) ──────────────────────────
+
+- id: api.indices.create
+  category: index_api
+  construct: indices.create (with mappings)
+  kinds: [indices.create]
+  api: indices.create
+  outcome: partial
+  note: Creates the namespace (`POST /v1/namespaces`); plain mapping types become the namespace schema.
+  divergence: >-
+    `settings` are ignored (no shards, replicas or refresh interval), and
+    object, nested and multi-field mappings are left out of the schema. A
+    text field's `analyzer` is passed through, and the server refuses a name
+    it does not have (language analyzers, custom analyzers) with a 400.
+
+- id: api.indices.exists
+  category: index_api
+  construct: indices.exists
+  kinds: [indices.exists]
+  api: indices.exists
+  outcome: supported
+  note: True when every named namespace exists.
+
+- id: api.indices.get_mapping
+  category: index_api
+  construct: indices.get_mapping, indices.get
+  kinds: [indices.get_mapping, indices.get]
+  api: indices.get_mapping
+  outcome: supported
+  note: The schema's fields with ES types; a namespace without a schema has empty properties. Fields are never guessed.
+
+- id: api.indices.get_settings
+  category: index_api
+  construct: indices.get_settings
+  kinds: [indices.get_settings]
+  api: indices.get_settings
+  outcome: partial
+  note: Returns the index name.
+  divergence: Nothing else is reported; Kosha has no shard, replica or refresh settings.
+
+- id: api.indices.put_mapping
+  category: index_api
+  construct: indices.put_mapping, indices.put_settings
+  kinds: [indices.put_mapping, indices.put_settings]
+  api: indices.put_mapping
+  outcome: partial
+  note: Acknowledged.
+  divergence: A no-op; the schema is unchanged. Set the schema when creating the namespace.
+
+- id: api.indices.refresh
+  category: index_api
+  construct: indices.refresh
+  kinds: [indices.refresh]
+  api: indices.refresh
+  outcome: supported
+  note: Makes every write searchable now (a flush).
+
+- id: api.indices.flush
+  category: index_api
+  construct: indices.flush, indices.close
+  kinds: [indices.flush, indices.close]
+  api: indices.flush
+  outcome: partial
+  note: Acknowledged.
+  divergence: Both are no-ops; use `indices.refresh` to make writes searchable.
+
+- id: api.indices.delete
+  category: index_api
+  construct: indices.delete
+  kinds: [indices.delete]
+  api: indices.delete
+  outcome: supported
+  note: Deletes the namespace and its data. `ignore_unavailable` and `ignore=404` are honoured.
+
+- id: api.index
+  category: index_api
+  construct: index (one document)
+  kinds: [index]
+  api: index
+  outcome: supported
+  note: Upserts by id. `refresh=true` / `wait_for` makes it searchable on return.
+
+- id: api.bulk
+  category: index_api
+  construct: bulk / helpers.bulk
+  kinds: [bulk]
+  api: bulk
+  outcome: partial
+  note: index, create and update (partial `doc` merge) actions.
+  divergence: "`delete` actions are not applied: each comes back as an item error with status 501."
+
+- id: api.get
+  category: index_api
+  construct: get, mget
+  kinds: [get, mget]
+  api: get
+  outcome: partial
+  note: A one-hit search per id, so it sees what search sees.
+  divergence: "A missing document returns `found: false` instead of raising NotFoundError."
+
+- id: api.count
+  category: index_api
+  construct: count
+  kinds: [count]
+  api: count
+  outcome: partial
+  note: Counts the documents matching the query, exactly.
+  divergence: >-
+    Without a query (or with `match_all`) it counts 0, for the reason in the
+    `match_all` row; pass `{"query": {"bool": {"filter": [{"match_all": {}}]}}}`
+    to count every document.
+
+- id: api.msearch
+  category: index_api
+  construct: msearch
+  kinds: [msearch]
+  api: msearch
+  outcome: supported
+  note: Runs as one search per body, in order; a failed search becomes an error item and the others still run.
+
+- id: api.search
+  category: index_api
+  construct: search
+  kinds: [search]
+  api: search
+  outcome: supported
+  note: The translator described by every row above; the response has the OpenSearch shape.
+
+- id: api.update
+  category: index_api
+  construct: update (doc)
+  kinds: [update]
+  api: update
+  outcome: partial
+  note: Merges the partial `doc` into the stored document.
+  divergence: "`script`, `upsert` and `doc_as_upsert` are not interpreted."
+
+- id: api.delete_by_query
+  category: index_api
+  construct: delete_by_query
+  kinds: [delete_by_query]
+  api: delete_by_query
+  outcome: supported
+  note: The query must translate as a filter; a text query is refused rather than over-deleting.
+
+- id: api.update_by_query
+  category: index_api
+  construct: update_by_query, tasks.get
+  kinds: [update_by_query, tasks.get]
+  api: update_by_query
+  outcome: partial
+  note: Runs synchronously, or as a task polled with `tasks.get`.
+  divergence: >-
+    Only simple assignments (`ctx._source.f = 'v'` or another field) and
+    `params.<map>[_did]` lookups are understood; other Painless is refused.
+    Tasks live in the client process.
+
+- id: api.scroll
+  category: index_api
+  construct: scroll, clear_scroll
+  kinds: [scroll, clear_scroll]
+  api: scroll
+  outcome: rejected
+  note: "`scroll` raises NotImplementedError; walk results with `search_after` (or from / size). `clear_scroll` is a no-op."
+
+- id: api.ping
+  category: index_api
+  construct: ping
+  kinds: [ping]
+  api: ping
+  outcome: supported
+  note: True when the server answers.
+
+- id: api.not_implemented
+  category: index_api
+  construct: delete (by id), exists, create, reindex, aliases, point in time, ...
+  api: not_implemented
+  outcome: rejected
+  note: Not on KoshaClient (AttributeError). There is no delete by id (`delete_by_query` takes a filter on fields, not `_id`); copy indices with scripts/copy_es_to_kosha.py.

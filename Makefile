@@ -9,9 +9,10 @@
 #   make rust-test        — run Rust tests
 #   make rust-build       — build Rust binary
 #   make cli-assets       — kosha shell completions + man pages into target/cli-assets
-#   make client-python-test — run Python client unit tests
+#   make client-python-test — run Python client unit tests (+ the copy script smoke test)
 #   make bench-hook-test   — run commit_bench_section.sh regression tests
-#   make migration-job-manifest — regen the ES→Kosha staging backfill Job YAML
+#   make migration-job-manifest MIGRATION_INDICES="a b" — regen the ES→Kosha backfill Job YAML
+#   make compat-matrix    — regen docs/compat/opensearch.{md,json} (KOSHA_BIN=... runs it live)
 #   make all              — lint + gen + build + test
 #
 
@@ -74,17 +75,34 @@ client-python-publish:
 	python -m twine upload clients/python/dist/*
 
 client-python-test:
-	python -m pip install -e clients/python pytest
-	python -m pytest clients/python/tests/ -q
+	python -m pip install -e clients/python pytest pyyaml
+	python -m pytest clients/python/tests/ scripts/tests/ -q
 
 # ── ES → Kosha migration ───────────────────────────────────────────────────
 
 .PHONY: migration-job-manifest
 
-# Regenerate the self-contained staging backfill manifest (ConfigMap with the
-# copy script embedded + Job) after changing scripts/copy_es_to_kosha.py.
+# Regenerate the staging backfill Job manifest (it runs `kosha-server migrate`;
+# see k8s/README.md). The index names belong to the deployment, not the repo:
+#   make migration-job-manifest MIGRATION_INDICES="my_index other_index"
 migration-job-manifest:
-	python3 scripts/gen_es_migration_job.py > k8s/stage/es-to-kosha-migration-job.yaml
+	@test -n "$(MIGRATION_INDICES)" || { echo 'set MIGRATION_INDICES="<index> [<index> ...]"' >&2; exit 1; }
+	python3 scripts/gen_es_migration_job.py $(foreach i,$(MIGRATION_INDICES),--index $(i)) > k8s/stage/es-to-kosha-migration-job.yaml
+
+# ── OpenSearch / Elasticsearch compatibility matrix ────────────────────────
+
+.PHONY: compat-matrix
+
+# Regenerate docs/compat/opensearch.{md,json} from scripts/conformance/dsl/cases.yaml.
+# With KOSHA_BIN (a kosha-server binary) every case also runs against a live
+# server, as CI does; without it only the client-side translation is checked.
+# Needs PyYAML (pip install pyyaml).
+compat-matrix:
+ifdef KOSHA_BIN
+	python3 scripts/conformance/dsl/run.py --spawn $(KOSHA_BIN)
+else
+	python3 scripts/conformance/dsl/run.py --offline
+endif
 
 # ── Rust ───────────────────────────────────────────────────────────────────
 
