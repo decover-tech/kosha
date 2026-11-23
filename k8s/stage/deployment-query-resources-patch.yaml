@@ -69,27 +69,45 @@ spec:
           env:
             # Overrides the ConfigMap's 40GiB value (see comment above) —
             # explicit container env wins over envFrom on key collision.
-            # ~20GiB leaves ~12GiB of the 32Gi limit for process baseline +
-            # concurrent per-request working memory, so the cache evicts
-            # gracefully instead of the pod getting OOMKilled.
+            # 16GiB (SC). The idle parsed-segment cache and the decoded
+            # vector postings cache (C = 4GiB, below) both count toward the
+            # live watermark (W = 20GiB, below). At SC 20 + C 4 = 24 > W the
+            # idle caches alone exceeded W: the segment cache never evicted
+            # on its own and every loading search fell into the synchronous
+            # admission-path eviction. SC 16 + C 4 = 20 = W fits; the RAM
+            # bound W + C = 24GiB of the 32Gi limit is unchanged. Cost: 4GiB
+            # less room for parsed segments.
             - name: KOSHA_SEGMENT_CACHE_MAX_BYTES
-              value: "21474836480"
+              value: "17179869184"
             # ~24GiB on-disk cache budget, well under the 40Gi
             # ephemeral-storage limit (see comment above) — the cache's own
             # LRU eviction is what should bite first, not a pod eviction.
             - name: KOSHA_CACHE_MAX_BYTES
               value: "25769803776"
-            # Live-bytes watermark (cache-resident + pinned by in-flight
-            # searches — see kosha_query::MemoryLedger). Must be set
-            # explicitly here: the code default is 2× the cache budget
-            # (40GiB), which exceeds the 32Gi container limit. 24GiB leaves
-            # ~8GiB of the limit for process baseline + working memory of
-            # the (KOSHA_MAX_CONCURRENT_SEARCHES, default 8) concurrent
-            # scoring passes. Same 24GiB figure as KOSHA_CACHE_MAX_BYTES
-            # above by coincidence, not by coupling — that one bounds disk
-            # (emptyDir/ephemeral-storage), this one bounds RAM.
+            # Live-bytes watermark W (cache-resident + pinned by in-flight
+            # searches + decoded postings — see kosha_query::MemoryLedger).
+            # Must be set explicitly here: the code default is 2× the cache
+            # budget (32GiB), which is the whole 32Gi container limit.
+            # 20GiB, not 24GiB, because decoded vector postings (C below)
+            # inserted after a search is admitted are not reserved by the
+            # ledger, so live can pass W by up to C: worst case
+            # W + C = 20 + 4 = 24GiB of the 32Gi limit, leaving ~8GiB for
+            # process baseline + working memory of the
+            # (KOSHA_MAX_CONCURRENT_SEARCHES, default 8) concurrent scoring
+            # passes. Unrelated to KOSHA_CACHE_MAX_BYTES above, which bounds
+            # disk (ephemeral-storage); this one bounds RAM.
             - name: KOSHA_SEGMENT_LIVE_MAX_BYTES
-              value: "25769803776"
+              value: "21474836480"
+            # Decoded vector postings C: one LRU for the whole process (all
+            # segments together), 4GiB; counted in W above. The code default
+            # is 512MiB. A posting decodes to ~435KB here, so the cache
+            # holds ~4GiB / 435KB ≈ 9,870 postings, and its second-touch
+            # window is the same size: one 489K-chunk query (1,610 probes,
+            # ~700MB) and one 1.8M-chunk query (~5,950 probes, ~2.6GB) each
+            # fit and are cached on their second run; a probe set larger
+            # than the cache is not admitted (it could only churn).
+            - name: KOSHA_VECTOR_POSTINGS_CACHE_MAX_BYTES
+              value: "4294967296"
             # Readiness-gated prefetch of the scoring scaffolding
             # (footer.json + inverted.idx + doc_store.offsets) for every
             # segment in the manifest, hydrated with

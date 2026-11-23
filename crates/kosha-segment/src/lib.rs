@@ -4635,7 +4635,7 @@ pub struct LazyInvertedIndex {
     data: Vec<u8>,
     term_count: usize,
     /// Decoded-postings LRU — see [`PostingsCache`].
-    cache: PostingsCache<Arc<Vec<Posting>>>,
+    cache: PostingsCache<usize, Arc<Vec<Posting>>>,
 }
 
 pub struct SplitInvertedIndex {
@@ -4643,12 +4643,12 @@ pub struct SplitInvertedIndex {
     segment_dir: PathBuf,
     term_count: usize,
     encoding: SplitPostingsEncoding,
-    cache: PostingsCache<Arc<Vec<Posting>>>,
+    cache: PostingsCache<usize, Arc<Vec<Posting>>>,
     /// v5 (skip-split) only: per-term scoring views (skip table + raw
     /// scoring/positions bytes, block-decoded on demand) — cached
     /// separately from full decodes because the WAND read path never
     /// materializes `Vec<Posting>` at all. Same admission/LRU policy.
-    scoring_cache: PostingsCache<Arc<BlockedTermPostings>>,
+    scoring_cache: PostingsCache<usize, Arc<BlockedTermPostings>>,
     /// Set when a term the TOC *contains* could not be served because its
     /// posting-blob shard failed to read or decode (evicted from the disk
     /// cache, truncated, corrupt). Distinguishes "term absent" (a normal
@@ -4802,21 +4802,25 @@ fn postings_cache_max_bytes() -> usize {
     })
 }
 
-/// Per-segment byte budget for the decoded *vector* postings LRU
-/// (`KOSHA_VECTOR_POSTINGS_CACHE_MAX_BYTES`, default 32 MiB, `0` disables).
-/// Larger default than the text budget above because a kNN query's working
-/// set is `nprobe` whole postings of `dim`-wide f32 vectors — at realistic
-/// embedding dimensionality a single posting runs hundreds of KiB, so a
-/// text-sized budget would thrash. Aggregate residency across segments is
-/// still bounded by the ledger watermark (entries report to the same
-/// [`PostingsMemoryAccount`]), not by this per-segment cap alone.
+/// Process-wide byte budget for decoded *vector* postings
+/// (`KOSHA_VECTOR_POSTINGS_CACHE_MAX_BYTES`, default 512 MiB, `0` disables).
+///
+/// One budget for every open segment, not one per segment: a kNN query's
+/// working set is hundreds of whole postings of `dim`-wide vectors (a
+/// compacted segment's postings decode to over a GB), so a per-segment cap
+/// large enough to help multiplied by the number of open vector segments
+/// had no bound at all. [`shared_vector_cache`] holds every segment's
+/// entries in one LRU under this budget, so the hottest postings across all
+/// segments stay and resident decoded vector postings never exceed it.
+/// Entries also report to the segment's [`PostingsMemoryAccount`], so they
+/// count toward the query pod's live-bytes watermark.
 fn vector_postings_cache_max_bytes() -> usize {
     static BUDGET: OnceLock<usize> = OnceLock::new();
     *BUDGET.get_or_init(|| {
         std::env::var("KOSHA_VECTOR_POSTINGS_CACHE_MAX_BYTES")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(32 * 1024 * 1024)
+            .unwrap_or(512 * 1024 * 1024)
     })
 }
 
@@ -4838,7 +4842,9 @@ pub trait PostingsMemoryAccount: Send + Sync {
     fn release_postings(&self, bytes: u64);
 }
 
-/// Small per-segment LRU of decoded postings, keyed by term-table index.
+type SharedAccount = Arc<dyn PostingsMemoryAccount + Send + Sync>;
+
+/// Small LRU of decoded postings.
 ///
 /// The lazy v2 format trades resident memory for a per-query decode — the
 /// right trade for the vocabulary at large, but a hot query term ("the")
@@ -4846,98 +4852,215 @@ pub trait PostingsMemoryAccount: Send + Sync {
 /// expanding to thousands of terms re-decodes a big slice of the index per
 /// query. Caching the *decoded form of recently-queried terms only* keeps
 /// the v1 warm-path amortization for exactly the hot subset, while the
-/// cold/open/resident wins of the lazy format stand: the budget is a few
-/// MiB per segment (see [`postings_cache_max_bytes`]), not the whole
-/// vocabulary.
+/// cold/open/resident wins of the lazy format stand: the text budget is a
+/// few MiB per segment (see [`postings_cache_max_bytes`]), not the whole
+/// vocabulary. Text caches are per segment, keyed by term-table index; the
+/// vector cache is one per process (see [`shared_vector_cache`]).
 ///
 /// Entries are `Arc`s, so a hit is a pointer clone and eviction never
 /// invalidates postings an in-flight query still holds. Approximate entry
 /// cost: `count × size_of::<Posting>()` + 4 bytes per position.
 ///
-/// Resident bytes are reported to the optional [`PostingsMemoryAccount`]
-/// (insert adds, evict and drop release), so a fleet of open segments'
-/// aggregate decoded postings counts toward the query pod's live-bytes
-/// watermark — bounded by admission, not just the per-segment cap here.
-struct PostingsCache<V> {
+/// Every operation is O(1) amortized under the one lock: a hit re-stamps
+/// the entry and appends to [`StampedFifo`] instead of searching the
+/// recency order, so a warm kNN query that hits thousands of postings does
+/// not pay a scan of the cache per hit.
+///
+/// Resident bytes are reported to each entry's [`PostingsMemoryAccount`]
+/// (insert adds, evict and drop release), so aggregate decoded postings
+/// count toward the query pod's live-bytes watermark.
+struct PostingsCache<K, V> {
     max_bytes: usize,
-    state: Mutex<PostingsCacheState<V>>,
-    account: Option<Arc<dyn PostingsMemoryAccount + Send + Sync>>,
+    /// Boxed: a segment embeds three text caches, and inline state would
+    /// make `InvertedAccess`'s variants lopsided.
+    state: Box<Mutex<PostingsCacheState<K, V>>>,
+    /// Account for [`Self::insert`]; the shared vector cache has none and
+    /// takes each segment's account per entry ([`Self::insert_for`]).
+    account: Option<SharedAccount>,
 }
 
-struct PostingsCacheState<V> {
-    entries: HashMap<usize, (V, usize)>,
-    recency: VecDeque<usize>,
+struct CacheEntry<V> {
+    value: V,
+    bytes: usize,
+    /// This entry's latest stamp in [`PostingsCacheState::recency`].
+    stamp: u64,
+    account: Option<SharedAccount>,
+}
+
+struct PostingsCacheState<K, V> {
+    entries: HashMap<K, CacheEntry<V>>,
+    recency: StampedFifo<K>,
     total_bytes: usize,
-    /// Recently-missed term indices (bounded ring) for second-touch
-    /// admission — see [`PostingsCache::admit_on_miss`].
-    recent_misses: VecDeque<usize>,
+    /// Keys missed recently and not yet admitted, with their stamp in
+    /// `miss_order` — the second-touch history ("ghost list"), see
+    /// [`PostingsCache::admit_on_miss_within`].
+    misses: HashMap<K, u64>,
+    miss_order: StampedFifo<K>,
 }
 
-/// Capacity of the second-touch admission ring. Big enough to remember a
-/// realistic hot working set between queries; small enough that a wildcard
-/// blast writing thousands of one-shot entries through it costs nothing.
-const POSTINGS_CACHE_MISS_RING: usize = 256;
+/// Keys in the order they were last stamped. Re-stamping a key appends it
+/// again instead of moving it, and the older position is skipped when it
+/// reaches the front (its stamp no longer matches the owner's), so a touch
+/// is O(1) and the order is exact LRU. Stale positions are dropped in one
+/// pass once they outnumber the live ones, which keeps the queue under
+/// `2 × live + 64` and the compaction cost amortized O(1) per touch.
+struct StampedFifo<K> {
+    queue: VecDeque<(K, u64)>,
+    next: u64,
+}
 
-impl<V> Default for PostingsCacheState<V> {
-    fn default() -> Self {
+impl<K: Copy> StampedFifo<K> {
+    fn new() -> Self {
         Self {
-            entries: HashMap::new(),
-            recency: VecDeque::new(),
-            total_bytes: 0,
-            recent_misses: VecDeque::new(),
+            queue: VecDeque::new(),
+            next: 0,
+        }
+    }
+
+    /// Append `key` as the most recent; returns its new stamp.
+    fn stamp(&mut self, key: K) -> u64 {
+        let stamp = self.next;
+        self.next += 1;
+        self.queue.push_back((key, stamp));
+        stamp
+    }
+
+    /// Remove and return the least recently stamped key that is still
+    /// current (`current(key)` is its latest stamp, `None` once gone).
+    fn pop_oldest(&mut self, current: impl Fn(&K) -> Option<u64>) -> Option<K> {
+        while let Some((key, stamp)) = self.queue.pop_front() {
+            if current(&key) == Some(stamp) {
+                return Some(key);
+            }
+        }
+        None
+    }
+
+    /// Drop stale positions once they outnumber the `live` current ones.
+    fn compact(&mut self, live: usize, current: impl Fn(&K) -> Option<u64>) {
+        if self.queue.len() > 2 * live + 64 {
+            self.queue
+                .retain(|(key, stamp)| current(key) == Some(*stamp));
         }
     }
 }
 
-impl<V: Clone> PostingsCache<V> {
-    fn new(
-        max_bytes: usize,
-        account: Option<Arc<dyn PostingsMemoryAccount + Send + Sync>>,
-    ) -> Self {
+/// Capacity of the text caches' second-touch history. Big enough to
+/// remember a realistic hot working set between queries; small enough that
+/// a wildcard blast writing thousands of one-shot entries through it costs
+/// nothing.
+const POSTINGS_CACHE_MISS_RING: usize = 256;
+
+/// Upper bound on the vector cache's second-touch history (see
+/// [`PostingsCache::vector_miss_window`]): 2^18 keys, ~20 MiB of map and
+/// queue at the worst case of tiny postings and a large budget.
+const VECTOR_MISS_WINDOW_MAX: usize = 1 << 18;
+
+impl<K: Copy + Eq + std::hash::Hash, V: Clone> PostingsCache<K, V> {
+    fn new(max_bytes: usize, account: Option<SharedAccount>) -> Self {
         Self {
             max_bytes,
-            state: Mutex::new(PostingsCacheState::default()),
+            state: Box::new(Mutex::new(PostingsCacheState {
+                entries: HashMap::new(),
+                recency: StampedFifo::new(),
+                total_bytes: 0,
+                misses: HashMap::new(),
+                miss_order: StampedFifo::new(),
+            })),
             account,
         }
     }
 
-    fn get(&self, term_index: usize) -> Option<V> {
+    /// The cached value for `key`, marking it most recently used.
+    fn get(&self, key: K) -> Option<V> {
         if self.max_bytes == 0 {
             return None;
         }
-        let mut st = self.state.lock().unwrap();
-        let hit = st.entries.get(&term_index).map(|(p, _)| p.clone());
-        if hit.is_some() {
-            if let Some(pos) = st.recency.iter().position(|k| *k == term_index) {
-                st.recency.remove(pos);
-            }
-            st.recency.push_back(term_index);
-        }
-        hit
+        let mut guard = self.state.lock().unwrap();
+        let st = &mut *guard;
+        let entry = st.entries.get_mut(&key)?;
+        entry.stamp = st.recency.stamp(key);
+        let hit = entry.value.clone();
+        let entries = &st.entries;
+        st.recency
+            .compact(entries.len(), |k| entries.get(k).map(|e| e.stamp));
+        Some(hit)
+    }
+
+    /// Whether `key` is cached, without touching its recency.
+    fn contains(&self, key: K) -> bool {
+        self.max_bytes != 0 && self.state.lock().unwrap().entries.contains_key(&key)
+    }
+
+    /// Second-touch admission for the text caches: see
+    /// [`Self::admit_on_miss_within`], with a history of
+    /// [`POSTINGS_CACHE_MISS_RING`] keys.
+    fn admit_on_miss(&self, key: K) -> bool {
+        self.admit_on_miss_within(key, POSTINGS_CACHE_MISS_RING)
     }
 
     /// Second-touch admission, recorded on a cache miss: returns whether
-    /// this term was *already* missed recently (→ caller should cache the
-    /// decode), and remembers the miss either way.
+    /// `key` was *already* missed within the last `window` distinct missed
+    /// keys (→ the caller should cache the decode), and remembers the miss
+    /// either way. O(1) amortized.
     ///
     /// Why not cache every decode: a wildcard query expanding to thousands
-    /// of terms would write its entire one-shot working set through the
-    /// cache each time — evicting the genuinely hot terms and paying
-    /// insert/evict churn for entries that are never reused. Requiring a
-    /// second miss within the ring's horizon filters exactly that traffic:
-    /// hot query terms recur and get admitted on their second lookup;
-    /// wildcard blasts pass through without disturbing anything.
-    fn admit_on_miss(&self, term_index: usize) -> bool {
-        let mut st = self.state.lock().unwrap();
-        if let Some(pos) = st.recent_misses.iter().position(|k| *k == term_index) {
-            st.recent_misses.remove(pos);
+    /// of terms, or a kNN probe of a namespace scanned once, would write
+    /// its entire one-shot working set through the cache each time —
+    /// evicting the genuinely hot entries and paying insert/evict churn
+    /// for entries that are never reused. Requiring a second miss within
+    /// the window filters exactly that traffic: recurring keys get
+    /// admitted on their second lookup; one-shot ones age out of the
+    /// history without disturbing anything.
+    fn admit_on_miss_within(&self, key: K, window: usize) -> bool {
+        let mut guard = self.state.lock().unwrap();
+        let st = &mut *guard;
+        if st.misses.remove(&key).is_some() {
             return true;
         }
-        if st.recent_misses.len() >= POSTINGS_CACHE_MISS_RING {
-            st.recent_misses.pop_front();
+        let stamp = st.miss_order.stamp(key);
+        st.misses.insert(key, stamp);
+        while st.misses.len() > window {
+            let misses = &st.misses;
+            match st.miss_order.pop_oldest(|k| misses.get(k).copied()) {
+                Some(oldest) => {
+                    st.misses.remove(&oldest);
+                }
+                None => break,
+            }
         }
-        st.recent_misses.push_back(term_index);
+        let misses = &st.misses;
+        st.miss_order
+            .compact(misses.len(), |k| misses.get(k).copied());
         false
+    }
+
+    /// The vector cache's second-touch window: as many keys as the budget
+    /// holds entries of the current mean size (`estimate` bytes while the
+    /// cache is empty), between [`POSTINGS_CACHE_MISS_RING`] and
+    /// [`VECTOR_MISS_WINDOW_MAX`].
+    ///
+    /// This is a 2Q-style ghost list sized to the cache's own reach. A
+    /// posting missed again before that many other postings were missed
+    /// would also have stayed resident had it been cached, so it is
+    /// admitted — however many postings one query probes, and however
+    /// many segments share the cache. A posting that recurs only after
+    /// more misses than the cache can hold would be evicted before its
+    /// reuse anyway (one query probing more than the budget holds, run
+    /// again: the LRU loop), so it is not admitted and does not churn.
+    /// A fixed 256-key window admitted nothing once one query probed more
+    /// than 256 postings (1,610 per segment on staging), and every warm
+    /// query re-read and re-decoded ~700 MB.
+    fn vector_miss_window(&self, estimate: usize) -> usize {
+        let mean = {
+            let st = self.state.lock().unwrap();
+            if st.entries.is_empty() {
+                estimate
+            } else {
+                st.total_bytes / st.entries.len()
+            }
+        };
+        (self.max_bytes / mean.max(1)).clamp(POSTINGS_CACHE_MISS_RING, VECTOR_MISS_WINDOW_MAX)
     }
 
     /// Whether [`Self::insert`] would keep an entry of `bytes` at all.
@@ -4945,7 +5068,12 @@ impl<V: Clone> PostingsCache<V> {
         self.max_bytes != 0 && bytes <= self.max_bytes
     }
 
-    fn insert(&self, term_index: usize, postings: V, bytes: usize) {
+    fn insert(&self, key: K, value: V, bytes: usize) {
+        self.insert_for(key, value, bytes, self.account.as_ref());
+    }
+
+    /// [`Self::insert`] charging `account` for the entry's bytes.
+    fn insert_for(&self, key: K, value: V, bytes: usize, account: Option<&SharedAccount>) {
         // An entry bigger than the whole budget would evict everything and
         // then itself churn on every query — don't cache it at all.
         if !self.accepts(bytes) {
@@ -4958,64 +5086,116 @@ impl<V: Clone> PostingsCache<V> {
         // "cache locks may be held while taking the ledger lock, never the
         // reverse." Reporting outside the cache lock keeps that direction
         // clean and avoids any reentrancy if `add_postings` ever touches
-        // the same segment's cache.
-        let to_add: u64 = bytes as u64;
-        let mut to_release: Vec<u64> = Vec::new();
+        // the same cache. Evicted entries are freed out there too: one
+        // insert can evict many postings, and every kNN worker of every
+        // segment waits on this lock.
+        let mut gone: Vec<CacheEntry<V>> = Vec::new();
         {
-            let mut st = self.state.lock().unwrap();
-            match st.entries.insert(term_index, (postings, bytes)) {
-                None => {
-                    st.recency.push_back(term_index);
-                    st.total_bytes += bytes;
-                }
-                Some((_, old_bytes)) => {
-                    // Replacing an existing entry: its old resident bytes
-                    // were previously reported as added; release them, and
-                    // the new bytes get added below.
-                    st.total_bytes = st.total_bytes - old_bytes + bytes;
-                    to_release.push(old_bytes as u64);
-                }
+            let mut guard = self.state.lock().unwrap();
+            let st = &mut *guard;
+            let stamp = st.recency.stamp(key);
+            let entry = CacheEntry {
+                value,
+                bytes,
+                stamp,
+                account: account.cloned(),
+            };
+            if let Some(old) = st.entries.insert(key, entry) {
+                // Replacing an entry: release its bytes, add the new ones.
+                st.total_bytes -= old.bytes;
+                gone.push(old);
             }
+            st.total_bytes += bytes;
             while st.total_bytes > self.max_bytes {
-                let Some(oldest) = st.recency.pop_front() else {
+                let entries = &st.entries;
+                let Some(oldest) = st.recency.pop_oldest(|k| entries.get(k).map(|e| e.stamp))
+                else {
                     break;
                 };
-                if let Some((_, size)) = st.entries.remove(&oldest) {
-                    st.total_bytes -= size;
-                    to_release.push(size as u64);
+                if let Some(evicted) = st.entries.remove(&oldest) {
+                    st.total_bytes -= evicted.bytes;
+                    gone.push(evicted);
                 }
             }
+            let entries = &st.entries;
+            st.recency
+                .compact(entries.len(), |k| entries.get(k).map(|e| e.stamp));
         }
-        if let Some(account) = &self.account {
-            for r in &to_release {
-                account.release_postings(*r);
-            }
-            if to_add > 0 {
-                account.add_postings(to_add);
-            }
+        release_and_free(gone);
+        if let Some(account) = account {
+            account.add_postings(bytes as u64);
+        }
+    }
+
+    /// Remove every entry whose key `doomed` selects, releasing its bytes
+    /// to its account. O(entries) under the lock; the entries are freed
+    /// after it is released (a segment's postings can be thousands of
+    /// allocations, and this runs from `SegmentReader::drop`). Remembered misses are left to age out
+    /// of their bounded window: purging them would cost a pass over up to
+    /// [`VECTOR_MISS_WINDOW_MAX`] keys under the lock every kNN shares.
+    fn remove_where(&self, doomed: impl Fn(&K) -> bool) {
+        let removed = {
+            // Reachable from `Drop`: a poisoned lock must not panic there.
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let st = &mut *guard;
+            let removed: Vec<CacheEntry<V>> = st
+                .entries
+                .extract_if(|key, _| doomed(key))
+                .map(|(_, entry)| entry)
+                .collect();
+            st.total_bytes -= removed.iter().map(|entry| entry.bytes).sum::<usize>();
+            let entries = &st.entries;
+            st.recency
+                .compact(entries.len(), |k| entries.get(k).map(|e| e.stamp));
+            removed
+        };
+        release_and_free(removed);
+    }
+
+    /// Bytes held by the entries `selected` picks. O(entries).
+    fn resident_bytes_where(&self, selected: impl Fn(&K) -> bool) -> usize {
+        let st = self.state.lock().unwrap();
+        st.entries
+            .iter()
+            .filter(|(key, _)| selected(key))
+            .map(|(_, entry)| entry.bytes)
+            .sum()
+    }
+}
+
+/// Free entries taken out of a cache, then release their bytes with one
+/// call per distinct account (dropping thousands of entries notifies the
+/// ledger once). Call with the cache lock released.
+fn release_and_free<V>(gone: Vec<CacheEntry<V>>) {
+    let mut totals: Vec<(SharedAccount, u64)> = Vec::new();
+    for entry in gone {
+        let Some(account) = entry.account else {
+            continue;
+        };
+        match totals.iter_mut().find(|(a, _)| Arc::ptr_eq(a, &account)) {
+            Some((_, total)) => *total += entry.bytes as u64,
+            None => totals.push((account, entry.bytes as u64)),
+        }
+    }
+    for (account, total) in totals {
+        if total > 0 {
+            account.release_postings(total);
         }
     }
 }
 
-impl<V> Drop for PostingsCache<V> {
+impl<K, V> Drop for PostingsCache<K, V> {
     fn drop(&mut self) {
-        // Release whatever this segment's postings cache still holds to the
-        // live-bytes account, so `MemoryLedger::live` stays truthful as the
-        // owning `SegmentReader` (and its caches) go away — see the trait
-        // doc. Snapshot under the lock, report outside (same lock-order
-        // discipline as `insert`).
-        let total: u64 = self
-            .state
-            .lock()
-            .unwrap()
-            .total_bytes
-            .try_into()
-            .unwrap_or(0);
-        if total > 0 {
-            if let Some(account) = &self.account {
-                account.release_postings(total);
-            }
-        }
+        // Release whatever this cache still holds to the live-bytes
+        // accounts, so `MemoryLedger::live` stays truthful as the owning
+        // `SegmentReader` (and its caches) go away — see the trait doc.
+        // Taken under the lock, reported outside it (same lock-order
+        // discipline as `insert_for`).
+        let gone: Vec<CacheEntry<V>> = {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.entries.drain().map(|(_, entry)| entry).collect()
+        };
+        release_and_free(gone);
     }
 }
 
@@ -7081,17 +7261,21 @@ pub struct SegmentReader {
     /// The segment's vector columns (#204), empty unless opened with
     /// `load_vectors`. Each is loaded on first use.
     vector_slots: Vec<VectorFieldSlot>,
-    /// Decoded vector postings LRU shared by every column, keyed by
-    /// `(slot, range index)` — the vector twin of the text path's
-    /// per-segment [`PostingsCache`]. Without it every kNN query re-reads
-    /// and re-decodes its `nprobe` candidate postings from `vector.idx`,
-    /// even when the segment itself is warm in the `SegmentCache` —
-    /// hydration I/O + decode was the dominant warm-path cost. Entries are
-    /// `Arc`s (hit = pointer clone) and resident bytes report to the same
-    /// live-bytes account as text postings. One cache per segment keeps
-    /// `KOSHA_VECTOR_POSTINGS_CACHE_MAX_BYTES` a per-segment budget however
-    /// many columns there are.
-    vector_cache: PostingsCache<SharedVectorPosting>,
+    /// Decoded vector postings LRU: the process-wide
+    /// [`shared_vector_cache`], keyed by `(vector_cache_owner, slot, range
+    /// index)` — the vector twin of the text path's per-segment
+    /// [`PostingsCache`]. Without it every kNN query re-reads and
+    /// re-decodes its `nprobe` candidate postings from `vector.idx`, even
+    /// when the segment itself is warm in the `SegmentCache` — hydration
+    /// I/O + decode was the dominant warm-path cost. Entries are `Arc`s
+    /// (hit = pointer clone) and resident bytes report to
+    /// `postings_account`, the same live-bytes account as text postings.
+    /// This segment's entries leave the cache when it drops.
+    vector_cache: Arc<VectorPostingsCache>,
+    /// This reader's part of the vector cache's key, unique per process.
+    vector_cache_owner: u64,
+    /// Live-bytes account this segment's vector cache entries report to.
+    postings_account: Option<SharedAccount>,
     /// Parsed `doc_vectors.bin` header, loaded on first doc-record read of a
     /// segment whose footer sets `doc_vectors` (#243). Only success is
     /// cached: the file may be hydrated after the segment was opened.
@@ -7129,9 +7313,45 @@ pub fn vector_rescore_factor() -> usize {
 
 const DEFAULT_VECTOR_RESCORE_FACTOR: usize = 4;
 
-/// Posting-cache key for `range_idx` of the column at `slot`.
-fn vector_cache_key(slot: u32, range_idx: usize) -> usize {
-    ((slot as u64) << 32 | range_idx as u64) as usize
+/// Decoded vector postings of every open segment, under one budget (see
+/// [`vector_postings_cache_max_bytes`]).
+type VectorPostingsCache = PostingsCache<(u64, usize), SharedVectorPosting>;
+
+/// The process-wide vector postings cache every [`SegmentReader`] uses.
+fn shared_vector_cache() -> Arc<VectorPostingsCache> {
+    static CACHE: OnceLock<Arc<VectorPostingsCache>> = OnceLock::new();
+    Arc::clone(
+        CACHE.get_or_init(|| Arc::new(PostingsCache::new(vector_postings_cache_max_bytes(), None))),
+    )
+}
+
+/// A new [`SegmentReader::vector_cache_owner`].
+fn next_vector_cache_owner() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+impl SegmentReader {
+    /// Vector cache key for `range_idx` of the column at `slot`.
+    fn vector_cache_key(&self, slot: u32, range_idx: usize) -> (u64, usize) {
+        (
+            self.vector_cache_owner,
+            ((slot as u64) << 32 | range_idx as u64) as usize,
+        )
+    }
+}
+
+impl Drop for SegmentReader {
+    fn drop(&mut self) {
+        // The shared cache outlives this reader: take its entries (and
+        // their live bytes) out with it. O(entries), so skipped for the
+        // (many) readers opened without vectors, which never insert.
+        if self.vector_slots.is_empty() {
+            return;
+        }
+        let owner = self.vector_cache_owner;
+        self.vector_cache.remove_where(|(o, _)| *o == owner);
+    }
 }
 
 impl SegmentReader {
@@ -7203,7 +7423,9 @@ impl SegmentReader {
             inverted: Self::read_inverted(&segment_dir, postings_account.clone(), posting_spans)?,
             filters,
             vector_slots,
-            vector_cache: PostingsCache::new(vector_postings_cache_max_bytes(), postings_account),
+            vector_cache: shared_vector_cache(),
+            vector_cache_owner: next_vector_cache_owner(),
+            postings_account,
             doc_vectors: Mutex::new(None),
             field_lengths: Mutex::new(HashMap::new()),
             vector_rescore_factor: vector_rescore_factor(),
@@ -7307,7 +7529,8 @@ impl SegmentReader {
     /// Bytes the decoded vector-posting cache holds right now (#210
     /// measurement; also what it reports to the live-bytes account).
     pub fn vector_cache_resident_bytes(&self) -> usize {
-        self.vector_cache.state.lock().unwrap().total_bytes
+        let owner = self.vector_cache_owner;
+        self.vector_cache.resident_bytes_where(|(o, _)| *o == owner)
     }
 
     /// The vector columns `footer` declares, or the single unnamed legacy
@@ -7849,7 +8072,7 @@ impl SegmentReader {
     ) -> Result<(), KoshaError> {
         let vi = scan.vi;
         let centroid = vi.centroid(range_idx);
-        let key = vector_cache_key(vi.slot, range_idx);
+        let key = self.vector_cache_key(vi.slot, range_idx);
         let mut clock = scan.clock();
         if let Some(hit) = self.vector_cache.get(key) {
             hit.for_each_similarity(scan.accept, f32_similarity, &scan.probe, centroid, emit);
@@ -7873,11 +8096,13 @@ impl SegmentReader {
                 ))
             })?;
         scan.stats.read_nanos += lap_nanos(&mut clock);
-        // Second-touch admission, same as text postings: one-shot probes
-        // (a cold namespace scanned once) pass through without evicting a
-        // hot working set; recurring probes get cached on their second
-        // hydration.
-        let admit = self.vector_cache.admit_on_miss(key);
+        // Second-touch admission, as for text postings, over a history as
+        // long as the cache's reach (see `vector_miss_window`): one-shot
+        // probes (a cold namespace scanned once) pass through without
+        // evicting a hot working set; probes that recur across queries get
+        // cached on their second hydration, however many one query makes.
+        let window = self.vector_cache.vector_miss_window(bytes.len());
+        let admit = self.vector_cache.admit_on_miss_within(key, window);
         if !vi.quantized {
             let count = bytes.len() / vector_entry_size(vi.dim as u32, vi.version);
             let keep = admit
@@ -7903,7 +8128,12 @@ impl SegmentReader {
         let decoded = Arc::new(decode_posting_entries(bytes, vi.dim as u32, vi.version));
         if admit {
             let bytes = decoded.resident_bytes();
-            self.vector_cache.insert(key, Arc::clone(&decoded), bytes);
+            self.vector_cache.insert_for(
+                key,
+                Arc::clone(&decoded),
+                bytes,
+                self.postings_account.as_ref(),
+            );
         }
         scan.stats.decode_nanos += lap_nanos(&mut clock);
         decoded.for_each_similarity(scan.accept, f32_similarity, &scan.probe, centroid, emit);
@@ -7993,8 +8223,7 @@ impl SegmentReader {
                 || whole_len >= end
                 || self
                     .vector_cache
-                    .get(vector_cache_key(vi.slot, i))
-                    .is_some()
+                    .contains(self.vector_cache_key(vi.slot, i))
             {
                 continue;
             }
