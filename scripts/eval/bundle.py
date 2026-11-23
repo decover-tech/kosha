@@ -8,6 +8,18 @@ Needs kubectl access to the cluster; run it beside run_eval.py.
 `finish` adds events, pod and data state, each pod's local files, and writes
 analysis.md: errors and latency per pod, pod age when it failed, and what
 the server did for the slow and semantic requests.
+
+In-cluster follow (survives the laptop sleeping; k8s/collector.yaml):
+  apply      kubectl apply -k scripts/eval      starts following into /data/run
+  run start  optional, drops earlier logs; returns once collection restarted (~30 s):
+             kubectl -n kosha exec deploy/kosha-eval-collector -- sh -c 'rm -rf /data/old;
+               mv /data/run /data/old; rm -rf /data/old; until [ -e /data/run/started ]; do sleep 1; done'
+  run end    mkdir -p <dir> && kubectl -n kosha exec deploy/kosha-eval-collector -- \
+               tar cf - -C /data/run logs | tar xf - -C <dir>
+             bundle.py finish <dir> <samples.jsonl.gz>    on the laptop, as before
+  delete     kubectl delete -k scripts/eval      also deletes the saved logs
+Delete the collector after each run: it pins its node (do-not-disrupt), and at
+~100 MB/hour of logs under load its 5Gi volume fills in about 50 hours.
 """
 import collections
 import gzip
@@ -20,6 +32,7 @@ import time
 
 NS = "kosha"
 FIELD = re.compile(r"(\w+)=(\S+)")
+STAMP = re.compile(rb"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z ")
 
 
 def kubectl(*args, namespace=NS):
@@ -27,8 +40,12 @@ def kubectl(*args, namespace=NS):
                           capture_output=True, text=True).stdout
 
 
-def pods():
-    return [p for p in kubectl("get", "pods", "-o", "name").split() if "loader" not in p]
+def pods(with_phase=False):
+    """`pod/<name>` of every Kosha pod, or (`pod/<name>`, phase) pairs."""
+    out = kubectl("get", "pods", "-o", "jsonpath={range .items[*]}pod/{.metadata.name} {.status.phase}{'\\n'}{end}")
+    rows = [(r.split() + [""])[:2] for r in out.splitlines() if r.strip()]
+    rows = [(p, phase) for p, phase in rows if "loader" not in p and "eval-collector" not in p]
+    return rows if with_phase else [p for p, _ in rows]
 
 
 def last_time(path):
@@ -38,28 +55,42 @@ def last_time(path):
             f.seek(0, 2)
             f.seek(max(0, f.tell() - 8192))
             lines = f.read().splitlines()
-        return lines[-1].split(b" ", 1)[0].decode() if lines else None
+        # A line cut short (killed mid-write) has no usable timestamp.
+        stamps = [m.group().decode().strip() for m in map(STAMP.match, reversed(lines)) if m]
+        return stamps[0] if stamps else None
     except OSError:
         return None
 
 
 def follow(out):
     os.makedirs(f"{out}/logs", exist_ok=True)
-    tails = {}
-    while not os.path.exists(f"{out}/STOP"):
-        for pod in pods():
-            # A stream ends when the connection drops (tunnel, laptop sleep):
-            # restart it from the last saved line so the gap is filled.
-            if pod not in tails or tails[pod].poll() is not None:
+    # Pods with nothing saved yet are read from when collection first started,
+    # so a pod that appears mid-run (or is still Pending when first seen) keeps
+    # its startup lines. Kept in a file so a restarted follow uses the same time.
+    if not os.path.exists(f"{out}/started"):
+        open(f"{out}/started", "w").write(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    started = open(f"{out}/started").read().strip()
+    tails, finished = {}, set()
+    try:
+        # Stops on STOP, or when the logs dir is moved or deleted under it.
+        while os.path.isdir(f"{out}/logs") and not os.path.exists(f"{out}/STOP"):
+            for pod, phase in pods(with_phase=True):
+                # A stream ends when the connection drops (tunnel, laptop sleep):
+                # restart it from the last saved line so the gap is filled.
+                # A terminated pod gets one last read, then is left alone.
+                if pod in tails and (tails[pod].poll() is None or pod in finished):
+                    continue
+                if phase in ("Succeeded", "Failed"):
+                    finished.add(pod)
                 path = f"{out}/logs/{pod.split('/')[-1]}.log"
-                since = last_time(path)
                 tails[pod] = subprocess.Popen(
                     ["kubectl", "-n", NS, "logs", "-f", "--timestamps",
-                     f"--since-time={since}" if since else "--since=1s", pod],
+                     f"--since-time={last_time(path) or started}", pod],
                     stdout=open(path, "a"), stderr=subprocess.DEVNULL)
-        time.sleep(15)
-    for tail in tails.values():
-        tail.terminate()
+            time.sleep(15)
+    finally:
+        for tail in tails.values():
+            tail.terminate()
 
 
 def pct(values, p):
