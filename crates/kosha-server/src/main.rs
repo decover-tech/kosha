@@ -16271,6 +16271,48 @@ mod tests {
         ));
     }
 
+    /// A doc-store promotion (or warm-up) of an f32 sidecar segment lands
+    /// with `doc_store.bin` alone; a quantized one also needs its whole
+    /// `doc_vectors.bin`, which the promotion therefore fetches.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn promotion_fetches_and_waits_for_doc_vectors_only_for_quantized_columns() {
+        for (quantization, kept) in [
+            (kosha_core::VectorQuantization::F32, false),
+            (kosha_core::VectorQuantization::I8, true),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "kosha-test-promote-landed-{quantization:?}-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            let mut w =
+                kosha_segment::SegmentWriter::new(kosha_core::SegmentId("s".into()), dir.clone())
+                    .with_vector_store_mode(kosha_segment::VectorStoreMode::Sidecar)
+                    .with_vector_quantization(kosha_segment::VectorQuantizationConfig::all(
+                        quantization,
+                    ));
+            for i in 0..8 {
+                w.add_document(
+                    DocumentId(format!("d{i}")),
+                    vec![Field::vector("emb", vec![1.0, i as f32, 0.5, 0.0])],
+                );
+            }
+            w.finalize(Default::default()).unwrap();
+            fs::remove_file(dir.join(kosha_segment::DOC_VECTORS_FILE)).unwrap();
+            assert_eq!(kosha_segment::segment_keeps_doc_vectors_whole(&dir), kept);
+            assert_eq!(
+                doc_vectors_promotion(&dir) == DOC_VECTORS_PROMOTED,
+                kept,
+                "{quantization:?}"
+            );
+            assert_eq!(doc_store_promotion_landed(&dir), !kept, "{quantization:?}");
+            fs::remove_file(dir.join(kosha_segment::DOC_STORE_FILE)).unwrap();
+            assert!(!doc_store_promotion_landed(&dir));
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
     #[cfg(feature = "s3")]
     #[test]
     fn scoring_complete_needs_only_the_queried_vector_column() {

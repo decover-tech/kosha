@@ -1277,6 +1277,72 @@ mod tests {
         assert_eq!(store.gets(), gets);
     }
 
+    /// An f32 sidecar segment's promotion lands `doc_store.bin` alone:
+    /// `doc_vectors.bin` stays remote (`doc_vectors_kept_whole`), so its
+    /// spans are kept — page vectors are still read from them, with no GET
+    /// — and the vector-only ranged reads that follow never queue the
+    /// segment for a promotion that would fetch nothing.
+    #[test]
+    fn f32_sidecar_promotion_keeps_vector_spans_and_does_not_requeue() {
+        let f = fixture("promote-f32", 1, 1000, true, |i| i % 50 == 0);
+        let store = CountingStore::new(f.remote.clone());
+        let cache = Cache::new(f.data.clone());
+        let cfg = SpanConfig {
+            coalesce_gap: 0,
+            promote_after_gets: 3,
+            promote_after_bytes: 0,
+        };
+        let hydrator = SpanHydrator::new(f.data.clone(), cfg);
+        let searcher = Searcher::new(f.data.clone());
+        let seg = f.data.join(&f.ns.0).join("s0");
+        assert!(!kosha_segment::segment_keeps_doc_vectors_whole(&seg));
+
+        let mut q = query("needle", 4);
+        let (_, o, _) = search(&f, &searcher, &hydrator, &store, &cache, &q);
+        assert_eq!(o.promote, vec![seg.clone()]);
+        let dv_spans = SpanIndex::load(&seg, DOC_VECTORS_FILE).total_bytes();
+        assert!(dv_spans > 0);
+
+        // What `promote_doc_store` fetches for this segment: the doc store.
+        std::fs::copy(
+            f.remote.join(&f.ns.0).join("s0").join(DOC_STORE_FILE),
+            seg.join(DOC_STORE_FILE),
+        )
+        .unwrap();
+        let before = cache.total_size();
+        hydrator.finish_promotion(&cache, &seg, true);
+        assert!(!span_cache::spans_dir(&seg, DOC_STORE_FILE).exists());
+        assert_eq!(
+            SpanIndex::load(&seg, DOC_VECTORS_FILE).total_bytes(),
+            dv_spans,
+            "vector spans are still how this segment's vectors are read"
+        );
+        assert!(cache.total_size() < before);
+        assert!(!seg.join(DOC_VECTORS_FILE).exists());
+
+        // The same page again: records from the whole file, vectors from
+        // the kept spans — no GET.
+        let gets = store.gets();
+        let (r, _, calls) = search(&f, &searcher, &hydrator, &store, &cache, &q);
+        assert_eq!(r.results.len(), 4);
+        assert!(r
+            .results
+            .iter()
+            .all(|d| d.fields.iter().any(|fl| fl.name == "emb")));
+        assert_eq!(calls, 0);
+        assert_eq!(store.gets(), gets);
+
+        // New pages read only vector spans: past the GET threshold, but
+        // never re-queued (a promotion would fetch nothing).
+        for from in [4, 8, 12] {
+            q.from = from;
+            let (r, o, _) = search(&f, &searcher, &hydrator, &store, &cache, &q);
+            assert_eq!(r.results.len(), 4);
+            assert!(o.gets > 0);
+            assert!(o.promote.is_empty(), "re-queued at from={from}");
+        }
+    }
+
     #[test]
     fn failed_ranges_and_legacy_segments_fall_back_to_whole_files() {
         let f = fixture("fallback", 1, 50, false, |i| i < 3);
