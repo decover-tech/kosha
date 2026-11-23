@@ -370,7 +370,10 @@ pub fn coalesce(ranges: Vec<(u64, u64)>, max_gap: u64) -> Vec<(u64, u64)> {
 /// for its own bytes — instead of one GET the size of the file, held in
 /// memory whole. An input range is never split (a reader needs each one
 /// inside a single cached span), so one larger than `max_len` is fetched
-/// as it is.
+/// as it is, and an input that overlaps a merged range already at the cap
+/// starts a new one overlapping it: the overlap (at most that input's
+/// length) is fetched twice rather than leaving the input split across
+/// two spans.
 pub fn coalesce_capped(mut ranges: Vec<(u64, u64)>, max_gap: u64, max_len: u64) -> Vec<(u64, u64)> {
     ranges.retain(|(s, e)| e > s);
     ranges.sort_unstable();
@@ -437,6 +440,12 @@ mod tests {
         assert_eq!(
             coalesce_capped(dense.clone(), 0, u64::MAX),
             coalesce(dense, 0)
+        );
+        // An input overlapping a merged range at the cap starts a new
+        // range that still holds all of it.
+        assert_eq!(
+            coalesce_capped(vec![(0, 20), (15, 30)], 0, 20),
+            vec![(0, 20), (15, 30)]
         );
         // An input larger than the cap is kept whole, never split.
         assert_eq!(
