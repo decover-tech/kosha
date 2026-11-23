@@ -36,6 +36,7 @@ DEFAULT_KEYS = [
     "knn_postings_cached",
     "knn_segments",
     "knn_centroids",
+    "knn_plan_exact_centroids",
     "opens_cold",
     "opens_cached",
     "open_total_ms",

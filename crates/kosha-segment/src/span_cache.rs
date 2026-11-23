@@ -21,9 +21,12 @@
 //! disk cache counts them toward its byte budget and its LRU may evict any
 //! of them; an evicted span is just a miss that the next query re-fetches.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, SystemTime};
 
 /// Suffix of the sparse cache directory next to a segment file.
 pub const SPANS_SUFFIX: &str = ".spans";
@@ -54,15 +57,109 @@ pub fn parse_span_file_name(name: &str) -> Option<(u64, u64)> {
 #[derive(Debug, Default, Clone)]
 pub struct SpanIndex {
     dir: PathBuf,
-    spans: Vec<(u64, u64)>,
+    spans: Arc<Vec<(u64, u64)>>,
+}
+
+/// Listings of span directories, keyed by directory, each valid while the
+/// directory's modification time is the one it was taken at.
+///
+/// A listing is a `read_dir` plus a stat of every span file, and a segment
+/// warmed by ranged reads holds hundreds of spans per file. Every reader
+/// that lists per segment visit (a result page's documents and vectors,
+/// exact rescoring, a kNN probe) paid that on every query: on the 10M
+/// vector bench, materializing a 10-hit page took 14 ms and rescoring ~100
+/// vectors 6.6 ms, almost all of it listings of `doc_vectors.bin.spans`.
+///
+/// Why the modification time is enough: a span appears by a rename into
+/// the directory and disappears by an unlink, and both change the
+/// directory's mtime; span files are never rewritten in place (see
+/// `write_span` in kosha-server). A listing is only cached when the
+/// directory had been quiet for [`LISTING_QUIET`] when it was taken, so a
+/// change landing in the same timestamp tick as the listing cannot hide
+/// behind an equal mtime.
+type ListingCache = RwLock<HashMap<PathBuf, (SystemTime, Arc<Vec<(u64, u64)>>)>>;
+
+fn listing_cache() -> &'static ListingCache {
+    static CACHE: OnceLock<ListingCache> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// How long a span directory must have been unmodified for its listing to
+/// be cached: longer than any filesystem's timestamp granularity.
+const LISTING_QUIET: Duration = Duration::from_secs(2);
+
+/// Entries kept before the cache is dropped and refilled; a bound on
+/// memory for a node that has listed very many segments, not a tuning
+/// knob (one entry is 16 bytes per span).
+const LISTING_CACHE_MAX_DIRS: usize = 16_384;
+
+/// `KOSHA_SPAN_LISTING_CACHE=0` (or `off`/`false`) lists the directory on
+/// every [`SpanIndex::load`], as before. Read once.
+fn listing_cache_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("KOSHA_SPAN_LISTING_CACHE")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("0") | Some("off") | Some("false")
+        )
+    })
+}
+
+fn dir_mtime(dir: &Path) -> Option<SystemTime> {
+    fs::metadata(dir).and_then(|m| m.modified()).ok()
 }
 
 impl SpanIndex {
     /// List `{segment_dir}/{file}.spans`. A missing directory is an empty
     /// index. Spans whose file length disagrees with their name are left
     /// out.
+    ///
+    /// Served from the listing cache when the directory has not changed
+    /// since it was last listed (one stat instead of a `read_dir` and a
+    /// stat per span); see [`ListingCache`].
     pub fn load(segment_dir: &Path, file: &str) -> Self {
         let dir = spans_dir(segment_dir, file);
+        if !listing_cache_enabled() {
+            return Self::list(dir);
+        }
+        let Some(before) = dir_mtime(&dir) else {
+            // No directory: an empty index, and nothing worth caching.
+            return Self {
+                dir,
+                spans: Arc::default(),
+            };
+        };
+        if let Some((at, spans)) = listing_cache().read().unwrap().get(&dir) {
+            if *at == before {
+                return Self {
+                    dir,
+                    spans: Arc::clone(spans),
+                };
+            }
+        }
+        let listed = Self::list(dir);
+        // Cache only a listing of a directory that did not change while
+        // it was listed and had been quiet for a while before that.
+        let quiet = SystemTime::now()
+            .duration_since(before)
+            .is_ok_and(|age| age >= LISTING_QUIET);
+        let mut cache = listing_cache().write().unwrap();
+        if quiet && dir_mtime(&listed.dir) == Some(before) {
+            if cache.len() >= LISTING_CACHE_MAX_DIRS {
+                cache.clear();
+            }
+            cache.insert(listed.dir.clone(), (before, Arc::clone(&listed.spans)));
+        } else {
+            cache.remove(&listed.dir);
+        }
+        listed
+    }
+
+    /// The directory, listed now.
+    fn list(dir: PathBuf) -> Self {
         let mut spans = Vec::new();
         if let Ok(entries) = fs::read_dir(&dir) {
             for entry in entries.flatten() {
@@ -76,7 +173,10 @@ impl SpanIndex {
             }
         }
         spans.sort_unstable();
-        Self { dir, spans }
+        Self {
+            dir,
+            spans: Arc::new(spans),
+        }
     }
 
     /// A cached span containing all of `[start, end)`, if any.
@@ -359,13 +459,32 @@ impl LocalRangeReader {
 /// one fetch each — reading a little dead space between two documents is
 /// cheaper than a second round trip. Input order does not matter; empty
 /// ranges are dropped.
-pub fn coalesce(mut ranges: Vec<(u64, u64)>, max_gap: u64) -> Vec<(u64, u64)> {
+pub fn coalesce(ranges: Vec<(u64, u64)>, max_gap: u64) -> Vec<(u64, u64)> {
+    coalesce_capped(ranges, max_gap, u64::MAX)
+}
+
+/// [`coalesce`] that stops growing a merged range once it would pass
+/// `max_len` bytes, so a dense set of ranges (every vector posting of a
+/// column, every candidate vector of a one-matter segment) becomes many
+/// bounded GETs — fetched concurrently, each holding the in-flight budget
+/// for its own bytes — instead of one GET the size of the file, held in
+/// memory whole. An input range is never split (a reader needs each one
+/// inside a single cached span), so one larger than `max_len` is fetched
+/// as it is, and an input that overlaps a merged range already at the cap
+/// starts a new one overlapping it: the overlap (at most that input's
+/// length) is fetched twice rather than leaving the input split across
+/// two spans.
+pub fn coalesce_capped(mut ranges: Vec<(u64, u64)>, max_gap: u64, max_len: u64) -> Vec<(u64, u64)> {
     ranges.retain(|(s, e)| e > s);
     ranges.sort_unstable();
     let mut out: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
     for (s, e) in ranges {
         match out.last_mut() {
-            Some(last) if s <= last.1.saturating_add(max_gap) => last.1 = last.1.max(e),
+            Some(last)
+                if s <= last.1.saturating_add(max_gap) && last.1.max(e) - last.0 <= max_len =>
+            {
+                last.1 = last.1.max(e)
+            }
             _ => out.push((s, e)),
         }
     }
@@ -394,6 +513,87 @@ mod tests {
         .unwrap();
     }
 
+    /// Set a span directory's modification time, as a quiet directory's.
+    fn set_dir_mtime(seg: &Path, file: &str, at: SystemTime) {
+        fs::File::open(spans_dir(seg, file))
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    }
+
+    #[test]
+    fn listing_is_cached_until_the_directory_changes() {
+        let seg = tmp("listing-cache");
+        let file = "doc_vectors.bin";
+        put(&seg, file, 0, &[1; 8]);
+        put(&seg, file, 100, &[2; 8]);
+        let quiet = SystemTime::now() - Duration::from_secs(60);
+        set_dir_mtime(&seg, file, quiet);
+        assert_eq!(SpanIndex::load(&seg, file).spans(), &[(0, 8), (100, 108)]);
+
+        // A span added behind the cache's back (mtime put back, which no
+        // real writer does) is not seen: the listing came from the cache.
+        put(&seg, file, 200, &[3; 8]);
+        set_dir_mtime(&seg, file, quiet);
+        assert_eq!(SpanIndex::load(&seg, file).spans(), &[(0, 8), (100, 108)]);
+
+        // What a real writer does (the rename moves the mtime): seen.
+        set_dir_mtime(&seg, file, quiet + Duration::from_secs(1));
+        assert_eq!(
+            SpanIndex::load(&seg, file).spans(),
+            &[(0, 8), (100, 108), (200, 208)]
+        );
+
+        // An eviction (unlink) moves it too.
+        fs::remove_file(spans_dir(&seg, file).join(span_file_name(100, 108))).unwrap();
+        set_dir_mtime(&seg, file, quiet + Duration::from_secs(2));
+        assert_eq!(SpanIndex::load(&seg, file).spans(), &[(0, 8), (200, 208)]);
+        let _ = fs::remove_dir_all(&seg);
+    }
+
+    #[test]
+    fn a_recently_changed_directory_is_listed_every_time() {
+        // Inside the quiet window a change can share the listing's
+        // timestamp, so nothing is cached and every span shows up at once.
+        let seg = tmp("listing-fresh");
+        let file = "doc_store.bin";
+        put(&seg, file, 0, &[1; 4]);
+        assert_eq!(SpanIndex::load(&seg, file).spans(), &[(0, 4)]);
+        put(&seg, file, 10, &[2; 4]);
+        assert_eq!(SpanIndex::load(&seg, file).spans(), &[(0, 4), (10, 14)]);
+        fs::remove_dir_all(spans_dir(&seg, file)).unwrap();
+        assert!(SpanIndex::load(&seg, file).is_empty());
+        let _ = fs::remove_dir_all(&seg);
+    }
+
+    /// `cargo test --release -p kosha-segment --lib -- --ignored
+    /// --nocapture listing_cost`: one listing of a 730-span directory (the
+    /// 10M vector bench's `doc_vectors.bin.spans` per segment), listed and
+    /// from the cache.
+    #[test]
+    #[ignore = "microbench"]
+    fn listing_cost() {
+        let seg = tmp("listing-cost");
+        let file = "doc_vectors.bin";
+        for i in 0..730u64 {
+            put(&seg, file, i * 8192, &[0; 4096]);
+        }
+        set_dir_mtime(&seg, file, SystemTime::now() - Duration::from_secs(60));
+        let iters = 2000;
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            assert_eq!(SpanIndex::list(spans_dir(&seg, file)).spans().len(), 730);
+        }
+        let listed = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            assert_eq!(SpanIndex::load(&seg, file).spans().len(), 730);
+        }
+        let cached = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        println!("listing 730 spans: {listed:.1} us listed, {cached:.2} us cached");
+        let _ = fs::remove_dir_all(&seg);
+    }
+
     #[test]
     fn name_round_trips_and_rejects_junk() {
         let name = span_file_name(10, 4096);
@@ -407,6 +607,32 @@ mod tests {
         let merged = coalesce(vec![(100, 200), (0, 50), (230, 300), (10_000, 10_010)], 32);
         assert_eq!(merged, vec![(0, 50), (100, 300), (10_000, 10_010)]);
         assert_eq!(coalesce(vec![(0, 10), (5, 8), (9, 9)], 0), vec![(0, 10)]);
+    }
+
+    #[test]
+    fn coalesce_capped_bounds_merged_ranges_without_splitting_inputs() {
+        // Contiguous ranges merge up to the cap, then start a new range.
+        let dense: Vec<(u64, u64)> = (0..10).map(|i| (i * 10, i * 10 + 10)).collect();
+        assert_eq!(
+            coalesce_capped(dense.clone(), 0, 30),
+            vec![(0, 30), (30, 60), (60, 90), (90, 100)]
+        );
+        // No cap: the same as `coalesce`.
+        assert_eq!(
+            coalesce_capped(dense.clone(), 0, u64::MAX),
+            coalesce(dense, 0)
+        );
+        // An input overlapping a merged range at the cap starts a new
+        // range that still holds all of it.
+        assert_eq!(
+            coalesce_capped(vec![(0, 20), (15, 30)], 0, 20),
+            vec![(0, 20), (15, 30)]
+        );
+        // An input larger than the cap is kept whole, never split.
+        assert_eq!(
+            coalesce_capped(vec![(0, 5), (5, 100), (100, 110)], 0, 20),
+            vec![(0, 5), (5, 100), (100, 110)]
+        );
     }
 
     #[test]

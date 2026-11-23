@@ -79,6 +79,8 @@ mod crash_points_tests;
 #[cfg_attr(not(feature = "s3"), allow(dead_code))]
 mod segment_commit;
 mod segment_gc;
+#[cfg(all(test, feature = "s3"))]
+mod segment_pin_tests;
 mod tenant_limits;
 mod unindexed;
 mod usage;
@@ -673,6 +675,12 @@ struct HydrationOutcome {
     /// (#245). Segments fetch concurrently, so `rounds` is the most any one
     /// segment needed. Filled in after the search runs.
     vectors: posting_spans::PostingFetchStats,
+    /// Segments whose `doc_vectors.bin` header a filtered kNN wanted
+    /// (best-effort, see [`exact_knn_wants_doc_vectors_header`]) and did
+    /// not get. The query still answers; this pass's verdict is not cached,
+    /// so a later query retries the fetch.
+    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
+    exact_knn_headers_missing: usize,
 }
 
 #[cfg(feature = "s3")]
@@ -871,6 +879,37 @@ fn knn_files_complete(
     !knn_wants_doc_vectors_header(footer, field) || doc_spans::doc_vectors_header_local(seg_path)
 }
 
+/// [`doc_vectors_promotion`] for a segment whose `doc_vectors.bin` is
+/// promoted whole with its doc store.
+#[cfg(feature = "s3")]
+const DOC_VECTORS_PROMOTED: &str = "whole(quantized column)";
+
+/// What a doc-store promotion or warm-up does with `seg`'s
+/// `doc_vectors.bin`, for its log lines: fetched whole
+/// ([`DOC_VECTORS_PROMOTED`]), left to ranged reads (f32 columns, see
+/// [`kosha_segment::doc_vectors_kept_whole`]), or nothing to do.
+#[cfg(feature = "s3")]
+fn doc_vectors_promotion(seg: &Path) -> &'static str {
+    if kosha_segment::segment_keeps_doc_vectors_whole(seg) {
+        DOC_VECTORS_PROMOTED
+    } else if kosha_segment::segment_uses_doc_vectors(seg) {
+        "ranged(f32 columns)"
+    } else {
+        "none"
+    }
+}
+
+/// Whether a doc-store promotion or warm-up of `seg` has everything it
+/// fetches local: `doc_store.bin`, and `doc_vectors.bin` where it is kept
+/// whole. A segment whose sidecar stays remote counts as landed without
+/// it — otherwise it would read as a failed promotion forever.
+#[cfg(feature = "s3")]
+fn doc_store_promotion_landed(seg: &Path) -> bool {
+    file_present_nonempty(&seg.join(kosha_segment::DOC_STORE_FILE))
+        && (!kosha_segment::segment_keeps_doc_vectors_whole(seg)
+            || file_present_nonempty(&seg.join(kosha_segment::DOC_VECTORS_FILE)))
+}
+
 /// `KOSHA_KNN_GLOBAL_RESCORE` (#381), read once for the hydration
 /// predicates (the searcher reads the same variable).
 #[cfg(feature = "s3")]
@@ -910,15 +949,41 @@ fn knn_wants_doc_vectors_header_with(
             }))
 }
 
+/// Whether a filtered kNN on `field` would like `doc_vectors.bin`'s header
+/// local in a segment with this footer, best-effort: exact filtered kNN
+/// (#252) scores every candidate's vector from the sidecar, and with the
+/// file not whole (f32 sidecars are never promoted, see
+/// [`kosha_segment::doc_vectors_kept_whole`]) it reads just the
+/// candidates' ranges, which the header locates. Without it the exact path
+/// scans every vector posting of the column instead (logged), so the
+/// header is never REQUIRED: a segment the filter sends to the ANN probe
+/// does not need it, and a failed fetch must not fail the query. ~12 bytes
+/// per stored vector (0.2% of a 1536-dim f32 file).
+#[cfg(feature = "s3")]
+fn exact_knn_wants_doc_vectors_header(footer: Option<&kosha_core::Footer>, field: &str) -> bool {
+    footer.is_some_and(|f| {
+        f.doc_vectors
+            && f.vector_fields
+                .as_ref()
+                .is_some_and(|cols| cols.iter().any(|c| c.name == field))
+    })
+}
+
 /// The vector key a query's [`HydrationVerdict`] records and checks: its
 /// `knn.field` for a single-vector kNN (#204), and a key of its own for a
 /// late-interaction kNN (#205), whose pass hydrates the field's multivec
-/// files rather than its single-vector column. `None` without kNN.
+/// files rather than its single-vector column, and one for a kNN that
+/// reads filter columns, whose pass also hydrates the column's
+/// `doc_vectors.bin` header (see [`knn_wants_doc_vectors_header`]): an
+/// unfiltered pass's verdict must not let a filtered kNN skip that.
+/// `None` without kNN.
 #[cfg_attr(not(feature = "s3"), allow(dead_code))]
 fn knn_verdict_key(query: &SearchQuery) -> Option<String> {
     query.knn.as_ref().map(|knn| {
         if knn.is_late_interaction() {
             format!("late_interaction:{}", knn.field)
+        } else if query.needs_filter_columns() {
+            format!("filtered:{}", knn.field)
         } else {
             knn.field.clone()
         }
@@ -2803,8 +2868,12 @@ impl AppState {
                 manifest,
                 &query,
                 &RequestHydration::unlimited(),
+                None,
             );
-            if outcome.missing.is_empty() && !outcome.bloom_pruned {
+            if outcome.missing.is_empty()
+                && !outcome.bloom_pruned
+                && outcome.exact_knn_headers_missing == 0
+            {
                 self.completed_hydrations
                     .lock()
                     .unwrap()
@@ -3555,21 +3624,25 @@ impl AppState {
     #[cfg(feature = "s3")]
     /// Returns `(files_fetched, bytes_fetched)` — already-local files cost
     /// nothing and aren't counted.
-    /// Fetch what materializing documents from these segments needs:
-    /// `doc_store.bin`, plus `doc_vectors.bin` for segments whose footer
-    /// says vectors were moved there (#243). Only those segments are asked
-    /// for the sidecar, so older segments never trigger a GET for a file
-    /// they don't have.
+    /// Fetch whole `doc_store.bin` for these segments, plus
+    /// `doc_vectors.bin` for those `with_vectors` picks: for a page
+    /// materialized from whole files, segments with a sidecar whose vectors
+    /// the page returns (`PageSegment::vectors`); for promotion and warm-up,
+    /// segments whose readers need it whole
+    /// ([`kosha_segment::segment_keeps_doc_vectors_whole`]). Only those
+    /// segments are asked for the sidecar, so others never trigger a GET
+    /// for it.
     #[cfg(feature = "s3")]
     fn ensure_doc_store_local(
         &self,
         seg_paths: &[PathBuf],
         request: &Arc<RequestHydration>,
+        with_vectors: impl Fn(&Path) -> bool,
     ) -> (usize, u64) {
         let (mut files, mut bytes) = self.ensure_files_local(seg_paths, "doc_store.bin", request);
         let with_sidecar: Vec<PathBuf> = seg_paths
             .iter()
-            .filter(|p| kosha_segment::segment_uses_doc_vectors(p))
+            .filter(|p| with_vectors(p))
             .cloned()
             .collect();
         if !with_sidecar.is_empty() {
@@ -3628,7 +3701,16 @@ impl AppState {
             }
         };
         if !whole.is_empty() {
-            let (files, bytes) = self.ensure_doc_store_local(&whole, request);
+            // `doc_vectors.bin` only for a page that returns its vectors:
+            // one whose `_source` excludes them (the backend's searches)
+            // never downloads the sidecar — up to 2 GB — in-request.
+            let page_reads_vectors = |p: &Path| {
+                pages
+                    .iter()
+                    .any(|page| page.segment_dir == p && page.vectors)
+                    && kosha_segment::segment_uses_doc_vectors(p)
+            };
+            let (files, bytes) = self.ensure_doc_store_local(&whole, request, page_reads_vectors);
             stats.rounds += 1;
             stats.whole_files = files as u64;
             stats.whole_bytes = bytes;
@@ -3685,20 +3767,22 @@ impl AppState {
     /// operations; this thread is one operation at a time by construction,
     /// and its bytes are bounded by the background share.
     ///
-    /// `doc_vectors.bin` is still promoted whole: with it whole, an exact
-    /// filtered kNN scores candidates straight from it (without it, from
-    /// every vector posting of the column — as many bytes again, by range),
-    /// and the default per-segment path rescores a quantized column's
-    /// shortlist from it (without it, the estimates stand).
+    /// `doc_vectors.bin` comes along only for a segment with a quantized
+    /// vector column ([`kosha_segment::doc_vectors_kept_whole`]): the
+    /// default per-segment kNN path rescores that column's shortlist from
+    /// the whole file. Every other reader takes ranges (page vectors, exact
+    /// filtered kNN, global rescoring), so an f32 segment's sidecar — 2.0 of
+    /// a ~2.6 GB promotion on staging — stays remote.
     #[cfg(feature = "s3")]
     fn promote_doc_store(&self, seg: &Path) {
         let t = Instant::now();
         self.log_promotion_start(seg);
-        let (files, bytes) =
-            self.ensure_doc_store_local(&[seg.to_path_buf()], &RequestHydration::background());
-        let landed = file_present_nonempty(&seg.join(kosha_segment::DOC_STORE_FILE))
-            && (!kosha_segment::segment_uses_doc_vectors(seg)
-                || file_present_nonempty(&seg.join(kosha_segment::DOC_VECTORS_FILE)));
+        let (files, bytes) = self.ensure_doc_store_local(
+            &[seg.to_path_buf()],
+            &RequestHydration::background(),
+            kosha_segment::segment_keeps_doc_vectors_whole,
+        );
+        let landed = doc_store_promotion_landed(seg);
         self.span_hydrator
             .finish_promotion(&self.cache, seg, landed);
         if landed {
@@ -3710,8 +3794,10 @@ impl AppState {
             });
         }
         println!(
-            "doc store promote: seg={} landed={landed} fetched {files} file(s) ({:.1} MB) in {:.0} ms",
+            "doc store promote: seg={} landed={landed} doc_vectors={} fetched {files} file(s) \
+             ({:.1} MB) in {:.0} ms",
             seg.display(),
+            doc_vectors_promotion(seg),
             bytes as f64 / (1024.0 * 1024.0),
             t.elapsed().as_secs_f64() * 1e3,
         );
@@ -3728,7 +3814,8 @@ impl AppState {
             return;
         };
         let mut wanted = vec![kosha_segment::DOC_STORE_FILE];
-        if kosha_segment::segment_uses_doc_vectors(seg) {
+        let vectors = doc_vectors_promotion(seg);
+        if vectors == DOC_VECTORS_PROMOTED {
             wanted.push(kosha_segment::DOC_VECTORS_FILE);
         }
         wanted.retain(|f| !file_present_nonempty(&seg.join(f)));
@@ -3760,8 +3847,9 @@ impl AppState {
         let (gets, ranged) = self.span_hydrator.heat(seg).unwrap_or((0, 0));
         let cfg = self.span_hydrator.config();
         println!(
-            "doc store promote start: seg={} files={} total_mb={:.1} trigger: ranged_gets={gets} \
-             ranged_mb={:.1} (promote at gets>={} or mb>={:.1}) queued={}",
+            "doc store promote start: seg={} files={} total_mb={:.1} doc_vectors={vectors} \
+             trigger: ranged_gets={gets} ranged_mb={:.1} (promote at gets>={} or mb>={:.1}) \
+             queued={}",
             seg.display(),
             if files.is_empty() {
                 "-".to_string()
@@ -3824,26 +3912,38 @@ impl AppState {
         (files, bytes)
     }
 
-    /// Pin every segment directory of `manifest` in the disk cache until
-    /// the returned guard drops.
-    fn pin_segments(&self, ns: &NamespaceId, manifest: &kosha_core::Manifest) -> SegmentPins<'_> {
-        let keys: Vec<String> = manifest
+    /// A search's disk-cache pins, until the returned guard drops: to start
+    /// with, the `footer.json` of every segment `manifest` holds no cached
+    /// footer for. The searcher prunes segments with those footers read
+    /// from disk (`Manifest::footer_or_read`), so it needs them for every
+    /// segment, including the ones it never hydrates: one evicted
+    /// mid-search leaves its segment unpruned, and the search fails on a
+    /// segment it was never meant to read. The directories of the segments
+    /// it does read are added once hydration has chosen them
+    /// ([`search_segment_sets`]), before anything is fetched for them.
+    #[cfg(feature = "s3")]
+    fn pin_search_footers(
+        &self,
+        ns: &NamespaceId,
+        manifest: &kosha_core::Manifest,
+    ) -> SegmentPins<'_> {
+        let mut pins = SegmentPins {
+            cache: &self.cache,
+            data_dir: &self.data_dir,
+            keys: Vec::new(),
+        };
+        let footers: Vec<PathBuf> = manifest
             .segments
             .iter()
-            .filter_map(|entry| {
-                let dir = manifest.segment_dir(&self.data_dir, ns, &entry.segment_id);
-                dir.strip_prefix(&self.data_dir)
-                    .ok()
-                    .map(|rel| rel.to_string_lossy().into_owned())
+            .filter(|entry| manifest.segment_footer(&entry.segment_id).is_none())
+            .map(|entry| {
+                manifest
+                    .segment_dir(&self.data_dir, ns, &entry.segment_id)
+                    .join("footer.json")
             })
             .collect();
-        for key in &keys {
-            self.cache.pin(key);
-        }
-        SegmentPins {
-            cache: &self.cache,
-            keys,
-        }
+        pins.hold_all(&footers);
+        pins
     }
 
     /// Fetch a batch of `(logical_path, projected_size_bytes)` pairs into
@@ -4121,13 +4221,17 @@ impl AppState {
         manifest: &kosha_core::Manifest,
         query: &SearchQuery,
         request: &Arc<RequestHydration>,
+        // A search's pins (see `AppState::pin_search_footers`): the
+        // segments chosen below are added before any of their files is
+        // fetched. `None` for warm-up, which reads nothing afterwards.
+        pins: Option<&mut SegmentPins<'_>>,
     ) -> HydrationOutcome {
-        let term_prune = kosha_query::term_bloom_prune_mode(query);
         // The query is analyzed per segment with the chains its footer
         // records (#220), so which terms (and posting-blob shards) a
         // segment needs depends on its footer.
         let query_analysis = kosha_query::QueryAnalysis::new(query);
-        let needs_bloom_check = query.has_prunable_filter() || term_prune.is_some();
+        let needs_bloom_check =
+            query.has_prunable_filter() || kosha_query::term_bloom_prune_mode(query).is_some();
         // Single-vector kNN reads its column's index; late interaction
         // (#205) reads the field's multivec files instead (below).
         let knn_field = query
@@ -4247,24 +4351,20 @@ impl AppState {
             posting_terms_for_query(query, &query_analysis, analyses.iter().copied());
         let stats_terms = kosha_query::namespace_stats_terms(query, analyses.iter().copied())
             .filter(|t| !t.is_empty());
-        let mut to_hydrate: Vec<PathBuf> = Vec::new();
-        let mut stats_only: Vec<PathBuf> = Vec::new();
-        for (entry, seg_path) in manifest.segments.iter().zip(all_seg_paths.iter().cloned()) {
-            // Borrowed, never cloned: footers hold every bloom. A segment
-            // with no cached footer was already read (once) into
-            // `fetched_footers` above.
-            let footer = segment_footer(entry);
-            match segment_search_hydration(
-                query,
-                needs_bloom_check,
-                term_prune.map(|mode| (&query_analysis, mode)),
-                stats_terms.as_deref(),
-                footer,
-            ) {
-                SegmentHydration::Scoring => to_hydrate.push(seg_path),
-                SegmentHydration::StatsOnly => stats_only.push(seg_path),
-                SegmentHydration::Skip => {}
-            }
+        // Footers borrowed, never cloned: they hold every bloom. A segment
+        // with no cached footer was already read (once) into
+        // `fetched_footers` above.
+        let (to_hydrate, stats_only) = search_segment_sets(
+            query,
+            &query_analysis,
+            stats_terms.as_deref(),
+            all_seg_paths
+                .iter()
+                .cloned()
+                .zip(manifest.segments.iter().map(segment_footer)),
+        );
+        if let Some(pins) = pins {
+            pins.hold_all(to_hydrate.iter().chain(&stats_only));
         }
         // The filter files each segment needs for this query (#244): its
         // whole `filters.bin`, or `filters.toc` plus only the columns the
@@ -4296,6 +4396,15 @@ impl AppState {
             &posting_files,
             request,
         );
+        if let (Some(field), false) = (knn_field, filter_files.is_empty()) {
+            self.fetch_exact_knn_headers(
+                &to_hydrate,
+                field,
+                &manifest_footers,
+                request,
+                &mut outcome,
+            );
+        }
         outcome.files_fetched += postings_outcome.files_fetched;
         outcome.bytes_fetched += postings_outcome.bytes_fetched;
         outcome.missing.extend(postings_outcome.missing);
@@ -4474,6 +4583,90 @@ impl AppState {
             }
         }
         true
+    }
+
+    /// Best-effort: the `doc_vectors.bin` header of every scoring segment a
+    /// filtered kNN on `field` may score exactly from its sidecar (see
+    /// [`exact_knn_wants_doc_vectors_header`]), by range into the span
+    /// cache, one round sized from the footer. Unlike the scoring files a
+    /// header that does not arrive fails nothing — the exact path then
+    /// scans the column's vector postings (and says so) — it is only
+    /// counted, so the pass's verdict is not cached.
+    #[cfg(feature = "s3")]
+    fn fetch_exact_knn_headers(
+        &self,
+        seg_paths: &[PathBuf],
+        field: &str,
+        manifest_footers: &HashMap<PathBuf, &kosha_core::Footer>,
+        request: &Arc<RequestHydration>,
+        outcome: &mut HydrationOutcome,
+    ) {
+        let Some(ref s3) = self.s3_storage else {
+            return;
+        };
+        let mut targets: Vec<(&Path, String, u64)> = Vec::new();
+        for seg in seg_paths {
+            let local_footer;
+            let footer = match manifest_footers.get(seg) {
+                Some(footer) => Some(*footer),
+                None => {
+                    local_footer = SegmentReader::read_footer(seg).ok();
+                    local_footer.as_ref()
+                }
+            };
+            if !exact_knn_wants_doc_vectors_header(footer, field)
+                || doc_spans::doc_vectors_header_local(seg)
+            {
+                continue;
+            }
+            let (Some(footer), Ok(rel)) = (footer, seg.strip_prefix(&self.data_dir)) else {
+                continue;
+            };
+            targets.push((
+                seg.as_path(),
+                rel.to_string_lossy().into_owned(),
+                kosha_segment::doc_vectors_header_estimate(footer),
+            ));
+        }
+        if targets.is_empty() {
+            return;
+        }
+        if request.is_shed() {
+            outcome.exact_knn_headers_missing += targets.len();
+            return;
+        }
+        let fetcher = doc_spans::S3RangeFetcher {
+            s3,
+            concurrency: self.scoring_hydrate_concurrency,
+            budget: &self.hydration_budget,
+            request,
+        };
+        let refs: Vec<(&Path, &str)> = targets.iter().map(|(d, r, _)| (*d, r.as_str())).collect();
+        let fetched = {
+            let _permit = self.hydration_semaphore.acquire("exact_knn_headers");
+            doc_spans::fetch_doc_vectors_headers_probing(
+                &refs,
+                |i| targets[i].2,
+                &fetcher,
+                &self.cache,
+            )
+        };
+        outcome.rounds += fetched.rounds;
+        for (seg, (dir, _, _)) in fetched.segments.iter().zip(&targets) {
+            outcome.bytes_fetched += seg.bytes;
+            match seg.status {
+                doc_spans::HeaderStatus::Cached => outcome.files_fetched += 1,
+                doc_spans::HeaderStatus::Shed => outcome.exact_knn_headers_missing += 1,
+                doc_spans::HeaderStatus::Failed => {
+                    outcome.exact_knn_headers_missing += 1;
+                    eprintln!(
+                        "WARN: doc_vectors.bin header of {} could not be fetched for a filtered \
+                         kNN on '{field}': its exact path scans the column's vector postings",
+                        dir.display()
+                    );
+                }
+            }
+        }
     }
 
     /// Scoring-set-only counterpart of [`AppState::ensure_segments_local`]:
@@ -4883,6 +5076,9 @@ impl AppState {
     /// [`kosha_segment::POSTING_BLOB_SHARDS`] shard files). Sub-ms when the
     /// shards are already local and the presence cache has already seen
     /// them this manifest version — see `posting_blob_presence`.
+    ///
+    /// Also adds to `pins` the segments the search reads, chosen as
+    /// `hydrate_segments_for_search` chooses them, before fetching anything.
     #[cfg(feature = "s3")]
     fn ensure_query_posting_blobs(
         &self,
@@ -4890,45 +5086,79 @@ impl AppState {
         manifest: &kosha_core::Manifest,
         query: &SearchQuery,
         request: &Arc<RequestHydration>,
+        pins: &mut SegmentPins<'_>,
     ) -> HydrationOutcome {
-        // Footers are local whenever the namespace verdict is cached (it
-        // means every segment's scoring set is present).
-        let analyses: Vec<Option<kosha_core::SegmentAnalysis>> = manifest
-            .segments
-            .iter()
-            .map(|entry| {
-                let dir = manifest.segment_dir(&self.data_dir, ns, &entry.segment_id);
-                manifest
-                    .footer_or_read(&entry.segment_id, || {
-                        kosha_segment::SegmentReader::read_footer(&dir).ok()
-                    })
-                    .and_then(|footer| footer.analysis.clone())
-            })
-            .collect();
-        let query_analysis = kosha_query::QueryAnalysis::new(query);
-        let posting_files = posting_blob_files_for_query(
-            query,
-            &query_analysis,
-            analyses.iter().map(Option::as_ref),
-        );
-        let posting_terms =
-            posting_terms_for_query(query, &query_analysis, analyses.iter().map(Option::as_ref));
-        if posting_files.is_empty() {
-            return HydrationOutcome::default();
-        }
         let seg_paths: Vec<PathBuf> = manifest
             .segments
             .iter()
             .map(|entry| manifest.segment_dir(&self.data_dir, ns, &entry.segment_id))
             .collect();
-        self.ensure_query_postings(
+        // Footers are local whenever the namespace verdict is cached (it
+        // means every segment's scoring set is present). Held together for
+        // this call, as `hydrate_segments_for_search` holds the ones it
+        // reads: usually borrowed from the manifest, which caches them.
+        let footers: Vec<Option<std::borrow::Cow<'_, kosha_core::Footer>>> = manifest
+            .segments
+            .iter()
+            .zip(&seg_paths)
+            .map(|(entry, dir)| {
+                manifest.footer_or_read(&entry.segment_id, || {
+                    kosha_segment::SegmentReader::read_footer(dir).ok()
+                })
+            })
+            .collect();
+        let analyses: Vec<Option<&kosha_core::SegmentAnalysis>> = footers
+            .iter()
+            .map(|footer| footer.as_deref().and_then(|f| f.analysis.as_ref()))
+            .collect();
+        let query_analysis = kosha_query::QueryAnalysis::new(query);
+        let stats_terms = kosha_query::namespace_stats_terms(query, analyses.iter().copied())
+            .filter(|t| !t.is_empty());
+        let (scoring, stats_only) = search_segment_sets(
+            query,
+            &query_analysis,
+            stats_terms.as_deref(),
+            seg_paths
+                .iter()
+                .cloned()
+                .zip(footers.iter().map(Option::as_deref)),
+        );
+        pins.hold_all(scoring.iter().chain(&stats_only));
+        let posting_files =
+            posting_blob_files_for_query(query, &query_analysis, analyses.iter().copied());
+        let posting_terms =
+            posting_terms_for_query(query, &query_analysis, analyses.iter().copied());
+        if posting_files.is_empty() {
+            return HydrationOutcome::default();
+        }
+        // As `hydrate_segments_for_search` does: the scored segments'
+        // postings must be local, the stats-only ones' are best effort, and
+        // a segment the search skips gets none (it is never read, and its
+        // files would be fetched unpinned).
+        let mut outcome = self.ensure_query_postings(
             ns,
             manifest,
-            &seg_paths,
+            &scoring,
             &posting_terms,
             &posting_files,
             request,
-        )
+        );
+        if !stats_only.is_empty() {
+            let stats = self.ensure_query_postings(
+                ns,
+                manifest,
+                &stats_only,
+                &posting_terms,
+                &posting_files,
+                request,
+            );
+            outcome.files_fetched += stats.files_fetched;
+            outcome.bytes_fetched += stats.bytes_fetched;
+        }
+        // A shed anywhere above, the best-effort stats fetch included, is a
+        // 429, as on the cold path.
+        outcome.set_shed(request);
+        outcome
     }
 
     /// Make the query terms' postings local in `seg_paths` (#245).
@@ -8714,11 +8944,13 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     // See `hydration_budget`.
     #[cfg(feature = "s3")]
     let hydration_request = Arc::new(RequestHydration::new(state.hydrate_request_max_bytes));
-    // Hold this search's segments in the disk cache until it returns: once
+    // Hold what this search reads in the disk cache until it returns: once
     // the working set reaches KOSHA_CACHE_MAX_BYTES, files fetched for it
     // otherwise evicted files it had just checked, and it failed with
-    // "segment hydration failed".
-    let _segment_pins = state.pin_segments(&ns, manifest);
+    // "segment hydration failed". Only what it reads — see `SegmentPins`;
+    // hydration adds the segments it chooses.
+    #[cfg(feature = "s3")]
+    let mut segment_pins = state.pin_search_footers(&ns, manifest);
     // Read stamp for the disk-cache policy (#389): files this search
     // hydrates do not count its own read as a re-read. 0 when off.
     let cache_read_at = state.begin_cache_read();
@@ -8763,10 +8995,21 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
             // sub-ms when the shards are already local: one metadata stat
             // per term-shard per split segment.
             state.record_warm_nvme_hits(&ns, manifest);
-            state.ensure_query_posting_blobs(&ns, manifest, search_query, &hydration_request)
+            state.ensure_query_posting_blobs(
+                &ns,
+                manifest,
+                search_query,
+                &hydration_request,
+                &mut segment_pins,
+            )
         } else {
-            let outcome =
-                state.hydrate_segments_for_search(&ns, manifest, search_query, &hydration_request);
+            let outcome = state.hydrate_segments_for_search(
+                &ns,
+                manifest,
+                search_query,
+                &hydration_request,
+                Some(&mut segment_pins),
+            );
             // Cache what this pass verified: the static scoring set is
             // local for this manifest version, so future warm queries with
             // matching-or-lesser needs skip the per-segment static checks
@@ -8789,7 +9032,10 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
             // a query needing only `filters.bin` must not erase a
             // `vectors_verified` flag an earlier kNN pass already earned,
             // and vice versa.
-            if outcome.missing.is_empty() && !outcome.bloom_pruned {
+            if outcome.missing.is_empty()
+                && !outcome.bloom_pruned
+                && outcome.exact_knn_headers_missing == 0
+            {
                 state
                     .completed_hydrations
                     .lock()
@@ -9375,11 +9621,13 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
     // See `hydration_budget`.
     #[cfg(feature = "s3")]
     let hydration_request = Arc::new(RequestHydration::new(state.hydrate_request_max_bytes));
-    // Hold this search's segments in the disk cache until it returns: once
+    // Hold what this search reads in the disk cache until it returns: once
     // the working set reaches KOSHA_CACHE_MAX_BYTES, files fetched for it
     // otherwise evicted files it had just checked, and it failed with
-    // "segment hydration failed".
-    let _segment_pins = state.pin_segments(&ns, manifest);
+    // "segment hydration failed". Only what it reads — see `SegmentPins`;
+    // hydration adds the segments it chooses.
+    #[cfg(feature = "s3")]
+    let mut segment_pins = state.pin_search_footers(&ns, manifest);
 
     let cache_read_at = state.begin_cache_read();
     let t_hydrate = Instant::now();
@@ -9403,13 +9651,27 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
             // Posting blobs are per-query and outside the cached verdict —
             // see `handle_search_post` for the full rationale.
             state.record_warm_nvme_hits(&ns, manifest);
-            state.ensure_query_posting_blobs(&ns, manifest, &query, &hydration_request)
+            state.ensure_query_posting_blobs(
+                &ns,
+                manifest,
+                &query,
+                &hydration_request,
+                &mut segment_pins,
+            )
         } else {
-            let outcome =
-                state.hydrate_segments_for_search(&ns, manifest, &query, &hydration_request);
+            let outcome = state.hydrate_segments_for_search(
+                &ns,
+                manifest,
+                &query,
+                &hydration_request,
+                Some(&mut segment_pins),
+            );
             // Only merge when unfiltered — see `HydrationOutcome::bloom_pruned`
             // and `handle_search_post` for the full rationale.
-            if outcome.missing.is_empty() && !outcome.bloom_pruned {
+            if outcome.missing.is_empty()
+                && !outcome.bloom_pruned
+                && outcome.exact_knn_headers_missing == 0
+            {
                 state
                     .completed_hydrations
                     .lock()
@@ -11187,6 +11449,38 @@ fn segment_search_hydration(
     }
 }
 
+/// The segments a search for `query` reads beyond their footers, as
+/// [`segment_search_hydration`] decides each from its footer: the ones it
+/// scores (whose files later phases also read: page doc stores, vector
+/// postings, kNN rescoring) and the ones it reads only for namespace BM25
+/// `df` (`stats_only`). The searcher prunes the rest with the same bloom
+/// checks and never opens them.
+#[cfg(feature = "s3")]
+fn search_segment_sets<'f>(
+    query: &SearchQuery,
+    analysis: &kosha_query::QueryAnalysis,
+    stats_terms: Option<&[String]>,
+    segments: impl IntoIterator<Item = (PathBuf, Option<&'f kosha_core::Footer>)>,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let term_prune = kosha_query::term_bloom_prune_mode(query);
+    let needs_bloom_check = query.has_prunable_filter() || term_prune.is_some();
+    let (mut scoring, mut stats_only) = (Vec::new(), Vec::new());
+    for (seg_path, footer) in segments {
+        match segment_search_hydration(
+            query,
+            needs_bloom_check,
+            term_prune.map(|mode| (analysis, mode)),
+            stats_terms,
+            footer,
+        ) {
+            SegmentHydration::Scoring => scoring.push(seg_path),
+            SegmentHydration::StatsOnly => stats_only.push(seg_path),
+            SegmentHydration::Skip => {}
+        }
+    }
+    (scoring, stats_only)
+}
+
 /// Whether scoring/materialization needs `filters.bin`. Broad lexical
 /// queries with default score/_id ranking do not: they use only postings,
 /// doc metadata, and page doc stores.
@@ -11425,17 +11719,36 @@ fn json_ok<T: serde::Serialize>(value: &T) -> String {
     )
 }
 
-/// Disk-cache pins on a search's segment directories, released on drop.
+/// Disk-cache pins on what a search reads, released on drop. Only what it
+/// reads: all Decover matters share one namespace, so pinning every
+/// segment of it for each in-flight search stopped all eviction under
+/// steady traffic and let the cache grow past `KOSHA_CACHE_MAX_BYTES`.
+#[cfg(feature = "s3")]
 struct SegmentPins<'a> {
     cache: &'a Cache,
+    data_dir: &'a Path,
     keys: Vec<String>,
 }
 
+#[cfg(feature = "s3")]
+impl SegmentPins<'_> {
+    /// Pin `paths` (segment directories, each holding every file under
+    /// it, or single files) until the guard drops.
+    fn hold_all<'p>(&mut self, paths: impl IntoIterator<Item = &'p PathBuf>) {
+        let start = self.keys.len();
+        self.keys.extend(paths.into_iter().filter_map(|path| {
+            path.strip_prefix(self.data_dir)
+                .ok()
+                .map(|rel| rel.to_string_lossy().into_owned())
+        }));
+        self.cache.pin_all(&self.keys[start..]);
+    }
+}
+
+#[cfg(feature = "s3")]
 impl Drop for SegmentPins<'_> {
     fn drop(&mut self) {
-        for key in &self.keys {
-            self.cache.unpin(key);
-        }
+        self.cache.unpin_all(&self.keys);
     }
 }
 
@@ -11544,7 +11857,7 @@ fn log_search_timing(
         "search timing: ns={} total_ms={:.1} wall_ms={:.1} hydrate_ms={:.1} hydrate_files={} \
          hydrate_mb={:.1} queue_ms={:.1} admit_ms={:.1} bm25_stats={} bm25_stats_ms={:.2} \
          score_ms={:.1} materialize_ms={:.1} opens_cold={} opens_cached={} \
-         open_total_ms={:.1} knn_postings={} knn_segments={} knn_centroids={} knn_plan_ms={:.1} knn_mode={} knn_exact_vectors={} \
+         open_total_ms={:.1} knn_postings={} knn_segments={} knn_centroids={} knn_plan_ms={:.1} knn_plan_exact_centroids={} knn_plan_prep_ms={:.2} knn_plan_s1_ms={:.2} knn_plan_sel_ms={:.2} knn_plan_s2_ms={:.2} knn_plan_rank_ms={:.2} knn_mode={} knn_exact_vectors={} \
          knn_filtered={} knn_degraded={} hits={} page_gets={} \
          page_ranged_kb={:.1} page_whole_files={} page_whole_mb={:.1} s3_rounds={} \
          s3_bytes={} postings_gets={} postings_ranged_kb={:.1} postings_whole_files={} \
@@ -11569,6 +11882,12 @@ fn log_search_timing(
         phases.knn_segments_probed,
         phases.knn_centroids_scanned,
         phases.knn_plan_ms,
+        phases.knn_plan_exact_centroids,
+        phases.knn_plan_split_ms[0],
+        phases.knn_plan_split_ms[1],
+        phases.knn_plan_split_ms[2],
+        phases.knn_plan_split_ms[3],
+        phases.knn_plan_split_ms[4],
         phases.knn_mode.map_or("-", |mode| mode.as_str()),
         phases.knn_exact_vectors,
         phases
@@ -16099,13 +16418,13 @@ mod tests {
 
     /// #204: a kNN's scoring set holds only the queried column's files, as
     /// the segment's footer lists them.
-    /// Global kNN rescoring (#381) reads a quantized column's exact
-    /// vectors by range, so with the flag on its `doc_vectors.bin` header
-    /// joins the kNN scoring set; with it off (the default) and for f32
-    /// columns, the predicate is the legacy one.
+    /// Readers that take sidecar vectors by range need its header: global
+    /// rescoring (#381) requires a quantized column's in the kNN scoring
+    /// set; exact filtered kNN asks best-effort for any column whose
+    /// vectors are in the sidecar (f32 sidecars are never fetched whole).
     #[cfg(feature = "s3")]
     #[test]
-    fn global_rescore_wants_the_doc_vectors_header_of_quantized_columns() {
+    fn knn_wants_the_doc_vectors_header_where_it_reads_ranges() {
         let footer = |quantization| {
             let dir = std::env::temp_dir().join(format!(
                 "kosha-test-dv-header-{quantization:?}-{}",
@@ -16131,11 +16450,66 @@ mod tests {
         };
         let i8 = footer(kosha_core::VectorQuantization::I8);
         let f32 = footer(kosha_core::VectorQuantization::F32);
+        // Required: a legacy segment's, and with global rescoring a
+        // quantized column's — never an f32 column's.
         assert!(!knn_wants_doc_vectors_header_with(Some(&i8), "emb", false));
         assert!(knn_wants_doc_vectors_header_with(Some(&i8), "emb", true));
         assert!(!knn_wants_doc_vectors_header_with(Some(&i8), "other", true));
         assert!(!knn_wants_doc_vectors_header_with(Some(&f32), "emb", true));
         assert!(!knn_wants_doc_vectors_header_with(None, "emb", false));
+        // Best-effort for a filtered kNN: any column whose vectors are in
+        // the sidecar (exact filtered kNN reads its candidates by range).
+        assert!(exact_knn_wants_doc_vectors_header(Some(&f32), "emb"));
+        assert!(exact_knn_wants_doc_vectors_header(Some(&i8), "emb"));
+        assert!(!exact_knn_wants_doc_vectors_header(Some(&f32), "other"));
+        assert!(!exact_knn_wants_doc_vectors_header(None, "emb"));
+        let inline = kosha_core::Footer {
+            doc_vectors: false,
+            ..f32.clone()
+        };
+        assert!(!exact_knn_wants_doc_vectors_header(Some(&inline), "emb"));
+    }
+
+    /// A doc-store promotion (or warm-up) of an f32 sidecar segment lands
+    /// with `doc_store.bin` alone; a quantized one also needs its whole
+    /// `doc_vectors.bin`, which the promotion therefore fetches.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn promotion_fetches_and_waits_for_doc_vectors_only_for_quantized_columns() {
+        for (quantization, kept) in [
+            (kosha_core::VectorQuantization::F32, false),
+            (kosha_core::VectorQuantization::I8, true),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "kosha-test-promote-landed-{quantization:?}-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            let mut w =
+                kosha_segment::SegmentWriter::new(kosha_core::SegmentId("s".into()), dir.clone())
+                    .with_vector_store_mode(kosha_segment::VectorStoreMode::Sidecar)
+                    .with_vector_quantization(kosha_segment::VectorQuantizationConfig::all(
+                        quantization,
+                    ));
+            for i in 0..8 {
+                w.add_document(
+                    DocumentId(format!("d{i}")),
+                    vec![Field::vector("emb", vec![1.0, i as f32, 0.5, 0.0])],
+                );
+            }
+            w.finalize(Default::default()).unwrap();
+            fs::remove_file(dir.join(kosha_segment::DOC_VECTORS_FILE)).unwrap();
+            assert_eq!(kosha_segment::segment_keeps_doc_vectors_whole(&dir), kept);
+            assert_eq!(
+                doc_vectors_promotion(&dir) == DOC_VECTORS_PROMOTED,
+                kept,
+                "{quantization:?}"
+            );
+            assert_eq!(doc_store_promotion_landed(&dir), !kept, "{quantization:?}");
+            fs::remove_file(dir.join(kosha_segment::DOC_STORE_FILE)).unwrap();
+            assert!(!doc_store_promotion_landed(&dir));
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 
     #[cfg(feature = "s3")]
@@ -16951,6 +17325,7 @@ mod tests {
             &manifest,
             &base_query,
             &RequestHydration::unlimited(),
+            None,
         );
         assert!(
             !unfiltered.bloom_pruned,
@@ -16967,6 +17342,7 @@ mod tests {
             &manifest,
             &filtered_query,
             &RequestHydration::unlimited(),
+            None,
         );
         assert!(
             filtered.bloom_pruned,
@@ -17300,6 +17676,7 @@ mod tests {
             &manifest,
             &warmup_like,
             &RequestHydration::unlimited(),
+            None,
         );
         assert!(outcome.missing.is_empty() && !outcome.bloom_pruned);
         state
@@ -17373,6 +17750,7 @@ mod tests {
             &manifest,
             &sorted_unfiltered,
             &RequestHydration::unlimited(),
+            None,
         );
         assert!(
             outcome3.missing.is_empty() && !outcome3.bloom_pruned,

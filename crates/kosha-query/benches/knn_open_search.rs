@@ -330,8 +330,9 @@ fn main() {
     let mut scan = (0.0f64, 0.0f64, 0.0f64, 0usize, 0usize);
     // Of the same samples (#436): `knn_plan` wall ms, the scoring pass's
     // wall ms, the ms segments spent ranking their own centroids (summed
-    // over threads), and centroids the plan scored.
-    let mut phases = (0.0f64, 0.0f64, 0.0f64, 0usize);
+    // over threads), centroids the plan scanned, and those of them it
+    // scored exactly in f32 (`knn_plan_exact_centroids`).
+    let mut phases = (0.0f64, 0.0f64, 0.0f64, 0usize, 0usize);
     // FNV-1a over every warm kNN sample's hits (document id and score
     // bits, in order): two builds that return the same top-k for the same
     // knobs print the same digest.
@@ -365,6 +366,7 @@ fn main() {
                 phases.1 += stats.score_wall_ms;
                 phases.2 += stats.knn_rank_ms;
                 phases.3 += stats.knn_centroids_scanned;
+                phases.4 += stats.knn_plan_exact_centroids;
                 for hit in &r.results {
                     let bytes = hit
                         .doc_id
@@ -423,11 +425,13 @@ fn main() {
 
     println!(
         "warm kNN phases per query (mean): knn_plan {:.3}ms, score wall {:.3}ms, segment centroid \
-         ranking {:.3}ms (summed over threads); {:.0} centroids scored by the plan",
+         ranking {:.3}ms (summed over threads); {:.0} centroids scanned by the plan, \
+         knn_plan_exact_centroids {:.1}",
         per_query(phases.0),
         per_query(phases.1),
         per_query(phases.2),
         per_query(phases.3 as f64),
+        per_query(phases.4 as f64),
     );
     println!("warm kNN top-k digest (ids and score bits of every sample): {digest:016x}");
 
@@ -458,6 +462,7 @@ fn main() {
                 "score_wall_ms": per_query(phases.1),
                 "knn_rank_ms": per_query(phases.2),
                 "centroids_per_query": per_query(phases.3 as f64),
+                "knn_plan_exact_centroids": per_query(phases.4 as f64),
                 "topk_digest": format!("{digest:016x}"),
             },
         });

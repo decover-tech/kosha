@@ -1952,6 +1952,49 @@ pub fn knn_needs_doc_vectors(footer: Option<&Footer>) -> bool {
     footer.is_some_and(|f| f.vector_fields.is_none() && f.doc_vectors)
 }
 
+/// Whether a query node should hold this segment's `doc_vectors.bin`
+/// WHOLE, i.e. whether background promotion and warm-up fetch it.
+///
+/// Only a quantized (i8 / RaBitQ) column needs the whole file: the
+/// default per-segment kNN path rescores its shortlist from it, and
+/// without it returns quantized estimates as final scores
+/// ([`SegmentReader::rescores_quantized_locally`]). An f32 column never
+/// rescores, and every other reader works from ranges — page documents'
+/// vectors ([`SegmentReader::doc_is_local`]), exact filtered kNN
+/// (`knn_exact_filtered_fetching`) and global rescoring
+/// (`knn_exact_scores_fetching`) — so for f32 columns the whole file (as
+/// large as the f32 vector index) is never worth its download or its
+/// disk. A legacy footer that lists no columns cannot say, so it keeps
+/// the whole file as before. `false` when the segment has no sidecar.
+pub fn doc_vectors_kept_whole(footer: &Footer) -> bool {
+    footer.doc_vectors
+        && footer
+            .vector_fields
+            .as_ref()
+            .is_none_or(|cols| cols.iter().any(|c| !c.quantization.is_f32()))
+}
+
+/// An upper bound on `doc_vectors.bin`'s header length from the footer
+/// alone, at least [`DOC_VECTORS_HEADER_PROBE`]: 12 bytes per entry, at
+/// most one entry per document per vector column, plus the field table.
+/// Reading this many bytes first fetches the whole header in one round
+/// (any surplus is the first vectors). A legacy footer that lists no
+/// columns gives the plain probe.
+pub fn doc_vectors_header_estimate(footer: &Footer) -> u64 {
+    let Some(cols) = footer.vector_fields.as_ref() else {
+        return DOC_VECTORS_HEADER_PROBE;
+    };
+    let names: u64 = cols.iter().map(|c| 4 + c.name.len() as u64).sum();
+    let entries = footer.doc_count as u64 * cols.len() as u64;
+    (12 + names + 12 * entries).max(DOC_VECTORS_HEADER_PROBE)
+}
+
+/// [`doc_vectors_kept_whole`] for `segment_dir`'s local `footer.json`;
+/// `false` if it can't be read (as [`segment_uses_doc_vectors`]).
+pub fn segment_keeps_doc_vectors_whole(segment_dir: &Path) -> bool {
+    SegmentReader::read_footer(segment_dir).is_ok_and(|footer| doc_vectors_kept_whole(&footer))
+}
+
 /// The files a kNN on `field` needs from `segment_dir` (#204), each paired
 /// with whether the segment cannot be searched without it. Decided from
 /// the local `footer.json`:
@@ -2615,6 +2658,9 @@ impl VectorPosting {
 
 #[cfg(test)]
 mod posting_scan_tests;
+
+#[cfg(test)]
+mod centroid_codes_tests;
 
 #[cfg(test)]
 mod vector_index_v2_tests {
@@ -4077,6 +4123,29 @@ pub struct DocVectors {
     file_len: u64,
 }
 
+/// Span-cache listings of one segment, kept across the documents of one
+/// result page ([`SegmentReader::page_doc_is_local`],
+/// [`SegmentReader::page_doc_record`]): a listing is a `read_dir` plus a
+/// stat of every cached span, so taking one per document cost a page
+/// `documents x spans` stats.
+#[derive(Default)]
+pub struct PageSpans {
+    doc_store: Option<span_cache::SpanIndex>,
+    doc_vectors: Option<span_cache::SpanIndex>,
+}
+
+/// Which sidecar vectors a visit reads, in which runs: see
+/// [`DocVectors::visit_field_vectors`].
+#[derive(Default)]
+struct VectorRuns {
+    /// Entry indices of the wanted vectors, ascending.
+    wanted: Vec<usize>,
+    /// `[start, end)` into `wanted`, one per run.
+    runs: Vec<(usize, usize)>,
+    /// The `[start, end)` file bytes of each run.
+    ranges: Vec<(u64, u64)>,
+}
+
 impl DocVectors {
     /// Open a whole local `doc_vectors.bin`, checking its length against
     /// the header.
@@ -4163,16 +4232,27 @@ impl DocVectors {
     /// `(field name, vector)` for every vector stored for `doc_seq`, in the
     /// document's field order. One local read.
     pub fn vectors_for(&self, doc_seq: u32) -> Result<Vec<(&str, Vec<f32>)>, KoshaError> {
+        self.vectors_for_reusing(doc_seq, &mut None)
+    }
+
+    /// [`Self::vectors_for`] keeping the span listing in `spans` across
+    /// calls (see [`span_cache::read_local_range_reusing`]).
+    pub fn vectors_for_reusing(
+        &self,
+        doc_seq: u32,
+        spans: &mut Option<span_cache::SpanIndex>,
+    ) -> Result<Vec<(&str, Vec<f32>)>, KoshaError> {
         let (start, end) = self.entry_range(doc_seq);
         let Some((span_start, span_end)) = self.doc_span(doc_seq) else {
             return Ok(Vec::new());
         };
-        let buf = span_cache::read_local_range(
+        let buf = span_cache::read_local_range_reusing(
             &self.segment_dir,
             DOC_VECTORS_FILE,
             self.file_len,
             span_start,
             span_end - span_start,
+            spans,
         )
         .ok_or_else(|| {
             KoshaError::NotFound(format!(
@@ -4229,7 +4309,7 @@ impl DocVectors {
 
     /// Calls `visit(doc_seq, vector)` for `field`'s vector of every
     /// document in `doc_seqs` (ascending) that has one, in `doc_seq` order,
-    /// and returns how many were visited.
+    /// and returns how many were visited. Reads the whole local file.
     ///
     /// Built for exact kNN over a filtered set (#252): vectors that sit
     /// close together in the file (gaps up to [`Self::COALESCE_GAP`]) are
@@ -4240,48 +4320,105 @@ impl DocVectors {
         &self,
         field: &str,
         doc_seqs: &[u32],
-        mut visit: impl FnMut(u32, &[f32]),
+        visit: impl FnMut(u32, &[f32]),
     ) -> Result<usize, KoshaError> {
-        let Some(field_idx) = self.fields.iter().position(|name| name == field) else {
+        let plan = self.field_vector_runs(field, doc_seqs);
+        if plan.wanted.is_empty() {
             return Ok(0);
+        }
+        let mut file = fs::File::open(self.segment_dir.join(DOC_VECTORS_FILE))?;
+        self.visit_runs(&plan, visit, |start, end, buf| {
+            buf.resize((end - start) as usize, 0);
+            file.seek(SeekFrom::Start(start))?;
+            file.read_exact(buf)?;
+            Ok(())
+        })
+    }
+
+    /// The byte ranges [`Self::visit_field_vectors`] reads for `field`'s
+    /// vectors of `doc_seqs` (ascending), in file order: the ranges a
+    /// reader without the whole file fetches into the span cache first.
+    pub fn field_vector_ranges(&self, field: &str, doc_seqs: &[u32]) -> Vec<(u64, u64)> {
+        self.field_vector_runs(field, doc_seqs).ranges
+    }
+
+    /// [`Self::visit_field_vectors`] reading each of
+    /// [`Self::field_vector_ranges`] from the sparse span cache instead of
+    /// the whole file (#245). Same vectors, same order, same arithmetic for
+    /// the caller. `Err` when a range is not cached (never fetched, or
+    /// evicted since).
+    pub fn visit_field_vectors_cached(
+        &self,
+        spans: &span_cache::SpanIndex,
+        field: &str,
+        doc_seqs: &[u32],
+        visit: impl FnMut(u32, &[f32]),
+    ) -> Result<usize, KoshaError> {
+        let plan = self.field_vector_runs(field, doc_seqs);
+        self.visit_runs(&plan, visit, |start, end, buf| {
+            *buf = spans.read(start, end).ok_or_else(|| {
+                KoshaError::NotFound(format!(
+                    "{DOC_VECTORS_FILE} bytes {start}..{end} are not cached in segment {:?}",
+                    self.segment_dir
+                ))
+            })?;
+            Ok(())
+        })
+    }
+
+    /// Entry indices of `field`'s vectors of `doc_seqs` (ascending), and
+    /// the runs they are read in.
+    fn field_vector_runs(&self, field: &str, doc_seqs: &[u32]) -> VectorRuns {
+        let mut plan = VectorRuns::default();
+        let Some(field_idx) = self.fields.iter().position(|name| name == field) else {
+            return plan;
         };
         let field_idx = field_idx as u32;
-        // Entry indices of the wanted vectors, ascending (entries are
-        // sorted by doc_seq, and so is `doc_seqs`).
-        let mut wanted: Vec<usize> = Vec::with_capacity(doc_seqs.len());
+        // Entries are sorted by doc_seq, and so is `doc_seqs`.
         let mut from = 0usize;
         for &doc_seq in doc_seqs {
             let start = from + self.entries[from..].partition_point(|e| e.0 < doc_seq);
             let mut i = start;
             while i < self.entries.len() && self.entries[i].0 == doc_seq {
                 if self.entries[i].1 == field_idx {
-                    wanted.push(i);
+                    plan.wanted.push(i);
                 }
                 i += 1;
             }
             from = i;
         }
-        if wanted.is_empty() {
-            return Ok(0);
-        }
         let end_of = |i: usize| self.offsets[i] + self.entries[i].2 as u64 * 4;
-        let mut file = fs::File::open(self.segment_dir.join(DOC_VECTORS_FILE))?;
-        let mut buf: Vec<u8> = Vec::new();
-        let mut vector: Vec<f32> = Vec::new();
         let mut run_start = 0usize;
-        while run_start < wanted.len() {
+        while run_start < plan.wanted.len() {
+            let first = self.offsets[plan.wanted[run_start]];
             let mut run_end = run_start + 1;
-            while run_end < wanted.len()
-                && self.offsets[wanted[run_end]] <= end_of(wanted[run_end - 1]) + Self::COALESCE_GAP
+            while run_end < plan.wanted.len()
+                && self.offsets[plan.wanted[run_end]]
+                    <= end_of(plan.wanted[run_end - 1]) + Self::COALESCE_GAP
+                && end_of(plan.wanted[run_end]) - first <= Self::MAX_RUN_BYTES
             {
                 run_end += 1;
             }
-            let span_start = self.offsets[wanted[run_start]];
-            let span_end = end_of(wanted[run_end - 1]);
-            buf.resize((span_end - span_start) as usize, 0);
-            file.seek(SeekFrom::Start(span_start))?;
-            file.read_exact(&mut buf)?;
-            for &i in &wanted[run_start..run_end] {
+            plan.runs.push((run_start, run_end));
+            plan.ranges.push((first, end_of(plan.wanted[run_end - 1])));
+            run_start = run_end;
+        }
+        plan
+    }
+
+    /// Decode every run of `plan`, reading its bytes into the buffer with
+    /// `read(start, end, buf)`, and visit its vectors in `doc_seq` order.
+    fn visit_runs(
+        &self,
+        plan: &VectorRuns,
+        mut visit: impl FnMut(u32, &[f32]),
+        mut read: impl FnMut(u64, u64, &mut Vec<u8>) -> Result<(), KoshaError>,
+    ) -> Result<usize, KoshaError> {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut vector: Vec<f32> = Vec::new();
+        for (&(run_start, run_end), &(span_start, span_end)) in plan.runs.iter().zip(&plan.ranges) {
+            read(span_start, span_end, &mut buf)?;
+            for &i in &plan.wanted[run_start..run_end] {
                 let at = (self.offsets[i] - span_start) as usize;
                 let dim = self.entries[i].2 as usize;
                 vector.clear();
@@ -4294,15 +4431,21 @@ impl DocVectors {
                 );
                 visit(self.entries[i].0, &vector);
             }
-            run_start = run_end;
         }
-        Ok(wanted.len())
+        Ok(plan.wanted.len())
     }
 
     /// Largest gap between two wanted vectors that
     /// [`Self::visit_field_vectors`] reads through rather than seeking
     /// over: reading 64 KiB costs about what one more seek does.
     pub const COALESCE_GAP: u64 = 64 * 1024;
+
+    /// Most bytes one run reads at once. Without a cap a dense candidate
+    /// set (every document of a one-matter segment) is a single run the
+    /// size of the whole file — a 2 GB buffer for one segment's exact kNN.
+    /// 8 MiB is ~2,700 768-dim vectors per read: still a few large
+    /// sequential reads, at a bounded heap cost per scoring thread.
+    pub const MAX_RUN_BYTES: u64 = 8 * 1024 * 1024;
 
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -6539,6 +6682,12 @@ struct LazyVectorIndex {
     /// One allocation, so the per-query scan over all of them reads memory
     /// sequentially instead of chasing a pointer per centroid.
     centroids: Vec<f32>,
+    /// i8 codes of the same centroids, for the first stage of kNN planning
+    /// (see [`CentroidCodes`]). Built here, in memory, when the column is
+    /// loaded; nothing on disk changes. `None` for a column that is not
+    /// unit-norm, with `KOSHA_KNN_PLAN_I8=0`, or when a centroid is not a
+    /// sane unit-scale vector: planning then scores the f32 centroids.
+    centroid_codes: Option<CentroidCodes>,
     /// `(offset, length)` into `vector.idx`, one per posting.
     ranges: Vec<(u64, u32)>,
     /// Parallel to `ranges` — max cosine distance from each posting's
@@ -6586,6 +6735,10 @@ impl LazyVectorIndex {
             ranges.push((p.offset, p.length));
             radii.push(p.radius);
         }
+        let unit_norm = is_unit_norm_vector_index_version(version);
+        let centroid_codes = (unit_norm && knn_plan_i8_from_env())
+            .then(|| CentroidCodes::build(&centroids, dim))
+            .flatten();
         LazyVectorIndex {
             vector_idx_path: idx_path.to_path_buf(),
             idx_file: idx_path.file_name().map_or_else(
@@ -6595,9 +6748,10 @@ impl LazyVectorIndex {
             slot,
             dim,
             centroids,
+            centroid_codes,
             ranges,
             radii,
-            unit_norm: is_unit_norm_vector_index_version(version),
+            unit_norm,
             version,
             quantized: is_quantized_vector_index_version(version),
             rabitq: is_rabitq_vector_index_version(version),
@@ -6613,6 +6767,238 @@ impl LazyVectorIndex {
     /// Every centroid, in posting order.
     fn centroid_rows(&self) -> impl Iterator<Item = &[f32]> {
         (0..self.ranges.len()).map(|i| self.centroid(i))
+    }
+}
+
+/// Bytes per centroid that [`CentroidCodes`] keeps resident beyond its
+/// `dim` code bytes: the row's scale and its two error coefficients.
+const CENTROID_CODE_ROW_OVERHEAD: usize = 3 * std::mem::size_of::<f32>();
+
+/// Largest dimension [`CentroidCodes`] is built for. The rounding-error
+/// term of its bound assumes `dim * 2^-24` is far below 1.
+const CENTROID_CODES_MAX_DIM: usize = 1 << 16;
+
+/// i8 codes of a unit-norm column's centroids: a quarter of the f32
+/// matrix, so the per-query scan over every centroid of every segment
+/// (`knn_plan`, which is memory-bandwidth-bound at 1024 dimensions) reads a
+/// quarter of the bytes. The codes only decide which centroids are worth
+/// an exact f32 score; nothing ranked, cut off or probed ever comes from
+/// them (see `SegmentReader::centroid_score_bounds`).
+///
+/// Quantization is [`kosha_vector_spfresh::quantize_i8`], one scale per
+/// centroid. A query is quantized too, to i16
+/// ([`kosha_vector_spfresh::quantize_i16`]), and the estimate of
+/// `<q, c>` is `s_q * s * <q_k, k>` with the sum taken in integers
+/// ([`kosha_vector_spfresh::dot_i16_i8`]).
+///
+/// # Error coefficients
+///
+/// For row `c` with codes `k` and scale `s`, let `c^ = s * k` and
+/// `r = c - c^`, the residual actually left by quantization (measured
+/// here, in f64, not assumed to be `s / 2` per coordinate). Likewise
+/// `q^ = s_q * q_k` and `r_q = q - q^` for the query. In real arithmetic
+///
+/// ```text
+/// <q, c> - <q^, c^> = <q, r> + <r_q, c^>
+/// |<q, r>|    <= min(||q||_2 * ||r||_2,  ||q||_1 * ||r||_inf)
+/// |<r_q, c^>| <= ||r_q||_2 * ||c^||_2
+/// ```
+///
+/// (Cauchy-Schwarz and Hoelder). The `||q||_1` form is the
+/// `scale / 2 * ||q||_1` bound the i8 posting path uses
+/// (`KOSHA_KNN_I8_BOUND=strict`); the `||q||_2` form is about a third
+/// tighter for a dense query and is what usually decides. The query term
+/// is small (a 1024-dimension query keeps 14 bits a coordinate) and is
+/// added per query from [`Self::max_code_norm`].
+///
+/// The exact side is an f32 dot product and carries a rounding error: for
+/// a sum of `n` products in any order at most `gamma_n * sum |x_i * y_i|`
+/// with `gamma_n = n u / (1 - n u)`, `u = 2^-24` (Higham, Accuracy and
+/// Stability of Numerical Algorithms, section 3.1), and
+/// `sum |q_i * c_i| <= ||q||_2 * ||c||_2`. `fp` below is
+/// `(n + 8) * 2u * (||c||_2 + ||c^||_2)`, more than twice that. The
+/// integer sum is exact; turning it into an f32 estimate costs three
+/// roundings, which the query term also covers.
+///
+/// `err_l2 = ||r||_2 + fp` and `err_linf = ||r||_inf + fp` (`fp` may ride
+/// on the L1 term because `||q||_2 <= ||q||_1`), each rounded up, so for
+/// the computed f32 values
+///
+/// ```text
+/// |dot(q, c) - estimate| <= min(err_l2 * ||q||_2, err_linf * ||q||_1) + query term
+/// ```
+#[derive(Debug)]
+struct CentroidCodes {
+    /// Row-major, `dim` codes per centroid, parallel to
+    /// [`LazyVectorIndex::centroids`].
+    codes: Vec<i8>,
+    /// One scale per centroid.
+    scales: Vec<f32>,
+    err_l2: Vec<f32>,
+    err_linf: Vec<f32>,
+    /// The largest `||s * k||_2` of any row, rounded up: what a query's
+    /// own quantization error is multiplied by.
+    max_code_norm: f32,
+}
+
+impl CentroidCodes {
+    /// `None` when the codes could not carry a guaranteed bound: an empty
+    /// or absurdly wide column, or a centroid that is not finite or not
+    /// roughly unit length (the writer renormalizes them, so this means a
+    /// damaged or foreign sidecar; the exact path makes no such
+    /// assumption).
+    fn build(centroids: &[f32], dim: usize) -> Option<Self> {
+        if dim == 0 || dim > CENTROID_CODES_MAX_DIM || centroids.is_empty() {
+            return None;
+        }
+        let rows = centroids.len() / dim;
+        let mut out = CentroidCodes {
+            codes: Vec::with_capacity(rows * dim),
+            scales: Vec::with_capacity(rows),
+            err_l2: Vec::with_capacity(rows),
+            err_linf: Vec::with_capacity(rows),
+            max_code_norm: 0.0,
+        };
+        let mut row_codes: Vec<i8> = Vec::with_capacity(dim);
+        // Rounds a non-negative f64 up to an f32 with room to spare for
+        // the f32 arithmetic the coefficient is later used in.
+        let up = |x: f64| (x * (1.0 + 1e-5)) as f32;
+        for row in centroids.chunks_exact(dim) {
+            if row.iter().any(|x| !x.is_finite()) {
+                return None;
+            }
+            let scale = kosha_vector_spfresh::quantize_i8(row, &mut row_codes);
+            let (mut norm2, mut approx2, mut res2, mut res_inf) = (0f64, 0f64, 0f64, 0f64);
+            for (&x, &k) in row.iter().zip(&row_codes) {
+                let x = f64::from(x);
+                let approx = f64::from(scale) * f64::from(k);
+                let r = x - approx;
+                norm2 += x * x;
+                approx2 += approx * approx;
+                res2 += r * r;
+                res_inf = res_inf.max(r.abs());
+            }
+            if !scale.is_finite() || norm2.sqrt() > 2.0 {
+                return None;
+            }
+            let fp = (dim + 8) as f64 * f64::from(f32::EPSILON) * (norm2.sqrt() + approx2.sqrt());
+            out.codes.extend_from_slice(&row_codes);
+            out.scales.push(scale);
+            out.err_l2.push(up(res2.sqrt() + fp));
+            out.err_linf.push(up(res_inf + fp));
+            out.max_code_norm = out.max_code_norm.max(up(approx2.sqrt()));
+        }
+        Some(out)
+    }
+
+    /// Posting `i`'s codes.
+    fn row(&self, i: usize, dim: usize) -> &[i8] {
+        &self.codes[i * dim..(i + 1) * dim]
+    }
+}
+
+/// Resident bytes of the centroid codes a segment open builds for the
+/// vector column whose `vector.offsets` sidecar is at `offsets_path` (see
+/// [`CentroidCodes`]): zero when the column gets none (not unit-norm,
+/// `KOSHA_KNN_PLAN_I8=0`, or no readable sidecar header).
+///
+/// The codes are derived at load and have no file of their own, so the
+/// on-disk sizes the query layer's `approx_segment_bytes` sums do not see
+/// them; it adds this. Only the sidecar's 16-byte header is read.
+pub fn vector_centroid_code_bytes(offsets_path: &Path) -> u64 {
+    if !knn_plan_i8_from_env() {
+        return 0;
+    }
+    let mut header = [0u8; VECTOR_OFFSETS_HEADER_LEN];
+    let read = fs::File::open(offsets_path).and_then(|mut f| f.read_exact(&mut header));
+    if read.is_err() || header[0..4] != VECTOR_OFFSETS_MAGIC.to_le_bytes() {
+        return 0;
+    }
+    let mut cursor = &header[4..];
+    let version = read_u32_le(&mut cursor);
+    let dim = read_u32_le(&mut cursor) as u64;
+    let postings = read_u32_le(&mut cursor) as u64;
+    if !is_known_vector_index_version(version) || !is_unit_norm_vector_index_version(version) {
+        return 0;
+    }
+    postings.saturating_mul(dim + CENTROID_CODE_ROW_OVERHEAD as u64)
+}
+
+/// `KOSHA_KNN_PLAN_I8` (default on): `0`, `false` or `off` turns off the
+/// i8 first stage of kNN planning. Unit-norm columns are then loaded
+/// without centroid codes and the plan scores every f32 centroid, as it
+/// did before the stage existed. Read once per process.
+pub fn knn_plan_i8_from_env() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("KOSHA_KNN_PLAN_I8")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("0") | Some("false") | Some("off")
+        )
+    })
+}
+
+/// Guaranteed bounds on every posting's kNN rank score, from the i8
+/// centroid codes: `lower[i] <= score <= upper[i]`, where `score` is the
+/// f32 value [`SegmentReader::knn_centroid_distances`] computes for
+/// posting `i`. See [`SegmentReader::knn_centroid_score_bounds`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct KnnCentroidScoreBounds {
+    pub lower: Vec<f32>,
+    pub upper: Vec<f32>,
+}
+
+/// Centroids held in memory and scored exactly as a loaded unit-norm
+/// column's are, with the same i8 codes: for timing and testing the kNN
+/// planning pass at sizes no test corpus on disk reaches. Not a way to
+/// search anything (it has no postings).
+#[doc(hidden)]
+pub struct KnnCentroidMatrix(LazyVectorIndex);
+
+impl KnnCentroidMatrix {
+    /// `centroids` is row-major, `dim` floats per row, one radius per row.
+    pub fn new(dim: usize, centroids: &[f32], radii: &[f32]) -> Self {
+        assert!(dim > 0 && centroids.len() == dim * radii.len());
+        let parsed = centroids
+            .chunks_exact(dim)
+            .zip(radii)
+            .map(|(centroid, &radius)| VectorPostingIndex {
+                centroid: centroid.to_vec(),
+                offset: 0,
+                length: 0,
+                radius,
+            })
+            .collect();
+        Self(LazyVectorIndex::from_parsed(
+            Path::new(VECTOR_IDX_FILE),
+            0,
+            dim as u32,
+            RADIUS_AWARE_VECTOR_INDEX_VERSION,
+            parsed,
+            None,
+        ))
+    }
+
+    pub fn postings(&self) -> usize {
+        self.0.ranges.len()
+    }
+
+    /// See [`SegmentReader::knn_centroid_distances_with_alpha`].
+    pub fn scores(&self, query: &[f32], alpha: f32) -> Vec<f32> {
+        SegmentReader::centroid_scores(&self.0, query, alpha)
+    }
+
+    /// See [`SegmentReader::knn_centroid_scores_for`].
+    pub fn scores_for(&self, query: &[f32], postings: &[u32], alpha: f32) -> Vec<f32> {
+        SegmentReader::centroid_scores_at(&self.0, query, postings, alpha)
+    }
+
+    /// See [`SegmentReader::knn_centroid_score_bounds`].
+    pub fn score_bounds(&self, query: &[f32], alpha: f32) -> Option<KnnCentroidScoreBounds> {
+        SegmentReader::centroid_score_bounds(&self.0, query, alpha)
     }
 }
 
@@ -6769,8 +7155,13 @@ pub enum KnnProbeBudget<'a> {
 /// `max_distance`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KnnSegmentRanking {
-    /// One rank score per posting, in posting order.
-    bounds: Vec<f32>,
+    /// One rank score per posting, in posting order. `None` when the plan
+    /// scored only the postings that could be inside the budget
+    /// ([`Self::from_candidates`]): a restricted probe that runs past the
+    /// budget then scores the segment's centroids itself.
+    bounds: Option<Vec<f32>>,
+    /// How many postings the segment's column has.
+    postings: usize,
     /// The postings inside the budget, nearest first.
     budgeted: Vec<u32>,
     max_distance: f32,
@@ -6797,32 +7188,71 @@ impl KnnSegmentRanking {
             // Without NaN, "ascending score, ties in posting order" is a
             // total order on `(score, posting)`, so the first `max_probes`
             // under the cutoff can be selected without sorting the rest.
-            let by_rank = |a: &(f32, u32), b: &(f32, u32)| {
-                a.0.partial_cmp(&b.0)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(a.1.cmp(&b.1))
-            };
-            let mut within: Vec<(f32, u32)> = bounds
+            let within: Vec<(f32, u32)> = bounds
                 .iter()
                 .enumerate()
                 .filter(|(_, d)| **d <= max_distance)
                 .map(|(i, &d)| (d, i as u32))
                 .collect();
-            if within.len() > max_probes {
-                if max_probes > 0 {
-                    within.select_nth_unstable_by(max_probes - 1, by_rank);
-                }
-                within.truncate(max_probes);
-            }
-            within.sort_unstable_by(by_rank);
-            within.into_iter().map(|(_, i)| i).collect()
+            Self::nearest(within, max_probes)
         };
         Self {
-            bounds,
+            postings: bounds.len(),
+            bounds: Some(bounds),
             budgeted,
             max_distance,
             max_probes,
         }
+    }
+
+    /// [`Self::new`] for a segment of `postings` postings of which only
+    /// `candidates` were scored: `(posting, score)` pairs, each score the
+    /// value [`SegmentReader::knn_centroid_distances`] has for that
+    /// posting.
+    ///
+    /// The budgeted postings are the ones [`Self::new`] picks from the
+    /// segment's full scores provided `candidates` holds every posting
+    /// whose score is at or under `max_distance`: postings over the cutoff
+    /// are dropped by both, and among the rest both apply the same total
+    /// order. A NaN score (which the score function never produces) is
+    /// never at or under a cutoff, so it is dropped here rather than
+    /// ordered; the caller plans from full scores if it ever sees one.
+    pub fn from_candidates(
+        postings: usize,
+        candidates: &[(u32, f32)],
+        max_distance: f32,
+        max_probes: usize,
+    ) -> Self {
+        let within: Vec<(f32, u32)> = candidates
+            .iter()
+            .filter(|(_, d)| *d <= max_distance)
+            .map(|&(i, d)| (d, i))
+            .collect();
+        Self {
+            bounds: None,
+            postings,
+            budgeted: Self::nearest(within, max_probes),
+            max_distance,
+            max_probes,
+        }
+    }
+
+    /// The first `max_probes` of `within` (`(score, posting)` pairs, no
+    /// NaN) in ascending score, equal scores in posting order.
+    fn nearest(mut within: Vec<(f32, u32)>, max_probes: usize) -> Vec<u32> {
+        let by_rank = |a: &(f32, u32), b: &(f32, u32)| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.1.cmp(&b.1))
+        };
+        if within.len() > max_probes {
+            if max_probes > 0 {
+                within.select_nth_unstable_by(max_probes - 1, by_rank);
+            }
+            within.truncate(max_probes);
+        }
+        within.sort_unstable_by(by_rank);
+        within.into_iter().map(|(_, i)| i).collect()
     }
 
     /// The postings inside the budget, nearest first.
@@ -6830,9 +7260,15 @@ impl KnnSegmentRanking {
         &self.budgeted
     }
 
-    /// The rank score of every posting, in posting order.
-    pub fn bounds(&self) -> &[f32] {
-        &self.bounds
+    /// The rank score of every posting, in posting order; `None` for a
+    /// ranking built from candidates only ([`Self::from_candidates`]).
+    pub fn bounds(&self) -> Option<&[f32]> {
+        self.bounds.as_deref()
+    }
+
+    /// How many postings the ranked column has.
+    pub fn postings(&self) -> usize {
+        self.postings
     }
 
     /// The cutoff the ranking was built for.
@@ -7665,12 +8101,21 @@ impl SegmentReader {
     /// is corruption and fails loudly: returning the empty value would let
     /// a compaction write the document out without its vector.
     fn sidecar_vectors(&self, record: &DocRecord) -> Result<Vec<(usize, Vec<f32>)>, KoshaError> {
+        self.sidecar_vectors_reusing(record, &mut None)
+    }
+
+    /// [`Self::sidecar_vectors`] keeping the span listing in `spans`.
+    fn sidecar_vectors_reusing(
+        &self,
+        record: &DocRecord,
+        spans: &mut Option<span_cache::SpanIndex>,
+    ) -> Result<Vec<(usize, Vec<f32>)>, KoshaError> {
         let is_placeholder = |f: &Field| f.field_type == FieldType::Vector && f.value.is_empty();
         if !self.footer.doc_vectors || !record.fields.iter().any(is_placeholder) {
             return Ok(Vec::new());
         }
         let dv = self.doc_vectors()?;
-        let mut stored = dv.vectors_for(record.doc_seq)?.into_iter();
+        let mut stored = dv.vectors_for_reusing(record.doc_seq, spans)?.into_iter();
         let mut out = Vec::new();
         for (index, field) in record.fields.iter().enumerate() {
             if !is_placeholder(field) {
@@ -8277,18 +8722,143 @@ impl SegmentReader {
     /// cutoff and each segment's own ranking come from this function, so
     /// they stay in the same units.
     fn centroid_lower_bounds(vi: &LazyVectorIndex, query: &[f32]) -> Vec<f32> {
-        let alpha = knn_probe_radius_alpha();
+        Self::centroid_scores(vi, query, knn_probe_radius_alpha())
+    }
+
+    /// [`Self::centroid_lower_bounds`] at an explicit radius weight.
+    fn centroid_scores(vi: &LazyVectorIndex, query: &[f32], alpha: f32) -> Vec<f32> {
         let unit = Self::unit_query(vi, query);
-        vi.centroid_rows()
-            .zip(&vi.radii)
-            .map(|(c, &r)| {
-                let distance = match &unit {
-                    Some(unit) => 1.0 - kosha_vector_spfresh::dot(unit, c).clamp(-1.0, 1.0),
-                    None => kosha_vector_spfresh::cosine_distance(query, c),
-                };
-                centroid_probe_score(distance, r, alpha)
-            })
+        (0..vi.ranges.len())
+            .map(|i| Self::centroid_score(vi, unit.as_deref(), query, i, alpha))
             .collect()
+    }
+
+    /// Posting `i`'s rank score: the one expression every exact centroid
+    /// score comes from, whether the whole column is scored or a few of
+    /// its postings, so the two are the same f32 bit for bit.
+    fn centroid_score(
+        vi: &LazyVectorIndex,
+        unit: Option<&[f32]>,
+        query: &[f32],
+        i: usize,
+        alpha: f32,
+    ) -> f32 {
+        let c = vi.centroid(i);
+        let distance = match unit {
+            Some(unit) => 1.0 - kosha_vector_spfresh::dot(unit, c).clamp(-1.0, 1.0),
+            None => kosha_vector_spfresh::cosine_distance(query, c),
+        };
+        centroid_probe_score(distance, vi.radii[i], alpha)
+    }
+
+    /// [`Self::centroid_score`] of each of `postings` (all in range), in
+    /// the order given.
+    fn centroid_scores_at(
+        vi: &LazyVectorIndex,
+        query: &[f32],
+        postings: &[u32],
+        alpha: f32,
+    ) -> Vec<f32> {
+        let unit = Self::unit_query(vi, query);
+        postings
+            .iter()
+            .map(|&i| Self::centroid_score(vi, unit.as_deref(), query, i as usize, alpha))
+            .collect()
+    }
+
+    /// Guaranteed bounds on every posting's [`Self::centroid_score`] from
+    /// the column's i8 centroid codes, without reading an f32 centroid.
+    /// `None` when there are no codes (see
+    /// [`LazyVectorIndex::centroid_codes`]) or the bound's assumptions do
+    /// not hold for this query; the caller then uses exact scores.
+    ///
+    /// Why the bounds hold, for posting `i` with f32 centroid `c`:
+    ///
+    /// 1. `x = dot(unit, c)` is what the exact score is computed from and
+    ///    `x'` is the estimate from the codes. By [`CentroidCodes`],
+    ///    `|x - x'| <= e0`, with `e0 = min(err_l2 * ||unit||_2,
+    ///    err_linf * ||unit||_1) + query_err`, where `query_err` is the
+    ///    query's own quantization residual times the largest code norm,
+    ///    plus the rounding of the estimate.
+    /// 2. The exact distance is `d = fl(1 - clamp(x))` and the estimate
+    ///    `d' = fl(1 - clamp(x'))`. `clamp` to `[-1, 1]` never increases a
+    ///    difference and each subtraction rounds a value in `[0, 2]`, by at
+    ///    most `2^-24`, so `|d - d'| <= e0 + 2^-23`. `e = e0 + PAD` covers
+    ///    that and the rounding of `d' - e` and `d' + e` themselves (each
+    ///    under `2.4e-7`): `fl(d' - e) <= d <= fl(d' + e)`.
+    /// 3. [`centroid_probe_score`] is `max(fl(d - fl(alpha * r)), 0)`. For
+    ///    a fixed radius and alpha it is a non-decreasing function of `d`
+    ///    *as computed in f32*: `fl(alpha * r)` is the same number in every
+    ///    call, rounding to nearest is monotone, and so is `max`. That
+    ///    needs nothing of alpha or the radius (no Lipschitz constant, no
+    ///    sign), so it holds for every `KOSHA_KNN_PROBE_RADIUS_ALPHA`.
+    ///    Hence `score(fl(d' - e)) <= score(d) <= score(fl(d' + e))`.
+    ///
+    /// A NaN would break step 3 silently (`max` turns it into `0`), so a
+    /// query or an estimate that is not finite yields `None` instead.
+    fn centroid_score_bounds(
+        vi: &LazyVectorIndex,
+        query: &[f32],
+        alpha: f32,
+    ) -> Option<KnnCentroidScoreBounds> {
+        /// Absolute slack for the handful of f32 roundings in step 2.
+        const PAD: f32 = 2e-6;
+        let codes = vi.centroid_codes.as_ref()?;
+        if !(alpha.is_finite() && alpha >= 0.0) {
+            return None;
+        }
+        let unit = Self::unit_query(vi, query)?;
+        if unit.iter().any(|x| !x.is_finite()) {
+            return None;
+        }
+        // The query's norms, rounded up. A unit query's L2 norm is 1 to
+        // within rounding; it is measured rather than assumed (a zero
+        // query stays zero).
+        let (l1, l2sq) = unit.iter().fold((0f64, 0f64), |(l1, l2sq), &x| {
+            let x = f64::from(x);
+            (l1 + x.abs(), l2sq + x * x)
+        });
+        let up = |x: f64| (x * (1.0 + 1e-5)) as f32;
+        let (l1, l2) = (up(l1), up(l2sq.sqrt()));
+        // The query's codes, and what quantizing it can cost against any
+        // row: `||r_q||_2 * max ||c^||_2`, plus three f32 roundings of an
+        // estimate no larger than `||q^||_2 * max ||c^||_2`.
+        let (query_codes, query_scale) = kosha_vector_spfresh::quantize_i16(
+            &unit,
+            kosha_vector_spfresh::max_i16_query_code(vi.dim),
+        );
+        let query_residual = unit
+            .iter()
+            .zip(&query_codes)
+            .map(|(&x, &k)| {
+                let r = f64::from(x) - f64::from(query_scale) * f64::from(k);
+                r * r
+            })
+            .sum::<f64>()
+            .sqrt();
+        let query_err = codes.max_code_norm
+            * up(query_residual + 4.0 * f64::from(f32::EPSILON) * (l2sq.sqrt() + query_residual));
+        let n = vi.ranges.len();
+        let mut bounds = KnnCentroidScoreBounds {
+            lower: Vec::with_capacity(n),
+            upper: Vec::with_capacity(n),
+        };
+        let mut finite = true;
+        for i in 0..n {
+            let sum = kosha_vector_spfresh::dot_i16_i8(&query_codes, codes.row(i, vi.dim));
+            let estimate = sum as f32 * (query_scale * codes.scales[i]);
+            let e = (codes.err_l2[i] * l2).min(codes.err_linf[i] * l1) + query_err + PAD;
+            finite &= estimate.is_finite() && e.is_finite();
+            let distance = 1.0 - estimate.clamp(-1.0, 1.0);
+            let r = vi.radii[i];
+            bounds
+                .lower
+                .push(centroid_probe_score(distance - e, r, alpha));
+            bounds
+                .upper
+                .push(centroid_probe_score(distance + e, r, alpha));
+        }
+        finite.then_some(bounds)
     }
 
     /// `query` scaled to unit length when `vi` stores unit vectors, so a
@@ -8342,6 +8912,81 @@ impl SegmentReader {
             return None;
         }
         Some(Self::centroid_lower_bounds(vi, query))
+    }
+
+    /// The lazy index [`Self::knn_centroid_distances`] scores for `field`
+    /// and a query of `dim` dimensions, under the same conditions.
+    fn with_knn_plan_index<R>(
+        &self,
+        field: &str,
+        dim: usize,
+        f: impl FnOnce(&LazyVectorIndex) -> Option<R>,
+    ) -> Option<R> {
+        let index = self.vector_field(field).ok()??;
+        f(index.lazy.as_ref().filter(|vi| vi.dim == dim)?)
+    }
+
+    /// How many scores [`Self::knn_centroid_distances`] returns for
+    /// `field` and a query of `dim` dimensions (one per posting), without
+    /// computing them; `None` exactly when it returns `None`.
+    pub fn knn_centroid_count(&self, field: &str, dim: usize) -> Option<usize> {
+        self.with_knn_plan_index(field, dim, |vi| Some(vi.ranges.len()))
+    }
+
+    /// [`Self::knn_centroid_distances`] at an explicit radius weight
+    /// instead of the process's `KOSHA_KNN_PROBE_RADIUS_ALPHA` (which is
+    /// what a segment's own probe uses: pass anything else only to compare
+    /// plans, never to plan a real query).
+    pub fn knn_centroid_distances_with_alpha(
+        &self,
+        field: &str,
+        query: &[f32],
+        alpha: f32,
+    ) -> Option<Vec<f32>> {
+        self.with_knn_plan_index(field, query.len(), |vi| {
+            Some(Self::centroid_scores(vi, query, alpha))
+        })
+    }
+
+    /// The scores [`Self::knn_centroid_distances_with_alpha`] has for
+    /// `postings` only, in the order given: the same f32 values, computed
+    /// by the same expression, reading only those centroids. `None` under
+    /// the same conditions, or when a posting is out of range.
+    pub fn knn_centroid_scores_for(
+        &self,
+        field: &str,
+        query: &[f32],
+        postings: &[u32],
+        alpha: f32,
+    ) -> Option<Vec<f32>> {
+        self.with_knn_plan_index(field, query.len(), |vi| {
+            if postings.iter().any(|&i| i as usize >= vi.ranges.len()) {
+                return None;
+            }
+            Some(Self::centroid_scores_at(vi, query, postings, alpha))
+        })
+    }
+
+    /// Stage one of two-stage kNN planning: guaranteed lower and upper
+    /// bounds on every score [`Self::knn_centroid_distances_with_alpha`]
+    /// would return, computed from i8 codes of the centroids (a quarter of
+    /// the memory the exact scan reads). The query layer uses them to
+    /// decide which postings need an exact score
+    /// ([`Self::knn_centroid_scores_for`]); the bounds themselves never
+    /// rank or admit anything.
+    ///
+    /// `None` when the column has no codes (not unit-norm,
+    /// `KOSHA_KNN_PLAN_I8=0`, no lazy index, a dimension mismatch) or the
+    /// query is not finite: the caller scores the column exactly.
+    pub fn knn_centroid_score_bounds(
+        &self,
+        field: &str,
+        query: &[f32],
+        alpha: f32,
+    ) -> Option<KnnCentroidScoreBounds> {
+        self.with_knn_plan_index(field, query.len(), |vi| {
+            Self::centroid_score_bounds(vi, query, alpha)
+        })
     }
 
     /// Score only the postings of the segment's first vector column whose
@@ -8756,8 +9401,10 @@ impl SegmentReader {
     /// postings full of documents the filter throws away, and keep going
     /// outward until it has found `k` that pass.
     ///
-    /// Vectors are read from `doc_vectors.bin` (#243) when the segment has
-    /// it locally and it holds `field`; otherwise every posting of the
+    /// Vectors are read from `doc_vectors.bin` (#243) when it holds
+    /// `field` and is local — the whole file, or its header with the
+    /// candidates' ranges fetched through `fetch` (see
+    /// [`Self::knn_exact_from_sidecar`]); otherwise every posting of the
     /// column is hydrated and filtered (the only way to see every vector
     /// of a segment that stores them inline). Scores are the posting
     /// probe's: cosine similarity, which on the sidecar's raw vectors is
@@ -8802,43 +9449,8 @@ impl SegmentReader {
                 source: ExactKnnSource::Sidecar,
             }));
         }
-        if self.footer.doc_vectors && self.segment_dir.join(DOC_VECTORS_FILE).exists() {
-            match self.doc_vectors() {
-                Ok(dv) if dv.has_field(field) => {
-                    let mut scored: Vec<(u32, f64)> = Vec::with_capacity(candidates.len());
-                    let visited = dv.visit_field_vectors(field, candidates, |doc_seq, v| {
-                        // A stray vector of another dimension was never
-                        // indexed (see `SegmentWriter::unindexed_vectors`),
-                        // so it is not a candidate on the probe path either.
-                        if v.len() == query.len() {
-                            scored.push((
-                                doc_seq,
-                                kosha_vector_spfresh::cosine_similarity(query, v) as f64,
-                            ));
-                        }
-                    });
-                    match visited {
-                        Ok(_) => {
-                            let vectors_scored = scored.len();
-                            return Some(Ok(ExactKnnResult {
-                                hits: top_k_by_score(scored, k),
-                                vectors_scored,
-                                postings_hydrated: 0,
-                                source: ExactKnnSource::Sidecar,
-                            }));
-                        }
-                        Err(e) => eprintln!(
-                            "WARN: exact kNN could not read {DOC_VECTORS_FILE} of {}: {e} — scoring from vector postings instead",
-                            self.segment_dir.display()
-                        ),
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => eprintln!(
-                    "WARN: exact kNN could not open {DOC_VECTORS_FILE} of {}: {e} — scoring from vector postings instead",
-                    self.segment_dir.display()
-                ),
-            }
+        if let Some(result) = self.knn_exact_from_sidecar(field, query, k, candidates, fetch) {
+            return Some(Ok(result));
         }
         // No usable sidecar: every posting, filtered while it is scored.
         self.prefetch_vector_postings(vi, 0..vi.ranges.len(), fetch);
@@ -8873,6 +9485,120 @@ impl SegmentReader {
             postings_hydrated: vi.ranges.len(),
             source: ExactKnnSource::Postings,
         }))
+    }
+
+    /// [`Self::knn_exact_filtered_fetching`]'s sidecar path: every
+    /// candidate's `field` vector from `doc_vectors.bin`, scored exactly.
+    ///
+    /// Read from the whole local file when it is there, otherwise — header
+    /// local (whole file or cached header span) — from the candidates'
+    /// ranges in the span cache, fetching the missing ones through `fetch`
+    /// first. Both read the same bytes and score them with the same
+    /// function in the same order, so the hits are identical either way: a
+    /// query node need not hold the whole file (as large as the f32 vector
+    /// index) to answer exactly.
+    ///
+    /// `None` sends the caller to the postings: the segment stores vectors
+    /// inline, the sidecar holds no `field`, its header is not local, or a
+    /// read failed (logged).
+    fn knn_exact_from_sidecar(
+        &self,
+        field: &str,
+        query: &[f32],
+        k: usize,
+        candidates: &[u32],
+        fetch: Option<VectorSpanFetch<'_>>,
+    ) -> Option<ExactKnnResult> {
+        if !self.footer.doc_vectors {
+            return None;
+        }
+        let whole = self.segment_dir.join(DOC_VECTORS_FILE).exists();
+        let dv = if whole {
+            match self.doc_vectors() {
+                Ok(dv) => dv,
+                Err(e) => {
+                    eprintln!(
+                        "WARN: exact kNN could not open {DOC_VECTORS_FILE} of {}: {e} — scoring from vector postings instead",
+                        self.segment_dir.display()
+                    );
+                    return None;
+                }
+            }
+        } else {
+            match self.local_doc_vectors() {
+                Some(dv) => dv,
+                None => {
+                    // Rare: the scoring hydration fetches the header for a
+                    // filtered kNN (best-effort), so this is a shed or
+                    // failed fetch, or a caller without hydration.
+                    eprintln!(
+                        "WARN: exact kNN on '{field}' in {}: {DOC_VECTORS_FILE} header not local \
+                         (not hydrated, or its fetch failed) — scoring all {} vector postings \
+                         instead of {} candidate vectors",
+                        self.segment_dir.display(),
+                        self.vector_field(field)
+                            .ok()
+                            .flatten()
+                            .and_then(|index| index.lazy.as_ref().map(|vi| vi.ranges.len()))
+                            .unwrap_or(0),
+                        candidates.len()
+                    );
+                    return None;
+                }
+            }
+        };
+        if !dv.has_field(field) {
+            return None;
+        }
+        let mut scored: Vec<(u32, f64)> = Vec::with_capacity(candidates.len());
+        // A stray vector of another dimension was never indexed (see
+        // `SegmentWriter::unindexed_vectors`), so it is not a candidate on
+        // the probe path either.
+        let score = |doc_seq: u32, v: &[f32]| {
+            if v.len() == query.len() {
+                scored.push((
+                    doc_seq,
+                    kosha_vector_spfresh::cosine_similarity(query, v) as f64,
+                ));
+            }
+        };
+        let visited = if whole {
+            dv.visit_field_vectors(field, candidates, score)
+        } else {
+            let ranges = dv.field_vector_ranges(field, candidates);
+            let mut spans = span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE);
+            if let Some(fetch) = fetch {
+                let missing: Vec<(u64, u64)> = ranges
+                    .iter()
+                    .copied()
+                    .filter(|&(start, end)| !spans.covers(start, end))
+                    .collect();
+                if !missing.is_empty() {
+                    fetch(&self.segment_dir, DOC_VECTORS_FILE, &missing);
+                    spans = span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE);
+                }
+            }
+            dv.visit_field_vectors_cached(&spans, field, candidates, score)
+        };
+        match visited {
+            Ok(_) => {
+                let vectors_scored = scored.len();
+                Some(ExactKnnResult {
+                    hits: top_k_by_score(scored, k),
+                    vectors_scored,
+                    postings_hydrated: 0,
+                    source: ExactKnnSource::Sidecar,
+                })
+            }
+            Err(e) => {
+                eprintln!(
+                    "WARN: exact kNN could not read {DOC_VECTORS_FILE} of {} ({}): {e} — scoring from vector postings instead",
+                    self.segment_dir.display(),
+                    if whole { "whole file" } else { "cached ranges" },
+                );
+                None
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8936,7 +9662,7 @@ impl SegmentReader {
         // Timed only when the segment ranks for itself, so a probe handed
         // its ranking reports exactly zero rather than a timer's overhead.
         let mut rank_nanos = 0;
-        let ranking = match planned.filter(|r| r.bounds.len() == vi.ranges.len()) {
+        let ranking = match planned.filter(|r| r.postings == vi.ranges.len()) {
             Some(planned) => planned,
             None => {
                 let mut rank_clock = KNN_SCAN_STATS
@@ -8982,7 +9708,18 @@ impl SegmentReader {
             && budgeted < vi.ranges.len();
         if refills {
             let mut rank_clock = scan.clock();
-            let ranked = KnnSegmentRanking::rank_all(&ranking.bounds);
+            // A plan that scored only its candidates (`from_candidates`)
+            // left the rest of this segment unscored: score it now, with
+            // the function the plan's own scores came from.
+            let scored;
+            let bounds = match &ranking.bounds {
+                Some(bounds) => bounds,
+                None => {
+                    scored = Self::centroid_lower_bounds(vi, query);
+                    &scored
+                }
+            };
+            let ranked = KnnSegmentRanking::rank_all(bounds);
             scan.stats.rank_nanos += lap_nanos(&mut rank_clock);
             for position in budgeted..ranked.len() {
                 if sink.len() >= k {
@@ -9496,15 +10233,56 @@ impl SegmentReader {
     /// disk for `Lazy` segments — use only for documents actually being
     /// materialized into a response, not during scoring.
     pub fn doc_record_full(&self, doc_seq: u32) -> Result<Option<DocRecord>, KoshaError> {
-        let mut record = self.doc_record_stored(doc_seq)?;
-        if let Some(record) = record.as_mut() {
-            self.fill_doc_vectors(record)?;
+        self.page_doc_record(doc_seq, true, &mut PageSpans::default())
+    }
+
+    /// [`Self::doc_record_full`] for one document of a result page:
+    /// span-cache listings are kept in `spans` across the page's documents
+    /// of this segment (one listing per file per page, not per document),
+    /// and with `vectors` false the sidecar vectors are not read at all —
+    /// their `Vector` fields stay empty placeholders, for a page whose
+    /// `_source` returns none of them (see [`Self::page_reads_doc_vectors`]).
+    pub fn page_doc_record(
+        &self,
+        doc_seq: u32,
+        vectors: bool,
+        spans: &mut PageSpans,
+    ) -> Result<Option<DocRecord>, KoshaError> {
+        let mut record = self.doc_record_stored_reusing(doc_seq, &mut spans.doc_store)?;
+        if let Some(record) = record.as_mut().filter(|_| vectors) {
+            for (index, vector) in self.sidecar_vectors_reusing(record, &mut spans.doc_vectors)? {
+                record.fields[index].value = serde_json::to_string(&vector)?;
+            }
         }
         Ok(record)
     }
 
+    /// Whether a result page returning the fields `returns` keeps needs this
+    /// segment's sidecar vectors: some `Vector` field it stores in
+    /// `doc_vectors.bin` is returned. Only single-vector fields go there,
+    /// each with a column in the footer (a bag stays inline), so the
+    /// footer's column names cover the sidecar's; a legacy footer that
+    /// lists none cannot say, so it reads them. `false` without a sidecar.
+    pub fn page_reads_doc_vectors(&self, returns: impl Fn(&str) -> bool) -> bool {
+        self.footer.doc_vectors
+            && self
+                .footer
+                .vector_fields
+                .as_ref()
+                .is_none_or(|cols| cols.iter().any(|c| returns(&c.name)))
+    }
+
     /// The record as stored in `doc_store.bin`, vector placeholders and all.
     fn doc_record_stored(&self, doc_seq: u32) -> Result<Option<DocRecord>, KoshaError> {
+        self.doc_record_stored_reusing(doc_seq, &mut None)
+    }
+
+    /// [`Self::doc_record_stored`] keeping the span listing in `spans`.
+    fn doc_record_stored_reusing(
+        &self,
+        doc_seq: u32,
+        spans: &mut Option<span_cache::SpanIndex>,
+    ) -> Result<Option<DocRecord>, KoshaError> {
         match &self.doc_store {
             DocStoreAccess::Eager(records) => Ok(records.get(doc_seq as usize).cloned()),
             DocStoreAccess::Lazy {
@@ -9518,12 +10296,13 @@ impl SegmentReader {
                 // The whole file when it is complete, else the sparse span
                 // cache (#245). Neither → the plain read below, which fails
                 // with the same IO error as before spans existed.
-                let buf = match span_cache::read_local_range(
+                let buf = match span_cache::read_local_range_reusing(
                     &self.segment_dir,
                     DOC_STORE_FILE,
                     index.complete_len(),
                     entry.offset,
                     entry.length as u64,
+                    spans,
                 ) {
                     Some(buf) => buf,
                     None => {
@@ -9595,24 +10374,34 @@ impl SegmentReader {
     /// bytes. Out-of-range `doc_seq`s are "local" (there is nothing to
     /// fetch; `doc_record_full` returns `None`).
     pub fn doc_is_local(&self, doc_seq: u32) -> bool {
-        if self.has_local_doc_store() {
-            return true;
-        }
+        self.page_doc_is_local(doc_seq, true, &mut PageSpans::default())
+    }
+
+    /// [`Self::doc_is_local`] for one document of a result page, keeping
+    /// span listings in `spans` across the page's documents of this
+    /// segment. With `vectors` false (the page returns no sidecar field,
+    /// see [`Self::page_reads_doc_vectors`]) only the record must be local.
+    pub fn page_doc_is_local(&self, doc_seq: u32, vectors: bool, spans: &mut PageSpans) -> bool {
+        let vectors = vectors && self.footer.doc_vectors;
         let DocStoreAccess::Lazy { index, .. } = &self.doc_store else {
-            // Eager record, but a sidecar whose file is absent.
-            return false;
+            // Eager record: local; its vectors only with the whole sidecar.
+            return !vectors || self.has_local_doc_store();
         };
         let Some(entry) = index.entries.get(doc_seq as usize) else {
             return true;
         };
         let record_local =
             file_is_complete(&self.segment_dir.join(DOC_STORE_FILE), index.complete_len())
-                || span_cache::SpanIndex::load(&self.segment_dir, DOC_STORE_FILE)
+                || spans
+                    .doc_store
+                    .get_or_insert_with(|| {
+                        span_cache::SpanIndex::load(&self.segment_dir, DOC_STORE_FILE)
+                    })
                     .covers(entry.offset, entry.offset + entry.length as u64);
         if !record_local {
             return false;
         }
-        if !self.footer.doc_vectors {
+        if !vectors {
             return true;
         }
         let Some(dv) = self.local_doc_vectors() else {
@@ -9622,7 +10411,11 @@ impl SegmentReader {
             None => true,
             Some((start, end)) => {
                 file_is_complete(&self.segment_dir.join(DOC_VECTORS_FILE), dv.file_len())
-                    || span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE)
+                    || spans
+                        .doc_vectors
+                        .get_or_insert_with(|| {
+                            span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE)
+                        })
                         .covers(start, end)
             }
         }

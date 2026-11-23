@@ -206,7 +206,9 @@ impl PostingSpanHydrator {
             let mut files: Vec<_> = by_file.into_iter().collect();
             files.sort_by(|a, b| a.0.cmp(b.0));
             for (file, ranges) in files {
-                for (s, e) in span_cache::coalesce(ranges, self.cfg.coalesce_gap) {
+                for (s, e) in
+                    span_cache::coalesce_capped(ranges, self.cfg.coalesce_gap, MAX_RANGE_BYTES)
+                {
                     reqs.push((format!("{rel}/{file}"), s, e - s));
                     pending.push(Pending {
                         seg: i,
@@ -331,6 +333,16 @@ impl PostingSpanHydrator {
     }
 }
 
+/// Most bytes one coalesced ranged GET asks for — of kNN postings and
+/// sidecar vectors ([`fetch_file_spans`]), term postings and page records
+/// — a whole-object download's part size
+/// (`s3_storage::DOWNLOAD_PART_BYTES`). A single input range larger than
+/// this (one huge posting or record) is still one GET: ranges are never
+/// split, a reader needs each inside one cached span.
+pub(crate) const MAX_RANGE_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(feature = "s3")]
+const _: () = assert!(MAX_RANGE_BYTES == crate::s3_storage::DOWNLOAD_PART_BYTES);
+
 /// Fetch `ranges` (`[start, end)`, any order) of `{segment_dir}/{file}`
 /// into the span cache in one batch of coalesced ranged GETs, skipping what
 /// is already cached. Used for kNN postings of `vector.idx`, whose offsets
@@ -353,7 +365,11 @@ pub fn fetch_file_spans(
         .copied()
         .filter(|&(s, e)| !have.covers(s, e))
         .collect();
-    let merged = span_cache::coalesce(need, coalesce_gap);
+    // Bounded like a whole-object download's parts: an exact kNN can ask
+    // for every vector posting of a column, or every candidate vector of a
+    // one-matter segment (~2 GB on staging), and as one coalesced range
+    // that was a single GET held in memory whole.
+    let merged = span_cache::coalesce_capped(need, coalesce_gap, MAX_RANGE_BYTES);
     if merged.is_empty() {
         return out;
     }
