@@ -249,8 +249,9 @@ pub struct Cache {
     /// Eviction bound in bytes. `None` means unbounded (legacy behavior).
     max_bytes: Option<u64>,
     total_bytes: AtomicU64,
-    /// Bumped once per file/dir actually removed by `evict` — see
-    /// `eviction_generation()`.
+    /// Bumped once per file/dir actually removed by `evict` (or the LRU,
+    /// `evict_dir_unless_pinned`, `evict_prefix`) — not by
+    /// `drop_superseded_dir_unless_pinned`. See `eviction_generation()`.
     eviction_generation: AtomicU64,
     /// Whether the last `enforce_limit` ended over `max_bytes` because every
     /// remaining file was pinned. Logged on each change, not on every write.
@@ -903,6 +904,31 @@ impl Cache {
     /// across the check and the removal, so a hydration batch cannot pin a
     /// file in between and then lose it.
     pub fn evict_dir_unless_pinned(&self, key: &str) -> Result<Option<u64>, KoshaError> {
+        self.remove_dir_unless_pinned(key, true)
+    }
+
+    /// [`Self::evict_dir_unless_pinned`] for a directory whose contents are
+    /// now redundant because the data became *more* local: the span cache of
+    /// a file that a promotion just landed whole. The bytes and the LRU list
+    /// are updated exactly as for an eviction, but this is not one: nothing
+    /// that was readable locally stops being readable (the whole file wins
+    /// every read), so neither `eviction_generation` nor the tenant's
+    /// eviction count moves. Bumping the generation here invalidated the
+    /// server's whole-namespace posting presence cache after every promotion,
+    /// and each following distinct query re-planned every segment from its
+    /// `inverted.idx` (~450 ms on staging) to find nothing to fetch.
+    ///
+    /// Only for that case: any removal of data a reader may still need goes
+    /// through [`Self::evict_dir_unless_pinned`] or [`Self::evict`].
+    pub fn drop_superseded_dir_unless_pinned(&self, key: &str) -> Result<Option<u64>, KoshaError> {
+        self.remove_dir_unless_pinned(key, false)
+    }
+
+    fn remove_dir_unless_pinned(
+        &self,
+        key: &str,
+        is_eviction: bool,
+    ) -> Result<Option<u64>, KoshaError> {
         let path = self.path_for(key)?;
         let key = key
             .trim_start_matches('/')
@@ -934,13 +960,17 @@ impl Cache {
                 freed += tracked.forget(&rel);
             }
         }
-        tracked.tenants.evicted(tenant_of_dir_key(&key));
+        if is_eviction {
+            tracked.tenants.evicted(tenant_of_dir_key(&key));
+        }
         drop(tracked);
         drop(pinned);
         drop(recency);
         self.policy_forget(|k| k == key || k.starts_with(&prefix));
         self.sub_total(freed);
-        self.eviction_generation.fetch_add(1, Ordering::Relaxed);
+        if is_eviction {
+            self.eviction_generation.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(Some(on_disk))
     }
 
@@ -982,7 +1012,9 @@ impl Cache {
 
     /// Monotonic counter bumped once per file/dir this cache has actually
     /// removed (LRU `enforce_limit` or an explicit `evict` call) — never on
-    /// a no-op `evict` of an already-absent key. Callers that cache their
+    /// a no-op `evict` of an already-absent key, and never on
+    /// [`Self::drop_superseded_dir_unless_pinned`] (redundant spans of a
+    /// file now whole: nothing became less present). Callers that cache their
     /// own "is this file present on disk" verdicts across requests (e.g.
     /// the server's posting-blob presence cache) can snapshot this value
     /// alongside a verdict and treat any change as "something was removed
@@ -1395,6 +1427,65 @@ mod tests {
         // already-gone directory is a no-op.
         assert!(cache.get("ns/seg-a2/doc_store.bin").is_some());
         assert_eq!(cache.evict_dir_unless_pinned("ns/seg-a").unwrap(), Some(0));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Dropping the spans of a file a promotion just landed whole frees the
+    /// bytes exactly like an eviction but is not one: the eviction
+    /// generation (which invalidates the server's posting presence cache)
+    /// and the tenant's eviction count stay put, pins still block it, and a
+    /// real eviction afterwards still bumps both.
+    #[test]
+    fn dropping_superseded_spans_is_not_an_eviction() {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-cache-superseded-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let cache = Cache::new(dir.clone());
+        cache
+            .put_bytes("acme/ns/seg/postings-00.bin.spans/0-10", &[0u8; 10])
+            .unwrap();
+        cache
+            .put_bytes("acme/ns/seg/postings-00.bin", &[0u8; 30])
+            .unwrap();
+        cache
+            .put_bytes("acme/ns/seg/postings-01.bin", &[0u8; 5])
+            .unwrap();
+        let evictions = |c: &Cache| {
+            c.tenant_stats()
+                .iter()
+                .find(|s| s.tenant == "acme")
+                .map_or(0, |s| s.evictions)
+        };
+
+        cache.pin("acme/ns/seg/postings-00.bin.spans/0-10");
+        assert_eq!(
+            cache
+                .drop_superseded_dir_unless_pinned("acme/ns/seg/postings-00.bin.spans")
+                .unwrap(),
+            None
+        );
+        cache.unpin("acme/ns/seg/postings-00.bin.spans/0-10");
+
+        assert_eq!(
+            cache
+                .drop_superseded_dir_unless_pinned("acme/ns/seg/postings-00.bin.spans")
+                .unwrap(),
+            Some(10)
+        );
+        assert!(!dir.join("acme/ns/seg/postings-00.bin.spans").exists());
+        assert_eq!(cache.total_size(), 35, "the spans' bytes left the total");
+        assert_eq!(cache.eviction_generation(), 0, "not an eviction");
+        assert_eq!(evictions(&cache), 0);
+
+        cache.evict("acme/ns/seg/postings-01.bin").unwrap();
+        assert_eq!(
+            cache.eviction_generation(),
+            1,
+            "a real eviction still bumps"
+        );
+        assert_eq!(evictions(&cache), 1);
         let _ = fs::remove_dir_all(&dir);
     }
 
