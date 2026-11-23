@@ -19,9 +19,12 @@ instead of giving a number. Defaults are per pod unless the row says
 otherwise. Every override is described in
 [configuration.md](configuration.md).
 
-Status codes on this page are the ones the server returns today. The `/v1`
-error model in #350 changes some of them. Tenant quota refusals move from
-429 to 403, and the tenant body cap moves from 429 to 413. Those rows say so.
+Status codes on this page are the ones main returns as of commit `e174058`.
+The `/v1` error model in #350 changes some of them. Tenant quota refusals
+move from 429 to 403, and the tenant body cap moves from 429 to 413. Those
+rows say so. #350 adds `proto/kosha/v1/errors.proto`. Once that file exists,
+`check_guarantees.py` fails until this page's "Refusal today" column is
+replaced with the new status codes.
 
 ---
 
@@ -102,20 +105,30 @@ the pod check the manifest version before it answers.
 | Read | Visible after |
 | --- | --- |
 | `strong` (the default) | the write's acknowledgement. The tail scan sees it immediately |
-| `eventual`, same pod | the next flush: the idle-flush timer or the size threshold below, plus the time to build the segment |
+| `eventual`, same pod | the next flush, plus the time to build the segment. A flush is triggered by the idle-flush timer, by the size threshold below, by a delete-by-query on the namespace (it flushes the buffer and publishes), or by an explicit flush |
 | `eventual`, another query pod | the next flush, plus up to one manifest poll interval |
 
 | Setting | Value | Source |
 | --- | --- | --- |
 | Idle flush | 1000 ms | `crates/kosha-server/src/main.rs` (`DEFAULT_FLUSH_MAX_AGE_MS`), override `KOSHA_FLUSH_MAX_AGE_MS` (`0` disables the timer) |
 | Size flush | 1000 docs per namespace | `crates/kosha-server/src/main.rs` (`flush_threshold`), override `KOSHA_FLUSH_THRESHOLD` |
+| Idle flush check | every 250 ms (a quarter of the idle flush, at least 50 ms) | `crates/kosha-server/src/main.rs` (`idle_flush_tick`), follows `KOSHA_FLUSH_MAX_AGE_MS` |
+
+The idle timer measures a namespace's age from its oldest pending document.
+With no other trigger, a document is therefore visible to `eventual` reads
+at most about 1.25 s after its write (1000 ms plus one 250 ms check), plus
+the segment build. A document written while older ones are pending is
+published sooner.
 
 | Measurement | p50 | p99 | Result file |
 | --- | --- | --- | --- |
-| Write-to-visible, `eventual` read, idle flush on, one standalone pod on a developer laptop, 3 min, 60 samples, 2026-11-22, commit `e174058` | 0.027 s | 3.659 s | `scripts/soak/results/2026-11-22-local.md` |
+| Write-to-visible, `eventual` read, idle and size flush only (no deletes), one standalone pod on a developer laptop, 3 min, 70 samples, 2026-11-22, commit `78cd18c` | 0.46 s | 4.642 s | `scripts/soak/results/2026-11-22-local-no-delete.md` |
+| Write-to-visible, `eventual` read, mixed workload with 20% delete-by-query (deletes also flush), same setup, 60 samples, 2026-11-22, commit `e174058` | 0.027 s | 3.659 s | `scripts/soak/results/2026-11-22-local.md` |
 
-That run is short and local, and its p99 is the single slowest of 60
-samples. It is not a production guarantee.
+Use the first row for the idle-flush path. In the second row, deletes
+flushed the namespaces often, so its p50 is not a typical write-to-visible
+time. Both runs are short and local, and each p99 is the single slowest
+sample. They are not production guarantees.
 
 - Write-to-visible on production hardware, across pods (ingest to query
   pod): **not yet measured.** The soak driver measures it
@@ -133,10 +146,13 @@ samples. It is not a production guarantee.
 | Docs per namespace | **Not enforced** by default. Opt-in per tenant: `docs_per_namespace` | 10M documents (BM25 and 1024-dim vector), see Latency |
 | Bytes per namespace | **Not enforced.** There is no per-namespace storage quota. A free billing plan can cap a tenant's average `stored_bytes` per month (HTTP 402) | about 249 GB (10M × 1024-dim vectors), see Latency |
 | Namespaces per tenant | **Not enforced** by default. Opt-in per tenant: `namespaces` | not yet measured |
-| Max document size | **No per-document limit.** The request body cap (64 MiB below) bounds it | not yet measured |
-| Max vector dimensions | **No global limit** on vectors you supply. All vectors in one namespace field must have the same length. Server-side embedding is capped at 4096 (below). Opt-in per tenant: `vector_dims` | 1024 dims |
-| Max top-k (`max_results`, `knn.k`) | **Not enforced.** Defaults are 10 (below). No `from + size` window limit exists | not yet measured |
-| Request size | 64 MiB (below) | not yet measured |
+| Max document size | **No per-document limit.** The request body cap bounds it: see "Request body" under [Hard limits](#hard-limits) | not yet measured |
+| Max vector dimensions | **No global limit** on vectors you supply. All vectors in one namespace field must have the same length. Server-side embedding is capped: see "Server-side embedding dimensions" under [Hard limits](#hard-limits). Opt-in per tenant: `vector_dims` | 1024 dims |
+| Max top-k (`max_results`, `knn.k`) | **Not enforced.** For the defaults see [Defaults that bound a response](#defaults-that-bound-a-response). No `from + size` window limit exists | not yet measured |
+| Request size | See "Request body" under [Hard limits](#hard-limits) | not yet measured |
+
+This table restates no numbers from the code. Each value lives in one
+checked row below, so it cannot drift from the code without CI failing.
 
 An unbounded `max_results`, `knn.k` or `num_candidates` costs memory and CPU
 on the pod that serves it. The memory admission and search queue limits
@@ -179,7 +195,7 @@ not say.
 | Total hits counted | 10,000 | `crates/kosha-query/src/lib.rs` (`total_hits_cap_engine_default`), override `KOSHA_TOTAL_HITS_CAP`, or per request `total_hits_cap` / `exact_total_hits` |
 | Text value copied into filter columns | 256 chars | `crates/kosha-segment/src/lib.rs` (`DEFAULT_TEXT_FILTER_IGNORE_ABOVE`), override `KOSHA_TEXT_FILTER_IGNORE_ABOVE` (`off` disables) |
 
-Past the total-hits cap, `total_hits` is reported with `relation: "gte"`.
+Past the total-hits cap, the response sets `total_hits_relation: "gte"`.
 Longer text values are still fully searchable. They are only left out of
 the term filter columns.
 
@@ -190,12 +206,15 @@ request gets 503 or 429 with `Retry-After`, and it is safe to retry.
 
 | Limit | Value | When exceeded | Source |
 | --- | --- | --- | --- |
-| Open HTTP connections | 1024 | 503, `Retry-After: 1`, connection closed | `crates/kosha-server/src/http.rs` (`Config::new`), override `KOSHA_HTTP_MAX_CONNECTIONS` |
-| Requests in flight | 256 | 503, `Retry-After: 1` | `crates/kosha-server/src/http.rs` (`Config::new`), override `KOSHA_HTTP_MAX_INFLIGHT` |
-| Concurrent searches | 8 | queued (depth 4 × permits by default), then 429 | `crates/kosha-server/src/main.rs` (search admission), override `KOSHA_MAX_CONCURRENT_SEARCHES` |
+| Open HTTP connections | 1024 | 503 with `Retry-After` (below), connection closed | `crates/kosha-server/src/http.rs` (`Config::new`), override `KOSHA_HTTP_MAX_CONNECTIONS` |
+| Requests in flight | 256 | 503 with `Retry-After` (below) | `crates/kosha-server/src/http.rs` (`Config::new`), override `KOSHA_HTTP_MAX_INFLIGHT` |
+| Concurrent searches | 8 | queued up to the search queue depth (below), then 429 | `crates/kosha-server/src/main.rs` (search admission), override `KOSHA_MAX_CONCURRENT_SEARCHES` |
 | Search queue wait | 10,000 ms | 429 | `crates/kosha-server/src/main.rs` (search admission), override `KOSHA_SEARCH_QUEUE_TIMEOUT_MS` |
 | Request body read timeout | 300 s | 408 | `crates/kosha-server/src/main.rs` (`io_timeout_secs`), override `KOSHA_HTTP_IO_TIMEOUT_SECS` |
-| Unindexed backlog per namespace | 2 GiB | index and replace get 429, `Retry-After: 1`, until flushes catch up | `crates/kosha-server/src/unindexed.rs` (`DEFAULT_MAX_UNINDEXED_BYTES`), override `KOSHA_MAX_UNINDEXED_BYTES` (`0` disables) |
+| Search queue depth | 4 × permits | 429 | `crates/kosha-server/src/main.rs` (search admission, `permits * 4`), override `KOSHA_SEARCH_QUEUE_DEPTH` |
+| Unindexed backlog per namespace | 2 GiB | index and replace get 429 with `Retry-After` (below) until flushes catch up | `crates/kosha-server/src/unindexed.rs` (`DEFAULT_MAX_UNINDEXED_BYTES`), override `KOSHA_MAX_UNINDEXED_BYTES` (`0` disables) |
+| Connection and in-flight shed `Retry-After` | 1 s | sent with the 503 | `crates/kosha-server/src/http.rs` (`busy`, hard-coded), no override |
+| Unindexed backlog `Retry-After` | 1 s | sent with the 429 | `crates/kosha-server/src/unindexed.rs` (`BACKPRESSURE_RETRY_AFTER_SECS`), no override |
 
 Memory admission (`KOSHA_SEGMENT_LIVE_MAX_BYTES`, `KOSHA_ADMISSION_TIMEOUT_MS`)
 and the per-search hydration ceiling (`KOSHA_HYDRATE_REQUEST_MAX_BYTES`) also
@@ -215,10 +234,14 @@ query replicas. Admin and internal credentials are never limited.
 | `qps` | searches per second | 429 `tenant_qps_exceeded` | 429, retryable |
 | `concurrent_queries` | searches in flight | 429 `tenant_concurrency_exceeded` | 429, retryable |
 | `write_docs_per_sec`, `write_bytes_per_sec` | write rate | 429 `tenant_write_rate_exceeded` | 429, retryable |
-| `namespaces` | namespaces held (branches count, shards do not) | 429 `namespace_quota_exceeded`, retry 60 s | 403, not retryable |
-| `docs_per_namespace` | committed plus unflushed documents | 429 `doc_quota_exceeded`, retry 60 s | 403, not retryable |
-| `vector_dims` | widest vector, supplied or embedded | 429 `vector_dims_exceeded`, retry 60 s | 403, not retryable |
-| `max_body_bytes` | write body, under the pod cap | 429 `body_too_large`, retry 60 s | 413, not retryable |
+| `namespaces` | namespaces held (branches count, shards do not) | 429 `namespace_quota_exceeded` with the quota `Retry-After` (below) | 403, not retryable |
+| `docs_per_namespace` | committed plus unflushed documents | 429 `doc_quota_exceeded` with the quota `Retry-After` (below) | 403, not retryable |
+| `vector_dims` | widest vector, supplied or embedded | 429 `vector_dims_exceeded` with the quota `Retry-After` (below) | 403, not retryable |
+| `max_body_bytes` | write body, under the pod cap | 429 `body_too_large` with the quota `Retry-After` (below) | 413, not retryable |
+
+| Setting | Value | Source |
+| --- | --- | --- |
+| Tenant quota `Retry-After` | 60 s | `crates/kosha-server/src/tenant_limits.rs` (`QUOTA_RETRY_AFTER_MS`), no override |
 
 The namespace and document quotas are approximate. Concurrent creations can
 pass the namespace count together, and an unflushed upsert of an existing id
@@ -286,9 +309,13 @@ the following happens:
 - a code constant cited above changes and this page does not;
 - a row cites a source file without naming its `KOSHA_*` override;
 - a row cites code that the script does not check;
+- a refusal or "limit today" cell states a number other than an HTTP status
+  code, instead of pointing at the checked row that holds it;
 - a cited results file is missing, or does not contain the run id or date
   quoted;
-- a cited commit is not in git history.
+- a cited commit is not in git history;
+- `proto/kosha/v1/errors.proto` (#350) exists while the page still shows
+  the pre-#350 "Refusal today" status codes.
 
 To change a number, change the code or commit a new results file, then
 update this page in the same PR.

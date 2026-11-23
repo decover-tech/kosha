@@ -17,8 +17,15 @@ both:
    date (YYYY-MM-DD) in the row must appear in that file. The commit in the
    row must exist in git history (skipped, with a note, in a shallow clone).
 
-It also fails on ``TBD``/``TODO`` on the page, or if README.md does not link
-to the page.
+3. **No unchecked restatements.** Cells in the columns named in
+   ``POINTER_COLUMNS`` (refusal and at-a-glance columns) may not state a
+   number other than an HTTP status code or an issue reference: they must
+   point at the checked row that holds the value instead. That keeps a
+   restated default from drifting while its checked row is updated.
+
+It also fails on ``TBD``/``TODO`` on the page, if README.md does not link
+to the page, or if #350's error model has landed (``ERRORS_PROTO`` exists)
+while the page still shows the pre-#350 status codes (``PRE_350_MARKER``).
 
     python3 scripts/docs/check_guarantees.py            # check
     python3 scripts/docs/check_guarantees.py --self-test
@@ -32,11 +39,17 @@ import argparse
 import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 ROOT = Path(__file__).resolve().parents[2]
 PAGE = "docs/guarantees.md"
+# #350 adds this file. Its arrival means the page's pre-#350 status codes
+# (the "Refusal today" column) are stale and must be rewritten.
+ERRORS_PROTO = "proto/kosha/v1/errors.proto"
+PRE_350_MARKER = "Refusal today"
 
 KIB = 1024
 UNITS = {
@@ -62,6 +75,9 @@ class Check:
     pattern: str  # regex; group 1 is the value expression in the code
     unit: str  # "count", "bytes", "ms" or "s": what the code expression means
     env: str | None = None  # the KOSHA_* override, when one exists
+    # Turns the matched integer into the page's value, for a number the code
+    # derives from others (gets the match and the whole source file).
+    derive: Callable[[int, str], int] | None = None
 
 
 def _const(name: str, ty: str = r"\w+") -> str:
@@ -71,6 +87,16 @@ def _const(name: str, ty: str = r"\w+") -> str:
 def _env_default(var: str) -> str:
     # `std::env::var("VAR") ... .unwrap_or(EXPR)`, within a few lines.
     return rf'"{var}"\)(?:(?!\bfn\b)[\s\S]){{0,300}}?\.unwrap_or\(([^()]+(?:\([^()]*\))?)\)'
+
+
+_IDLE_TICK = r"fn idle_flush_tick\(max_age: Duration\) -> Duration \{\s*\(max_age / (\d+)\)"
+
+
+def _idle_flush_tick_ms(divisor: int, source: str) -> int:
+    # `(max_age / 4).max(Duration::from_millis(50))` with the default max_age.
+    max_age = eval_int_expr(re.search(_const("DEFAULT_FLUSH_MAX_AGE_MS"), source).group(1))
+    floor = int(re.search(_IDLE_TICK + r"\.max\(Duration::from_millis\((\d+)\)\)", source).group(2))
+    return max(max_age // divisor, floor)
 
 
 # Only `impl Default for GroupCommitConfig`, not the tests' configs.
@@ -118,6 +144,17 @@ CHECKS: list[Check] = [
           _env_default("KOSHA_SEARCH_QUEUE_TIMEOUT_MS"), "ms", "KOSHA_SEARCH_QUEUE_TIMEOUT_MS"),
     Check("Request body read timeout", "crates/kosha-server/src/main.rs",
           _env_default("KOSHA_HTTP_IO_TIMEOUT_SECS"), "s", "KOSHA_HTTP_IO_TIMEOUT_SECS"),
+    # The page states the multiplier: "4 × permits".
+    Check("Search queue depth", "crates/kosha-server/src/main.rs",
+          r'"KOSHA_SEARCH_QUEUE_DEPTH"\)[\s\S]{0,300}?\.unwrap_or\(permits \* (\d+)\)',
+          "count", "KOSHA_SEARCH_QUEUE_DEPTH"),
+    Check("Connection and in-flight shed `Retry-After`", "crates/kosha-server/src/http.rs",
+          r'fn busy\(message: &str\) -> Response \{[\s\S]{0,200}?"retry-after", "(\d+)"\)', "s"),
+    Check("Unindexed backlog `Retry-After`", "crates/kosha-server/src/unindexed.rs",
+          _const("BACKPRESSURE_RETRY_AFTER_SECS"), "s"),
+    # Per-tenant limits.
+    Check("Tenant quota `Retry-After`", "crates/kosha-server/src/tenant_limits.rs",
+          _const("QUOTA_RETRY_AFTER_MS"), "ms"),
     Check("Unindexed backlog per namespace", "crates/kosha-server/src/unindexed.rs",
           _const("DEFAULT_MAX_UNINDEXED_BYTES"), "bytes", "KOSHA_MAX_UNINDEXED_BYTES"),
     # Timings behind the guarantees.
@@ -134,7 +171,21 @@ CHECKS: list[Check] = [
           _const("DEFAULT_FLUSH_MAX_AGE_MS"), "ms", "KOSHA_FLUSH_MAX_AGE_MS"),
     Check("Size flush", "crates/kosha-server/src/main.rs",
           _env_default("KOSHA_FLUSH_THRESHOLD"), "count", "KOSHA_FLUSH_THRESHOLD"),
+    Check("Idle flush check", "crates/kosha-server/src/main.rs",
+          _IDLE_TICK, "ms", "KOSHA_FLUSH_MAX_AGE_MS", derive=_idle_flush_tick_ms),
 ]
+
+
+# Columns whose cells describe a refusal or summarise a limit. A number in one
+# of these would be an unchecked copy of a checked row, so only HTTP status
+# codes (4xx/5xx) and issue references (#NNN) are allowed.
+POINTER_COLUMNS = ("When exceeded", "Refusal today", "After #350", "Limit today", "Visible after")
+
+
+def stray_numbers(cell: str) -> list[str]:
+    cell = re.sub(r"#\d+", "", cell)
+    cell = re.sub(r"\b[45]\d\d\b", "", cell)
+    return re.findall(r"\d[\d,._]*", cell)
 
 
 # ─── parsing ────────────────────────────────────────────────────────────────
@@ -160,6 +211,11 @@ def code_value(check: Check, source: str) -> tuple[str, int]:
     if len(values) != 1:
         raise ValueError(f"pattern is ambiguous in {check.file}: {sorted(values)}")
     value = values.pop()
+    if check.derive is not None:
+        try:
+            value = check.derive(value, source)
+        except (AttributeError, ValueError) as e:
+            raise ValueError(f"cannot derive {check.label!r} from {check.file}: {e}") from e
     if check.unit == "s":
         return "ms", value * 1000
     if check.unit in ("bytes", "ms"):
@@ -250,6 +306,11 @@ def check_page(root: Path, text: str, readme: str, verify_commits: bool | None =
         errors.append(f"{PAGE}: contains TBD/TODO")
     if "docs/guarantees.md" not in readme:
         errors.append("README.md: no link to docs/guarantees.md")
+    if (root / ERRORS_PROTO).is_file() and PRE_350_MARKER in text:
+        errors.append(
+            f"{PAGE}: {ERRORS_PROTO} exists, so #350's error model has landed, but the page "
+            f"still has the pre-#350 {PRE_350_MARKER!r} status codes: rewrite them"
+        )
 
     if verify_commits is None:
         verify_commits = not shallow_clone(root)
@@ -260,8 +321,15 @@ def check_page(root: Path, text: str, readme: str, verify_commits: bool | None =
         src_col = column(header, "Source")
         val_col = column(header, "Value")
         res_col = column(header, "Result file")
+        pointer_cols = [i for i in (column(header, n) for n in POINTER_COLUMNS) if i is not None]
         for row in rows:
             label = row[0]
+            for i in pointer_cols:
+                if i < len(row) and stray_numbers(row[i]):
+                    errors.append(
+                        f"row {label!r}, column {header[i]!r}: states {stray_numbers(row[i])}; "
+                        "point at the checked row instead of restating a number"
+                    )
             if src_col is not None and src_col < len(row) and "crates/" in row[src_col]:
                 if val_col is None:
                     errors.append(f"table row {label!r}: Source cites code but the table has no Value column")
@@ -366,8 +434,44 @@ def self_test() -> None:
     broken = text.replace("2026-11-22-wal-group-commit.md", "2026-11-22-missing.md")
     errs = check_page(ROOT, broken, readme, verify_commits=False)
     assert any("does not exist" in e for e in errs), errs
+    for old, new in [
+        ("| Tenant quota `Retry-After` | 60 s", "| Tenant quota `Retry-After` | 5 s"),
+        ("| Search queue depth | 4 ×", "| Search queue depth | 8 ×"),
+        ("| Unindexed backlog `Retry-After` | 1 s", "| Unindexed backlog `Retry-After` | 2 s"),
+    ]:
+        broken = text.replace(old, new, 1)
+        assert broken != text, f"self-test anchor missing: {old}"
+        assert check_page(ROOT, broken, readme, verify_commits=False), old
+    broken = text.replace("| Request size | See", "| Request size | 64 MiB. See", 1)
+    assert broken != text, "self-test anchor missing: the Request size row"
+    errs = check_page(ROOT, broken, readme, verify_commits=False)
+    assert any("Request size" in e and "restating" in e for e in errs), errs
+    broken = text.replace("| 503 with `Retry-After` (below) |", "| 503, `Retry-After: 1` |", 1)
+    assert broken != text, "self-test anchor missing: Requests in flight"
+    assert any("Retry-After" in e or "Requests in flight" in e
+               for e in check_page(ROOT, broken, readme, verify_commits=False))
+    assert stray_numbers("429 `doc_quota_exceeded`, 403 after #350") == []
+    assert stray_numbers("retry 60 s") == ["60"]
     errs = check_page(ROOT, text, readme.replace("docs/guarantees.md", "x"), verify_commits=False)
     assert any("README" in e for e in errs), errs
+    tick = Check("t", "f", _IDLE_TICK, "ms", derive=_idle_flush_tick_ms)
+    tick_src = (
+        "const DEFAULT_FLUSH_MAX_AGE_MS: u64 = {};\n"
+        "fn idle_flush_tick(max_age: Duration) -> Duration {{\n"
+        "    (max_age / 4).max(Duration::from_millis(50))\n}}"
+    )
+    assert code_value(tick, tick_src.format("1000")) == ("ms", 250)
+    assert code_value(tick, tick_src.format("100")) == ("ms", 50)
+
+    # Once #350's errors.proto exists, the pre-#350 status column fails.
+    with tempfile.TemporaryDirectory() as tmp:
+        fake = Path(tmp)
+        (fake / ERRORS_PROTO).parent.mkdir(parents=True)
+        (fake / ERRORS_PROTO).write_text("")
+        errs = check_page(fake, "| Refusal today |\n| --- |\n| x |\n", readme, verify_commits=False)
+        assert any("#350" in e for e in errs), errs
+        errs = check_page(fake, "| Refusal |\n| --- |\n| x |\n", readme, verify_commits=False)
+        assert not any("#350" in e for e in errs), errs
     print("self-test ok")
 
 
