@@ -3327,10 +3327,13 @@ impl AppState {
     /// that verdict on its cached reader, and the local files are whole
     /// (they land by rename), so re-checking presence finds nothing to
     /// fetch: without this, every kNN touching the segment is a 503 until
-    /// the pod restarts. Forget the reader, then evict the segment's
-    /// fetched vector index files unless a search holds the segment
-    /// pinned (that search may be between hydrating and opening it); the
-    /// next search re-downloads them. At most once per segment per
+    /// the pod restarts. Evict the segment's fetched vector index files
+    /// unless a search holds the segment pinned (that search may be
+    /// between hydrating and opening it), and only then forget the
+    /// reader; the next search re-downloads them. A refused eviction
+    /// keeps the reader. Under sustained traffic on one segment the heal
+    /// can wait long for a moment without pins (follow-up: heal in the
+    /// next request's hydration, under single-flight, before it pins). At most once per segment per
     /// [`KNN_SELF_HEAL_INTERVAL`]: when the object in S3 is itself corrupt
     /// the 503 persists (its ERROR line names the segment) without a
     /// download per request. Call with this request's own pins released.
@@ -3365,12 +3368,24 @@ impl AppState {
             let Ok(dir_key) = dir.strip_prefix(&self.data_dir) else {
                 continue;
             };
-            self.searcher.forget_segment(ns, segment);
             match self.cache.evict_files_unless_pinned(
                 &dir_key.to_string_lossy(),
                 kosha_core::is_vector_index_file,
             ) {
+                // Only now: a reader forgotten before a refused eviction is
+                // reopened on the same corrupt files (losing its lexical
+                // state for nothing), and one forgotten before the eviction
+                // could be reopened corrupt in between and stay cached.
+                Ok(Some(0)) => {
+                    self.searcher.forget_segment(ns, segment);
+                    eprintln!(
+                        "WARN: kNN self-heal: segment {} has no fetched vector index file to \
+                         evict; reopening it, not rate-limited{rid}",
+                        segment.0
+                    );
+                }
                 Ok(Some(bytes)) => {
+                    self.searcher.forget_segment(ns, segment);
                     self.knn_self_heals
                         .lock()
                         .unwrap()
@@ -17729,6 +17744,49 @@ mod tests {
         assert_eq!(status, 200, "the retry re-downloads and heals: {body}");
         assert_eq!(body["knn_degraded_segments"], 0, "{body}");
         assert_eq!(body["results"], want, "{body}");
+    }
+
+    /// A heal refused because another search holds the segment keeps the
+    /// cached reader (and its lexical state) and the files: nothing is
+    /// thrown away for a re-download that did not happen.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn a_refused_self_heal_keeps_the_cached_reader() {
+        const NS: &str = "vector-heal-pinned";
+        let (_s3, state, manifest, seg_paths) = corrupt_vector_node(NS);
+        let search = |state: &AppState| corrupt_vector_search(state, NS);
+        assert_eq!(search(&state).0, 200);
+        for (dir, entry) in seg_paths.iter().zip(&manifest.segments) {
+            corrupt_vector_column(dir);
+            state
+                .searcher
+                .forget_segment(&NamespaceId(NS.into()), &entry.segment_id);
+        }
+        // Another search holds both segments.
+        let keys: Vec<String> = seg_paths
+            .iter()
+            .map(|dir| {
+                dir.strip_prefix(&state.data_dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        state.cache.pin_all(&keys);
+        let (status, body) = search(&state);
+        assert_eq!(status, 503, "{body}");
+        assert!(
+            state.searcher.segment_cache_bytes() > 0,
+            "the readers this search opened stay cached"
+        );
+        for dir in &seg_paths {
+            assert!(dir.join("vector.idx").exists(), "pinned: not evicted");
+        }
+        // Released: the next 503 heals, and the retry answers in full.
+        state.cache.unpin_all(&keys);
+        assert_eq!(search(&state).0, 503);
+        let (status, body) = search(&state);
+        assert_eq!(status, 200, "{body}");
     }
 
     /// When the object in S3 is itself corrupt, every search stays a 503,
