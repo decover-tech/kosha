@@ -570,6 +570,21 @@ def test_metric_aggregations_and_metric_sub_aggregations_pass_through():
     }
 
 
+def test_percentiles_pass_through_top_level_and_as_a_sub_aggregation():
+    aggs = {
+        "latency": {"percentiles": {"field": "tookMs", "percents": [50, 95, 99], "keyed": False}},
+        "by_sender": {
+            "terms": {"field": "senderEmail"},
+            "aggs": {"pages": {"percentiles": {"field": "pageNumber"}}},
+        },
+    }
+    assert translate({"size": 0, "aggs": aggs})["aggs"] == aggs
+    assert "sub-aggregations under 'percentiles'" in refused(
+        {"aggs": {"p": {"percentiles": {"field": "a"}, "aggs": {"x": {"min": {"field": "b"}}}}}}
+    )
+    assert "percentile_ranks" in refused({"aggs": {"r": {"percentile_ranks": {"field": "a", "values": [1]}}}})
+
+
 def test_histogram_aggregations_pass_through_with_metric_sub_aggregations():
     aggs = {
         "by_size": {"histogram": {"field": "bytes", "interval": 1024, "min_doc_count": 1}},

@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 
+mod quantile;
 pub mod rerank;
 /// Offline head/tail analysis (research #387); not on the query path.
 pub mod two_tier;
@@ -9528,10 +9529,10 @@ fn metric_sub_partials<'a>(
         .into_iter()
         .flatten()
         .filter_map(|(name, sub)| {
-            let (kind, metric) = sub.metric()?;
+            let (kind, field) = sub.metric()?;
             let mut per_doc: HashMap<u32, MetricPartial> = HashMap::new();
-            visit_metric_values(store, &metric.field, kind, wanted, |doc, sample| {
-                per_doc.entry(doc).or_default().add(sample)
+            visit_metric_values(store, field, kind, wanted, |doc, sample| {
+                per_doc.entry(doc).or_default().observe(kind, sample)
             });
             Some((name, per_doc))
         })
@@ -9665,8 +9666,8 @@ fn finish_histogram(
     Ok(serde_json::json!({ "buckets": buckets }))
 }
 
-/// Mergeable partial of a single-value metric over some set of values.
-#[derive(Debug, Clone, Copy)]
+/// Mergeable partial of a metric over some set of values.
+#[derive(Debug, Clone)]
 struct MetricPartial {
     /// Values seen: numeric values for `min`/`max`/`sum`/`avg`, values of
     /// any type for `value_count`.
@@ -9678,6 +9679,9 @@ struct MetricPartial {
     /// parsed from a `Date` field's text) — when all were, the result also
     /// carries `value_as_string`.
     dates: u64,
+    /// The values themselves, kept only for `percentiles` (see
+    /// [`MetricPartial::observe`]); `None` for every other metric.
+    quantiles: Option<Box<quantile::QuantileState>>,
 }
 
 impl Default for MetricPartial {
@@ -9688,6 +9692,7 @@ impl Default for MetricPartial {
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
             dates: 0,
+            quantiles: None,
         }
     }
 }
@@ -9702,6 +9707,15 @@ enum MetricSample {
 }
 
 impl MetricPartial {
+    /// Fold in one observation of a `kind` metric. `percentiles` also
+    /// keeps the value; the other kinds need only the running totals.
+    fn observe(&mut self, kind: MetricKind, sample: MetricSample) {
+        if let (MetricKind::Percentiles, MetricSample::Number(v, _)) = (kind, sample) {
+            self.quantiles.get_or_insert_with(Default::default).add(v);
+        }
+        self.add(sample);
+    }
+
     fn add(&mut self, sample: MetricSample) {
         match sample {
             MetricSample::Number(v, is_date) => {
@@ -9721,6 +9735,63 @@ impl MetricPartial {
         self.min = self.min.min(other.min);
         self.max = self.max.max(other.max);
         self.dates += other.dates;
+        if let Some(theirs) = &other.quantiles {
+            self.quantiles
+                .get_or_insert_with(Default::default)
+                .merge(theirs);
+        }
+    }
+
+    /// The Elasticsearch-shaped `percentiles` result: `{"values": {"50.0":
+    /// v, ...}}`, or with `keyed: false` a list of `{"key": 50.0, "value":
+    /// v}`. With no values every percentile is `null`. Over a date field
+    /// each value also comes as text (`"50.0_as_string"` /
+    /// `"value_as_string"`).
+    fn render_percentiles(&self, spec: &kosha_core::AggPercentiles) -> serde_json::Value {
+        let values = match &self.quantiles {
+            Some(quantiles) => quantiles.percentiles(&spec.percents),
+            None => vec![None; spec.percents.len()],
+        };
+        let all_dates = self.count > 0 && self.dates == self.count;
+        let as_string = |v: Option<f64>| {
+            v.filter(|v| all_dates && v.is_finite())
+                .map(|v| kosha_core::datetime::format_epoch_millis(v.floor() as i64))
+        };
+        if spec.keyed {
+            let mut out = serde_json::Map::new();
+            for (percent, value) in spec.percents.iter().zip(values) {
+                let key = kosha_core::AggPercentiles::key(*percent);
+                if let Some(text) = as_string(value) {
+                    out.insert(format!("{key}_as_string"), text.into());
+                }
+                out.insert(key, serde_json::json!(value));
+            }
+            serde_json::json!({ "values": out })
+        } else {
+            let list: Vec<serde_json::Value> = spec
+                .percents
+                .iter()
+                .zip(values)
+                .map(|(percent, value)| {
+                    let mut entry = serde_json::Map::new();
+                    entry.insert("key".into(), serde_json::json!(percent));
+                    entry.insert("value".into(), serde_json::json!(value));
+                    if let Some(text) = as_string(value) {
+                        entry.insert("value_as_string".into(), text.into());
+                    }
+                    serde_json::Value::Object(entry)
+                })
+                .collect();
+            serde_json::json!({ "values": list })
+        }
+    }
+
+    /// The result of metric aggregation `agg` over this partial.
+    fn render_for(&self, agg: &Aggregation) -> Option<serde_json::Value> {
+        match agg {
+            Aggregation::Percentiles { percentiles } => Some(self.render_percentiles(percentiles)),
+            other => other.metric().map(|(kind, _)| self.render(kind)),
+        }
     }
 
     /// The Elasticsearch-shaped result: `{"value": ...}`. With no values,
@@ -9730,6 +9801,8 @@ impl MetricPartial {
         let value = match kind {
             MetricKind::ValueCount => return serde_json::json!({ "value": self.count }),
             MetricKind::Sum => Some(self.sum),
+            // `percentiles` has its own shape: see `render_percentiles`.
+            MetricKind::Percentiles => None,
             _ if self.count == 0 => None,
             MetricKind::Min => Some(self.min),
             MetricKind::Max => Some(self.max),
@@ -9862,6 +9935,7 @@ fn aggregation_sources(agg: &Aggregation) -> Vec<(String, String)> {
         | Aggregation::Sum { .. }
         | Aggregation::Avg { .. }
         | Aggregation::ValueCount { .. }
+        | Aggregation::Percentiles { .. }
         | Aggregation::Histogram { .. }
         | Aggregation::DateHistogram { .. } => Vec::new(),
     }
@@ -9873,9 +9947,9 @@ fn aggregate_matches(
     agg: &Aggregation,
 ) -> AggregationState {
     let mut state = AggregationState::default();
-    if let Some((kind, metric)) = agg.metric() {
-        visit_metric_values(store, &metric.field, kind, wanted, |_, sample| {
-            state.metric.add(sample)
+    if let Some((kind, field)) = agg.metric() {
+        visit_metric_values(store, field, kind, wanted, |_, sample| {
+            state.metric.observe(kind, sample)
         });
         return state;
     }
@@ -10125,9 +10199,9 @@ fn aggregate_matches_columnar(
     agg: &Aggregation,
 ) -> Result<AggregationState, KoshaError> {
     let mut state = AggregationState::default();
-    if let Some((kind, metric)) = agg.metric() {
-        visit_metric_values_columnar(reader, &metric.field, kind, wanted, |_, sample| {
-            state.metric.add(sample)
+    if let Some((kind, field)) = agg.metric() {
+        visit_metric_values_columnar(reader, field, kind, wanted, |_, sample| {
+            state.metric.observe(kind, sample)
         })?;
         return Ok(state);
     }
@@ -10219,12 +10293,12 @@ fn metric_sub_partials_columnar<'a>(
 ) -> Result<ColumnarSubPartials<'a>, KoshaError> {
     let mut subs = Vec::new();
     for (name, sub) in agg.sub_aggregations().into_iter().flatten() {
-        let Some((kind, metric)) = sub.metric() else {
+        let Some((kind, field)) = sub.metric() else {
             continue;
         };
         let mut per_doc: HashMap<usize, MetricPartial> = HashMap::new();
-        visit_metric_values_columnar(reader, &metric.field, kind, wanted, |wi, sample| {
-            per_doc.entry(wi).or_default().add(sample)
+        visit_metric_values_columnar(reader, field, kind, wanted, |wi, sample| {
+            per_doc.entry(wi).or_default().observe(kind, sample)
         })?;
         subs.push((name, per_doc));
     }
@@ -10516,12 +10590,9 @@ fn render_sub_aggregations(
         .into_iter()
         .flatten()
         .filter_map(|(name, sub)| {
-            let (kind, _) = sub.metric()?;
-            let partial = partials
-                .and_then(|p| p.get(name))
-                .copied()
-                .unwrap_or_default();
-            Some((name.clone(), partial.render(kind)))
+            let empty = MetricPartial::default();
+            let partial = partials.and_then(|p| p.get(name)).unwrap_or(&empty);
+            Some((name.clone(), partial.render_for(sub)?))
         })
         .collect()
 }
@@ -10560,9 +10631,9 @@ fn finish_aggregations(
             | Aggregation::Max { .. }
             | Aggregation::Sum { .. }
             | Aggregation::Avg { .. }
-            | Aggregation::ValueCount { .. } => {
-                let (kind, _) = agg.metric().expect("metric variant");
-                state.metric.render(kind)
+            | Aggregation::ValueCount { .. }
+            | Aggregation::Percentiles { .. } => {
+                state.metric.render_for(agg).expect("metric variant")
             }
             Aggregation::Histogram { .. } | Aggregation::DateHistogram { .. } => {
                 finish_histogram(name, agg, &state)?
@@ -24901,6 +24972,327 @@ mod metric_aggregation_tests {
         assert!(out["avg"]["value_as_string"].is_string(), "{out}");
         assert!(out["sum"].get("value_as_string").is_none(), "{out}");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Linear interpolation between closest ranks: what `percentiles`
+    /// returns while the values are kept exactly.
+    fn brute_percentile(values: &[f64], percent: f64) -> Option<f64> {
+        if values.is_empty() {
+            return None;
+        }
+        let mut sorted = values.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        let rank = percent / 100.0 * (sorted.len() - 1) as f64;
+        let (lo, hi) = (rank.floor() as usize, rank.ceil() as usize);
+        Some(sorted[lo] + (sorted[hi] - sorted[lo]) * (rank - lo as f64))
+    }
+
+    fn assert_percentile(got: &serde_json::Value, want: Option<f64>, what: &str) {
+        match want {
+            None => assert!(got.is_null(), "{what}: expected null, got {got}"),
+            Some(want) => {
+                let got = got.as_f64().unwrap_or_else(|| panic!("{what}: {got}"));
+                assert!((got - want).abs() < 1e-9, "{what}: got {got}, want {want}");
+            }
+        }
+    }
+
+    #[test]
+    fn percentiles_match_brute_force_across_segments() {
+        let root = temp_root("pct");
+        let segments = fixture();
+        let (ns, manifest) = build(&root, &segments);
+        let docs: Vec<Doc> = segments.concat();
+        let defaults = [1.0, 5.0, 25.0, 50.0, 75.0, 95.0, 99.0];
+        let keys = ["1.0", "5.0", "25.0", "50.0", "75.0", "95.0", "99.0"];
+
+        for (text, scope) in [("", None), ("apple", Some("apple"))] {
+            let in_scope: Vec<&Doc> = docs
+                .iter()
+                .filter(|d| scope.is_none_or(|s| d.text.split(' ').any(|w| w == s)))
+                .collect();
+            let prices: Vec<f64> = in_scope.iter().filter_map(|d| d.price).collect();
+            let qtys: Vec<f64> = in_scope
+                .iter()
+                .filter_map(|d| d.qty.map(|q| q as f64))
+                .collect();
+            let out = run(
+                &root,
+                &ns,
+                &manifest,
+                &query(
+                    text,
+                    0,
+                    serde_json::json!({
+                        "price": {"percentiles": {"field": "price"}},
+                        "qty": {"percentiles": {"field": "qty"}},
+                        "absent": {"percentiles": {"field": "absent"}},
+                        "words": {"percentiles": {"field": "category"}},
+                    }),
+                ),
+            );
+            for (name, values) in [("price", &prices), ("qty", &qtys)] {
+                let got = out[name]["values"].as_object().unwrap();
+                assert_eq!(got.len(), keys.len(), "{name}/{text:?}: {out}");
+                for (key, percent) in keys.iter().zip(defaults) {
+                    assert_percentile(
+                        &got[*key],
+                        brute_percentile(values, percent),
+                        &format!("{name}/{text:?} p{percent}"),
+                    );
+                }
+            }
+            // No values: every requested percentile is present and null.
+            for name in ["absent", "words"] {
+                let got = out[name]["values"].as_object().unwrap();
+                assert_eq!(got.len(), keys.len(), "{name}: {out}");
+                assert!(got.values().all(|v| v.is_null()), "{name}: {out}");
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn percentiles_honour_percents_and_keyed_and_format_keys_like_elasticsearch() {
+        let root = temp_root("pct-shape");
+        let segments = fixture();
+        let (ns, manifest) = build(&root, &segments);
+        let prices: Vec<f64> = segments.concat().iter().filter_map(|d| d.price).collect();
+        let out = run(
+            &root,
+            &ns,
+            &manifest,
+            &query(
+                "",
+                0,
+                serde_json::json!({
+                    "keyed": {"percentiles": {"field": "price", "percents": [0, 50, 99.9, 100]}},
+                    "list": {"percentiles": {"field": "price", "percents": [50, 99.9], "keyed": false}},
+                }),
+            ),
+        );
+        let keyed = out["keyed"]["values"].as_object().unwrap();
+        let mut keys: Vec<&str> = keyed.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["0.0", "100.0", "50.0", "99.9"], "{out}");
+        let (min, max, _, _) = expected(&prices);
+        assert_percentile(&keyed["0.0"], min, "p0 is the minimum");
+        assert_percentile(&keyed["100.0"], max, "p100 is the maximum");
+        assert_percentile(&keyed["50.0"], brute_percentile(&prices, 50.0), "median");
+
+        let list = out["list"]["values"].as_array().unwrap();
+        assert_eq!(list.len(), 2, "{out}");
+        assert_eq!(list[0]["key"], 50.0, "{out}");
+        assert_eq!(list[1]["key"], 99.9, "{out}");
+        assert_percentile(
+            &list[0]["value"],
+            brute_percentile(&prices, 50.0),
+            "list p50",
+        );
+        assert_percentile(
+            &list[1]["value"],
+            brute_percentile(&prices, 99.9),
+            "list p99.9",
+        );
+        assert!(list[0].get("value_as_string").is_none(), "{out}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn percentiles_over_dates_also_return_text() {
+        let root = temp_root("pct-date");
+        let segments = fixture();
+        let (ns, manifest) = build(&root, &segments);
+        let millis: Vec<f64> = segments
+            .concat()
+            .iter()
+            .filter_map(|d| d.sent)
+            .map(|s| kosha_core::datetime::parse_epoch_millis(s).unwrap() as f64)
+            .collect();
+        let out = run(
+            &root,
+            &ns,
+            &manifest,
+            &query(
+                "",
+                0,
+                serde_json::json!({
+                    "keyed": {"percentiles": {"field": "sent", "percents": [0, 50, 100]}},
+                    "list": {"percentiles": {"field": "sent", "percents": [100], "keyed": false}},
+                }),
+            ),
+        );
+        let keyed = &out["keyed"]["values"];
+        assert_eq!(keyed["0.0"], 1_704_067_200_000.0, "{out}");
+        assert_eq!(keyed["0.0_as_string"], "2024-01-01T00:00:00.000Z", "{out}");
+        assert_eq!(
+            keyed["100.0_as_string"], "2024-06-15T00:00:00.000Z",
+            "{out}"
+        );
+        assert_percentile(
+            &keyed["50.0"],
+            brute_percentile(&millis, 50.0),
+            "date median",
+        );
+        assert!(keyed["50.0_as_string"].is_string(), "{out}");
+        assert_eq!(
+            out["list"]["values"][0]["value_as_string"], "2024-06-15T00:00:00.000Z",
+            "{out}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn percentiles_nest_under_terms_composite_and_histogram() {
+        let root = temp_root("pct-nested");
+        let segments = fixture();
+        let (ns, manifest) = build(&root, &segments);
+        let docs = segments.concat();
+        let subs = serde_json::json!({
+            "p": {"percentiles": {"field": "price", "percents": [25, 50, 75]}},
+            "total": {"sum": {"field": "price"}},
+        });
+        let out = run(
+            &root,
+            &ns,
+            &manifest,
+            &query(
+                "",
+                0,
+                serde_json::json!({
+                    "by_cat": {"terms": {"field": "category"}, "aggs": subs},
+                    "pages": {
+                        "composite": {"size": 10, "sources": [{"cat": {"terms": {"field": "category"}}}]},
+                        "aggs": subs,
+                    },
+                    "by_qty": {"histogram": {"field": "qty", "interval": 5}, "aggs": subs},
+                }),
+            ),
+        );
+        let terms = out["by_cat"]["buckets"].as_array().unwrap();
+        let composite = out["pages"]["buckets"].as_array().unwrap();
+        for cat in ["fruit", "bakery", "dairy"] {
+            let prices: Vec<f64> = docs
+                .iter()
+                .filter(|d| d.category == cat)
+                .filter_map(|d| d.price)
+                .collect();
+            for bucket in [
+                terms.iter().find(|b| b["key"] == cat).unwrap(),
+                composite.iter().find(|b| b["key"]["cat"] == cat).unwrap(),
+            ] {
+                for (key, percent) in [("25.0", 25.0), ("50.0", 50.0), ("75.0", 75.0)] {
+                    assert_percentile(
+                        &bucket["p"]["values"][key],
+                        brute_percentile(&prices, percent),
+                        &format!("{cat} p{percent}"),
+                    );
+                }
+            }
+        }
+        // Histogram buckets, including gap-filled empty ones (all null).
+        let buckets = out["by_qty"]["buckets"].as_array().unwrap();
+        assert!(!buckets.is_empty(), "{out}");
+        for bucket in buckets {
+            let lo = bucket["key"].as_f64().unwrap();
+            let prices: Vec<f64> = docs
+                .iter()
+                .filter(|d| {
+                    d.qty
+                        .is_some_and(|q| (q as f64) >= lo && (q as f64) < lo + 5.0)
+                })
+                .filter_map(|d| d.price)
+                .collect();
+            assert_percentile(
+                &bucket["p"]["values"]["50.0"],
+                brute_percentile(&prices, 50.0),
+                &format!("qty bucket {lo}"),
+            );
+            assert_eq!(
+                bucket["p"]["values"].as_object().unwrap().len(),
+                3,
+                "{bucket}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn percentiles_past_the_exact_limit_stay_within_one_percent_and_ignore_segment_layout() {
+        // 12,000 values, more than `quantile::EXACT_LIMIT`, so the result
+        // comes from the sketch. One segment and five uneven segments must
+        // agree exactly, and both must be within the documented 1% of the
+        // true order statistic.
+        let n = 12_000usize;
+        assert!(n > quantile::EXACT_LIMIT);
+        let value = |i: usize| ((i * 7919) % n) as f64 * 1.5 + 10.0;
+        let docs: Vec<Doc> = (0..n)
+            .map(|i| doc(&format!("d{i}"), "x", "c", Some(value(i)), None, None, None))
+            .collect();
+        let aggs = serde_json::json!({
+            "p": {"percentiles": {"field": "price", "percents": [0, 1, 25, 50, 75, 99, 99.9, 100]}},
+        });
+
+        let one_root = temp_root("pct-big-one");
+        let (ns, manifest) = build(&one_root, std::slice::from_ref(&docs));
+        let single = run(&one_root, &ns, &manifest, &query("", 0, aggs.clone()));
+
+        let many_root = temp_root("pct-big-many");
+        let cuts = [0, 17, 4_113, 4_500, 9_000, n];
+        let layout: Vec<Vec<Doc>> = cuts.windows(2).map(|w| docs[w[0]..w[1]].to_vec()).collect();
+        let (ns, manifest) = build(&many_root, &layout);
+        let many = run(&many_root, &ns, &manifest, &query("", 0, aggs));
+        assert_eq!(single, many, "segment layout changed the percentiles");
+
+        let mut sorted: Vec<f64> = (0..n).map(value).collect();
+        sorted.sort_by(f64::total_cmp);
+        for (key, percent) in [
+            ("0.0", 0.0),
+            ("1.0", 1.0),
+            ("25.0", 25.0),
+            ("50.0", 50.0),
+            ("75.0", 75.0),
+            ("99.0", 99.0),
+            ("99.9", 99.9),
+            ("100.0", 100.0),
+        ] {
+            let got = many["p"]["values"][key].as_f64().unwrap();
+            let want = sorted[(percent / 100.0 * (n - 1) as f64).floor() as usize];
+            assert!(
+                (got - want).abs() <= quantile::RELATIVE_ACCURACY * want.abs(),
+                "p{percent}: got {got}, want {want}"
+            );
+        }
+        assert_eq!(many["p"]["values"]["0.0"], sorted[0]);
+        assert_eq!(many["p"]["values"]["100.0"], sorted[n - 1]);
+        std::fs::remove_dir_all(one_root).unwrap();
+        std::fs::remove_dir_all(many_root).unwrap();
+    }
+
+    #[test]
+    fn percentiles_on_the_row_filter_store() {
+        // The pre-columnar `FilterStore` path, driven directly: integer,
+        // float, numeric text and list values all contribute, a document
+        // outside `wanted` does not.
+        let mut store = FilterStore::default();
+        store
+            .integer_fields
+            .insert("n".into(), vec![(0, 10), (1, 20), (9, 1_000)]);
+        store.float_fields.insert("n".into(), vec![(2, 30.0)]);
+        store
+            .string_fields
+            .insert("n".into(), vec![(3, "40".into()), (4, "[50, 60]".into())]);
+        let wanted: HashSet<u32> = (0..5).collect();
+        let agg: Aggregation = serde_json::from_value(
+            serde_json::json!({"percentiles": {"field": "n", "percents": [0, 50, 100]}}),
+        )
+        .unwrap();
+        let state = aggregate_matches(&store, &wanted, &agg);
+        let out = state.metric.render_for(&agg).unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!({"values": {"0.0": 10.0, "50.0": 35.0, "100.0": 60.0}})
+        );
     }
 
     #[test]
