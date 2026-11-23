@@ -3672,6 +3672,7 @@ impl AppState {
             HYDRATE_OWNER_SEGMENTS,
             |p, _| Self::segment_is_complete(p, needs_vectors),
             |owned| {
+                let bytes_before = outcome.bytes_fetched;
                 // Bound total concurrent hydration *operations* server-wide —
                 // released as soon as this operation's fetch is done, before
                 // waiters below get to run.
@@ -3760,7 +3761,7 @@ impl AppState {
                     }
                 }
 
-                outcome.bytes_fetched
+                outcome.bytes_fetched - bytes_before
             },
             || false,
         );
@@ -4711,6 +4712,7 @@ impl AppState {
             &filter_files,
             &manifest_footers,
             request,
+            true,
         );
         let postings_outcome = self.ensure_query_postings(
             ns,
@@ -4785,6 +4787,7 @@ impl AppState {
                 &HashMap::new(),
                 &manifest_footers,
                 request,
+                false, // best effort: a miss does not fail the search
             );
             let stats_postings = self.ensure_query_postings(
                 ns,
@@ -5025,8 +5028,10 @@ impl AppState {
     /// unfiltered search ahead of a filtered kNN, or a search ahead of a
     /// compaction) finds the segment still incomplete by its own predicate
     /// afterwards and fetches the rest itself (`hydrate_single_flight`);
-    /// only what is incomplete after that is reported `missing`, each with a
-    /// WARN naming the failed check and this request's role.
+    /// only what is incomplete after that is reported `missing`. With
+    /// `log_missing` (a set whose miss fails the request) one WARN then names
+    /// the count and the first few segments with the failed check and this
+    /// request's role.
     #[cfg(feature = "s3")]
     fn ensure_scoring_files_local(
         &self,
@@ -5035,6 +5040,7 @@ impl AppState {
         filter_files: &HashMap<PathBuf, Vec<String>>,
         manifest_footers: &HashMap<PathBuf, &kosha_core::Footer>,
         request: &Arc<RequestHydration>,
+        log_missing: bool,
     ) -> HydrationOutcome {
         let Some(ref s3) = self.s3_storage else {
             return HydrationOutcome::default();
@@ -5066,6 +5072,7 @@ impl AppState {
                 complete
             },
             |owned| {
+                let bytes_before = outcome.bytes_fetched;
                 let _permit = self.hydration_semaphore.acquire("scoring_set");
 
                 // Which vector files a kNN needs is read from each segment's
@@ -5377,11 +5384,18 @@ impl AppState {
                     }
                 }
 
-                outcome.bytes_fetched
+                outcome.bytes_fetched - bytes_before
             },
             || request.is_shed(),
         );
 
+        // Rare path (a required set fails the request with it): say which
+        // check failed and how this request took part in the fetch, so a 503
+        // can be read from the log without a reproduction (finding 28). One
+        // line per request, naming the first few segments. Not for a shed
+        // request (its 429 says why) or a best-effort set.
+        const LOGGED_SEGMENTS: usize = 3;
+        let mut detail: Vec<String> = Vec::new();
         for p in seg_paths {
             let Some(gap) = Self::scoring_gap(
                 p,
@@ -5395,21 +5409,22 @@ impl AppState {
             let Ok(rel) = p.strip_prefix(&self.data_dir) else {
                 continue;
             };
-            // Rare path (the request fails with it): say which check failed
-            // and how this request took part in the fetch, so a 503 can be
-            // read from the log without a reproduction (finding 28).
-            let role = roles.get(p).map_or_else(
-                || "found complete, then lost".to_string(),
-                |r| r.to_string(),
-            );
+            if log_missing && detail.len() < LOGGED_SEGMENTS {
+                let role = roles.get(p).map_or_else(
+                    || "found complete, then lost".to_string(),
+                    |r| r.to_string(),
+                );
+                detail.push(format!("{} (missing={gap}, role={role})", rel.display()));
+            }
+            outcome.missing.push(rel.to_string_lossy().into_owned());
+        }
+        if log_missing && !outcome.missing.is_empty() && !request.is_shed() {
             eprintln!(
-                "WARN: scoring set incomplete after hydration: segment={} missing={gap} \
-                 role={role} shed={}{}",
-                rel.display(),
-                request.is_shed(),
+                "WARN: scoring set incomplete after hydration: segments={} first: {}{}",
+                outcome.missing.len(),
+                detail.join("; "),
                 request_id()
             );
-            outcome.missing.push(rel.to_string_lossy().into_owned());
         }
         outcome
     }
@@ -17976,20 +17991,26 @@ mod tests {
         assert!(in_flight.lock().unwrap().is_empty());
     }
 
-    /// Finding 28 end to end on a cold query node: an unfiltered search owns
-    /// every segment's scoring hydration and fetches no filter files; a
-    /// filtered search arriving meanwhile waits on it. Before the fix the
-    /// filtered one then reported every segment missing (the run9 503 with
-    /// 12 bare segment directories); now it fetches the filter files itself.
+    /// A cold query node over a fake bucket of two segments written by
+    /// `writer` (configured by `configure`, documents from `fields(i)`),
+    /// with the writer's footers on the manifest. Returns the bucket, the
+    /// node, its segment dirs and their footers.
     #[cfg(feature = "s3")]
-    #[test]
-    fn filtered_waiter_behind_unfiltered_owner_fetches_its_filter_files() {
+    fn single_flight_node(
+        ns: &str,
+        configure: impl Fn(kosha_segment::SegmentWriter) -> kosha_segment::SegmentWriter,
+        fields: impl Fn(u32) -> Vec<Field>,
+    ) -> (
+        crate::doc_store_fallback_tests::FakeS3,
+        AppState,
+        kosha_core::Manifest,
+        Vec<PathBuf>,
+    ) {
         use crate::doc_store_fallback_tests::{cold_node, temp_dir, FakeS3};
 
-        const NS: &str = "singleflight-filters";
         // A manifest of two segments, from the indexer...
         let writer = AppState::new(temp_dir("sf-writer"));
-        let ns = NamespaceId(NS.into());
+        let id = NamespaceId(ns.into());
         for batch in 0..2 {
             let docs = (0..6)
                 .map(|i| Document {
@@ -17997,53 +18018,116 @@ mod tests {
                     fields: vec![Field::text("text", format!("contract clause {i}"))],
                 })
                 .collect();
-            writer.indexer.index_documents(ns.clone(), docs).unwrap();
-            writer.indexer.flush_namespace(&ns).unwrap();
+            writer.indexer.index_documents(id.clone(), docs).unwrap();
+            writer.indexer.flush_namespace(&id).unwrap();
         }
-        let mut manifest = writer.indexer.manifest_cloned(&ns).unwrap();
-        // ...whose segments in the bucket are columnar-filter ones (#244),
-        // as staging writes them: a filtered query needs `filters.toc` and
-        // the `matterId` column, which an unfiltered one never fetches.
+        let mut manifest = writer.indexer.manifest_cloned(&id).unwrap();
+        // ...whose segments in the bucket are written in the shape under test.
         let bucket = temp_dir("sf-bucket");
         for (batch, entry) in manifest.segments.iter().enumerate() {
-            let mut w = kosha_segment::SegmentWriter::new(
+            let mut w = configure(kosha_segment::SegmentWriter::new(
                 entry.segment_id.clone(),
-                bucket.join(NS).join(&entry.segment_id.0),
-            )
-            .with_filters_write_version(2);
+                bucket.join(ns).join(&entry.segment_id.0),
+            ));
             for i in 0..entry.doc_count {
-                w.add_document(
-                    DocumentId(format!("d{batch}-{i}")),
-                    vec![
-                        Field::text("text", format!("contract clause {i}")),
-                        Field::keyword("matterId", format!("m{}", i % 2)),
-                    ],
-                );
+                w.add_document(DocumentId(format!("d{batch}-{i}")), fields(i));
             }
             let footer = w.finalize(kosha_core::Bm25Params::default()).unwrap();
-            assert!(footer.filter_columns.is_some());
             manifest
                 .segment_footers
                 .insert(entry.segment_id.clone(), Arc::new(footer));
         }
         let s3 = FakeS3::start(bucket);
-        let state = cold_node(&s3, NS, manifest.clone());
-
-        let seg_paths: Vec<PathBuf> = manifest
+        let state = cold_node(&s3, ns, manifest.clone());
+        let seg_paths = manifest
             .segments
             .iter()
-            .map(|e| manifest.segment_dir(&state.data_dir, &ns, &e.segment_id))
+            .map(|e| manifest.segment_dir(&state.data_dir, &id, &e.segment_id))
             .collect();
-        let footers: HashMap<PathBuf, &kosha_core::Footer> = manifest
+        (s3, state, manifest, seg_paths)
+    }
+
+    /// Each segment dir's manifest footer.
+    #[cfg(feature = "s3")]
+    fn footers_of<'a>(
+        manifest: &'a kosha_core::Manifest,
+        seg_paths: &[PathBuf],
+    ) -> HashMap<PathBuf, &'a kosha_core::Footer> {
+        manifest
             .segments
             .iter()
-            .zip(&seg_paths)
+            .zip(seg_paths)
             .filter_map(|(e, p)| {
                 manifest
                     .segment_footer(&e.segment_id)
                     .map(|f| (p.clone(), f))
             })
-            .collect();
+            .collect()
+    }
+
+    /// Run `waiter` (an `ensure_scoring_files_local` call) while an
+    /// unfiltered keyword search owns every segment's scoring hydration:
+    /// the owner claims them all, waits until `waiter` is waiting on each,
+    /// lands only what its own round fetches (`footer.json`, `inverted.idx`,
+    /// `doc_store.offsets`), then completes. Returns the waiter's outcome.
+    #[cfg(feature = "s3")]
+    fn behind_unfiltered_owner(
+        s3: &crate::doc_store_fallback_tests::FakeS3,
+        state: &AppState,
+        seg_paths: &[PathBuf],
+        footers: &HashMap<PathBuf, &kosha_core::Footer>,
+        waiter: impl FnOnce() -> HydrationOutcome + Send,
+    ) -> HydrationOutcome {
+        let (owned, waiting) = partition_for_hydration(
+            &state.in_flight_segments,
+            seg_paths,
+            HYDRATE_OWNER_SCORING,
+            |_| false,
+        );
+        assert_eq!((owned.len(), waiting.len()), (seg_paths.len(), 0));
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(waiter);
+            for (_, entry) in &owned {
+                wait_for_holders(entry, 3);
+            }
+            for p in seg_paths {
+                let rel = p.strip_prefix(&state.data_dir).unwrap();
+                fs::create_dir_all(p).unwrap();
+                for f in ["footer.json", "inverted.idx", "doc_store.offsets"] {
+                    fs::copy(s3.root.join(rel).join(f), p.join(f)).unwrap();
+                }
+                assert!(AppState::scoring_complete(
+                    p,
+                    None,
+                    false,
+                    &[],
+                    footers.get(p).copied()
+                ));
+            }
+            complete_owned(&state.in_flight_segments, &owned, 0);
+            waiter.join().unwrap()
+        })
+    }
+
+    /// Finding 28, filter shape: a filtered search waiting behind an
+    /// unfiltered owner finds `filters.toc` and its column absent (the
+    /// owner never fetches filter files). Before the fix it reported every
+    /// segment missing; now it fetches the filter files itself.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn filtered_waiter_behind_unfiltered_owner_fetches_its_filter_files() {
+        // Columnar-filter segments (#244), as staging writes them.
+        let (s3, state, manifest, seg_paths) = single_flight_node(
+            "singleflight-filters",
+            |w| w.with_filters_write_version(2),
+            |i| {
+                vec![
+                    Field::text("text", format!("contract clause {i}")),
+                    Field::keyword("matterId", format!("m{}", i % 2)),
+                ]
+            },
+        );
+        let footers = footers_of(&manifest, &seg_paths);
         let query: SearchQuery = serde_json::from_value(serde_json::json!({
             "query_text": "contract",
             "filter": {"term": {"matterId.keyword": "m1"}}
@@ -18060,45 +18144,15 @@ mod tests {
             })
             .collect();
 
-        // The unfiltered owner: claims every segment, then (once the filtered
-        // search is waiting on all of them) fetches its own scoring set.
-        let (owned, waiting) = partition_for_hydration(
-            &state.in_flight_segments,
-            &seg_paths,
-            HYDRATE_OWNER_SCORING,
-            |_| false,
-        );
-        assert_eq!((owned.len(), waiting.len()), (seg_paths.len(), 0));
-        let outcome = std::thread::scope(|scope| {
-            let filtered = scope.spawn(|| {
-                state.ensure_scoring_files_local(
-                    &seg_paths,
-                    None,
-                    &filter_files,
-                    &footers,
-                    &Arc::new(RequestHydration::new(u64::MAX)),
-                )
-            });
-            for (_, entry) in &owned {
-                wait_for_holders(entry, 3);
-            }
-            // What the unfiltered owner's round fetches: no filter files.
-            for p in &seg_paths {
-                let rel = p.strip_prefix(&state.data_dir).unwrap();
-                fs::create_dir_all(p).unwrap();
-                for f in ["footer.json", "inverted.idx", "doc_store.offsets"] {
-                    fs::copy(s3.root.join(rel).join(f), p.join(f)).unwrap();
-                }
-                assert!(AppState::scoring_complete(
-                    p,
-                    None,
-                    false,
-                    &[],
-                    footers.get(p).copied()
-                ));
-            }
-            complete_owned(&state.in_flight_segments, &owned, 0);
-            filtered.join().unwrap()
+        let outcome = behind_unfiltered_owner(&s3, &state, &seg_paths, &footers, || {
+            state.ensure_scoring_files_local(
+                &seg_paths,
+                None,
+                &filter_files,
+                &footers,
+                &Arc::new(RequestHydration::new(u64::MAX)),
+                true,
+            )
         });
 
         assert!(
@@ -18109,6 +18163,75 @@ mod tests {
         for (p, files) in &filter_files {
             for f in files {
                 assert!(file_present_nonempty(&p.join(f)), "{f} of {}", p.display());
+            }
+        }
+    }
+
+    /// Finding 28 as it happened on run9's ld9nd: an unfiltered keyword
+    /// search (rid ev95429290-14094) owned the 12 scoring segments and
+    /// fetched no vector files; two unfiltered kNN searches waiting on it
+    /// (-14099, -14105) then found the kNN column's files absent and 503'd
+    /// 0.3 s after the owner finished, without a fetch of their own. Now the
+    /// kNN waiter fetches its column files itself, in both posting read
+    /// modes (ranged: `vector.offsets`; whole: also `vector.idx`).
+    #[cfg(feature = "s3")]
+    #[test]
+    fn knn_waiter_behind_keyword_owner_fetches_its_vector_files() {
+        for mode in [doc_spans::ReadMode::Ranged, doc_spans::ReadMode::Whole] {
+            let (s3, mut state, manifest, seg_paths) = single_flight_node(
+                "singleflight-knn",
+                |w| w.with_vector_store_mode(kosha_segment::VectorStoreMode::Sidecar),
+                |i| {
+                    vec![
+                        Field::text("text", format!("contract clause {i}")),
+                        Field::vector("emb", vec![1.0, i as f32, 0.5, 0.0]),
+                    ]
+                },
+            );
+            state.posting_read_mode = mode;
+            let ranged = mode == doc_spans::ReadMode::Ranged;
+            let footers = footers_of(&manifest, &seg_paths);
+            for p in &seg_paths {
+                assert!(
+                    !kosha_segment::knn_vector_columns(footers.get(p).copied(), "emb").is_empty(),
+                    "segments carry an 'emb' column"
+                );
+            }
+
+            let outcome = behind_unfiltered_owner(&s3, &state, &seg_paths, &footers, || {
+                state.ensure_scoring_files_local(
+                    &seg_paths,
+                    Some("emb"),
+                    &HashMap::new(),
+                    &footers,
+                    &Arc::new(RequestHydration::new(u64::MAX)),
+                    true,
+                )
+            });
+
+            assert!(
+                outcome.missing.is_empty(),
+                "{mode:?}: the kNN search must fetch its vector files, not fail on: {:?}",
+                outcome.missing
+            );
+            for p in &seg_paths {
+                let footer = footers.get(p).copied();
+                for column in kosha_segment::knn_vector_columns(footer, "emb") {
+                    let local = |f: &str| file_present_nonempty(&p.join(f));
+                    assert!(
+                        column.offsets_file.as_deref().is_some_and(local)
+                            || local(&column.idx_file),
+                        "{mode:?}: a vector file of 'emb' in {}",
+                        p.display()
+                    );
+                }
+                assert!(AppState::scoring_complete(
+                    p,
+                    Some("emb"),
+                    ranged,
+                    &[],
+                    footer
+                ));
             }
         }
     }
