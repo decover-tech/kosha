@@ -36,7 +36,9 @@ pub use error::VectorIndexError;
 pub use point::{
     cosine_distance, cosine_similarity, dot, dot_lanes, maxsim, mean_vector, normalize_in_place,
 };
-pub use quant::{dequantize_i8, dot_i8, quantize_i8, I8_MAX_CODE};
+pub use quant::{
+    dequantize_i8, dot_i16_i8, dot_i8, max_i16_query_code, quantize_i16, quantize_i8, I8_MAX_CODE,
+};
 pub use rabitq::{
     encode_rabitq, rabitq_code_bytes, rabitq_padded_dim, RaBitQCode, RaBitQEstimator, RaBitQQuery,
     RaBitQRotation, RABITQ_EPSILON0, RABITQ_QUERY_BITS, RABITQ_ROTATION_SEED,
