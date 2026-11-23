@@ -14938,7 +14938,7 @@ mod tests {
         let calls = Mutex::new(0usize);
         let fetch = |seg: &Path, file: &str, ranges: &[(u64, u64)]| {
             if file != kosha_segment::DOC_VECTORS_FILE {
-                return;
+                return kosha_segment::span_cache::SpanHolds::new();
             }
             *calls.lock().unwrap() += 1;
             let bytes = &sidecars[seg];
@@ -14950,6 +14950,7 @@ mod tests {
                 )
                 .unwrap();
             }
+            kosha_segment::span_cache::SpanHolds::new()
         };
         let searcher = Searcher::new(dir.clone()).with_knn_global_rescore(true);
         let query = global_rescore_vector(5150);
