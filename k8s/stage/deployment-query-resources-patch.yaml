@@ -69,11 +69,16 @@ spec:
           env:
             # Overrides the ConfigMap's 40GiB value (see comment above) —
             # explicit container env wins over envFrom on key collision.
-            # ~20GiB leaves ~12GiB of the 32Gi limit for process baseline +
-            # concurrent per-request working memory, so the cache evicts
-            # gracefully instead of the pod getting OOMKilled.
+            # 16GiB (SC). The idle parsed-segment cache and the decoded
+            # vector postings cache (C = 4GiB, below) both count toward the
+            # live watermark (W = 20GiB, below). At SC 20 + C 4 = 24 > W the
+            # idle caches alone exceeded W: the segment cache never evicted
+            # on its own and every loading search fell into the synchronous
+            # admission-path eviction. SC 16 + C 4 = 20 = W fits; the RAM
+            # bound W + C = 24GiB of the 32Gi limit is unchanged. Cost: 4GiB
+            # less room for parsed segments.
             - name: KOSHA_SEGMENT_CACHE_MAX_BYTES
-              value: "21474836480"
+              value: "17179869184"
             # ~24GiB on-disk cache budget, well under the 40Gi
             # ephemeral-storage limit (see comment above) — the cache's own
             # LRU eviction is what should bite first, not a pod eviction.
@@ -82,7 +87,7 @@ spec:
             # Live-bytes watermark W (cache-resident + pinned by in-flight
             # searches + decoded postings — see kosha_query::MemoryLedger).
             # Must be set explicitly here: the code default is 2× the cache
-            # budget (40GiB), which exceeds the 32Gi container limit.
+            # budget (32GiB), which is the whole 32Gi container limit.
             # 20GiB, not 24GiB, because decoded vector postings (C below)
             # inserted after a search is admitted are not reserved by the
             # ledger, so live can pass W by up to C: worst case
