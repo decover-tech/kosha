@@ -95,7 +95,7 @@ recreate() { # recreate <env-file>
   # Same shape as benchmark.yml: host network, cache volume, env.
   sudo docker run -d --name kosha --network host --env-file "$1" \
     -v /data/kosha:/var/cache/kosha "$IMAGE" >/dev/null
-  for i in $(seq 120); do curl -sf http://127.0.0.1:8080/readyz >/dev/null 2>&1 && return 0; sleep 5; done
+  for i in $(seq 120); do curl -sf http://127.0.0.1:8080/v1/readyz >/dev/null 2>&1 && return 0; sleep 5; done
   echo "::error::kosha /readyz not green 600s after recreate"; sudo docker logs --tail 200 kosha 2>&1 || true
   return 1
 }

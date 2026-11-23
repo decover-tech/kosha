@@ -22,3 +22,6 @@
 
 # Local dev volumes (docker-compose)
 /volumes
+
+# OpenAPI generation scratch and the pinned API tool binaries (make openapi)
+/build

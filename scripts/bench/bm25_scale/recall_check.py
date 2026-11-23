@@ -147,7 +147,9 @@ def server_topk(
     if no_cache:
         payload["no_cache"] = True
     t0 = time.time()
-    resp = session.post(f"{host}/search", json=payload, headers=headers, timeout=timeout)
+    resp = session.post(
+        f"{host}/v1/namespaces/{namespace}/search", json=payload, headers=headers, timeout=timeout
+    )
     latency_ms = (time.time() - t0) * 1000
     resp.raise_for_status()
     body = resp.json()

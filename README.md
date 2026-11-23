@@ -8,7 +8,9 @@ A storage-disaggregated search engine: **S3 is the source of truth, local NVMe
 SSD is a transparent cache, and compute nodes are disposable.** Kosha is being
 built to replace Elasticsearch/OpenSearch and is intended to be reusable as a general-purpose, schema-driven search service.
 
-See [DESIGN.md](DESIGN.md) for the full architecture.
+See [DESIGN.md](DESIGN.md) for the full architecture, and
+[docs/guarantees.md](docs/guarantees.md) for the durability, consistency and
+latency guarantees and the limits Kosha enforces.
 
 > **Status: BM25 lexical, kNN/ANN vector and RRF hybrid search are implemented**,
 > with filtering, aggregations, compaction, a Postgres control plane and a
@@ -21,6 +23,8 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 | --- | --- | --- |
 | Server image | [Docker Hub — `ravidecoverai/kosha`](https://hub.docker.com/r/ravidecoverai/kosha) | `docker pull ravidecoverai/kosha:latest` |
 | Python client | [PyPI — `kosha-client`](https://pypi.org/project/kosha-client/) | `pip install kosha-client` |
+| TypeScript SDK (preview) | npm — `@decover/kosha` ([clients/typescript](clients/typescript)) | `npm install @decover/kosha` |
+| Go SDK (preview) | `github.com/decover-tech/kosha/clients/go` ([clients/go](clients/go)) | `go get github.com/decover-tech/kosha/clients/go` |
 | CLI | not published to crates.io yet | `cargo install --path crates/kosha-cli` |
 
 ## Supported features
@@ -355,10 +359,11 @@ own document, or combine the two values into one leaf (`"name_org": "Ada|beta"`)
 
 ### API and clients
 
-- HTTP/JSON `/v1` API (see [HTTP routes](#http-routes)) — namespace create and delete, `documents`, `search`, `flush`, `delete`, `exists`, `stats` — with the Phase 1 unversioned routes still served for backward compatibility.
-- `proto/kosha/v1/kosha.proto` is the canonical API contract and the source for generated stubs and the OpenAPI spec.
+- HTTP/JSON `/v1` API (see [HTTP routes](#http-routes)), published as a generated OpenAPI 3 document (`api/openapi/v1/kosha.openapi.json`) with one error model (`docs/api/errors.md`). The Phase 1 unversioned routes are deprecated (`Deprecation`/`Sunset` headers) and can be turned off per pod or tenant; see [docs/api/versioning.md](docs/api/versioning.md).
+- `proto/kosha/v1/*.proto` describes the wire format and generates the OpenAPI documents (`make openapi`).
 - `kosha` CLI (built from `crates/kosha-cli`, not yet on crates.io): health, index, search, flush, delete, stats, admin commands, named profiles, `--json` output, and a `kosha curl` escape hatch.
-- OpenSearch-compatible Python client, [`kosha-client` on PyPI](https://pypi.org/project/kosha-client/): `search`, `index`, `bulk`, `count`, `update`, `delete_by_query`, `update_by_query`, `scroll`, plus `indices` and `tasks` namespaces, translating the ES query DSL to Kosha's native shape.
+- OpenSearch-compatible Python client, [`kosha-client` on PyPI](https://pypi.org/project/kosha-client/): `search`, `index`, `bulk`, `count`, `update`, `delete_by_query`, `update_by_query`, `scroll`, plus `indices` and `tasks` namespaces, translating the ES query DSL to Kosha's native shape. What it supports, partially supports and rejects: [docs/compat/opensearch.md](docs/compat/opensearch.md). Moving an index over: [docs/migration/from-elasticsearch.md](docs/migration/from-elasticsearch.md).
+- TypeScript ([clients/typescript](clients/typescript)) and Go ([clients/go](clients/go)) SDKs for the native `/v1` API, typed from the OpenAPI document: namespaces, schema, upsert/merge, search, a `search_after` iterator, batched bulk indexing, and retries on `429`/`503` that honour `Retry-After`. All three SDKs share one retry policy ([clients/conformance/RETRY.md](clients/conformance/RETRY.md)) and one conformance suite run against a live stack in CI ([clients/conformance](clients/conformance)). The TS and Go SDKs take native bodies only (no OpenSearch DSL translation).
 
 ### Not supported yet
 
@@ -481,28 +486,36 @@ unqualified name, stored as `{tenant}/{ns}`, and another tenant's namespace of
 the same name is invisible (404). Query pods (`KOSHA_INGEST_HOST` set) forward
 the routes marked *write* to the ingest pod.
 
-| Method and path | Body → response | Notes |
-|---|---|---|
-| `POST /v1/namespaces` | `CreateNamespaceRequest` → `CreateNamespaceResponse` | *write*. 409 if it exists, 400 for an invalid name or schema. Optional: namespaces still auto-create on first write. A `schema` is validated, echoed back and stored as the namespace schema, as `POST /v1/namespaces/{ns}/schema` would (see [Analyzers](#analyzers)). |
-| `GET /v1/namespaces` | → `{"namespaces": [{"name", "documents", "segments", "manifest_version"}]}` | The caller's namespaces (#214), tenant prefix stripped; shard and internal namespaces are left out. |
-| `DELETE /v1/namespaces/{ns}` | → `DeleteNamespaceResponse` | *write*. 404 if it does not exist, 409 while a branch still shares its segments, and 409 for a branch (delete it with `DELETE /v1/namespaces/{ns}/branch`). Permanent; see below. |
-| `POST /v1/namespaces/{ns}/documents` | `IndexDocumentsRequest` → `IndexDocumentsResponse` | *write*. Upsert by id. |
-| `POST /v1/namespaces/{ns}/flush` | → `FlushResponse` | *write*. Make buffered writes searchable. |
-| `POST /v1/namespaces/{ns}/delete` | `DeleteByQueryRequest` → `DeleteByQueryResponse` | *write*. Delete by query. |
-| `POST /v1/namespaces/{ns}/branch`, `GET /v1/namespaces/{ns}/branches`, `DELETE /v1/namespaces/{ns}/branch` | `{"name": "<branch>"}` → the branch; → its branches; → what was reclaimed | Create (*write*), list and delete (*write*) copy-on-write branches (#208). 409 if the name is taken, or for deleting a namespace that is not a branch. |
-| `POST /v1/namespaces/{ns}/shards` | `{"shards": N}` → `{"namespace", "shards", "changed"}` | *write*. Create the namespace sharded (#207); see [Namespace sharding](#namespace-sharding). |
-| `POST /v1/namespaces/{ns}/schema`, `GET /v1/namespaces/{ns}/schema` | `NamespaceSchema` | Set (*write*) or read the namespace schema; see [Analyzers](#analyzers). |
-| `POST /v1/namespaces/{ns}/search` | `SearchRequest` → `SearchResponse` | 404 for a missing namespace. |
-| `POST /v1/namespaces/{ns}/exists` | ids → per-id existence | |
-| `GET /v1/namespaces/{ns}/stats` | → `NamespaceStats` | 404 for a missing namespace. |
-| `GET /v1/healthz`, `GET /healthz`, `GET /readyz` | | Unauthenticated probes. |
-| `GET /metrics` | → Prometheus text format | Unauthenticated unless `KOSHA_METRICS_AUTH=admin`; see [docs/metrics.md](docs/metrics.md). |
-| `GET /dashboard` | | Read-only web UI, `KOSHA_DASHBOARD=on` only (404 otherwise); see [docs/dashboard.md](docs/dashboard.md). |
-| `GET /v1/usage` | → `{"tenant", "from", "to", "namespaces": [...], "total"}` | The caller's usage per namespace over `?from=&to=` (Unix seconds, default the last 30 days). 404 unless `KOSHA_USAGE_METERING=on`. `GET /v1/admin/usage[?tenant=]` is the admin view. |
-| `GET /v1/admin/usage/reconcile` | → `{"within_tolerance", "namespaces": [{"tenant", "namespace", "control_plane", "snapshot_bytes", "storage", "difference_bytes", "status"}], "totals", "unattributed", "skipped_prefixes", "warnings"}` | Admin key. Stored-bytes snapshots against object storage, per namespace; `?tenant=&tolerance=&tolerance_bytes=&max_snapshot_age=`. 404 unless `KOSHA_USAGE_METERING=on`. |
-| `GET /v1/billing` | → `{"tenant", "plan", "kind", "state", "free_tier_exceeded", "period", "usage", "accrued", "invoices"}` | The caller's plan, payment state, month-to-date usage with the charge accrued so far, and invoices. 404 unless `KOSHA_BILLING=on`. The admin routes are under `/v1/admin/billing/`. |
-| `GET /v1/stats` | | Admin key only. |
-| `/v1/admin/*` | | Admin key only; see the operations list above. |
+The API reference is the generated, checked-in OpenAPI 3 document:
+
+- [`api/openapi/v1/kosha.openapi.json`](api/openapi/v1/kosha.openapi.json):
+  every public route, with request and response schemas that match the wire
+  (checked by `scripts/api/check_wire.py`). Render it with any OpenAPI viewer,
+  or generate a client from it (see [tools/codegen](tools/codegen/README.md)).
+- [`api/openapi/v1/kosha-admin.openapi.json`](api/openapi/v1/kosha-admin.openapi.json):
+  the operator routes (`/v1/admin/*`, `GET /v1/stats`; admin key only, beta).
+- [`docs/api/errors.md`](docs/api/errors.md): the error model and every
+  error code. [`docs/api/versioning.md`](docs/api/versioning.md): what may
+  change inside `/v1`, deprecation, and the legacy-route timeline.
+  [`api/CHANGELOG.md`](api/CHANGELOG.md): contract changes.
+
+The public routes in brief:
+
+| Routes | Notes |
+|---|---|
+| `POST`/`GET /v1/namespaces`, `DELETE /v1/namespaces/{ns}` | Create (*write*), list, delete (*write*; see below). |
+| `POST /v1/namespaces/{ns}/documents`, `/replace`, `/flush`, `/delete` | *write*. Upsert by id; replace by id merging partial documents; make buffered writes searchable; delete by query. |
+| `POST /v1/namespaces/{ns}/search`, `/exists`, `GET .../stats` | Reads. |
+| `POST`/`GET /v1/namespaces/{ns}/schema`, `POST .../shards` | Schema (see [Analyzers](#analyzers)); sharding ([Namespace sharding](#namespace-sharding)). |
+| `POST .../branch`, `GET .../branches`, `DELETE .../branch` | Copy-on-write branches (#208). |
+| `GET /v1/usage`, `GET /v1/billing` | Usage metering and billing, when enabled. |
+| `GET /v1/healthz` | Liveness (SDK `ping`). |
+
+Operational endpoints, unversioned and outside the spec (see
+[docs/operations/endpoints.md](docs/operations/endpoints.md)): `GET /healthz`
+and `GET /readyz` (unauthenticated probes, also served as `/v1/healthz` and
+`/v1/readyz`), `GET /metrics` ([docs/metrics.md](docs/metrics.md)) and
+`GET /dashboard` ([docs/dashboard.md](docs/dashboard.md)).
 
 **Deleting a namespace** (`DELETE /v1/namespaces/{ns}`) runs on the ingest pod
 under the namespace's publication lock:
@@ -717,7 +730,7 @@ POST /v1/namespaces/shop/search
   and replaced by its vector before the write reaches the WAL, so replay, compaction and the doc
   store hold vectors only (the text is not kept; a document reads back with its vector). A
   number array is accepted as is when it has the declared `dims`, otherwise 400. A model this
-  pod has no provider for is a 503, an unreachable or timed-out provider a 503, and a provider
+  pod has no provider for is a 501 `not_implemented` (not retryable), an unreachable or timed-out provider a 503, and a provider
   that answers with an error or the wrong dimension a 502. Nothing is written on any of them.
 - **Query.** `knn` takes exactly one of `vector`, `vectors` or `query_text`. `query_text` against
   a field with no declared model is a 400. Non-kNN queries, and namespaces that declare no model,
@@ -808,7 +821,9 @@ and the server logs a warning at startup for any in `KOSHA_API_KEYS`.
   `KOSHA_AUTH=disabled` is set explicitly (local development only). Postgres keys
   are re-read every `KOSHA_API_KEY_REFRESH_SECS` (default 30), request bodies are
   capped at `KOSHA_MAX_BODY_BYTES` (default 64 MiB, 413 above it), and
-  `KOSHA_LEGACY_ROUTES=off` turns the unversioned routes into 410s.
+  `KOSHA_LEGACY_ROUTES=off` turns the unversioned routes into 410s
+  (`KOSHA_LEGACY_ROUTES_TENANTS` keeps them for named tenants; see
+  [docs/api/versioning.md](docs/api/versioning.md#legacy-routes)).
 
 ### Scoped API keys (Postgres key registry)
 
@@ -1100,6 +1115,9 @@ back requires converting both formats. The SQL column needs no schema change.
       python/kosha_client   OpenSearch-compatible Python client
                             (spec → codegen → thin client)
       python/README.md      how the client is structured
+      typescript/           TypeScript SDK (@decover/kosha)
+      go/                   Go SDK (github.com/decover-tech/kosha/clients/go)
+      conformance/          shared SDK conformance cases, fault proxy, retry policy
     proto/
       buf.yaml              Buf module config
       kosha/v1/kosha.proto  canonical API contract (source of truth)

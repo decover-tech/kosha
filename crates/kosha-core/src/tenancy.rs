@@ -78,6 +78,22 @@ pub fn tenant_of_file_key(key: &str) -> &str {
     tenant_of_namespace(namespace)
 }
 
+/// The longest namespace or branch name a tenant may supply, in UTF-8
+/// bytes. A namespace is a directory, and its segment directories are
+/// named `<tenant>_<name>[__shard-NNNN]-<suffix>` with a suffix of up to
+/// 41 bytes (`-compact-` plus a 32-hex uuid), all inside one path
+/// component that filesystems cap at 255 bytes. With
+/// [`MAX_TENANT_ID_BYTES`] that is at most 80 + 1 + 120 + 12 + 41 = 254
+/// bytes. Before this limit a longer name was accepted and its
+/// acknowledged writes then failed to flush with "File name too long".
+pub const MAX_NAMESPACE_NAME_BYTES: usize = 120;
+
+/// The longest tenant id a new API key may carry, in UTF-8 bytes (see
+/// [`MAX_NAMESPACE_NAME_BYTES`]). An organization's generated tenant id
+/// (a slug of at most 63 bytes, `-`, 12 hex digits) fits. Existing tenants
+/// are not re-checked.
+pub const MAX_TENANT_ID_BYTES: usize = 80;
+
 /// True for a tenant-supplied namespace or branch name that collides with
 /// the shard layout: stored as `<tenant>/_shard-NNNN`, it would be read as
 /// a shard of the bare (pre-#262) namespace `<tenant>` — sharing its

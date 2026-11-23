@@ -1,0 +1,56 @@
+[
+  {
+    "id": "errors.namespace_not_found",
+    "description": "An unknown namespace is a 404 namespace_not_found with a request id, tried once.",
+    "covers": ["KoshaService_Search"],
+    "steps": [
+      {
+        "op": "search",
+        "args": { "namespace": "$NS-missing", "body": { "query_text": "x" } },
+        "expect": {
+          "error": { "kind": "http", "status": 404, "code": "namespace_not_found", "retryable": false, "has_request_id": true },
+          "attempts": 1
+        }
+      }
+    ]
+  },
+  {
+    "id": "errors.bad_body",
+    "description": "A body of the wrong shape is a 400 invalid_argument.",
+    "covers": ["KoshaService_Search"],
+    "setup": [{ "op": "create_namespace" }],
+    "steps": [
+      {
+        "op": "raw_request",
+        "args": { "method": "POST", "path": "/v1/namespaces/$NS/search", "body": { "query_text": 1 } },
+        "expect": { "error": { "kind": "http", "status": 400, "code": "invalid_argument", "retryable": false } }
+      }
+    ]
+  },
+  {
+    "id": "errors.bad_key",
+    "description": "An unknown API key is a 401 unauthenticated.",
+    "covers": ["KoshaService_ListNamespaces"],
+    "tenant": "invalid",
+    "steps": [
+      {
+        "op": "list_namespaces",
+        "expect": { "error": { "kind": "http", "status": 401, "code": "unauthenticated", "retryable": false } }
+      }
+    ]
+  },
+  {
+    "id": "errors.payload_too_large",
+    "description": "A body over the tenant's limit is a 413 payload_too_large and is never retried.",
+    "covers": ["KoshaService_IndexDocuments"],
+    "tenant": "small",
+    "setup": [{ "op": "create_namespace" }],
+    "steps": [
+      {
+        "op": "upsert",
+        "args": { "documents": [{ "id": "big", "fields": [{ "name": "title", "field_type": "Text", "value": "$BIG" }] }] },
+        "expect": { "error": { "kind": "http", "status": 413, "code": "payload_too_large", "retryable": false }, "attempts": 1 }
+      }
+    ]
+  }
+]

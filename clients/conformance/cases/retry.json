@@ -1,0 +1,147 @@
+[
+  {
+    "id": "retry.retry_after_honoured",
+    "description": "A 429 with Retry-After: 1 and no body code is retried after about a second.",
+    "covers": ["KoshaService_Search"],
+    "setup": [{ "op": "create_namespace" }],
+    "faults": [
+      { "match": { "method": "POST", "path_suffix": "/search" }, "times": 1, "respond": { "status": 429, "headers": { "Retry-After": "1" }, "body": { "error": "slow down" } } }
+    ],
+    "steps": [
+      { "op": "search", "args": { "body": { "query_text": "x" } }, "expect": { "ok": true, "attempts": 2, "min_elapsed_ms": 950 } }
+    ]
+  },
+  {
+    "id": "retry.quota_not_retried",
+    "description": "Synthetic fault: a 429 whose body says retryable:false is tried once (RETRY.md rule 1, the body's retryable wins over the status). The server itself sends quota rejections as 403.",
+    "covers": ["KoshaService_Search"],
+    "setup": [{ "op": "create_namespace" }],
+    "faults": [
+      {
+        "match": { "method": "POST", "path_suffix": "/search" },
+        "respond": { "status": 429, "body": { "error": "quota", "code": "namespace_quota_exceeded", "retryable": false, "request_id": "fault-1" } }
+      }
+    ],
+    "steps": [
+      {
+        "op": "search",
+        "args": { "body": { "query_text": "x" } },
+        "expect": { "error": { "kind": "http", "status": 429, "code": "namespace_quota_exceeded", "retryable": false }, "attempts": 1 }
+      }
+    ]
+  },
+  {
+    "id": "retry.bare_503_backoff",
+    "description": "Two bare 503s, then success: three attempts.",
+    "covers": ["KoshaService_Flush"],
+    "setup": [{ "op": "create_namespace" }],
+    "faults": [
+      { "match": { "method": "POST", "path_suffix": "/flush" }, "times": 2, "respond": { "status": 503, "body": { "error": "unavailable" } } }
+    ],
+    "steps": [{ "op": "flush", "expect": { "ok": true, "attempts": 3 } }]
+  },
+  {
+    "id": "retry.retry_after_too_long",
+    "description": "A server delay over maxRetryAfter (30 s) is reported at once, not slept through.",
+    "covers": ["KoshaService_ListNamespaces"],
+    "faults": [
+      { "match": { "method": "GET", "path_suffix": "/v1/namespaces" }, "respond": { "status": 429, "headers": { "Retry-After": "120" }, "body": { "error": "later" } } }
+    ],
+    "steps": [
+      {
+        "op": "list_namespaces",
+        "expect": { "error": { "kind": "http", "status": 429, "retry_after_ms": 120000 }, "attempts": 1, "max_elapsed_ms": 2000 }
+      }
+    ]
+  },
+  {
+    "id": "retry.budget_exhausted",
+    "description": "No sleep that would end past the total budget.",
+    "covers": ["KoshaService_ListNamespaces"],
+    "faults": [
+      {
+        "match": { "method": "GET", "path_suffix": "/v1/namespaces" },
+        "respond": { "status": 503, "body": { "error": "unavailable", "code": "unavailable", "retryable": true, "retry_after_ms": 1000, "request_id": "fault-2" } }
+      }
+    ],
+    "steps": [
+      {
+        "op": "list_namespaces",
+        "client": { "total_budget_ms": 500 },
+        "expect": { "error": { "kind": "http", "status": 503, "code": "unavailable", "retryable": true }, "attempts": 1, "max_elapsed_ms": 900 }
+      }
+    ]
+  },
+  {
+    "id": "retry.timeout_non_idempotent",
+    "description": "A timed-out namespace create is not replayed.",
+    "covers": ["KoshaService_CreateNamespace"],
+    "faults": [{ "match": { "method": "POST", "path_suffix": "/v1/namespaces" }, "times": 1, "delay_ms": 1500 }],
+    "steps": [
+      {
+        "op": "create_namespace",
+        "client": { "timeout_ms": 400 },
+        "expect": { "error": { "kind": "transport" }, "attempts": 1 }
+      }
+    ]
+  },
+  {
+    "id": "retry.timeout_idempotent",
+    "description": "A timed-out search is replayed and succeeds.",
+    "covers": ["KoshaService_Search"],
+    "setup": [{ "op": "create_namespace" }],
+    "faults": [{ "match": { "method": "POST", "path_suffix": "/search" }, "times": 1, "delay_ms": 1500 }],
+    "steps": [
+      { "op": "search", "args": { "body": { "query_text": "x" } }, "client": { "timeout_ms": 400 }, "expect": { "ok": true, "attempts": 2 } }
+    ]
+  },
+  {
+    "id": "retry.outcome_unknown_not_replayed",
+    "description": "Synthetic fault: a forwarded namespace create whose outcome is unknown is not replayed, even from an older server that said retryable:true (RETRY.md rule 1 exception).",
+    "covers": ["KoshaService_CreateNamespace"],
+    "faults": [
+      {
+        "match": { "method": "POST", "path_suffix": "/v1/namespaces" },
+        "times": 1,
+        "respond": {
+          "status": 503,
+          "body": { "error": "the ingest pod could not be reached", "code": "unavailable", "retryable": true, "retry_after_ms": 100, "request_id": "fault-3", "details": { "reason": "ingest_unreachable", "outcome": "unknown" } }
+        }
+      }
+    ],
+    "steps": [
+      {
+        "op": "create_namespace",
+        "expect": { "error": { "kind": "http", "status": 503, "code": "unavailable" }, "attempts": 1 }
+      }
+    ]
+  },
+  {
+    "id": "retry.outcome_unknown_idempotent_replayed",
+    "description": "Synthetic fault: a forwarded flush whose outcome is unknown says retryable:false, and is still replayed because flush is idempotent.",
+    "covers": ["KoshaService_Flush"],
+    "setup": [{ "op": "create_namespace" }],
+    "faults": [
+      {
+        "match": { "method": "POST", "path_suffix": "/flush" },
+        "times": 1,
+        "respond": {
+          "status": 503,
+          "body": { "error": "the ingest pod could not be reached", "code": "unavailable", "retryable": false, "request_id": "fault-4", "details": { "reason": "ingest_unreachable", "outcome": "unknown" } }
+        }
+      }
+    ],
+    "steps": [{ "op": "flush", "expect": { "ok": true, "attempts": 2 } }]
+  },
+  {
+    "id": "retry.tenant_qps_live",
+    "description": "Against a live qps:1 limit, back-to-back searches still succeed; the second sees at least one 429.",
+    "covers": ["KoshaService_Search"],
+    "tenant": "limited",
+    "setup": [{ "op": "create_namespace" }],
+    "steps": [
+      { "op": "search", "args": { "body": { "query_text": "x" } }, "expect": { "ok": true } },
+      { "op": "search", "args": { "body": { "query_text": "x" } }, "expect": { "ok": true, "attempts_min": 2 } }
+    ]
+  }
+]

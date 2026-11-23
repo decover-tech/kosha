@@ -82,15 +82,15 @@ pub fn requirement(method: &str, path: &str) -> Requirement {
         let Some((ns, action)) = rest.rsplit_once('/') else {
             // The bare `/v1/namespaces/{ns}`.
             return match method {
-                "DELETE" => scoped(Admin, Target::Path(crate::url_decode(rest))),
+                "DELETE" => scoped(Admin, Target::Path(crate::path_decode(rest))),
                 _ => Requirement::Unknown,
             };
         };
-        let ns = crate::url_decode(ns);
+        let ns = crate::path_decode(ns);
         let scope = match (method, action) {
             ("POST", "search" | "exists") => Read,
             ("GET", "schema" | "branches" | "stats") => Read,
-            ("POST", "documents" | "flush" | "delete") => Write,
+            ("POST", "documents" | "replace" | "flush" | "delete") => Write,
             ("POST", "schema" | "shards") => Admin,
             ("DELETE", "branch") => Admin,
             ("POST", "branch") => return scoped(Admin, Target::PathAndBody(ns, "name")),
@@ -223,6 +223,7 @@ mod tests {
         ("POST", "/exists", Scope::Read),
         ("GET", "/search?ns=docs&q=x", Scope::Read),
         ("POST", "/v1/namespaces/docs/documents", Scope::Write),
+        ("POST", "/v1/namespaces/docs/replace", Scope::Write),
         ("POST", "/v1/namespaces/docs/flush", Scope::Write),
         ("POST", "/v1/namespaces/docs/delete", Scope::Write),
         ("POST", "/index", Scope::Write),
@@ -365,7 +366,7 @@ mod tests {
             let fine = statement.starts_with(' ')
                 || statement.starts_with("if ")
                 || statement.starts_with("//")
-                || ["{", "}", "json_error(404, \"not found\")"].contains(&statement);
+                || ["{", "}", "api_error(ErrorCode::NotFound, \"not found\")"].contains(&statement);
             if !fine {
                 unknown.push(statement.to_string());
             }
@@ -507,7 +508,7 @@ mod tests {
         return b();
     }
 
-    json_error(404, "not found")"#;
+    api_error(ErrorCode::NotFound, "not found")"#;
         assert_eq!(
             unrecognised_dispatches(known, DELEGATES),
             Vec::<String>::new()

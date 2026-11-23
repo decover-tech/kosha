@@ -90,12 +90,12 @@ def server():
 @pytest.fixture(autouse=True)
 def fresh_pools(monkeypatch):
     monkeypatch.setattr(transport_mod, "_POOLS", {}, raising=False)
-    monkeypatch.setattr(Transport, "backoff_base", 0.01)
-    monkeypatch.setattr(Transport, "backoff_cap", 0.02)
 
 
 def transport(server, **kwargs):
     kwargs.setdefault("max_retries", 3)
+    kwargs.setdefault("base_delay_ms", 10)
+    kwargs.setdefault("max_delay_ms", 20)
     return Transport(f"http://127.0.0.1:{server.server_port}", **kwargs)
 
 
@@ -205,23 +205,32 @@ def test_idle_connections_expire(server, monkeypatch):
 def test_timeout_applies_to_a_reused_connection(server):
     transport(server, timeout=60).request("GET", "v1/x")  # pools the connection
     server.delay = 1.0
-    t = transport(server, timeout=0.2)
+    t = transport(server, timeout=0.2, max_retries=1)
     started = time.monotonic()
-    with pytest.raises(TimeoutError):
+    with pytest.raises(KoshaRequestError) as info:
         t.request("POST", SEARCH, {})
+    assert info.value.status_code == 0
+    assert isinstance(info.value.__cause__, TimeoutError)
     assert time.monotonic() - started < 0.9
     assert server.accepts == 1
 
 
-def test_a_response_timeout_raises_as_with_urlopen(server):
-    # urlopen raised the socket timeout itself when the response did not
-    # come in time, and nothing retried it; a slow search is not resent.
+def test_a_response_timeout_follows_the_shared_retry_policy(server):
+    # A timeout after the request was sent is retried only for idempotent
+    # operations (clients/conformance/RETRY.md): a search is resent, a
+    # namespace create is not.
     server.delay = 0.5
-    t = transport(server, timeout=0.1, max_retries=3)
-    with pytest.raises(TimeoutError):
+    t = transport(server, timeout=0.1, max_retries=2)
+    with pytest.raises(KoshaRequestError) as info:
         t.request("POST", SEARCH, {})
-    time.sleep(0.5)
-    assert server.requests == 1
+    assert info.value.attempts == 2
+    time.sleep(0.6)
+    assert server.requests == 2
+    with pytest.raises(KoshaRequestError) as info:
+        t.request("POST", "v1/namespaces", {"name": "ns"})
+    assert info.value.attempts == 1
+    time.sleep(0.6)
+    assert server.requests == 3
 
 
 def test_a_refused_connection_is_retried_as_before(monkeypatch):
@@ -229,7 +238,7 @@ def test_a_refused_connection_is_retried_as_before(monkeypatch):
     with pytest.raises(KoshaRequestError) as info:
         t.request("POST", SEARCH, {})
     assert info.value.status_code == 0
-    assert "after 2 retries" in str(info.value)
+    assert info.value.attempts == 2
 
 
 def test_old_connections_are_retired(server, monkeypatch):
