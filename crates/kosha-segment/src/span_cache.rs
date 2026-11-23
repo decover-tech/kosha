@@ -221,6 +221,140 @@ pub fn read_local_range_reusing(
         .or_else(read_whole)
 }
 
+/// Fill `buf` from `file` at `offset`, without moving a shared cursor.
+/// `false` when the file is shorter than that (or the read fails).
+#[cfg(unix)]
+fn read_exact_at(file: &fs::File, buf: &mut [u8], offset: u64) -> bool {
+    std::os::unix::fs::FileExt::read_exact_at(file, buf, offset).is_ok()
+}
+
+#[cfg(not(unix))]
+fn read_exact_at(mut file: &fs::File, buf: &mut [u8], offset: u64) -> bool {
+    file.seek(SeekFrom::Start(offset)).is_ok() && file.read_exact(buf).is_ok()
+}
+
+/// [`read_local_range_reusing`] for a caller that reads many ranges of one
+/// file back to back and wants neither a `stat` + `open` + `seek` nor a
+/// fresh buffer per range (#435: a warm kNN probe reads ~30 postings of a
+/// segment's `vector.idx`, and that bookkeeping cost about as much as the
+/// bytes).
+///
+/// The whole file is opened at most once and read with positional reads;
+/// a span file's handle is kept for as long as consecutive ranges fall in
+/// the same span; every range lands in one buffer owned by the reader.
+/// The sources and their order are those of [`read_local_range_reusing`]:
+///
+/// 1. the whole file, when it holds at least `complete_len` bytes;
+/// 2. the span cache, through a listing kept between reads and rebuilt
+///    once when it does not serve a range (a span fetched or evicted since
+///    the listing was taken);
+/// 3. the whole file again, reopened: a background promotion can land the
+///    file and drop the spans between the two looks.
+///
+/// A handle that is already open keeps serving a file or span that is
+/// unlinked meanwhile: those bytes are still the bytes of the range. Use
+/// one reader for one `segment_dir` and `file`, and drop it when the run
+/// of reads ends.
+#[derive(Debug)]
+pub struct LocalRangeReader {
+    whole_path: PathBuf,
+    segment_dir: PathBuf,
+    file: String,
+    /// The whole file and its length when it was opened.
+    whole: Option<(fs::File, u64)>,
+    whole_tried: bool,
+    spans: Option<SpanIndex>,
+    /// The span file the last span read came from.
+    span_file: Option<((u64, u64), fs::File)>,
+    buf: Vec<u8>,
+}
+
+impl LocalRangeReader {
+    pub fn new(segment_dir: &Path, file: &str) -> Self {
+        Self {
+            whole_path: segment_dir.join(file),
+            segment_dir: segment_dir.to_path_buf(),
+            file: file.to_string(),
+            whole: None,
+            whole_tried: false,
+            spans: None,
+            span_file: None,
+            buf: Vec::new(),
+        }
+    }
+
+    /// The bytes `[start, start + len)` of the file, valid until the next
+    /// read. `None` when neither the whole file nor a cached span holds the
+    /// range; never a short or zero-filled slice.
+    pub fn read(&mut self, complete_len: u64, start: u64, len: u64) -> Option<&[u8]> {
+        let n = usize::try_from(len).ok()?;
+        if n == 0 {
+            return Some(&[]);
+        }
+        let end = start.checked_add(len)?;
+        if self.buf.len() < n {
+            self.buf.resize(n, 0);
+        }
+        let found = self.read_whole(complete_len, start, n, false)
+            || self.read_span(start, end, n)
+            || self.read_whole(complete_len, start, n, true);
+        found.then(|| &self.buf[..n])
+    }
+
+    fn read_whole(&mut self, complete_len: u64, start: u64, n: usize, reopen: bool) -> bool {
+        if reopen || !self.whole_tried {
+            self.whole_tried = true;
+            self.whole = fs::File::open(&self.whole_path).ok().and_then(|file| {
+                let len = file.metadata().ok().filter(|m| m.is_file())?.len();
+                Some((file, len))
+            });
+        }
+        let Some((file, file_len)) = &self.whole else {
+            return false;
+        };
+        // A short (truncated) whole file is not trusted for this range.
+        if *file_len == 0 || *file_len < complete_len {
+            return false;
+        }
+        read_exact_at(file, &mut self.buf[..n], start)
+    }
+
+    fn read_span(&mut self, start: u64, end: u64, n: usize) -> bool {
+        if self.spans.is_some() && self.read_listed_span(start, end, n) {
+            return true;
+        }
+        self.spans = Some(SpanIndex::load(&self.segment_dir, &self.file));
+        self.span_file = None;
+        self.read_listed_span(start, end, n)
+    }
+
+    fn read_listed_span(&mut self, start: u64, end: u64, n: usize) -> bool {
+        let Some(spans) = &self.spans else {
+            return false;
+        };
+        let Some(span) = spans.covering(start, end) else {
+            return false;
+        };
+        if self
+            .span_file
+            .as_ref()
+            .is_none_or(|(open, _)| *open != span)
+        {
+            self.span_file = fs::File::open(spans.dir.join(span_file_name(span.0, span.1)))
+                .ok()
+                .map(|file| (span, file));
+        }
+        let Some((_, file)) = &self.span_file else {
+            return false;
+        };
+        if read_exact_at(file, &mut self.buf[..n], start - span.0) {
+            return true;
+        }
+        self.span_file = None;
+        false
+    }
+}
+
 /// Merge `[start, end)` ranges whose gap is at most `max_gap` bytes into
 /// one fetch each — reading a little dead space between two documents is
 /// cheaper than a second round trip. Input order does not matter; empty
@@ -332,6 +466,79 @@ mod tests {
         fs::remove_file(spans_dir(&seg, "vector.idx").join(span_file_name(0, 4))).unwrap();
         assert_eq!(read(0, &mut spans), None);
         assert_eq!(read(10, &mut spans).as_deref(), Some(&b"BBBB"[..]));
+        let _ = fs::remove_dir_all(&seg);
+    }
+
+    #[test]
+    fn range_reader_serves_whole_file_then_spans_and_reuses_its_buffer() {
+        let seg = tmp("reader-whole");
+        let bytes: Vec<u8> = (0..=255u8).collect();
+        fs::write(seg.join("vector.idx"), &bytes).unwrap();
+        let mut reader = LocalRangeReader::new(&seg, "vector.idx");
+        assert_eq!(reader.read(256, 10, 4), Some(&bytes[10..14]));
+        // A shorter read after a longer one returns exactly its range.
+        assert_eq!(reader.read(256, 0, 200), Some(&bytes[..200]));
+        assert_eq!(reader.read(256, 250, 2), Some(&bytes[250..252]));
+        assert_eq!(reader.read(256, 5, 0), Some(&[][..]));
+        // Past the end of the file: a miss, never zero-filled bytes.
+        assert_eq!(reader.read(256, 250, 10), None);
+        // A whole file shorter than the caller says is complete is not
+        // trusted, and there is no span to fall back to.
+        assert_eq!(reader.read(1000, 10, 4), None);
+        // The open handle keeps serving after the file is unlinked.
+        fs::remove_file(seg.join("vector.idx")).unwrap();
+        assert_eq!(reader.read(256, 100, 8), Some(&bytes[100..108]));
+        let _ = fs::remove_dir_all(&seg);
+    }
+
+    #[test]
+    fn range_reader_follows_spans_added_evicted_and_promoted_mid_run() {
+        let seg = tmp("reader-spans");
+        put(&seg, "vector.idx", 0, b"AAAA");
+        put(&seg, "vector.idx", 100, b"CCCCDDDD");
+        let mut reader = LocalRangeReader::new(&seg, "vector.idx");
+        assert_eq!(reader.read(4, 0, 4), Some(&b"AAAA"[..]));
+        // Two ranges of one span, then back to another span.
+        assert_eq!(reader.read(104, 100, 4), Some(&b"CCCC"[..]));
+        assert_eq!(reader.read(108, 104, 4), Some(&b"DDDD"[..]));
+        assert_eq!(reader.read(4, 1, 2), Some(&b"AA"[..]));
+        // Fetched after the listing was taken: one rebuild finds it.
+        put(&seg, "vector.idx", 10, b"BBBB");
+        assert_eq!(reader.read(14, 10, 4), Some(&b"BBBB"[..]));
+        // A range no source holds is a miss.
+        assert_eq!(reader.read(54, 50, 4), None);
+        // Evicted after the listing: a miss once its handle is gone (a
+        // reader that still holds the handle may keep serving the bytes).
+        fs::remove_file(spans_dir(&seg, "vector.idx").join(span_file_name(0, 4))).unwrap();
+        assert_eq!(reader.read(14, 10, 4), Some(&b"BBBB"[..]));
+        assert_eq!(reader.read(4, 0, 4), None);
+        // Promoted mid-run: the whole file lands and the spans are dropped.
+        let mut whole = vec![b'w'; 108];
+        whole[..4].copy_from_slice(b"WXYZ");
+        fs::write(seg.join("vector.idx"), &whole).unwrap();
+        fs::remove_dir_all(spans_dir(&seg, "vector.idx")).unwrap();
+        assert_eq!(reader.read(4, 0, 4), Some(&b"WXYZ"[..]));
+        assert_eq!(reader.read(54, 50, 4), Some(&b"wwww"[..]));
+        let _ = fs::remove_dir_all(&seg);
+    }
+
+    #[test]
+    fn range_reader_agrees_with_read_local_range() {
+        let seg = tmp("reader-agree");
+        let bytes: Vec<u8> = (0..200u32).map(|i| (i * 7 % 251) as u8).collect();
+        put(&seg, "f.bin", 20, &bytes[20..90]);
+        put(&seg, "f.bin", 80, &bytes[80..160]);
+        let mut reader = LocalRangeReader::new(&seg, "f.bin");
+        for start in (0..200u64).step_by(7) {
+            for len in [0u64, 1, 9, 40, 90] {
+                let expect = read_local_range(&seg, "f.bin", start + len, start, len);
+                assert_eq!(
+                    reader.read(start + len, start, len).map(<[u8]>::to_vec),
+                    expect,
+                    "[{start}, +{len})"
+                );
+            }
+        }
         let _ = fs::remove_dir_all(&seg);
     }
 }

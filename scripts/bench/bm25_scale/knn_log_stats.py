@@ -26,8 +26,14 @@ import sys
 
 DEFAULT_KEYS = [
     "total_ms",
+    "score_ms",
     "knn_plan_ms",
+    "knn_read_ms",
+    "knn_decode_ms",
+    "knn_dot_ms",
+    "knn_rank_ms",
     "knn_postings",
+    "knn_postings_cached",
     "knn_segments",
     "knn_centroids",
     "opens_cold",
