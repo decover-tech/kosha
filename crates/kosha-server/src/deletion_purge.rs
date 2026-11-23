@@ -118,6 +118,11 @@ pub(crate) fn pod_id() -> &'static str {
     })
 }
 
+/// A subject's records in one pass: its scope, the highest retired
+/// version, the tenant records whose reclaim is not done, and the records
+/// waiting for this pod's acknowledgement.
+type FreshSubject = (DeletionScope, Option<u64>, Vec<String>, Vec<String>);
+
 /// The order subjects are swept in: namespaces and branches before the
 /// tenants they belong to.
 fn scope_order(scope: DeletionScope) -> u8 {
@@ -573,10 +578,7 @@ impl AppState {
         // Several records can name one subject (deleted, re-created,
         // deleted again): one sweep covers them, against the highest
         // retired version.
-        let mut subjects: BTreeMap<
-            (u8, String),
-            (DeletionScope, Option<u64>, Vec<String>, Vec<String>),
-        > = BTreeMap::new();
+        let mut subjects: BTreeMap<(u8, String), FreshSubject> = BTreeMap::new();
         for record in &fresh {
             let (scope, floor, pending, unacked) = subjects
                 .entry((scope_order(record.scope), record.subject.clone()))

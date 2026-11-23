@@ -948,10 +948,10 @@ impl AppState {
 
     fn export_has_remote_store(&self) -> bool {
         #[cfg(feature = "s3")]
-        if self.s3_storage.is_some() {
-            return true;
-        }
-        false
+        let remote = self.s3_storage.is_some();
+        #[cfg(not(feature = "s3"))]
+        let remote = false;
+        remote
     }
 
     /// Refresh this pod's claim; `Err(Stop::Lost)` once the export is gone

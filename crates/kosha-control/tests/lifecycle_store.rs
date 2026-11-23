@@ -157,7 +157,12 @@ fn exercise(store: &mut dyn ControlStore, tag: &str) {
         ..ExportFilter::default()
     };
     assert_eq!(store.exports(&of_ns).unwrap().len(), 1);
-    assert_eq!(store.delete_exports(&[export.id.clone()]).unwrap(), 1);
+    assert_eq!(
+        store
+            .delete_exports(std::slice::from_ref(&export.id))
+            .unwrap(),
+        1
+    );
     assert!(store.export(&export.id).unwrap().is_none());
 }
 
