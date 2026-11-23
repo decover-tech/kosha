@@ -623,6 +623,7 @@ struct HydrationOutcome {
     /// one request.
     shed: bool,
     /// Why `shed` is set, for the 429's log line.
+    #[cfg(feature = "s3")]
     shed_reason: Option<String>,
     /// Bytes the page's documents pulled from S3 after scoring (#245):
     /// ranged spans or whole files. Filled in after the search runs.
@@ -640,6 +641,7 @@ struct HydrationOutcome {
     vectors: posting_spans::PostingFetchStats,
 }
 
+#[cfg(feature = "s3")]
 impl HydrationOutcome {
     /// Mark the outcome shed (never unmark) if `request` was, with why.
     fn set_shed(&mut self, request: &RequestHydration) {
@@ -8614,6 +8616,17 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
             );
             state.record_search_access(&ns, manifest, search_query, &phases, &hydration);
             state.record_cache_reads(&ns, manifest, search_query, &phases, cache_read_at);
+            #[cfg(feature = "s3")]
+            let shed = hydration_request
+                .is_shed()
+                .then(|| hydration_request.shed_reason());
+            #[cfg(not(feature = "s3"))]
+            let shed = None;
+            if let Some(response) =
+                knn_shed_response(result.knn_degraded_segments.unwrap_or(0), shed)
+            {
+                return response;
+            }
             // Before a rerank replaces `result`.
             let knn_degraded = result.knn_degraded_segments.unwrap_or(0);
             if let Some(ref provider) = reranker {
@@ -9204,6 +9217,17 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
             );
             state.record_search_access(&ns, manifest, &query, &phases, &hydration);
             state.record_cache_reads(&ns, manifest, &query, &phases, cache_read_at);
+            #[cfg(feature = "s3")]
+            let shed = hydration_request
+                .is_shed()
+                .then(|| hydration_request.shed_reason());
+            #[cfg(not(feature = "s3"))]
+            let shed = None;
+            if let Some(response) =
+                knn_shed_response(result.knn_degraded_segments.unwrap_or(0), shed)
+            {
+                return response;
+            }
             json_ok(&result)
         }
         Err(e) => {
@@ -10998,13 +11022,26 @@ fn hydration_error_response(outcome: &HydrationOutcome) -> Option<String> {
 /// its ceiling *after* scoring — at which point the missing doc store
 /// surfaces as an IO error. Reporting that as a 500 would call a deliberate
 /// admission decision a server bug.
-#[cfg(feature = "s3")]
 fn hydration_shed_response() -> String {
     overload_shed_response(
         "search_hydration_limit",
         "search overloaded: this query needs more segment data than one request \
          may hydrate — the namespace is still warming, retry with backoff",
     )
+}
+
+/// A kNN answer that skipped segments because the request was shed (its
+/// vector postings were never fetched) is a 429, like any other shed: a 200
+/// would serve the partial page as complete, and neither the backend nor the
+/// Python client reads `knn_degraded_segments`. Other skips (a segment of
+/// another embedding model) stay a 200 that reports them.
+fn knn_shed_response(degraded: u32, shed: Option<String>) -> Option<String> {
+    let reason = shed.filter(|_| degraded > 0)?;
+    eprintln!(
+        "WARN: search shed: kNN skipped {degraded} segment(s): {reason}{}",
+        request_id()
+    );
+    Some(hydration_shed_response())
 }
 
 /// Error message for a search that can't proceed because hydrating one or
@@ -15916,6 +15953,16 @@ mod tests {
             hydration_error_response(&HydrationOutcome::default()).is_none(),
             "a clean hydration proceeds"
         );
+    }
+
+    /// A kNN page that skipped a segment because the request was shed is a
+    /// 429; a skip without a shed stays a 200.
+    #[test]
+    fn knn_answer_skipping_a_segment_after_a_shed_is_a_429() {
+        assert!(knn_shed_response(0, Some("x".into())).is_none());
+        assert!(knn_shed_response(2, None).is_none());
+        let shed = knn_shed_response(1, Some("waited".into())).unwrap();
+        assert!(shed.starts_with("HTTP/1.1 429"), "{shed}");
     }
 
     #[cfg(feature = "s3")]
