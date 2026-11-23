@@ -147,9 +147,30 @@ impl WarmStorage for AppState {
     fn class_sizes(&self, ns: &NamespaceId) -> Result<HashMap<(String, FileClass), u64>, String> {
         #[cfg(feature = "s3")]
         if let Some(ref s3) = self.s3_storage {
+            // A `doc_vectors.bin` that warming leaves remote (f32 columns,
+            // see `kosha_segment::doc_vectors_kept_whole`) is no part of
+            // the bytes it plans for. Kept when the manifest has no footer
+            // to tell: over-counting only warms less.
+            let manifest = self.indexer.manifest_shared(ns);
+            let remote_sidecar = |relative: &str| {
+                let Some((segment, kosha_segment::DOC_VECTORS_FILE)) = relative.split_once('/')
+                else {
+                    return false;
+                };
+                manifest
+                    .as_ref()
+                    .and_then(|m| m.segment_footer(&kosha_core::SegmentId(segment.to_string())))
+                    .is_some_and(|footer| !kosha_segment::doc_vectors_kept_whole(footer))
+            };
             return s3
                 .list_namespace_objects(&ns.0)
-                .map(group_class_sizes)
+                .map(|objects| {
+                    group_class_sizes(
+                        objects
+                            .into_iter()
+                            .filter(|(relative, _)| !remote_sidecar(relative)),
+                    )
+                })
                 .map_err(|e| format!("S3 size listing for '{}' failed: {e}", ns.0));
         }
         Ok(local_class_sizes(&self.data_dir.join(&ns.0)))
@@ -326,14 +347,17 @@ impl AppState {
             FileClass::DocStore => {
                 let (files, bytes) = {
                     let _permit = self.hydration_semaphore.acquire("warm_doc_store");
-                    self.ensure_doc_store_local(&seg_paths, &request)
+                    // `doc_vectors.bin` only where readers need it whole
+                    // (quantized columns); f32 sidecars are read by range.
+                    self.ensure_doc_store_local(
+                        &seg_paths,
+                        &request,
+                        kosha_segment::segment_keeps_doc_vectors_whole,
+                    )
                 };
                 let mut missing = 0;
                 for seg in &seg_paths {
-                    let landed = file_present_nonempty(&seg.join(kosha_segment::DOC_STORE_FILE))
-                        && (!kosha_segment::segment_uses_doc_vectors(seg)
-                            || file_present_nonempty(&seg.join(kosha_segment::DOC_VECTORS_FILE)));
-                    if landed {
+                    if crate::doc_store_promotion_landed(seg) {
                         self.span_hydrator.finish_promotion(&self.cache, seg, true);
                     } else {
                         missing += 1;

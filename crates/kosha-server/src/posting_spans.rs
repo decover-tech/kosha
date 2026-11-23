@@ -331,6 +331,12 @@ impl PostingSpanHydrator {
     }
 }
 
+/// Most bytes one coalesced GET of [`fetch_file_spans`] asks for: a
+/// whole-object download's part size (`s3_storage::DOWNLOAD_PART_BYTES`).
+pub(crate) const MAX_RANGE_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(feature = "s3")]
+const _: () = assert!(MAX_RANGE_BYTES == crate::s3_storage::DOWNLOAD_PART_BYTES);
+
 /// Fetch `ranges` (`[start, end)`, any order) of `{segment_dir}/{file}`
 /// into the span cache in one batch of coalesced ranged GETs, skipping what
 /// is already cached. Used for kNN postings of `vector.idx`, whose offsets
@@ -353,7 +359,11 @@ pub fn fetch_file_spans(
         .copied()
         .filter(|&(s, e)| !have.covers(s, e))
         .collect();
-    let merged = span_cache::coalesce(need, coalesce_gap);
+    // Bounded like a whole-object download's parts: an exact kNN can ask
+    // for every vector posting of a column, or every candidate vector of a
+    // one-matter segment (~2 GB on staging), and as one coalesced range
+    // that was a single GET held in memory whole.
+    let merged = span_cache::coalesce_capped(need, coalesce_gap, MAX_RANGE_BYTES);
     if merged.is_empty() {
         return out;
     }

@@ -359,13 +359,29 @@ impl LocalRangeReader {
 /// one fetch each — reading a little dead space between two documents is
 /// cheaper than a second round trip. Input order does not matter; empty
 /// ranges are dropped.
-pub fn coalesce(mut ranges: Vec<(u64, u64)>, max_gap: u64) -> Vec<(u64, u64)> {
+pub fn coalesce(ranges: Vec<(u64, u64)>, max_gap: u64) -> Vec<(u64, u64)> {
+    coalesce_capped(ranges, max_gap, u64::MAX)
+}
+
+/// [`coalesce`] that stops growing a merged range once it would pass
+/// `max_len` bytes, so a dense set of ranges (every vector posting of a
+/// column, every candidate vector of a one-matter segment) becomes many
+/// bounded GETs — fetched concurrently, each holding the in-flight budget
+/// for its own bytes — instead of one GET the size of the file, held in
+/// memory whole. An input range is never split (a reader needs each one
+/// inside a single cached span), so one larger than `max_len` is fetched
+/// as it is.
+pub fn coalesce_capped(mut ranges: Vec<(u64, u64)>, max_gap: u64, max_len: u64) -> Vec<(u64, u64)> {
     ranges.retain(|(s, e)| e > s);
     ranges.sort_unstable();
     let mut out: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
     for (s, e) in ranges {
         match out.last_mut() {
-            Some(last) if s <= last.1.saturating_add(max_gap) => last.1 = last.1.max(e),
+            Some(last)
+                if s <= last.1.saturating_add(max_gap) && last.1.max(e) - last.0 <= max_len =>
+            {
+                last.1 = last.1.max(e)
+            }
             _ => out.push((s, e)),
         }
     }
@@ -407,6 +423,26 @@ mod tests {
         let merged = coalesce(vec![(100, 200), (0, 50), (230, 300), (10_000, 10_010)], 32);
         assert_eq!(merged, vec![(0, 50), (100, 300), (10_000, 10_010)]);
         assert_eq!(coalesce(vec![(0, 10), (5, 8), (9, 9)], 0), vec![(0, 10)]);
+    }
+
+    #[test]
+    fn coalesce_capped_bounds_merged_ranges_without_splitting_inputs() {
+        // Contiguous ranges merge up to the cap, then start a new range.
+        let dense: Vec<(u64, u64)> = (0..10).map(|i| (i * 10, i * 10 + 10)).collect();
+        assert_eq!(
+            coalesce_capped(dense.clone(), 0, 30),
+            vec![(0, 30), (30, 60), (60, 90), (90, 100)]
+        );
+        // No cap: the same as `coalesce`.
+        assert_eq!(
+            coalesce_capped(dense.clone(), 0, u64::MAX),
+            coalesce(dense, 0)
+        );
+        // An input larger than the cap is kept whole, never split.
+        assert_eq!(
+            coalesce_capped(vec![(0, 5), (5, 100), (100, 110)], 0, 20),
+            vec![(0, 5), (5, 100), (100, 110)]
+        );
     }
 
     #[test]

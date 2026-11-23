@@ -453,7 +453,11 @@ impl SpanHydrator {
                 out.whole_fallback.push(page.segment_dir.to_path_buf());
                 continue;
             }
-            if seg_gets[i] == 0 {
+            // Heat counts toward a promotion only while one would fetch
+            // something: an f32 segment whose `doc_store.bin` is already
+            // whole keeps reading its page vectors by range, and
+            // re-promoting it would fetch nothing and drop nothing.
+            if seg_gets[i] == 0 || !promotion_would_fetch(page.segment_dir, page.reader) {
                 continue;
             }
             let h = heat.entry(page.segment_dir.to_path_buf()).or_default();
@@ -488,10 +492,13 @@ impl SpanHydrator {
     }
 
     /// A background whole-file hydration for `segment_dir` finished. When
-    /// the whole files `landed`, its spans are redundant (the whole file
-    /// wins every read) and are dropped from disk and from the cache's
-    /// accounting. Either way the segment's heat resets, so a failed
-    /// promotion may be retried after another threshold's worth of reads.
+    /// the whole files `landed`, the spans of each file now whole are
+    /// redundant (the whole file wins every read) and are dropped from disk
+    /// and from the cache's accounting. A `doc_vectors.bin` kept remote
+    /// (f32 columns, see [`kosha_segment::doc_vectors_kept_whole`]) keeps
+    /// its spans: they are still how its vectors are read. Either way the
+    /// segment's heat resets, so a failed promotion may be retried after
+    /// another threshold's worth of reads.
     pub fn finish_promotion(&self, cache: &Cache, segment_dir: &Path, landed: bool) {
         self.promoting.lock().unwrap().remove(segment_dir);
         self.heat.lock().unwrap().remove(segment_dir);
@@ -502,12 +509,28 @@ impl SpanHydrator {
             return;
         };
         for file in [DOC_STORE_FILE, DOC_VECTORS_FILE] {
+            if !std::fs::metadata(segment_dir.join(file)).is_ok_and(|m| m.len() > 0) {
+                continue;
+            }
             let key = format!("{rel}/{file}{}", span_cache::SPANS_SUFFIX);
             if let Err(e) = cache.evict_dir_unless_pinned(&key) {
                 eprintln!("WARN: failed to drop span cache {key}: {e}");
             }
         }
     }
+}
+
+/// Whether promoting `segment_dir` would fetch anything: its
+/// `doc_store.bin` is not whole yet, or its `doc_vectors.bin` is kept whole
+/// ([`kosha_segment::doc_vectors_kept_whole`]) and is not local yet.
+fn promotion_would_fetch(segment_dir: &Path, reader: &kosha_segment::SegmentReader) -> bool {
+    let whole = |file: &str, len: Option<u64>| {
+        std::fs::metadata(segment_dir.join(file))
+            .is_ok_and(|m| m.len() > 0 && len.is_none_or(|len| m.len() >= len))
+    };
+    !whole(DOC_STORE_FILE, reader.doc_store_len())
+        || (kosha_segment::doc_vectors_kept_whole(reader.footer())
+            && !whole(DOC_VECTORS_FILE, None))
 }
 
 /// Write one fetched range `[start, start + bytes.len())` of

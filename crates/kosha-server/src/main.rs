@@ -841,13 +841,15 @@ impl HydrationVerdict {
 /// vector (seconds on a large segment). A legacy segment that stores its
 /// vectors in `doc_vectors.bin` also needs that file's header, whose field
 /// table binds its unnamed index — the whole file or just the header span
-/// in the span cache.
+/// in the span cache — and so does a `filtered` kNN on a column whose
+/// vectors are there (see [`knn_wants_doc_vectors_header`]).
 #[cfg(feature = "s3")]
 fn knn_files_complete(
     seg_path: &Path,
     footer: Option<&kosha_core::Footer>,
     field: &str,
     vectors_ranged: bool,
+    filtered: bool,
 ) -> bool {
     for column in kosha_segment::knn_vector_columns(footer, field) {
         let offsets_local = column
@@ -868,7 +870,39 @@ fn knn_files_complete(
             return false;
         }
     }
-    !knn_wants_doc_vectors_header(footer, field) || doc_spans::doc_vectors_header_local(seg_path)
+    !knn_wants_doc_vectors_header(footer, field, filtered)
+        || doc_spans::doc_vectors_header_local(seg_path)
+}
+
+/// [`doc_vectors_promotion`] for a segment whose `doc_vectors.bin` is
+/// promoted whole with its doc store.
+#[cfg(feature = "s3")]
+const DOC_VECTORS_PROMOTED: &str = "whole(quantized column)";
+
+/// What a doc-store promotion or warm-up does with `seg`'s
+/// `doc_vectors.bin`, for its log lines: fetched whole
+/// ([`DOC_VECTORS_PROMOTED`]), left to ranged reads (f32 columns, see
+/// [`kosha_segment::doc_vectors_kept_whole`]), or nothing to do.
+#[cfg(feature = "s3")]
+fn doc_vectors_promotion(seg: &Path) -> &'static str {
+    if kosha_segment::segment_keeps_doc_vectors_whole(seg) {
+        DOC_VECTORS_PROMOTED
+    } else if kosha_segment::segment_uses_doc_vectors(seg) {
+        "ranged(f32 columns)"
+    } else {
+        "none"
+    }
+}
+
+/// Whether a doc-store promotion or warm-up of `seg` has everything it
+/// fetches local: `doc_store.bin`, and `doc_vectors.bin` where it is kept
+/// whole. A segment whose sidecar stays remote counts as landed without
+/// it — otherwise it would read as a failed promotion forever.
+#[cfg(feature = "s3")]
+fn doc_store_promotion_landed(seg: &Path) -> bool {
+    file_present_nonempty(&seg.join(kosha_segment::DOC_STORE_FILE))
+        && (!kosha_segment::segment_keeps_doc_vectors_whole(seg)
+            || file_present_nonempty(&seg.join(kosha_segment::DOC_VECTORS_FILE)))
 }
 
 /// `KOSHA_KNN_GLOBAL_RESCORE` (#381), read once for the hydration
@@ -880,16 +914,29 @@ fn knn_global_rescore_on() -> bool {
 }
 
 /// Whether a kNN on `field` needs `doc_vectors.bin`'s header local in a
-/// segment with this footer: a legacy segment's always (its field table
-/// binds the unnamed index), and, with global rescoring on (#381), a
-/// quantized column's, because the pass reads exact vectors by range and
-/// a range needs the header to locate it. Fetching it here, with the
-/// scoring files, makes it part of a fully cached query, rather than
-/// depending on whether an earlier query happened to put this segment on
-/// a page. Off by default: the predicate is then exactly the legacy one.
+/// segment with this footer:
+///
+/// * a legacy segment's always (its field table binds the unnamed index);
+/// * a `filtered` kNN's, when `field`'s column keeps its vectors there:
+///   exact filtered kNN (#252) scores every candidate's vector from the
+///   sidecar, and with the file not whole (f32 sidecars are never
+///   promoted, see [`kosha_segment::doc_vectors_kept_whole`]) it reads
+///   just the candidates' ranges — which the header locates. Without it
+///   the exact path falls back to scanning every vector posting of the
+///   column. ~12 bytes per stored vector (~0.4% of a 768-dim f32 file);
+/// * with global rescoring on (#381), a quantized column's, because the
+///   pass reads exact vectors by range.
+///
+/// Fetching it here, with the scoring files, makes it part of a fully
+/// cached query, rather than depending on whether an earlier query
+/// happened to put this segment on a page.
 #[cfg(feature = "s3")]
-fn knn_wants_doc_vectors_header(footer: Option<&kosha_core::Footer>, field: &str) -> bool {
-    knn_wants_doc_vectors_header_with(footer, field, knn_global_rescore_on())
+fn knn_wants_doc_vectors_header(
+    footer: Option<&kosha_core::Footer>,
+    field: &str,
+    filtered: bool,
+) -> bool {
+    knn_wants_doc_vectors_header_with(footer, field, filtered, knn_global_rescore_on())
 }
 
 /// [`knn_wants_doc_vectors_header`] with the flag passed in, for tests.
@@ -897,28 +944,36 @@ fn knn_wants_doc_vectors_header(footer: Option<&kosha_core::Footer>, field: &str
 fn knn_wants_doc_vectors_header_with(
     footer: Option<&kosha_core::Footer>,
     field: &str,
+    filtered: bool,
     global_rescore: bool,
 ) -> bool {
     kosha_segment::knn_needs_doc_vectors(footer)
-        || (global_rescore
-            && footer.is_some_and(|f| {
-                f.doc_vectors
-                    && f.vector_fields.as_ref().is_some_and(|cols| {
-                        cols.iter()
-                            .any(|c| c.name == field && !c.quantization.is_f32())
+        || footer.is_some_and(|f| {
+            f.doc_vectors
+                && f.vector_fields.as_ref().is_some_and(|cols| {
+                    cols.iter().any(|c| {
+                        c.name == field
+                            && (filtered || (global_rescore && !c.quantization.is_f32()))
                     })
-            }))
+                })
+        })
 }
 
 /// The vector key a query's [`HydrationVerdict`] records and checks: its
 /// `knn.field` for a single-vector kNN (#204), and a key of its own for a
 /// late-interaction kNN (#205), whose pass hydrates the field's multivec
-/// files rather than its single-vector column. `None` without kNN.
+/// files rather than its single-vector column, and one for a kNN that
+/// reads filter columns, whose pass also hydrates the column's
+/// `doc_vectors.bin` header (see [`knn_wants_doc_vectors_header`]): an
+/// unfiltered pass's verdict must not let a filtered kNN skip that.
+/// `None` without kNN.
 #[cfg_attr(not(feature = "s3"), allow(dead_code))]
 fn knn_verdict_key(query: &SearchQuery) -> Option<String> {
     query.knn.as_ref().map(|knn| {
         if knn.is_late_interaction() {
             format!("late_interaction:{}", knn.field)
+        } else if query.needs_filter_columns() {
+            format!("filtered:{}", knn.field)
         } else {
             knn.field.clone()
         }
@@ -3555,21 +3610,26 @@ impl AppState {
     #[cfg(feature = "s3")]
     /// Returns `(files_fetched, bytes_fetched)` — already-local files cost
     /// nothing and aren't counted.
-    /// Fetch what materializing documents from these segments needs:
-    /// `doc_store.bin`, plus `doc_vectors.bin` for segments whose footer
-    /// says vectors were moved there (#243). Only those segments are asked
-    /// for the sidecar, so older segments never trigger a GET for a file
-    /// they don't have.
+    /// Fetch whole `doc_store.bin` for these segments, plus
+    /// `doc_vectors.bin` for those `with_vectors` picks: segments whose
+    /// footer says vectors were moved there (#243) when the page itself is
+    /// being materialized from whole files
+    /// ([`kosha_segment::segment_uses_doc_vectors`]), and only those whose
+    /// readers need it whole for promotion and warm-up
+    /// ([`kosha_segment::segment_keeps_doc_vectors_whole`]). Only those
+    /// segments are asked for the sidecar, so others never trigger a GET
+    /// for it.
     #[cfg(feature = "s3")]
     fn ensure_doc_store_local(
         &self,
         seg_paths: &[PathBuf],
         request: &Arc<RequestHydration>,
+        with_vectors: fn(&Path) -> bool,
     ) -> (usize, u64) {
         let (mut files, mut bytes) = self.ensure_files_local(seg_paths, "doc_store.bin", request);
         let with_sidecar: Vec<PathBuf> = seg_paths
             .iter()
-            .filter(|p| kosha_segment::segment_uses_doc_vectors(p))
+            .filter(|p| with_vectors(p))
             .cloned()
             .collect();
         if !with_sidecar.is_empty() {
@@ -3628,7 +3688,11 @@ impl AppState {
             }
         };
         if !whole.is_empty() {
-            let (files, bytes) = self.ensure_doc_store_local(&whole, request);
+            let (files, bytes) = self.ensure_doc_store_local(
+                &whole,
+                request,
+                kosha_segment::segment_uses_doc_vectors,
+            );
             stats.rounds += 1;
             stats.whole_files = files as u64;
             stats.whole_bytes = bytes;
@@ -3685,20 +3749,22 @@ impl AppState {
     /// operations; this thread is one operation at a time by construction,
     /// and its bytes are bounded by the background share.
     ///
-    /// `doc_vectors.bin` is still promoted whole: with it whole, an exact
-    /// filtered kNN scores candidates straight from it (without it, from
-    /// every vector posting of the column — as many bytes again, by range),
-    /// and the default per-segment path rescores a quantized column's
-    /// shortlist from it (without it, the estimates stand).
+    /// `doc_vectors.bin` comes along only for a segment with a quantized
+    /// vector column ([`kosha_segment::doc_vectors_kept_whole`]): the
+    /// default per-segment kNN path rescores that column's shortlist from
+    /// the whole file. Every other reader takes ranges (page vectors, exact
+    /// filtered kNN, global rescoring), so an f32 segment's sidecar — 2.0 of
+    /// a ~2.6 GB promotion on staging — stays remote.
     #[cfg(feature = "s3")]
     fn promote_doc_store(&self, seg: &Path) {
         let t = Instant::now();
         self.log_promotion_start(seg);
-        let (files, bytes) =
-            self.ensure_doc_store_local(&[seg.to_path_buf()], &RequestHydration::background());
-        let landed = file_present_nonempty(&seg.join(kosha_segment::DOC_STORE_FILE))
-            && (!kosha_segment::segment_uses_doc_vectors(seg)
-                || file_present_nonempty(&seg.join(kosha_segment::DOC_VECTORS_FILE)));
+        let (files, bytes) = self.ensure_doc_store_local(
+            &[seg.to_path_buf()],
+            &RequestHydration::background(),
+            kosha_segment::segment_keeps_doc_vectors_whole,
+        );
+        let landed = doc_store_promotion_landed(seg);
         self.span_hydrator
             .finish_promotion(&self.cache, seg, landed);
         if landed {
@@ -3710,8 +3776,10 @@ impl AppState {
             });
         }
         println!(
-            "doc store promote: seg={} landed={landed} fetched {files} file(s) ({:.1} MB) in {:.0} ms",
+            "doc store promote: seg={} landed={landed} doc_vectors={} fetched {files} file(s) \
+             ({:.1} MB) in {:.0} ms",
             seg.display(),
+            doc_vectors_promotion(seg),
             bytes as f64 / (1024.0 * 1024.0),
             t.elapsed().as_secs_f64() * 1e3,
         );
@@ -3728,7 +3796,8 @@ impl AppState {
             return;
         };
         let mut wanted = vec![kosha_segment::DOC_STORE_FILE];
-        if kosha_segment::segment_uses_doc_vectors(seg) {
+        let vectors = doc_vectors_promotion(seg);
+        if vectors == DOC_VECTORS_PROMOTED {
             wanted.push(kosha_segment::DOC_VECTORS_FILE);
         }
         wanted.retain(|f| !file_present_nonempty(&seg.join(f)));
@@ -3760,8 +3829,9 @@ impl AppState {
         let (gets, ranged) = self.span_hydrator.heat(seg).unwrap_or((0, 0));
         let cfg = self.span_hydrator.config();
         println!(
-            "doc store promote start: seg={} files={} total_mb={:.1} trigger: ranged_gets={gets} \
-             ranged_mb={:.1} (promote at gets>={} or mb>={:.1}) queued={}",
+            "doc store promote start: seg={} files={} total_mb={:.1} doc_vectors={vectors} \
+             trigger: ranged_gets={gets} ranged_mb={:.1} (promote at gets>={} or mb>={:.1}) \
+             queued={}",
             seg.display(),
             if files.is_empty() {
                 "-".to_string()
@@ -4469,7 +4539,13 @@ impl AppState {
                     local_footer.as_ref()
                 }
             };
-            if !knn_files_complete(seg_path, footer, field, vectors_ranged) {
+            if !knn_files_complete(
+                seg_path,
+                footer,
+                field,
+                vectors_ranged,
+                !filter_files.is_empty(),
+            ) {
                 return false;
             }
         }
@@ -4665,12 +4741,14 @@ impl AppState {
                             }
                         }
                     }
-                    // Only the header of a legacy `doc_vectors.bin` (its
-                    // field table binds the unnamed index), by range below:
-                    // the whole file is as large as the index itself. With
-                    // global rescoring on (#381), a quantized column's
-                    // header too (see `knn_wants_doc_vectors_header`).
-                    if knn_wants_doc_vectors_header(footer, field)
+                    // Only the header of `doc_vectors.bin`, by range below:
+                    // the whole file is as large as the index itself. A
+                    // legacy segment's (its field table binds the unnamed
+                    // index), a filtered kNN's (exact filtered kNN reads
+                    // its candidates' vectors by range), and with global
+                    // rescoring on (#381) a quantized column's (see
+                    // `knn_wants_doc_vectors_header`).
+                    if knn_wants_doc_vectors_header(footer, field, !filters_of(seg_path).is_empty())
                         && !doc_spans::doc_vectors_header_local(seg_path)
                     {
                         doc_vector_headers.push((seg_path.as_path(), s3_prefix.clone()));
@@ -16099,13 +16177,14 @@ mod tests {
 
     /// #204: a kNN's scoring set holds only the queried column's files, as
     /// the segment's footer lists them.
-    /// Global kNN rescoring (#381) reads a quantized column's exact
-    /// vectors by range, so with the flag on its `doc_vectors.bin` header
-    /// joins the kNN scoring set; with it off (the default) and for f32
-    /// columns, the predicate is the legacy one.
+    /// Readers that take sidecar vectors by range need its header in the
+    /// kNN scoring set: global rescoring (#381) for a quantized column, and
+    /// exact filtered kNN for any column whose vectors are in the sidecar
+    /// (f32 sidecars are never fetched whole). An unfiltered kNN with the
+    /// flag off keeps the legacy predicate.
     #[cfg(feature = "s3")]
     #[test]
-    fn global_rescore_wants_the_doc_vectors_header_of_quantized_columns() {
+    fn knn_wants_the_doc_vectors_header_where_it_reads_ranges() {
         let footer = |quantization| {
             let dir = std::env::temp_dir().join(format!(
                 "kosha-test-dv-header-{quantization:?}-{}",
@@ -16131,11 +16210,65 @@ mod tests {
         };
         let i8 = footer(kosha_core::VectorQuantization::I8);
         let f32 = footer(kosha_core::VectorQuantization::F32);
-        assert!(!knn_wants_doc_vectors_header_with(Some(&i8), "emb", false));
-        assert!(knn_wants_doc_vectors_header_with(Some(&i8), "emb", true));
-        assert!(!knn_wants_doc_vectors_header_with(Some(&i8), "other", true));
-        assert!(!knn_wants_doc_vectors_header_with(Some(&f32), "emb", true));
-        assert!(!knn_wants_doc_vectors_header_with(None, "emb", false));
+        // Unfiltered: only global rescoring of a quantized column.
+        assert!(!knn_wants_doc_vectors_header_with(
+            Some(&i8),
+            "emb",
+            false,
+            false
+        ));
+        assert!(knn_wants_doc_vectors_header_with(
+            Some(&i8),
+            "emb",
+            false,
+            true
+        ));
+        assert!(!knn_wants_doc_vectors_header_with(
+            Some(&i8),
+            "other",
+            false,
+            true
+        ));
+        assert!(!knn_wants_doc_vectors_header_with(
+            Some(&f32),
+            "emb",
+            false,
+            true
+        ));
+        assert!(!knn_wants_doc_vectors_header_with(
+            None, "emb", false, false
+        ));
+        // Filtered: exact filtered kNN reads the candidates' sidecar vectors
+        // by range, for any quantization — but only of a column there.
+        assert!(knn_wants_doc_vectors_header_with(
+            Some(&f32),
+            "emb",
+            true,
+            false
+        ));
+        assert!(knn_wants_doc_vectors_header_with(
+            Some(&i8),
+            "emb",
+            true,
+            false
+        ));
+        assert!(!knn_wants_doc_vectors_header_with(
+            Some(&f32),
+            "other",
+            true,
+            false
+        ));
+        assert!(!knn_wants_doc_vectors_header_with(None, "emb", true, false));
+        let inline = kosha_core::Footer {
+            doc_vectors: false,
+            ..f32.clone()
+        };
+        assert!(!knn_wants_doc_vectors_header_with(
+            Some(&inline),
+            "emb",
+            true,
+            true
+        ));
     }
 
     #[cfg(feature = "s3")]
