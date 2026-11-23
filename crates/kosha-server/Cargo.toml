@@ -67,5 +67,7 @@ prometheus-client = "0.26"
 fail = "0.5"
 
 [dev-dependencies]
+# Paused clock for budget-wait tests (`hydration_budget`).
+tokio = { version = "1", features = ["test-util"] }
 # Self-signed certificates for the TLS smoke test (http.rs).
 rcgen = "=0.14.5"

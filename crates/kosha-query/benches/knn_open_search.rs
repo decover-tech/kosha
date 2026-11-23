@@ -319,7 +319,7 @@ fn main() {
     ];
     // `KOSHA_BENCH_QUERIES` > 1 rotates each warm shape through that many
     // distinct query vectors, so successive queries probe different
-    // postings and the per-segment decoded-posting cache (second-touch
+    // postings and the process-wide decoded-posting cache (second-touch
     // admission, `KOSHA_VECTOR_POSTINGS_CACHE_MAX_BYTES`) is mostly missed,
     // as it is under real traffic. The default repeats one vector.
     let distinct = env_usize("KOSHA_BENCH_QUERIES", 1).max(1);
