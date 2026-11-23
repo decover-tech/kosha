@@ -820,17 +820,29 @@ a query pod forwards a write to the ingest pod:
 |---|---|
 | `read` | search, exists, namespace stats, reading a schema, listing namespaces and branches, the tenant's own usage (`GET /v1/usage`) and billing state (`GET /v1/billing`) |
 | `write` | index, replace, delete documents, flush |
-| `admin` | create and delete namespaces and branches, change a namespace's schema or shards |
+| `admin` | create and delete namespaces and branches, change a namespace's schema or shards, manage the tenant's own keys (`/v1/api-keys`, below) |
 
 Scopes are independent (`admin` does not include `write`). A request outside a
 key's scopes or namespaces gets a `403` naming what is missing; an expired key
 gets `401` "API key expired". The `admin` scope is tenant-level: `/v1/admin/*`
-still needs an admin credential. Env keys (`KOSHA_API_KEY`, `KOSHA_API_KEYS`)
-and every key created before scopes existed have all three scopes, every
-namespace and no expiry, so they behave as before. A key restricted to
-namespaces cannot use the routes that answer for the whole tenant (listing all
-namespaces, `GET /v1/usage`, `GET /v1/billing`), and can only create a
-namespace or branch whose name is on its list.
+still needs an admin credential. Every key created before scopes existed has
+all three scopes, every namespace and no expiry, so it behaves as before. A key
+restricted to namespaces sees only those namespaces in `GET /v1/namespaces`,
+cannot use the routes that answer for the whole tenant (`GET /v1/usage`,
+`GET /v1/billing`), and can only create a namespace or branch whose name is on
+its list.
+
+Env keys can be narrowed the same way (#346). A `KOSHA_API_KEYS` entry takes
+`;`-separated attributes after its tenant:
+
+```
+KOSHA_API_KEYS="sk-app=acme,sk-ci=acme;scopes=read+write;namespaces=docs+wiki;expires_at=1798761600"
+```
+
+`scopes` and `namespaces` are `+`-separated, `expires_at` is unix seconds. An
+entry without attributes (`sk-app=acme`, and `KOSHA_API_KEY`) has every scope,
+every namespace and no expiry, exactly as before. A malformed attribute stops
+the server at startup with an error that names the entry, never the key.
 
 Manage keys with the admin credential (`kosha admin ...` wraps these):
 
@@ -840,13 +852,35 @@ Manage keys with the admin credential (`kosha admin ...` wraps these):
 | `GET /v1/admin/api-keys[?tenant_id=T]` | List keys that are not revoked: id, tenant, scopes, namespaces, `expires_at`, `last_used_at` (unix seconds). No secrets |
 | `POST /v1/admin/api-keys/revoke` | `{"key_id"}`. The pod that answers refuses the key at once, the others within `KOSHA_API_KEY_REFRESH_SECS` |
 | `POST /v1/admin/api-keys/rotate` | `{"key_id", "overlap_secs": 86400}`. Issues a replacement with the same tenant, scopes and namespaces; the old key keeps working for the overlap (default one day), so clients switch without downtime |
-| `POST /v1/admin/api-keys/scrub-plaintext` | Removes the plaintext that keys created before this feature still hold in the database |
-| `GET /v1/admin/api-keys/plaintext-count` | Read-only: `{"plaintext_rows": N, "scrub_due": true}`, the rows `scrub-plaintext` would rewrite. The server logs the same count at startup (`api keys: N row(s) still hold a plaintext key`) |
+| `POST /v1/admin/api-keys/scrub-plaintext` | Removes, now, the plaintext that keys created before this feature still hold in the database (the server also does it by itself; see **Upgrading** below) |
+| `GET /v1/admin/api-keys/plaintext-count` | Read-only: `{"plaintext_rows": N, "scrub_due": true}`, the rows `scrub-plaintext` would rewrite. The server logs the state at startup (`api keys: N row(s) still hold a plaintext key; the automatic scrub removes it at unix time T`) |
 
 Keys are stored as SHA-256 hashes; a key's `key_id` is that hash. Creating,
 rotating and revoking a key are recorded in the audit log, in the same
-transaction as the change; see [docs/organizations.md](docs/organizations.md#audit-log).
-`last_used_at` is written about once per refresh interval, not per request.
+transaction as the change, naming the admin credential that did it
+(`operator` or `operator:<name>`); see
+[docs/organizations.md](docs/organizations.md#audit-log). `last_used_at` is
+written about once per refresh interval, not per request.
+
+**A tenant managing its own keys.** A key with the `admin` scope can list,
+create, rotate and revoke its own tenant's registry keys without an operator
+(`kosha keys ...` wraps these; Postgres control plane only):
+
+| Route | Does |
+|---|---|
+| `GET /v1/api-keys` | The tenant's keys the calling key may manage, as in the admin listing, plus `current` for the calling key itself |
+| `POST /v1/api-keys` | `{"description", "scopes", "namespaces", "expires_in_secs"}`, all optional. Left out, the scopes, namespaces and expiry are the calling key's own. The key is in the response and is never shown again |
+| `POST /v1/api-keys/rotate` | `{"key_id", "overlap_secs", "expires_in_secs"}`, as the admin route |
+| `POST /v1/api-keys/revoke` | `{"key_id"}` |
+
+A key never grants more than it holds: what it creates has a subset of its
+scopes and namespaces and expires no later than it does (asking for more is a
+`403`), and it can see, rotate or revoke only keys of its own tenant that it
+could itself have created (any other `key_id` is a `404`). A rotation's
+replacement is bounded by the calling key's expiry too. Env keys are never
+listed or changed here. Every change is in the audit log with the calling key
+as the actor (`api_key:<first twelve characters of its id>`). The admin
+credential gets `403` on these routes; operators use `/v1/admin/api-keys`.
 
 ### Operator admin credentials
 
@@ -865,8 +899,18 @@ its detail carries `"via": "operator:<name>"`.
 |---|---|
 | `POST /v1/admin/operators` | Issue a credential: `{"name": "alice", "description", "expires_in_secs": 7776000}`. Only `name` is required (1 to 64 of letters, digits, `. _ - @ +`). The credential is in the response and is never shown again. `409` if that operator already holds a usable one: rotate it |
 | `GET /v1/admin/operators` | List credentials that are not revoked: id, name, `expires_at`, `last_used_at`. No secrets |
-| `POST /v1/admin/operators/revoke` | `{"key_id"}` revokes one credential, `{"name"}` every credential of that operator. The pod that answers refuses them at once, the others within `KOSHA_API_KEY_REFRESH_SECS` |
-| `POST /v1/admin/operators/rotate` | `{"key_id", "overlap_secs": 86400}`. Issues a replacement for the same operator; the old credential keeps working for the overlap (default one day) |
+| `POST /v1/admin/operators/revoke` | `{"key_id"}` revokes one credential, `{"name"}` every credential of that operator. The pod that answers refuses them at once, the others within `KOSHA_API_KEY_REFRESH_SECS` (a pod that cannot reload its keys for ten intervals refuses every operator credential until it can). `"force": true` overrides the lock-out guard |
+| `POST /v1/admin/operators/rotate` | `{"key_id", "overlap_secs": 86400}`. Issues a replacement for the same operator; the old credential keeps working for the overlap (default one day). `"force": true` overrides the lock-out guard |
+
+`kosha admin create-operator --name alice`, `list-operators`,
+`rotate-operator <key_id>`, `revoke-operator <key_id>` (or `--name alice`) and
+`api-key-plaintext-count` wrap these.
+
+Every other admin request that changes state (segment GC, compaction, imports
+and repairs, tenant deletion, billing and usage administration) is written to
+the audit log too, as `admin.*` with the method, path and response status and
+the credential that made it; see
+[docs/organizations.md](docs/organizations.md#audit-log).
 
 Operator credentials are stored in the key registry like tenant keys (hashed,
 same expiry, rotation and refresh), but the two never mix: an operator
@@ -899,23 +943,55 @@ whoever did it, in the same transaction as the change.
    works again. Rotate it afterwards if it was exposed.
 
 Leaving the variable unset keeps today's behaviour: the shared key and operator
-credentials both work. The server refuses to start on any other value. It does
-not stop you disabling the shared key while no operator credential is usable;
-it logs a warning at startup, and step 4 is the way back. During a rolling
+credentials both work. The server refuses to start on any other value.
+
+**Lock-out guard.** While the shared key is off (`KOSHA_ADMIN_BOOTSTRAP_KEY=disabled`,
+or `KOSHA_ADMIN_API_KEY` unset), the server refuses with `409` a revoke or
+rotate that would leave no usable operator credential, or that makes the last
+one lapse within a day (rotating it into a short-lived one, say). Nothing
+changes; issue another credential first. To do it anyway, repeat the request
+with `"force": true` (`--force` on the CLI), knowing that step 4 is then the
+way back in. Credentials that simply reach their expiry are not an API call
+the server can refuse, so with the shared key disabled it warns at startup and
+about hourly when none is usable or the last one expires within a week.
+During a rolling
 upgrade, pods still on a build without this feature refuse operator credentials
 (as an admin credential and as a tenant key), so issue them once every pod is
 upgraded. `/internal/*` and `KOSHA_INTERNAL_API_KEY` are unaffected.
 
 **Upgrading.** The migration (`003_scoped_api_keys.sql`, also applied by the
 server at startup) only adds columns and hashes existing keys; it leaves their
-plaintext in place, because pods still running the previous build read it. Roll
-every pod to the new build, then run `kosha admin scrub-plaintext-api-keys`
-once. Until every pod is upgraded, a key created through an upgraded pod is not
-accepted by the pods still on the old build. After the scrub the table holds no
-usable key, and a rollback to a build from
-before this feature would no longer accept Postgres keys (env keys are
-unaffected). The server's database role must own `kosha.api_keys`
-(`002_grant_kosha_role.sql`) or an admin must apply the migration first
+plaintext in place, because pods still running a build from before hashed keys
+read it. Until every pod is upgraded, a key created through an upgraded pod is
+not accepted by the pods still on the old build.
+
+The plaintext is then removed without an operator (`009_api_key_scrub.sql`,
+`KOSHA_API_KEY_AUTO_SCRUB`). Every server with Postgres runs a scrub round on
+each key refresh, and it rewrites the plaintext rows
+`KOSHA_API_KEY_SCRUB_GRACE_SECS` (default one day) after the database last
+showed a sign of an old build: the first start of a server with the automatic
+scrub (recorded by the server, so applying migrations ahead of a deploy starts
+no clock), or a key row only an old build inserts (one without a hash), which
+restarts the clock. One pod does it per round, and running it again changes
+nothing. The server logs the state at startup and when it changes. The upgrade
+path:
+
+1. Roll out the new build as usual. Old and new pods both accept every key.
+2. Nothing else. A day after the first new pod started (or after the last old
+   pod created a key), the plaintext is gone; the startup line says
+   `api keys: no row holds a plaintext key`, and
+   `GET /v1/admin/api-keys/plaintext-count` answers `0`.
+
+Upgrading from a build that already has hashed keys (but no automatic scrub)
+is the same: such builds read keys by hash, so the scrub cannot lock them out.
+If a rollout of a build from before hashed keys could take longer than a day,
+raise `KOSHA_API_KEY_SCRUB_GRACE_SECS`, or set `KOSHA_API_KEY_AUTO_SCRUB=off`
+and run `kosha admin scrub-plaintext-api-keys` yourself once every pod is
+upgraded. After the scrub the table holds no usable key, and a rollback to a
+build from before hashed keys would no longer accept Postgres keys (env keys
+are unaffected); a rollback to any build with hashed keys is unaffected. The
+server's database role must own `kosha.api_keys` and `kosha.api_key_scrub`
+(`002_grant_kosha_role.sql`) or an admin must apply the migrations first
 (`make db-migrate`).
 
 **Upgrading an instance that was set up with `make db-migrate`.** Tables created

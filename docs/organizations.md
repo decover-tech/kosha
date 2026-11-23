@@ -128,17 +128,24 @@ Refused requests are not recorded.
 | `api_key.created` | tenant | `key_suffix` (last four characters), `description`. A key made with `POST /v1/admin/api-keys` also has `key_id_prefix` (first twelve characters of its `key_id`), `scopes`, `namespaces` and `expires_at` |
 | `api_key.rotated` | tenant | The replacement key, as for `api_key.created`, and `replaces`: the old key's `key_id_prefix` and the `expires_at` it now has |
 | `api_key.revoked` | tenant | `key_id_prefix`, `description` |
+| `admin.segment_gc`, `admin.compaction`, `admin.tenant_deletion`, `admin.billing`, `admin.usage`, `admin.import_namespace`, `admin.repair`, `admin.request` | `tenant` for `DELETE /v1/admin/tenants/{tenant}`, otherwise `route` (target id: the path) | `method`, `path`, `status`: one entry per state-changing (`POST`, `DELETE`) admin request that has no entry of its own, written after it ran, so refused and failed attempts are there too. Never the request body |
 
-An entry has `id`, `org_id`, `actor` (`operator`, `operator:<name>` or
-`user:<id>`), `action`,
+An entry has `id`, `org_id`, `actor` (`operator`, `operator:<name>`,
+`user:<id>`, or `api_key:<first twelve characters of the key's id>` for a
+tenant managing its own keys, `api_key:env` when that key is an env key),
+`action`,
 `target_type`, `target_id`, `detail` and `created_at_ms`. Any entry by a user
 may also carry `via` in its detail (see [Who is calling](#who-is-calling)). The log never holds an
 API key. `GET .../audit-log` returns one organization's entries newest first,
 100 per page by default (`limit`, at most 1000); pass the response's
 `next_before` as `before` for the next page. Keys created, rotated
 (`/rotate`) or revoked (`/revoke`) through `POST /v1/admin/api-keys` are
-recorded too, with the operator as the actor, under the tenant's organization
-when it has one. `user.created`, key entries for a tenant no organization
+recorded too, with the admin credential that made the request as the actor
+(`operator` for the shared key, `operator:<name>` for an operator
+credential), under the tenant's organization when it has one; so are keys a
+tenant manages itself through `/v1/api-keys`, with its key as the actor. A
+tenant deletion's `admin.tenant_deletion` entry is under the tenant's
+organization too. `user.created`, key entries for a tenant no organization
 owns, and changes to operator credentials (`operator_credential.created`,
 `.rotated`, `.revoked`; target type `operator`, target id the operator's name)
 are recorded with no organization and are only visible in the
@@ -147,8 +154,12 @@ holds a whole `key_id` either, while an operator-credential entry names the
 credential by its full `key_id`.
 
 Not recorded yet: namespace deletion and other data-plane actions made with a
-tenant API key, the keys removed when a tenant is deleted, and
-`POST /v1/admin/api-keys/scrub-plaintext`.
+tenant API key, the keys removed when a tenant is deleted (the deletion itself
+is), and the automatic plaintext scrub (which changes no key; it is logged by
+the server and kept in `kosha.api_key_scrub`). Running the scrub by hand
+(`POST /v1/admin/api-keys/scrub-plaintext`) is recorded, with no
+organization, as `api_key.plaintext_scrubbed` (target `registry`, detail
+`rows`).
 
 ## Storage
 

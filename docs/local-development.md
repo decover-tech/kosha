@@ -115,7 +115,7 @@ isolation section):
 | Env | Purpose |
 |-----|---------|
 | `KOSHA_API_KEY` | Tenant key for tenant `default` |
-| `KOSHA_API_KEYS` | Tenant keys, `key1=tenant1,key2=tenant2` |
+| `KOSHA_API_KEYS` | Tenant keys, `key1=tenant1,key2=tenant2`; an entry may narrow its key: `key=tenant;scopes=read;namespaces=docs+wiki;expires_at=<unix secs>` |
 | `KOSHA_ADMIN_API_KEY` | Admin credential for `/v1/admin/*` and global `/stats` |
 | `KOSHA_ADMIN_BOOTSTRAP_KEY=disabled` | Refuse `KOSHA_ADMIN_API_KEY`, leaving only per-operator credentials (`POST /v1/admin/operators`) |
 | `KOSHA_INTERNAL_API_KEY` | Peer credential for `/internal/*`: segment hydration, and query pods reading the ingest pod's unindexed writes for strong-consistency searches (#255) |

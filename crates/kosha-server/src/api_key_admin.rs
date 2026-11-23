@@ -1,6 +1,6 @@
-//! The API-key registry's admin routes (#346). All need the dedicated
-//! `KOSHA_ADMIN_API_KEY` credential (`route` checks it for `/v1/admin/*`)
-//! and a Postgres control plane:
+//! The API-key registry's admin routes (#346). All need an admin
+//! credential (the shared `KOSHA_ADMIN_API_KEY` or an operator credential;
+//! `route` checks it for `/v1/admin/*`) and a Postgres control plane:
 //!
 //! - `POST /v1/admin/api-keys` creates a key:
 //!   `{"tenant_id": "acme", "description": "...", "scopes": ["read"],
@@ -17,8 +17,10 @@
 //!   the same tenant, scopes and namespaces; the old key keeps working for
 //!   `overlap_secs` (default one day), so clients can switch over without
 //!   downtime. `expires_in_secs` / `expires_at` set the new key's expiry.
-//! - `POST /v1/admin/api-keys/scrub-plaintext` removes the plaintext that
-//!   rows created before #346 still hold.
+//! - `POST /v1/admin/api-keys/scrub-plaintext` removes, now, the plaintext
+//!   that rows created before #346 still hold (servers also do it by
+//!   themselves once it is safe: `PgStore::auto_scrub_plaintext`). Audited
+//!   as `api_key.plaintext_scrubbed`.
 //!
 //! A key's `key_id` is the SHA-256 hash the registry stores for it. Where
 //! a `key_id` is expected, `{"api_key": "<the key>"}` works too.
@@ -332,7 +334,22 @@ fn execute(action: Action, actor: &str) -> String {
             Err(e) => json_error(500, &format!("failed to rotate key: {e}")),
         },
         Action::ScrubPlaintext => match pg.scrub_plaintext_api_keys() {
-            Ok(scrubbed) => json_ok(&serde_json::json!({ "scrubbed": scrubbed })),
+            Ok(scrubbed) => {
+                // Best effort: the scrub is done and idempotent either way.
+                use kosha_control::orgs::{NewAuditEvent, OrgStore};
+                let event = NewAuditEvent {
+                    org_id: None,
+                    actor: actor.to_string(),
+                    action: "api_key.plaintext_scrubbed",
+                    target_type: "registry",
+                    target_id: "kosha.api_keys".to_string(),
+                    detail: serde_json::json!({ "rows": scrubbed }),
+                };
+                if let Err(e) = pg.transact(&mut |tx| tx.insert_audit(&event)) {
+                    eprintln!("api keys: failed to audit the plaintext scrub: {e}");
+                }
+                json_ok(&serde_json::json!({ "scrubbed": scrubbed }))
+            }
             Err(e) => json_error(500, &format!("failed to scrub plaintext keys: {e}")),
         },
     }
