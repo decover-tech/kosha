@@ -5730,6 +5730,7 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(300);
+    slow_search_log_ms();
     let addr = format!("0.0.0.0:{port}");
     // #382 experiment flags: one line only when one is set or the image was
     // built above baseline x86-64, so a default server logs nothing new.
@@ -8599,15 +8600,6 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
                 ..hydration
             };
             obs.s3_bytes.set(hydration.s3_bytes());
-            log_search_timing(
-                &ns,
-                &hydration,
-                hydrate_ms,
-                queue_ms,
-                &phases,
-                result.total_hits,
-                result.knn_degraded_segments,
-            );
             state.metrics.record_search_phases(
                 hydrate_ms,
                 queue_ms,
@@ -8622,9 +8614,24 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
                 .then(|| hydration_request.shed_reason());
             #[cfg(not(feature = "s3"))]
             let shed = None;
+            // `wall_ms` is read when the line is logged: after the rerank
+            // and the response build, or at a kNN shed (429).
+            let log_timing = |total_hits, knn_degraded_segments| {
+                log_search_timing(
+                    &ns,
+                    &hydration,
+                    hydrate_ms,
+                    queue_ms,
+                    &phases,
+                    total_hits,
+                    knn_degraded_segments,
+                    t_request.elapsed().as_secs_f64() * 1e3,
+                )
+            };
             if let Some(response) =
                 knn_shed_response(result.knn_degraded_segments.unwrap_or(0), shed)
             {
+                log_timing(result.total_hits, result.knn_degraded_segments);
                 return response;
             }
             // Before a rerank replaces `result`.
@@ -8679,6 +8686,7 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
             if let Some(key) = cache_key.filter(|_| cacheable) {
                 state.result_cache.lock().unwrap().insert(key, &resp);
             }
+            log_timing(result.total_hits, result.knn_degraded_segments);
             if want_timings {
                 return with_search_timings(response_body_json(&resp), &timings);
             }
@@ -8944,6 +8952,7 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
 }
 
 fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> String {
+    let t_request = Instant::now();
     // Parse query string from the request line.
     // request_line looks like: "GET /search?ns=...&q=...&max_results=... HTTP/1.1"
     let query_string = request_line
@@ -9200,15 +9209,6 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
                 ..hydration
             };
             obs.s3_bytes.set(hydration.s3_bytes());
-            log_search_timing(
-                &ns,
-                &hydration,
-                hydrate_ms,
-                queue_ms,
-                &phases,
-                result.total_hits,
-                result.knn_degraded_segments,
-            );
             state.metrics.record_search_phases(
                 hydrate_ms,
                 queue_ms,
@@ -9223,12 +9223,20 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
                 .then(|| hydration_request.shed_reason());
             #[cfg(not(feature = "s3"))]
             let shed = None;
-            if let Some(response) =
-                knn_shed_response(result.knn_degraded_segments.unwrap_or(0), shed)
-            {
-                return response;
-            }
-            json_ok(&result)
+            // A kNN shed (429) is logged too, like the search it answers.
+            let resp = knn_shed_response(result.knn_degraded_segments.unwrap_or(0), shed)
+                .unwrap_or_else(|| json_ok(&result));
+            log_search_timing(
+                &ns,
+                &hydration,
+                hydrate_ms,
+                queue_ms,
+                &phases,
+                result.total_hits,
+                result.knn_degraded_segments,
+                t_request.elapsed().as_secs_f64() * 1e3,
+            );
+            resp
         }
         Err(e) => {
             // Same verdict invalidation as `handle_search_post` — see
@@ -11136,22 +11144,36 @@ impl Drop for SegmentPins<'_> {
 }
 
 /// `KOSHA_SLOW_SEARCH_LOG_MS`: a search logs its `search timing:` line only
-/// when its `total_ms` is at least this (default 1000; `0` logs every
-/// search). Read once, like the other knobs in this file.
+/// when its phase sum or its wall time is at least this (default 1000; `0`
+/// logs every search). Read once, like the other knobs in this file;
+/// `main` reads it at startup so a bad value is reported there.
 fn slow_search_log_ms() -> u64 {
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MS.get_or_init(|| {
-        parse_slow_search_log_ms(std::env::var("KOSHA_SLOW_SEARCH_LOG_MS").ok().as_deref())
+        let raw = std::env::var("KOSHA_SLOW_SEARCH_LOG_MS").ok();
+        parse_slow_search_log_ms(raw.as_deref()).unwrap_or_else(|| {
+            eprintln!(
+                "WARN: KOSHA_SLOW_SEARCH_LOG_MS={:?} is not a whole number of ms; using 1000",
+                raw.unwrap_or_default()
+            );
+            1000
+        })
     })
 }
 
-/// Unset or unparseable falls back to the 1000 ms default.
-fn parse_slow_search_log_ms(raw: Option<&str>) -> u64 {
-    raw.and_then(|v| v.trim().parse().ok()).unwrap_or(1000)
+/// Unset: the 1000 ms default. `None` for a value that does not parse.
+fn parse_slow_search_log_ms(raw: Option<&str>) -> Option<u64> {
+    match raw {
+        None => Some(1000),
+        Some(v) => v.trim().parse().ok(),
+    }
 }
 
-fn search_timing_logged(total_ms: f64, threshold_ms: u64) -> bool {
-    total_ms >= threshold_ms as f64
+/// Gated on the larger of the phase sum and the request's wall time, so
+/// a search slow outside the scored phases (manifest read, rerank,
+/// response build) is still logged.
+fn search_timing_logged(total_ms: f64, wall_ms: f64, threshold_ms: u64) -> bool {
+    total_ms.max(wall_ms) >= threshold_ms as f64
 }
 
 /// One structured line per slow search request (`KOSHA_SLOW_SEARCH_LOG_MS`,
@@ -11161,6 +11183,7 @@ fn search_timing_logged(total_ms: f64, threshold_ms: u64) -> bool {
 /// cold-open cost). `hydrate_files`/`hydrate_mb` count only this request's
 /// own S3 fetches; a fully-warm NVMe cache logs 0/0.0 with a small
 /// residual `hydrate_ms` (local existence checks).
+#[allow(clippy::too_many_arguments)]
 fn log_search_timing(
     ns: &NamespaceId,
     hydration: &HydrationOutcome,
@@ -11172,6 +11195,8 @@ fn log_search_timing(
     // non-kNN query) logs the same as `Some(0)` here; this line is a human/
     // grep-facing skim, not the API contract that needs the distinction.
     knn_degraded_segments: Option<u32>,
+    // The handler's wall time up to the built response.
+    wall_ms: f64,
 ) {
     let total_ms = hydrate_ms
         + queue_ms
@@ -11182,7 +11207,7 @@ fn log_search_timing(
         + phases.knn_rescore_ms;
     // Decided before any of the line is formatted: a fast search allocates
     // nothing here.
-    if !search_timing_logged(total_ms, slow_search_log_ms()) {
+    if !search_timing_logged(total_ms, wall_ms, slow_search_log_ms()) {
         return;
     }
     // Global bound-driven kNN rescoring (#381) logs its counters only when
@@ -11220,7 +11245,7 @@ fn log_search_timing(
         ));
     }
     println!(
-        "search timing: ns={} total_ms={:.1} hydrate_ms={:.1} hydrate_files={} \
+        "search timing: ns={} total_ms={:.1} wall_ms={:.1} hydrate_ms={:.1} hydrate_files={} \
          hydrate_mb={:.1} queue_ms={:.1} admit_ms={:.1} bm25_stats={} bm25_stats_ms={:.2} \
          score_ms={:.1} materialize_ms={:.1} opens_cold={} opens_cached={} \
          open_total_ms={:.1} knn_postings={} knn_segments={} knn_centroids={} knn_plan_ms={:.1} knn_mode={} knn_exact_vectors={} \
@@ -11231,6 +11256,7 @@ fn log_search_timing(
          vector_whole_files={}{}{}{}",
         ns.0,
         total_ms,
+        wall_ms,
         hydrate_ms,
         hydration.files_fetched,
         hydration.bytes_fetched as f64 / (1024.0 * 1024.0),
@@ -15116,19 +15142,22 @@ mod tests {
 
     #[test]
     fn slow_search_log_threshold() {
-        assert_eq!(parse_slow_search_log_ms(None), 1000);
-        assert_eq!(parse_slow_search_log_ms(Some("garbage")), 1000);
-        assert_eq!(parse_slow_search_log_ms(Some("-5")), 1000);
-        assert_eq!(parse_slow_search_log_ms(Some("250")), 250);
-        let default = parse_slow_search_log_ms(None);
-        assert!(!search_timing_logged(12.5, default));
-        assert!(!search_timing_logged(999.9, default));
-        assert!(search_timing_logged(1000.0, default));
-        assert!(search_timing_logged(4321.0, default));
+        assert_eq!(parse_slow_search_log_ms(None), Some(1000));
+        assert_eq!(parse_slow_search_log_ms(Some("garbage")), None);
+        assert_eq!(parse_slow_search_log_ms(Some("-5")), None);
+        assert_eq!(parse_slow_search_log_ms(Some("250")), Some(250));
+        let default = parse_slow_search_log_ms(None).unwrap();
+        assert!(!search_timing_logged(12.5, 13.0, default));
+        assert!(!search_timing_logged(999.9, 999.9, default));
+        assert!(search_timing_logged(1000.0, 1000.0, default));
+        assert!(search_timing_logged(4321.0, 4330.0, default));
+        // Fast phases, slow request (manifest read, rerank, response
+        // build): the wall time alone crosses the threshold.
+        assert!(search_timing_logged(400.0, 3000.0, default));
         // 0 logs every search, including a 0 ms one.
-        let all = parse_slow_search_log_ms(Some("0"));
-        assert!(search_timing_logged(0.0, all));
-        assert!(search_timing_logged(0.3, all));
+        let all = parse_slow_search_log_ms(Some("0")).unwrap();
+        assert!(search_timing_logged(0.0, 0.0, all));
+        assert!(search_timing_logged(0.3, 0.4, all));
     }
 
     #[test]
