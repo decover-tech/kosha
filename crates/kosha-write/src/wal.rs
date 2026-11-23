@@ -104,7 +104,7 @@ impl LocalWalStore {
 
 impl WalStore for LocalWalStore {
     fn append_batch(&self, first_lsn: u64, bytes: &[u8]) -> Result<(), KoshaError> {
-        std::fs::create_dir_all(&self.dir).ok();
+        kosha_core::create_dir_named(&self.dir)?;
         durable_write(&self.path(first_lsn), bytes)
     }
 
@@ -1779,6 +1779,25 @@ mod tests {
         fn write_meta(&self, name: &str, bytes: &[u8]) -> Result<(), KoshaError> {
             self.inner.write_meta(name, bytes)
         }
+    }
+
+    /// A WAL dir that cannot be created fails the append with the dir's
+    /// path, not with NotFound on a temp file inside it.
+    #[test]
+    fn append_names_a_wal_dir_it_cannot_create() {
+        let dir = temp_dir("not-a-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("file");
+        std::fs::write(&file, b"").unwrap();
+        let wal_dir = file.join("_wal");
+        let err = LocalWalStore::new(wal_dir.clone())
+            .append_batch(1, b"x")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!("cannot create {}", wal_dir.display())),
+            "{err}"
+        );
     }
 
     #[test]

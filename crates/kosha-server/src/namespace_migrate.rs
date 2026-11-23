@@ -496,7 +496,12 @@ mod s3_objects {
                 .apply_sse(sse)
                 .send()
                 .await
-                .map_err(|e| format!("create_multipart_upload {key}: {e}"))?;
+                .map_err(|e| {
+                    format!(
+                        "create_multipart_upload {key}: {}",
+                        crate::s3_storage::log_s3_error("create_multipart_upload", key, &e)
+                    )
+                })?;
             let upload_id = upload
                 .upload_id()
                 .ok_or_else(|| format!("create_multipart_upload {key}: no upload id"))?
@@ -528,7 +533,10 @@ mod s3_objects {
                             .build(),
                     ),
                     Err(e) => {
-                        failure = Some(format!("upload_part_copy {key} part {number}: {e}"));
+                        failure = Some(format!(
+                            "upload_part_copy {key} part {number}: {}",
+                            crate::s3_storage::log_s3_error("upload_part_copy", key, &e)
+                        ));
                         break;
                     }
                 }
@@ -548,7 +556,12 @@ mod s3_objects {
                     .await;
                 match done {
                     Ok(_) => return Ok(()),
-                    Err(e) => failure = Some(format!("complete_multipart_upload {key}: {e}")),
+                    Err(e) => {
+                        failure = Some(format!(
+                            "complete_multipart_upload {key}: {}",
+                            crate::s3_storage::log_s3_error("complete_multipart_upload", key, &e)
+                        ))
+                    }
                 }
             }
             let _ = client
@@ -608,7 +621,12 @@ mod s3_objects {
                     .send()
                     .await
                     .map(|_| ())
-                    .map_err(|e| format!("copy_object {source} -> {key}: {e}"))
+                    .map_err(|e| {
+                        format!(
+                            "copy_object {source} -> {key}: {}",
+                            crate::s3_storage::log_s3_error("copy_object", &key, &e)
+                        )
+                    })
             })
         }
 
@@ -636,7 +654,16 @@ mod s3_objects {
                         .delete(delete)
                         .send()
                         .await
-                        .map_err(|e| format!("delete_objects: {e}"))?;
+                        .map_err(|e| {
+                            format!(
+                                "delete_objects: {}",
+                                crate::s3_storage::log_s3_error(
+                                    "delete_objects",
+                                    batch.first().map_or("-", String::as_str),
+                                    &e
+                                )
+                            )
+                        })?;
                     if let Some(err) = out.errors().first() {
                         return Err(format!(
                             "delete_objects: {} of {} failed, first {}: {}",

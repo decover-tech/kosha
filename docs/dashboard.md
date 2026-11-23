@@ -73,8 +73,8 @@ API output is unchanged by default:
   was missing or shed, and it did not degrade a kNN segment or fall back to per-segment BM25
   statistics; a result-cache hit is fully cached. It is Kosha's counterpart to turbopuffer's
   `cache_hit_ratio == 1.0`, which a hot benchmark polls for before measuring. The field is
-  ignored when the dashboard is off. The phase and S3 numbers are also on the `search timing:`
-  log line.
+  ignored when the dashboard is off. The phase and S3 numbers are also on slow searches'
+  `search timing:` log line (`KOSHA_SLOW_SEARCH_LOG_MS`).
 
 `GET /v1/namespaces` itself is always available.
 

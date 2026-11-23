@@ -1952,6 +1952,49 @@ pub fn knn_needs_doc_vectors(footer: Option<&Footer>) -> bool {
     footer.is_some_and(|f| f.vector_fields.is_none() && f.doc_vectors)
 }
 
+/// Whether a query node should hold this segment's `doc_vectors.bin`
+/// WHOLE, i.e. whether background promotion and warm-up fetch it.
+///
+/// Only a quantized (i8 / RaBitQ) column needs the whole file: the
+/// default per-segment kNN path rescores its shortlist from it, and
+/// without it returns quantized estimates as final scores
+/// ([`SegmentReader::rescores_quantized_locally`]). An f32 column never
+/// rescores, and every other reader works from ranges — page documents'
+/// vectors ([`SegmentReader::doc_is_local`]), exact filtered kNN
+/// (`knn_exact_filtered_fetching`) and global rescoring
+/// (`knn_exact_scores_fetching`) — so for f32 columns the whole file (as
+/// large as the f32 vector index) is never worth its download or its
+/// disk. A legacy footer that lists no columns cannot say, so it keeps
+/// the whole file as before. `false` when the segment has no sidecar.
+pub fn doc_vectors_kept_whole(footer: &Footer) -> bool {
+    footer.doc_vectors
+        && footer
+            .vector_fields
+            .as_ref()
+            .is_none_or(|cols| cols.iter().any(|c| !c.quantization.is_f32()))
+}
+
+/// An upper bound on `doc_vectors.bin`'s header length from the footer
+/// alone, at least [`DOC_VECTORS_HEADER_PROBE`]: 12 bytes per entry, at
+/// most one entry per document per vector column, plus the field table.
+/// Reading this many bytes first fetches the whole header in one round
+/// (any surplus is the first vectors). A legacy footer that lists no
+/// columns gives the plain probe.
+pub fn doc_vectors_header_estimate(footer: &Footer) -> u64 {
+    let Some(cols) = footer.vector_fields.as_ref() else {
+        return DOC_VECTORS_HEADER_PROBE;
+    };
+    let names: u64 = cols.iter().map(|c| 4 + c.name.len() as u64).sum();
+    let entries = footer.doc_count as u64 * cols.len() as u64;
+    (12 + names + 12 * entries).max(DOC_VECTORS_HEADER_PROBE)
+}
+
+/// [`doc_vectors_kept_whole`] for `segment_dir`'s local `footer.json`;
+/// `false` if it can't be read (as [`segment_uses_doc_vectors`]).
+pub fn segment_keeps_doc_vectors_whole(segment_dir: &Path) -> bool {
+    SegmentReader::read_footer(segment_dir).is_ok_and(|footer| doc_vectors_kept_whole(&footer))
+}
+
 /// The files a kNN on `field` needs from `segment_dir` (#204), each paired
 /// with whether the segment cannot be searched without it. Decided from
 /// the local `footer.json`:
@@ -4077,6 +4120,29 @@ pub struct DocVectors {
     file_len: u64,
 }
 
+/// Span-cache listings of one segment, kept across the documents of one
+/// result page ([`SegmentReader::page_doc_is_local`],
+/// [`SegmentReader::page_doc_record`]): a listing is a `read_dir` plus a
+/// stat of every cached span, so taking one per document cost a page
+/// `documents x spans` stats.
+#[derive(Default)]
+pub struct PageSpans {
+    doc_store: Option<span_cache::SpanIndex>,
+    doc_vectors: Option<span_cache::SpanIndex>,
+}
+
+/// Which sidecar vectors a visit reads, in which runs: see
+/// [`DocVectors::visit_field_vectors`].
+#[derive(Default)]
+struct VectorRuns {
+    /// Entry indices of the wanted vectors, ascending.
+    wanted: Vec<usize>,
+    /// `[start, end)` into `wanted`, one per run.
+    runs: Vec<(usize, usize)>,
+    /// The `[start, end)` file bytes of each run.
+    ranges: Vec<(u64, u64)>,
+}
+
 impl DocVectors {
     /// Open a whole local `doc_vectors.bin`, checking its length against
     /// the header.
@@ -4163,16 +4229,27 @@ impl DocVectors {
     /// `(field name, vector)` for every vector stored for `doc_seq`, in the
     /// document's field order. One local read.
     pub fn vectors_for(&self, doc_seq: u32) -> Result<Vec<(&str, Vec<f32>)>, KoshaError> {
+        self.vectors_for_reusing(doc_seq, &mut None)
+    }
+
+    /// [`Self::vectors_for`] keeping the span listing in `spans` across
+    /// calls (see [`span_cache::read_local_range_reusing`]).
+    pub fn vectors_for_reusing(
+        &self,
+        doc_seq: u32,
+        spans: &mut Option<span_cache::SpanIndex>,
+    ) -> Result<Vec<(&str, Vec<f32>)>, KoshaError> {
         let (start, end) = self.entry_range(doc_seq);
         let Some((span_start, span_end)) = self.doc_span(doc_seq) else {
             return Ok(Vec::new());
         };
-        let buf = span_cache::read_local_range(
+        let buf = span_cache::read_local_range_reusing(
             &self.segment_dir,
             DOC_VECTORS_FILE,
             self.file_len,
             span_start,
             span_end - span_start,
+            spans,
         )
         .ok_or_else(|| {
             KoshaError::NotFound(format!(
@@ -4229,7 +4306,7 @@ impl DocVectors {
 
     /// Calls `visit(doc_seq, vector)` for `field`'s vector of every
     /// document in `doc_seqs` (ascending) that has one, in `doc_seq` order,
-    /// and returns how many were visited.
+    /// and returns how many were visited. Reads the whole local file.
     ///
     /// Built for exact kNN over a filtered set (#252): vectors that sit
     /// close together in the file (gaps up to [`Self::COALESCE_GAP`]) are
@@ -4240,48 +4317,105 @@ impl DocVectors {
         &self,
         field: &str,
         doc_seqs: &[u32],
-        mut visit: impl FnMut(u32, &[f32]),
+        visit: impl FnMut(u32, &[f32]),
     ) -> Result<usize, KoshaError> {
-        let Some(field_idx) = self.fields.iter().position(|name| name == field) else {
+        let plan = self.field_vector_runs(field, doc_seqs);
+        if plan.wanted.is_empty() {
             return Ok(0);
+        }
+        let mut file = fs::File::open(self.segment_dir.join(DOC_VECTORS_FILE))?;
+        self.visit_runs(&plan, visit, |start, end, buf| {
+            buf.resize((end - start) as usize, 0);
+            file.seek(SeekFrom::Start(start))?;
+            file.read_exact(buf)?;
+            Ok(())
+        })
+    }
+
+    /// The byte ranges [`Self::visit_field_vectors`] reads for `field`'s
+    /// vectors of `doc_seqs` (ascending), in file order: the ranges a
+    /// reader without the whole file fetches into the span cache first.
+    pub fn field_vector_ranges(&self, field: &str, doc_seqs: &[u32]) -> Vec<(u64, u64)> {
+        self.field_vector_runs(field, doc_seqs).ranges
+    }
+
+    /// [`Self::visit_field_vectors`] reading each of
+    /// [`Self::field_vector_ranges`] from the sparse span cache instead of
+    /// the whole file (#245). Same vectors, same order, same arithmetic for
+    /// the caller. `Err` when a range is not cached (never fetched, or
+    /// evicted since).
+    pub fn visit_field_vectors_cached(
+        &self,
+        spans: &span_cache::SpanIndex,
+        field: &str,
+        doc_seqs: &[u32],
+        visit: impl FnMut(u32, &[f32]),
+    ) -> Result<usize, KoshaError> {
+        let plan = self.field_vector_runs(field, doc_seqs);
+        self.visit_runs(&plan, visit, |start, end, buf| {
+            *buf = spans.read(start, end).ok_or_else(|| {
+                KoshaError::NotFound(format!(
+                    "{DOC_VECTORS_FILE} bytes {start}..{end} are not cached in segment {:?}",
+                    self.segment_dir
+                ))
+            })?;
+            Ok(())
+        })
+    }
+
+    /// Entry indices of `field`'s vectors of `doc_seqs` (ascending), and
+    /// the runs they are read in.
+    fn field_vector_runs(&self, field: &str, doc_seqs: &[u32]) -> VectorRuns {
+        let mut plan = VectorRuns::default();
+        let Some(field_idx) = self.fields.iter().position(|name| name == field) else {
+            return plan;
         };
         let field_idx = field_idx as u32;
-        // Entry indices of the wanted vectors, ascending (entries are
-        // sorted by doc_seq, and so is `doc_seqs`).
-        let mut wanted: Vec<usize> = Vec::with_capacity(doc_seqs.len());
+        // Entries are sorted by doc_seq, and so is `doc_seqs`.
         let mut from = 0usize;
         for &doc_seq in doc_seqs {
             let start = from + self.entries[from..].partition_point(|e| e.0 < doc_seq);
             let mut i = start;
             while i < self.entries.len() && self.entries[i].0 == doc_seq {
                 if self.entries[i].1 == field_idx {
-                    wanted.push(i);
+                    plan.wanted.push(i);
                 }
                 i += 1;
             }
             from = i;
         }
-        if wanted.is_empty() {
-            return Ok(0);
-        }
         let end_of = |i: usize| self.offsets[i] + self.entries[i].2 as u64 * 4;
-        let mut file = fs::File::open(self.segment_dir.join(DOC_VECTORS_FILE))?;
-        let mut buf: Vec<u8> = Vec::new();
-        let mut vector: Vec<f32> = Vec::new();
         let mut run_start = 0usize;
-        while run_start < wanted.len() {
+        while run_start < plan.wanted.len() {
+            let first = self.offsets[plan.wanted[run_start]];
             let mut run_end = run_start + 1;
-            while run_end < wanted.len()
-                && self.offsets[wanted[run_end]] <= end_of(wanted[run_end - 1]) + Self::COALESCE_GAP
+            while run_end < plan.wanted.len()
+                && self.offsets[plan.wanted[run_end]]
+                    <= end_of(plan.wanted[run_end - 1]) + Self::COALESCE_GAP
+                && end_of(plan.wanted[run_end]) - first <= Self::MAX_RUN_BYTES
             {
                 run_end += 1;
             }
-            let span_start = self.offsets[wanted[run_start]];
-            let span_end = end_of(wanted[run_end - 1]);
-            buf.resize((span_end - span_start) as usize, 0);
-            file.seek(SeekFrom::Start(span_start))?;
-            file.read_exact(&mut buf)?;
-            for &i in &wanted[run_start..run_end] {
+            plan.runs.push((run_start, run_end));
+            plan.ranges.push((first, end_of(plan.wanted[run_end - 1])));
+            run_start = run_end;
+        }
+        plan
+    }
+
+    /// Decode every run of `plan`, reading its bytes into the buffer with
+    /// `read(start, end, buf)`, and visit its vectors in `doc_seq` order.
+    fn visit_runs(
+        &self,
+        plan: &VectorRuns,
+        mut visit: impl FnMut(u32, &[f32]),
+        mut read: impl FnMut(u64, u64, &mut Vec<u8>) -> Result<(), KoshaError>,
+    ) -> Result<usize, KoshaError> {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut vector: Vec<f32> = Vec::new();
+        for (&(run_start, run_end), &(span_start, span_end)) in plan.runs.iter().zip(&plan.ranges) {
+            read(span_start, span_end, &mut buf)?;
+            for &i in &plan.wanted[run_start..run_end] {
                 let at = (self.offsets[i] - span_start) as usize;
                 let dim = self.entries[i].2 as usize;
                 vector.clear();
@@ -4294,15 +4428,21 @@ impl DocVectors {
                 );
                 visit(self.entries[i].0, &vector);
             }
-            run_start = run_end;
         }
-        Ok(wanted.len())
+        Ok(plan.wanted.len())
     }
 
     /// Largest gap between two wanted vectors that
     /// [`Self::visit_field_vectors`] reads through rather than seeking
     /// over: reading 64 KiB costs about what one more seek does.
     pub const COALESCE_GAP: u64 = 64 * 1024;
+
+    /// Most bytes one run reads at once. Without a cap a dense candidate
+    /// set (every document of a one-matter segment) is a single run the
+    /// size of the whole file — a 2 GB buffer for one segment's exact kNN.
+    /// 8 MiB is ~2,700 768-dim vectors per read: still a few large
+    /// sequential reads, at a bounded heap cost per scoring thread.
+    pub const MAX_RUN_BYTES: u64 = 8 * 1024 * 1024;
 
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -4635,7 +4775,7 @@ pub struct LazyInvertedIndex {
     data: Vec<u8>,
     term_count: usize,
     /// Decoded-postings LRU — see [`PostingsCache`].
-    cache: PostingsCache<Arc<Vec<Posting>>>,
+    cache: PostingsCache<usize, Arc<Vec<Posting>>>,
 }
 
 pub struct SplitInvertedIndex {
@@ -4643,12 +4783,12 @@ pub struct SplitInvertedIndex {
     segment_dir: PathBuf,
     term_count: usize,
     encoding: SplitPostingsEncoding,
-    cache: PostingsCache<Arc<Vec<Posting>>>,
+    cache: PostingsCache<usize, Arc<Vec<Posting>>>,
     /// v5 (skip-split) only: per-term scoring views (skip table + raw
     /// scoring/positions bytes, block-decoded on demand) — cached
     /// separately from full decodes because the WAND read path never
     /// materializes `Vec<Posting>` at all. Same admission/LRU policy.
-    scoring_cache: PostingsCache<Arc<BlockedTermPostings>>,
+    scoring_cache: PostingsCache<usize, Arc<BlockedTermPostings>>,
     /// Set when a term the TOC *contains* could not be served because its
     /// posting-blob shard failed to read or decode (evicted from the disk
     /// cache, truncated, corrupt). Distinguishes "term absent" (a normal
@@ -4802,21 +4942,25 @@ fn postings_cache_max_bytes() -> usize {
     })
 }
 
-/// Per-segment byte budget for the decoded *vector* postings LRU
-/// (`KOSHA_VECTOR_POSTINGS_CACHE_MAX_BYTES`, default 32 MiB, `0` disables).
-/// Larger default than the text budget above because a kNN query's working
-/// set is `nprobe` whole postings of `dim`-wide f32 vectors — at realistic
-/// embedding dimensionality a single posting runs hundreds of KiB, so a
-/// text-sized budget would thrash. Aggregate residency across segments is
-/// still bounded by the ledger watermark (entries report to the same
-/// [`PostingsMemoryAccount`]), not by this per-segment cap alone.
+/// Process-wide byte budget for decoded *vector* postings
+/// (`KOSHA_VECTOR_POSTINGS_CACHE_MAX_BYTES`, default 512 MiB, `0` disables).
+///
+/// One budget for every open segment, not one per segment: a kNN query's
+/// working set is hundreds of whole postings of `dim`-wide vectors (a
+/// compacted segment's postings decode to over a GB), so a per-segment cap
+/// large enough to help multiplied by the number of open vector segments
+/// had no bound at all. [`shared_vector_cache`] holds every segment's
+/// entries in one LRU under this budget, so the hottest postings across all
+/// segments stay and resident decoded vector postings never exceed it.
+/// Entries also report to the segment's [`PostingsMemoryAccount`], so they
+/// count toward the query pod's live-bytes watermark.
 fn vector_postings_cache_max_bytes() -> usize {
     static BUDGET: OnceLock<usize> = OnceLock::new();
     *BUDGET.get_or_init(|| {
         std::env::var("KOSHA_VECTOR_POSTINGS_CACHE_MAX_BYTES")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(32 * 1024 * 1024)
+            .unwrap_or(512 * 1024 * 1024)
     })
 }
 
@@ -4838,7 +4982,9 @@ pub trait PostingsMemoryAccount: Send + Sync {
     fn release_postings(&self, bytes: u64);
 }
 
-/// Small per-segment LRU of decoded postings, keyed by term-table index.
+type SharedAccount = Arc<dyn PostingsMemoryAccount + Send + Sync>;
+
+/// Small LRU of decoded postings.
 ///
 /// The lazy v2 format trades resident memory for a per-query decode — the
 /// right trade for the vocabulary at large, but a hot query term ("the")
@@ -4846,98 +4992,215 @@ pub trait PostingsMemoryAccount: Send + Sync {
 /// expanding to thousands of terms re-decodes a big slice of the index per
 /// query. Caching the *decoded form of recently-queried terms only* keeps
 /// the v1 warm-path amortization for exactly the hot subset, while the
-/// cold/open/resident wins of the lazy format stand: the budget is a few
-/// MiB per segment (see [`postings_cache_max_bytes`]), not the whole
-/// vocabulary.
+/// cold/open/resident wins of the lazy format stand: the text budget is a
+/// few MiB per segment (see [`postings_cache_max_bytes`]), not the whole
+/// vocabulary. Text caches are per segment, keyed by term-table index; the
+/// vector cache is one per process (see [`shared_vector_cache`]).
 ///
 /// Entries are `Arc`s, so a hit is a pointer clone and eviction never
 /// invalidates postings an in-flight query still holds. Approximate entry
 /// cost: `count × size_of::<Posting>()` + 4 bytes per position.
 ///
-/// Resident bytes are reported to the optional [`PostingsMemoryAccount`]
-/// (insert adds, evict and drop release), so a fleet of open segments'
-/// aggregate decoded postings counts toward the query pod's live-bytes
-/// watermark — bounded by admission, not just the per-segment cap here.
-struct PostingsCache<V> {
+/// Every operation is O(1) amortized under the one lock: a hit re-stamps
+/// the entry and appends to [`StampedFifo`] instead of searching the
+/// recency order, so a warm kNN query that hits thousands of postings does
+/// not pay a scan of the cache per hit.
+///
+/// Resident bytes are reported to each entry's [`PostingsMemoryAccount`]
+/// (insert adds, evict and drop release), so aggregate decoded postings
+/// count toward the query pod's live-bytes watermark.
+struct PostingsCache<K, V> {
     max_bytes: usize,
-    state: Mutex<PostingsCacheState<V>>,
-    account: Option<Arc<dyn PostingsMemoryAccount + Send + Sync>>,
+    /// Boxed: a segment embeds three text caches, and inline state would
+    /// make `InvertedAccess`'s variants lopsided.
+    state: Box<Mutex<PostingsCacheState<K, V>>>,
+    /// Account for [`Self::insert`]; the shared vector cache has none and
+    /// takes each segment's account per entry ([`Self::insert_for`]).
+    account: Option<SharedAccount>,
 }
 
-struct PostingsCacheState<V> {
-    entries: HashMap<usize, (V, usize)>,
-    recency: VecDeque<usize>,
+struct CacheEntry<V> {
+    value: V,
+    bytes: usize,
+    /// This entry's latest stamp in [`PostingsCacheState::recency`].
+    stamp: u64,
+    account: Option<SharedAccount>,
+}
+
+struct PostingsCacheState<K, V> {
+    entries: HashMap<K, CacheEntry<V>>,
+    recency: StampedFifo<K>,
     total_bytes: usize,
-    /// Recently-missed term indices (bounded ring) for second-touch
-    /// admission — see [`PostingsCache::admit_on_miss`].
-    recent_misses: VecDeque<usize>,
+    /// Keys missed recently and not yet admitted, with their stamp in
+    /// `miss_order` — the second-touch history ("ghost list"), see
+    /// [`PostingsCache::admit_on_miss_within`].
+    misses: HashMap<K, u64>,
+    miss_order: StampedFifo<K>,
 }
 
-/// Capacity of the second-touch admission ring. Big enough to remember a
-/// realistic hot working set between queries; small enough that a wildcard
-/// blast writing thousands of one-shot entries through it costs nothing.
-const POSTINGS_CACHE_MISS_RING: usize = 256;
+/// Keys in the order they were last stamped. Re-stamping a key appends it
+/// again instead of moving it, and the older position is skipped when it
+/// reaches the front (its stamp no longer matches the owner's), so a touch
+/// is O(1) and the order is exact LRU. Stale positions are dropped in one
+/// pass once they outnumber the live ones, which keeps the queue under
+/// `2 × live + 64` and the compaction cost amortized O(1) per touch.
+struct StampedFifo<K> {
+    queue: VecDeque<(K, u64)>,
+    next: u64,
+}
 
-impl<V> Default for PostingsCacheState<V> {
-    fn default() -> Self {
+impl<K: Copy> StampedFifo<K> {
+    fn new() -> Self {
         Self {
-            entries: HashMap::new(),
-            recency: VecDeque::new(),
-            total_bytes: 0,
-            recent_misses: VecDeque::new(),
+            queue: VecDeque::new(),
+            next: 0,
+        }
+    }
+
+    /// Append `key` as the most recent; returns its new stamp.
+    fn stamp(&mut self, key: K) -> u64 {
+        let stamp = self.next;
+        self.next += 1;
+        self.queue.push_back((key, stamp));
+        stamp
+    }
+
+    /// Remove and return the least recently stamped key that is still
+    /// current (`current(key)` is its latest stamp, `None` once gone).
+    fn pop_oldest(&mut self, current: impl Fn(&K) -> Option<u64>) -> Option<K> {
+        while let Some((key, stamp)) = self.queue.pop_front() {
+            if current(&key) == Some(stamp) {
+                return Some(key);
+            }
+        }
+        None
+    }
+
+    /// Drop stale positions once they outnumber the `live` current ones.
+    fn compact(&mut self, live: usize, current: impl Fn(&K) -> Option<u64>) {
+        if self.queue.len() > 2 * live + 64 {
+            self.queue
+                .retain(|(key, stamp)| current(key) == Some(*stamp));
         }
     }
 }
 
-impl<V: Clone> PostingsCache<V> {
-    fn new(
-        max_bytes: usize,
-        account: Option<Arc<dyn PostingsMemoryAccount + Send + Sync>>,
-    ) -> Self {
+/// Capacity of the text caches' second-touch history. Big enough to
+/// remember a realistic hot working set between queries; small enough that
+/// a wildcard blast writing thousands of one-shot entries through it costs
+/// nothing.
+const POSTINGS_CACHE_MISS_RING: usize = 256;
+
+/// Upper bound on the vector cache's second-touch history (see
+/// [`PostingsCache::vector_miss_window`]): 2^18 keys, ~20 MiB of map and
+/// queue at the worst case of tiny postings and a large budget.
+const VECTOR_MISS_WINDOW_MAX: usize = 1 << 18;
+
+impl<K: Copy + Eq + std::hash::Hash, V: Clone> PostingsCache<K, V> {
+    fn new(max_bytes: usize, account: Option<SharedAccount>) -> Self {
         Self {
             max_bytes,
-            state: Mutex::new(PostingsCacheState::default()),
+            state: Box::new(Mutex::new(PostingsCacheState {
+                entries: HashMap::new(),
+                recency: StampedFifo::new(),
+                total_bytes: 0,
+                misses: HashMap::new(),
+                miss_order: StampedFifo::new(),
+            })),
             account,
         }
     }
 
-    fn get(&self, term_index: usize) -> Option<V> {
+    /// The cached value for `key`, marking it most recently used.
+    fn get(&self, key: K) -> Option<V> {
         if self.max_bytes == 0 {
             return None;
         }
-        let mut st = self.state.lock().unwrap();
-        let hit = st.entries.get(&term_index).map(|(p, _)| p.clone());
-        if hit.is_some() {
-            if let Some(pos) = st.recency.iter().position(|k| *k == term_index) {
-                st.recency.remove(pos);
-            }
-            st.recency.push_back(term_index);
-        }
-        hit
+        let mut guard = self.state.lock().unwrap();
+        let st = &mut *guard;
+        let entry = st.entries.get_mut(&key)?;
+        entry.stamp = st.recency.stamp(key);
+        let hit = entry.value.clone();
+        let entries = &st.entries;
+        st.recency
+            .compact(entries.len(), |k| entries.get(k).map(|e| e.stamp));
+        Some(hit)
+    }
+
+    /// Whether `key` is cached, without touching its recency.
+    fn contains(&self, key: K) -> bool {
+        self.max_bytes != 0 && self.state.lock().unwrap().entries.contains_key(&key)
+    }
+
+    /// Second-touch admission for the text caches: see
+    /// [`Self::admit_on_miss_within`], with a history of
+    /// [`POSTINGS_CACHE_MISS_RING`] keys.
+    fn admit_on_miss(&self, key: K) -> bool {
+        self.admit_on_miss_within(key, POSTINGS_CACHE_MISS_RING)
     }
 
     /// Second-touch admission, recorded on a cache miss: returns whether
-    /// this term was *already* missed recently (→ caller should cache the
-    /// decode), and remembers the miss either way.
+    /// `key` was *already* missed within the last `window` distinct missed
+    /// keys (→ the caller should cache the decode), and remembers the miss
+    /// either way. O(1) amortized.
     ///
     /// Why not cache every decode: a wildcard query expanding to thousands
-    /// of terms would write its entire one-shot working set through the
-    /// cache each time — evicting the genuinely hot terms and paying
-    /// insert/evict churn for entries that are never reused. Requiring a
-    /// second miss within the ring's horizon filters exactly that traffic:
-    /// hot query terms recur and get admitted on their second lookup;
-    /// wildcard blasts pass through without disturbing anything.
-    fn admit_on_miss(&self, term_index: usize) -> bool {
-        let mut st = self.state.lock().unwrap();
-        if let Some(pos) = st.recent_misses.iter().position(|k| *k == term_index) {
-            st.recent_misses.remove(pos);
+    /// of terms, or a kNN probe of a namespace scanned once, would write
+    /// its entire one-shot working set through the cache each time —
+    /// evicting the genuinely hot entries and paying insert/evict churn
+    /// for entries that are never reused. Requiring a second miss within
+    /// the window filters exactly that traffic: recurring keys get
+    /// admitted on their second lookup; one-shot ones age out of the
+    /// history without disturbing anything.
+    fn admit_on_miss_within(&self, key: K, window: usize) -> bool {
+        let mut guard = self.state.lock().unwrap();
+        let st = &mut *guard;
+        if st.misses.remove(&key).is_some() {
             return true;
         }
-        if st.recent_misses.len() >= POSTINGS_CACHE_MISS_RING {
-            st.recent_misses.pop_front();
+        let stamp = st.miss_order.stamp(key);
+        st.misses.insert(key, stamp);
+        while st.misses.len() > window {
+            let misses = &st.misses;
+            match st.miss_order.pop_oldest(|k| misses.get(k).copied()) {
+                Some(oldest) => {
+                    st.misses.remove(&oldest);
+                }
+                None => break,
+            }
         }
-        st.recent_misses.push_back(term_index);
+        let misses = &st.misses;
+        st.miss_order
+            .compact(misses.len(), |k| misses.get(k).copied());
         false
+    }
+
+    /// The vector cache's second-touch window: as many keys as the budget
+    /// holds entries of the current mean size (`estimate` bytes while the
+    /// cache is empty), between [`POSTINGS_CACHE_MISS_RING`] and
+    /// [`VECTOR_MISS_WINDOW_MAX`].
+    ///
+    /// This is a 2Q-style ghost list sized to the cache's own reach. A
+    /// posting missed again before that many other postings were missed
+    /// would also have stayed resident had it been cached, so it is
+    /// admitted — however many postings one query probes, and however
+    /// many segments share the cache. A posting that recurs only after
+    /// more misses than the cache can hold would be evicted before its
+    /// reuse anyway (one query probing more than the budget holds, run
+    /// again: the LRU loop), so it is not admitted and does not churn.
+    /// A fixed 256-key window admitted nothing once one query probed more
+    /// than 256 postings (1,610 per segment on staging), and every warm
+    /// query re-read and re-decoded ~700 MB.
+    fn vector_miss_window(&self, estimate: usize) -> usize {
+        let mean = {
+            let st = self.state.lock().unwrap();
+            if st.entries.is_empty() {
+                estimate
+            } else {
+                st.total_bytes / st.entries.len()
+            }
+        };
+        (self.max_bytes / mean.max(1)).clamp(POSTINGS_CACHE_MISS_RING, VECTOR_MISS_WINDOW_MAX)
     }
 
     /// Whether [`Self::insert`] would keep an entry of `bytes` at all.
@@ -4945,7 +5208,12 @@ impl<V: Clone> PostingsCache<V> {
         self.max_bytes != 0 && bytes <= self.max_bytes
     }
 
-    fn insert(&self, term_index: usize, postings: V, bytes: usize) {
+    fn insert(&self, key: K, value: V, bytes: usize) {
+        self.insert_for(key, value, bytes, self.account.as_ref());
+    }
+
+    /// [`Self::insert`] charging `account` for the entry's bytes.
+    fn insert_for(&self, key: K, value: V, bytes: usize, account: Option<&SharedAccount>) {
         // An entry bigger than the whole budget would evict everything and
         // then itself churn on every query — don't cache it at all.
         if !self.accepts(bytes) {
@@ -4958,64 +5226,116 @@ impl<V: Clone> PostingsCache<V> {
         // "cache locks may be held while taking the ledger lock, never the
         // reverse." Reporting outside the cache lock keeps that direction
         // clean and avoids any reentrancy if `add_postings` ever touches
-        // the same segment's cache.
-        let to_add: u64 = bytes as u64;
-        let mut to_release: Vec<u64> = Vec::new();
+        // the same cache. Evicted entries are freed out there too: one
+        // insert can evict many postings, and every kNN worker of every
+        // segment waits on this lock.
+        let mut gone: Vec<CacheEntry<V>> = Vec::new();
         {
-            let mut st = self.state.lock().unwrap();
-            match st.entries.insert(term_index, (postings, bytes)) {
-                None => {
-                    st.recency.push_back(term_index);
-                    st.total_bytes += bytes;
-                }
-                Some((_, old_bytes)) => {
-                    // Replacing an existing entry: its old resident bytes
-                    // were previously reported as added; release them, and
-                    // the new bytes get added below.
-                    st.total_bytes = st.total_bytes - old_bytes + bytes;
-                    to_release.push(old_bytes as u64);
-                }
+            let mut guard = self.state.lock().unwrap();
+            let st = &mut *guard;
+            let stamp = st.recency.stamp(key);
+            let entry = CacheEntry {
+                value,
+                bytes,
+                stamp,
+                account: account.cloned(),
+            };
+            if let Some(old) = st.entries.insert(key, entry) {
+                // Replacing an entry: release its bytes, add the new ones.
+                st.total_bytes -= old.bytes;
+                gone.push(old);
             }
+            st.total_bytes += bytes;
             while st.total_bytes > self.max_bytes {
-                let Some(oldest) = st.recency.pop_front() else {
+                let entries = &st.entries;
+                let Some(oldest) = st.recency.pop_oldest(|k| entries.get(k).map(|e| e.stamp))
+                else {
                     break;
                 };
-                if let Some((_, size)) = st.entries.remove(&oldest) {
-                    st.total_bytes -= size;
-                    to_release.push(size as u64);
+                if let Some(evicted) = st.entries.remove(&oldest) {
+                    st.total_bytes -= evicted.bytes;
+                    gone.push(evicted);
                 }
             }
+            let entries = &st.entries;
+            st.recency
+                .compact(entries.len(), |k| entries.get(k).map(|e| e.stamp));
         }
-        if let Some(account) = &self.account {
-            for r in &to_release {
-                account.release_postings(*r);
-            }
-            if to_add > 0 {
-                account.add_postings(to_add);
-            }
+        release_and_free(gone);
+        if let Some(account) = account {
+            account.add_postings(bytes as u64);
+        }
+    }
+
+    /// Remove every entry whose key `doomed` selects, releasing its bytes
+    /// to its account. O(entries) under the lock; the entries are freed
+    /// after it is released (a segment's postings can be thousands of
+    /// allocations, and this runs from `SegmentReader::drop`). Remembered misses are left to age out
+    /// of their bounded window: purging them would cost a pass over up to
+    /// [`VECTOR_MISS_WINDOW_MAX`] keys under the lock every kNN shares.
+    fn remove_where(&self, doomed: impl Fn(&K) -> bool) {
+        let removed = {
+            // Reachable from `Drop`: a poisoned lock must not panic there.
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let st = &mut *guard;
+            let removed: Vec<CacheEntry<V>> = st
+                .entries
+                .extract_if(|key, _| doomed(key))
+                .map(|(_, entry)| entry)
+                .collect();
+            st.total_bytes -= removed.iter().map(|entry| entry.bytes).sum::<usize>();
+            let entries = &st.entries;
+            st.recency
+                .compact(entries.len(), |k| entries.get(k).map(|e| e.stamp));
+            removed
+        };
+        release_and_free(removed);
+    }
+
+    /// Bytes held by the entries `selected` picks. O(entries).
+    fn resident_bytes_where(&self, selected: impl Fn(&K) -> bool) -> usize {
+        let st = self.state.lock().unwrap();
+        st.entries
+            .iter()
+            .filter(|(key, _)| selected(key))
+            .map(|(_, entry)| entry.bytes)
+            .sum()
+    }
+}
+
+/// Free entries taken out of a cache, then release their bytes with one
+/// call per distinct account (dropping thousands of entries notifies the
+/// ledger once). Call with the cache lock released.
+fn release_and_free<V>(gone: Vec<CacheEntry<V>>) {
+    let mut totals: Vec<(SharedAccount, u64)> = Vec::new();
+    for entry in gone {
+        let Some(account) = entry.account else {
+            continue;
+        };
+        match totals.iter_mut().find(|(a, _)| Arc::ptr_eq(a, &account)) {
+            Some((_, total)) => *total += entry.bytes as u64,
+            None => totals.push((account, entry.bytes as u64)),
+        }
+    }
+    for (account, total) in totals {
+        if total > 0 {
+            account.release_postings(total);
         }
     }
 }
 
-impl<V> Drop for PostingsCache<V> {
+impl<K, V> Drop for PostingsCache<K, V> {
     fn drop(&mut self) {
-        // Release whatever this segment's postings cache still holds to the
-        // live-bytes account, so `MemoryLedger::live` stays truthful as the
-        // owning `SegmentReader` (and its caches) go away — see the trait
-        // doc. Snapshot under the lock, report outside (same lock-order
-        // discipline as `insert`).
-        let total: u64 = self
-            .state
-            .lock()
-            .unwrap()
-            .total_bytes
-            .try_into()
-            .unwrap_or(0);
-        if total > 0 {
-            if let Some(account) = &self.account {
-                account.release_postings(total);
-            }
-        }
+        // Release whatever this cache still holds to the live-bytes
+        // accounts, so `MemoryLedger::live` stays truthful as the owning
+        // `SegmentReader` (and its caches) go away — see the trait doc.
+        // Taken under the lock, reported outside it (same lock-order
+        // discipline as `insert_for`).
+        let gone: Vec<CacheEntry<V>> = {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.entries.drain().map(|(_, entry)| entry).collect()
+        };
+        release_and_free(gone);
     }
 }
 
@@ -6135,8 +6455,14 @@ pub struct DocMetaRef<'a> {
 /// same rule per file: `filters.toc` and each `filters-NNN.col` is cached
 /// only once a read found it present. A query node hydrates only the
 /// columns its queries touch, so [`Self::store_for`] adds columns to the
-/// cached compatibility [`FilterStore`] as they land, and a column that
-/// is still missing is simply retried on the next call.
+/// cached compatibility [`FilterStore`] as they land.
+///
+/// A filter file the footer says exists but that is not on local disk
+/// (never hydrated, or evicted from the disk cache) is an error, never "no
+/// values": read as empty, a `matterId` filter matched nothing in the
+/// segment, and the searcher's per-segment filter-set cache then kept that
+/// empty answer after the file came back. The error is not cached either,
+/// so the next call reads the disk again.
 struct LazyFilters {
     segment_dir: PathBuf,
     doc_count: u32,
@@ -6173,52 +6499,47 @@ impl LazyFilters {
     /// bytes resident.)
     ///
     /// Only a read that finds the file *present* is cached. A read that
-    /// finds it missing/empty returns a fresh (empty) store for that one
-    /// call but leaves the cache unset, so the *next* call re-reads from
-    /// disk — self-healing once hydration actually lands, instead of
-    /// permanently committing to whatever the first, possibly-premature,
-    /// read happened to see. The writer always emits filters.bin (even
-    /// with zero fields, the header is present), so an empty raw read is
-    /// unambiguously "file isn't local yet," never "this segment has no
-    /// filterable fields" — a genuinely field-less segment's file is
+    /// finds it missing/empty is an error for that one call and leaves the
+    /// cache unset, so the *next* call re-reads from disk — self-healing
+    /// once hydration actually lands. The writer always emits filters.bin
+    /// (even with zero fields, the header is present), so an empty raw
+    /// read is unambiguously "file isn't local," never "this segment has
+    /// no filterable fields" — a genuinely field-less segment's file is
     /// non-empty (just a zero-entry header) and caches normally on first
-    /// read, so this retry loop only ever runs during the brief hydration
-    /// race, not on every query against a filter-less segment.
+    /// read.
     fn legacy(&self, state: &mut FilterState) -> Result<Arc<FilterStore>, KoshaError> {
         if let Some(store) = state.legacy.as_ref() {
             return Ok(Arc::clone(store));
         }
         let raw = SegmentReader::read_filters_raw(&self.segment_dir);
         if raw.is_empty() {
-            eprintln!(
-                "WARN: filters.bin missing/empty at first use for {} — filtered queries against this segment will match nothing until it hydrates; retrying on next use",
-                self.segment_dir.display()
-            );
-            // Deliberately not cached — leave `state.legacy` as `None` so
-            // the next call re-reads instead of trusting this premature
-            // empty parse forever.
-            return Ok(Arc::new(SegmentReader::parse_filters(&raw)?));
+            // Not cached: `state.legacy` stays `None`, so the next call
+            // re-reads once hydration lands the file.
+            return Err(self.not_local(kosha_core::FILTERS_BIN_FILE));
         }
         let store = Arc::new(SegmentReader::parse_filters(&raw)?);
         state.legacy = Some(Arc::clone(&store));
         Ok(store)
     }
 
-    /// `filters.toc`, or `None` while it is not local (not cached).
-    fn toc(
-        &self,
-        state: &mut FilterState,
-    ) -> Result<Option<Arc<filter_columns::FiltersToc>>, KoshaError> {
+    /// The error for a filter file the footer lists but that is not on
+    /// local disk. See the type's doc comment.
+    fn not_local(&self, file: &str) -> KoshaError {
+        KoshaError::NotFound(format!(
+            "{}/{file}: filter file not local (not hydrated, or evicted from the disk cache); \
+             the filter cannot be evaluated",
+            self.segment_dir.display()
+        ))
+    }
+
+    /// `filters.toc`; an error while it is not local (not cached).
+    fn toc(&self, state: &mut FilterState) -> Result<Arc<filter_columns::FiltersToc>, KoshaError> {
         if let Some(toc) = state.toc.as_ref() {
-            return Ok(Some(Arc::clone(toc)));
+            return Ok(Arc::clone(toc));
         }
         let path = self.segment_dir.join(kosha_core::FILTERS_TOC_FILE);
         let Some(bytes) = filter_columns::read_present(&path)? else {
-            eprintln!(
-                "WARN: filters.toc missing/empty at first use for {} — filtered queries against this segment will match nothing until it hydrates; retrying on next use",
-                self.segment_dir.display()
-            );
-            return Ok(None);
+            return Err(self.not_local(kosha_core::FILTERS_TOC_FILE));
         };
         let toc = filter_columns::FiltersToc::decode(&bytes).map_err(|e| {
             KoshaError::CorruptSegment(format!("{}: {e}", self.segment_dir.display()))
@@ -6233,27 +6554,27 @@ impl LazyFilters {
         }
         let toc = Arc::new(toc);
         state.toc = Some(Arc::clone(&toc));
-        Ok(Some(toc))
+        Ok(toc)
     }
 
-    /// Read and decode one column file; `Ok(None)` while it is not local.
-    /// A present but damaged file is an error: it fails the query rather
-    /// than quietly matching nothing.
+    /// Read and decode one column file. Not local, or present but damaged,
+    /// is an error: it fails the query rather than quietly matching nothing.
     fn read_column(
         &self,
         meta: &kosha_core::FilterColumnMeta,
-    ) -> Result<Option<filter_columns::FilterColumn>, KoshaError> {
+    ) -> Result<filter_columns::FilterColumn, KoshaError> {
         let file = meta.file_name();
         let Some(bytes) = filter_columns::read_present(&self.segment_dir.join(&file))? else {
-            return Ok(None);
+            return Err(self.not_local(&file));
         };
         let what = format!("{}/{file} ({:?})", self.segment_dir.display(), meta.name);
-        filter_columns::decode_column(&bytes, meta.kind, self.doc_count, &what).map(Some)
+        filter_columns::decode_column(&bytes, meta.kind, self.doc_count, &what)
     }
 
     /// The compatibility [`FilterStore`] holding at least every column
-    /// named in `fields` (all columns for `None`) that is local. Legacy
-    /// segments ignore `fields`: `filters.bin` holds every column.
+    /// named in `fields` (all columns for `None`); an error when one of
+    /// them is not local. Legacy segments ignore `fields`: `filters.bin`
+    /// holds every column.
     fn store_for(
         &self,
         fields: Option<&std::collections::BTreeSet<String>>,
@@ -6262,9 +6583,7 @@ impl LazyFilters {
         if !self.columnar {
             return self.legacy(&mut state);
         }
-        let Some(toc) = self.toc(&mut state)? else {
-            return Ok(Arc::new(FilterStore::default()));
-        };
+        let toc = self.toc(&mut state)?;
         let wanted: Vec<&kosha_core::FilterColumnMeta> = toc
             .columns
             .iter()
@@ -6274,21 +6593,10 @@ impl LazyFilters {
         if wanted.is_empty() {
             return Ok(Arc::clone(&state.merged));
         }
-        let mut loaded = Vec::new();
-        for meta in wanted {
-            match self.read_column(meta)? {
-                Some(column) => loaded.push((meta, column)),
-                None => eprintln!(
-                    "WARN: filter column {} ({:?}) missing at use for {} — filters on it match nothing until it hydrates; retrying on next use",
-                    meta.file_name(),
-                    meta.name,
-                    self.segment_dir.display()
-                ),
-            }
-        }
-        if loaded.is_empty() {
-            return Ok(Arc::clone(&state.merged));
-        }
+        let loaded = wanted
+            .into_iter()
+            .map(|meta| Ok((meta, self.read_column(meta)?)))
+            .collect::<Result<Vec<_>, KoshaError>>()?;
         // Copy-on-grow: readers holding the previous Arc keep it. Rare —
         // only when a query touches a column this segment has not loaded.
         let mut store = (*state.merged).clone();
@@ -6301,7 +6609,7 @@ impl LazyFilters {
     }
 
     /// One column, decoded and cached. `Ok(None)` when the segment has no
-    /// such column, or (columnar) its file is not local yet — not cached.
+    /// such column; an error (not cached) when its file is not local.
     fn column(
         &self,
         name: &str,
@@ -6314,16 +6622,11 @@ impl LazyFilters {
             return Ok(Some(Arc::clone(column)));
         }
         let column = if self.columnar {
-            let Some(toc) = self.toc(&mut state)? else {
-                return Ok(None);
-            };
+            let toc = self.toc(&mut state)?;
             let Some(meta) = toc.find(name, kind) else {
                 return Ok(None);
             };
-            match self.read_column(meta)? {
-                Some(column) => column,
-                None => return Ok(None),
-            }
+            self.read_column(meta)?
         } else {
             let store = self.legacy(&mut state)?;
             let column = match kind {
@@ -6342,8 +6645,8 @@ impl LazyFilters {
                     .map(|e| FilterColumn::Float(NumericColumn::from_entries(e))),
             };
             match column {
-                Some(column) if state.legacy.is_some() => column,
-                _ => return Ok(None),
+                Some(column) => column,
+                None => return Ok(None),
             }
         };
         let column = Arc::new(column);
@@ -7098,17 +7401,21 @@ pub struct SegmentReader {
     /// The segment's vector columns (#204), empty unless opened with
     /// `load_vectors`. Each is loaded on first use.
     vector_slots: Vec<VectorFieldSlot>,
-    /// Decoded vector postings LRU shared by every column, keyed by
-    /// `(slot, range index)` — the vector twin of the text path's
-    /// per-segment [`PostingsCache`]. Without it every kNN query re-reads
-    /// and re-decodes its `nprobe` candidate postings from `vector.idx`,
-    /// even when the segment itself is warm in the `SegmentCache` —
-    /// hydration I/O + decode was the dominant warm-path cost. Entries are
-    /// `Arc`s (hit = pointer clone) and resident bytes report to the same
-    /// live-bytes account as text postings. One cache per segment keeps
-    /// `KOSHA_VECTOR_POSTINGS_CACHE_MAX_BYTES` a per-segment budget however
-    /// many columns there are.
-    vector_cache: PostingsCache<SharedVectorPosting>,
+    /// Decoded vector postings LRU: the process-wide
+    /// [`shared_vector_cache`], keyed by `(vector_cache_owner, slot, range
+    /// index)` — the vector twin of the text path's per-segment
+    /// [`PostingsCache`]. Without it every kNN query re-reads and
+    /// re-decodes its `nprobe` candidate postings from `vector.idx`, even
+    /// when the segment itself is warm in the `SegmentCache` — hydration
+    /// I/O + decode was the dominant warm-path cost. Entries are `Arc`s
+    /// (hit = pointer clone) and resident bytes report to
+    /// `postings_account`, the same live-bytes account as text postings.
+    /// This segment's entries leave the cache when it drops.
+    vector_cache: Arc<VectorPostingsCache>,
+    /// This reader's part of the vector cache's key, unique per process.
+    vector_cache_owner: u64,
+    /// Live-bytes account this segment's vector cache entries report to.
+    postings_account: Option<SharedAccount>,
     /// Parsed `doc_vectors.bin` header, loaded on first doc-record read of a
     /// segment whose footer sets `doc_vectors` (#243). Only success is
     /// cached: the file may be hydrated after the segment was opened.
@@ -7146,9 +7453,45 @@ pub fn vector_rescore_factor() -> usize {
 
 const DEFAULT_VECTOR_RESCORE_FACTOR: usize = 4;
 
-/// Posting-cache key for `range_idx` of the column at `slot`.
-fn vector_cache_key(slot: u32, range_idx: usize) -> usize {
-    ((slot as u64) << 32 | range_idx as u64) as usize
+/// Decoded vector postings of every open segment, under one budget (see
+/// [`vector_postings_cache_max_bytes`]).
+type VectorPostingsCache = PostingsCache<(u64, usize), SharedVectorPosting>;
+
+/// The process-wide vector postings cache every [`SegmentReader`] uses.
+fn shared_vector_cache() -> Arc<VectorPostingsCache> {
+    static CACHE: OnceLock<Arc<VectorPostingsCache>> = OnceLock::new();
+    Arc::clone(
+        CACHE.get_or_init(|| Arc::new(PostingsCache::new(vector_postings_cache_max_bytes(), None))),
+    )
+}
+
+/// A new [`SegmentReader::vector_cache_owner`].
+fn next_vector_cache_owner() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+impl SegmentReader {
+    /// Vector cache key for `range_idx` of the column at `slot`.
+    fn vector_cache_key(&self, slot: u32, range_idx: usize) -> (u64, usize) {
+        (
+            self.vector_cache_owner,
+            ((slot as u64) << 32 | range_idx as u64) as usize,
+        )
+    }
+}
+
+impl Drop for SegmentReader {
+    fn drop(&mut self) {
+        // The shared cache outlives this reader: take its entries (and
+        // their live bytes) out with it. O(entries), so skipped for the
+        // (many) readers opened without vectors, which never insert.
+        if self.vector_slots.is_empty() {
+            return;
+        }
+        let owner = self.vector_cache_owner;
+        self.vector_cache.remove_where(|(o, _)| *o == owner);
+    }
 }
 
 impl SegmentReader {
@@ -7220,7 +7563,9 @@ impl SegmentReader {
             inverted: Self::read_inverted(&segment_dir, postings_account.clone(), posting_spans)?,
             filters,
             vector_slots,
-            vector_cache: PostingsCache::new(vector_postings_cache_max_bytes(), postings_account),
+            vector_cache: shared_vector_cache(),
+            vector_cache_owner: next_vector_cache_owner(),
+            postings_account,
             doc_vectors: Mutex::new(None),
             field_lengths: Mutex::new(HashMap::new()),
             vector_rescore_factor: vector_rescore_factor(),
@@ -7324,7 +7669,8 @@ impl SegmentReader {
     /// Bytes the decoded vector-posting cache holds right now (#210
     /// measurement; also what it reports to the live-bytes account).
     pub fn vector_cache_resident_bytes(&self) -> usize {
-        self.vector_cache.state.lock().unwrap().total_bytes
+        let owner = self.vector_cache_owner;
+        self.vector_cache.resident_bytes_where(|(o, _)| *o == owner)
     }
 
     /// The vector columns `footer` declares, or the single unnamed legacy
@@ -7459,12 +7805,21 @@ impl SegmentReader {
     /// is corruption and fails loudly: returning the empty value would let
     /// a compaction write the document out without its vector.
     fn sidecar_vectors(&self, record: &DocRecord) -> Result<Vec<(usize, Vec<f32>)>, KoshaError> {
+        self.sidecar_vectors_reusing(record, &mut None)
+    }
+
+    /// [`Self::sidecar_vectors`] keeping the span listing in `spans`.
+    fn sidecar_vectors_reusing(
+        &self,
+        record: &DocRecord,
+        spans: &mut Option<span_cache::SpanIndex>,
+    ) -> Result<Vec<(usize, Vec<f32>)>, KoshaError> {
         let is_placeholder = |f: &Field| f.field_type == FieldType::Vector && f.value.is_empty();
         if !self.footer.doc_vectors || !record.fields.iter().any(is_placeholder) {
             return Ok(Vec::new());
         }
         let dv = self.doc_vectors()?;
-        let mut stored = dv.vectors_for(record.doc_seq)?.into_iter();
+        let mut stored = dv.vectors_for_reusing(record.doc_seq, spans)?.into_iter();
         let mut out = Vec::new();
         for (index, field) in record.fields.iter().enumerate() {
             if !is_placeholder(field) {
@@ -7866,7 +8221,7 @@ impl SegmentReader {
     ) -> Result<(), KoshaError> {
         let vi = scan.vi;
         let centroid = vi.centroid(range_idx);
-        let key = vector_cache_key(vi.slot, range_idx);
+        let key = self.vector_cache_key(vi.slot, range_idx);
         let mut clock = scan.clock();
         if let Some(hit) = self.vector_cache.get(key) {
             hit.for_each_similarity(scan.accept, f32_similarity, &scan.probe, centroid, emit);
@@ -7890,11 +8245,13 @@ impl SegmentReader {
                 ))
             })?;
         scan.stats.read_nanos += lap_nanos(&mut clock);
-        // Second-touch admission, same as text postings: one-shot probes
-        // (a cold namespace scanned once) pass through without evicting a
-        // hot working set; recurring probes get cached on their second
-        // hydration.
-        let admit = self.vector_cache.admit_on_miss(key);
+        // Second-touch admission, as for text postings, over a history as
+        // long as the cache's reach (see `vector_miss_window`): one-shot
+        // probes (a cold namespace scanned once) pass through without
+        // evicting a hot working set; probes that recur across queries get
+        // cached on their second hydration, however many one query makes.
+        let window = self.vector_cache.vector_miss_window(bytes.len());
+        let admit = self.vector_cache.admit_on_miss_within(key, window);
         if !vi.quantized {
             let count = bytes.len() / vector_entry_size(vi.dim as u32, vi.version);
             let keep = admit
@@ -7920,7 +8277,12 @@ impl SegmentReader {
         let decoded = Arc::new(decode_posting_entries(bytes, vi.dim as u32, vi.version));
         if admit {
             let bytes = decoded.resident_bytes();
-            self.vector_cache.insert(key, Arc::clone(&decoded), bytes);
+            self.vector_cache.insert_for(
+                key,
+                Arc::clone(&decoded),
+                bytes,
+                self.postings_account.as_ref(),
+            );
         }
         scan.stats.decode_nanos += lap_nanos(&mut clock);
         decoded.for_each_similarity(scan.accept, f32_similarity, &scan.probe, centroid, emit);
@@ -8010,8 +8372,7 @@ impl SegmentReader {
                 || whole_len >= end
                 || self
                     .vector_cache
-                    .get(vector_cache_key(vi.slot, i))
-                    .is_some()
+                    .contains(self.vector_cache_key(vi.slot, i))
             {
                 continue;
             }
@@ -8544,8 +8905,10 @@ impl SegmentReader {
     /// postings full of documents the filter throws away, and keep going
     /// outward until it has found `k` that pass.
     ///
-    /// Vectors are read from `doc_vectors.bin` (#243) when the segment has
-    /// it locally and it holds `field`; otherwise every posting of the
+    /// Vectors are read from `doc_vectors.bin` (#243) when it holds
+    /// `field` and is local — the whole file, or its header with the
+    /// candidates' ranges fetched through `fetch` (see
+    /// [`Self::knn_exact_from_sidecar`]); otherwise every posting of the
     /// column is hydrated and filtered (the only way to see every vector
     /// of a segment that stores them inline). Scores are the posting
     /// probe's: cosine similarity, which on the sidecar's raw vectors is
@@ -8590,43 +8953,8 @@ impl SegmentReader {
                 source: ExactKnnSource::Sidecar,
             }));
         }
-        if self.footer.doc_vectors && self.segment_dir.join(DOC_VECTORS_FILE).exists() {
-            match self.doc_vectors() {
-                Ok(dv) if dv.has_field(field) => {
-                    let mut scored: Vec<(u32, f64)> = Vec::with_capacity(candidates.len());
-                    let visited = dv.visit_field_vectors(field, candidates, |doc_seq, v| {
-                        // A stray vector of another dimension was never
-                        // indexed (see `SegmentWriter::unindexed_vectors`),
-                        // so it is not a candidate on the probe path either.
-                        if v.len() == query.len() {
-                            scored.push((
-                                doc_seq,
-                                kosha_vector_spfresh::cosine_similarity(query, v) as f64,
-                            ));
-                        }
-                    });
-                    match visited {
-                        Ok(_) => {
-                            let vectors_scored = scored.len();
-                            return Some(Ok(ExactKnnResult {
-                                hits: top_k_by_score(scored, k),
-                                vectors_scored,
-                                postings_hydrated: 0,
-                                source: ExactKnnSource::Sidecar,
-                            }));
-                        }
-                        Err(e) => eprintln!(
-                            "WARN: exact kNN could not read {DOC_VECTORS_FILE} of {}: {e} — scoring from vector postings instead",
-                            self.segment_dir.display()
-                        ),
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => eprintln!(
-                    "WARN: exact kNN could not open {DOC_VECTORS_FILE} of {}: {e} — scoring from vector postings instead",
-                    self.segment_dir.display()
-                ),
-            }
+        if let Some(result) = self.knn_exact_from_sidecar(field, query, k, candidates, fetch) {
+            return Some(Ok(result));
         }
         // No usable sidecar: every posting, filtered while it is scored.
         self.prefetch_vector_postings(vi, 0..vi.ranges.len(), fetch);
@@ -8661,6 +8989,120 @@ impl SegmentReader {
             postings_hydrated: vi.ranges.len(),
             source: ExactKnnSource::Postings,
         }))
+    }
+
+    /// [`Self::knn_exact_filtered_fetching`]'s sidecar path: every
+    /// candidate's `field` vector from `doc_vectors.bin`, scored exactly.
+    ///
+    /// Read from the whole local file when it is there, otherwise — header
+    /// local (whole file or cached header span) — from the candidates'
+    /// ranges in the span cache, fetching the missing ones through `fetch`
+    /// first. Both read the same bytes and score them with the same
+    /// function in the same order, so the hits are identical either way: a
+    /// query node need not hold the whole file (as large as the f32 vector
+    /// index) to answer exactly.
+    ///
+    /// `None` sends the caller to the postings: the segment stores vectors
+    /// inline, the sidecar holds no `field`, its header is not local, or a
+    /// read failed (logged).
+    fn knn_exact_from_sidecar(
+        &self,
+        field: &str,
+        query: &[f32],
+        k: usize,
+        candidates: &[u32],
+        fetch: Option<VectorSpanFetch<'_>>,
+    ) -> Option<ExactKnnResult> {
+        if !self.footer.doc_vectors {
+            return None;
+        }
+        let whole = self.segment_dir.join(DOC_VECTORS_FILE).exists();
+        let dv = if whole {
+            match self.doc_vectors() {
+                Ok(dv) => dv,
+                Err(e) => {
+                    eprintln!(
+                        "WARN: exact kNN could not open {DOC_VECTORS_FILE} of {}: {e} — scoring from vector postings instead",
+                        self.segment_dir.display()
+                    );
+                    return None;
+                }
+            }
+        } else {
+            match self.local_doc_vectors() {
+                Some(dv) => dv,
+                None => {
+                    // Rare: the scoring hydration fetches the header for a
+                    // filtered kNN (best-effort), so this is a shed or
+                    // failed fetch, or a caller without hydration.
+                    eprintln!(
+                        "WARN: exact kNN on '{field}' in {}: {DOC_VECTORS_FILE} header not local \
+                         (not hydrated, or its fetch failed) — scoring all {} vector postings \
+                         instead of {} candidate vectors",
+                        self.segment_dir.display(),
+                        self.vector_field(field)
+                            .ok()
+                            .flatten()
+                            .and_then(|index| index.lazy.as_ref().map(|vi| vi.ranges.len()))
+                            .unwrap_or(0),
+                        candidates.len()
+                    );
+                    return None;
+                }
+            }
+        };
+        if !dv.has_field(field) {
+            return None;
+        }
+        let mut scored: Vec<(u32, f64)> = Vec::with_capacity(candidates.len());
+        // A stray vector of another dimension was never indexed (see
+        // `SegmentWriter::unindexed_vectors`), so it is not a candidate on
+        // the probe path either.
+        let score = |doc_seq: u32, v: &[f32]| {
+            if v.len() == query.len() {
+                scored.push((
+                    doc_seq,
+                    kosha_vector_spfresh::cosine_similarity(query, v) as f64,
+                ));
+            }
+        };
+        let visited = if whole {
+            dv.visit_field_vectors(field, candidates, score)
+        } else {
+            let ranges = dv.field_vector_ranges(field, candidates);
+            let mut spans = span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE);
+            if let Some(fetch) = fetch {
+                let missing: Vec<(u64, u64)> = ranges
+                    .iter()
+                    .copied()
+                    .filter(|&(start, end)| !spans.covers(start, end))
+                    .collect();
+                if !missing.is_empty() {
+                    fetch(&self.segment_dir, DOC_VECTORS_FILE, &missing);
+                    spans = span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE);
+                }
+            }
+            dv.visit_field_vectors_cached(&spans, field, candidates, score)
+        };
+        match visited {
+            Ok(_) => {
+                let vectors_scored = scored.len();
+                Some(ExactKnnResult {
+                    hits: top_k_by_score(scored, k),
+                    vectors_scored,
+                    postings_hydrated: 0,
+                    source: ExactKnnSource::Sidecar,
+                })
+            }
+            Err(e) => {
+                eprintln!(
+                    "WARN: exact kNN could not read {DOC_VECTORS_FILE} of {} ({}): {e} — scoring from vector postings instead",
+                    self.segment_dir.display(),
+                    if whole { "whole file" } else { "cached ranges" },
+                );
+                None
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9049,9 +9491,11 @@ impl SegmentReader {
     }
 
     /// The segment's filter columns, parsed on first use (see
-    /// [`LazyFilters`]). Queries without filters/aggregations/field sorts
-    /// never call this, and never pay the parse.
-    pub fn filter_store(&self) -> Arc<FilterStore> {
+    /// [`LazyFilters`]); an unreadable store logs and reads as empty, so
+    /// only tests use it. Search and admin paths use the fallible
+    /// [`Self::filter_store_for`] / [`Self::try_filter_store`].
+    #[cfg(test)]
+    fn filter_store(&self) -> Arc<FilterStore> {
         self.try_filter_store().unwrap_or_else(|e| {
             eprintln!(
                 "ERROR: filter columns of {} unreadable: {e}",
@@ -9061,9 +9505,9 @@ impl SegmentReader {
         })
     }
 
-    /// [`Self::filter_store`] that reports a damaged columnar filter file
-    /// (#244) as an error instead of an empty store. Callers that filter,
-    /// sort or aggregate use this so corruption fails the request closed.
+    /// Every filter column of the segment. A damaged (#244) or not-local
+    /// filter file is an error, never an empty store, so the request fails
+    /// closed.
     pub fn try_filter_store(&self) -> Result<Arc<FilterStore>, KoshaError> {
         self.filters.store_for(None)
     }
@@ -9089,9 +9533,9 @@ impl SegmentReader {
 
     /// One filter column, decoded on first use and cached (#244). Works on
     /// both formats: a legacy segment builds it from `filters.bin`.
-    /// `Ok(None)` when the segment has no such column or its file is not
-    /// local yet (a missing file is never cached, so a later call sees it
-    /// once hydrated). `Err` when the file is present but damaged.
+    /// `Ok(None)` when the segment has no such column. `Err` when its file
+    /// is not local (never cached, so a later call sees it once hydrated)
+    /// or is present but damaged.
     pub fn filter_column(
         &self,
         field: &str,
@@ -9282,15 +9726,56 @@ impl SegmentReader {
     /// disk for `Lazy` segments — use only for documents actually being
     /// materialized into a response, not during scoring.
     pub fn doc_record_full(&self, doc_seq: u32) -> Result<Option<DocRecord>, KoshaError> {
-        let mut record = self.doc_record_stored(doc_seq)?;
-        if let Some(record) = record.as_mut() {
-            self.fill_doc_vectors(record)?;
+        self.page_doc_record(doc_seq, true, &mut PageSpans::default())
+    }
+
+    /// [`Self::doc_record_full`] for one document of a result page:
+    /// span-cache listings are kept in `spans` across the page's documents
+    /// of this segment (one listing per file per page, not per document),
+    /// and with `vectors` false the sidecar vectors are not read at all —
+    /// their `Vector` fields stay empty placeholders, for a page whose
+    /// `_source` returns none of them (see [`Self::page_reads_doc_vectors`]).
+    pub fn page_doc_record(
+        &self,
+        doc_seq: u32,
+        vectors: bool,
+        spans: &mut PageSpans,
+    ) -> Result<Option<DocRecord>, KoshaError> {
+        let mut record = self.doc_record_stored_reusing(doc_seq, &mut spans.doc_store)?;
+        if let Some(record) = record.as_mut().filter(|_| vectors) {
+            for (index, vector) in self.sidecar_vectors_reusing(record, &mut spans.doc_vectors)? {
+                record.fields[index].value = serde_json::to_string(&vector)?;
+            }
         }
         Ok(record)
     }
 
+    /// Whether a result page returning the fields `returns` keeps needs this
+    /// segment's sidecar vectors: some `Vector` field it stores in
+    /// `doc_vectors.bin` is returned. Only single-vector fields go there,
+    /// each with a column in the footer (a bag stays inline), so the
+    /// footer's column names cover the sidecar's; a legacy footer that
+    /// lists none cannot say, so it reads them. `false` without a sidecar.
+    pub fn page_reads_doc_vectors(&self, returns: impl Fn(&str) -> bool) -> bool {
+        self.footer.doc_vectors
+            && self
+                .footer
+                .vector_fields
+                .as_ref()
+                .is_none_or(|cols| cols.iter().any(|c| returns(&c.name)))
+    }
+
     /// The record as stored in `doc_store.bin`, vector placeholders and all.
     fn doc_record_stored(&self, doc_seq: u32) -> Result<Option<DocRecord>, KoshaError> {
+        self.doc_record_stored_reusing(doc_seq, &mut None)
+    }
+
+    /// [`Self::doc_record_stored`] keeping the span listing in `spans`.
+    fn doc_record_stored_reusing(
+        &self,
+        doc_seq: u32,
+        spans: &mut Option<span_cache::SpanIndex>,
+    ) -> Result<Option<DocRecord>, KoshaError> {
         match &self.doc_store {
             DocStoreAccess::Eager(records) => Ok(records.get(doc_seq as usize).cloned()),
             DocStoreAccess::Lazy {
@@ -9304,12 +9789,13 @@ impl SegmentReader {
                 // The whole file when it is complete, else the sparse span
                 // cache (#245). Neither → the plain read below, which fails
                 // with the same IO error as before spans existed.
-                let buf = match span_cache::read_local_range(
+                let buf = match span_cache::read_local_range_reusing(
                     &self.segment_dir,
                     DOC_STORE_FILE,
                     index.complete_len(),
                     entry.offset,
                     entry.length as u64,
+                    spans,
                 ) {
                     Some(buf) => buf,
                     None => {
@@ -9381,24 +9867,34 @@ impl SegmentReader {
     /// bytes. Out-of-range `doc_seq`s are "local" (there is nothing to
     /// fetch; `doc_record_full` returns `None`).
     pub fn doc_is_local(&self, doc_seq: u32) -> bool {
-        if self.has_local_doc_store() {
-            return true;
-        }
+        self.page_doc_is_local(doc_seq, true, &mut PageSpans::default())
+    }
+
+    /// [`Self::doc_is_local`] for one document of a result page, keeping
+    /// span listings in `spans` across the page's documents of this
+    /// segment. With `vectors` false (the page returns no sidecar field,
+    /// see [`Self::page_reads_doc_vectors`]) only the record must be local.
+    pub fn page_doc_is_local(&self, doc_seq: u32, vectors: bool, spans: &mut PageSpans) -> bool {
+        let vectors = vectors && self.footer.doc_vectors;
         let DocStoreAccess::Lazy { index, .. } = &self.doc_store else {
-            // Eager record, but a sidecar whose file is absent.
-            return false;
+            // Eager record: local; its vectors only with the whole sidecar.
+            return !vectors || self.has_local_doc_store();
         };
         let Some(entry) = index.entries.get(doc_seq as usize) else {
             return true;
         };
         let record_local =
             file_is_complete(&self.segment_dir.join(DOC_STORE_FILE), index.complete_len())
-                || span_cache::SpanIndex::load(&self.segment_dir, DOC_STORE_FILE)
+                || spans
+                    .doc_store
+                    .get_or_insert_with(|| {
+                        span_cache::SpanIndex::load(&self.segment_dir, DOC_STORE_FILE)
+                    })
                     .covers(entry.offset, entry.offset + entry.length as u64);
         if !record_local {
             return false;
         }
-        if !self.footer.doc_vectors {
+        if !vectors {
             return true;
         }
         let Some(dv) = self.local_doc_vectors() else {
@@ -9408,7 +9904,11 @@ impl SegmentReader {
             None => true,
             Some((start, end)) => {
                 file_is_complete(&self.segment_dir.join(DOC_VECTORS_FILE), dv.file_len())
-                    || span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE)
+                    || spans
+                        .doc_vectors
+                        .get_or_insert_with(|| {
+                            span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE)
+                        })
                         .covers(start, end)
             }
         }
@@ -9844,35 +10344,28 @@ impl SegmentReader {
         })
     }
 
-    /// Raw bytes of `filters.bin` — empty when the file is absent (a
-    /// segment with no filter fields). Parsing is deferred to first use;
-    /// see [`LazyFilters`].
+    /// Raw bytes of `filters.bin` — empty when the file is not local (the
+    /// writer always emits at least its 4-byte header). Parsing is
+    /// deferred to first use; see [`LazyFilters`].
     fn read_filters_raw(segment_dir: &Path) -> Vec<u8> {
         fs::read(segment_dir.join("filters.bin")).unwrap_or_default()
     }
 
     /// Eagerly read every filter column, in whichever format `footer`
     /// says the segment uses — for the bloom-rewrite admin path, which
-    /// always needs the parsed form. A columnar segment must have its TOC
-    /// and every column local; a missing one is an error here (a rebuilt
-    /// bloom must not silently drop a field).
+    /// always needs the parsed form. Every filter file must be local; a
+    /// missing one is an error here (a rebuilt bloom must not silently
+    /// drop a field, or prune the segment from every filtered query).
     fn read_filters_any(segment_dir: &Path, footer: &Footer) -> Result<FilterStore, KoshaError> {
-        if footer.filter_columns.is_none() {
-            return Self::parse_filters(&Self::read_filters_raw(segment_dir));
-        }
         let filters = LazyFilters {
             segment_dir: segment_dir.to_path_buf(),
             doc_count: footer.doc_count,
-            columnar: true,
+            columnar: footer.filter_columns.is_some(),
             state: Mutex::new(FilterState::default()),
         };
-        if !filter_columns::filter_files_present(segment_dir, footer) {
-            return Err(KoshaError::NotFound(format!(
-                "{}: columnar filter files not all local",
-                segment_dir.display()
-            )));
-        }
-        Ok((*filters.store_for(None)?).clone())
+        let store = filters.store_for(None)?;
+        drop(filters);
+        Ok(Arc::unwrap_or_clone(store))
     }
 
     /// Parse filter columns from raw `filters.bin` bytes. Empty/short input
@@ -10250,47 +10743,10 @@ fn parse_doc_index_bytes(
 
 // ─── Atomic file rewrite ────────────────────────────────────────────────────
 
-/// Overwrite `path` atomically: write to a sibling temp file, then `rename`
-/// over the destination. POSIX (and Windows, via `MoveFileEx`-equivalent
-/// semantics `std::fs::rename` uses) guarantees a rename within the same
-/// directory is atomic — a concurrent reader always sees either the old
-/// complete file or the new complete one, never a truncated/partial one.
-///
-/// This matters specifically for files that get rewritten *in place* on a
-/// segment that's already published and actively being searched (unlike the
-/// original write during segment build, which completes before the segment
-/// is registered in the manifest and so can never race a reader). Plain
-/// `fs::write` truncates the destination before filling it back in, so a
-/// reader landing in that window sees a short read — for `footer.json` that
-/// surfaces as `serde_json` failing with "EOF while parsing a value" on an
-/// in-flight search.
-///
-/// The temp filename includes the PID and a per-process atomic counter so
-/// concurrent rewrites of the *same* file (e.g. two overlapping admin
-/// requests) never collide on the same temp path.
-fn atomic_write(path: &Path, data: &[u8]) -> Result<(), KoshaError> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let dir = path.parent().ok_or_else(|| {
-        KoshaError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("atomic_write: {} has no parent directory", path.display()),
-        ))
-    })?;
-    let file_name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
-        KoshaError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("atomic_write: {} has no file name", path.display()),
-        ))
-    })?;
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp_path = dir.join(format!(".{file_name}.tmp.{}.{n}", std::process::id()));
-
-    fs::write(&tmp_path, data)?;
-    fs::rename(&tmp_path, path)?;
-    Ok(())
-}
+// Footer and offsets rewrites on a published segment go through
+// `kosha_core::atomic_write` (temp file + rename): a search reading the
+// segment concurrently sees the old or the new file, never a short one.
+use kosha_core::atomic_write;
 
 // ─── Binary read helpers ────────────────────────────────────────────────────
 
@@ -14428,11 +14884,19 @@ mod filter_column_format_tests {
         assert!(store.integer_fields.is_empty());
 
         // A later query touches `pages`, whose column lands afterwards: the
-        // missing read is not cached, and the store grows once it is local.
-        let missing = r.filter_store_for(&fields(&["matterId", "pages"])).unwrap();
-        assert!(!missing.integer_fields.contains_key("pages"));
+        // read while it is not local is an error (never "no values"), is
+        // not cached, and the store grows once it is local.
+        assert!(matches!(
+            r.filter_store_for(&fields(&["matterId", "pages"])),
+            Err(KoshaError::NotFound(_))
+        ));
+        assert!(matches!(
+            r.filter_column("pages", FilterColumnKind::Integer),
+            Err(KoshaError::NotFound(_))
+        ));
+        // A column the segment does not have is still "no values".
         assert!(r
-            .filter_column("pages", FilterColumnKind::Integer)
+            .filter_column("nope", FilterColumnKind::String)
             .unwrap()
             .is_none());
         let v2 = temp_dir("subset-src");
@@ -14461,8 +14925,10 @@ mod filter_column_format_tests {
         let stash = dir.join("toc.stash");
         fs::rename(dir.join(FILTERS_TOC_FILE), &stash).unwrap();
         let r = SegmentReader::open_with_options(dir.clone(), false).unwrap();
-        let store = r.try_filter_store().unwrap();
-        assert!(store.string_fields.is_empty());
+        assert!(matches!(r.try_filter_store(), Err(KoshaError::NotFound(_))));
+        assert!(r
+            .filter_column("matterId", FilterColumnKind::String)
+            .is_err());
         assert!(r.filters.state.lock().unwrap().toc.is_none());
         fs::rename(&stash, dir.join(FILTERS_TOC_FILE)).unwrap();
         let store = r.try_filter_store().unwrap();
@@ -14531,6 +14997,17 @@ mod filter_column_format_tests {
         let any = &footer.filter_columns.as_ref().unwrap()[0];
         fs::remove_file(dir.join(any.file_name())).unwrap();
         assert!(SegmentReader::rewrite_filter_blooms(&dir).is_err());
+        let _ = fs::remove_dir_all(&dir);
+
+        // Same for a legacy segment's `filters.bin`: rebuilt from nothing,
+        // its blooms would prune the segment from every filtered query.
+        let dir = temp_dir("bloom-rewrite-v1");
+        write(&dir, 1, &docs());
+        fs::remove_file(dir.join(kosha_core::FILTERS_BIN_FILE)).unwrap();
+        assert!(matches!(
+            SegmentReader::rewrite_filter_blooms(&dir),
+            Err(KoshaError::NotFound(_))
+        ));
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -543,7 +543,9 @@ pub struct Indexer {
 impl Indexer {
     pub fn new(data_dir: PathBuf) -> Self {
         let wal_dir = data_dir.join("_wal");
-        std::fs::create_dir_all(&wal_dir).ok();
+        // No WAL dir = every acknowledged write would fail; stop here, like
+        // the failed recovery below, instead of at the first append.
+        kosha_core::create_dir_named(&wal_dir).unwrap_or_else(|e| panic!("WAL: {e}"));
         let (wal, records) = crate::wal::WalWriter::open(
             Arc::new(crate::wal::LocalWalStore::new(wal_dir)),
             crate::wal::GroupCommitConfig::from_env(),
@@ -6032,7 +6034,7 @@ mod tests {
         );
         let seg_id = idx.manifest(&ns).unwrap().segments[0].segment_id.clone();
         let reader = kosha_segment::SegmentReader::open(dir.join("test").join(&seg_id.0)).unwrap();
-        let store = reader.filter_store();
+        let store = reader.try_filter_store().unwrap();
         // Merge order is not index order: key everything by document id.
         let records: Vec<_> = reader.iter_doc_records().map(|r| r.unwrap()).collect();
         let id_of = |seq: u32| records[seq as usize].doc_id.0.clone();

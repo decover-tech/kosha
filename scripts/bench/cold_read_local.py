@@ -107,6 +107,7 @@ def spawn_server(role, data_dir, port, extra_env=None, log_path=None):
         KOSHA_HTTP_PORT=str(port),
         KOSHA_DATA_DIR=str(data_dir),
         KOSHA_HTTP_IO_TIMEOUT_SECS="600",
+        KOSHA_SLOW_SEARCH_LOG_MS="0",  # every `search timing:` line is read below
     )
     log = open(log_path, "w") if log_path else subprocess.DEVNULL
     proc = subprocess.Popen(

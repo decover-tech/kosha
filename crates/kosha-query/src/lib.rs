@@ -40,6 +40,11 @@ pub struct PageSegment<'a> {
     /// The page's documents in this segment that still need bytes, in page
     /// order, deduplicated.
     pub doc_seqs: Vec<u32>,
+    /// Whether the page returns any of this segment's sidecar vector
+    /// fields ([`SegmentReader::page_reads_doc_vectors`]). `false` (e.g.
+    /// `_source.excludes` names the embedding): only the records' bytes are
+    /// needed, not `doc_vectors.bin`'s header or vector spans.
+    pub vectors: bool,
 }
 
 /// Optional callback the searcher invokes, after ranking and before field
@@ -4990,11 +4995,10 @@ impl Searcher {
     ) -> Result<Option<SegmentOutput>, KoshaError> {
         let manifest_footer = manifest.segment_footer(&entry.segment_id);
         let seg_dir = manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id);
-        if !seg_dir.exists() {
-            return Ok(None);
-        }
 
         // Prune via footer blooms before opening inverted/filters/vectors.
+        // A pruned segment needs nothing local: a query node never
+        // hydrates it.
         if query.has_prunable_filter() || term_prune.is_some() {
             let footer = match manifest_footer {
                 Some(footer) => Some(std::borrow::Cow::Borrowed(footer)),
@@ -5012,6 +5016,16 @@ impl Searcher {
                     }
                 }
             }
+        }
+        // A segment the manifest lists and the query may match but that is
+        // not on local disk (evicted after hydration, or behind a stale
+        // hydration verdict) fails the search: skipping it would answer
+        // without its documents.
+        if !seg_dir.exists() {
+            return Err(KoshaError::NotFound(format!(
+                "{}: segment not local (not hydrated, or evicted from the disk cache)",
+                seg_dir.display()
+            )));
         }
 
         // Lexical/BM25 queries (no query.knn) never touch vectors or the
@@ -7489,7 +7503,7 @@ impl Searcher {
         if let Some(ref rank_by) = rank_by {
             candidates.sort_by(by_score_then_id);
             candidates.truncate(rank_by.window);
-            rescore_candidates(rank_by, &mut candidates);
+            rescore_candidates(rank_by, &query.filter_column_fields(), &mut candidates)?;
         }
 
         // ── Sort (score-only / sort-key candidates — no full field payloads) ──
@@ -7572,46 +7586,81 @@ impl Searcher {
                 phase_stats.page_segments.push(dir.to_path_buf());
             }
         }
+        // Per page segment: whether the page returns its sidecar vectors,
+        // and its span listings, taken once per segment rather than per
+        // document (see `kosha_segment::PageSpans`).
+        let mut page_readers: Vec<(&Arc<TrackedSegment>, bool, kosha_segment::PageSpans)> =
+            Vec::new();
+        let mut page_idx: Vec<usize> = Vec::with_capacity(to.saturating_sub(from));
+        for cand in &candidates[from..to] {
+            let reader = &cand.reader;
+            let i = match page_readers
+                .iter()
+                .position(|(r, _, _)| Arc::ptr_eq(r, reader))
+            {
+                Some(i) => i,
+                None => {
+                    let vectors = reader.page_reads_doc_vectors(|f| query.returns_field(f));
+                    page_readers.push((reader, vectors, Default::default()));
+                    page_readers.len() - 1
+                }
+            };
+            page_idx.push(i);
+        }
         if let Some(ensure_doc_store) = doc_store_hydrator {
-            let mut page_segs: Vec<(&Arc<TrackedSegment>, Vec<u32>)> = Vec::new();
-            for cand in &candidates[from..to] {
-                if cand.reader.doc_is_local(cand.doc_seq) {
+            let mut page_segs: Vec<(usize, Vec<u32>)> = Vec::new();
+            for (cand, &i) in candidates[from..to].iter().zip(&page_idx) {
+                let (reader, vectors, spans) = &mut page_readers[i];
+                if reader.page_doc_is_local(cand.doc_seq, *vectors, spans) {
                     continue;
                 }
-                match page_segs
-                    .iter_mut()
-                    .find(|(reader, _)| Arc::ptr_eq(reader, &cand.reader))
-                {
+                match page_segs.iter_mut().find(|(seg, _)| *seg == i) {
                     Some((_, seqs)) => {
                         if !seqs.contains(&cand.doc_seq) {
                             seqs.push(cand.doc_seq);
                         }
                     }
-                    None => page_segs.push((&cand.reader, vec![cand.doc_seq])),
+                    None => page_segs.push((i, vec![cand.doc_seq])),
                 }
             }
             if !page_segs.is_empty() {
                 let request: Vec<PageSegment<'_>> = page_segs
                     .into_iter()
-                    .map(|(reader, doc_seqs)| PageSegment {
-                        segment_dir: reader.segment_dir(),
-                        reader,
-                        doc_seqs,
+                    .map(|(i, doc_seqs)| {
+                        let (reader, vectors, _) = &page_readers[i];
+                        PageSegment {
+                            segment_dir: reader.segment_dir(),
+                            reader,
+                            doc_seqs,
+                            vectors: *vectors,
+                        }
                     })
                     .collect();
                 ensure_doc_store(&request);
             }
+        }
+        // Fresh listings for the reads: the hydrator just added spans.
+        for (_, _, spans) in &mut page_readers {
+            *spans = Default::default();
         }
 
         // Materialize fields / highlights only for the returned page — the
         // only place a `Lazy` segment's full field content is ever read
         // from disk (one seek+read per document, not the whole segment).
         // Every page document is now local — whole file or cached span —
-        // so `doc_record_full` needs no further S3 round trip.
+        // so reading it needs no further S3 round trip.
         let mut page = Vec::with_capacity(to - from);
-        for cand in &candidates[from..to] {
-            let Some(doc_rec) = cand.reader.doc_record_full(cand.doc_seq)? else {
-                continue;
+        for (cand, &i) in candidates[from..to].iter().zip(&page_idx) {
+            let (reader, vectors, spans) = &mut page_readers[i];
+            // A hit's `doc_seq` came from this segment's own postings or
+            // vectors, so a record that is not there is a damaged segment,
+            // not a hit to leave off the page.
+            let Some(doc_rec) = reader.page_doc_record(cand.doc_seq, *vectors, spans)? else {
+                return Err(KoshaError::CorruptSegment(format!(
+                    "{}: hit doc_seq {} has no stored record",
+                    cand.reader.segment_dir().display(),
+                    cand.doc_seq
+                )));
             };
             let mut doc = ScoredDocument {
                 doc_id: cand.doc_id.clone(),
@@ -8749,8 +8798,15 @@ fn by_score_then_id(a: &HitCandidate, b: &HitCandidate) -> std::cmp::Ordering {
 
 /// Apply `rank_by` to `candidates` in place, keeping each hit's original
 /// score in `rank_details.base_score`. Candidates are grouped by segment so
-/// each segment's filter columns are located once.
-fn rescore_candidates(rank_by: &kosha_core::CompiledRankBy, candidates: &mut [HitCandidate]) {
+/// each segment's filter columns are located once. `fields` is the query's
+/// `filter_column_fields`, which holds the `rank_by` fields: only those
+/// columns are read (#244), and one that is not local fails the search
+/// rather than leaving every hit of the segment unranked.
+fn rescore_candidates(
+    rank_by: &kosha_core::CompiledRankBy,
+    fields: &std::collections::BTreeSet<String>,
+    candidates: &mut [HitCandidate],
+) -> Result<(), KoshaError> {
     let mut order: Vec<usize> = (0..candidates.len()).collect();
     order.sort_by_key(|&i| Arc::as_ptr(&candidates[i].reader) as usize);
     let mut start = 0;
@@ -8760,7 +8816,7 @@ fn rescore_candidates(rank_by: &kosha_core::CompiledRankBy, candidates: &mut [Hi
         while end < order.len() && Arc::ptr_eq(&candidates[order[end]].reader, &reader) {
             end += 1;
         }
-        let store = reader.filter_store();
+        let store = reader.filter_store_for(fields)?;
         let mut ranker = rank_by.for_segment(&store);
         for &i in &order[start..end] {
             let cand = &mut candidates[i];
@@ -8772,6 +8828,7 @@ fn rescore_candidates(rank_by: &kosha_core::CompiledRankBy, candidates: &mut [Hi
         }
         start = end;
     }
+    Ok(())
 }
 
 /// The order of the result list: the request's sort keys, or score
@@ -18318,6 +18375,119 @@ mod columnar_eval_differential_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A filter file that is not local when the filter is evaluated (evicted
+    /// from the disk cache after hydration, or behind a stale hydration
+    /// verdict) must fail the search, not read as "no values": that would
+    /// answer a `matterId` filter with zero hits from the segment, and the
+    /// per-segment filter-set cache would keep answering zero after the file
+    /// is back. Both formats: a columnar segment's column and TOC, a legacy
+    /// segment's `filters.bin`.
+    #[test]
+    fn filter_file_not_local_fails_the_search_and_is_not_cached() {
+        let root =
+            std::env::temp_dir().join(format!("kosha-q-filter-not-local-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ns = NamespaceId("ns".into());
+        let q: SearchQuery = serde_json::from_value(serde_json::json!({
+            "query_text": "contract", "max_results": 10,
+            "filter": {"term": {"matterId": "m1"}}, "exact_total_hits": true}))
+        .unwrap();
+        for (version, file) in [
+            (2, None),
+            (2, Some(kosha_core::FILTERS_TOC_FILE)),
+            (1, None),
+        ] {
+            let dir = root.join(format!("v{version}-{}", file.unwrap_or("col")));
+            let m = build(&dir, &[version, version]);
+            let want = Searcher::new(dir.clone())
+                .search(&ns, &m, &q, None)
+                .unwrap();
+            assert!(want.total_hits > 0, "vacuous query");
+            let seg = dir.join("ns").join("s0");
+            let footer = SegmentReader::read_footer(&seg).unwrap();
+            let file = match (file, footer.filter_columns.as_ref()) {
+                (Some(file), _) => file.to_string(),
+                (None, Some(columns)) => columns
+                    .iter()
+                    .find(|c| c.name == "matterId")
+                    .unwrap()
+                    .file_name(),
+                (None, None) => kosha_core::FILTERS_BIN_FILE.to_string(),
+            };
+            let stash = seg.join("stash");
+            std::fs::rename(seg.join(&file), &stash).unwrap();
+
+            let searcher = Searcher::new(dir.clone());
+            let cold = searcher.search(&ns, &m, &q, None);
+            std::fs::rename(&stash, seg.join(&file)).unwrap();
+            let back = searcher.search(&ns, &m, &q, None).unwrap();
+            assert_eq!(
+                back.total_hits, want.total_hits,
+                "v{version} {file}: once the file is local again the answer must be complete \
+                 (an incomplete answer from the not-local read was cached)"
+            );
+            assert!(
+                cold.is_err(),
+                "v{version} {file}: a filter file that is not local must fail the search, \
+                 got total_hits={} (want {})",
+                cold.map(|r| r.total_hits).unwrap_or_default(),
+                want.total_hits
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A whole segment directory missing locally (evicted after hydration,
+    /// or behind a stale hydration verdict) fails the search instead of
+    /// answering without that segment's documents. A segment the footer
+    /// blooms prune needs nothing local and is still skipped quietly.
+    #[test]
+    fn segment_not_local_fails_the_search_unless_pruned() {
+        let root =
+            std::env::temp_dir().join(format!("kosha-q-seg-not-local-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ns = NamespaceId("ns".into());
+        let mut m = build(&root, &[2, 2]);
+        // As on a query node: footers come with the manifest.
+        for entry in &m.segments {
+            let footer = SegmentReader::read_footer(&root.join("ns").join(&entry.segment_id.0));
+            m.segment_footers
+                .insert(entry.segment_id.clone(), Arc::new(footer.unwrap()));
+        }
+        let q = |filter: serde_json::Value| -> SearchQuery {
+            serde_json::from_value(serde_json::json!({
+                "query_text": "contract", "max_results": 10,
+                "filter": filter, "exact_total_hits": true}))
+            .unwrap()
+        };
+        let matter = q(serde_json::json!({"term": {"matterId": "m1"}}));
+        // A matter s1's bloom rules out (blooms have false positives, so
+        // pick one it actually rejects).
+        let s1_footer = m.segment_footer(&SegmentId("s1".into())).unwrap();
+        let nowhere = (0..)
+            .map(|i| q(serde_json::json!({"term": {"matterId": format!("no-such-matter-{i}")}})))
+            .find(|q| !q.segment_may_match_filters(s1_footer.filter_blooms.as_ref()))
+            .unwrap();
+        let want = Searcher::new(root.clone())
+            .search(&ns, &m, &matter, None)
+            .unwrap();
+        assert!(want.total_hits > 0, "vacuous query");
+        std::fs::remove_dir_all(root.join("ns").join("s1")).unwrap();
+        let searcher = Searcher::new(root.clone());
+        let got = searcher.search(&ns, &m, &matter, None);
+        assert!(
+            got.is_err(),
+            "a segment that is not local must fail the search, got total_hits={} (want {})",
+            got.map(|r| r.total_hits).unwrap_or_default(),
+            want.total_hits
+        );
+        assert_eq!(
+            searcher.search(&ns, &m, &nowhere, None).unwrap().total_hits,
+            0
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A query node hydrates only the columns `filter_column_fields`
     /// names (#244). Every query must answer the same from just those
     /// columns as from `filters.bin`: a column it reads but does not name
@@ -19041,8 +19211,10 @@ mod corpus_stats_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A segment whose footer can't be read here (listed in the manifest
-    /// but absent locally) makes namespace statistics incomplete. The
+    /// A segment that is not local makes namespace statistics incomplete.
+    /// On a query node that is a stats-only segment: the term bloom rules
+    /// it out of scoring (it lacks one of an AND query's terms) but it may
+    /// hold another term's `df`, and that hydration is best effort. The
     /// search must fall back to per-segment statistics — the documented
     /// pre-#246 behavior — rather than score with a `df` missing it.
     #[test]
@@ -19053,10 +19225,24 @@ mod corpus_stats_tests {
         let docs = random_corpus(&mut rng, 200);
         let groups = random_split(&mut rng, &docs, false);
         let (mut many, _) = write_segments(&dir, &ns.0, "many", &groups, 1);
-        many.segments.push(ManifestEntry {
-            segment_id: SegmentId("not-hydrated".into()),
-            doc_count: 50,
-        });
+        let stats_only = vec![Doc {
+            id: "stats-only".into(),
+            content: "alpha".into(),
+            matter: "m0".into(),
+        }];
+        let (extra, _) = write_segments(&dir, &ns.0, "stats-only", &[stats_only], 1);
+        let entry = extra.segments[0].clone();
+        let seg_dir = dir.join(&ns.0).join(&entry.segment_id.0);
+        let footer = SegmentReader::read_footer(&seg_dir).unwrap();
+        assert!(!footer
+            .term_bloom
+            .as_ref()
+            .unwrap()
+            .may_contain(kosha_core::fields::bloom_term("beta")));
+        many.segment_footers
+            .insert(entry.segment_id.clone(), Arc::new(footer));
+        many.segments.push(entry);
+        std::fs::remove_dir_all(&seg_dir).unwrap();
         let searcher = Searcher::new(dir.clone());
         let q = query("alpha beta", 50);
         let (r, stats) = searcher.search_with_stats(&ns, &many, &q, None).unwrap();
@@ -23740,7 +23926,7 @@ mod nested_attribute_tests {
         );
         writer.finalize(Bm25Params::default()).unwrap();
         let reader = kosha_segment::SegmentReader::open(root.join(&ns.0).join(&id.0)).unwrap();
-        let store = reader.filter_store();
+        let store = reader.try_filter_store().unwrap();
         let mut names: Vec<&String> = store.string_fields.keys().collect();
         names.sort();
         assert_eq!(names, vec!["k", "tags"]);

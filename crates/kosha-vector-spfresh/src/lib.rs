@@ -170,6 +170,10 @@ pub struct RebalanceStats {
     pub postings_split: usize,
     pub postings_merged: usize,
     pub entries_gced: usize,
+    /// Postings left over `max_posting_size` because splitting them made
+    /// no progress: `balanced_bisect` could not separate them, or Reassign
+    /// moved the halves back together (near-identical members).
+    pub postings_left_oversized: usize,
 }
 
 /// A read-only snapshot of one posting's live content — centroid plus
@@ -363,8 +367,21 @@ impl ClusterIndex {
 
         self.defer_cascade_splits = true;
         // A posting `balanced_bisect` cannot separate (every member
-        // identical) stays oversized; never retry it.
+        // identical) stays oversized; never retry it. The same goes for a
+        // posting that a split did not shrink: with near-identical
+        // members Reassign moves the two halves back together (each
+        // member is nearest the same centroid by a rounding error), so
+        // the split "succeeds", the posting is as large as before, and an
+        // empty sibling is left behind. Retrying it never ends.
         let mut unsplittable: HashSet<PostingId> = HashSet::new();
+        // Backstop for a cycle the per-posting check does not see (two
+        // postings trading members): no rebalance needs more splits than
+        // a few times the postings its vectors can fill.
+        let live_total: usize = self
+            .active_posting_ids()
+            .map(|pid| self.postings[pid].as_ref().unwrap().live_count())
+            .sum();
+        let split_budget = 8 * (live_total / self.config.min_posting_size.max(1) + 1) + 64;
         for _ in 0..MAX_ROUNDS {
             let mut changed = false;
             if self.config.enable_split {
@@ -380,21 +397,48 @@ impl ClusterIndex {
                     if oversized.is_empty() {
                         break;
                     }
+                    if stats.postings_split >= split_budget {
+                        eprintln!(
+                            "WARN: vector index rebalance stopped after {} splits \
+                             (budget {split_budget}) with {} posting(s) still over \
+                             max_posting_size; leaving them oversized",
+                            stats.postings_split,
+                            oversized.len()
+                        );
+                        unsplittable.extend(oversized);
+                        break;
+                    }
                     let mut split_any = false;
                     for pid in oversized {
                         // A cascade from an earlier split may already have
                         // dealt with it.
-                        let still = self.postings[pid]
-                            .as_ref()
-                            .is_some_and(|p| p.live_count() > max);
-                        if !still {
+                        let live = self.postings[pid].as_ref().map_or(0, |p| p.live_count());
+                        if live <= max {
                             continue;
                         }
-                        if ops::split::split_posting(self, pid, 0) {
-                            stats.postings_split += 1;
-                            split_any = true;
-                        } else {
-                            unsplittable.insert(pid);
+                        match ops::split::split_posting_sibling(self, pid, 0) {
+                            Some(sibling) => {
+                                stats.postings_split += 1;
+                                split_any = true;
+                                // No progress: Reassign emptied one
+                                // half back into the other, which holds
+                                // as many as the posting did. (A half
+                                // that grew from its neighbours while
+                                // its sibling kept members is real
+                                // progress and is split again.)
+                                let count = |index: &Self, id: PostingId| {
+                                    index.postings[id].as_ref().map_or(0, |p| p.live_count())
+                                };
+                                let (left, right) = (count(self, pid), count(self, sibling));
+                                if right == 0 && left >= live {
+                                    unsplittable.insert(pid);
+                                } else if left == 0 && right >= live {
+                                    unsplittable.insert(sibling);
+                                }
+                            }
+                            None => {
+                                unsplittable.insert(pid);
+                            }
                         }
                     }
                     changed |= split_any;
@@ -428,6 +472,22 @@ impl ClusterIndex {
             }
         }
         self.defer_cascade_splits = false;
+        // A split Reassign undid leaves its sibling empty, and with merges
+        // off nothing else removes it.
+        for pid in self.active_posting_ids().collect::<Vec<_>>() {
+            if self.active_posting_count() > 1
+                && self.postings[pid]
+                    .as_ref()
+                    .is_some_and(|p| p.live_count() == 0)
+            {
+                self.free_slot(pid);
+            }
+        }
+        let max = self.config.max_posting_size;
+        stats.postings_left_oversized = self
+            .active_posting_ids()
+            .filter(|pid| self.postings[*pid].as_ref().unwrap().live_count() > max)
+            .count();
 
         stats
     }
