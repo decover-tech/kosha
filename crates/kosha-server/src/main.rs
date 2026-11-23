@@ -3304,6 +3304,16 @@ impl AppState {
             .clone()
     }
 
+    /// Drop the cached hydration verdict for one manifest version, so the
+    /// next search re-checks its scoring set on disk instead of trusting a
+    /// verdict that a failed search just proved stale.
+    fn forget_hydration_verdict(&self, ns: &NamespaceId, manifest_version: u64) {
+        self.completed_hydrations
+            .lock()
+            .unwrap()
+            .remove(&(ns.0.clone(), manifest_version));
+    }
+
     /// Drop every per-namespace cache entry this node keeps for a deleted
     /// namespace. Versions never repeat across a delete and re-create, so
     /// this is hygiene (memory) rather than correctness, except for the
@@ -9575,7 +9585,8 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
             #[cfg(not(feature = "s3"))]
             let shed = None;
             // `wall_ms` is read when the line is logged: after the rerank
-            // and the response build, or at a kNN shed (429).
+            // and the response build, or at a kNN shed (429) or failure
+            // (503).
             let log_timing = |total_hits, knn_degraded_segments| {
                 log_search_timing(
                     &ns,
@@ -9588,14 +9599,20 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
                     t_request.elapsed().as_secs_f64() * 1e3,
                 )
             };
-            if let Some(response) =
-                knn_shed_response(result.knn_degraded_segments.unwrap_or(0), shed)
-            {
+            // Before a rerank replaces `result`.
+            let knn_degraded = result.knn_degraded_segments.unwrap_or(0);
+            if let Some(response) = knn_shed_response(knn_degraded, shed).or_else(|| {
+                knn_failed_response(
+                    state,
+                    &ns,
+                    manifest.version,
+                    &phases.knn_failed_segments,
+                    knn_degraded,
+                )
+            }) {
                 log_timing(result.total_hits, result.knn_degraded_segments);
                 return response;
             }
-            // Before a rerank replaces `result`.
-            let knn_degraded = result.knn_degraded_segments.unwrap_or(0);
             if let Some(ref provider) = reranker {
                 let (reranked, call) = kosha_query::rerank::apply(&query, result, provider);
                 result = reranked;
@@ -9667,11 +9684,7 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
             // itself failed for another reason.
             #[cfg(feature = "s3")]
             {
-                state
-                    .completed_hydrations
-                    .lock()
-                    .unwrap()
-                    .remove(&(ns.0.clone(), manifest.version));
+                state.forget_hydration_verdict(&ns, manifest.version);
                 state.posting_blob_presence.lock().unwrap().remove(&ns.0);
                 // A page-materialize fetch that crossed the request's byte
                 // ceiling leaves the doc store absent, which surfaces here
@@ -10205,8 +10218,19 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
                 .then(|| hydration_request.shed_reason());
             #[cfg(not(feature = "s3"))]
             let shed = None;
-            // A kNN shed (429) is logged too, like the search it answers.
-            let resp = knn_shed_response(result.knn_degraded_segments.unwrap_or(0), shed)
+            // A kNN shed (429) or failure (503) is logged too, like the
+            // search it answers.
+            let degraded = result.knn_degraded_segments.unwrap_or(0);
+            let resp = knn_shed_response(degraded, shed)
+                .or_else(|| {
+                    knn_failed_response(
+                        state,
+                        &ns,
+                        manifest.version,
+                        &phases.knn_failed_segments,
+                        degraded,
+                    )
+                })
                 .unwrap_or_else(|| json_ok(&result));
             log_search_timing(
                 &ns,
@@ -10226,11 +10250,7 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
             // cause the retry to also skip hydration and fail again).
             #[cfg(feature = "s3")]
             {
-                state
-                    .completed_hydrations
-                    .lock()
-                    .unwrap()
-                    .remove(&(ns.0.clone(), manifest.version));
+                state.forget_hydration_verdict(&ns, manifest.version);
                 // A page-materialize fetch that crossed the request's byte
                 // ceiling leaves the doc store absent, which surfaces here
                 // as an IO error. It is a shed, not a fault — report it as
@@ -12081,28 +12101,79 @@ fn knn_shed_response(degraded: u32, shed: Option<String>) -> Option<String> {
     Some(hydration_shed_response())
 }
 
+/// A kNN answer that lost segments to an error is a 503 with `Retry-After`,
+/// never a 200: the page is missing those segments' nearest neighbours, and
+/// neither the backend nor the Python client reads `knn_degraded_segments`,
+/// so a 200 would serve the partial page as complete (run10: 68 of 540 1.8M
+/// eval queries). The cause is usually a vector posting that was not local
+/// when scored (evicted, or its span write dropped); the bytes are in S3, so
+/// a retry can succeed. `failed` is `SearchPhaseStats::knn_failed_segments`;
+/// a segment skipped by design (another embedding model, #209) is not in it
+/// and stays a degraded 200. Checked after [`knn_shed_response`]: a shed
+/// request is a 429 whatever else went wrong. Not cached: only a 200 enters
+/// the result cache.
+fn knn_failed_response(
+    state: &AppState,
+    ns: &NamespaceId,
+    manifest_version: u64,
+    failed: &[kosha_core::SegmentId],
+    degraded: u32,
+) -> Option<String> {
+    if failed.is_empty() {
+        return None;
+    }
+    // As on a search error: a failed segment may be missing a scoring-set
+    // file (`vector.offsets`, `vector.idx`) that the cached verdict still
+    // calls local, and the retry `Retry-After` invites must re-check it.
+    state.forget_hydration_verdict(ns, manifest_version);
+    let rid = request_id();
+    let message = format!(
+        "kNN search lost {} segment(s) to errors, search would be incomplete",
+        failed.len()
+    );
+    eprintln!(
+        "ERROR: {message}: {}{rid}",
+        capped_segment_list(failed.iter().map(|segment| segment.0.as_str()))
+    );
+    let retry_after_ms = tenant_limits::QUEUE_SHED_RETRY_AFTER_MS;
+    let body = serde_json::json!({
+        "error": message,
+        "reason": "knn_segments_unavailable",
+        "knn_failed_segments": failed.len(),
+        "knn_degraded_segments": degraded,
+        "request_id": rid.strip_prefix(" rid="),
+        "retry_after_ms": retry_after_ms,
+    })
+    .to_string();
+    Some(retry_after(
+        raw_response(503, &body),
+        retry_after_ms.div_ceil(1000).max(1),
+    ))
+}
+
 /// Error message for a search that can't proceed because hydrating one or
 /// more required segments from S3 failed — returning results anyway would
 /// silently look like "0 hits" for a namespace that actually has data.
 #[cfg(feature = "s3")]
 fn hydration_failed_message(missing: &[String]) -> String {
-    const MAX_LISTED: usize = 10;
-    let listed: Vec<&str> = missing
-        .iter()
-        .take(MAX_LISTED)
-        .map(|s| s.as_str())
-        .collect();
-    let suffix = if missing.len() > MAX_LISTED {
-        format!(" (+{} more)", missing.len() - MAX_LISTED)
-    } else {
-        String::new()
-    };
     format!(
-        "segment hydration failed for {} segment(s), search would be incomplete: {}{}",
+        "segment hydration failed for {} segment(s), search would be incomplete: {}",
         missing.len(),
-        listed.join(", "),
-        suffix
+        capped_segment_list(missing.iter().map(String::as_str))
     )
+}
+
+/// Up to ten segment ids, comma-separated, then `(+N more)`: one log or
+/// error line stays bounded however many segments a namespace has.
+fn capped_segment_list<'a>(segments: impl ExactSizeIterator<Item = &'a str>) -> String {
+    const MAX_LISTED: usize = 10;
+    let total = segments.len();
+    let listed: Vec<&str> = segments.take(MAX_LISTED).collect();
+    if total > MAX_LISTED {
+        format!("{} (+{} more)", listed.join(", "), total - MAX_LISTED)
+    } else {
+        listed.join(", ")
+    }
 }
 
 // ─── Internal (pod-to-pod) routes ───────────────────────────────────────────
@@ -17342,6 +17413,158 @@ mod tests {
         assert!(knn_shed_response(2, None).is_none());
         let shed = knn_shed_response(1, Some("waited".into())).unwrap();
         assert!(shed.starts_with("HTTP/1.1 429"), "{shed}");
+    }
+
+    /// Finding 31 / run10: a kNN search whose vector posting is gone when
+    /// it is scored loses that segment's neighbours. Both POST routes (the
+    /// legacy `/search` and the v1 route the Python client uses) must
+    /// answer 503 + `Retry-After`, never a 200 with fewer hits. (`GET
+    /// /search` builds no kNN query, so it cannot lose a kNN segment.)
+    #[test]
+    fn a_knn_search_that_loses_a_segment_to_an_error_is_a_503() {
+        let state = test_state();
+        let ns = NamespaceId("acme/knnlost".into());
+        let docs: Vec<Document> = [("d1", [1.0, 0.0, 0.0]), ("d2", [0.0, 1.0, 0.0])]
+            .into_iter()
+            .map(|(id, v)| Document {
+                id: DocumentId(id.into()),
+                fields: vec![Field::text("text", "x"), Field::vector("emb", v.to_vec())],
+            })
+            .collect();
+        let body = serde_json::to_vec(&kosha_core::IndexRequest {
+            namespace: ns.clone(),
+            documents: docs,
+        })
+        .unwrap();
+        let resp = handle_index(&body, &state);
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+
+        let knn = r#""query_text":"","no_cache":true,"knn":{"field":"emb","vector":[1.0,0.0,0.0],"k":2,"num_candidates":10}"#;
+        let legacy = || {
+            let body = format!(r#"{{"namespace":"acme/knnlost",{knn}}}"#);
+            handle_search_post(body.as_bytes(), &state)
+        };
+        let v1 = || {
+            route(
+                "POST /v1/namespaces/knnlost/search HTTP/1.1\r\n",
+                &HashMap::new(),
+                format!("{{{knn}}}").as_bytes(),
+                "acme",
+                &state,
+            )
+        };
+        let json = |resp: &str| -> serde_json::Value {
+            serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..]).unwrap()
+        };
+        // Warm: the segment is open in the searcher's cache, and its
+        // posting was read from disk. A first touch is never admitted to
+        // the decoded-posting cache, so the next probe reads disk again.
+        let resp = legacy();
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let body = json(&resp);
+        assert_eq!(body["knn_degraded_segments"], 0, "{body}");
+        assert_eq!(body["results"].as_array().unwrap().len(), 2, "{body}");
+        // The open reader's `vector.idx` vanishes (as an evicted or never
+        // written span does): the next probe of the posting fails.
+        let manifest = state.indexer.manifest(&ns).unwrap();
+        for entry in &manifest.segments {
+            let dir = manifest.segment_dir(&state.data_dir, &ns, &entry.segment_id);
+            fs::remove_file(dir.join("vector.idx")).unwrap();
+        }
+        for (route, resp) in [("legacy", legacy()), ("v1", v1())] {
+            assert!(resp.starts_with("HTTP/1.1 503"), "{route}: {resp}");
+            assert!(resp.contains("\r\nretry-after: 1\r\n"), "{route}: {resp}");
+            let body = json(&resp);
+            assert_eq!(
+                body["reason"], "knn_segments_unavailable",
+                "{route}: {body}"
+            );
+            assert_eq!(body["knn_failed_segments"], 1, "{route}: {body}");
+            assert_eq!(body["knn_degraded_segments"], 1, "{route}: {body}");
+            assert!(body["results"].is_null(), "no partial page: {body}");
+        }
+    }
+
+    /// The staging shape of the same failure (run10): the scoring set is
+    /// local, the kNN postings are read by range from S3, and the ranges
+    /// cannot be fetched (not a shed: the request has room). The postings
+    /// stay not local, the probe fails, and the answer is a 503, not a 200
+    /// with `knn_degraded_segments > 0`.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn knn_search_whose_vector_postings_cannot_be_fetched_is_a_503() {
+        const NS: &str = "vector-lost";
+        let (s3, mut state, manifest, _) = single_flight_node(
+            NS,
+            |w| w.with_vector_store_mode(kosha_segment::VectorStoreMode::Sidecar),
+            |i| {
+                vec![
+                    Field::text("text", format!("contract clause {i}")),
+                    Field::vector("emb", vec![1.0, i as f32, 0.5, 0.0]),
+                ]
+            },
+        );
+        state.posting_read_mode = doc_spans::ReadMode::Ranged;
+        let query = serde_json::json!({
+            "namespace": NS,
+            "query_text": "",
+            "max_results": 3,
+            "knn": {"field": "emb", "vector": [1.0, 0.0, 0.5, 0.0], "k": 3, "num_candidates": 100},
+        });
+        let scoring = state.hydrate_segments_for_search(
+            &NamespaceId(NS.into()),
+            &manifest,
+            &serde_json::from_value(query.clone()).unwrap(),
+            &Arc::new(RequestHydration::new(u64::MAX)),
+            None,
+        );
+        assert!(scoring.missing.is_empty() && !scoring.shed);
+        // Every `vector.idx` object goes from the bucket: a ranged read of
+        // a posting now fails.
+        for entry in &manifest.segments {
+            fs::remove_file(
+                s3.root
+                    .join(NS)
+                    .join(&entry.segment_id.0)
+                    .join("vector.idx"),
+            )
+            .unwrap();
+        }
+        let resp = handle_search_post(query.to_string().as_bytes(), &state);
+        assert_eq!(status_of(&resp), 503, "{resp}");
+        assert!(resp.contains("\r\nretry-after: 1\r\n"), "{resp}");
+        let body: serde_json::Value =
+            serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+        assert_eq!(body["reason"], "knn_segments_unavailable", "{body}");
+        assert_eq!(body["knn_failed_segments"], 2, "{body}");
+    }
+
+    /// The 503's contract: nothing for a search with no failed segment
+    /// (a degraded-by-design skip, another embedding model, stays a 200),
+    /// otherwise `Retry-After`, the reason, the counts and the request id.
+    #[test]
+    fn knn_failed_response_is_a_503_with_retry_after_and_request_id() {
+        let state = test_state();
+        let ns = NamespaceId("acme/x".into());
+        assert!(knn_failed_response(&state, &ns, 1, &[], 1).is_none());
+        set_request_id(Some("ev-123"));
+        let failed = [
+            kosha_core::SegmentId("seg-a".into()),
+            kosha_core::SegmentId("seg-b".into()),
+        ];
+        let resp = knn_failed_response(&state, &ns, 1, &failed, 3).unwrap();
+        set_request_id(None);
+        assert!(resp.starts_with("HTTP/1.1 503"), "{resp}");
+        assert!(resp.contains("\r\nretry-after: 1\r\n"), "{resp}");
+        let body: serde_json::Value =
+            serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+        assert_eq!(body["reason"], "knn_segments_unavailable");
+        assert_eq!(body["knn_failed_segments"], 2);
+        assert_eq!(body["knn_degraded_segments"], 3);
+        assert_eq!(body["request_id"], "ev-123");
+        assert_eq!(body["retry_after_ms"], 1000);
     }
 
     #[cfg(feature = "s3")]
