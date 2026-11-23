@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import random
 import time
 import urllib.error
@@ -48,18 +49,24 @@ def json_default(data: Any) -> Any:
     raise TypeError(f"Unable to serialize {data!r} (type: {type(data)})")
 
 
-# A 429 is retried for every request: the server sends it only for work it
-# refused before starting (tenant limits and quotas, write backpressure, a
-# search shed under load), so a retry can never apply a write twice.
+# A 429 is retried for every request. A 429'd write is safe to repeat: the
+# server refuses most before any work (tenant limits, write backpressure),
+# and a sharded write refused on one shard after another committed repeats
+# the committed part as the same upsert by document id. A 429'd search may
+# have scored before it was shed, but a search only reads.
 # 502/503/504 are retried only for reads: a 503 can also come back after a
-# write was forwarded to the ingest pod, which may have applied it.
+# write was forwarded to the ingest pod, which may have applied it, and is
+# left to the caller.
 _RETRY_ANY = frozenset({429})
 _RETRY_READ = frozenset({502, 503, 504})
 
 
 def _is_read(method: str, path: str) -> bool:
     """Whether a request only reads (search, count, get, stats, schema)."""
-    return method in ("GET", "HEAD") or path.rstrip("/").endswith("search")
+    last_segment = path.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+    if method in ("GET", "HEAD"):
+        return True
+    return method == "POST" and last_segment == "search"
 
 
 def _retry_after_secs(value: str | None) -> float | None:
@@ -67,9 +74,12 @@ def _retry_after_secs(value: str | None) -> float | None:
     if not value:
         return None
     try:
-        return max(0.0, float(value))
+        seconds = float(value)
     except ValueError:
         pass
+    else:
+        # "nan"/"inf" parse as floats but are no usable hint.
+        return max(0.0, seconds) if math.isfinite(seconds) else None
     try:
         when = parsedate_to_datetime(value)
     except (TypeError, ValueError):
@@ -164,8 +174,11 @@ class Transport:
                 body_bytes = e.read()
                 try:
                     err = json.loads(body_bytes.decode())
-                except json.JSONDecodeError:
-                    err = {"error": body_bytes.decode()}
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    err = None
+                if not isinstance(err, dict):
+                    # A non-JSON or non-object body (a proxy's HTML page).
+                    err = {"error": body_bytes.decode(errors="replace")}
                 retry_after = e.headers.get("Retry-After") if e.headers else None
                 delay = self._status_retry_delay(
                     method, path, e.code, retry_after, attempt, started

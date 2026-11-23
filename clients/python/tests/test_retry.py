@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from kosha_client import KoshaClient, KoshaRequestError
-from kosha_client.transport import Transport, _retry_after_secs
+from kosha_client.transport import Transport, _is_read, _retry_after_secs
 
 
 class Script:
@@ -140,6 +140,10 @@ def test_does_not_retry_other_statuses(server, status):
         ("POST", "flush"),
         ("POST", "v1/namespaces"),
         ("DELETE", "v1/namespaces/ns"),
+        # A namespace whose name ends in "search" is not the search route.
+        ("DELETE", "v1/namespaces/legal_research"),
+        ("POST", "v1/namespaces/research/documents"),
+        ("POST", "v1/namespaces/research"),
     ],
 )
 @pytest.mark.parametrize("status", [502, 503, 504])
@@ -204,7 +208,16 @@ def test_client_search_retries_a_shed(server, monkeypatch):
 
 @pytest.mark.parametrize(
     "value,expected",
-    [(None, None), ("", None), ("3", 3.0), ("-1", 0.0), ("junk", None)],
+    [
+        (None, None),
+        ("", None),
+        ("3", 3.0),
+        ("-1", 0.0),
+        ("junk", None),
+        ("nan", None),
+        ("inf", None),
+        ("-inf", None),
+    ],
 )
 def test_retry_after_parsing(value, expected):
     assert _retry_after_secs(value) == expected
@@ -212,3 +225,42 @@ def test_retry_after_parsing(value, expected):
 
 def test_retry_after_date_in_the_past_is_zero():
     assert _retry_after_secs("Wed, 21 Oct 2015 07:28:00 GMT") == 0.0
+
+
+@pytest.mark.parametrize(
+    "method,path,read",
+    [
+        ("POST", "search", True),
+        ("POST", "v1/namespaces/research/search", True),
+        ("POST", "v1/namespaces/search/search", True),
+        ("GET", "v1/namespaces/legal_research/stats", True),
+        ("DELETE", "v1/namespaces/legal_research", False),
+        ("DELETE", "v1/namespaces/search", False),
+        ("POST", "v1/namespaces/legal_research", False),
+        ("POST", "research", False),
+        ("POST", "index", False),
+    ],
+)
+def test_is_read_matches_the_search_route_only(method, path, read):
+    assert _is_read(method, path) is read
+
+
+def test_nan_retry_after_falls_back_to_backoff(server):
+    script = Script((429, {"retry-after": "nan"}, {"error": "shed"}), OK)
+    server(script).request("POST", "search", {})
+    assert len(script.calls) == 2
+
+
+@pytest.mark.parametrize("body", [["a", "list"], "a string", 7, None])
+def test_non_object_error_body_raises_kosha_error(server, body):
+    script = Script((400, {}, body))
+    with pytest.raises(KoshaRequestError) as raised:
+        server(script).request("POST", "search", {})
+    assert raised.value.status_code == 400
+    assert raised.value.error == json.dumps(body)
+
+
+def test_non_object_body_on_a_retryable_status_is_retried(server):
+    script = Script((503, {}, ["warming"]), OK)
+    server(script).request("POST", "search", {})
+    assert len(script.calls) == 2
