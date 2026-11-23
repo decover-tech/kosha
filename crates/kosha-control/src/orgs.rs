@@ -946,6 +946,13 @@ impl MemoryOrgStore {
             .find(|k| k.api_key == api_key)
             .map(|k| k.tenant_id.clone())
     }
+
+    /// Every audit row, oldest first, with or without an organization
+    /// (tests; the organization routes read one organization's rows).
+    pub fn audit_log(&self) -> Vec<AuditEvent> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.audit.clone()
+    }
 }
 
 impl OrgStore for MemoryOrgStore {

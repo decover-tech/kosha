@@ -21,13 +21,15 @@ pub mod orgs;
 pub mod api_keys;
 #[cfg(feature = "postgres")]
 mod orgs_pg;
-pub use api_keys::{hash_api_key, ApiKeyRecord, NewApiKey, Scope, Scopes};
+pub use api_keys::{hash_api_key, ApiKeyRecord, KeyAuthority, NewApiKey, Scope, Scopes};
 
 #[cfg(feature = "postgres")]
 mod api_key_store;
 
 #[cfg(feature = "postgres")]
-pub use api_key_store::{IssuedApiKey, OperatorCredentials, RotatedApiKey};
+pub use api_key_store::{
+    CredentialError, IssuedApiKey, LockoutGuard, OperatorCredentials, RotatedApiKey, ScrubStatus,
+};
 
 #[cfg(feature = "postgres")]
 mod postgres;
