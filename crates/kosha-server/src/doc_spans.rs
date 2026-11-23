@@ -272,6 +272,18 @@ impl SpanHydrator {
         }
     }
 
+    pub fn config(&self) -> &SpanConfig {
+        &self.cfg
+    }
+
+    /// Ranged GETs and bytes `segment_dir` has drawn since its heat last
+    /// reset — what put it over a promotion threshold, for the promotion's
+    /// start line.
+    pub fn heat(&self, segment_dir: &Path) -> Option<(u64, u64)> {
+        let heat = self.heat.lock().unwrap();
+        heat.get(segment_dir).map(|h| (h.gets, h.bytes))
+    }
+
     fn rel(&self, segment_dir: &Path) -> Option<String> {
         segment_dir
             .strip_prefix(&self.data_dir)
@@ -707,7 +719,6 @@ impl PromotionQueue {
         q.pop_front()
     }
 
-    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.queue.lock().unwrap().len()
     }

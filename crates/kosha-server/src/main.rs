@@ -3644,9 +3644,9 @@ impl AppState {
 
     /// Start the thread that promotes hot segments from ranged reads to a
     /// whole local `doc_store.bin` (+ `doc_vectors.bin`), then drops their
-    /// now-redundant spans (#245). One segment at a time, each under a
-    /// hydration permit, so promotions queue behind live queries' fetches
-    /// instead of competing with them.
+    /// now-redundant spans (#245). One segment at a time, as background
+    /// work on the hydration budget, so promotions yield to live queries'
+    /// fetches instead of competing with them (see `promote_doc_store`).
     fn spawn_doc_store_promoter(self: &Arc<Self>) {
         #[cfg(feature = "s3")]
         {
@@ -3673,13 +3673,29 @@ impl AppState {
 
     /// Hydrate one segment's whole doc store for promotion and drop its
     /// spans once it is in place.
+    ///
+    /// Background work: its fetches yield to every request fetch on the
+    /// in-flight budget and hold at most its background share, in parts
+    /// (see `s3_storage::download_parts`), and it takes no
+    /// `hydration_semaphore` slot. It used to hold a slot (one of
+    /// `KOSHA_MAX_CONCURRENT_HYDRATIONS`, default 4) for its whole download
+    /// and fetch `doc_vectors.bin` (up to 2.6 GB on staging) as one GET
+    /// admitted past the budget's capacity, shutting every request fetch
+    /// on the pod out for 45-407 s. The slot bounds concurrent hydration
+    /// operations; this thread is one operation at a time by construction,
+    /// and its bytes are bounded by the background share.
+    ///
+    /// `doc_vectors.bin` is still promoted whole: with it whole, an exact
+    /// filtered kNN scores candidates straight from it (without it, from
+    /// every vector posting of the column — as many bytes again, by range),
+    /// and the default per-segment path rescores a quantized column's
+    /// shortlist from it (without it, the estimates stand).
     #[cfg(feature = "s3")]
     fn promote_doc_store(&self, seg: &Path) {
         let t = Instant::now();
-        let (files, bytes) = {
-            let _permit = self.hydration_semaphore.acquire("promote_doc_store");
-            self.ensure_doc_store_local(&[seg.to_path_buf()], &RequestHydration::unlimited())
-        };
+        self.log_promotion_start(seg);
+        let (files, bytes) =
+            self.ensure_doc_store_local(&[seg.to_path_buf()], &RequestHydration::background());
         let landed = file_present_nonempty(&seg.join(kosha_segment::DOC_STORE_FILE))
             && (!kosha_segment::segment_uses_doc_vectors(seg)
                 || file_present_nonempty(&seg.join(kosha_segment::DOC_VECTORS_FILE)));
@@ -3698,6 +3714,65 @@ impl AppState {
             seg.display(),
             bytes as f64 / (1024.0 * 1024.0),
             t.elapsed().as_secs_f64() * 1e3,
+        );
+    }
+
+    /// The `doc store promote start:` line: which segment, which files and
+    /// how large (one LIST of the segment, a promotion's only extra
+    /// request, skipped when every file is already local), what triggered it and how many more are queued. Rare (a
+    /// few per pod per hour), and the only place a multi-GB background
+    /// download shows up before it finishes.
+    #[cfg(feature = "s3")]
+    fn log_promotion_start(&self, seg: &Path) {
+        let Some(ref s3) = self.s3_storage else {
+            return;
+        };
+        let mut wanted = vec![kosha_segment::DOC_STORE_FILE];
+        if kosha_segment::segment_uses_doc_vectors(seg) {
+            wanted.push(kosha_segment::DOC_VECTORS_FILE);
+        }
+        wanted.retain(|f| !file_present_nonempty(&seg.join(f)));
+        let rel = seg
+            .strip_prefix(&self.data_dir)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // Nothing left to fetch (already whole): no LIST.
+        let sizes = if wanted.is_empty() {
+            Vec::new()
+        } else {
+            s3.list_remote_with_sizes(&rel).unwrap_or_else(|e| {
+                eprintln!("WARN: doc store promote: listing {rel} for file sizes failed: {e}");
+                Vec::new()
+            })
+        };
+        let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+        let mut total = 0u64;
+        let files: Vec<String> = wanted
+            .iter()
+            .map(|f| match sizes.iter().find(|(name, _)| name == f) {
+                Some((_, size)) => {
+                    total += size;
+                    format!("{f}:{:.1}MB", mb(*size))
+                }
+                None => format!("{f}:?"),
+            })
+            .collect();
+        let (gets, ranged) = self.span_hydrator.heat(seg).unwrap_or((0, 0));
+        let cfg = self.span_hydrator.config();
+        println!(
+            "doc store promote start: seg={} files={} total_mb={:.1} trigger: ranged_gets={gets} \
+             ranged_mb={:.1} (promote at gets>={} or mb>={:.1}) queued={}",
+            seg.display(),
+            if files.is_empty() {
+                "-".to_string()
+            } else {
+                files.join(",")
+            },
+            mb(total),
+            mb(ranged),
+            cfg.promote_after_gets,
+            mb(cfg.promote_after_bytes),
+            self.doc_store_promotions.len(),
         );
     }
 
@@ -5087,7 +5162,8 @@ impl AppState {
         // A failed range of `doc_vectors.bin` (only global rescoring, #381,
         // asks for those) is NOT retried as the whole file: that is the
         // full-precision sidecar the codes-only tier exists to keep remote,
-        // ~200 MB per segment. The pass reports the vectors it could not
+        // as large as the f32 vector index itself (1.9-2.7 GB per compacted
+        // segment on staging). The pass reports the vectors it could not
         // read as unavailable (and the segment degraded) instead.
         let error = o.error.as_deref().unwrap_or_default();
         if o.failed && file != kosha_segment::DOC_VECTORS_FILE {
@@ -5142,10 +5218,10 @@ impl AppState {
             return;
         };
         let t = Instant::now();
-        let (files, bytes) = {
-            let _permit = self.hydration_semaphore.acquire("promote_posting_shard");
-            self.ensure_files_local(&[seg.to_path_buf()], &file, &RequestHydration::unlimited())
-        };
+        // Background work, like `promote_doc_store`: yields to request
+        // fetches on the budget and takes no hydration slot.
+        let (files, bytes) =
+            self.ensure_files_local(&[seg.to_path_buf()], &file, &RequestHydration::background());
         let landed = file_present_nonempty(shard);
         self.posting_span_hydrator
             .finish_promotion(&self.cache, shard, landed);
@@ -8919,7 +8995,7 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
                 // as an IO error. It is a shed, not a fault — report it as
                 // one.
                 if hydration_request.is_shed() {
-                    return hydration_shed_response();
+                    return post_scoring_shed_response(&hydration_request, &e);
                 }
             }
             search_error_response(&e)
@@ -9459,7 +9535,7 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
                 // as an IO error. It is a shed, not a fault — report it as
                 // one.
                 if hydration_request.is_shed() {
-                    return hydration_shed_response();
+                    return post_scoring_shed_response(&hydration_request, &e);
                 }
             }
             search_error_response(&e)
@@ -11241,6 +11317,21 @@ fn hydration_shed_response() -> String {
         "search overloaded: this query needs more segment data than one request \
          may hydrate — the namespace is still warming, retry with backoff",
     )
+}
+
+/// The 429 for a search that failed after scoring because its request was
+/// shed meanwhile (a page-materialize fetch crossed the ceiling or waited
+/// out the budget, leaving a doc store absent). Logged like every other
+/// shed, with the cause and the error it surfaced as — before, these two
+/// sites returned the 429 with no line at all.
+#[cfg(feature = "s3")]
+fn post_scoring_shed_response(request: &RequestHydration, error: &KoshaError) -> String {
+    eprintln!(
+        "WARN: search shed after scoring: {}; surfaced as: {error}{}",
+        request.shed_reason(),
+        request_id()
+    );
+    hydration_shed_response()
 }
 
 /// A kNN answer that skipped segments because the request was shed (its
