@@ -78,6 +78,11 @@ pub fn requirement(method: &str, path: &str) -> Requirement {
     if bare.starts_with("/v1/admin/") || bare.starts_with("/internal/") {
         return Requirement::Service;
     }
+    // The console (#345) authenticates with a session cookie, answered
+    // before API keys are looked at; no tenant key is ever accepted there.
+    if bare == "/v1/console" || bare.starts_with("/v1/console/") {
+        return Requirement::Service;
+    }
     if let Some(rest) = bare.strip_prefix("/v1/namespaces/") {
         let Some((ns, action)) = rest.rsplit_once('/') else {
             // The bare `/v1/namespaces/{ns}`.

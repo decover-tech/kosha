@@ -562,7 +562,7 @@ pub(crate) fn documents_logical_bytes(documents: &[kosha_core::Document]) -> u64
 /// list (local-only mode, or a flush not uploaded yet). `None` when the
 /// manifest is not loaded or the listing failed: no snapshot is better
 /// than a wrong one.
-fn namespace_stored_bytes(state: &AppState, ns: &NamespaceId) -> Option<u64> {
+pub(crate) fn namespace_stored_bytes(state: &AppState, ns: &NamespaceId) -> Option<u64> {
     let manifest = state.indexer.manifest_shared(ns)?;
     #[cfg_attr(not(feature = "s3"), allow(unused_mut))]
     let mut remote: HashMap<String, u64> = HashMap::new();
