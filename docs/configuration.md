@@ -752,16 +752,37 @@ seconds or a unit (`90s`, `5m`, `1h`).
 | `KOSHA_LOCAL_GC_GRACE` | How long a retired segment's local files stay after the publish that dropped it (and after every search that could read them ends) | `5m` | duration |
 | `KOSHA_LOCAL_GC_INTERVAL_MS` | How often each pod reclaims retired local segments; `0` disables | `60000` | milliseconds |
 
-## Deleted namespaces (cache purge and retry)
+## Deleted namespaces (cache purge, acknowledgements and retry)
 
-Read in `PurgeSettings::from_env` (`crates/kosha-server/src/deletion_purge.rs`). Both are off
-unless set. A value that is not a whole number of milliseconds stops the server at startup.
+Read in `PurgeSettings::from_env` (`crates/kosha-server/src/deletion_purge.rs`). All are off
+unless set. A value that is not a whole number of milliseconds (or `on`/`off` for the switches)
+stops the server at startup, and so does `KOSHA_DELETION_REQUIRE_ACKS=on` without a purge
+interval, or with a liveness window shorter than three intervals.
 See "Deleting a namespace" in the README for what a pass removes and when.
 
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
 | `KOSHA_DELETION_PURGE_INTERVAL_MS` | How often this pod (any role) reads the deletion records it has not handled and removes the deleted namespaces' and tenants' cached copies from its memory and local disk. The first pass runs at boot and reads every record. Unset or `0`: off, and cached copies leave only by eviction | unset (off) | milliseconds |
-| `KOSHA_DELETION_RESUME_INTERVAL_MS` | How often a writer pod (`ingest` or `standalone`) retries the storage reclaim of pending namespace deletion records, starting at boot. A record that stays pending waits twice as long before each further try, up to one hour. Tenant records are not retried. Each retry takes the namespace's writer lease first and is skipped while another writer holds it; with `KOSHA_WRITER_LEASE=off` there is no such guard, so do not set this where two writer pods can overlap. Ignored on `query` and `indexer` pods. Unset or `0`: off | unset (off) | milliseconds |
+| `KOSHA_DELETION_RESUME_INTERVAL_MS` | How often a writer pod (`ingest` or `standalone`) retries the storage reclaim of pending deletion records (namespaces, branches and tenants; namespaces first), starting at boot. A record that stays pending waits twice as long before each further try, up to one hour. A namespace or branch retry takes the namespace's writer lease first and is skipped while another writer holds it; with `KOSHA_WRITER_LEASE=off` there is no such guard, so do not set this where two writer pods can overlap. A tenant retry deletes whatever keys and namespaces the tenant id has when it runs. Records of `migrate-namespace` sources are finished by that tool, not retried. Ignored on `query` and `indexer` pods. Unset or `0`: off | unset (off) | milliseconds |
+| `KOSHA_DELETION_REQUIRE_ACKS` | `on`: a deletion recorded on this pod completes only once every live pod that runs the purge has acknowledged that it removed its cached copies (`acks_required` on the record). Needs `KOSHA_DELETION_PURGE_INTERVAL_MS` on this pod. Set it on the writer pods; every pod with the purge on registers and acknowledges regardless | `off` | switch |
+| `KOSHA_POD_LIVENESS_MS` | A pod whose last heartbeat (one per purge pass) is older than this is not waited for: the bound on how long a pod that died can hold a record pending. Must be at least three purge intervals | `300000` (5 min) | milliseconds |
+| `KOSHA_POD_ID` | This pod's id in the pod registry and on its acknowledgements and export claims. Keep it stable across restarts of the same pod | `HOSTNAME`, else a random id per process | string |
+| `KOSHA_NAMESPACE_DELETE_CONFIRM` | `on`: `DELETE /v1/namespaces/{ns}` must carry `?confirm=<ns>` (the unqualified name), else 400. Off keeps every existing caller working | `off` | switch |
+
+## Namespace exports
+
+Read in `ExportSettings::from_env` (`crates/kosha-server/src/exports.rs`). Exports are off
+unless `KOSHA_EXPORTS=on`; a malformed value stops the server at startup. Set the same values on
+every pod: writer pods run and expire exports, any pod serves the status and download routes.
+See "Exports" in the README.
+
+| Variable | Purpose | Default | Units |
+| --- | --- | --- | --- |
+| `KOSHA_EXPORTS` | `on` serves `/v1/namespaces/{ns}/exports...` and runs the export sweep on writer pods. Off: those routes answer 404 | `off` | switch |
+| `KOSHA_EXPORT_TTL_SECS` | How long a completed export stays downloadable before the sweep deletes its objects (state `expired`). At least 60 | `604800` (7 days) | seconds |
+| `KOSHA_EXPORT_PART_BYTES` | JSON bytes per part before a new part starts (each part is read whole into memory for its upload). At least 1 MiB | `268435456` (256 MiB) | bytes |
+| `KOSHA_EXPORT_PRESIGN_SECS` | Lifetime of the presigned S3 `GET` URLs the status route returns (capped at 7 days) | `900` | seconds |
+| `KOSHA_EXPORT_MAX_ACTIVE` | Pending or running exports one tenant may have at once; more is a 429 | `2` | count |
 
 ## Segment format (rollout and rollback gates)
 
