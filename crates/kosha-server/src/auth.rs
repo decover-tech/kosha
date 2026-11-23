@@ -582,7 +582,7 @@ impl KeyStore {
         use kosha_control::ScrubStatus;
         let mut state = self.scrub.lock().unwrap_or_else(|e| e.into_inner());
         state.rounds += 1;
-        if state.clean && !startup && state.rounds % SCRUB_CLEAN_EVERY != 0 {
+        if state.clean && !startup && !state.rounds.is_multiple_of(SCRUB_CLEAN_EVERY) {
             return true;
         }
         let Some(pg) = self.database_url.as_ref().and_then(|_| self.pg()) else {
@@ -731,6 +731,8 @@ pub fn purge_tenant_keys(auth: &Auth, tenant: &str) -> Result<KeyPurge, String> 
     })
 }
 
+// One process-wide instance (`AUTH`): its size does not matter.
+#[allow(clippy::large_enum_variant)]
 pub enum Auth {
     /// `KOSHA_AUTH=disabled`: every request is tenant `dev`.
     Disabled,
@@ -974,7 +976,9 @@ pub fn init_global() {
         std::thread::Builder::new()
             .name("api-key-refresh".into())
             .spawn(move || {
-                for round in 1u64.. {
+                let mut round = 0u64;
+                loop {
+                    round += 1;
                     std::thread::sleep(ttl);
                     let Auth::Keys(store) = global() else {
                         continue;
@@ -986,7 +990,7 @@ pub fn init_global() {
                     if let Some(grace) = auto_scrub {
                         store.scrub_round(grace, false);
                     }
-                    if !bootstrap_enabled && round % lapse_check_every == 0 {
+                    if !bootstrap_enabled && round.is_multiple_of(lapse_check_every) {
                         let now = unix_now();
                         if let Some(warning) =
                             operator_lapse_warning(store.operator_horizon(now), now)
