@@ -33,6 +33,7 @@ fn namespace_tenant(ns: &str) -> Option<&str> {
 /// credentials. Operator traffic is never tenant-limited (#341).
 const SERVICE_TENANT: &str = "service";
 
+mod admin_audit;
 mod api_key_admin;
 mod auth;
 mod authz;
@@ -84,6 +85,7 @@ mod segment_gc;
 #[cfg(all(test, feature = "s3"))]
 mod segment_pin_tests;
 mod span_writes;
+mod tenant_key_admin;
 mod tenant_limits;
 mod unindexed;
 mod usage;
@@ -6829,6 +6831,7 @@ fn dispatch(state: &AppState, request: http::Request) -> http::Response {
 
     // ── API key authentication ──────────────────────────────────────────
     // Per proto/kosha/v1/kosha.proto: Authorization: Bearer <key> or X-Api-Key.
+    let mut tenant_key = None;
     let authentication = if admin_actor(&headers, state).is_some()
         || service_authorized(&headers, state.internal_service_key.as_deref())
     {
@@ -6841,19 +6844,27 @@ fn dispatch(state: &AppState, request: http::Request) -> http::Response {
         authenticate(&headers).and_then(|principal| {
             let (method, path) = parse_method_and_path(&request_line).unwrap_or(("", ""));
             match authz::authorize(&principal, method, path, &body) {
-                Ok(()) => Ok(principal.tenant),
+                Ok(()) => {
+                    let tenant = principal.tenant.clone();
+                    tenant_key = Some(principal);
+                    Ok(tenant)
+                }
                 Err(message) => Err(json_error_body(403, &message)),
             }
         })
     };
-    dispatch_authenticated(
-        state,
-        &request_line,
-        &headers,
-        &body,
-        authentication,
-        started,
-    )
+    // The key's grant, for the handlers that narrow their answer to it
+    // (namespace listing, `/v1/api-keys`): `authz::current_principal`.
+    authz::with_principal(tenant_key, || {
+        dispatch_authenticated(
+            state,
+            &request_line,
+            &headers,
+            &body,
+            authentication,
+            started,
+        )
+    })
 }
 
 /// The rest of [`dispatch`] once the caller is known: `authentication` is
@@ -7796,6 +7807,16 @@ fn route(
         if let Some(response) = operator_admin::handle(method, path, body, &operator) {
             return response;
         }
+        // Tenant API keys (#346), audited as the credential's holder.
+        if let Some(response) = api_key_admin::handle(method, path, body, &operator) {
+            return response;
+        }
+        // Every other admin change is audited here, naming the operator.
+        if method != "GET" {
+            return admin_audit::audited(&state.orgs, &operator, method, path, || {
+                route_inner(request_line, headers, body, tenant, state)
+            });
+        }
     } else if path.starts_with("/internal/") {
         if !service_authorized(headers, state.internal_service_key.as_deref()) {
             return json_error(403, "internal service credential required");
@@ -7900,6 +7921,9 @@ fn route(
                 "/v1/namespaces",
                 "/v1/usage",
                 "/v1/billing",
+                "/v1/api-keys",
+                "/v1/api-keys/rotate",
+                "/v1/api-keys/revoke",
             ]
             .contains(&bare_path)
         {
@@ -8009,8 +8033,8 @@ fn route_inner(
         return response;
     }
 
-    // ── Admin routes (Postgres-backed only) ────────────────────────────────
-    if let Some(response) = api_key_admin::handle(request_line, body) {
+    // ── A tenant's own API keys (#346 self-service, Postgres only) ─────────
+    if let Some(response) = tenant_key_admin::handle(request_line, body) {
         return response;
     }
 
@@ -10660,6 +10684,8 @@ fn handle_list_namespaces(tenant: &str, state: &AppState) -> String {
         .into_iter()
         .filter_map(|ns| ns.0.strip_prefix(&prefix).map(str::to_string))
         .filter(|name| !name.is_empty() && !name.contains('/'))
+        // A key restricted to namespaces lists only those (#346).
+        .filter(|name| authz::may_see_namespace(name))
         .collect();
     names.sort_unstable();
     names.dedup();
@@ -23611,6 +23637,25 @@ mod tests {
         // A sharded namespace reports totals over its shards.
         assert_eq!(listed[2]["documents"], 20, "{resp}");
         assert!(!resp.contains("_shard-"), "{resp}");
+
+        // A key restricted to namespaces lists only those it may use
+        // (#346), and names none it may not, existing or not.
+        let docs_only = auth::Principal {
+            namespaces: Some(vec!["docs".to_string(), "missing".to_string()].into()),
+            ..auth::Principal::full("acme")
+        };
+        let resp = authz::with_principal(Some(docs_only), || {
+            v1(
+                &state,
+                "acme",
+                "GET /v1/namespaces",
+                serde_json::Value::Null,
+            )
+        });
+        assert_eq!(status_of(&resp), 200, "{resp}");
+        let listed = body_of(&resp)["namespaces"].as_array().unwrap().clone();
+        let names: Vec<&str> = listed.iter().map(|n| n["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["docs"], "{resp}");
 
         let resp = v1(
             &state,

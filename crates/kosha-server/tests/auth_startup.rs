@@ -208,9 +208,12 @@ fn invalid_bootstrap_key_switch_refuses_to_start() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
     assert!(
-        stderr.contains("FATAL: invalid KOSHA_ADMIN_BOOTSTRAP_KEY 'disable'"),
+        stderr.contains("FATAL: invalid KOSHA_ADMIN_BOOTSTRAP_KEY"),
         "stderr: {stderr}"
     );
+    // The value is not echoed: the likeliest mistake is pasting the shared
+    // admin key into it, and a crash-looping pod would log it every time.
+    assert!(!stderr.contains("'disable'"), "stderr: {stderr}");
 }
 
 /// #346: `KOSHA_ADMIN_BOOTSTRAP_KEY=disabled` turns the shared admin key
@@ -820,6 +823,7 @@ mod scoped_keys {
             .revoke_operator_credentials(
                 kosha_control::OperatorCredentials::Operator(&carol),
                 "operator",
+                kosha_control::LockoutGuard::Off,
             )
             .unwrap();
         assert_eq!(revoked.len(), 1);

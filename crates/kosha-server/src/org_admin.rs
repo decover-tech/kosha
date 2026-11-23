@@ -64,6 +64,12 @@ impl OrgBackend {
         }
     }
 
+    /// Every audit row of the in-memory store, oldest first (tests).
+    #[cfg(test)]
+    pub(crate) fn audit_rows(&self) -> Vec<kosha_control::orgs::AuditEvent> {
+        self.memory.audit_log()
+    }
+
     pub(crate) fn from_env() -> Self {
         #[allow(unused_mut)]
         let mut backend = Self::in_memory();
@@ -74,7 +80,9 @@ impl OrgBackend {
         backend
     }
 
-    fn store(&self) -> Result<Arc<dyn OrgStore>, String> {
+    /// The organization store: Postgres when configured, else this
+    /// process's memory. Also where `admin_audit` writes its rows.
+    pub(crate) fn store(&self) -> Result<Arc<dyn OrgStore>, String> {
         #[cfg(feature = "postgres")]
         if let Some(url) = &self.database_url {
             // One pool per process: the key store's, when there is one.

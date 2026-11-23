@@ -14,13 +14,21 @@
 //!     and billing state (`GET /v1/billing`).
 //!   - `write`: index, replace, delete documents, flush.
 //!   - `admin`: create and delete namespaces and branches, change a
-//!     namespace's schema or shards.
+//!     namespace's schema or shards, and manage the tenant's own API keys
+//!     (`/v1/api-keys`, `tenant_key_admin.rs`).
 //!
 //! Usage and billing answer for the whole tenant (every namespace's usage,
-//! the plan, the invoices), so, like listing namespaces, a key restricted
-//! to specific namespaces is refused there whatever its scopes. The routes
-//! that delete a tenant or change its plan are under `/v1/admin/` and take
-//! the admin credential, never a tenant key.
+//! the plan, the invoices), so a key restricted to specific namespaces is
+//! refused there whatever its scopes. Listing namespaces and the key
+//! routes are [`Target::Filtered`] instead: a restricted key may use them,
+//! and the handler narrows the answer (only its namespaces are listed;
+//! only keys within its own grant are shown or changed). The routes that
+//! delete a tenant or change its plan are under `/v1/admin/` and take the
+//! admin credential, never a tenant key.
+//!
+//! The request's principal is also kept for the handlers that narrow their
+//! answer ([`with_principal`], [`current_principal`]): `dispatch` sets it for
+//! the whole of the request, on the connection's thread.
 //!
 //! **Keep [`requirement`] in step with `route_inner`'s dispatch table.** A
 //! tenant route missing here is not left open: it classifies as
@@ -33,12 +41,58 @@
 
 use crate::auth::Principal;
 use kosha_control::Scope;
+use std::cell::RefCell;
+
+thread_local! {
+    /// The tenant key the request this thread is serving authenticated
+    /// with; `None` for the admin and internal credentials.
+    static CURRENT: RefCell<Option<Principal>> = const { RefCell::new(None) };
+}
+
+/// Run `f` (the rest of a request) with `principal` as the request's
+/// principal, and clear it afterwards, even if `f` panics, so it can never
+/// leak into the next request served on this thread.
+pub fn with_principal<R>(principal: Option<Principal>, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<Principal>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            CURRENT.with(|current| *current.borrow_mut() = previous);
+        }
+    }
+    let previous = CURRENT.with(|current| current.replace(principal));
+    let _reset = Reset(previous);
+    f()
+}
+
+/// The principal [`with_principal`] set for the request this thread is
+/// serving.
+pub fn current_principal() -> Option<Principal> {
+    CURRENT.with(|current| current.borrow().clone())
+}
+
+/// Whether the request's key may see namespace `name` (unqualified) in a
+/// listing: every key not restricted to namespaces may, and the admin and
+/// internal credentials (no principal) may.
+pub fn may_see_namespace(name: &str) -> bool {
+    CURRENT.with(|current| match current.borrow().as_ref() {
+        Some(principal) => principal
+            .namespaces
+            .as_deref()
+            .is_none_or(|allowed| allowed.iter().any(|ns| ns == name)),
+        None => true,
+    })
+}
 
 /// Where a route names the namespace(s) it acts on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
-    /// The tenant as a whole (listing namespaces, usage, billing).
+    /// The tenant as a whole (usage, billing): a key restricted to
+    /// namespaces is refused.
     Tenant,
+    /// The tenant as a whole, but the handler answers only within the
+    /// key's namespaces (listing namespaces, the key routes).
+    Filtered,
     /// Named in the path.
     Path(String),
     /// Named by a string field of the JSON body.
@@ -100,7 +154,12 @@ pub fn requirement(method: &str, path: &str) -> Requirement {
     }
     match (method, bare) {
         (_, "/healthz" | "/v1/healthz" | "/stats" | "/v1/stats") => Requirement::Open,
-        ("GET", "/v1/namespaces") => scoped(Read, Target::Tenant),
+        ("GET", "/v1/namespaces") => scoped(Read, Target::Filtered),
+        // The tenant's own keys (#346 self-service).
+        ("GET" | "POST", "/v1/api-keys")
+        | ("POST", "/v1/api-keys/rotate" | "/v1/api-keys/revoke") => {
+            scoped(Admin, Target::Filtered)
+        }
         // A tenant reading its own usage (#348) and billing state (#349).
         ("GET", "/v1/usage" | "/v1/billing") => scoped(Read, Target::Tenant),
         ("POST", "/v1/namespaces") => scoped(Admin, Target::Body("namespace")),
@@ -133,7 +192,7 @@ fn target_namespaces(target: &Target, body: &[u8]) -> Option<Vec<String>> {
         value.get(field)?.as_str().map(str::to_string)
     };
     match target {
-        Target::Tenant => None,
+        Target::Tenant | Target::Filtered => None,
         Target::Path(ns) => Some(vec![ns.clone()]),
         Target::Body(field) => Some(vec![body_field(field)?]),
         Target::PathAndBody(ns, field) => Some(vec![ns.clone(), body_field(field)?]),
@@ -174,6 +233,9 @@ pub fn authorize(
     let Some(allowed) = principal.namespaces.as_deref() else {
         return Ok(());
     };
+    if target == Target::Filtered {
+        return Ok(());
+    }
     let Some(wanted) = target_namespaces(&target, body) else {
         return Err(match target {
             Target::Tenant => {
@@ -202,6 +264,8 @@ mod tests {
             tenant: "acme".into(),
             scopes: Scopes::of(scopes),
             namespaces: namespaces.map(|ns| ns.iter().map(|n| n.to_string()).collect()),
+            expires_at: None,
+            key_id: None,
         }
     }
 
@@ -235,13 +299,24 @@ mod tests {
         ("POST", "/v1/namespaces/docs/shards", Scope::Admin),
         ("POST", "/v1/namespaces/docs/branch", Scope::Admin),
         ("DELETE", "/v1/namespaces/docs/branch", Scope::Admin),
+        ("GET", "/v1/api-keys", Scope::Admin),
+        ("POST", "/v1/api-keys", Scope::Admin),
+        ("POST", "/v1/api-keys/rotate", Scope::Admin),
+        ("POST", "/v1/api-keys/revoke", Scope::Admin),
     ];
 
-    /// The routes of `ROUTES` that answer for the whole tenant.
-    const TENANT_WIDE: &[(&str, &str)] = &[
+    /// The routes of `ROUTES` that answer for the whole tenant and refuse a
+    /// namespace-restricted key.
+    const TENANT_WIDE: &[(&str, &str)] = &[("GET", "/v1/usage"), ("GET", "/v1/billing")];
+
+    /// The routes of `ROUTES` that answer for the whole tenant but narrow
+    /// the answer to a restricted key's namespaces.
+    const FILTERED: &[(&str, &str)] = &[
         ("GET", "/v1/namespaces"),
-        ("GET", "/v1/usage"),
-        ("GET", "/v1/billing"),
+        ("GET", "/v1/api-keys"),
+        ("POST", "/v1/api-keys"),
+        ("POST", "/v1/api-keys/rotate"),
+        ("POST", "/v1/api-keys/revoke"),
     ];
 
     /// The body of `route_inner` in main.rs, after its signature.
@@ -325,15 +400,17 @@ mod tests {
             source: Some((include_str!("billing.rs"), "\npub(crate) fn route(")),
         },
         Delegate {
-            call: "api_key_admin::handle(request_line, body)",
+            call: "tenant_key_admin::handle(request_line, body)",
             routes: &[
-                ("POST", "/v1/admin/api-keys"),
-                ("GET", "/v1/admin/api-keys"),
-                ("POST", "/v1/admin/api-keys/revoke"),
-                ("POST", "/v1/admin/api-keys/rotate"),
-                ("POST", "/v1/admin/api-keys/scrub-plaintext"),
+                ("GET", "/v1/api-keys"),
+                ("POST", "/v1/api-keys"),
+                ("POST", "/v1/api-keys/rotate"),
+                ("POST", "/v1/api-keys/revoke"),
             ],
-            source: Some((include_str!("api_key_admin.rs"), "\npub(crate) fn handle(")),
+            source: Some((
+                include_str!("tenant_key_admin.rs"),
+                "\npub(crate) fn handle(",
+            )),
         },
         Delegate {
             call: "namespace_deletion::route_admin(request_line, body, state)",
@@ -620,7 +697,8 @@ mod tests {
         let docs_only = key(&all, Some(&["docs", "docs-branch"]));
         let other_only = key(&all, Some(&["other"]));
         for &(method, path, _) in ROUTES {
-            if TENANT_WIDE.contains(&(method, path.split('?').next().unwrap())) {
+            let bare = path.split('?').next().unwrap();
+            if TENANT_WIDE.contains(&(method, bare)) || FILTERED.contains(&(method, bare)) {
                 continue;
             }
             assert!(
@@ -639,13 +717,32 @@ mod tests {
     fn namespace_restricted_keys_fail_closed() {
         let all = [Scope::Read, Scope::Write, Scope::Admin];
         let docs = key(&all, Some(&["docs"]));
-        // Listing, usage and billing span the tenant: the answer would
-        // name namespaces (or money) the key was not given.
+        // Usage and billing span the tenant: the answer would name
+        // namespaces (or money) the key was not given.
         for &(method, path) in TENANT_WIDE {
             let denied = authorize(&docs, method, path, b"").unwrap_err();
             assert!(denied.contains("whole tenant"), "{method} {path}: {denied}");
             // The same key without the namespace restriction may.
             assert!(authorize(&key(&[Scope::Read], None), method, path, b"").is_ok());
+        }
+        // Listing namespaces and the key routes narrow their answer to the
+        // key's namespaces instead, so a restricted key may use them (with
+        // the right scope).
+        for &(method, path) in FILTERED {
+            assert!(
+                authorize(&docs, method, path, b"").is_ok(),
+                "{method} {path}"
+            );
+            let read_only_docs = key(&[Scope::Read], Some(&["docs"]));
+            let needed = match requirement(method, path) {
+                Requirement::Scoped { scope, .. } => scope,
+                other => panic!("{method} {path}: {other:?}"),
+            };
+            assert_eq!(
+                authorize(&read_only_docs, method, path, b"").is_ok(),
+                needed == Scope::Read,
+                "{method} {path}"
+            );
         }
         assert!(authorize(&docs, "GET", "/v1/usage?from=1&to=2", b"").is_err());
         // A branch must be allowed by name as well as its parent.
@@ -692,6 +789,31 @@ mod tests {
             assert!(authorize(principal, "POST", "/v1/admin/api-keys", b"").is_ok());
             assert!(authorize(principal, "GET", "/internal/segment/a/b", b"").is_ok());
         }
+    }
+
+    #[test]
+    fn the_request_principal_narrows_listings_and_never_outlives_its_request() {
+        assert_eq!(current_principal(), None);
+        assert!(may_see_namespace("anything"));
+        let docs = key(&[Scope::Read], Some(&["docs"]));
+        with_principal(Some(docs.clone()), || {
+            assert_eq!(current_principal(), Some(docs.clone()));
+            assert!(may_see_namespace("docs"));
+            assert!(!may_see_namespace("other"));
+            // Nested (a request handled in a request) restores the outer one.
+            with_principal(None, || assert!(may_see_namespace("other")));
+            assert!(!may_see_namespace("other"));
+        });
+        assert_eq!(current_principal(), None);
+        // Cleared even when the request panics.
+        let _ = std::panic::catch_unwind(|| {
+            with_principal(Some(docs.clone()), || panic!("handler failed"))
+        });
+        assert_eq!(current_principal(), None);
+        // Unrestricted keys see everything.
+        with_principal(Some(key(&[Scope::Read], None)), || {
+            assert!(may_see_namespace("other"))
+        });
     }
 
     #[test]
