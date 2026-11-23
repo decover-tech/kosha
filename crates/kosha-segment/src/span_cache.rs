@@ -34,7 +34,7 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, RwLock, Weak};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock, Weak};
 use std::time::{Duration, SystemTime};
 
 /// Suffix of the sparse cache directory next to a segment file.
@@ -309,7 +309,70 @@ pub struct SpanIndex {
 /// directory had been quiet for [`LISTING_QUIET`] when it was taken, so a
 /// change landing in the same timestamp tick as the listing cannot hide
 /// behind an equal mtime.
-type ListingCache = RwLock<HashMap<PathBuf, (SystemTime, Arc<Vec<(u64, u64)>>)>>;
+type ListingCache = RwLock<Listings>;
+
+/// A cached listing: the directory's mtime when listed, its spans, and
+/// the [`listing_bytes`] it was charged.
+type Listing = (SystemTime, Arc<Vec<(u64, u64)>>, usize);
+
+/// The cached listings and an estimate of the heap they hold.
+#[derive(Debug, Default)]
+struct Listings {
+    map: HashMap<PathBuf, Listing>,
+    /// Sum of the charges in `map`.
+    bytes: usize,
+}
+
+/// Heap held by one cached listing: the map slot, the key's path, and the
+/// shared span vector (its allocation, not just its length). An estimate
+/// within allocator rounding; the spans dominate for any warmed directory.
+fn listing_bytes(dir: &Path, spans: &Arc<Vec<(u64, u64)>>) -> usize {
+    std::mem::size_of::<(PathBuf, Listing)>()
+        + 1 // hashbrown control byte
+        + dir.as_os_str().len()
+        + 2 * std::mem::size_of::<usize>() // Arc counts
+        + std::mem::size_of::<Vec<(u64, u64)>>()
+        + spans.capacity() * std::mem::size_of::<(u64, u64)>()
+}
+
+impl Listings {
+    /// Caches `spans` as `dir`'s listing at `at`, within `max_dirs`
+    /// directories and `max_bytes` of [`listing_bytes`]. A listing larger
+    /// than `max_bytes` alone is not cached. When the new listing does not
+    /// fit, every listing is dropped (as when the count bound is hit): the
+    /// dropped ones are returned, for the caller to free after releasing
+    /// the lock, together with any listing `dir` had before.
+    fn store(
+        &mut self,
+        dir: PathBuf,
+        at: SystemTime,
+        spans: Arc<Vec<(u64, u64)>>,
+        max_dirs: usize,
+        max_bytes: usize,
+    ) -> Garbage {
+        let replaced = self.remove(&dir);
+        let bytes = listing_bytes(&dir, &spans);
+        if bytes > max_bytes {
+            return (None, replaced);
+        }
+        let evicted = (self.map.len() >= max_dirs || self.bytes + bytes > max_bytes)
+            .then(|| std::mem::take(self));
+        self.map.insert(dir, (at, spans, bytes));
+        self.bytes += bytes;
+        (evicted, replaced)
+    }
+
+    fn remove(&mut self, dir: &Path) -> Option<Arc<Vec<(u64, u64)>>> {
+        let (_, old, charged) = self.map.remove(dir)?;
+        self.bytes = self.bytes.saturating_sub(charged);
+        Some(old)
+    }
+}
+
+/// Listings removed from the cache (every one, on eviction; the one a
+/// directory had before), to be dropped outside the cache's lock: freeing
+/// 16,384 listings is not free.
+type Garbage = (Option<Listings>, Option<Arc<Vec<(u64, u64)>>>);
 
 fn listing_cache() -> &'static ListingCache {
     static CACHE: OnceLock<ListingCache> = OnceLock::new();
@@ -324,6 +387,14 @@ const LISTING_QUIET: Duration = Duration::from_secs(2);
 /// memory for a node that has listed very many segments, not a tuning
 /// knob (one entry is 16 bytes per span).
 const LISTING_CACHE_MAX_DIRS: usize = 16_384;
+
+/// Heap the cached listings may hold ([`listing_bytes`]), whatever the
+/// count: the count alone does not bound memory, since one directory can
+/// hold any number of spans. 64 MiB is 4M spans, ~250 per directory at
+/// the count bound (the 10M vector bench's per-segment
+/// `doc_vectors.bin.spans` holds ~730); 0.26% of a 24 GiB live-memory
+/// watermark. Not a tuning knob.
+const LISTING_CACHE_MAX_BYTES: usize = 64 << 20;
 
 /// `KOSHA_SPAN_LISTING_CACHE=0` (or `off`/`false`) lists the directory on
 /// every [`SpanIndex::load`], as before. Read once.
@@ -384,7 +455,12 @@ impl SpanIndex {
                 ..Self::default()
             };
         };
-        if let Some((at, spans)) = listing_cache().read().unwrap().get(&dir) {
+        if let Some((at, spans, _)) = listing_cache()
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .map
+            .get(&dir)
+        {
             if *at == before {
                 return Self::from_disk(dir, Arc::clone(spans));
             }
@@ -392,18 +468,28 @@ impl SpanIndex {
         let listed = Self::list(dir);
         // Cache only a listing of a directory that did not change while
         // it was listed and had been quiet for a while before that.
-        let quiet = SystemTime::now()
+        let cacheable = SystemTime::now()
             .duration_since(before)
-            .is_ok_and(|age| age >= LISTING_QUIET);
-        let mut cache = listing_cache().write().unwrap();
-        if quiet && dir_mtime(&listed.dir) == Some(before) {
-            if cache.len() >= LISTING_CACHE_MAX_DIRS {
-                cache.clear();
+            .is_ok_and(|age| age >= LISTING_QUIET)
+            && dir_mtime(&listed.dir) == Some(before);
+        // Taken and released here; what it drops is freed after.
+        let garbage = {
+            let mut cache = listing_cache()
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            if cacheable {
+                cache.store(
+                    listed.dir.clone(),
+                    before,
+                    Arc::clone(&listed.on_disk),
+                    LISTING_CACHE_MAX_DIRS,
+                    LISTING_CACHE_MAX_BYTES,
+                )
+            } else {
+                (None, cache.remove(&listed.dir))
             }
-            cache.insert(listed.dir.clone(), (before, Arc::clone(&listed.on_disk)));
-        } else {
-            cache.remove(&listed.dir);
-        }
+        };
+        drop(garbage);
         listed
     }
 
@@ -853,6 +939,78 @@ mod tests {
         assert_eq!(SpanIndex::load(&seg, file).spans(), &[(0, 4), (10, 14)]);
         fs::remove_dir_all(spans_dir(&seg, file)).unwrap();
         assert!(SpanIndex::load(&seg, file).is_empty());
+        let _ = fs::remove_dir_all(&seg);
+    }
+
+    #[test]
+    fn listings_are_bounded_by_bytes_as_well_as_count() {
+        let spans = |n: usize| Arc::new(vec![(0u64, 1u64); n]);
+        let at = SystemTime::UNIX_EPOCH;
+        let one = listing_bytes(Path::new("/s/0"), &spans(1000));
+        // Room for three 1000-span listings, and a count bound far away.
+        let max = 3 * one + one / 2;
+        let mut cache = Listings::default();
+        for i in 0..3 {
+            let (evicted, replaced) = cache.store(
+                PathBuf::from(format!("/s/{i}")),
+                at,
+                spans(1000),
+                1 << 20,
+                max,
+            );
+            assert!(evicted.is_none() && replaced.is_none());
+        }
+        assert_eq!((cache.map.len(), cache.bytes), (3, 3 * one));
+
+        // Re-listing a directory replaces its charge instead of adding one.
+        let (evicted, replaced) = cache.store(PathBuf::from("/s/1"), at, spans(1000), 1 << 20, max);
+        assert!(evicted.is_none() && replaced.is_some());
+        assert_eq!(cache.bytes, 3 * one);
+
+        // A fourth does not fit: the cache is dropped (handed back to be
+        // freed outside the lock) and holds only the new listing.
+        let (evicted, _) = cache.store(PathBuf::from("/s/3"), at, spans(1000), 1 << 20, max);
+        assert_eq!(evicted.map(|e| (e.map.len(), e.bytes)), Some((3, 3 * one)));
+        assert_eq!((cache.map.len(), cache.bytes), (1, one));
+
+        // A listing over the whole bound is not cached, and takes the
+        // directory's stale listing out with it.
+        let (evicted, replaced) = cache.store(PathBuf::from("/s/3"), at, spans(4000), 1 << 20, max);
+        assert!(evicted.is_none() && replaced.is_some());
+        assert_eq!((cache.map.len(), cache.bytes), (0, 0));
+
+        // The count bound still applies.
+        for i in 0..5 {
+            let _ = cache.store(
+                PathBuf::from(format!("/c/{i}")),
+                at,
+                spans(1),
+                2,
+                usize::MAX,
+            );
+        }
+        assert!(cache.map.len() <= 2);
+        let charged: usize = cache.map.values().map(|v| v.2).sum();
+        assert_eq!(cache.bytes, charged);
+    }
+
+    #[test]
+    fn a_poisoned_listing_cache_still_serves() {
+        let seg = tmp("listing-poison");
+        let file = "doc_vectors.bin";
+        put(&seg, file, 0, &[1; 8]);
+        set_dir_mtime(&seg, file, SystemTime::now() - Duration::from_secs(60));
+        // A thread that panics holding the lock poisons it.
+        let _ = std::thread::spawn(|| {
+            let _guard = listing_cache()
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            panic!("poison the listing cache");
+        })
+        .join();
+        assert!(listing_cache().is_poisoned());
+        assert_eq!(SpanIndex::load(&seg, file).spans(), &[(0, 8)]);
+        assert_eq!(SpanIndex::load(&seg, file).spans(), &[(0, 8)]);
         let _ = fs::remove_dir_all(&seg);
     }
 
