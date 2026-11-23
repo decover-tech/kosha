@@ -5821,7 +5821,7 @@ fn dispatch(state: &AppState, request: http::Request) -> http::Response {
 
 fn dispatch_request(state: &AppState, request: http::Request) -> http::Response {
     let started = Instant::now();
-    let request_line = request.request_line();
+    let mut request_line = request.request_line();
     let headers = request.headers;
     let body = request.body;
 
@@ -5876,13 +5876,23 @@ fn dispatch_request(state: &AppState, request: http::Request) -> http::Response 
         // allow-list cover this request (#346). Checked here, ahead of
         // the role routing below, so a query pod refuses a request itself
         // instead of forwarding it to the ingest pod.
-        authenticate(&headers).and_then(|principal| {
-            let (method, path) = parse_method_and_path(&request_line).unwrap_or(("", ""));
-            match authz::authorize(&principal, method, path, &body) {
-                Ok(()) => Ok(principal.tenant),
-                Err(message) => Err(api_error(ErrorCode::PermissionDenied, &message)),
+        match authenticate(&headers) {
+            Err(e) => Err(e),
+            Ok(principal) => {
+                // Before authorization, so the key's allow-list is checked
+                // against the namespace the request will actually reach.
+                if let Some(aliased) =
+                    pre_utf8_namespace_alias(&request_line, &principal.tenant, state)
+                {
+                    request_line = aliased;
+                }
+                let (method, path) = parse_method_and_path(&request_line).unwrap_or(("", ""));
+                match authz::authorize(&principal, method, path, &body) {
+                    Ok(()) => Ok(principal.tenant),
+                    Err(message) => Err(api_error(ErrorCode::PermissionDenied, &message)),
+                }
             }
-        })
+        }
     };
     dispatch_authenticated(
         state,
@@ -6648,21 +6658,33 @@ fn valid_name_component(name: &str) -> bool {
             .any(|c| c == '/' || c == '\\' || c.is_control())
 }
 
-/// A namespace or branch name a tenant supplies: a valid component that is
-/// not a shard component (`_shard-NNNN`). Stored as `<tenant>/_shard-0001`
-/// it would be read as a shard of the bare namespace `<tenant>` (and
-/// accounted to `_legacy`) — see [`kosha_core::tenancy::is_reserved_name`].
-/// Other names starting with `_` or `.` stay valid, so namespaces created
-/// before #342 remain reachable.
+use kosha_core::tenancy::{MAX_NAMESPACE_NAME_BYTES, MAX_TENANT_ID_BYTES};
+
+/// A namespace or branch name a tenant supplies: a valid component of at
+/// most [`MAX_NAMESPACE_NAME_BYTES`] that is not a shard component
+/// (`_shard-NNNN`). Stored as `<tenant>/_shard-0001` it would be read as a
+/// shard of the bare namespace `<tenant>` (and accounted to `_legacy`) —
+/// see [`kosha_core::tenancy::is_reserved_name`]. Other names starting with
+/// `_` or `.` stay valid, so namespaces created before #342 remain
+/// reachable.
 fn valid_namespace_component(name: &str) -> bool {
-    valid_name_component(name) && !kosha_core::tenancy::is_reserved_name(name)
+    valid_name_component(name)
+        && name.len() <= MAX_NAMESPACE_NAME_BYTES
+        && !kosha_core::tenancy::is_reserved_name(name)
 }
 
-/// A tenant id for a newly registered API key. Ids starting with `_` or `.`
-/// are reserved: every namespace under them is accounted to the shared
+/// A tenant id that may own namespaces: ids starting with `_` or `.` are
+/// reserved, as every namespace under them is accounted to the shared
 /// `_legacy` tenant. Existing keys are not re-checked per request.
 fn valid_new_tenant_id(tenant: &str) -> bool {
     valid_name_component(tenant) && !tenant.starts_with('_') && !tenant.starts_with('.')
+}
+
+/// A tenant id for a newly registered API key: [`valid_new_tenant_id`] and
+/// at most [`MAX_TENANT_ID_BYTES`], so its namespaces' segment directory
+/// names fit the filesystem (see [`MAX_NAMESPACE_NAME_BYTES`]).
+fn valid_new_key_tenant_id(tenant: &str) -> bool {
+    valid_new_tenant_id(tenant) && tenant.len() <= MAX_TENANT_ID_BYTES
 }
 
 /// Authorize before dispatch, including compatibility and internal routes.
@@ -9307,16 +9329,42 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
 
 // ─── v1 route handlers (proto-defined paths, tenant-scoped namespaces) ─────
 
+/// Sets a `/v1/namespaces/{ns}/...` request body's `namespace` to the
+/// tenant-scoped path namespace and re-serializes it. Only a JSON object
+/// is accepted: the handlers behind these routes deserialize structs that
+/// carry their own `namespace` field, and serde also reads a struct from a
+/// JSON array (`["other-tenant/ns", [...]]`), so passing a non-object body
+/// through would let the body name a namespace outside the caller's tenant
+/// that authorization never checked.
+fn scope_body_to_namespace(
+    mut body_val: serde_json::Value,
+    scoped_ns: &str,
+) -> Result<Vec<u8>, String> {
+    let Some(obj) = body_val.as_object_mut() else {
+        return Err(api_error(
+            ErrorCode::InvalidArgument,
+            "request body must be a JSON object",
+        ));
+    };
+    obj.insert("namespace".into(), serde_json::json!(scoped_ns));
+    serde_json::to_vec(&body_val).map_err(|e| {
+        api_error(
+            ErrorCode::Internal,
+            &format!("re-encoding request body: {e}"),
+        )
+    })
+}
+
 fn handle_index_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &AppState) -> String {
     let scoped_ns = tenant_namespace(tenant, namespace);
-    let mut body_val: serde_json::Value = match serde_json::from_slice(body) {
+    let body_val: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => body_val_fallback(body),
     };
-    if let Some(obj) = body_val.as_object_mut() {
-        obj.insert("namespace".into(), serde_json::json!(scoped_ns));
-    }
-    let modified_body = serde_json::to_vec(&body_val).unwrap_or_else(|_| body.to_vec());
+    let modified_body = match scope_body_to_namespace(body_val, &scoped_ns) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
     handle_index(&modified_body, state)
 }
 
@@ -9327,14 +9375,14 @@ fn handle_index_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &AppS
 /// instead of silently treating partial patches as full upserts.
 fn handle_replace_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &AppState) -> String {
     let scoped_ns = tenant_namespace(tenant, namespace);
-    let mut body_val: serde_json::Value = match serde_json::from_slice(body) {
+    let body_val: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => return api_error(ErrorCode::InvalidArgument, &format!("invalid JSON: {e}")),
     };
-    if let Some(obj) = body_val.as_object_mut() {
-        obj.insert("namespace".into(), serde_json::json!(scoped_ns));
-    }
-    let modified_body = serde_json::to_vec(&body_val).unwrap_or_else(|_| body.to_vec());
+    let modified_body = match scope_body_to_namespace(body_val, &scoped_ns) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
     handle_replace(&modified_body, state)
 }
 
@@ -9555,53 +9603,54 @@ fn search_post_with_ns(
     obs: &SearchObservation,
 ) -> String {
     let scoped_ns = tenant_namespace(tenant, namespace);
-    let mut body_val: serde_json::Value = match serde_json::from_slice(body) {
+    let body_val: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return api_error(ErrorCode::InvalidArgument, "invalid JSON"),
     };
-    if let Some(obj) = body_val.as_object_mut() {
-        obj.insert("namespace".into(), serde_json::json!(scoped_ns));
-    }
-    let modified_body = serde_json::to_vec(&body_val).unwrap_or_else(|_| body.to_vec());
+    let modified_body = match scope_body_to_namespace(body_val, &scoped_ns) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
     search_post(&modified_body, state, obs)
 }
 
 fn handle_flush_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &AppState) -> String {
     let scoped_ns = tenant_namespace(tenant, namespace);
-    let mut body_val: serde_json::Value = match serde_json::from_slice(body) {
+    // An empty (or `null`) body is a flush with no options.
+    let body_val: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(serde_json::Value::Null) | Err(_) => serde_json::json!({}),
         Ok(v) => v,
-        Err(_) => serde_json::json!({}),
     };
-    if let Some(obj) = body_val.as_object_mut() {
-        obj.insert("namespace".into(), serde_json::json!(scoped_ns));
-    }
-    let modified_body = serde_json::to_vec(&body_val).unwrap_or_else(|_| body.to_vec());
+    let modified_body = match scope_body_to_namespace(body_val, &scoped_ns) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
     handle_flush(&modified_body, state)
 }
 
 fn handle_delete_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &AppState) -> String {
     let scoped_ns = tenant_namespace(tenant, namespace);
-    let mut body_val: serde_json::Value = match serde_json::from_slice(body) {
+    let body_val: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return api_error(ErrorCode::InvalidArgument, "invalid JSON"),
     };
-    if let Some(obj) = body_val.as_object_mut() {
-        obj.insert("namespace".into(), serde_json::json!(scoped_ns));
-    }
-    let modified_body = serde_json::to_vec(&body_val).unwrap_or_else(|_| body.to_vec());
+    let modified_body = match scope_body_to_namespace(body_val, &scoped_ns) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
     handle_delete(&modified_body, state)
 }
 
 fn handle_exists_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &AppState) -> String {
     let scoped_ns = tenant_namespace(tenant, namespace);
-    let mut req: serde_json::Value = match serde_json::from_slice(body) {
+    let req: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => return api_error(ErrorCode::InvalidArgument, &format!("invalid JSON: {e}")),
     };
-    if let Some(obj) = req.as_object_mut() {
-        obj.insert("namespace".into(), serde_json::json!(scoped_ns));
-    }
-    let modified = serde_json::to_vec(&req).unwrap_or_else(|_| body.to_vec());
+    let modified = match scope_body_to_namespace(req, &scoped_ns) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
     handle_exists(&modified, state)
 }
 
@@ -11465,6 +11514,105 @@ fn path_decode(input: &str) -> String {
     percent_decode(input, false)
 }
 
+/// How servers before #350 decoded a namespace in a URL: every `%XX` byte
+/// became the char with that code point (Latin-1, so `caf%C3%A9` was
+/// `cafÃ©`) and `+` became a space, in path segments too.
+fn pre_utf8_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |j: usize| bytes.get(j).and_then(|c| (*c as char).to_digit(16));
+        match bytes[i] {
+            b'+' => out.push(' '),
+            b'%' => match (hex(i + 1), hex(i + 2)) {
+                (Some(hi), Some(lo)) => {
+                    out.push(char::from((hi * 16 + lo) as u8));
+                    i += 2;
+                }
+                _ => out.push('%'),
+            },
+            _ => {
+                // Copy the whole (possibly multi-byte) char.
+                let ch = input[i..].chars().next().unwrap_or('\u{FFFD}');
+                out.push(ch);
+                i += ch.len_utf8();
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Percent-encode every byte of `name` except RFC 3986 unreserved ones,
+/// so [`path_decode`] and [`url_decode`] both give `name` back.
+fn percent_encode_component(name: &str) -> String {
+    name.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+/// Keeps namespaces created through a URL by a server before #350
+/// reachable. Those servers decoded a namespace in a path (or legacy
+/// `GET /search?ns=`) one byte per char and `+` as a space, so a client
+/// asking for `café` (`caf%C3%A9`) or `c++` created `cafÃ©` or `c  `. The
+/// server now decodes UTF-8 and keeps `+` in paths, and the same request
+/// names a different namespace. When the namespace the request decodes to
+/// does not exist for `tenant` but the old decoding names one that does,
+/// this returns the request line rewritten to address the old name, and
+/// logs it; `None` otherwise. Rename the namespace (or copy it) to stop
+/// relying on this.
+fn pre_utf8_namespace_alias(request_line: &str, tenant: &str, state: &AppState) -> Option<String> {
+    let (method, target) = parse_method_and_path(request_line)?;
+    // (offset of the raw namespace in `target`, its raw text, current decoding)
+    let (start, raw, current) = if let Some(rest) = target.strip_prefix("/v1/namespaces/") {
+        let raw = rest.split(['/', '?']).next()?;
+        (target.len() - rest.len(), raw, path_decode(raw))
+    } else if method == "GET" && target.split('?').next() == Some("/search") {
+        let (_, query) = target.split_once('?')?;
+        let mut offset = target.len() - query.len();
+        let mut found = None;
+        for pair in query.split('&') {
+            if let Some(raw) = pair.strip_prefix("ns=") {
+                found = Some((offset + 3, raw));
+                break;
+            }
+            offset += pair.len() + 1;
+        }
+        let (start, raw) = found?;
+        (start, raw, url_decode(raw))
+    } else {
+        return None;
+    };
+    let legacy = pre_utf8_decode(raw);
+    if legacy == current || !valid_namespace_component(&legacy) {
+        return None;
+    }
+    let exists =
+        |name: &str| !namespace_is_new(state, &NamespaceId(tenant_namespace(tenant, name)));
+    if exists(&current) || !exists(&legacy) {
+        return None;
+    }
+    eprintln!(
+        "warning: tenant {tenant:?}: namespace {current:?} does not exist; serving {legacy:?}, \
+         the name a server before API 1.0 decoded {raw:?} to. Rename it to {current:?}."
+    );
+    let rewritten = format!(
+        "{}{}{}",
+        &target[..start],
+        percent_encode_component(&legacy),
+        &target[start + raw.len()..]
+    );
+    Some(request_line.replacen(target, &rewritten, 1))
+}
+
 /// Collect the decoded bytes, then read them as UTF-8 (an invalid sequence
 /// becomes U+FFFD). A `%` not followed by two hex digits stays literal.
 fn percent_decode(input: &str, plus_is_space: bool) -> String {
@@ -11826,6 +11974,22 @@ mod tests {
         assert!(valid_name_component("_ops"));
         assert!(valid_namespace_component("_staging"));
         assert!(!valid_namespace_component("_shard-0001"));
+        assert!(valid_namespace_component(
+            &"a".repeat(MAX_NAMESPACE_NAME_BYTES)
+        ));
+        assert!(!valid_namespace_component(
+            &"a".repeat(MAX_NAMESPACE_NAME_BYTES + 1)
+        ));
+        // Bytes, not chars: 'é' is two bytes in UTF-8.
+        assert!(!valid_namespace_component(
+            &"é".repeat(MAX_NAMESPACE_NAME_BYTES / 2 + 1)
+        ));
+        assert!(valid_new_key_tenant_id(&"t".repeat(MAX_TENANT_ID_BYTES)));
+        assert!(!valid_new_key_tenant_id(
+            &"t".repeat(MAX_TENANT_ID_BYTES + 1)
+        ));
+        // Deleting an existing tenant is not bound by the new-key limit.
+        assert!(valid_new_tenant_id(&"t".repeat(MAX_TENANT_ID_BYTES + 1)));
     }
 
     #[test]
@@ -17895,6 +18059,89 @@ mod tests {
     fn json_body(response: &str) -> serde_json::Value {
         let body = response.split("\r\n\r\n").nth(1).unwrap_or_default();
         serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {response}"))
+    }
+
+    /// A namespace a server before #350 created from a URL (Latin-1
+    /// decoding, `+` as a space) stays reachable by the request that
+    /// created it, as long as the UTF-8 name does not exist.
+    #[test]
+    fn pre_utf8_namespaces_stay_reachable() {
+        let state = test_state();
+        let ensure = |ns: &str| {
+            state
+                .controller
+                .lock()
+                .unwrap()
+                .ensure_namespace(NamespaceId(ns.into()))
+        };
+        ensure("t/caf\u{c3}\u{a9}");
+        ensure("t/c  ");
+        let line = "POST /v1/namespaces/caf%C3%A9/search HTTP/1.1\r\n";
+        let aliased = pre_utf8_namespace_alias(line, "t", &state).expect("aliased");
+        assert_eq!(
+            extract_namespace(&aliased, "POST /v1/namespaces/", "/search").as_deref(),
+            Some("caf\u{c3}\u{a9}")
+        );
+        assert!(aliased.ends_with("/search HTTP/1.1\r\n"), "{aliased}");
+        let del = pre_utf8_namespace_alias("DELETE /v1/namespaces/c++ HTTP/1.1\r\n", "t", &state)
+            .expect("aliased");
+        assert_eq!(bare_namespace(&del, "DELETE").as_deref(), Some("c  "));
+        let get =
+            pre_utf8_namespace_alias("GET /search?q=x&ns=caf%C3%A9&k=1 HTTP/1.1\r\n", "t", &state)
+                .expect("aliased");
+        assert!(get.contains("&ns=caf%C3%83%C2%A9&k=1 "), "{get}");
+        // Another tenant, an ASCII name, or a UTF-8 name that exists: no alias.
+        assert!(pre_utf8_namespace_alias(line, "u", &state).is_none());
+        assert!(pre_utf8_namespace_alias(
+            "POST /v1/namespaces/docs/search HTTP/1.1\r\n",
+            "t",
+            &state
+        )
+        .is_none());
+        ensure("t/caf\u{e9}");
+        assert!(pre_utf8_namespace_alias(line, "t", &state).is_none());
+    }
+
+    /// A `/v1/namespaces/{ns}/...` body that is not a JSON object is a 400.
+    /// serde reads a struct from a JSON array too, so an array body such as
+    /// `["victim/docs", [...]]` used to slip past the object-only namespace
+    /// rewrite and write into a namespace outside the caller's tenant.
+    #[test]
+    fn v1_namespace_routes_reject_non_object_bodies() {
+        let state = test_state();
+        let headers = HashMap::new();
+        let doc = serde_json::json!([{"id": "x", "fields": [["title", {"Text": "hi"}]]}]);
+        let array_body = serde_json::to_vec(&serde_json::json!(["victim/docs", doc])).unwrap();
+        for action in [
+            "documents",
+            "replace",
+            "search",
+            "flush",
+            "delete",
+            "exists",
+        ] {
+            let line = format!("POST /v1/namespaces/mine/{action} HTTP/1.1\r\n");
+            for body in [array_body.as_slice(), b"\"victim/docs\"", b"7"] {
+                let resp = route_inner(&line, &headers, body, "attacker", &state);
+                assert!(resp.starts_with("HTTP/1.1 400"), "{action}: {resp}");
+                assert_eq!(
+                    json_body(&resp)["code"],
+                    "invalid_argument",
+                    "{action}: {resp}"
+                );
+            }
+        }
+        // An empty or `null` flush body is still a flush with no options.
+        for body in [&b""[..], b"null"] {
+            let resp = route_inner(
+                "POST /v1/namespaces/mine/flush HTTP/1.1\r\n",
+                &headers,
+                body,
+                "t",
+                &state,
+            );
+            assert!(!resp.starts_with("HTTP/1.1 400"), "{resp}");
+        }
     }
 
     /// #242: nothing used to call `needs_compaction`. A scheduler tick must

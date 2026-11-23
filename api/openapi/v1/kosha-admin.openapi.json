@@ -3535,6 +3535,16 @@
     "/v1/admin/orgs": {
       "post": {
         "operationId": "AdminService_CreateOrg",
+        "parameters": [
+          {
+            "description": "The user id to act for; the user's role in the organization is enforced. Omit to act as the operator (not bound by roles). An empty value is 400 invalid_argument.",
+            "in": "header",
+            "name": "X-Kosha-Actor",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -3713,6 +3723,14 @@
             "in": "path",
             "name": "org",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The user id to act for; the user's role in the organization is enforced. Omit to act as the operator (not bound by roles). An empty value is 400 invalid_argument.",
+            "in": "header",
+            "name": "X-Kosha-Actor",
             "schema": {
               "type": "string"
             }
@@ -3905,6 +3923,14 @@
               "format": "int64",
               "type": "integer"
             }
+          },
+          {
+            "description": "The user id to act for; the user's role in the organization is enforced. Omit to act as the operator (not bound by roles). An empty value is 400 invalid_argument.",
+            "in": "header",
+            "name": "X-Kosha-Actor",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -4076,6 +4102,14 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "The user id to act for; the user's role in the organization is enforced. Omit to act as the operator (not bound by roles). An empty value is 400 invalid_argument.",
+            "in": "header",
+            "name": "X-Kosha-Actor",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -4242,6 +4276,14 @@
             "in": "path",
             "name": "org",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The user id to act for; the user's role in the organization is enforced. Omit to act as the operator (not bound by roles). An empty value is 400 invalid_argument.",
+            "in": "header",
+            "name": "X-Kosha-Actor",
             "schema": {
               "type": "string"
             }
@@ -4436,6 +4478,14 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "The user id to act for; the user's role in the organization is enforced. Omit to act as the operator (not bound by roles). An empty value is 400 invalid_argument.",
+            "in": "header",
+            "name": "X-Kosha-Actor",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -4612,6 +4662,14 @@
             "in": "path",
             "name": "user_id",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The user id to act for; the user's role in the organization is enforced. Omit to act as the operator (not bound by roles). An empty value is 400 invalid_argument.",
+            "in": "header",
+            "name": "X-Kosha-Actor",
             "schema": {
               "type": "string"
             }
@@ -4798,6 +4856,14 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "The user id to act for; the user's role in the organization is enforced. Omit to act as the operator (not bound by roles). An empty value is 400 invalid_argument.",
+            "in": "header",
+            "name": "X-Kosha-Actor",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -4964,6 +5030,14 @@
             "in": "path",
             "name": "org",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The user id to act for; the user's role in the organization is enforced. Omit to act as the operator (not bound by roles). An empty value is 400 invalid_argument.",
+            "in": "header",
+            "name": "X-Kosha-Actor",
             "schema": {
               "type": "string"
             }
@@ -5150,6 +5224,14 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "The user id to act for; the user's role in the organization is enforced. Omit to act as the operator (not bound by roles). An empty value is 400 invalid_argument.",
+            "in": "header",
+            "name": "X-Kosha-Actor",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -5316,6 +5398,14 @@
             "in": "path",
             "name": "org",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The user id to act for; the user's role in the organization is enforced. Omit to act as the operator (not bound by roles). An empty value is 400 invalid_argument.",
+            "in": "header",
+            "name": "X-Kosha-Actor",
             "schema": {
               "type": "string"
             }
@@ -5507,6 +5597,14 @@
             "in": "path",
             "name": "tenant_id",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The user id to act for; the user's role in the organization is enforced. Omit to act as the operator (not bound by roles). An empty value is 400 invalid_argument.",
+            "in": "header",
+            "name": "X-Kosha-Actor",
             "schema": {
               "type": "string"
             }
@@ -6240,6 +6338,16 @@
     "/v1/admin/users": {
       "post": {
         "operationId": "AdminService_CreateUser",
+        "parameters": [
+          {
+            "description": "The user id to act for; the user's role in the organization is enforced. Omit to act as the operator (not bound by roles). An empty value is 400 invalid_argument.",
+            "in": "header",
+            "name": "X-Kosha-Actor",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -6418,6 +6526,14 @@
             "in": "path",
             "name": "user_id",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The user id to act for; the user's role in the organization is enforced. Omit to act as the operator (not bound by roles). An empty value is 400 invalid_argument.",
+            "in": "header",
+            "name": "X-Kosha-Actor",
             "schema": {
               "type": "string"
             }

@@ -415,6 +415,18 @@ def test_a_count_mismatch_fails(env):
     assert copy.main(["--index", "products", "--no-verify"]) == 0
 
 
+def test_a_rerun_after_deletes_in_es_needs_allow_extra(env):
+    assert copy.main(["--index", "products"]) == 0
+    StubES.indices["products"]["docs"].pop("p00")
+    # The re-run upserts and never deletes, so Kosha holds one more document.
+    assert copy.main(["--index", "products"]) == 1
+    assert copy.main(["--index", "products", "--allow-extra"]) == 0
+    # Fewer documents in Kosha than in Elasticsearch still fails.
+    FakeKosha.namespaces.clear()
+    FakeKosha.drop_one_from = {"products"}
+    assert copy.main(["--index", "products", "--allow-extra"]) == 1
+
+
 def test_an_index_or_pattern_is_required(env):
     with pytest.raises(SystemExit) as e:
         copy.main([])

@@ -1254,6 +1254,13 @@ service AdminService {
       body: "body"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      parameters: {
+        headers: {
+          name: "X-Kosha-Actor"
+          description: "The user id to act for; the user's role in the organization is enforced. Omit to act as the operator (not bound by roles). An empty value is 400 invalid_argument."
+          type: STRING
+        }
+      }
       responses: {
         key: "408"
         value: {
@@ -1297,6 +1304,13 @@ service AdminService {
       get: "/v1/admin/users/{user_id}"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      parameters: {
+        headers: {
+          name: "X-Kosha-Actor"
+          description: "The user id to act for; the user's role in the organization is enforced. Omit to act as the operator (not bound by roles). An empty value is 400 invalid_argument."
+          type: STRING
+        }
+      }
       responses: {
         key: "408"
         value: {
@@ -1341,6 +1355,13 @@ service AdminService {
       body: "body"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      parameters: {
+        headers: {
+          name: "X-Kosha-Actor"
+          description: "The user id to act for; the user's role in the organization is enforced. Omit to act as the operator (not bound by roles). An empty value is 400 invalid_argument."
+          type: STRING
+        }
+      }
       responses: {
         key: "408"
         value: {
@@ -1384,6 +1405,13 @@ service AdminService {
       get: "/v1/admin/orgs/{org}"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      parameters: {
+        headers: {
+          name: "X-Kosha-Actor"
+          description: "The user id to act for; the user's role in the organization is enforced. Omit to act as the operator (not bound by roles). An empty value is 400 invalid_argument."
+          type: STRING
+        }
+      }
       responses: {
         key: "408"
         value: {
@@ -1427,6 +1455,13 @@ service AdminService {
       get: "/v1/admin/orgs/{org}/members"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      parameters: {
+        headers: {
+          name: "X-Kosha-Actor"
+          description: "The user id to act for; the user's role in the organization is enforced. Omit to act as the operator (not bound by roles). An empty value is 400 invalid_argument."
+          type: STRING
+        }
+      }
       responses: {
         key: "408"
         value: {
@@ -1471,6 +1506,13 @@ service AdminService {
       body: "body"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      parameters: {
+        headers: {
+          name: "X-Kosha-Actor"
+          description: "The user id to act for; the user's role in the organization is enforced. Omit to act as the operator (not bound by roles). An empty value is 400 invalid_argument."
+          type: STRING
+        }
+      }
       responses: {
         key: "408"
         value: {
@@ -1515,6 +1557,13 @@ service AdminService {
       body: "body"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      parameters: {
+        headers: {
+          name: "X-Kosha-Actor"
+          description: "The user id to act for; the user's role in the organization is enforced. Omit to act as the operator (not bound by roles). An empty value is 400 invalid_argument."
+          type: STRING
+        }
+      }
       responses: {
         key: "408"
         value: {
@@ -1558,6 +1607,13 @@ service AdminService {
       delete: "/v1/admin/orgs/{org}/members/{user_id}"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      parameters: {
+        headers: {
+          name: "X-Kosha-Actor"
+          description: "The user id to act for; the user's role in the organization is enforced. Omit to act as the operator (not bound by roles). An empty value is 400 invalid_argument."
+          type: STRING
+        }
+      }
       responses: {
         key: "408"
         value: {
@@ -1601,6 +1657,13 @@ service AdminService {
       get: "/v1/admin/orgs/{org}/projects"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      parameters: {
+        headers: {
+          name: "X-Kosha-Actor"
+          description: "The user id to act for; the user's role in the organization is enforced. Omit to act as the operator (not bound by roles). An empty value is 400 invalid_argument."
+          type: STRING
+        }
+      }
       responses: {
         key: "408"
         value: {
@@ -1645,6 +1708,13 @@ service AdminService {
       body: "body"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      parameters: {
+        headers: {
+          name: "X-Kosha-Actor"
+          description: "The user id to act for; the user's role in the organization is enforced. Omit to act as the operator (not bound by roles). An empty value is 400 invalid_argument."
+          type: STRING
+        }
+      }
       responses: {
         key: "408"
         value: {
@@ -1688,6 +1758,13 @@ service AdminService {
       get: "/v1/admin/orgs/{org}/tenants"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      parameters: {
+        headers: {
+          name: "X-Kosha-Actor"
+          description: "The user id to act for; the user's role in the organization is enforced. Omit to act as the operator (not bound by roles). An empty value is 400 invalid_argument."
+          type: STRING
+        }
+      }
       responses: {
         key: "408"
         value: {
@@ -1732,6 +1809,13 @@ service AdminService {
       body: "body"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      parameters: {
+        headers: {
+          name: "X-Kosha-Actor"
+          description: "The user id to act for; the user's role in the organization is enforced. Omit to act as the operator (not bound by roles). An empty value is 400 invalid_argument."
+          type: STRING
+        }
+      }
       responses: {
         key: "408"
         value: {
@@ -1776,6 +1860,13 @@ service AdminService {
       body: "body"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      parameters: {
+        headers: {
+          name: "X-Kosha-Actor"
+          description: "The user id to act for; the user's role in the organization is enforced. Omit to act as the operator (not bound by roles). An empty value is 400 invalid_argument."
+          type: STRING
+        }
+      }
       responses: {
         key: "408"
         value: {
@@ -1819,6 +1910,13 @@ service AdminService {
       get: "/v1/admin/orgs/{org}/audit-log"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      parameters: {
+        headers: {
+          name: "X-Kosha-Actor"
+          description: "The user id to act for; the user's role in the organization is enforced. Omit to act as the operator (not bound by roles). An empty value is 400 invalid_argument."
+          type: STRING
+        }
+      }
       responses: {
         key: "408"
         value: {

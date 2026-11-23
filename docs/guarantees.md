@@ -190,7 +190,12 @@ sub-aggregations only. `terms` and `composite` sizes are not capped.
 
 Namespace and branch names are one path component: not empty, not `.` or
 `..`, with no `/`, `\` or control characters, and not of the form
-`_shard-NNNN`. There is no length limit.
+`_shard-NNNN`. They are at most 120 bytes of UTF-8 (a longer name is a
+400 `invalid_argument`): a namespace is a directory, its segment directory
+names embed the tenant and the namespace, and filesystems cap a path
+component at 255 bytes. A new API key's tenant id is at most 80 bytes for
+the same reason (`crates/kosha-core/src/tenancy.rs`,
+`MAX_NAMESPACE_NAME_BYTES` and `MAX_TENANT_ID_BYTES`, no override).
 
 ### Defaults that bound a response
 

@@ -26,6 +26,10 @@ enforces it on the public document.
   handler (413 body cap, 408 body timeout, 503 capacity) carry
   `X-Request-Id` (the caller's) and `Kosha-Api-Version` like every other
   response.
+- Admin document: the `X-Kosha-Actor` header parameter on every
+  `/v1/admin/users` and `/v1/admin/orgs` operation (act for that user under
+  their organization role; empty is `400`). Every other admin route answers
+  `403` when the header is present.
 
 ### Changed
 
@@ -41,6 +45,19 @@ enforces it on the public document.
 - Error messages no longer carry internal I/O, S3 or Postgres text, the
   ingest pod's address, or the tenant prefix of a namespace; those stay in
   the server log, keyed by `request_id`.
+- A namespace in a URL path or in legacy `GET /search?ns=` is decoded as
+  UTF-8 percent-escapes, and `+` in a path is a literal plus. Servers
+  before #350 decoded each `%XX` byte as one Latin-1 char and `+` as a
+  space, so a request for `café` (`caf%C3%A9`) or `c++` reached `cafÃ©` or
+  `c  `. A namespace created under such a name stays reachable by the same
+  request while no namespace with the UTF-8 name exists; the server logs a
+  warning each time. Rename those namespaces.
+- A `/v1/namespaces/{namespace}/...` request body that is not a JSON
+  object is `400 invalid_argument` (a JSON array was passed through, and
+  could name a namespace other than the path's).
+- Namespace and branch names are at most 120 bytes, and a new API key's
+  tenant id at most 80 bytes (`400 invalid_argument`). A longer name was
+  accepted and its writes then failed to flush ("File name too long").
 
 ## [0.10.0]
 

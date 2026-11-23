@@ -663,6 +663,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Also report how many docs carry this field (an embedding, say).")
     parser.add_argument("--no-verify", action="store_true",
                         help="Skip the count check after each index.")
+    parser.add_argument("--allow-extra", action="store_true",
+                        help="On a re-run, accept a namespace that holds more documents than "
+                             "Elasticsearch (documents deleted there since an earlier copy are "
+                             "not removed); the excess is logged as a warning, not a failure.")
     parser.add_argument("--timeout", type=int, default=120,
                         help="Per-request timeout in seconds (default 120).")
     parser.add_argument("--es-host", default=os.environ.get("ELASTICSEARCH_HOST", DEFAULT_ES_HOST),
@@ -735,6 +739,15 @@ def main(argv: list[str] | None = None) -> int:
             elif args.limit and got > want:
                 # A capped copy into a namespace that already held documents.
                 logger.warning("namespace %s holds %s documents; %s were copied (--limit)", namespace, got, want)
+            elif args.allow_extra and got > want:
+                # A re-run: the copy upserts but never deletes, so documents
+                # deleted in Elasticsearch since an earlier copy remain.
+                logger.warning(
+                    "namespace %s holds %s documents, %s more than Elasticsearch's %s "
+                    "(documents deleted in Elasticsearch since an earlier copy are not removed; "
+                    "--allow-extra)",
+                    namespace, got, got - want, want,
+                )
             else:
                 mismatches.append(f"{index} → {namespace}: ES {want}, Kosha {got}")
 

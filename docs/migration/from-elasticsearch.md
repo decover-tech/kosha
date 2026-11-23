@@ -109,6 +109,7 @@ python3 scripts/copy_es_to_kosha.py --pattern 'logs-*' --create-schema-from-mapp
 | `--limit N` | none | Copy at most N documents per index. |
 | `--embedding-field F` | none | Also report how many documents carry field F. |
 | `--no-verify` | off | Skip the count check described below. |
+| `--allow-extra` | off | In the count check, accept a namespace holding more documents than Elasticsearch (a re-run after deletes there). |
 
 Writes are upserts by document id, so a copy that stopped part-way can simply
 be run again. The script retries Kosha's 429 and 503 answers (honouring
@@ -118,13 +119,30 @@ The copy is a snapshot of each index as its scroll reads it. Documents written
 to Elasticsearch after that are not copied, and deletions are not propagated:
 keep writing to both systems until you cut over, or run the copy again just
 before switching (it upserts changed documents, but does not remove documents
-deleted in Elasticsearch).
+deleted in Elasticsearch). Pass `--allow-extra` to that re-run, because any
+document deleted in Elasticsearch since the first copy is still in Kosha and
+the count check would otherwise fail:
+
+```bash
+python3 scripts/copy_es_to_kosha.py --index products --allow-extra
+```
+
+To drop those stale documents instead, delete the namespace
+(`DELETE /v1/namespaces/products`) and run the copy into it again.
 
 ## 6. Verify
 
 After each index the script counts the documents in the namespace and
 compares the number with Elasticsearch's `_count` (or with `--limit`). A
 mismatch is logged as `count mismatch` and the script exits with status 1.
+With `--allow-extra`, more documents in Kosha than in Elasticsearch is a
+warning instead; fewer is still a mismatch.
+
+`_count` is read when an index's copy finishes, not when its scroll started.
+On an index that is still taking writes or deletes, the two numbers can
+differ even though the copy did what it should. Run the verifying copy
+after writes to Elasticsearch have stopped for the cutover, or treat a
+mismatch on a live index as expected and re-run once writes stop.
 
 Then compare search results for a handful of real queries, sending the same
 body through both clients:

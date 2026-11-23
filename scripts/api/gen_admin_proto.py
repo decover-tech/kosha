@@ -42,6 +42,23 @@ QUERY_PARAMS = {
     ],
 }
 
+# The organization routes (`org_admin.rs`, #345) act for the user this
+# header names and enforce that user's role; without it they run as the
+# operator. Every other admin route is operator-only and answers 403 when
+# the header is present.
+ACTOR_PREFIXES = ("/v1/admin/users", "/v1/admin/orgs")
+ACTOR_HEADER = (
+    "      parameters: {\n"
+    "        headers: {\n"
+    '          name: "X-Kosha-Actor"\n'
+    '          description: "The user id to act for; the user\'s role in the organization '
+    "is enforced. Omit to act as the operator (not bound by roles). An empty value is "
+    '400 invalid_argument."\n'
+    "          type: STRING\n"
+    "        }\n"
+    "      }\n"
+)
+
 # Operations that also answer 202 Accepted, and what that means.
 ACCEPTED = {
     "AdminService_CompactNamespace": (
@@ -280,6 +297,7 @@ def render():
             # Per operation: the generator drops headers of file-level
             # responses (grpc-gateway v2.24.0), so every retryable status
             # is repeated here with its Retry-After.
+            + (ACTOR_HEADER if template.startswith(ACTOR_PREFIXES) else "")
             + (_accepted_response(ACCEPTED[op]) if op in ACCEPTED else "")
             + RETRY_RESPONSES
             + "      extensions: {\n"

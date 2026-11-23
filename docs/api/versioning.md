@@ -48,9 +48,17 @@ Breaking (needs `/v2`):
 Behavioural breaks no tool can catch (the last two bullets) are a PR-review
 checklist item.
 
-**Unknown request fields** are accepted and ignored in v1 (existing
-clients, including the Python client's OpenSearch translator, send some);
-v2 will reject them.
+**Unknown request fields** are accepted and ignored in v1 at the top
+level of a request body (existing clients, including the Python client's
+OpenSearch translator, send some); v2 will reject them. Several nested
+objects are strict and answer an unknown key with 400 `invalid_argument`:
+`rerank`, `rank`, `rrf`, `limit_per`, aggregation metrics, the `exists`
+and `bool` filters, and each field definition in a namespace schema. A new
+optional field inside one of those objects is therefore additive for the
+server but not for an older server: a client that sends it to a server
+from before the revision that added it gets a 400. SDKs send such a field
+only when the caller sets it, and the changelog entry that adds it names
+the revision it needs.
 
 ### Client obligations
 
@@ -68,7 +76,7 @@ A client release names the oldest contract revision it needs:
 
 | Client | Needs | Why |
 |---|---|---|
-| kosha-client 0.3.x | a server that sends `Kosha-Api-Version` (contract 0.10.0+) | `update()`, bulk `update` and `update_by_query()` call `POST /v1/namespaces/{ns}/replace`, new in #350; an older server answers 404. |
+| kosha-client 0.3.x | a server that sends `Kosha-Api-Version` (contract 0.10.0+) | `update()`, bulk `update` and `update_by_query()` call `POST /v1/namespaces/{ns}/replace`, new in #350. An older server answers it with a bare 404 (or, for a scope- or namespace-restricted key, a bare 403), and the client then falls back to the deprecated `POST /replace`. |
 | kosha-client 0.2.x | legacy routes on | calls the unversioned routes. |
 
 Upgrade servers before clients. A server from before #350 sends no

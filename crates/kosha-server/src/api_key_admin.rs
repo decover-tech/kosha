@@ -24,7 +24,7 @@
 //! a `key_id` is expected, `{"api_key": "<the key>"}` works too.
 
 use crate::{
-    api_error, api_error_status, valid_namespace_component, valid_new_tenant_id, ErrorCode,
+    api_error, api_error_status, valid_namespace_component, valid_new_key_tenant_id, ErrorCode,
 };
 use kosha_control::{hash_api_key, ApiKeyRecord, NewApiKey, Scopes};
 
@@ -114,9 +114,9 @@ fn parse_create(req: &serde_json::Value, now: i64) -> Result<NewApiKey, Rejectio
         .get("tenant_id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| bad_request("missing 'tenant_id'"))?;
-    if !valid_new_tenant_id(tenant_id) {
+    if !valid_new_key_tenant_id(tenant_id) {
         return Err(bad_request(
-            "invalid 'tenant_id' (must be non-empty, without '/', '\\' or control \
+            "invalid 'tenant_id' (must be 1 to 80 bytes, without '/', '\\' or control \
              characters, and not start with '_' or '.')",
         ));
     }

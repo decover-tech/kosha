@@ -226,18 +226,25 @@ class KoshaClient:
             return self._transport.request(method, target, body, headers)
         except KoshaRequestError as e:
             # `POST /v1/namespaces/{ns}/replace` is new in contract 0.9.0.
-            # An older server answers it with a bare 404 (no `code`: only
-            # servers with the error model send one), so partial updates go
-            # to its legacy `/replace`, which it still serves. A current
-            # server's 404 here is `namespace_not_found` and is raised.
-            if path != "replace" or e.status_code != 404 or e.code is not None:
+            # An older server does not know the route: it answers a bare
+            # 404, or, for an API key restricted by scopes or namespaces, a
+            # bare 403 ("cannot use this route") from its authorization
+            # check, which runs before routing. Neither carries a `code`
+            # (only servers with the error model send one), so partial
+            # updates go to its legacy `/replace`, which it still serves to
+            # the same key. A current server's 404/403 carries a `code`
+            # (`namespace_not_found`, `permission_denied`) and is raised.
+            if path != "replace" or e.status_code not in (403, 404) or e.code is not None:
                 raise
             logger.warning(
                 "kosha server has no /v1/namespaces/{ns}/replace (older than API 0.9.0); "
                 "falling back to the deprecated POST /replace. Upgrade the server."
             )
+            result = self._transport.request(method, "replace", legacy_body, headers)
+            # Only once the legacy route has served the request: a bare 403
+            # that was a real refusal is raised by it, and not remembered.
             self._legacy_replace = True
-            return self._transport.request(method, "replace", legacy_body, headers)
+            return result
 
     def _v1_request(
         self, method: str, namespace: str, action: str, body: Any = None
