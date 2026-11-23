@@ -13,7 +13,7 @@
   },
   {
     "id": "retry.quota_not_retried",
-    "description": "A 429 that says retryable:false (a quota) is tried once.",
+    "description": "Synthetic fault: a 429 whose body says retryable:false is tried once (RETRY.md rule 1, the body's retryable wins over the status). The server itself sends quota rejections as 403.",
     "covers": ["KoshaService_Search"],
     "setup": [{ "op": "create_namespace" }],
     "faults": [

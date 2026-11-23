@@ -40,9 +40,12 @@ jobs:
               - 'proto/**'
               - 'api/**'
               - 'clients/**'
-              - 'crates/kosha-server/**'
-              - 'crates/kosha-core/**'
+              # every crate can change server behaviour (kosha-server links
+              # query, write, segment, control, cache and core)
+              - 'crates/**'
+              - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'rust-toolchain.toml'
               - 'Dockerfile'
               - 'docker-compose*.yml'
               - 'scripts/integration/**'
