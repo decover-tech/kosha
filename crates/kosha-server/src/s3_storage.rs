@@ -33,12 +33,21 @@ use crate::segment_commit;
 /// the chain goes only to the pod log, with the request id; the message
 /// keeps the short form. Error path only.
 pub(crate) fn log_s3_error<E: std::error::Error>(op: &str, target: &str, e: &E) -> String {
+    #[cfg(test)]
+    S3_ERRORS_LOGGED.with(|n| n.set(n.get() + 1));
     eprintln!(
         "WARN: S3 {op} {target} failed: {}{}",
         aws_sdk_s3::error::DisplayErrorContext(e),
         crate::request_id()
     );
     e.to_string()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Lines [`log_s3_error`] wrote on this thread, so a test can assert an
+    /// expected S3 answer is not logged.
+    pub(crate) static S3_ERRORS_LOGGED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// [`log_s3_error`] for `GetObject`, without the log line for a missing
@@ -3242,6 +3251,40 @@ mod error_path_tests {
             .delete(&["_wal/w1/acme/ns/000001".to_string()])
             .unwrap_err();
         assert_short(&delete.to_string());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A conditional WAL put that loses to an existing object (412) is the
+    /// expected answer: `AlreadyExists`, and no log line, since callers
+    /// treat it as success on every startup probe and `create_meta`.
+    #[test]
+    fn conditional_put_conflict_is_already_exists_and_not_logged() {
+        use kosha_write::object_wal::WalObjectBackend;
+        let endpoint = serve(
+            "412 Precondition Failed",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <Error><Code>PreconditionFailed</Code>\
+             <Message>At least one of the pre-conditions you specified did not hold</Message>\
+             <RequestId>REQ412</RequestId></Error>",
+        );
+        let (storage, root) = storage(&endpoint, "precondition");
+        let wal =
+            crate::s3_wal::S3WalBackend::new(&storage, std::time::Duration::from_secs(5)).unwrap();
+        let before = S3_ERRORS_LOGGED.with(|n| n.get());
+        let err = wal.put_if_absent("_wal/w1/meta", b"x").unwrap_err();
+        assert!(
+            matches!(&err, KoshaError::Io(e) if e.kind() == std::io::ErrorKind::AlreadyExists),
+            "{err:?}"
+        );
+        assert_eq!(
+            S3_ERRORS_LOGGED.with(|n| n.get()),
+            before,
+            "a 412 is not logged"
+        );
+
+        // The same answer to an unconditional put is a failure, logged.
+        assert!(wal.put("_wal/w1/meta", b"x").is_err());
+        assert_eq!(S3_ERRORS_LOGGED.with(|n| n.get()), before + 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 

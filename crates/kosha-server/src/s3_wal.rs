@@ -121,8 +121,16 @@ impl S3WalBackend {
                     };
                     // The chain (role ARN, bucket, request ids) and the key
                     // go to the pod log only: this message can reach a
-                    // tenant's response body (`indexing error: …`).
-                    let short = log_s3_error("put_object", &full, &error);
+                    // tenant's response body (`indexing error: …`). A
+                    // conditional put losing to an existing object is the
+                    // expected answer (callers treat it as success: the
+                    // startup probe, `create_meta`, migration replays), so
+                    // it is not logged.
+                    let short = if kind == std::io::ErrorKind::AlreadyExists {
+                        error.to_string()
+                    } else {
+                        log_s3_error("put_object", &full, &error)
+                    };
                     Err(std::io::Error::new(
                         kind,
                         format!("S3 put_object (status {status:?}): {short}"),
