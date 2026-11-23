@@ -105,7 +105,7 @@ else
   echo "LOCAL-CACHE-WIPED $SCOPED"
 fi
 sudo docker start kosha >/dev/null
-until curl -sf http://127.0.0.1:8080/healthz >/dev/null; do sleep 3; done
+until curl -sf http://127.0.0.1:8080/v1/healthz >/dev/null; do sleep 3; done
 
 # Segment count matters for anything that reasons about a per-query probe
 # budget spread across segments (e.g. knn.num_candidates is a whole-query

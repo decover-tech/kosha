@@ -401,7 +401,23 @@ impl RejectReason {
         }
     }
 
-    fn message(self) -> &'static str {
+    /// The API error code (#350). Rates are retryable 429s; quotas are
+    /// 403s and the body cap a 413, which retrying cannot fix.
+    pub(crate) fn code(self) -> crate::ErrorCode {
+        use crate::ErrorCode;
+        match self {
+            Self::TenantQps => ErrorCode::TenantQpsExceeded,
+            Self::TenantConcurrency => ErrorCode::TenantConcurrencyExceeded,
+            Self::TenantWriteRate => ErrorCode::TenantWriteRateExceeded,
+            Self::TenantQueueFull => ErrorCode::TenantQueueFull,
+            Self::NamespaceQuota => ErrorCode::NamespaceQuotaExceeded,
+            Self::DocQuota => ErrorCode::DocQuotaExceeded,
+            Self::VectorDims => ErrorCode::VectorDimsExceeded,
+            Self::BodyTooLarge => ErrorCode::PayloadTooLarge,
+        }
+    }
+
+    pub(crate) fn message(self) -> &'static str {
         match self {
             Self::TenantQps => "tenant query rate limit exceeded",
             Self::TenantConcurrency => "tenant concurrent query limit exceeded",
@@ -452,24 +468,13 @@ impl Rejection {
         }
     }
 
-    /// `Retry-After`, in whole seconds, at least 1.
-    pub(crate) fn retry_after_secs(&self) -> u64 {
-        self.retry_after_ms.div_ceil(1000).max(1)
-    }
-
-    /// The JSON body of the 429.
-    pub(crate) fn body(&self) -> serde_json::Value {
-        let limit = if self.limit.fract() == 0.0 && self.limit.abs() < 9.0e15 {
+    /// The limit as JSON: an integer when it is whole.
+    pub(crate) fn limit_json(&self) -> serde_json::Value {
+        if self.limit.fract() == 0.0 && self.limit.abs() < 9.0e15 {
             serde_json::json!(self.limit as u64)
         } else {
             serde_json::json!(self.limit)
-        };
-        serde_json::json!({
-            "error": self.reason.message(),
-            "reason": self.reason.as_str(),
-            "limit": limit,
-            "retry_after_ms": self.retry_after_ms,
-        })
+        }
     }
 }
 
@@ -859,10 +864,8 @@ mod tests {
         let qps = limiter.admit_query("a").err().unwrap();
         assert_eq!(qps.reason, RejectReason::TenantQps);
         assert!(qps.retry_after_ms > 0 && qps.retry_after_ms <= 500);
-        assert_eq!(qps.retry_after_secs(), 1);
-        let body = qps.body();
-        assert_eq!(body["reason"], "tenant_qps_exceeded");
-        assert_eq!(body["limit"], 2);
+        assert_eq!(qps.reason.code(), crate::ErrorCode::TenantQpsExceeded);
+        assert_eq!(qps.limit_json(), serde_json::json!(2));
     }
 
     #[test]

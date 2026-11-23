@@ -45,7 +45,7 @@ start_kosha() {
     -e KOSHA_SEGMENT_CACHE_CAPACITY=16384 \
     -e KOSHA_WARMUP_NAMESPACES="msmarco-10m,default/msmarco-10m" \
     -v /data/kosha:/var/cache/kosha kosha-server:bench >/dev/null
-  until curl -sf -H "Authorization: Bearer sk-bench" http://127.0.0.1:8080/stats >/dev/null; do sleep 2; done
+  until curl -sf http://127.0.0.1:8080/v1/healthz >/dev/null; do sleep 2; done
 }
 start_kosha
 echo "kosha up"
@@ -63,7 +63,7 @@ sudo docker stop kosha >/dev/null
 sudo rm -rf /data/kosha/data/*
 T_WARM0=$(date +%s)
 start_kosha
-until curl -sf http://127.0.0.1:8080/readyz >/dev/null 2>&1; do
+until curl -sf http://127.0.0.1:8080/v1/readyz >/dev/null 2>&1; do
   sleep 5
   [ $(( $(date +%s) - T_WARM0 )) -gt 2400 ] && { echo "WARMUP-TIMEOUT"; exit 1; }
 done

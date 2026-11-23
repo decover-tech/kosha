@@ -75,18 +75,15 @@ impl AppState {
             .lock()
             .unwrap()
             .try_manifest_cloned(parent)
-            .map_err(|e| json_error(503, &format!("control store: {e}")))?;
+            .map_err(|e| crate::control_store_unavailable(&format!("control store: {e}")))?;
         let Some(source) = source else {
-            return Err(json_error(
-                404,
-                &format!("namespace '{}' not found", short_name(parent)),
-            ));
+            return Err(crate::namespace_not_found(short_name(parent)));
         };
         // A sharded root (#207) lists no segments of its own; branching it
         // would need every shard branched with it, which is not supported.
         if source.shards.is_some_and(|n| n > 1) {
-            return Err(json_error(
-                400,
+            return Err(api_error(
+                ErrorCode::InvalidArgument,
                 &format!(
                     "namespace '{}' is sharded; sharded namespaces cannot be branched yet",
                     short_name(parent)
@@ -98,13 +95,13 @@ impl AppState {
             .lock()
             .unwrap()
             .manifest_version(child)
-            .map_err(|e| json_error(503, &format!("control store: {e}")))?
+            .map_err(|e| crate::control_store_unavailable(&format!("control store: {e}")))?
             .is_some()
             || self.indexer.manifest_version(child).is_some()
             || self.indexer.pending_doc_count(child) > 0;
         if child_exists {
-            return Err(json_error(
-                409,
+            return Err(api_error(
+                ErrorCode::AlreadyExists,
                 &format!("namespace '{}' already exists", short_name(child)),
             ));
         }
@@ -129,12 +126,14 @@ impl AppState {
                     .lock()
                     .unwrap()
                     .try_manifest_cloned(child)
-                    .map_err(|e| json_error(503, &format!("control store: {e}")))?;
+                    .map_err(|e| {
+                        crate::control_store_unavailable(&format!("control store: {e}"))
+                    })?;
                 if !fresh
                     .is_some_and(|m| m.version == at && m.segments.is_empty() && m.branch.is_none())
                 {
-                    return Err(json_error(
-                        409,
+                    return Err(api_error(
+                        ErrorCode::AlreadyExists,
                         &format!("namespace '{}' already exists", short_name(child)),
                     ));
                 }
@@ -173,8 +172,12 @@ impl AppState {
             Some(manifest) => manifest,
             None => {
                 let mut manifest = stored.clone();
-                self.hydrate_deletes(child, &mut manifest)
-                    .map_err(|e| json_error(500, &format!("branch deletes unreadable: {e}")))?;
+                self.hydrate_deletes(child, &mut manifest).map_err(|e| {
+                    api_error(
+                        ErrorCode::Internal,
+                        &format!("branch deletes unreadable: {e}"),
+                    )
+                })?;
                 manifest
             }
         };
@@ -198,16 +201,13 @@ impl AppState {
             .lock()
             .unwrap()
             .try_manifest_cloned(ns)
-            .map_err(|e| json_error(503, &format!("control store: {e}")))?;
+            .map_err(|e| crate::control_store_unavailable(&format!("control store: {e}")))?;
         let Some(stored) = stored else {
-            return Err(json_error(
-                404,
-                &format!("namespace '{}' not found", short_name(ns)),
-            ));
+            return Err(crate::namespace_not_found(short_name(ns)));
         };
         if stored.branch.is_none() {
-            return Err(json_error(
-                409,
+            return Err(api_error(
+                ErrorCode::Conflict,
                 &format!(
                     "namespace '{}' is not a branch; only branches can be deleted here",
                     short_name(ns)
@@ -275,11 +275,14 @@ impl AppState {
                 Ok(())
             })
             .map_err(|e| match e {
-                KoshaError::InvalidQuery(message) => json_error(409, &message),
+                KoshaError::InvalidQuery(message) => api_error(ErrorCode::Conflict, &message),
                 KoshaError::ControlPlane(message) => {
-                    json_error(503, &format!("control store: {message}"))
+                    crate::control_store_unavailable(&format!("control store: {message}"))
                 }
-                other => json_error(500, &format!("branch deletion failed: {other}")),
+                other => api_error(
+                    ErrorCode::Internal,
+                    &format!("branch deletion failed: {other}"),
+                ),
             })?;
         let (removed, reclaimed) = outcome.expect("drop_namespace ran the removal");
         println!(
@@ -471,17 +474,20 @@ pub(crate) fn handle_branch_create(
     let request: BranchRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
-            return json_error(
-                400,
+            return api_error(
+                ErrorCode::InvalidArgument,
                 &format!("invalid JSON (expected {{\"name\": ...}}): {e}"),
             )
         }
     };
     if !valid_namespace_component(&request.name) {
-        return json_error(400, "invalid branch name");
+        return api_error(ErrorCode::InvalidArgument, "invalid branch name");
     }
     if request.name == namespace {
-        return json_error(400, "a branch needs a name different from its parent");
+        return api_error(
+            ErrorCode::InvalidArgument,
+            "a branch needs a name different from its parent",
+        );
     }
     let parent = NamespaceId(tenant_namespace(tenant, namespace));
     let child = NamespaceId(tenant_namespace(tenant, &request.name));
@@ -507,7 +513,7 @@ pub(crate) fn handle_branch_list(namespace: &str, tenant: &str, state: &AppState
                 .map(|(ns, manifest)| branch_summary(ns, manifest))
                 .collect::<Vec<_>>(),
         })),
-        Err(e) => json_error(503, &format!("control store: {e}")),
+        Err(e) => crate::control_store_unavailable(&format!("control store: {e}")),
     }
 }
 

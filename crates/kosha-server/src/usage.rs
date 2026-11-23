@@ -763,14 +763,14 @@ pub(crate) fn handle_usage(
     state: &AppState,
 ) -> String {
     let Some(meter) = state.usage.as_ref() else {
-        return json_error(
-            404,
+        return api_error(
+            ErrorCode::NotFound,
             "usage metering is off on this pod (KOSHA_USAGE_METERING=on enables it)",
         );
     };
     let (from_ms, to_ms) = match usage_window(request_line, unix_millis()) {
         Ok(window) => window,
-        Err(e) => return json_error(400, &e),
+        Err(e) => return api_error(ErrorCode::InvalidArgument, &e),
     };
     // Best effort: a failed delivery is reported in `pipeline`, and the
     // read still answers from what the store has.
@@ -783,9 +783,12 @@ pub(crate) fn handle_usage(
                 // operator: logged, and shown on the admin route only.
                 eprintln!("WARN: usage metering: read failed: {e}");
                 return if admin {
-                    json_error(503, &format!("usage store unavailable: {e}"))
+                    api_error(
+                        ErrorCode::Unavailable,
+                        &format!("usage store unavailable: {e}"),
+                    )
                 } else {
-                    json_error(503, "usage store unavailable")
+                    api_error(ErrorCode::Unavailable, "usage store unavailable")
                 };
             }
         };

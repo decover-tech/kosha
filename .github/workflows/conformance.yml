@@ -36,6 +36,34 @@ jobs:
             --restart-cmd scripts/conformance/compose_restart_cold.sh \
             --out conformance-report.json
 
+      # Requests and responses against the checked-in OpenAPI document
+      # (#350): an unknown or missing field on either side fails.
+      - name: Wire check
+        run: |
+          python3 scripts/api/check_wire.py \
+            --host http://localhost:8080 --api-key sk-kosha-dev \
+            --admin-key sk-kosha-admin-dev
+
+      # The stack runs with KOSHA_LEGACY_ROUTES=off (the conformance
+      # overlay): every kosha_client operation must work on /v1 alone.
+      - name: Python client smoke (legacy routes off)
+        run: python3 scripts/api/client_smoke.py --host http://localhost:8080 --api-key sk-kosha-dev
+
+      # ADR-350 §c guards / plan acceptance 8: the client test suite, then the
+      # BM25 bench loader and query driver briefly, all against the legacy-off
+      # stack. The log check below then proves none of them touched a legacy
+      # route.
+      - name: Python client tests
+        run: |
+          python3 -m venv .venv-legacy-off
+          .venv-legacy-off/bin/pip install --quiet -e clients/python pytest numpy requests
+          .venv-legacy-off/bin/python -m pytest clients/python/tests -q
+
+      - name: Bench scripts smoke (legacy routes off)
+        run: |
+          PATH=$PWD/.venv-legacy-off/bin:$PATH \
+            scripts/api/bench_smoke.sh http://localhost:8080 sk-kosha-dev sk-kosha-admin-dev
+
       # After the suite above, so its python3 (system, stdlib only) is
       # unchanged. The DSL runner needs PyYAML.
       - uses: actions/setup-python@v5
@@ -66,6 +94,12 @@ jobs:
           KOSHA_TEST_HOST: http://localhost:8080
           KOSHA_TEST_API_KEY: sk-kosha-dev
         run: python -m pytest scripts/tests/ -q
+
+      - name: No legacy route was called
+        run: |
+          if docker compose logs --no-color kosha-server | grep -E 'status=410|legacy route usage'; then
+            echo "::error::a caller used a legacy unversioned route"; exit 1
+          fi
 
       - name: Server logs
         if: failure()

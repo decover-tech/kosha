@@ -1,11 +1,9 @@
 # ── Kosha build & codegen ──────────────────────────────────────────────────
 #
-#   make proto-lint       — lint proto files
-#   make proto-gen        — generate all stubs + OpenAPI spec from proto
-#   make openapi          — generate OpenAPI spec only
-#   make gen/python       — generate Python gRPC stubs
-#   make gen/go           — generate Go gRPC stubs
-#   make gen              — generate everything
+#   make proto-lint       — lint proto files (buf, pinned in tools/codegen)
+#   make openapi          — regenerate api/openapi/v1/*.openapi.json from proto/
+#   make proto-gen        — alias of openapi (the only thing generated from proto)
+#   make api-check        — openapi, then fail if api/ or proto/ drifted from git
 #   make rust-test        — run Rust tests
 #   make rust-build       — build Rust binary
 #   make cli-assets       — kosha shell completions + man pages into target/cli-assets
@@ -13,29 +11,58 @@
 #   make bench-hook-test   — run commit_bench_section.sh regression tests
 #   make migration-job-manifest MIGRATION_INDICES="a b" — regen the ES→Kosha backfill Job YAML
 #   make compat-matrix    — regen docs/compat/opensearch.{md,json} (KOSHA_BIN=... runs it live)
-#   make all              — lint + gen + build + test
+#   make all              — lint + openapi + build + test
 #
 
-.PHONY: proto-lint proto-gen openapi gen gen/python gen/go rust-test rust-build client-python-test bench-hook-test all
+.PHONY: proto-lint proto-gen openapi api-tools api-check rust-test rust-build client-python-test bench-hook-test all
 
-# ── Proto ──────────────────────────────────────────────────────────────────
+# ── Proto and the OpenAPI contract (#350) ──────────────────────────────────
+#
+# buf, protoc-gen-openapiv2 and apispec are built from tools/codegen/go.mod,
+# so every machine and CI job runs the same pinned versions. Needs Go.
 
-proto-lint:
-	cd proto && buf lint
+GO ?= go
+# The Python interpreter for the client and quickstart targets: `python3`,
+# which every supported platform ships (many have no bare `python`).
+# Override with PYTHON=... (e.g. a virtualenv's python).
+PYTHON ?= python3
+API_BIN := $(CURDIR)/build/bin
+API_SPEC_DIR := api/openapi/v1
 
-proto-gen:
-	cd proto && buf generate
+api-tools:
+	cd tools/codegen && $(GO) build -o $(API_BIN)/ \
+		github.com/bufbuild/buf/cmd/buf \
+		github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-openapiv2 \
+		./cmd/apispec
 
-openapi:
-	cd proto && buf generate --template buf.gen.yaml --path kosha/v1 --filter proto.lint
+proto-lint: api-tools
+	cd proto && $(API_BIN)/buf lint
 
-# ── Generated stubs ────────────────────────────────────────────────────────
+openapi: api-tools
+	python3 scripts/api/gen_admin_proto.py
+	cd proto && $(API_BIN)/buf lint
+	rm -rf build/openapi
+	cd proto && PATH="$(API_BIN):$$PATH" $(API_BIN)/buf generate
+	mkdir -p $(API_SPEC_DIR)
+	$(API_BIN)/apispec convert build/openapi/kosha/v1/kosha.swagger.json $(API_SPEC_DIR)/kosha.openapi.json
+	$(API_BIN)/apispec convert build/openapi/kosha/v1/admin.swagger.json $(API_SPEC_DIR)/kosha-admin.openapi.json
+	$(API_BIN)/apispec lint --public $(API_SPEC_DIR)/kosha.openapi.json
+	$(API_BIN)/apispec lint $(API_SPEC_DIR)/kosha-admin.openapi.json
 
-gen: proto-gen
+proto-gen: openapi
 
-gen/python: proto-gen  # for now, proto-gen includes python; isolate later
-
-gen/go: proto-gen      # for now, proto-gen includes go; isolate later
+# The spec-sync gate CI runs: regenerate, then require a clean tree. The
+# version check compares against origin/main when that ref exists.
+api-check: openapi
+	@git diff --exit-code --stat -- proto/ $(API_SPEC_DIR) && \
+		test -z "$$(git ls-files --others --exclude-standard -- proto/ $(API_SPEC_DIR))" || \
+		(echo "api/ or proto/ is stale: run 'make openapi' and commit the result" && exit 1)
+	@if git rev-parse --verify -q origin/main >/dev/null && \
+		git cat-file -e origin/main:$(API_SPEC_DIR)/kosha.openapi.json 2>/dev/null; then \
+		git show origin/main:$(API_SPEC_DIR)/kosha.openapi.json > build/openapi/base.openapi.json && \
+		$(API_BIN)/apispec check-version build/openapi/base.openapi.json \
+			$(API_SPEC_DIR)/kosha.openapi.json api/CHANGELOG.md; \
+	else echo "api-check: no spec on origin/main yet; version check skipped"; fi
 
 # ── CLI completions + man pages ───────────────────────────────────────────
 # Packaging input for the `kosha` CLI: completion scripts for every shell clap
@@ -62,21 +89,21 @@ cli-assets:
 .PHONY: quickstart
 
 quickstart:
-	KOSHA_HOST=http://localhost:8080 KOSHA_API_KEY=sk-kosha-dev python scripts/quickstart.py
+	KOSHA_HOST=http://localhost:8080 KOSHA_API_KEY=sk-kosha-dev $(PYTHON) scripts/quickstart.py
 
 # ── Python client ──────────────────────────────────────────────────────────
 
 .PHONY: client-python-build client-python-publish client-python-test
 
 client-python-build:
-	python -m build clients/python
+	$(PYTHON) -m build clients/python
 
 client-python-publish:
-	python -m twine upload clients/python/dist/*
+	$(PYTHON) -m twine upload clients/python/dist/*
 
 client-python-test:
-	python -m pip install -e clients/python pytest pyyaml
-	python -m pytest clients/python/tests/ scripts/tests/ -q
+	$(PYTHON) -m pip install -e clients/python pytest pyyaml
+	$(PYTHON) -m pytest clients/python/tests/ scripts/tests/ -q
 
 # ── ES → Kosha migration ───────────────────────────────────────────────────
 
@@ -147,4 +174,4 @@ db-migrate: db-bootstrap
 
 # ── All ────────────────────────────────────────────────────────────────────
 
-all: proto-lint proto-gen rust-build rust-test client-python-test
+all: proto-lint openapi rust-build rust-test client-python-test

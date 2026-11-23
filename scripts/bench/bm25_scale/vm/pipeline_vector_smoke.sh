@@ -50,7 +50,7 @@ sudo docker run -d --name kosha --network host \
   -e KOSHA_SEGMENT_LIVE_MAX_BYTES=68719476736 -e KOSHA_SCORING_HYDRATE_CONCURRENCY=64 \
   -e KOSHA_SEGMENT_CACHE_CAPACITY=16384 \
   -v /data/kosha:/var/cache/kosha kosha-server:bench8 >/dev/null
-until curl -sf -H "Authorization: Bearer sk-bench" http://127.0.0.1:8080/stats >/dev/null; do sleep 2; done
+until curl -sf http://127.0.0.1:8080/v1/healthz >/dev/null; do sleep 2; done
 echo "kosha up"
 
 # ── 1M vector load ───────────────────────────────────────────────────────

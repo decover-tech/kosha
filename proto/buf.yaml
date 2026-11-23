@@ -2,9 +2,19 @@ version: v2
 name: buf.build/decover/kosha
 deps:
   - buf.build/googleapis/googleapis
+  # openapiv2 options (info, security, field types, enums) for the
+  # generated spec (#350).
+  - buf.build/grpc-ecosystem/grpc-gateway
 lint:
   use:
     - STANDARD
+  ignore_only:
+    # The beta operator API answers free-form JSON objects
+    # (google.protobuf.Struct) until each body is typed (ADR-350 §a.5).
+    RPC_RESPONSE_STANDARD_NAME:
+      - kosha/v1/admin.proto
+    RPC_REQUEST_RESPONSE_UNIQUE:
+      - kosha/v1/admin.proto
 breaking:
   use:
     - FILE

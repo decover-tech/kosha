@@ -93,7 +93,7 @@ def search(host, ns, key, text, k):
         }
     ).encode()
     req = urllib.request.Request(
-        f"{host}/search",
+        f"{host}/v1/namespaces/{ns}/search",
         data=body,
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
     )

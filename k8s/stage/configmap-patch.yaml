@@ -2,6 +2,16 @@
 # writes them at apply time from GitHub Environment secrets (see
 # .github/actions/deploy-eks). Keeps this repo free of customer/account
 # bucket names.
+#
+# Legacy routes (#350, ADR-350 §c): stage still serves the unversioned Phase 1
+# routes, with Deprecation/Sunset headers and kosha_legacy_requests_total.
+# Flip stage only after this release has run here and the counter reads zero
+# for 7 days (or the stragglers are known), and after kosha-client 0.3.0 is
+# on PyPI. Then set:
+#   KOSHA_LEGACY_ROUTES: "off"
+#   KOSHA_LEGACY_ROUTES_TENANTS: "<tenants still migrating>"
+# under data (docs/api/versioning.md, "Legacy routes").
+# Rollback: set KOSHA_LEGACY_ROUTES to "on".
 apiVersion: v1
 kind: ConfigMap
 metadata:

@@ -46,6 +46,8 @@ use std::task::{ready, Context, Poll};
 use std::time::Duration;
 
 use http_body_util::{BodyExt, LengthLimitError, Limited};
+
+use crate::api_error::{ApiError, ErrorCode};
 use hyper::body::{Bytes, Frame, Incoming, SizeHint};
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::server::conn::http1;
@@ -125,9 +127,34 @@ impl Response {
         }
     }
 
-    /// `{"error": message}` with the given status.
-    pub fn json_error(status: u16, message: &str) -> Self {
-        Self::json(status, serde_json::json!({ "error": message }).to_string())
+    /// An error response in the one error model (#350): `ErrorResponse`
+    /// body, `X-Request-Id`, `Kosha-Api-Version`, and `Retry-After` when
+    /// retryable. For failures before a request reaches the handler.
+    pub fn error(error: ApiError) -> Self {
+        Self::error_with_id(error, &crate::api_error::current_request_id())
+    }
+
+    /// [`Response::error`] for a request whose id is known explicitly: a
+    /// failure on the async side, before a handler thread (and its
+    /// thread-local request id) exists.
+    pub fn error_with_id(error: ApiError, request_id: &str) -> Self {
+        if let Some(detail) = error.log_detail() {
+            eprintln!(
+                "WARN: request failed: status={} {detail} rid={request_id}",
+                error.status()
+            );
+        }
+        let mut response = Self::json(error.status(), error.body(request_id).to_string());
+        response.headers = error.response_headers(request_id);
+        response
+    }
+
+    fn error_code(code: ErrorCode, message: &str) -> Self {
+        Self::error(ApiError::new(code, message))
+    }
+
+    fn error_code_with_id(code: ErrorCode, message: &str, request_id: &str) -> Self {
+        Self::error_with_id(ApiError::new(code, message), request_id)
     }
 
     /// Stream `len` bytes of `file`, from its current position.
@@ -146,7 +173,7 @@ impl Response {
     /// sets framing itself and keeps the connection alive.
     pub fn from_raw(raw: String) -> Self {
         let Some(head_end) = raw.find("\r\n\r\n") else {
-            return Self::json_error(500, "malformed response");
+            return Self::error_code(ErrorCode::Internal, "malformed response");
         };
         let mut lines = raw[..head_end].split("\r\n");
         let status = lines
@@ -640,8 +667,12 @@ async fn serve_connection<I>(
             let shared = Arc::clone(&shared);
             async move {
                 let response = if over_capacity {
-                    busy("server at connection capacity (KOSHA_HTTP_MAX_CONNECTIONS)")
-                        .with_header("connection", "close")
+                    busy(
+                        "server at connection capacity (KOSHA_HTTP_MAX_CONNECTIONS)",
+                        "connection_limit",
+                        &request_id_of(&request),
+                    )
+                    .with_header("connection", "close")
                 } else {
                     handle_request(request, &shared, client_cert).await
                 };
@@ -676,27 +707,74 @@ async fn serve_connection<I>(
     let _ = connection.await;
 }
 
-/// `503` with `Retry-After: 1`.
-fn busy(message: &str) -> Response {
-    Response::json_error(503, message).with_header("retry-after", "1")
+/// `503 unavailable` with `Retry-After: 1`; `reason` is
+/// `inflight_limit` or `connection_limit`.
+fn busy(message: &str, reason: &str, request_id: &str) -> Response {
+    Response::error_with_id(
+        ApiError::new(ErrorCode::Unavailable, message).detail("reason", reason),
+        request_id,
+    )
 }
 
+/// The request's id, decided on the async side so a response sent before
+/// a handler thread runs echoes it too: the caller's `X-Request-Id`
+/// (sanitized), or a fresh one.
+fn request_id_of<B>(request: &hyper::Request<B>) -> String {
+    request
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(crate::api_error::sanitize_request_id)
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(crate::api_error::new_request_id)
+}
+
+/// [`answer`], plus the headers every response carries (#350): a response
+/// built here on the async side rather than by the handler (`dispatch` in
+/// `main.rs` stamps its own), such as `/v1/healthz` or a 413, gets
+/// `Kosha-Api-Version` and an `X-Request-Id`, the caller's (sanitized) when
+/// it sent one.
 async fn handle_request(
     request: hyper::Request<Incoming>,
     shared: &Shared,
     client_cert: bool,
 ) -> Response {
+    let request_id = request_id_of(&request);
+    let response = answer(request, shared, client_cert, &request_id).await;
+    stamp_api_headers(response, &request_id)
+}
+
+fn stamp_api_headers(mut response: Response, request_id: &str) -> Response {
+    if response.header("kosha-api-version").is_none() {
+        response = response.with_header("kosha-api-version", crate::api_error::API_VERSION);
+    }
+    if response.header("x-request-id").is_none() {
+        response = response.with_header("x-request-id", request_id);
+    }
+    response
+}
+
+async fn answer(
+    request: hyper::Request<Incoming>,
+    shared: &Shared,
+    client_cert: bool,
+    request_id: &str,
+) -> Response {
     let config = &shared.config;
     let path = request.uri().path();
     // Liveness answers on the async side, without an in-flight slot, so a
-    // pod whose handlers are all busy still reports alive.
+    // pod whose handlers are all busy still reports alive. Like every
+    // response it carries `X-Request-Id` and `Kosha-Api-Version`.
     if request.method() == hyper::Method::GET && (path == "/healthz" || path == "/v1/healthz") {
-        return Response::json(200, r#"{"status":"ok"}"#);
+        return Response::json(200, r#"{"status":"ok"}"#)
+            .with_header("x-request-id", request_id)
+            .with_header("kosha-api-version", crate::api_error::API_VERSION);
     }
     if shared.client_auth && !client_cert && path.starts_with("/internal/") {
-        return Response::json_error(
-            403,
+        return Response::error_code_with_id(
+            ErrorCode::PermissionDenied,
             "/internal/* requires a client certificate (KOSHA_TLS_CLIENT_CA_PATH)",
+            request_id,
         );
     }
 
@@ -708,11 +786,15 @@ async fn handle_request(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
     if let Some(len) = declared.filter(|len| *len > config.max_body_bytes as u64) {
-        return too_large(len, config.max_body_bytes);
+        return too_large(len, config.max_body_bytes, request_id);
     }
 
     let Ok(permit) = Arc::clone(&shared.inflight).try_acquire_owned() else {
-        return busy("server at request capacity (KOSHA_HTTP_MAX_INFLIGHT)");
+        return busy(
+            "server at request capacity (KOSHA_HTTP_MAX_INFLIGHT)",
+            "inflight_limit",
+            request_id,
+        );
     };
 
     let (parts, body) = request.into_parts();
@@ -724,13 +806,20 @@ async fn handle_request(
     {
         Ok(Ok(collected)) => collected.to_bytes(),
         Ok(Err(e)) if e.downcast_ref::<LengthLimitError>().is_some() => {
-            return too_large(declared.unwrap_or(0), config.max_body_bytes);
+            return too_large(declared.unwrap_or(0), config.max_body_bytes, request_id);
         }
-        Ok(Err(e)) => return Response::json_error(400, &format!("reading request body: {e}")),
+        Ok(Err(e)) => {
+            return Response::error_code_with_id(
+                ErrorCode::InvalidArgument,
+                &format!("reading request body: {e}"),
+                request_id,
+            )
+        }
         Err(_) => {
-            return Response::json_error(
-                408,
+            return Response::error_code_with_id(
+                ErrorCode::RequestTimeout,
                 "request body not received in time (KOSHA_HTTP_IO_TIMEOUT_SECS)",
+                request_id,
             )
         }
     };
@@ -742,6 +831,9 @@ async fn handle_request(
             String::from_utf8_lossy(value.as_bytes()).trim().to_string(),
         );
     }
+    // The handler (`dispatch`) takes its id from this header, so a request
+    // that came without one keeps the id chosen here.
+    headers.insert("x-request-id".to_string(), request_id.to_string());
     let request = Request {
         method: parts.method.as_str().to_string(),
         target: parts.uri.path_and_query().map_or_else(
@@ -759,20 +851,23 @@ async fn handle_request(
     match job.await {
         Ok(response) => response,
         Err(e) => {
-            eprintln!("ERROR: request handler failed: {e}");
-            Response::json_error(500, "internal error")
+            eprintln!("ERROR: request handler failed: {e} rid={request_id}");
+            Response::error_code_with_id(ErrorCode::Internal, "internal error", request_id)
         }
     }
 }
 
-fn too_large(len: u64, max: usize) -> Response {
+fn too_large(len: u64, max: usize, request_id: &str) -> Response {
     let message = if len > 0 {
         format!("request body of {len} bytes exceeds the {max}-byte limit (KOSHA_MAX_BODY_BYTES)")
     } else {
         format!("request body exceeds the {max}-byte limit (KOSHA_MAX_BODY_BYTES)")
     };
-    eprintln!("WARN: request failed: status=413 {message}");
-    Response::json_error(413, &message)
+    eprintln!("WARN: request failed: status=413 {message} rid={request_id}");
+    Response::error_with_id(
+        ApiError::new(ErrorCode::PayloadTooLarge, message).detail("scope", "pod"),
+        request_id,
+    )
 }
 
 // ─── Write-stall timeout ────────────────────────────────────────────────────
@@ -1008,6 +1103,33 @@ mod tests {
         assert_eq!(r.body_bytes(), b"{}");
     }
 
+    /// `/v1/healthz` is answered before the handler runs, and still carries
+    /// `X-Request-Id` and `Kosha-Api-Version` like every other response.
+    #[test]
+    fn async_side_responses_carry_request_id_and_api_version() {
+        let _server = TestServer::start(test_config(), echo_handler());
+        for (path, sent) in [("/v1/healthz", None), ("/healthz", Some("trace-7"))] {
+            let mut s = connect(_server.addr);
+            let extra = sent.map_or(String::new(), |id| format!("x-request-id: {id}\r\n"));
+            write!(s, "GET {path} HTTP/1.1\r\nhost: x\r\n{extra}\r\n").unwrap();
+            let (head, _) = read_response(&mut s).unwrap();
+            let lower = head.to_ascii_lowercase();
+            assert_eq!(status(&head), 200, "{head}");
+            let version = format!("kosha-api-version: {}", crate::api_error::API_VERSION);
+            assert!(lower.contains(&version), "{head}");
+            let rid = lower
+                .lines()
+                .find_map(|l| l.strip_prefix("x-request-id: "))
+                .unwrap_or_else(|| panic!("no x-request-id: {head}"))
+                .trim()
+                .to_string();
+            match sent {
+                Some(id) => assert_eq!(rid, id),
+                None => assert_eq!(rid.len(), 16, "{head}"),
+            }
+        }
+    }
+
     #[test]
     fn several_requests_share_one_keep_alive_connection() {
         let _server = TestServer::start(test_config(), echo_handler());
@@ -1066,6 +1188,70 @@ mod tests {
         .unwrap();
         let (head, _) = read_response(&mut s).unwrap();
         assert_eq!(status(&head), 413, "{head}");
+    }
+
+    fn head_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+        head.lines().skip(1).find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then_some(value.trim())
+        })
+    }
+
+    /// Responses sent on the async side, before a handler thread runs
+    /// (liveness, the body cap), still carry `Kosha-Api-Version` and echo
+    /// the caller's `X-Request-Id` in the header and the error body; a
+    /// request without one gets a generated id the handler sees too.
+    #[test]
+    fn responses_before_the_handler_carry_request_id_and_api_version() {
+        let mut config = test_config();
+        config.max_body_bytes = 8;
+        let handler: Handler = Arc::new(|req: Request| {
+            Response::json(
+                200,
+                serde_json::json!({"rid": req.headers.get("x-request-id")}).to_string(),
+            )
+        });
+        let server = TestServer::start(config, handler);
+
+        for path in ["/healthz", "/v1/healthz"] {
+            let mut s = connect(server.addr);
+            write!(
+                s,
+                "GET {path} HTTP/1.1\r\nhost: x\r\nx-request-id: probe-7\r\n\r\n"
+            )
+            .unwrap();
+            let (head, _) = read_response(&mut s).unwrap();
+            assert_eq!(status(&head), 200, "{head}");
+            assert_eq!(head_value(&head, "x-request-id"), Some("probe-7"), "{head}");
+            assert_eq!(
+                head_value(&head, "kosha-api-version"),
+                Some(crate::api_error::API_VERSION),
+                "{head}"
+            );
+        }
+
+        let mut s = connect(server.addr);
+        s.write_all(
+            b"POST /x HTTP/1.1\r\nhost: x\r\nx-request-id: big-1\r\ncontent-length: 100\r\n\r\n",
+        )
+        .unwrap();
+        let (head, body) = read_response(&mut s).unwrap();
+        assert_eq!(status(&head), 413, "{head}");
+        assert_eq!(head_value(&head, "x-request-id"), Some("big-1"), "{head}");
+        assert!(head_value(&head, "kosha-api-version").is_some(), "{head}");
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["request_id"], "big-1");
+        assert_eq!(body["code"], "payload_too_large");
+
+        // No id from the caller: the handler is given the generated one.
+        let mut s = connect(server.addr);
+        s.write_all(b"GET /x HTTP/1.1\r\nhost: x\r\n\r\n").unwrap();
+        let (head, body) = read_response(&mut s).unwrap();
+        assert_eq!(status(&head), 200, "{head}");
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["rid"].as_str().map(str::len), Some(16), "{body}");
     }
 
     #[test]

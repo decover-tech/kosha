@@ -71,10 +71,12 @@ fn call(state: &AppState, line: &str, body: serde_json::Value) -> (u16, serde_js
     );
     let status: u16 = response[9..12].parse().unwrap();
     let body = &response[response.find("\r\n\r\n").unwrap() + 4..];
-    (
-        status,
-        serde_json::from_str(body).unwrap_or(serde_json::Value::Null),
-    )
+    let mut body: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+    // Differs per request by design; the tests compare everything else.
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("request_id");
+    }
+    (status, body)
 }
 
 fn schema(model: &str, dims: u32) -> serde_json::Value {
@@ -363,18 +365,23 @@ fn namespaces_without_a_model_are_untouched() {
 
 #[test]
 fn embedding_errors_map_to_status_codes() {
-    // The schema declares a model this pod has no provider for: 503 on
-    // both paths, and nothing is written.
+    // The schema declares a model this pod has no provider for: 501
+    // `not_implemented`, not retryable, on both paths (ADR-350 §b: a
+    // retry-on-retryable client would otherwise loop), and nothing is
+    // written.
     let state = state_with(EmbedderRegistry::default());
     assert_eq!(put_schema(&state, "noprov", schema("mock-a", 16)).0, 200);
     let (status, body) = index_texts(&state, "noprov", &DOCS[..1]);
-    assert_eq!(status, 503, "{body}");
+    assert_eq!(status, 501, "{body}");
+    assert_eq!(body["code"], "not_implemented", "{body}");
+    assert_eq!(body["retryable"], false, "{body}");
     assert!(state
         .indexer
         .manifest(&NamespaceId("acme/noprov".into()))
         .is_none_or(|m| m.segments.is_empty()));
     let (status, body) = knn_text(&state, "noprov", "shoes");
-    assert_eq!(status, 503, "{body}");
+    assert_eq!(status, 501, "{body}");
+    assert_eq!(body["code"], "not_implemented", "{body}");
 
     // An http provider that cannot be reached: 503, never a 500.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

@@ -33,7 +33,7 @@ jobs:
         run: |
           for port in 8080 8081; do
             for i in $(seq 1 90); do
-              curl -fsS "http://localhost:$port/readyz" >/dev/null && break
+              curl -fsS "http://localhost:$port/v1/readyz" >/dev/null && break
               [ "$i" = 90 ] && { echo "pod on :$port not ready"; exit 1; }
               sleep 2
             done
