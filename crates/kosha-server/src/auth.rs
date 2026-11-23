@@ -513,7 +513,42 @@ pub fn parse_tenant_list(raw: Option<&str>) -> HashSet<String> {
 /// tenant is on the allowlist. A managed deployment sets the default off
 /// and lists only the tenants still migrating.
 pub fn legacy_routes_enabled_for(tenant: &str) -> bool {
+    #[cfg(test)]
+    if let Some(allowed) = LEGACY_POLICY_OVERRIDE.with(|policy| {
+        policy
+            .borrow()
+            .as_ref()
+            .map(|(default_on, allowlist)| legacy_routes_allowed(*default_on, allowlist, tenant))
+    }) {
+        return allowed;
+    }
     legacy_routes_allowed(legacy_routes_enabled(), legacy_routes_tenants(), tenant)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A per-thread stand-in for `KOSHA_LEGACY_ROUTES` and
+    /// `KOSHA_LEGACY_ROUTES_TENANTS` (both read once per process), so a
+    /// test can drive `route()` with the flag off without touching other
+    /// tests.
+    static LEGACY_POLICY_OVERRIDE: std::cell::RefCell<Option<(bool, HashSet<String>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` as if the pod default were `default_on` and the allowlist
+/// `allowlist`, on this thread only.
+#[cfg(test)]
+pub fn with_legacy_policy<T>(default_on: bool, allowlist: &str, f: impl FnOnce() -> T) -> T {
+    let policy = (default_on, parse_tenant_list(Some(allowlist)));
+    LEGACY_POLICY_OVERRIDE.with(|p| *p.borrow_mut() = Some(policy));
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            LEGACY_POLICY_OVERRIDE.with(|p| *p.borrow_mut() = None);
+        }
+    }
+    let _reset = Reset;
+    f()
 }
 
 /// The decision behind [`legacy_routes_enabled_for`], for tests.

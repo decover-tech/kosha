@@ -90,7 +90,7 @@ def wait_healthy(port, proc, timeout=30):
         if proc.poll() is not None:
             raise RuntimeError(f"server on :{port} exited early (rc={proc.returncode})")
         try:
-            http("GET", port, "healthz", timeout=2)
+            http("GET", port, "v1/healthz", timeout=2)
             return
         except (urllib.error.URLError, OSError):
             time.sleep(0.3)
@@ -146,11 +146,17 @@ def ensure_corpus(args):
     ingest_dir.mkdir(parents=True, exist_ok=True)
     proc = spawn_server("ingest", ingest_dir, INGEST_PORT, log_path=WORK / "ingest.log")
     try:
-        stats = http("GET", INGEST_PORT, "stats")
-        for ns in stats.get("namespaces", []):
-            if ns["namespace"] == NAMESPACE and ns["documents"] == expected:
-                print(f"  corpus reused: {expected} docs / {ns['segments']} segments")
-                return
+        # Namespace-scoped stats: server-wide GET /v1/stats needs the admin
+        # key, which this harness does not configure. 404: not loaded yet.
+        try:
+            ns = http("GET", INGEST_PORT, f"v1/namespaces/{NAMESPACE}/stats")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+            ns = None
+        if ns and ns["documents"] == expected:
+            print(f"  corpus reused: {expected} docs / {ns['segments']} segments")
+            return
         print(f"  ingesting {args.segs} segs × {args.docs} docs …")
         rng = [0x5EED]
         for s in range(args.segs):
@@ -167,9 +173,9 @@ def ensure_corpus(args):
                 }
                 for d in range(args.docs)
             ]
-            http("POST", INGEST_PORT, "index", {"namespace": NAMESPACE, "documents": docs})
+            http("POST", INGEST_PORT, f"v1/namespaces/{NAMESPACE}/documents", {"documents": docs})
             # One flush per batch = one segment, synced to MinIO on publish.
-            http("POST", INGEST_PORT, "flush", {"namespace": NAMESPACE})
+            http("POST", INGEST_PORT, f"v1/namespaces/{NAMESPACE}/flush", {})
             print(f"    segment {s + 1}/{args.segs} flushed")
     finally:
         proc.terminate()
@@ -187,8 +193,8 @@ def search_until_ok(port, max_attempts, query_text="the"):
             http(
                 "POST",
                 port,
-                "search",
-                {"namespace": NAMESPACE, "query_text": query_text, "max_results": 10},
+                f"v1/namespaces/{NAMESPACE}/search",
+                {"query_text": query_text, "max_results": 10},
             )
             return time.time() - t0, attempt
         except urllib.error.HTTPError as e:

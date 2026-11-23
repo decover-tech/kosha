@@ -165,8 +165,8 @@ sudo docker stop kosha >/dev/null
 # Empty local store (also drops every local.* reuse marker): see step 1.
 wipe_local_cache
 sudo docker start kosha >/dev/null
-for i in $(seq 120); do curl -sf http://127.0.0.1:8080/readyz >/dev/null 2>&1 && break; sleep 5
-  [ "$i" -eq 120 ] && { echo "::error::/readyz not green after 600s"; exit 1; }; done
+for i in $(seq 120); do curl -sf http://127.0.0.1:8080/v1/readyz >/dev/null 2>&1 && break; sleep 5
+  [ "$i" -eq 120 ] && { echo "::error::/v1/readyz not green after 600s"; exit 1; }; done
 echo "LOCAL-BYTES-START $(local_bytes)"
 ( while true; do printf '%s\t%s\n' "$(date +%s)" "$(local_bytes)"; sleep 60; done ) > "$OUT/footprint.tsv" &
 FOOTPRINT_PID=$!
@@ -190,8 +190,8 @@ sudo docker start kosha >/dev/null 2>&1 || true
 T0=$(date +%s)
 # No boot warmup is configured in this mode, so /readyz is green within
 # seconds of the server answering at all.
-for i in $(seq 120); do curl -sf http://127.0.0.1:8080/readyz >/dev/null 2>&1 && break; sleep 5
-  [ "$i" -eq 120 ] && { echo "::error::/readyz not green after 600s (KOSHA_WARMUP_NAMESPACES set on the container?)"; curl -s http://127.0.0.1:8080/readyz || true; echo; exit 1; }; done
+for i in $(seq 120); do curl -sf http://127.0.0.1:8080/v1/readyz >/dev/null 2>&1 && break; sleep 5
+  [ "$i" -eq 120 ] && { echo "::error::/v1/readyz not green after 600s (KOSHA_WARMUP_NAMESPACES set on the container?)"; curl -s http://127.0.0.1:8080/v1/readyz || true; echo; exit 1; }; done
 GATE_SINCE=$(iso_now)
 set +e
 $PY $GATE --host http://127.0.0.1:8080 --namespace "$NS" \
@@ -221,8 +221,8 @@ wipe_local_cache
 T0=$(date +%s)
 BOOT_SINCE=$(iso_now)
 sudo docker start kosha >/dev/null
-for i in $(seq 120); do curl -sf http://127.0.0.1:8080/readyz >/dev/null 2>&1 && break; sleep 5
-  [ "$i" -eq 120 ] && { echo "::error::/readyz not green after 600s with no warmup configured"; curl -s http://127.0.0.1:8080/readyz || true; echo; exit 1; }; done
+for i in $(seq 120); do curl -sf http://127.0.0.1:8080/v1/readyz >/dev/null 2>&1 && break; sleep 5
+  [ "$i" -eq 120 ] && { echo "::error::/v1/readyz not green after 600s with no warmup configured"; curl -s http://127.0.0.1:8080/v1/readyz || true; echo; exit 1; }; done
 save_server_log boot "$BOOT_SINCE"
 echo "COLD-READY in $(( $(date +%s) - T0 ))s local=$(sudo du -sb /data/kosha 2>/dev/null | cut -f1) bytes (no preload)"
 else
@@ -240,7 +240,7 @@ sudo docker start kosha >/dev/null
 # from a stuck one, and the server log on timeout.
 WARMUP_TIMEOUT_S="${WARMUP_TIMEOUT_S:-3600}"
 LAST_REPORT=$T0
-until curl -sf http://127.0.0.1:8080/readyz >/dev/null 2>&1; do
+until curl -sf http://127.0.0.1:8080/v1/readyz >/dev/null 2>&1; do
   sleep 5
   NOW=$(date +%s)
   if [ $(( NOW - LAST_REPORT )) -ge 300 ]; then
@@ -249,7 +249,7 @@ until curl -sf http://127.0.0.1:8080/readyz >/dev/null 2>&1; do
   fi
   if [ $(( NOW - T0 )) -gt "$WARMUP_TIMEOUT_S" ]; then
     echo "WARMUP-TIMEOUT after ${WARMUP_TIMEOUT_S}s"
-    curl -s http://127.0.0.1:8080/readyz || true; echo
+    curl -s http://127.0.0.1:8080/v1/readyz || true; echo
     sudo docker logs --tail 200 kosha 2>&1 || true
     save_server_log warmup "$WARMUP_SINCE"
     exit 1

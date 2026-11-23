@@ -528,7 +528,7 @@ class Suite:
         return None
 
     def wait_ready(self, since: float) -> Optional[float]:
-        took = poll_until(lambda: http_json("GET", self.args.ingest.rstrip("/") + "/readyz", timeout=2)[0] == 200, self.args.max_recovery, 0.2)
+        took = poll_until(lambda: http_json("GET", self.args.ingest.rstrip("/") + "/v1/readyz", timeout=2)[0] == 200, self.args.max_recovery, 0.2)
         return None if took is None else time.time() - since
 
     def exists(self, w: Workload) -> Callable[[List[str]], Optional[Set[str]]]:
@@ -778,7 +778,7 @@ class Suite:
         ready: Dict[str, Optional[float]] = {}
 
         def wait(p: str) -> None:
-            took = poll_until(lambda: http_json("GET", urls[p] + "/readyz", timeout=2)[0] == 200, a.boot_timeout, 0.25)
+            took = poll_until(lambda: http_json("GET", urls[p] + "/v1/readyz", timeout=2)[0] == 200, a.boot_timeout, 0.25)
             ready[p] = None if took is None else round(time.time() - t, 2)
 
         threads = [threading.Thread(target=wait, args=(p,)) for p in pods]
@@ -848,7 +848,7 @@ class Suite:
                     print("  toxiproxy reset failed: %s" % e)
                 # Leave the stack up for the next scenario.
                 for svc in ("kosha-ingest", "kosha-query"):
-                    if http_json("GET", (self.args.ingest if svc == "kosha-ingest" else self.args.query).rstrip("/") + "/readyz", timeout=2)[0] != 200:
+                    if http_json("GET", (self.args.ingest if svc == "kosha-ingest" else self.args.query).rstrip("/") + "/v1/readyz", timeout=2)[0] != 200:
                         self.sh("up", "-d", "--no-deps", svc, check=False)
                 Pod("x", self.args.ingest, "", "", "", "").wait_healthy(timeout=180)
             self.timings.append({"scenario": key, "seconds": round(time.time() - t, 1), "error": error})

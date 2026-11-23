@@ -33,9 +33,21 @@ done
 # Lines that intentionally name a legacy route (the integration suite's
 # legacy-route checks) carry `legacy-route-ok`; a fake server's
 # `path.endswith("/search")` matches /v1 paths too and is not a call.
-if hits=$(grep -rnE "$pattern" "${existing[@]}" | grep -v 'legacy-route-ok' | grep -v 'endswith('); then
+hits=$(grep -rnE "$pattern" "${existing[@]}" | grep -v 'legacy-route-ok' | grep -v 'endswith(' || true)
+
+# A legacy route given as a bare relative path to an HTTP helper that joins
+# it onto the base URL: http("POST", PORT, "index", ...) or
+# transport.request("GET", "stats"). kosha_client's own `_request(method,
+# "index", ...)` names an operation that it maps to /v1/namespaces/{ns}/...
+# (client.py _V1_ACTIONS, pinned by the client tests), so that file is not
+# checked by this pattern.
+bare='"(GET|POST|PUT|DELETE)",[[:space:]]*([A-Za-z_][A-Za-z_0-9.]*,[[:space:]]*)?f?["'"'"'](index|search|flush|delete|replace|exists|stats|healthz)["'"'"']'
+bare_hits=$(grep -rnE "$bare" "${existing[@]}" | grep -v '^clients/python/kosha_client/client.py:' | grep -v 'legacy-route-ok' || true)
+
+if [ -n "$hits$bare_hits" ]; then
   echo "legacy unversioned routes are still called (use /v1/namespaces/{ns}/...):"
-  echo "$hits"
+  [ -n "$hits" ] && echo "$hits"
+  [ -n "$bare_hits" ] && echo "$bare_hits"
   exit 1
 fi
 echo "no legacy route callers"

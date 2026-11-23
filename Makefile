@@ -22,6 +22,10 @@
 # so every machine and CI job runs the same pinned versions. Needs Go.
 
 GO ?= go
+# The Python interpreter for the client and quickstart targets: `python3`,
+# which every supported platform ships (many have no bare `python`).
+# Override with PYTHON=... (e.g. a virtualenv's python).
+PYTHON ?= python3
 API_BIN := $(CURDIR)/build/bin
 API_SPEC_DIR := api/openapi/v1
 
@@ -85,21 +89,21 @@ cli-assets:
 .PHONY: quickstart
 
 quickstart:
-	KOSHA_HOST=http://localhost:8080 KOSHA_API_KEY=sk-kosha-dev python scripts/quickstart.py
+	KOSHA_HOST=http://localhost:8080 KOSHA_API_KEY=sk-kosha-dev $(PYTHON) scripts/quickstart.py
 
 # ── Python client ──────────────────────────────────────────────────────────
 
 .PHONY: client-python-build client-python-publish client-python-test
 
 client-python-build:
-	python -m build clients/python
+	$(PYTHON) -m build clients/python
 
 client-python-publish:
-	python -m twine upload clients/python/dist/*
+	$(PYTHON) -m twine upload clients/python/dist/*
 
 client-python-test:
-	python -m pip install -e clients/python pytest pyyaml
-	python -m pytest clients/python/tests/ scripts/tests/ -q
+	$(PYTHON) -m pip install -e clients/python pytest pyyaml
+	$(PYTHON) -m pytest clients/python/tests/ scripts/tests/ -q
 
 # ── ES → Kosha migration ───────────────────────────────────────────────────
 

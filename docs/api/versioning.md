@@ -21,8 +21,11 @@ quoted int64s that the server does not accept.
   independent of the server's crate version. MINOR for additive changes,
   PATCH for documentation. Every response carries it as
   `Kosha-Api-Version`, so a client can tell which features a server has.
-  Until v1 is declared GA the revision is `0.x`, and corrections that make
-  the spec match the wire may still change it.
+  v1 is GA at revision `1.0.0` (the 0.9.x and 0.10.x revisions were
+  pre-GA). From 1.0.0 on, CI's `oasdiff breaking` gate fails a pull request
+  that breaks the public document; the `api-breaking` label overrides it
+  only together with an `api/CHANGELOG.md` "Changed" or "Removed" entry,
+  for a correction that makes the spec match the wire.
 
 ## What may change inside v1
 
@@ -58,6 +61,18 @@ SDKs (#351) are tested against these:
   HTTP status and `retryable`;
 - retry only when `retryable` is true, after `Retry-After`, with jitter and
   a bounded number of attempts.
+
+### Client and server compatibility
+
+A client release names the oldest contract revision it needs:
+
+| Client | Needs | Why |
+|---|---|---|
+| kosha-client 0.3.x | a server that sends `Kosha-Api-Version` (contract 0.10.0+) | `update()`, bulk `update` and `update_by_query()` call `POST /v1/namespaces/{ns}/replace`, new in #350; an older server answers 404. |
+| kosha-client 0.2.x | legacy routes on | calls the unversioned routes. |
+
+Upgrade servers before clients. A server from before #350 sends no
+`Kosha-Api-Version` header at all.
 
 ## Stability levels
 
@@ -104,11 +119,17 @@ and the `Link` to this section, and is counted in
 
 Two settings control them:
 
-- `KOSHA_LEGACY_ROUTES=on|off`: the pod default, `on` until the
-  self-hosted flip below. Off, a legacy route answers
+- `KOSHA_LEGACY_ROUTES=on|off`: the pod default. The built-in default is
+  `on` until the self-hosted flip below; the managed stage overlay sets it
+  `off` (`k8s/stage/configmap-patch.yaml`). Off, a legacy route answers
   `410 legacy_route_disabled` with `details.replacement`.
 - `KOSHA_LEGACY_ROUTES_TENANTS=a,b`: tenants that keep the legacy routes
   while the default is off.
+
+kosha-client 0.2.x calls the legacy routes, so it needs them on for its
+tenant. kosha-client 0.3.0 calls only `/v1`; against a server older than
+contract revision 0.9.0 (no `POST /v1/namespaces/{namespace}/replace`) it
+falls back to legacy `POST /replace` for partial updates.
 
 `/healthz`, `/readyz` and `/metrics` are operational endpoints, not legacy
 routes: they are never gated (see
@@ -118,13 +139,35 @@ routes: they are never gated (see
 
 | When | Step |
 |---|---|
-| The release that ships this (target 2026-12-15) | Headers and counter live; Kosha's own clients, bench and tools use only `/v1`; kosha-client 0.3.0. |
-| Once the ES migration script is on `/v1` (#353) and stage shows 7 days of zero legacy traffic (or stragglers are allowlisted) | Stage: `KOSHA_LEGACY_ROUTES=off`. |
-| After stage is clean and prod shows 7 days of zero | Prod: the same. |
+| The release that ships this (target 2026-12-15) | Headers and counter live; Kosha's own clients, bench and tools use only `/v1`; kosha-client 0.3.0. Stage: `KOSHA_LEGACY_ROUTES=off` (the stage backfill Job runs `kosha-server migrate` directly, so it does not use the HTTP routes; a manual `scripts/copy_es_to_kosha.py` run needs its tenant allowlisted until #353 moves it to `/v1`). |
+| After stage is clean and prod shows 7 days of zero legacy traffic (or the stragglers are allowlisted) | Prod: `KOSHA_LEGACY_ROUTES=off` in `k8s/prod/configmap-patch.yaml`. |
 | 2027-03-01 | Self-hosted built-in default flips to `off`. |
 | 2027-06-01 (Sunset) | Handlers removed, provided `kosha_legacy_requests_total` read zero on managed deployments for 14 days; otherwise the Sunset is extended and announced. After removal the paths keep answering `410 legacy_route_disabled` for the rest of v1. |
 
 Rollback at any point: set `KOSHA_LEGACY_ROUTES=on` again.
+
+### Rollout status
+
+What #350 shipped and what is still to do, so nobody reads the policy
+above as already in effect:
+
+- Shipped: the per-tenant flag (`KOSHA_LEGACY_ROUTES`,
+  `KOSHA_LEGACY_ROUTES_TENANTS`), deprecation headers, the
+  `kosha_legacy_requests_total` counter and log line, and every Kosha
+  caller (Python client 0.3.0, CLI, bench, conformance, soak, integration,
+  k8s probes) on `/v1`. CI runs the conformance suite, the wire check, the
+  client tests and smoke test and the bench loader/driver against a
+  legacy-off stack; integration scenario g runs with the flag off and an
+  allowlist.
+- Shipped: `info.version` 1.0.0 (v1 GA), the `oasdiff breaking` gate on
+  the public document, Redoc API docs (`api-docs.yml`) and both specs as
+  release assets.
+- Shipped: `k8s/stage` sets `KOSHA_LEGACY_ROUTES=off`.
+- **Not yet done: prod off.** `k8s/prod` still serves the legacy routes and
+  the built-in default stays `on`. The prod flip waits for 7 days of zero
+  `kosha_legacy_requests_total` in prod (or a known allowlist of
+  stragglers); it is a configmap change (see the comment in
+  `k8s/prod/configmap-patch.yaml`).
 
 ## Changing the contract
 

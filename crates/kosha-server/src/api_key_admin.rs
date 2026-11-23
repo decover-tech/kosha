@@ -233,7 +233,7 @@ fn record_json(record: &ApiKeyRecord, now: i64) -> serde_json::Value {
 #[cfg(not(feature = "postgres"))]
 fn execute(_action: Action) -> String {
     api_error(
-        ErrorCode::InvalidArgument,
+        ErrorCode::NotImplemented,
         "admin API requires postgres feature (compile with --features postgres)",
     )
 }
@@ -243,13 +243,13 @@ fn execute(action: Action) -> String {
     use crate::{auth, json_ok};
     let auth::Auth::Keys(store) = auth::global() else {
         return api_error(
-            ErrorCode::InvalidArgument,
+            ErrorCode::NotImplemented,
             "API keys are disabled (KOSHA_AUTH=disabled)",
         );
     };
     if std::env::var("DATABASE_URL").is_err() {
         return api_error(
-            ErrorCode::InvalidArgument,
+            ErrorCode::NotImplemented,
             "Postgres not configured (DATABASE_URL not set)",
         );
     }

@@ -16,6 +16,12 @@ x-kosha-env: &kosha-env
   KOSHA_API_KEY: sk-kosha-dev
   KOSHA_API_KEYS: sk-tenant-a=tenant-a,sk-tenant-b=tenant-b
   KOSHA_ADMIN_API_KEY: sk-kosha-admin-dev
+  # Legacy routes as a managed deployment runs them (#350, ADR-350 §c): off
+  # by default, kept for tenant-a only. Scenario g checks both sides: tenant-a
+  # still reaches (only its own namespaces through) the legacy routes, and
+  # tenant-b gets 410 legacy_route_disabled.
+  KOSHA_LEGACY_ROUTES: "off"
+  KOSHA_LEGACY_ROUTES_TENANTS: tenant-a
   # Peers and strong-consistency tail reads (#255), as in k8s/base.
   KOSHA_INTERNAL_API_KEY: sk-kosha-internal-dev
   KOSHA_HTTP_PORT: "8080"

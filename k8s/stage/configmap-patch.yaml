@@ -7,4 +7,15 @@ kind: ConfigMap
 metadata:
   name: kosha-config
   namespace: kosha
-data: {}
+data:
+  # The unversioned Phase 1 routes (POST /index, /search, ...) are off on
+  # this managed deployment: they answer 410 legacy_route_disabled naming
+  # the /v1 replacement (#350, ADR-350 §c, docs/api/versioning.md). Every
+  # in-repo caller, kosha-client 0.3.0 and the stage backfill Job (which
+  # runs `kosha-server migrate` directly, not HTTP) use /v1 only.
+  # A tenant still migrating keeps the legacy routes by being listed in
+  # KOSHA_LEGACY_ROUTES_TENANTS (comma-separated tenant ids); the 410s and
+  # the "legacy route usage: tenant=..." log lines name them. Rollback:
+  # set KOSHA_LEGACY_ROUTES to "on".
+  KOSHA_LEGACY_ROUTES: "off"
+  KOSHA_LEGACY_ROUTES_TENANTS: ""

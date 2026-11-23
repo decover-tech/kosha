@@ -49,6 +49,21 @@ jobs:
       - name: Python client smoke (legacy routes off)
         run: python3 scripts/api/client_smoke.py --host http://localhost:8080 --api-key sk-kosha-dev
 
+      # ADR-350 §c guards / plan acceptance 8: the client test suite, then the
+      # BM25 bench loader and query driver briefly, all against the legacy-off
+      # stack. The log check below then proves none of them touched a legacy
+      # route.
+      - name: Python client tests
+        run: |
+          python3 -m venv .venv-legacy-off
+          .venv-legacy-off/bin/pip install --quiet -e clients/python pytest numpy requests
+          .venv-legacy-off/bin/python -m pytest clients/python/tests -q
+
+      - name: Bench scripts smoke (legacy routes off)
+        run: |
+          PATH=$PWD/.venv-legacy-off/bin:$PATH \
+            scripts/api/bench_smoke.sh http://localhost:8080 sk-kosha-dev sk-kosha-admin-dev
+
       # After the suite above, so its python3 (system, stdlib only) is
       # unchanged. The DSL runner needs PyYAML.
       - uses: actions/setup-python@v5

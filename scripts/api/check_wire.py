@@ -176,7 +176,7 @@ class Server:
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                with urllib.request.urlopen(self.host + "/readyz", timeout=2) as r:
+                with urllib.request.urlopen(self.host + "/v1/readyz", timeout=2) as r:
                     if r.status == 200:
                         return
             except Exception:

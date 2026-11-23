@@ -25,7 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// The contract revision (`info.version` of the checked-in OpenAPI
 /// documents), sent as `Kosha-Api-Version` on every response. A test keeps
 /// it equal to the spec.
-pub(crate) const API_VERSION: &str = "0.10.0";
+pub(crate) const API_VERSION: &str = "1.0.0";
 
 /// The delay a retryable error advertises when its call site knows no
 /// better one.
@@ -213,7 +213,7 @@ impl ErrorCode {
             Self::TenantWriteRateExceeded => "The tenant's write rate limit.",
             Self::TenantQueueFull => "The tenant's share of the search queue is full.",
             Self::Overloaded => {
-                "The pod shed the request (scoring queue, memory, hydration); `details.reason` says which."
+                "The pod shed the request (scoring queue, memory, hydration, unindexed backlog); `details.reason` says which."
             }
             Self::Internal => {
                 "An unexpected server error. Quote `request_id` when reporting it."
@@ -355,18 +355,51 @@ pub(crate) struct ApiError {
     /// Deprecated top-level fields kept for old clients (`reason`, `limit`).
     aliases: Vec<(&'static str, serde_json::Value)>,
     headers: Vec<(String, String)>,
+    /// Text for the server log only (ADR-350 §b): internal I/O, S3 or
+    /// Postgres errors, hosts, tenant-qualified ids. Never in the body.
+    log_detail: Option<String>,
 }
 
+/// The body message of every `internal` error. What went wrong is logged
+/// with the request id; the body never carries it.
+pub(crate) const INTERNAL_MESSAGE: &str =
+    "internal error; the server log has the detail under this request_id";
+
 impl ApiError {
+    /// An error with `message` as its body text. An `internal` (500)
+    /// message is treated as log-only: the body says [`INTERNAL_MESSAGE`].
     pub(crate) fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        let message = message.into();
+        let (message, log_detail) = if code == ErrorCode::Internal && message != INTERNAL_MESSAGE {
+            (INTERNAL_MESSAGE.to_string(), Some(message))
+        } else {
+            (message, None)
+        };
         Self {
             code,
-            message: message.into(),
+            message,
             details: serde_json::Map::new(),
             retry_after: None,
             aliases: Vec::new(),
             headers: Vec::new(),
+            log_detail,
         }
+    }
+
+    /// Replace the body text with `public`, keeping the current text for
+    /// the log only.
+    pub(crate) fn redact(mut self, public: impl Into<String>) -> Self {
+        let internal = std::mem::replace(&mut self.message, public.into());
+        self.log_detail = Some(match self.log_detail.take() {
+            Some(earlier) => format!("{earlier}; {internal}"),
+            None => internal,
+        });
+        self
+    }
+
+    /// The log-only text, if any.
+    pub(crate) fn log_detail(&self) -> Option<&str> {
+        self.log_detail.as_deref()
     }
 
     /// Add one `details` key.
@@ -446,7 +479,7 @@ impl ApiError {
         eprintln!(
             "WARN: request failed: status={status} code={} {}{}",
             self.code.as_str(),
-            self.message,
+            self.log_detail.as_deref().unwrap_or(&self.message),
             log_rid()
         );
         let body = self.body(&request_id).to_string();
@@ -516,7 +549,12 @@ mod tests {
         for code in ErrorCode::ALL {
             let (status, headers, body) = parts(&api_error(code, "boom"));
             assert_eq!(status, code.status(), "{code:?}");
-            assert_eq!(body["error"], "boom");
+            if code == ErrorCode::Internal {
+                // A 500's own text is for the log only (ADR-350 §b).
+                assert_eq!(body["error"], INTERNAL_MESSAGE);
+            } else {
+                assert_eq!(body["error"], "boom");
+            }
             assert_eq!(body["code"], code.as_str());
             assert_eq!(body["retryable"], code.retryable());
             assert_eq!(body["request_id"], "rid-under-test");
@@ -531,6 +569,20 @@ mod tests {
             }
         }
         begin_request(None);
+    }
+
+    /// Internal text (I/O, S3, Postgres errors, hosts) never reaches the
+    /// body: a 500 says only [`INTERNAL_MESSAGE`], and a redacted error
+    /// shows its public text while the log keeps the rest.
+    #[test]
+    fn internal_detail_stays_in_the_log() {
+        let error = ApiError::new(ErrorCode::Internal, "S3 list failed: dispatch failure");
+        assert_eq!(error.body("r")["error"], INTERNAL_MESSAGE);
+        assert_eq!(error.log_detail(), Some("S3 list failed: dispatch failure"));
+        let error = ApiError::new(ErrorCode::Unavailable, "control store: pg: conn refused")
+            .redact("control store unavailable");
+        assert_eq!(error.body("r")["error"], "control store unavailable");
+        assert_eq!(error.log_detail(), Some("control store: pg: conn refused"));
     }
 
     #[test]
@@ -589,6 +641,43 @@ mod tests {
                 &serde_json::json!(want),
                 "proto/kosha/v1/errors.proto ErrorResponse.code enum differs from ErrorCode::ALL"
             );
+        }
+    }
+
+    /// Every public operation declares a typed `ErrorResponse` for the
+    /// status of every code a public route can send (all but the legacy-only
+    /// 410), and a `Retry-After` header on each status that carries a
+    /// retryable code, so an SDK generated from the spec handles every error
+    /// the server returns (#350).
+    #[test]
+    fn public_operations_declare_every_error_status() {
+        let doc: serde_json::Value = serde_json::from_str(PUBLIC_SPEC).unwrap();
+        let paths = doc["paths"].as_object().unwrap();
+        assert!(!paths.is_empty());
+        for (path, item) in paths {
+            for (method, op) in item.as_object().unwrap() {
+                let responses = &op["responses"];
+                for code in ErrorCode::ALL {
+                    if code == ErrorCode::LegacyRouteDisabled {
+                        continue;
+                    }
+                    let status = code.status().to_string();
+                    let response = &responses[status.as_str()];
+                    assert_eq!(
+                        response["content"]["application/json"]["schema"]["$ref"],
+                        "#/components/schemas/v1ErrorResponse",
+                        "{method} {path}: no ErrorResponse for {status} ({})",
+                        code.as_str()
+                    );
+                    if code.retryable() {
+                        assert!(
+                            response["headers"]["Retry-After"].is_object(),
+                            "{method} {path}: {status} ({}) is retryable but declares no Retry-After",
+                            code.as_str()
+                        );
+                    }
+                }
+            }
         }
     }
 

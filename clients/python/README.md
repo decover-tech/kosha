@@ -46,7 +46,16 @@ Kosha HTTP API. As the API stabilises, the hand-written code will shrink to just
 
 Since 0.3.0 the client calls only the `/v1` API (`/v1/namespaces/{ns}/documents`,
 `.../replace`, `.../search`, ...), so it works against servers with
-`KOSHA_LEGACY_ROUTES=off`; 0.2.x needs the legacy routes on. `KoshaRequestError`
+`KOSHA_LEGACY_ROUTES=off`; 0.2.x needs the legacy routes on.
+
+**Server compatibility.** 0.3.0 works with every server that serves `/v1`.
+Partial updates (`update()`, bulk `update` actions, `update_by_query`) use
+`POST /v1/namespaces/{ns}/replace`, which servers gained in API contract
+0.9.0 (`Kosha-Api-Version`). Against an older server the client sees that
+route's bare 404, logs a warning once, and falls back to the deprecated
+`POST /replace` for the rest of its life, so upgrading the client before the
+server is safe. Turn `KOSHA_LEGACY_ROUTES` off only once the server is on
+0.9.0 or later. `KoshaRequestError`
 carries the server's error model: `code`, `retryable`, `retry_after_ms` and
 `request_id` (see [docs/api/errors.md](../../docs/api/errors.md)). The client
 does not retry on HTTP status yet; retry when `retryable` is true.

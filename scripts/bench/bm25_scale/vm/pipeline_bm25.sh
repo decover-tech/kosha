@@ -63,7 +63,7 @@ sudo docker stop kosha >/dev/null
 sudo rm -rf /data/kosha/data/*
 T_WARM0=$(date +%s)
 start_kosha
-until curl -sf http://127.0.0.1:8080/readyz >/dev/null 2>&1; do
+until curl -sf http://127.0.0.1:8080/v1/readyz >/dev/null 2>&1; do
   sleep 5
   [ $(( $(date +%s) - T_WARM0 )) -gt 2400 ] && { echo "WARMUP-TIMEOUT"; exit 1; }
 done

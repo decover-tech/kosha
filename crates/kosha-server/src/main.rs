@@ -1061,13 +1061,25 @@ fn rebase_backoff(attempt: u32) -> Duration {
 fn publication_error(context: &str, error: &KoshaError) -> String {
     let message = format!("{context}: {error}");
     match error {
-        KoshaError::ManifestConflict { .. } => api_error(ErrorCode::WriteConflict, &message),
+        // The Display of both names the tenant-qualified namespace and
+        // fencing tokens: log it, show the tenant-relative name only.
+        KoshaError::ManifestConflict { namespace, .. } => {
+            let name = tenant_relative(&namespace.0);
+            ApiError::new(ErrorCode::WriteConflict, message)
+                .redact(format!(
+                    "{context}: a concurrent write to namespace '{name}' won; retry"
+                ))
+                .into_raw()
+        }
         // Another writer owns the namespace (#254): retry, by when its
         // lease would have lapsed, against whichever pod owns it now.
         KoshaError::Fenced { .. } => {
             let ttl =
                 writer_lease::ttl_from(std::env::var("KOSHA_WRITER_LEASE_TTL_MS").ok().as_deref());
             ApiError::new(ErrorCode::Unavailable, message)
+                .redact(format!(
+                    "{context}: another writer owns this namespace; retry"
+                ))
                 .detail("reason", "writer_lease")
                 .retry_after(ttl.max(Duration::from_secs(1)))
                 .into_raw()
@@ -2196,6 +2208,7 @@ impl AppState {
     /// 503 + `Retry-After` for a write this writer may not make.
     fn write_refusal(&self, error: &KoshaError) -> String {
         ApiError::new(ErrorCode::Unavailable, format!("write refused: {error}"))
+            .redact("write refused: another writer owns this namespace; retry")
             .detail("reason", "writer_lease")
             .retry_after(Duration::from_secs(self.writer_leases.retry_after_secs()))
             .into_raw()
@@ -6562,17 +6575,20 @@ fn forward_to_ingest(
                 })
                 .collect();
             let upstream_body = resp.text().unwrap_or_default();
+            // The ingest pod's own response, relayed verbatim: it already
+            // follows the error model (clippy.toml).
+            #[allow(clippy::disallowed_methods)]
+            let relay = raw_response(status, &upstream_body);
             relayed
                 .iter()
-                .fold(raw_response(status, &upstream_body), |out, (k, v)| {
-                    with_header(out, k, v)
-                })
+                .fold(relay, |out, (k, v)| with_header(out, k, v))
         }
         Err(e) => {
             let mut error = ApiError::new(
                 ErrorCode::Unavailable,
                 format!("forward to ingest ({ingest_host}) failed: {e}"),
             )
+            .redact("the ingest pod could not be reached")
             .detail("reason", "ingest_unreachable");
             // A connect failure never reached the ingest pod; anything later
             // (a timeout, a reset) may have been applied there.
@@ -10793,7 +10809,7 @@ fn handle_import_namespace(body: &[u8], _tenant: &str, state: &AppState) -> Stri
     #[cfg(not(feature = "s3"))]
     {
         api_error(
-            ErrorCode::InvalidArgument,
+            ErrorCode::NotImplemented,
             "import-namespace requires the s3 feature",
         )
     }
@@ -10830,7 +10846,7 @@ fn handle_import_namespace(body: &[u8], _tenant: &str, state: &AppState) -> Stri
         }
 
         let Some(ref s3) = state.s3_storage else {
-            return api_error(ErrorCode::InvalidArgument, "S3 not configured on this pod");
+            return api_error(ErrorCode::NotImplemented, "S3 not configured on this pod");
         };
         // Segment ids are the namespace prefix's child "directories"
         // (paginated common-prefix listing — `list_with_sizes` filters out
@@ -11073,6 +11089,10 @@ fn hydration_error_response(outcome: &HydrationOutcome) -> Option<String> {
         eprintln!("ERROR: {message}{}", request_id());
         return Some(
             ApiError::new(ErrorCode::Unavailable, message)
+                .redact(format!(
+                    "could not load {} segment(s) from storage; retry",
+                    outcome.missing.len()
+                ))
                 .detail("reason", "hydration_failed")
                 .into_raw(),
         );
@@ -11335,6 +11355,7 @@ fn search_error_response(e: &KoshaError) -> String {
         }
         KoshaError::ControlPlane(_) => {
             ApiError::new(ErrorCode::Unavailable, format!("search unavailable: {e}"))
+                .redact("search unavailable: the control store could not be reached")
                 .detail("reason", "control_store")
                 .into_raw()
         }
@@ -11346,19 +11367,28 @@ fn search_error_response(e: &KoshaError) -> String {
         KoshaError::NamespaceNotFound(ns) => namespace_not_found(&ns.0),
         KoshaError::NamespaceExists(_) => api_error(ErrorCode::AlreadyExists, &e.to_string()),
         KoshaError::ManifestConflict { .. } => {
-            api_error(ErrorCode::WriteConflict, &format!("search error: {e}"))
+            ApiError::new(ErrorCode::WriteConflict, format!("search error: {e}"))
+                .redact("search error: a concurrent write won; retry")
+                .into_raw()
         }
         KoshaError::Fenced { .. } => {
             ApiError::new(ErrorCode::Unavailable, format!("search error: {e}"))
+                .redact("search error: another writer owns this namespace; retry")
                 .detail("reason", "writer_lease")
                 .into_raw()
         }
         KoshaError::NotFound(_) => api_error(ErrorCode::NotFound, &e.to_string()),
+        // Internal I/O, serde and segment text (local paths among it) goes
+        // to the log keyed by request id, never to the caller (ADR-350 §b).
         KoshaError::SegmentNotFound(_)
         | KoshaError::Io(_)
         | KoshaError::Serde(_)
         | KoshaError::CorruptSegment(_) => {
-            api_error(ErrorCode::Internal, &format!("search error: {e}"))
+            eprintln!("ERROR: search error: {e}{}", api_error::log_rid());
+            api_error(
+                ErrorCode::Internal,
+                "internal search error; quote request_id when reporting it",
+            )
         }
     }
 }
@@ -11366,18 +11396,27 @@ fn search_error_response(e: &KoshaError) -> String {
 /// The 503 for a control-store (Postgres) failure: retryable, with
 /// `details.reason: "control_store"`.
 fn control_store_unavailable(message: &str) -> String {
+    // `message` carries the store's own error (driver, SQL, hosts): log it.
     ApiError::new(ErrorCode::Unavailable, message)
+        .redact("the control store is unavailable; retry")
         .detail("reason", "control_store")
         .into_raw()
+}
+
+/// The tenant-relative part of an internal `<tenant>/<name>` namespace id,
+/// as error messages show it (ADR-350 §b); an unqualified id is returned
+/// as is.
+fn tenant_relative(namespace: &str) -> &str {
+    namespace
+        .split_once('/')
+        .map_or(namespace, |(_, name)| name)
 }
 
 /// The 404 for a namespace that does not exist. `namespace` may be the
 /// internal `<tenant>/<name>` id; the message names only `<name>`, so one
 /// tenant's errors never show a tenant id (#350).
 fn namespace_not_found(namespace: &str) -> String {
-    let name = namespace
-        .split_once('/')
-        .map_or(namespace, |(_, name)| name);
+    let name = tenant_relative(namespace);
     ApiError::new(
         ErrorCode::NamespaceNotFound,
         format!("namespace '{name}' not found"),
@@ -11434,6 +11473,8 @@ impl Drop for AppState {
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+// Tests build raw responses (`raw_response`) as fixtures.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use kosha_core::{Document, DocumentId, Field};
@@ -19587,14 +19628,22 @@ mod tests {
             br#"{"namespace":"tenant/ryw-down","query_text":"hello","consistency":"strong"}"#;
         let refused = handle_search_post(strong, &query);
         assert!(refused.starts_with("HTTP/1.1 503"), "{refused}");
-        assert!(refused.contains("KOSHA_INTERNAL_API_KEY"), "{refused}");
+        // Why (no KOSHA_INTERNAL_API_KEY) is the operator's: logged, not
+        // shown (ADR-350 §b); the body says what failed and what to do.
+        assert!(!refused.contains("KOSHA_INTERNAL_API_KEY"), "{refused}");
+        assert!(
+            refused.contains("cannot read the unindexed tail of 'ryw-down'"),
+            "{refused}"
+        );
+        assert!(!refused.contains("tenant/ryw-down"), "{refused}");
         // A failing fetch is a 503 too.
         query.unindexed.fetcher = Some(Box::new(|_, _, _| {
             Err(KoshaError::Io(std::io::Error::other("ingest down")))
         }));
         let failed = handle_search_post(strong, &query);
         assert!(failed.starts_with("HTTP/1.1 503"), "{failed}");
-        assert!(failed.contains("ingest down"), "{failed}");
+        assert!(!failed.contains("ingest down"), "{failed}");
+        assert!(failed.contains("eventual"), "{failed}");
         let eventual =
             br#"{"namespace":"tenant/ryw-down","query_text":"hello","consistency":"eventual"}"#;
         assert_eq!(total_hits(&handle_search_post(eventual, &query)), 1);
@@ -19628,7 +19677,18 @@ mod tests {
         let refused = ryw_index(&state, ns, vec![ryw_doc("c", "three", "x")]);
         assert!(refused.starts_with("HTTP/1.1 429"), "{refused}");
         assert!(refused.contains("\r\nretry-after: 1\r\n"), "{refused}");
+        assert_eq!(
+            refused.matches("retry-after:").count(),
+            1,
+            "one Retry-After header: {refused}"
+        );
         assert!(refused.contains("KOSHA_MAX_UNINDEXED_DOCS"), "{refused}");
+        assert!(refused.contains("namespace 'ryw-cap'"), "{refused}");
+        assert!(!refused.contains("tenant/ryw-cap"), "{refused}");
+        assert!(
+            refused.contains("\"reason\":\"unindexed_backlog\""),
+            "{refused}"
+        );
         let replace = serde_json::to_vec(&IndexRequest {
             namespace: NamespaceId(ns.into()),
             documents: vec![ryw_doc("a", "patched", "x")],

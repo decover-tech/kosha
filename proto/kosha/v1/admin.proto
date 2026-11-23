@@ -15,7 +15,7 @@ option java_package = "com.decover.kosha.v1";
 option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_swagger) = {
   info: {
     title: "Kosha Admin API"
-    version: "0.10.0"
+    version: "1.0.0"
     description:
       "The operator API. Every route needs the admin credential (KOSHA_ADMIN_API_KEY) as `Authorization: Bearer <key>` or `X-Api-Key: <key>`. Beta: bodies are free-form JSON objects."
   }
@@ -84,6 +84,20 @@ option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_swagger) = {
     }
   }
   responses: {
+    key: "408"
+    value: {
+      description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+      schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+      headers: {
+        key: "Retry-After"
+        value: {
+          type: "integer"
+          description: "Seconds to wait before retrying."
+        }
+      }
+    }
+  }
+  responses: {
     key: "409"
     value: {
       description: "already_exists, conflict"
@@ -91,9 +105,23 @@ option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_swagger) = {
     }
   }
   responses: {
+    key: "413"
+    value: {
+      description: "payload_too_large"
+      schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+    }
+  }
+  responses: {
     key: "500"
     value: {
       description: "internal"
+      schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+    }
+  }
+  responses: {
+    key: "501"
+    value: {
+      description: "not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable"
       schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
     }
   }
@@ -124,6 +152,20 @@ service AdminService {
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
         key: "503"
         value: {
           description: "unavailable; retry after `Retry-After` seconds"
@@ -136,6 +178,10 @@ service AdminService {
             }
           }
         }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -149,6 +195,20 @@ service AdminService {
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
         key: "503"
         value: {
           description: "unavailable; retry after `Retry-After` seconds"
@@ -163,6 +223,10 @@ service AdminService {
         }
       }
       extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
+      extensions: {
         key: "x-stability-level"
         value: {string_value: "beta"}
       }
@@ -173,6 +237,20 @@ service AdminService {
       get: "/v1/admin/warmup-status"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
       responses: {
         key: "503"
         value: {
@@ -186,6 +264,10 @@ service AdminService {
             }
           }
         }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -200,6 +282,20 @@ service AdminService {
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
         key: "503"
         value: {
           description: "unavailable; retry after `Retry-After` seconds"
@@ -212,6 +308,10 @@ service AdminService {
             }
           }
         }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -226,6 +326,20 @@ service AdminService {
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
         key: "503"
         value: {
           description: "unavailable; retry after `Retry-After` seconds"
@@ -238,6 +352,10 @@ service AdminService {
             }
           }
         }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -252,6 +370,20 @@ service AdminService {
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
         key: "503"
         value: {
           description: "unavailable; retry after `Retry-After` seconds"
@@ -264,6 +396,10 @@ service AdminService {
             }
           }
         }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -277,6 +413,20 @@ service AdminService {
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
         key: "503"
         value: {
           description: "unavailable; retry after `Retry-After` seconds"
@@ -291,6 +441,10 @@ service AdminService {
         }
       }
       extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
+      extensions: {
         key: "x-stability-level"
         value: {string_value: "beta"}
       }
@@ -301,6 +455,20 @@ service AdminService {
       get: "/v1/admin/compaction-jobs/{job_id}"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
       responses: {
         key: "503"
         value: {
@@ -314,6 +482,10 @@ service AdminService {
             }
           }
         }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -328,6 +500,20 @@ service AdminService {
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
         key: "503"
         value: {
           description: "unavailable; retry after `Retry-After` seconds"
@@ -340,6 +526,10 @@ service AdminService {
             }
           }
         }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -354,6 +544,20 @@ service AdminService {
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
         key: "503"
         value: {
           description: "unavailable; retry after `Retry-After` seconds"
@@ -366,6 +570,10 @@ service AdminService {
             }
           }
         }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -380,6 +588,20 @@ service AdminService {
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
         key: "503"
         value: {
           description: "unavailable; retry after `Retry-After` seconds"
@@ -394,6 +616,10 @@ service AdminService {
         }
       }
       extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
+      extensions: {
         key: "x-stability-level"
         value: {string_value: "beta"}
       }
@@ -404,6 +630,20 @@ service AdminService {
       get: "/v1/admin/api-keys"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
       responses: {
         key: "503"
         value: {
@@ -417,6 +657,10 @@ service AdminService {
             }
           }
         }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -431,6 +675,20 @@ service AdminService {
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
         key: "503"
         value: {
           description: "unavailable; retry after `Retry-After` seconds"
@@ -443,6 +701,10 @@ service AdminService {
             }
           }
         }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -457,6 +719,20 @@ service AdminService {
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
         key: "503"
         value: {
           description: "unavailable; retry after `Retry-After` seconds"
@@ -471,6 +747,10 @@ service AdminService {
         }
       }
       extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
+      extensions: {
         key: "x-stability-level"
         value: {string_value: "beta"}
       }
@@ -481,6 +761,20 @@ service AdminService {
       post: "/v1/admin/api-keys/scrub-plaintext"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
       responses: {
         key: "503"
         value: {
@@ -494,6 +788,10 @@ service AdminService {
             }
           }
         }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -508,6 +806,20 @@ service AdminService {
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
         key: "503"
         value: {
           description: "unavailable; retry after `Retry-After` seconds"
@@ -520,6 +832,10 @@ service AdminService {
             }
           }
         }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -533,6 +849,20 @@ service AdminService {
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
         key: "503"
         value: {
           description: "unavailable; retry after `Retry-After` seconds"
@@ -547,6 +877,10 @@ service AdminService {
         }
       }
       extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
+      extensions: {
         key: "x-stability-level"
         value: {string_value: "beta"}
       }
@@ -557,6 +891,20 @@ service AdminService {
       get: "/v1/admin/deletions/{id}"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
       responses: {
         key: "503"
         value: {
@@ -570,6 +918,10 @@ service AdminService {
             }
           }
         }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -584,6 +936,20 @@ service AdminService {
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
         key: "503"
         value: {
           description: "unavailable; retry after `Retry-After` seconds"
@@ -598,6 +964,10 @@ service AdminService {
         }
       }
       extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
+      extensions: {
         key: "x-stability-level"
         value: {string_value: "beta"}
       }
@@ -608,6 +978,20 @@ service AdminService {
       get: "/v1/admin/billing/accounts"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
       responses: {
         key: "503"
         value: {
@@ -621,6 +1005,10 @@ service AdminService {
             }
           }
         }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -635,6 +1023,20 @@ service AdminService {
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
         key: "503"
         value: {
           description: "unavailable; retry after `Retry-After` seconds"
@@ -649,6 +1051,10 @@ service AdminService {
         }
       }
       extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
+      extensions: {
         key: "x-stability-level"
         value: {string_value: "beta"}
       }
@@ -659,6 +1065,20 @@ service AdminService {
       get: "/v1/admin/billing/invoices"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
       responses: {
         key: "503"
         value: {
@@ -672,6 +1092,10 @@ service AdminService {
             }
           }
         }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -686,6 +1110,20 @@ service AdminService {
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
         key: "503"
         value: {
           description: "unavailable; retry after `Retry-After` seconds"
@@ -700,6 +1138,10 @@ service AdminService {
         }
       }
       extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
+      extensions: {
         key: "x-stability-level"
         value: {string_value: "beta"}
       }
@@ -710,6 +1152,20 @@ service AdminService {
       post: "/v1/admin/billing/sync"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
       responses: {
         key: "503"
         value: {
@@ -723,6 +1179,10 @@ service AdminService {
             }
           }
         }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -737,6 +1197,20 @@ service AdminService {
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
         key: "503"
         value: {
           description: "unavailable; retry after `Retry-After` seconds"
@@ -749,6 +1223,10 @@ service AdminService {
             }
           }
         }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -763,6 +1241,20 @@ service AdminService {
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
         key: "503"
         value: {
           description: "unavailable; retry after `Retry-After` seconds"
@@ -777,6 +1269,10 @@ service AdminService {
         }
       }
       extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
+      extensions: {
         key: "x-stability-level"
         value: {string_value: "beta"}
       }
@@ -787,6 +1283,20 @@ service AdminService {
       get: "/v1/admin/users/{user_id}"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
       responses: {
         key: "503"
         value: {
@@ -800,6 +1310,10 @@ service AdminService {
             }
           }
         }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -814,6 +1328,20 @@ service AdminService {
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
         key: "503"
         value: {
           description: "unavailable; retry after `Retry-After` seconds"
@@ -826,6 +1354,10 @@ service AdminService {
             }
           }
         }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -839,6 +1371,20 @@ service AdminService {
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
         key: "503"
         value: {
           description: "unavailable; retry after `Retry-After` seconds"
@@ -853,6 +1399,10 @@ service AdminService {
         }
       }
       extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
+      extensions: {
         key: "x-stability-level"
         value: {string_value: "beta"}
       }
@@ -863,6 +1413,20 @@ service AdminService {
       get: "/v1/admin/orgs/{org}/members"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
       responses: {
         key: "503"
         value: {
@@ -876,6 +1440,10 @@ service AdminService {
             }
           }
         }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -890,6 +1458,20 @@ service AdminService {
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
         key: "503"
         value: {
           description: "unavailable; retry after `Retry-After` seconds"
@@ -902,6 +1484,10 @@ service AdminService {
             }
           }
         }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -916,6 +1502,20 @@ service AdminService {
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
         key: "503"
         value: {
           description: "unavailable; retry after `Retry-After` seconds"
@@ -928,6 +1528,10 @@ service AdminService {
             }
           }
         }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -941,6 +1545,20 @@ service AdminService {
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
         key: "503"
         value: {
           description: "unavailable; retry after `Retry-After` seconds"
@@ -955,6 +1573,10 @@ service AdminService {
         }
       }
       extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
+      extensions: {
         key: "x-stability-level"
         value: {string_value: "beta"}
       }
@@ -965,6 +1587,20 @@ service AdminService {
       get: "/v1/admin/orgs/{org}/projects"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
       responses: {
         key: "503"
         value: {
@@ -978,6 +1614,10 @@ service AdminService {
             }
           }
         }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -992,6 +1632,20 @@ service AdminService {
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
         key: "503"
         value: {
           description: "unavailable; retry after `Retry-After` seconds"
@@ -1006,6 +1660,10 @@ service AdminService {
         }
       }
       extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
+      extensions: {
         key: "x-stability-level"
         value: {string_value: "beta"}
       }
@@ -1016,6 +1674,20 @@ service AdminService {
       get: "/v1/admin/orgs/{org}/tenants"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
       responses: {
         key: "503"
         value: {
@@ -1029,6 +1701,10 @@ service AdminService {
             }
           }
         }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -1043,6 +1719,20 @@ service AdminService {
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
         key: "503"
         value: {
           description: "unavailable; retry after `Retry-After` seconds"
@@ -1055,6 +1745,10 @@ service AdminService {
             }
           }
         }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -1069,6 +1763,20 @@ service AdminService {
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
         key: "503"
         value: {
           description: "unavailable; retry after `Retry-After` seconds"
@@ -1083,6 +1791,10 @@ service AdminService {
         }
       }
       extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
+      extensions: {
         key: "x-stability-level"
         value: {string_value: "beta"}
       }
@@ -1093,6 +1805,20 @@ service AdminService {
       get: "/v1/admin/orgs/{org}/audit-log"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
       responses: {
         key: "503"
         value: {
@@ -1106,6 +1832,10 @@ service AdminService {
             }
           }
         }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"

@@ -611,7 +611,7 @@ POST /v1/namespaces/shop/search
   and replaced by its vector before the write reaches the WAL, so replay, compaction and the doc
   store hold vectors only (the text is not kept; a document reads back with its vector). A
   number array is accepted as is when it has the declared `dims`, otherwise 400. A model this
-  pod has no provider for is a 503, an unreachable or timed-out provider a 503, and a provider
+  pod has no provider for is a 501 `not_implemented` (not retryable), an unreachable or timed-out provider a 503, and a provider
   that answers with an error or the wrong dimension a 502. Nothing is written on any of them.
 - **Query.** `knn` takes exactly one of `vector`, `vectors` or `query_text`. `query_text` against
   a field with no declared model is a 400. Non-kNN queries, and namespaces that declare no model,

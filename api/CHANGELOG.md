@@ -7,6 +7,41 @@ independent of the server's crate version; see `docs/api/versioning.md`.
 
 Sections: Added, Changed, Deprecated, Removed.
 
+## [1.0.0]
+
+v1 is GA (#350, ADR-350 §a, §d). From this revision on, a breaking change
+to a stable operation needs `/v2`, and CI's `oasdiff breaking` gate
+enforces it on the public document.
+
+### Added
+
+- `x-kosha-error-codes` on every operation of both documents: the
+  `ErrorResponse.code` values it can return, for typed SDK errors.
+- Shared `408 request_timeout`, `501 not_implemented` and
+  `502 upstream_error` responses; the admin document also gains `408`,
+  `413` and `501`. `408` and `502` declare `Retry-After`, and so does the
+  public `409` (sent with `write_conflict`).
+- `details.reason: "unindexed_backlog"` on the write-backpressure 429.
+- `GET /v1/healthz` and the errors sent before a request reaches its
+  handler (413 body cap, 408 body timeout, 503 capacity) carry
+  `X-Request-Id` (the caller's) and `Kosha-Api-Version` like every other
+  response.
+
+### Changed
+
+- An embedding model this server has no provider for is
+  `501 not_implemented`, not retryable (was `503 unavailable`, retryable,
+  which a retry-on-`retryable` client loops on). Admin routes that need a
+  backend the server lacks (the `postgres` or `s3` feature, `DATABASE_URL`,
+  S3, API keys) are `501 not_implemented` (were `400 invalid_argument`).
+- `DELETE /v1/namespaces/{namespace}` on a missing namespace is
+  `namespace_not_found`, like every other route (was `not_found`).
+- The connection-capacity 503 says `details.reason: "connection_limit"`.
+- The write-backpressure 429 sends one `Retry-After` (it sent two).
+- Error messages no longer carry internal I/O, S3 or Postgres text, the
+  ingest pod's address, or the tenant prefix of a namespace; those stay in
+  the server log, keyed by `request_id`.
+
 ## [0.10.0]
 
 One error model on every route (#350, ADR-350 §b; table in

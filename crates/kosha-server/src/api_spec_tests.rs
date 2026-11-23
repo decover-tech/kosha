@@ -285,6 +285,103 @@ fn legacy_routes_follow_the_pod_default_and_the_allowlist() {
     assert!(auth::legacy_routes_allowed(true, &none, "a"));
 }
 
+/// The same through `route()`: with the pod default off and tenant B
+/// allowlisted, A's `POST /index` is a 410 naming the replacement and B's
+/// is served; with no allowlist both are refused; `/v1` is never gated.
+#[test]
+fn legacy_flag_off_and_allowlist_through_the_router() {
+    let state = AppState::new(tests::test_dir());
+    let headers = HashMap::new();
+    let body = serde_json::json!({"namespace": "docs", "documents": [{"id": "1", "fields": [
+        {"name": "title", "field_type": "Text", "value": "hello"}]}]})
+    .to_string();
+    let index = |tenant: &str| {
+        route(
+            "POST /index HTTP/1.1\r\n",
+            &headers,
+            body.as_bytes(),
+            tenant,
+            &state,
+        )
+    };
+    auth::with_legacy_policy(false, "b", || {
+        let refused = index("a");
+        assert_eq!(status_of(&refused), 410, "{refused}");
+        let refused = body_of(&refused);
+        assert_eq!(refused["code"], "legacy_route_disabled");
+        assert_eq!(
+            refused["details"]["replacement"],
+            "POST /v1/namespaces/{namespace}/documents"
+        );
+        let served = index("b");
+        assert_eq!(status_of(&served), 200, "{served}");
+        assert!(header_of(&served, "deprecation").is_some(), "{served}");
+        let v1 = route(
+            "POST /v1/namespaces/docs/documents HTTP/1.1\r\n",
+            &headers,
+            serde_json::json!({"documents": [{"id": "2", "fields": [
+                {"name": "title", "field_type": "Text", "value": "hi"}]}]})
+            .to_string()
+            .as_bytes(),
+            "a",
+            &state,
+        );
+        assert_eq!(status_of(&v1), 200, "{v1}");
+    });
+    auth::with_legacy_policy(false, "", || {
+        assert_eq!(status_of(&index("a")), 410);
+        assert_eq!(status_of(&index("b")), 410);
+    });
+    // Back to the process default (on): served again.
+    assert_eq!(status_of(&index("a")), 200);
+}
+
+/// A missing namespace is `namespace_not_found` on every route, delete
+/// included (ADR-350 §b).
+#[test]
+fn deleting_a_missing_namespace_is_namespace_not_found() {
+    let state = AppState::new(tests::test_dir());
+    let response = route(
+        "DELETE /v1/namespaces/nope HTTP/1.1\r\n",
+        &HashMap::new(),
+        b"",
+        "acme",
+        &state,
+    );
+    assert_eq!(status_of(&response), 404, "{response}");
+    let body = body_of(&response);
+    assert_eq!(body["code"], "namespace_not_found", "{response}");
+    assert_eq!(body["details"]["namespace"], "nope");
+    assert_eq!(body["error"], "namespace 'nope' not found");
+}
+
+/// Every operation in both documents lists the codes it can return
+/// (`x-kosha-error-codes`, for typed SDK errors), and each is a real code.
+#[test]
+fn every_operation_lists_its_error_codes() {
+    let known: BTreeSet<&str> = api_error::ErrorCode::ALL
+        .iter()
+        .map(|c| c.as_str())
+        .collect();
+    for spec in [PUBLIC_SPEC, ADMIN_SPEC] {
+        let doc: serde_json::Value = serde_json::from_str(spec).unwrap();
+        for (path, item) in doc["paths"].as_object().unwrap() {
+            for (method, op) in item.as_object().unwrap() {
+                if !["get", "post", "put", "patch", "delete"].contains(&method.as_str()) {
+                    continue;
+                }
+                let codes = op["x-kosha-error-codes"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{method} {path} has no x-kosha-error-codes"));
+                for code in codes {
+                    let code = code.as_str().unwrap();
+                    assert!(known.contains(code), "{method} {path}: unknown code {code}");
+                }
+            }
+        }
+    }
+}
+
 /// While a legacy route is served it says it is going away, and the
 /// cutover is counted; a /v1 response carries no deprecation headers.
 #[test]

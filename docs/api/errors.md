@@ -52,7 +52,7 @@ Every response, success or error, carries `X-Request-Id` and `Kosha-Api-Version`
 | `tenant_concurrency_exceeded` | 429 | yes | The tenant's concurrent query limit. |
 | `tenant_write_rate_exceeded` | 429 | yes | The tenant's write rate limit. |
 | `tenant_queue_full` | 429 | yes | The tenant's share of the search queue is full. |
-| `overloaded` | 429 | yes | The pod shed the request (scoring queue, memory, hydration); `details.reason` says which. |
+| `overloaded` | 429 | yes | The pod shed the request (scoring queue, memory, hydration, unindexed backlog); `details.reason` says which. |
 | `internal` | 500 | no | An unexpected server error. Quote `request_id` when reporting it. |
 | `not_implemented` | 501 | no | This server was built or configured without the feature (an embedding provider, s3, postgres). |
 | `upstream_error` | 502 | yes | A provider the server called (embedding, rerank) failed. |

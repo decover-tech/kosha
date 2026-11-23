@@ -462,6 +462,19 @@ class Suite:
             status, out = pa.raw("POST", "/search", dict(match_all, namespace=ns))  # legacy-route-ok
             got = sorted(h["doc_id"] for h in out.get("results", [])) if status == 200 else None
             self.record("g.legacy-search-own@%s" % p, got == a_ids, "HTTP %s, got %s" % (status, got))
+            # The overlay turns legacy routes off and allowlists tenant-a
+            # only (KOSHA_LEGACY_ROUTES_TENANTS): tenant-b is refused with a
+            # 410 naming the /v1 replacement, and its /v1 search still works.
+            status, out = pb.raw("POST", "/search", dict(match_all, namespace=ns))  # legacy-route-ok
+            self.record(
+                "g.legacy-off-not-allowlisted@%s" % p,
+                status == 410 and out.get("code") == "legacy_route_disabled"
+                and "/v1/namespaces/" in json.dumps(out.get("details", {})),
+                "HTTP %s %s" % (status, json.dumps(out)[:200]),
+            )
+            status, out = pb.raw("POST", "/index", {"namespace": ns, "documents": [tdoc("x", 0)]})  # legacy-route-ok
+            self.record("g.legacy-off-index@%s" % p, status == 410, "HTTP %s %s" % (status, json.dumps(out)[:200]))
+            self.record("g.legacy-off-v1-works@%s" % p, ids_of(pb) == b_ids, "B sees %s" % ids_of(pb))
 
         # A wipes its own namespace through the legacy route on the query
         # pod (forwarded); B's same-named namespace is untouched.
@@ -559,7 +572,7 @@ def self_test() -> int:
 
         def do_GET(self):
             counters[self.path] = counters.get(self.path, 0) + 1
-            if self.path == "/readyz":
+            if self.path == "/v1/readyz":
                 return self._send(200 if counters[self.path] > 2 else 503, {})
             self._send(404, {"error": "not found"})
 
@@ -593,7 +606,7 @@ def self_test() -> int:
     check("4xx returned, not retried", status == 403 and counters["/forbidden"] == 1)
     check("raw() does not retry", pod.raw("POST", "/flaky", {})[0] == 200 and counters["/flaky"] == 4)
     pod.wait_healthy(timeout=10)
-    check("wait_healthy polls /readyz", counters["/readyz"] == 3)
+    check("wait_healthy polls /v1/readyz", counters["/v1/readyz"] == 3)
     hits = pod.fetch_hits({"match_all": {}}, page=5)
     check("fetch_hits pages to the end", [h["doc_id"] for h in hits] == hits_db, len(hits))
     check("total()", pod.total({"match_all": {}}) == (200, 23))

@@ -1372,7 +1372,7 @@
   "info": {
     "description": "The public Kosha HTTP/JSON API. The OpenAPI document is the wire contract; proto3 canonical JSON is not (see docs/api/versioning.md). Every request carries a tenant API key (`Authorization: Bearer <key>` or `X-Api-Key: <key>`), and every namespace in a path is relative to that key's tenant.",
     "title": "Kosha API",
-    "version": "0.10.0"
+    "version": "1.0.0"
   },
   "openapi": "3.0.3",
   "paths": {
@@ -1450,6 +1450,24 @@
             },
             "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "409": {
             "content": {
               "application/json": {
@@ -1458,7 +1476,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict, write_conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -1498,6 +1524,34 @@
             },
             "description": "internal"
           },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "503": {
             "content": {
               "application/json": {
@@ -1520,6 +1574,20 @@
         "summary": "The caller's plan, month-to-date charges and invoices (issue #349).\n404 when billing is off or no plan applies.",
         "tags": [
           "KoshaService"
+        ],
+        "x-kosha-error-codes": [
+          "internal",
+          "invalid_argument",
+          "method_not_allowed",
+          "overloaded",
+          "payload_too_large",
+          "permission_denied",
+          "request_timeout",
+          "tenant_concurrency_exceeded",
+          "tenant_qps_exceeded",
+          "tenant_queue_full",
+          "unauthenticated",
+          "unavailable"
         ],
         "x-stability-level": "beta"
       }
@@ -1598,6 +1666,24 @@
             },
             "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "409": {
             "content": {
               "application/json": {
@@ -1606,7 +1692,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict, write_conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -1646,6 +1740,34 @@
             },
             "description": "internal"
           },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "503": {
             "content": {
               "application/json": {
@@ -1669,6 +1791,9 @@
         "summary": "Liveness. Answered before authentication. SDKs use it as `ping`.",
         "tags": [
           "KoshaService"
+        ],
+        "x-kosha-error-codes": [
+          "unavailable"
         ],
         "x-stability-level": "stable"
       }
@@ -1747,6 +1872,24 @@
             },
             "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "409": {
             "content": {
               "application/json": {
@@ -1755,7 +1898,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict, write_conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -1795,6 +1946,34 @@
             },
             "description": "internal"
           },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "503": {
             "content": {
               "application/json": {
@@ -1817,6 +1996,20 @@
         "summary": "The caller's namespaces (issue #214). Shard and other internal\nnamespaces are left out.",
         "tags": [
           "KoshaService"
+        ],
+        "x-kosha-error-codes": [
+          "internal",
+          "invalid_argument",
+          "method_not_allowed",
+          "overloaded",
+          "payload_too_large",
+          "permission_denied",
+          "request_timeout",
+          "tenant_concurrency_exceeded",
+          "tenant_qps_exceeded",
+          "tenant_queue_full",
+          "unauthenticated",
+          "unavailable"
         ],
         "x-stability-level": "stable"
       },
@@ -1904,6 +2097,24 @@
             },
             "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "409": {
             "content": {
               "application/json": {
@@ -1912,7 +2123,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict, write_conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -1952,6 +2171,34 @@
             },
             "description": "internal"
           },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "503": {
             "content": {
               "application/json": {
@@ -1974,6 +2221,23 @@
         "summary": "Create a namespace with an optional schema.",
         "tags": [
           "KoshaService"
+        ],
+        "x-kosha-error-codes": [
+          "already_exists",
+          "internal",
+          "invalid_argument",
+          "method_not_allowed",
+          "namespace_quota_exceeded",
+          "overloaded",
+          "payload_too_large",
+          "payment_required",
+          "permission_denied",
+          "request_timeout",
+          "tenant_concurrency_exceeded",
+          "tenant_qps_exceeded",
+          "tenant_queue_full",
+          "unauthenticated",
+          "unavailable"
         ],
         "x-stability-level": "stable"
       }
@@ -2062,6 +2326,24 @@
             },
             "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "409": {
             "content": {
               "application/json": {
@@ -2070,7 +2352,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict, write_conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -2110,6 +2400,34 @@
             },
             "description": "internal"
           },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "503": {
             "content": {
               "application/json": {
@@ -2132,6 +2450,23 @@
         "summary": "Delete a namespace and its segments. Permanent; a re-created namespace\nof the same name starts empty.",
         "tags": [
           "KoshaService"
+        ],
+        "x-kosha-error-codes": [
+          "conflict",
+          "internal",
+          "invalid_argument",
+          "method_not_allowed",
+          "namespace_not_found",
+          "overloaded",
+          "payload_too_large",
+          "permission_denied",
+          "request_timeout",
+          "tenant_concurrency_exceeded",
+          "tenant_qps_exceeded",
+          "tenant_queue_full",
+          "unauthenticated",
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "stable"
       }
@@ -2220,6 +2555,24 @@
             },
             "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "409": {
             "content": {
               "application/json": {
@@ -2228,7 +2581,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict, write_conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -2268,6 +2629,34 @@
             },
             "description": "internal"
           },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "503": {
             "content": {
               "application/json": {
@@ -2290,6 +2679,24 @@
         "summary": "Delete a branch. Reclaims only objects in the branch's own prefix that\nno remaining manifest references. Fails (409) for a namespace that is\nnot a branch.",
         "tags": [
           "KoshaService"
+        ],
+        "x-kosha-error-codes": [
+          "conflict",
+          "internal",
+          "invalid_argument",
+          "method_not_allowed",
+          "namespace_not_found",
+          "not_found",
+          "overloaded",
+          "payload_too_large",
+          "permission_denied",
+          "request_timeout",
+          "tenant_concurrency_exceeded",
+          "tenant_qps_exceeded",
+          "tenant_queue_full",
+          "unauthenticated",
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       },
@@ -2388,6 +2795,24 @@
             },
             "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "409": {
             "content": {
               "application/json": {
@@ -2396,7 +2821,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict, write_conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -2436,6 +2869,34 @@
             },
             "description": "internal"
           },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "503": {
             "content": {
               "application/json": {
@@ -2458,6 +2919,25 @@
         "summary": "Branch a namespace (issue #208): a new namespace whose manifest lists\nthe parent's segments in place (copy-on-write, no data copied).",
         "tags": [
           "KoshaService"
+        ],
+        "x-kosha-error-codes": [
+          "already_exists",
+          "internal",
+          "invalid_argument",
+          "method_not_allowed",
+          "namespace_not_found",
+          "namespace_quota_exceeded",
+          "not_found",
+          "overloaded",
+          "payload_too_large",
+          "permission_denied",
+          "request_timeout",
+          "tenant_concurrency_exceeded",
+          "tenant_qps_exceeded",
+          "tenant_queue_full",
+          "unauthenticated",
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -2546,6 +3026,24 @@
             },
             "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "409": {
             "content": {
               "application/json": {
@@ -2554,7 +3052,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict, write_conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -2594,6 +3100,34 @@
             },
             "description": "internal"
           },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "503": {
             "content": {
               "application/json": {
@@ -2615,6 +3149,21 @@
         },
         "tags": [
           "KoshaService"
+        ],
+        "x-kosha-error-codes": [
+          "internal",
+          "invalid_argument",
+          "method_not_allowed",
+          "namespace_not_found",
+          "overloaded",
+          "payload_too_large",
+          "permission_denied",
+          "request_timeout",
+          "tenant_concurrency_exceeded",
+          "tenant_qps_exceeded",
+          "tenant_queue_full",
+          "unauthenticated",
+          "unavailable"
         ],
         "x-stability-level": "beta"
       }
@@ -2714,6 +3263,24 @@
             },
             "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "409": {
             "content": {
               "application/json": {
@@ -2722,7 +3289,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict, write_conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -2762,6 +3337,34 @@
             },
             "description": "internal"
           },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "503": {
             "content": {
               "application/json": {
@@ -2784,6 +3387,25 @@
         "summary": "Delete the documents matching a filter (tombstones).",
         "tags": [
           "KoshaService"
+        ],
+        "x-kosha-error-codes": [
+          "internal",
+          "invalid_argument",
+          "invalid_query",
+          "method_not_allowed",
+          "namespace_not_found",
+          "overloaded",
+          "payload_too_large",
+          "payment_required",
+          "permission_denied",
+          "request_timeout",
+          "tenant_concurrency_exceeded",
+          "tenant_qps_exceeded",
+          "tenant_queue_full",
+          "tenant_write_rate_exceeded",
+          "unauthenticated",
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "stable"
       }
@@ -2883,6 +3505,24 @@
             },
             "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "409": {
             "content": {
               "application/json": {
@@ -2891,7 +3531,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict, write_conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -2931,6 +3579,34 @@
             },
             "description": "internal"
           },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "503": {
             "content": {
               "application/json": {
@@ -2953,6 +3629,28 @@
         "summary": "Index documents: each one is inserted, or replaces the stored document\nwith the same id in full.",
         "tags": [
           "KoshaService"
+        ],
+        "x-kosha-error-codes": [
+          "doc_quota_exceeded",
+          "internal",
+          "invalid_argument",
+          "method_not_allowed",
+          "namespace_not_found",
+          "not_implemented",
+          "overloaded",
+          "payload_too_large",
+          "payment_required",
+          "permission_denied",
+          "request_timeout",
+          "tenant_concurrency_exceeded",
+          "tenant_qps_exceeded",
+          "tenant_queue_full",
+          "tenant_write_rate_exceeded",
+          "unauthenticated",
+          "unavailable",
+          "upstream_error",
+          "vector_dims_exceeded",
+          "write_conflict"
         ],
         "x-stability-level": "stable"
       }
@@ -3052,6 +3750,24 @@
             },
             "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "409": {
             "content": {
               "application/json": {
@@ -3060,7 +3776,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict, write_conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -3100,6 +3824,34 @@
             },
             "description": "internal"
           },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "503": {
             "content": {
               "application/json": {
@@ -3122,6 +3874,21 @@
         "summary": "Which of the given document ids the namespace holds.",
         "tags": [
           "KoshaService"
+        ],
+        "x-kosha-error-codes": [
+          "internal",
+          "invalid_argument",
+          "method_not_allowed",
+          "namespace_not_found",
+          "overloaded",
+          "payload_too_large",
+          "permission_denied",
+          "request_timeout",
+          "tenant_concurrency_exceeded",
+          "tenant_qps_exceeded",
+          "tenant_queue_full",
+          "unauthenticated",
+          "unavailable"
         ],
         "x-stability-level": "stable"
       }
@@ -3221,6 +3988,24 @@
             },
             "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "409": {
             "content": {
               "application/json": {
@@ -3229,7 +4014,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict, write_conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -3269,6 +4062,34 @@
             },
             "description": "internal"
           },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "503": {
             "content": {
               "application/json": {
@@ -3291,6 +4112,24 @@
         "summary": "Flush buffered documents to a segment.",
         "tags": [
           "KoshaService"
+        ],
+        "x-kosha-error-codes": [
+          "internal",
+          "invalid_argument",
+          "method_not_allowed",
+          "namespace_not_found",
+          "overloaded",
+          "payload_too_large",
+          "payment_required",
+          "permission_denied",
+          "request_timeout",
+          "tenant_concurrency_exceeded",
+          "tenant_qps_exceeded",
+          "tenant_queue_full",
+          "tenant_write_rate_exceeded",
+          "unauthenticated",
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "stable"
       }
@@ -3390,6 +4229,24 @@
             },
             "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "409": {
             "content": {
               "application/json": {
@@ -3398,7 +4255,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict, write_conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -3438,6 +4303,34 @@
             },
             "description": "internal"
           },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "503": {
             "content": {
               "application/json": {
@@ -3460,6 +4353,28 @@
         "summary": "Replace documents by id, merging a partial document onto the latest\nstored copy (OpenSearch `_update` semantics): fields the request names\nare replaced, fields it omits are kept. A document whose id is not\nstored yet is inserted as given.",
         "tags": [
           "KoshaService"
+        ],
+        "x-kosha-error-codes": [
+          "doc_quota_exceeded",
+          "internal",
+          "invalid_argument",
+          "method_not_allowed",
+          "namespace_not_found",
+          "not_implemented",
+          "overloaded",
+          "payload_too_large",
+          "payment_required",
+          "permission_denied",
+          "request_timeout",
+          "tenant_concurrency_exceeded",
+          "tenant_qps_exceeded",
+          "tenant_queue_full",
+          "tenant_write_rate_exceeded",
+          "unauthenticated",
+          "unavailable",
+          "upstream_error",
+          "vector_dims_exceeded",
+          "write_conflict"
         ],
         "x-stability-level": "stable"
       }
@@ -3548,6 +4463,24 @@
             },
             "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "409": {
             "content": {
               "application/json": {
@@ -3556,7 +4489,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict, write_conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -3596,6 +4537,34 @@
             },
             "description": "internal"
           },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "503": {
             "content": {
               "application/json": {
@@ -3617,6 +4586,21 @@
         },
         "tags": [
           "KoshaService"
+        ],
+        "x-kosha-error-codes": [
+          "internal",
+          "invalid_argument",
+          "method_not_allowed",
+          "namespace_not_found",
+          "overloaded",
+          "payload_too_large",
+          "permission_denied",
+          "request_timeout",
+          "tenant_concurrency_exceeded",
+          "tenant_qps_exceeded",
+          "tenant_queue_full",
+          "unauthenticated",
+          "unavailable"
         ],
         "x-stability-level": "stable"
       },
@@ -3715,6 +4699,24 @@
             },
             "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "409": {
             "content": {
               "application/json": {
@@ -3723,7 +4725,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict, write_conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -3763,6 +4773,34 @@
             },
             "description": "internal"
           },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "503": {
             "content": {
               "application/json": {
@@ -3785,6 +4823,25 @@
         "summary": "Set a namespace's schema (issue #220): per-field analyzers for segments\nwritten from now on. Existing segments keep the analysis recorded in\ntheir footers and stay searchable with it.",
         "tags": [
           "KoshaService"
+        ],
+        "x-kosha-error-codes": [
+          "conflict",
+          "internal",
+          "invalid_argument",
+          "method_not_allowed",
+          "namespace_not_found",
+          "overloaded",
+          "payload_too_large",
+          "payment_required",
+          "permission_denied",
+          "request_timeout",
+          "tenant_concurrency_exceeded",
+          "tenant_qps_exceeded",
+          "tenant_queue_full",
+          "tenant_write_rate_exceeded",
+          "unauthenticated",
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "stable"
       }
@@ -3884,6 +4941,24 @@
             },
             "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "409": {
             "content": {
               "application/json": {
@@ -3892,7 +4967,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict, write_conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -3932,6 +5015,34 @@
             },
             "description": "internal"
           },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "503": {
             "content": {
               "application/json": {
@@ -3954,6 +5065,24 @@
         "summary": "Search: BM25 lexical, kNN, or hybrid (RRF) retrieval with filters,\nsorting, aggregations, highlighting, score modifiers and reranking.",
         "tags": [
           "KoshaService"
+        ],
+        "x-kosha-error-codes": [
+          "internal",
+          "invalid_argument",
+          "invalid_query",
+          "method_not_allowed",
+          "namespace_not_found",
+          "not_implemented",
+          "overloaded",
+          "payload_too_large",
+          "permission_denied",
+          "request_timeout",
+          "tenant_concurrency_exceeded",
+          "tenant_qps_exceeded",
+          "tenant_queue_full",
+          "unauthenticated",
+          "unavailable",
+          "upstream_error"
         ],
         "x-stability-level": "stable"
       }
@@ -4053,6 +5182,24 @@
             },
             "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "409": {
             "content": {
               "application/json": {
@@ -4061,7 +5208,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict, write_conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -4101,6 +5256,34 @@
             },
             "description": "internal"
           },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "503": {
             "content": {
               "application/json": {
@@ -4123,6 +5306,25 @@
         "summary": "Set the shard count of a new, empty namespace (issue #207).",
         "tags": [
           "KoshaService"
+        ],
+        "x-kosha-error-codes": [
+          "conflict",
+          "internal",
+          "invalid_argument",
+          "method_not_allowed",
+          "namespace_not_found",
+          "overloaded",
+          "payload_too_large",
+          "payment_required",
+          "permission_denied",
+          "request_timeout",
+          "tenant_concurrency_exceeded",
+          "tenant_qps_exceeded",
+          "tenant_queue_full",
+          "tenant_write_rate_exceeded",
+          "unauthenticated",
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -4211,6 +5413,24 @@
             },
             "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "409": {
             "content": {
               "application/json": {
@@ -4219,7 +5439,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict, write_conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -4259,6 +5487,34 @@
             },
             "description": "internal"
           },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "503": {
             "content": {
               "application/json": {
@@ -4281,6 +5537,21 @@
         "summary": "One namespace's statistics.",
         "tags": [
           "KoshaService"
+        ],
+        "x-kosha-error-codes": [
+          "internal",
+          "invalid_argument",
+          "method_not_allowed",
+          "namespace_not_found",
+          "overloaded",
+          "payload_too_large",
+          "permission_denied",
+          "request_timeout",
+          "tenant_concurrency_exceeded",
+          "tenant_qps_exceeded",
+          "tenant_queue_full",
+          "unauthenticated",
+          "unavailable"
         ],
         "x-stability-level": "stable"
       }
@@ -4379,6 +5650,24 @@
             },
             "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "409": {
             "content": {
               "application/json": {
@@ -4387,7 +5676,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict, write_conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -4427,6 +5724,34 @@
             },
             "description": "internal"
           },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "503": {
             "content": {
               "application/json": {
@@ -4449,6 +5774,20 @@
         "summary": "The caller's metered usage (issue #348). 404 when metering is off.",
         "tags": [
           "KoshaService"
+        ],
+        "x-kosha-error-codes": [
+          "internal",
+          "invalid_argument",
+          "method_not_allowed",
+          "overloaded",
+          "payload_too_large",
+          "permission_denied",
+          "request_timeout",
+          "tenant_concurrency_exceeded",
+          "tenant_qps_exceeded",
+          "tenant_queue_full",
+          "unauthenticated",
+          "unavailable"
         ],
         "x-stability-level": "beta"
       }

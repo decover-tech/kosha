@@ -13,10 +13,10 @@ option java_package = "com.decover.kosha.v1";
 option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_swagger) = {
   info: {
     title: "Kosha API"
-    // The contract revision (ADR-350 §a): 1.MINOR.PATCH once v1 is GA, 0.9.x
-    // until then. Independent of the crate version; kept equal to
-    // `api_error::API_VERSION` by a test.
-    version: "0.10.0"
+    // The contract revision (ADR-350 §a): 1.MINOR.PATCH now that v1 is GA
+    // (0.9.x and 0.10.x were pre-GA). Independent of the crate version; kept
+    // equal to `api_error::API_VERSION` by a test.
+    version: "1.0.0"
     description:
       "The public Kosha HTTP/JSON API. The OpenAPI document is the wire contract; "
       "proto3 canonical JSON is not (see docs/api/versioning.md). Every request carries "
@@ -99,10 +99,31 @@ option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_swagger) = {
     }
   }
   responses: {
+    key: "408"
+    value: {
+      description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+      schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+      headers: {
+        key: "Retry-After"
+        value: {
+          type: "integer"
+          description: "Seconds to wait before retrying."
+        }
+      }
+    }
+  }
+  responses: {
     key: "409"
     value: {
-      description: "already_exists, conflict, write_conflict"
+      description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
       schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+      headers: {
+        key: "Retry-After"
+        value: {
+          type: "integer"
+          description: "Seconds to wait before retrying; sent with write_conflict only."
+        }
+      }
     }
   }
   responses: {
@@ -131,6 +152,27 @@ option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_swagger) = {
     value: {
       description: "internal"
       schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+    }
+  }
+  responses: {
+    key: "501"
+    value: {
+      description: "not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable"
+      schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+    }
+  }
+  responses: {
+    key: "502"
+    value: {
+      description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+      schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+      headers: {
+        key: "Retry-After"
+        value: {
+          type: "integer"
+          description: "Seconds to wait before retrying."
+        }
+      }
     }
   }
   responses: {
@@ -199,6 +241,52 @@ service KoshaService {
           }
         }
       }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "unavailable"}]}}
+      }
       extensions: {
         key: "x-stability-level"
         value: {string_value: "stable"}
@@ -241,6 +329,52 @@ service KoshaService {
           }
         }
       }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "namespace_quota_exceeded"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "payment_required"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
       extensions: {
         key: "x-stability-level"
         value: {string_value: "stable"}
@@ -281,6 +415,52 @@ service KoshaService {
           }
         }
       }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
       extensions: {
         key: "x-stability-level"
         value: {string_value: "stable"}
@@ -320,6 +500,52 @@ service KoshaService {
             }
           }
         }
+      }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "namespace_not_found"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}, {string_value: "write_conflict"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -363,6 +589,52 @@ service KoshaService {
             }
           }
         }
+      }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "doc_quota_exceeded"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "namespace_not_found"}, {string_value: "not_implemented"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "payment_required"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "tenant_write_rate_exceeded"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}, {string_value: "upstream_error"}, {string_value: "vector_dims_exceeded"}, {string_value: "write_conflict"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -409,6 +681,52 @@ service KoshaService {
           }
         }
       }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "doc_quota_exceeded"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "namespace_not_found"}, {string_value: "not_implemented"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "payment_required"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "tenant_write_rate_exceeded"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}, {string_value: "upstream_error"}, {string_value: "vector_dims_exceeded"}, {string_value: "write_conflict"}]}}
+      }
       extensions: {
         key: "x-stability-level"
         value: {string_value: "stable"}
@@ -452,6 +770,52 @@ service KoshaService {
           }
         }
       }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "invalid_query"}, {string_value: "method_not_allowed"}, {string_value: "namespace_not_found"}, {string_value: "not_implemented"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}, {string_value: "upstream_error"}]}}
+      }
       extensions: {
         key: "x-stability-level"
         value: {string_value: "stable"}
@@ -493,6 +857,52 @@ service KoshaService {
             }
           }
         }
+      }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "namespace_not_found"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -536,6 +946,52 @@ service KoshaService {
           }
         }
       }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "namespace_not_found"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "payment_required"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "tenant_write_rate_exceeded"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}, {string_value: "write_conflict"}]}}
+      }
       extensions: {
         key: "x-stability-level"
         value: {string_value: "stable"}
@@ -578,6 +1034,52 @@ service KoshaService {
           }
         }
       }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "invalid_query"}, {string_value: "method_not_allowed"}, {string_value: "namespace_not_found"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "payment_required"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "tenant_write_rate_exceeded"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}, {string_value: "write_conflict"}]}}
+      }
       extensions: {
         key: "x-stability-level"
         value: {string_value: "stable"}
@@ -616,6 +1118,52 @@ service KoshaService {
             }
           }
         }
+      }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "namespace_not_found"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -661,6 +1209,52 @@ service KoshaService {
           }
         }
       }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "namespace_not_found"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "payment_required"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "tenant_write_rate_exceeded"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}, {string_value: "write_conflict"}]}}
+      }
       extensions: {
         key: "x-stability-level"
         value: {string_value: "stable"}
@@ -698,6 +1292,52 @@ service KoshaService {
             }
           }
         }
+      }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "namespace_not_found"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -740,6 +1380,52 @@ service KoshaService {
             }
           }
         }
+      }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "namespace_not_found"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "payment_required"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "tenant_write_rate_exceeded"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}, {string_value: "write_conflict"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -784,6 +1470,52 @@ service KoshaService {
           }
         }
       }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "namespace_not_found"}, {string_value: "namespace_quota_exceeded"}, {string_value: "not_found"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}, {string_value: "write_conflict"}]}}
+      }
       extensions: {
         key: "x-stability-level"
         value: {string_value: "beta"}
@@ -821,6 +1553,52 @@ service KoshaService {
             }
           }
         }
+      }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "namespace_not_found"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -863,6 +1641,52 @@ service KoshaService {
           }
         }
       }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "namespace_not_found"}, {string_value: "not_found"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}, {string_value: "write_conflict"}]}}
+      }
       extensions: {
         key: "x-stability-level"
         value: {string_value: "beta"}
@@ -901,6 +1725,52 @@ service KoshaService {
             }
           }
         }
+      }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"
@@ -941,6 +1811,52 @@ service KoshaService {
             }
           }
         }
+      }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
       }
       extensions: {
         key: "x-stability-level"

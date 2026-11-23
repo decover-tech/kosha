@@ -185,12 +185,30 @@ class KoshaClient:
         action = self._V1_ACTIONS.get(path)
         if action is None:
             return self._transport.request(method, path, body, headers)
+        legacy_body = body
         body = dict(body or {})
         namespace = body.pop("namespace", None)
         if not namespace:
             raise ValueError("%s needs a namespace" % path)
+        if path == "replace" and getattr(self, "_legacy_replace", False):
+            return self._transport.request(method, "replace", legacy_body, headers)
         target = "v1/namespaces/%s/%s" % (urllib.parse.quote(str(namespace), safe=""), action)
-        return self._transport.request(method, target, body, headers)
+        try:
+            return self._transport.request(method, target, body, headers)
+        except KoshaRequestError as e:
+            # `POST /v1/namespaces/{ns}/replace` is new in contract 0.9.0.
+            # An older server answers it with a bare 404 (no `code`: only
+            # servers with the error model send one), so partial updates go
+            # to its legacy `/replace`, which it still serves. A current
+            # server's 404 here is `namespace_not_found` and is raised.
+            if path != "replace" or e.status_code != 404 or e.code is not None:
+                raise
+            logger.warning(
+                "kosha server has no /v1/namespaces/{ns}/replace (older than API 0.9.0); "
+                "falling back to the deprecated POST /replace. Upgrade the server."
+            )
+            self._legacy_replace = True
+            return self._transport.request(method, "replace", legacy_body, headers)
 
     def _v1_request(
         self, method: str, namespace: str, action: str, body: Any = None

@@ -53,6 +53,57 @@ INT64 = (
 )
 
 
+# The file-level error responses: (status, description, sends Retry-After).
+ADMIN_RESPONSES = (
+        ("400", "invalid_argument", False),
+        ("401", "unauthenticated", False),
+        ("403", "permission_denied", False),
+        ("404", "not_found", False),
+        ("405", "method_not_allowed", False),
+        (
+            "408",
+            "request_timeout: the request body did not arrive in time; "
+            "retry after `Retry-After` seconds",
+            True,
+        ),
+        ("409", "already_exists, conflict", False),
+        ("413", "payload_too_large", False),
+        ("500", "internal", False),
+        (
+            "501",
+            "not_implemented: this server was built or configured without the "
+            "feature (an embedding provider, s3, postgres); not retryable",
+            False,
+        ),
+        ("503", "unavailable; retry after `Retry-After` seconds", True),
+)
+
+
+def _retry_response(status, doc):
+    return (
+        "      responses: {\n"
+        '        key: "%s"\n'
+        "        value: {\n"
+        '          description: "%s"\n'
+        '          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}\n'
+        "          headers: {\n"
+        '            key: "Retry-After"\n'
+        "            value: {\n"
+        '              type: "integer"\n'
+        '              description: "Seconds to wait before retrying."\n'
+        "            }\n"
+        "          }\n"
+        "        }\n"
+        "      }\n"
+    ) % (status, doc)
+
+
+# The per-operation copies of the responses that carry Retry-After.
+RETRY_RESPONSES = "".join(
+    _retry_response(status, doc) for status, doc, retry in ADMIN_RESPONSES if retry
+)
+
+
 def swagger_option():
     """The file-level openapiv2 option: the admin document's info, security
     and shared error responses. The version is kosha.proto's, so both
@@ -92,16 +143,7 @@ def swagger_option():
     lines.append("  }")
     for key in ("BearerAuth", "ApiKeyAuth"):
         lines += ["  security: {", '    security_requirement: {key: "%s"}' % key, "  }"]
-    for status, doc, retry in (
-        ("400", "invalid_argument", False),
-        ("401", "unauthenticated", False),
-        ("403", "permission_denied", False),
-        ("404", "not_found", False),
-        ("405", "method_not_allowed", False),
-        ("409", "already_exists, conflict", False),
-        ("500", "internal", False),
-        ("503", "unavailable; retry after `Retry-After` seconds", True),
-    ):
+    for status, doc, retry in ADMIN_RESPONSES:
         lines += [
             "  responses: {",
             '    key: "%s"' % status,
@@ -122,6 +164,26 @@ def swagger_option():
         lines += ["    }", "  }"]
     lines.append("};")
     return lines
+
+
+# The codes an admin operation can return (`x-kosha-error-codes`, for typed
+# SDK errors). The admin API is beta, so one superset serves every
+# operation; the public spec lists codes per operation.
+ADMIN_ERROR_CODES = (
+    "already_exists",
+    "conflict",
+    "internal",
+    "invalid_argument",
+    "method_not_allowed",
+    "not_found",
+    "not_implemented",
+    "payload_too_large",
+    "permission_denied",
+    "request_timeout",
+    "unauthenticated",
+    "unavailable",
+)
+ADMIN_ERROR_CODES_TEXT = ", ".join('{string_value: "%s"}' % c for c in ADMIN_ERROR_CODES)
 
 
 def render():
@@ -184,20 +246,12 @@ def render():
         out.append(
             "    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {\n"
             # Per operation: the generator drops headers of file-level
-            # responses (grpc-gateway v2.24.0).
-            "      responses: {\n"
-            '        key: "503"\n'
-            "        value: {\n"
-            '          description: "unavailable; retry after `Retry-After` seconds"\n'
-            '          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}\n'
-            "          headers: {\n"
-            '            key: "Retry-After"\n'
-            "            value: {\n"
-            '              type: "integer"\n'
-            '              description: "Seconds to wait before retrying."\n'
-            "            }\n"
-            "          }\n"
-            "        }\n"
+            # responses (grpc-gateway v2.24.0), so every retryable status
+            # is repeated here with its Retry-After.
+            + RETRY_RESPONSES
+            + "      extensions: {\n"
+            '        key: "x-kosha-error-codes"\n'
+            "        value: {list_value: {values: [" + ADMIN_ERROR_CODES_TEXT + "]}}\n"
             "      }\n"
             "      extensions: {\n"
             '        key: "x-stability-level"\n'

@@ -230,7 +230,13 @@ func lintFile(path string, public bool) error {
 			if op.Responses == nil {
 				continue
 			}
-			for _, status := range []string{"429", "503"} {
+			// Statuses whose codes are retryable carry Retry-After; in the
+			// public spec 409 does too (write_conflict).
+			retryStatuses := []string{"408", "429", "502", "503"}
+			if public {
+				retryStatuses = append(retryStatuses, "409")
+			}
+			for _, status := range retryStatuses {
 				response := op.Responses.Value(status)
 				if response == nil || response.Value == nil {
 					continue

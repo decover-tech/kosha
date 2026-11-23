@@ -297,11 +297,11 @@ impl AppState {
                     record,
                 )
             }
+            // The same code every other route gives a missing namespace
+            // (ADR-350 §b), so an SDK's `namespace_not_found` branch fires
+            // on delete too.
             Err(KoshaError::NamespaceNotFound(_)) => {
-                return Err(api_error(
-                    ErrorCode::NotFound,
-                    &format!("namespace '{name}' not found"),
-                ));
+                return Err(crate::namespace_not_found(name));
             }
             Err(e) => {
                 return Err(api_error(
