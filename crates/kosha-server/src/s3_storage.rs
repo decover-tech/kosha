@@ -1112,7 +1112,7 @@ impl S3Storage {
         })?;
 
         if let Some(parent) = local_path.parent() {
-            std::fs::create_dir_all(parent).ok();
+            kosha_core::create_dir_named(parent)?;
         }
         std::fs::write(local_path, &data).map_err(KoshaError::Io)?;
 
@@ -1711,7 +1711,9 @@ async fn fetch_one(
     let s3_key = join_s3_key(prefix, path);
 
     if let Some(parent) = local_path.parent() {
-        tokio::fs::create_dir_all(parent).await.ok();
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| kosha_core::dir_error(parent, e))?;
     }
     // Write to a uniquely-named temp file and atomically rename into place:
     // readers must never observe a created-but-unwritten or partially

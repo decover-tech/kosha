@@ -324,9 +324,7 @@ impl Cache {
         options: CacheOptions,
         shares: TenantShares,
     ) -> Self {
-        if let Err(e) = std::fs::create_dir_all(&cache_dir) {
-            eprintln!("ERROR: cannot create {}: {e}", cache_dir.display());
-        }
+        kosha_core::create_dir_named(&cache_dir).unwrap_or_else(|e| panic!("disk cache: {e}"));
         let (recency, sizes) = Self::scan_existing(&cache_dir);
         let mut tracked = Tracked::default();
         let mut total_bytes = 0u64;
@@ -664,7 +662,7 @@ impl Cache {
             println!(
                 "disk cache {}: size_mb={:.1} max_mb={:.1} pinned_keys={}",
                 if over {
-                    "over budget, every remaining file is pinned by in-flight work"
+                    "over budget, nothing evictable"
                 } else {
                     "back within budget"
                 },
