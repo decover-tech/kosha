@@ -249,8 +249,9 @@ pub struct Cache {
     /// Eviction bound in bytes. `None` means unbounded (legacy behavior).
     max_bytes: Option<u64>,
     total_bytes: AtomicU64,
-    /// Bumped once per file/dir actually removed by `evict` — see
-    /// `eviction_generation()`.
+    /// Bumped once per file/dir actually removed by `evict` (or the LRU,
+    /// `evict_dir_unless_pinned`, `evict_prefix`) — not by
+    /// `drop_superseded_dir_unless_pinned`. See `eviction_generation()`.
     eviction_generation: AtomicU64,
     /// Whether the last `enforce_limit` ended over `max_bytes` because every
     /// remaining file was pinned. Logged on each change, not on every write.
