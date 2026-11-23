@@ -33,7 +33,7 @@
 //! an empty key table or a failed Postgres connect silently turned auth off.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -611,36 +611,113 @@ pub fn legacy_routes_enabled() -> bool {
     *ON.get_or_init(|| !env_flag_disabled("KOSHA_LEGACY_ROUTES"))
 }
 
-/// Requests counted since the last log line, and when that line was written.
-type UsageWindow = (u64, Option<Instant>);
+/// The unversioned Phase 1 routes, as `record_legacy_use` counts them.
+const LEGACY_ROUTES: [&str; 7] = [
+    "/index", "/exists", "/replace", "/search", "/flush", "/delete", "/stats",
+];
 
-/// Per-tenant legacy route usage, so the cutover to `/v1` can be tracked
-/// from logs. Logs the first use of each (tenant, route), then at most once
-/// a minute with the count since the last line, so hot search traffic
-/// doesn't flood the log.
-pub fn record_legacy_use(tenant: &str, route: &str) {
-    static USAGE: OnceLock<Mutex<HashMap<(String, String), UsageWindow>>> = OnceLock::new();
-    let mut usage = USAGE.get_or_init(Default::default).lock().unwrap();
-    let entry = usage
-        .entry((tenant.to_string(), route.to_string()))
-        .or_insert((0, None));
-    entry.0 += 1;
-    let due = entry
-        .1
-        .is_none_or(|t| t.elapsed() >= Duration::from_secs(60));
-    if due {
-        println!(
-            "legacy route usage: tenant={tenant} route={route} requests={} \
+/// How often the legacy-route usage line is written, at most.
+const LEGACY_LOG_INTERVAL_S: u64 = 3600;
+
+/// Legacy route usage counted since the last log line: one atomic counter
+/// per route and the time the next line is due, so the per-request cost is
+/// an atomic add and a clock read, with no lock and no allocation.
+struct LegacyUsage {
+    counts: [AtomicU64; LEGACY_ROUTES.len()],
+    /// Seconds since `started` at which the next line may be written.
+    next_log_s: AtomicU64,
+}
+
+impl LegacyUsage {
+    const fn new() -> Self {
+        Self {
+            counts: [const { AtomicU64::new(0) }; LEGACY_ROUTES.len()],
+            next_log_s: AtomicU64::new(0),
+        }
+    }
+
+    /// Count one use of `route` at `now_s`; the log line when one is due
+    /// (the first use, then at most once per `LEGACY_LOG_INTERVAL_S`).
+    fn record(&self, tenant: &str, route: &str, now_s: u64) -> Option<String> {
+        let i = LEGACY_ROUTES.iter().position(|r| *r == route)?;
+        self.counts[i].fetch_add(1, Ordering::Relaxed);
+        let due = self.next_log_s.load(Ordering::Relaxed);
+        if now_s < due
+            || self
+                .next_log_s
+                .compare_exchange(
+                    due,
+                    now_s + LEGACY_LOG_INTERVAL_S,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+        {
+            return None;
+        }
+        let counts: Vec<String> = LEGACY_ROUTES
+            .iter()
+            .zip(&self.counts)
+            .filter_map(|(route, count)| {
+                let n = count.swap(0, Ordering::Relaxed);
+                (n > 0).then(|| format!("{route}={n}"))
+            })
+            .collect();
+        Some(format!(
+            "legacy route usage since the last line: {} latest_tenant={tenant} \
              (unversioned routes are deprecated; migrate to /v1/namespaces/{{ns}}/...)",
-            entry.0
-        );
-        *entry = (0, Some(Instant::now()));
+            counts.join(" ")
+        ))
+    }
+}
+
+/// Legacy route usage, so the cutover to `/v1` can be tracked from logs:
+/// a line on the first use, then at most once an hour per pod with each
+/// route's count since the last line. Runs on every legacy request (the
+/// backend's searches among them), so it takes no lock and allocates only
+/// when it logs.
+pub fn record_legacy_use(tenant: &str, route: &str) {
+    static USAGE: LegacyUsage = LegacyUsage::new();
+    static STARTED: OnceLock<Instant> = OnceLock::new();
+    let now_s = STARTED.get_or_init(Instant::now).elapsed().as_secs();
+    if let Some(line) = USAGE.record(tenant, route, now_s) {
+        println!("{line}");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_usage_logs_first_use_then_at_most_hourly() {
+        let usage = LegacyUsage::new();
+        let first = usage
+            .record("acme", "/search", 0)
+            .expect("first use is logged");
+        assert!(first.contains("/search=1"), "{first}");
+        for s in 1..LEGACY_LOG_INTERVAL_S {
+            assert_eq!(usage.record("acme", "/search", s), None);
+        }
+        assert_eq!(usage.record("beta", "/index", 10), None);
+        let next = usage
+            .record("acme", "/search", LEGACY_LOG_INTERVAL_S)
+            .expect("logged again after the interval");
+        assert!(
+            next.contains(&format!("/search={LEGACY_LOG_INTERVAL_S}")),
+            "{next}"
+        );
+        assert!(next.contains("/index=1"), "{next}");
+        assert_eq!(
+            usage.record("acme", "/search", LEGACY_LOG_INTERVAL_S + 1),
+            None
+        );
+        assert_eq!(
+            usage.record("acme", "/v1/other", 1 << 40),
+            None,
+            "not a legacy route"
+        );
+    }
 
     #[test]
     fn env_keys_parse_tenants() {

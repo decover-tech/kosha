@@ -496,7 +496,12 @@ mod s3_objects {
                 .apply_sse(sse)
                 .send()
                 .await
-                .map_err(|e| format!("create_multipart_upload {key}: {e}"))?;
+                .map_err(|e| {
+                    format!(
+                        "create_multipart_upload {key}: {}",
+                        aws_sdk_s3::error::DisplayErrorContext(&e)
+                    )
+                })?;
             let upload_id = upload
                 .upload_id()
                 .ok_or_else(|| format!("create_multipart_upload {key}: no upload id"))?
@@ -528,7 +533,10 @@ mod s3_objects {
                             .build(),
                     ),
                     Err(e) => {
-                        failure = Some(format!("upload_part_copy {key} part {number}: {e}"));
+                        failure = Some(format!(
+                            "upload_part_copy {key} part {number}: {}",
+                            aws_sdk_s3::error::DisplayErrorContext(&e)
+                        ));
                         break;
                     }
                 }
@@ -548,7 +556,12 @@ mod s3_objects {
                     .await;
                 match done {
                     Ok(_) => return Ok(()),
-                    Err(e) => failure = Some(format!("complete_multipart_upload {key}: {e}")),
+                    Err(e) => {
+                        failure = Some(format!(
+                            "complete_multipart_upload {key}: {}",
+                            aws_sdk_s3::error::DisplayErrorContext(&e)
+                        ))
+                    }
                 }
             }
             let _ = client
@@ -608,7 +621,12 @@ mod s3_objects {
                     .send()
                     .await
                     .map(|_| ())
-                    .map_err(|e| format!("copy_object {source} -> {key}: {e}"))
+                    .map_err(|e| {
+                        format!(
+                            "copy_object {source} -> {key}: {}",
+                            aws_sdk_s3::error::DisplayErrorContext(&e)
+                        )
+                    })
             })
         }
 
@@ -636,7 +654,12 @@ mod s3_objects {
                         .delete(delete)
                         .send()
                         .await
-                        .map_err(|e| format!("delete_objects: {e}"))?;
+                        .map_err(|e| {
+                            format!(
+                                "delete_objects: {}",
+                                aws_sdk_s3::error::DisplayErrorContext(&e)
+                            )
+                        })?;
                     if let Some(err) = out.errors().first() {
                         return Err(format!(
                             "delete_objects: {} of {} failed, first {}: {}",

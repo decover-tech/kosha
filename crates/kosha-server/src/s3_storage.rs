@@ -1142,7 +1142,12 @@ impl S3Storage {
                 .prefix(&prefix)
                 .send()
                 .await
-                .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))?;
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 list_objects_v2 {prefix}: {}",
+                        aws_sdk_s3::error::DisplayErrorContext(&e)
+                    ))
+                })?;
 
             let mut out = Vec::new();
             for obj in resp.contents() {
@@ -1189,10 +1194,12 @@ impl S3Storage {
                 if let Some(token) = continuation.take() {
                     req = req.continuation_token(token);
                 }
-                let resp = req
-                    .send()
-                    .await
-                    .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))?;
+                let resp = req.send().await.map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 list_objects_v2 {prefix}: {}",
+                        aws_sdk_s3::error::DisplayErrorContext(&e)
+                    ))
+                })?;
                 for cp in resp.common_prefixes() {
                     if let Some(p) = cp.prefix() {
                         let child = p
@@ -1252,10 +1259,12 @@ impl S3Storage {
                 if let Some(token) = continuation.take() {
                     req = req.continuation_token(token);
                 }
-                let resp = req
-                    .send()
-                    .await
-                    .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))?;
+                let resp = req.send().await.map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 list_objects_v2 {prefix}: {}",
+                        aws_sdk_s3::error::DisplayErrorContext(&e)
+                    ))
+                })?;
                 for obj in resp.contents() {
                     if let Some(key) = obj.key() {
                         let relative = key.strip_prefix(&prefix).unwrap_or(key);
@@ -1290,10 +1299,12 @@ impl S3Storage {
                 if let Some(token) = continuation.take() {
                     req = req.continuation_token(token);
                 }
-                let resp = req
-                    .send()
-                    .await
-                    .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))?;
+                let resp = req.send().await.map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 list_objects_v2 {key_prefix}: {}",
+                        aws_sdk_s3::error::DisplayErrorContext(&e)
+                    ))
+                })?;
                 for obj in resp.contents() {
                     let Some(path) = obj.key().and_then(|k| logical_path_of_key(&root, k)) else {
                         continue;
@@ -1353,9 +1364,12 @@ impl S3Storage {
                 if let Some(token) = continuation {
                     req = req.continuation_token(token);
                 }
-                self.rt
-                    .block_on(req.send())
-                    .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))
+                self.rt.block_on(req.send()).map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 list_objects_v2 {key_prefix}: {}",
+                        aws_sdk_s3::error::DisplayErrorContext(&e)
+                    ))
+                })
             },
             visit,
         )
@@ -1375,7 +1389,12 @@ impl S3Storage {
                 .send()
                 .await
                 .map(|_| ())
-                .map_err(|e| KoshaError::NotFound(format!("S3 delete_object {key}: {e}")))
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 delete_object {key}: {}",
+                        aws_sdk_s3::error::DisplayErrorContext(&e)
+                    ))
+                })
         })
     }
 
@@ -1404,10 +1423,12 @@ impl S3Storage {
                 if let Some(token) = continuation.take() {
                     req = req.continuation_token(token);
                 }
-                let resp = req
-                    .send()
-                    .await
-                    .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))?;
+                let resp = req.send().await.map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 list_objects_v2 {prefix}: {}",
+                        aws_sdk_s3::error::DisplayErrorContext(&e)
+                    ))
+                })?;
                 let objects = resp
                     .contents()
                     .iter()
@@ -1428,7 +1449,12 @@ impl S3Storage {
                         .delete(delete)
                         .send()
                         .await
-                        .map_err(|e| KoshaError::NotFound(format!("S3 delete_objects: {e}")))?;
+                        .map_err(|e| {
+                            KoshaError::NotFound(format!(
+                                "S3 delete_objects {prefix}: {}",
+                                aws_sdk_s3::error::DisplayErrorContext(&e)
+                            ))
+                        })?;
                     if let Some(err) = out.errors().first() {
                         return Err(KoshaError::NotFound(format!(
                             "S3 delete_objects: {} of {count} objects failed, first {}: {}",
@@ -1519,12 +1545,22 @@ impl S3Storage {
                 .key(&key)
                 .send()
                 .await
-                .map_err(|e| KoshaError::NotFound(format!("S3 get_object {key}: {e}")))?;
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 get_object {key}: {}",
+                        aws_sdk_s3::error::DisplayErrorContext(&e)
+                    ))
+                })?;
             let bytes = resp
                 .body
                 .collect()
                 .await
-                .map_err(|e| KoshaError::NotFound(format!("S3 read body {key}: {e}")))?
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 read body {key}: {}",
+                        aws_sdk_s3::error::DisplayErrorContext(&e)
+                    ))
+                })?
                 .into_bytes();
             Ok(bytes.to_vec())
         })
@@ -2051,7 +2087,12 @@ async fn put_bytes(
             .apply_sse(sse.as_ref())
             .send()
             .await
-            .map_err(|e| KoshaError::NotFound(format!("S3 create_multipart_upload: {e}")))?;
+            .map_err(|e| {
+                KoshaError::NotFound(format!(
+                    "S3 create_multipart_upload {key}: {}",
+                    aws_sdk_s3::error::DisplayErrorContext(&e)
+                ))
+            })?;
 
         let upload_id = mpu.upload_id().unwrap_or_default();
         let mut parts: Vec<aws_sdk_s3::types::CompletedPart> = Vec::new();
@@ -2074,7 +2115,12 @@ async fn put_bytes(
                 )))
                 .send()
                 .await
-                .map_err(|e| KoshaError::NotFound(format!("S3 upload_part: {e}")))?;
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 upload_part {key}: {}",
+                        aws_sdk_s3::error::DisplayErrorContext(&e)
+                    ))
+                })?;
 
             let etag = upload_part_res.e_tag().unwrap_or_default().to_string();
             parts.push(
@@ -2100,7 +2146,12 @@ async fn put_bytes(
             )
             .send()
             .await
-            .map_err(|e| KoshaError::NotFound(format!("S3 complete_multipart_upload: {e}")))?;
+            .map_err(|e| {
+                KoshaError::NotFound(format!(
+                    "S3 complete_multipart_upload {key}: {}",
+                    aws_sdk_s3::error::DisplayErrorContext(&e)
+                ))
+            })?;
     } else {
         client
             .put_object()
@@ -2110,7 +2161,12 @@ async fn put_bytes(
             .body(aws_sdk_s3::primitives::ByteStream::from(data))
             .send()
             .await
-            .map_err(|e| KoshaError::NotFound(format!("S3 put_object: {e}")))?;
+            .map_err(|e| {
+                KoshaError::NotFound(format!(
+                    "S3 put_object {key}: {}",
+                    aws_sdk_s3::error::DisplayErrorContext(&e)
+                ))
+            })?;
     }
     Ok::<_, KoshaError>(())
 }
@@ -2141,14 +2197,22 @@ impl StorageBackend for S3Storage {
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         let key = s3_key.clone();
+        // Best effort, as before: the local copy is gone and the caller
+        // proceeds; a remote leftover is segment GC's to collect. Logged so
+        // the leftover is explainable.
         self.rt.block_on(async move {
-            client
+            if let Err(e) = client
                 .delete_object()
                 .bucket(&bucket)
                 .key(&key)
                 .send()
                 .await
-                .ok();
+            {
+                eprintln!(
+                    "WARN: S3 delete_object {key} failed: {}; the remote object is left for GC",
+                    aws_sdk_s3::error::DisplayErrorContext(&e)
+                );
+            }
         });
         Ok(())
     }

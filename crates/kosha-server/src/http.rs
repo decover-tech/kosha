@@ -188,6 +188,31 @@ impl Response {
             .map(|(_, v)| v.as_str())
     }
 
+    /// ` error="…" reason=… limit=… retry_after_ms=…` from a JSON error
+    /// body (`{"error": …}` and the 429 fields), empty when the body is
+    /// not one. For the request log line of a failed request only: it
+    /// parses the body.
+    pub fn error_fields(&self) -> String {
+        let ResponseBody::Bytes(bytes) = &self.body else {
+            return String::new();
+        };
+        let Ok(serde_json::Value::Object(body)) = serde_json::from_slice(bytes) else {
+            return String::new();
+        };
+        let mut out = String::new();
+        for field in ["error", "reason", "limit", "retry_after_ms"] {
+            match body.get(field) {
+                Some(serde_json::Value::String(s)) if field == "error" => {
+                    out.push_str(&format!(" error={s:?}"))
+                }
+                Some(serde_json::Value::String(s)) => out.push_str(&format!(" {field}={s}")),
+                Some(v @ serde_json::Value::Number(_)) => out.push_str(&format!(" {field}={v}")),
+                _ => {}
+            }
+        }
+        out
+    }
+
     pub fn body_len(&self) -> u64 {
         match &self.body {
             ResponseBody::Bytes(bytes) => bytes.len() as u64,
