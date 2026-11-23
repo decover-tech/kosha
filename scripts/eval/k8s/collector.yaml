@@ -8,6 +8,8 @@
 # Read-only RBAC in namespace kosha only, its own ServiceAccount (no IAM role),
 # no secrets. Logs stay on the PVC until fetched; the PVC survives pod restarts,
 # and a restarted follow resumes each pod's log from its last saved line.
+# Delete it after each run: do-not-disrupt pins its node, and the volume fills
+# in about 50 hours at ~100 MB/hour of logs under load.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -24,13 +26,10 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list"]
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
-  - apiGroups: [""]
-    resources: ["events"]
-    verbs: ["list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -54,7 +53,8 @@ metadata:
     app: kosha-eval-collector
 spec:
   accessModes: ["ReadWriteOnce"]
-  storageClassName: gp2
+  # gp3, the class the kosha query caches use on staging.
+  storageClassName: decoverai-sc-ebs
   resources:
     requests:
       storage: 5Gi
@@ -90,9 +90,15 @@ spec:
         runAsUser: 1000
         runAsGroup: 1000
         fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: collector
-          image: python:3.12.13-slim-bookworm
+          image: python:3.12.13-slim-bookworm@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           env:
             - name: KUBECTL_VERSION
               value: v1.34.13
