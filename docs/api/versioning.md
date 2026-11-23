@@ -120,8 +120,8 @@ and the `Link` to this section, and is counted in
 Two settings control them:
 
 - `KOSHA_LEGACY_ROUTES=on|off`: the pod default. The built-in default is
-  `on` until the self-hosted flip below; the managed stage overlay sets it
-  `off` (`k8s/stage/configmap-patch.yaml`). Off, a legacy route answers
+  `on` until the self-hosted flip below, and the managed overlays leave it
+  on until their flips (see the timeline). Off, a legacy route answers
   `410 legacy_route_disabled` with `details.replacement`.
 - `KOSHA_LEGACY_ROUTES_TENANTS=a,b`: tenants that keep the legacy routes
   while the default is off.
@@ -139,7 +139,8 @@ routes: they are never gated (see
 
 | When | Step |
 |---|---|
-| The release that ships this (target 2026-12-15) | Headers and counter live; Kosha's own clients, bench and tools use only `/v1`; kosha-client 0.3.0. Stage: `KOSHA_LEGACY_ROUTES=off` (the stage backfill Job runs `kosha-server migrate` directly, and `scripts/copy_es_to_kosha.py` uses `/v1`, so neither needs the legacy routes). |
+| The release that ships this (target 2026-12-15) | Headers and counter live; Kosha's own clients, bench and tools use only `/v1`; kosha-client 0.3.0. No behaviour change: stage and prod still serve the legacy routes. |
+| Once stage shows 7 days of zero `kosha_legacy_requests_total` and kosha-client 0.3.0 is on PyPI | Stage: `KOSHA_LEGACY_ROUTES=off` in `k8s/stage/configmap-patch.yaml` (the stage backfill Job runs `kosha-server migrate` directly and `scripts/copy_es_to_kosha.py` uses `/v1`, so neither needs the legacy routes). |
 | After stage is clean and prod shows 7 days of zero legacy traffic (or the stragglers are allowlisted) | Prod: `KOSHA_LEGACY_ROUTES=off` in `k8s/prod/configmap-patch.yaml`. |
 | 2027-03-01 | Self-hosted built-in default flips to `off`. |
 | 2027-06-01 (Sunset) | Handlers removed, provided `kosha_legacy_requests_total` read zero on managed deployments for 14 days; otherwise the Sunset is extended and announced. After removal the paths keep answering `410 legacy_route_disabled` for the rest of v1. |
@@ -162,9 +163,12 @@ above as already in effect:
 - Shipped: `info.version` 1.0.0 (v1 GA), the `oasdiff breaking` gate on
   the public document, Redoc API docs (`api-docs.yml`) and both specs as
   release assets.
-- Shipped: `k8s/stage` sets `KOSHA_LEGACY_ROUTES=off`.
-- **Not yet done: prod off.** `k8s/prod` still serves the legacy routes and
-  the built-in default stays `on`. The prod flip waits for 7 days of zero
+- **Not yet done: managed off (stage, then prod).** This is a deliberate
+  deviation from #350's "off by default for managed tenants": the flip
+  needs observed traffic first (ADR-350 §c). `k8s/stage` and `k8s/prod`
+  still serve the legacy routes and the built-in default stays `on`. Stage
+  flips after 7 days of zero `kosha_legacy_requests_total` there and
+  kosha-client 0.3.0 on PyPI; the prod flip waits for 7 days of zero
   `kosha_legacy_requests_total` in prod (or a known allowlist of
   stragglers); it is a configmap change (see the comment in
   `k8s/prod/configmap-patch.yaml`).
