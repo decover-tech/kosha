@@ -1169,7 +1169,11 @@ impl Ctx<'_> {
 
     fn me(&self) -> Answer {
         let me = self.signed_in()?;
-        let orgs = identity::user_orgs(self.store, &me.user.id).map_err(|e| org_error(&e))?;
+        let mut orgs = identity::user_orgs(self.store, &me.user.id).map_err(|e| org_error(&e))?;
+        // A session from an organization's SSO sees only that organization.
+        if let Some(org_id) = me.session.auth_method.strip_prefix("sso:") {
+            orgs.retain(|o| o.org.id == org_id);
+        }
         Ok(reply(
             200,
             json!({
