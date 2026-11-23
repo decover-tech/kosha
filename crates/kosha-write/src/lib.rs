@@ -2476,6 +2476,15 @@ impl Indexer {
         if let Some(conflict) = self.embedding_conflict_in(namespace, &handle, &schema) {
             return Err(KoshaError::InvalidQuery(conflict));
         }
+        // Schema evolution rules (#347), re-checked here for the same
+        // reason: every route that sets a schema comes through this.
+        let existing = self.schema_existing_data_in(namespace, &handle);
+        let current = handle.state.lock().unwrap().manifest.schema.clone();
+        if let Err(refused) =
+            kosha_core::schema_evolution::check(current.as_ref(), &schema, &existing)
+        {
+            return Err(KoshaError::InvalidQuery(refused.message));
+        }
         let mut state = handle.state.lock().unwrap();
         if state.known && state.manifest.schema.as_ref() == Some(&schema) {
             return Ok(false);
@@ -2501,6 +2510,64 @@ impl Indexer {
     ) -> Option<String> {
         let handle = self.ns_handle(namespace);
         self.embedding_conflict_in(namespace, &handle, schema)
+    }
+
+    /// What `namespace` holds, as the schema evolution rules (#347,
+    /// [`kosha_core::schema_evolution`]) need it: whether any document is
+    /// stored or buffered, and which vector fields hold vectors (with their
+    /// dimension, from the segment footers).
+    pub fn schema_existing_data(
+        &self,
+        namespace: &NamespaceId,
+    ) -> kosha_core::schema_evolution::ExistingData {
+        let handle = self.ns_handle(namespace);
+        self.schema_existing_data_in(namespace, &handle)
+    }
+
+    fn schema_existing_data_in(
+        &self,
+        namespace: &NamespaceId,
+        handle: &NamespaceHandle,
+    ) -> kosha_core::schema_evolution::ExistingData {
+        let state = handle.state.lock().unwrap().clone();
+        let mut data = kosha_core::schema_evolution::ExistingData::default();
+        let buffered = state
+            .buffer
+            .iter()
+            .flat_map(|buf| buf.documents.iter())
+            .chain(state.flushing_docs.iter().flat_map(|docs| docs.iter()));
+        for doc in buffered {
+            data.has_documents = true;
+            for field in &doc.fields {
+                if field.field_type == kosha_core::FieldType::Vector {
+                    data.vector_fields.entry(field.name.clone()).or_insert(None);
+                }
+            }
+        }
+        for entry in &state.manifest.segments {
+            if entry.doc_count > 0 {
+                data.has_documents = true;
+            }
+            let fields = match state.manifest.segment_footer(&entry.segment_id) {
+                Some(footer) => footer.vector_fields.clone(),
+                None => {
+                    let seg_dir =
+                        state
+                            .manifest
+                            .segment_dir(&self.data_dir, namespace, &entry.segment_id);
+                    match kosha_segment::SegmentReader::read_footer(&seg_dir) {
+                        Ok(footer) => footer.vector_fields,
+                        // Unreadable here: assume it holds documents and
+                        // say nothing about its vectors.
+                        Err(_) => continue,
+                    }
+                }
+            };
+            for meta in fields.into_iter().flatten() {
+                data.vector_fields.insert(meta.name, Some(meta.dim));
+            }
+        }
+        data
     }
 
     fn embedding_conflict_in(
