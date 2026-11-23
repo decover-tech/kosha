@@ -8,10 +8,14 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use kosha_core::deletion::{DeletionFilter, DeletionPosition, DeletionRecord, NewDeletion};
+use kosha_core::deletion::{
+    AckStatus, DeletionFilter, DeletionPosition, DeletionRecord, NewDeletion, PodHeartbeat,
+};
+use kosha_core::export::{ExportFilter, ExportRecord, ExportUpdate, NewExport};
 use kosha_core::{ControlStore, KoshaError, Manifest, NamespaceId};
 
 mod deletion;
+mod export;
 
 mod namespace_rename;
 pub use namespace_rename::{rekey_manifest_references, NamespaceRename, RenameOutcome};
@@ -70,6 +74,8 @@ pub struct Controller {
     /// Deletion records (#347), the in-memory twin of
     /// `kosha.deletion_records`.
     deletions: deletion::DeletionLog,
+    /// Export jobs (#347), the in-memory twin of `kosha.exports`.
+    exports: export::ExportLog,
 }
 
 /// One namespace's writer lease.
@@ -92,6 +98,7 @@ impl Controller {
             retired: HashMap::new(),
             writer_leases: HashMap::new(),
             deletions: deletion::DeletionLog::default(),
+            exports: export::ExportLog::default(),
         }
     }
 
@@ -473,6 +480,57 @@ impl ControlStore for Controller {
         limit: u32,
     ) -> Result<Vec<DeletionRecord>, KoshaError> {
         Ok(self.deletions_after(after, limit))
+    }
+    fn note_deletion_exports(&mut self, deletion_id: &str, count: u64) -> Result<(), KoshaError> {
+        self.deletions.note_exports(deletion_id, count)
+    }
+    fn heartbeat_pod(&mut self, pod: &PodHeartbeat) -> Result<(), KoshaError> {
+        self.deletions.heartbeat(pod);
+        Ok(())
+    }
+    fn acknowledge_deletion(&mut self, deletion_id: &str, pod_id: &str) -> Result<(), KoshaError> {
+        self.deletions.acknowledge(deletion_id, pod_id)
+    }
+    fn deletion_ack_status(
+        &self,
+        deletion_id: &str,
+        live_within_ms: u64,
+    ) -> Result<AckStatus, KoshaError> {
+        Ok(self.deletions.ack_status(deletion_id, live_within_ms))
+    }
+    fn finalize_deletion(
+        &mut self,
+        deletion_id: &str,
+        live_within_ms: u64,
+    ) -> Result<DeletionRecord, KoshaError> {
+        self.deletions.finalize(deletion_id, live_within_ms)
+    }
+    fn create_export(&mut self, export: &NewExport) -> Result<ExportRecord, KoshaError> {
+        Ok(self.exports.create(export))
+    }
+    fn export(&self, export_id: &str) -> Result<Option<ExportRecord>, KoshaError> {
+        Ok(self.exports.get(export_id))
+    }
+    fn exports(&self, filter: &ExportFilter) -> Result<Vec<ExportRecord>, KoshaError> {
+        Ok(self.exports.list(filter))
+    }
+    fn update_export(
+        &mut self,
+        export_id: &str,
+        update: &ExportUpdate,
+    ) -> Result<Option<ExportRecord>, KoshaError> {
+        Ok(self.exports.update(export_id, update))
+    }
+    fn claim_export(
+        &mut self,
+        export_id: &str,
+        holder: &str,
+        stale_after_ms: u64,
+    ) -> Result<Option<ExportRecord>, KoshaError> {
+        Ok(self.exports.claim(export_id, holder, stale_after_ms))
+    }
+    fn delete_exports(&mut self, export_ids: &[String]) -> Result<u64, KoshaError> {
+        Ok(self.exports.delete(export_ids))
     }
     fn acquire_writer_lease(
         &mut self,

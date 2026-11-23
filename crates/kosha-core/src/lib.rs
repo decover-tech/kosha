@@ -2,10 +2,12 @@ pub mod analysis;
 pub mod branch;
 pub mod deletes;
 pub mod deletion;
+pub mod export;
 pub mod fields;
 pub mod fuzzy;
 pub mod gc;
 pub mod rank;
+pub mod schema_evolution;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -302,6 +304,134 @@ pub trait ControlStore: Send + Sync {
         let _ = (after, limit);
         Err(KoshaError::ControlPlane(
             "this control store holds no deletion records".into(),
+        ))
+    }
+
+    /// Add `count` to a record's `exports_deleted` (#347).
+    fn note_deletion_exports(&mut self, deletion_id: &str, count: u64) -> Result<(), KoshaError> {
+        let _ = count;
+        Err(KoshaError::ControlPlane(format!(
+            "this control store holds no deletion record {deletion_id}"
+        )))
+    }
+
+    // ── Pod registry and per-pod acknowledgements (#347) ─────────────────
+
+    /// Insert or refresh this pod's row in the pod registry, stamped with
+    /// the store's clock.
+    fn heartbeat_pod(&mut self, pod: &deletion::PodHeartbeat) -> Result<(), KoshaError> {
+        Err(KoshaError::ControlPlane(format!(
+            "this control store has no pod registry (pod {})",
+            pod.pod_id
+        )))
+    }
+
+    /// Record that `pod_id` purged its cached copies of a deletion's
+    /// subject. Idempotent.
+    fn acknowledge_deletion(&mut self, deletion_id: &str, pod_id: &str) -> Result<(), KoshaError> {
+        let _ = pod_id;
+        Err(KoshaError::ControlPlane(format!(
+            "this control store cannot acknowledge deletion {deletion_id}"
+        )))
+    }
+
+    /// Who acknowledged `deletion_id`, against the pods whose last
+    /// heartbeat is under `live_within_ms` old by the store's clock.
+    fn deletion_ack_status(
+        &self,
+        deletion_id: &str,
+        live_within_ms: u64,
+    ) -> Result<deletion::AckStatus, KoshaError> {
+        let _ = live_within_ms;
+        Err(KoshaError::ControlPlane(format!(
+            "this control store cannot report acknowledgements of {deletion_id}"
+        )))
+    }
+
+    /// Complete a record that waits only for acknowledgements once every
+    /// live pod (as [`Self::deletion_ack_status`] counts them) has
+    /// acknowledged it, atomically with that check. Returns the record as
+    /// it is afterwards; unchanged when it is not ready.
+    fn finalize_deletion(
+        &mut self,
+        deletion_id: &str,
+        live_within_ms: u64,
+    ) -> Result<deletion::DeletionRecord, KoshaError> {
+        let _ = live_within_ms;
+        Err(KoshaError::ControlPlane(format!(
+            "this control store cannot finalize deletion {deletion_id}"
+        )))
+    }
+
+    // ── Exports (#347) ───────────────────────────────────────────────────
+
+    /// Record a new, pending export.
+    fn create_export(
+        &mut self,
+        export: &export::NewExport,
+    ) -> Result<export::ExportRecord, KoshaError> {
+        Err(KoshaError::ControlPlane(format!(
+            "this control store cannot record exports (namespace {})",
+            export.namespace
+        )))
+    }
+
+    /// One export by id, pins and upload URL included.
+    fn export(&self, export_id: &str) -> Result<Option<export::ExportRecord>, KoshaError> {
+        Err(KoshaError::ControlPlane(format!(
+            "this control store holds no export {export_id}"
+        )))
+    }
+
+    /// Exports matching `filter`, oldest first, pins included. A store
+    /// without exports has none: segment GC asks every store for the pins
+    /// of active exports.
+    fn exports(
+        &self,
+        filter: &export::ExportFilter,
+    ) -> Result<Vec<export::ExportRecord>, KoshaError> {
+        let _ = filter;
+        Ok(Vec::new())
+    }
+
+    /// Apply `update`; `Ok(None)` when there is no such export (or, with
+    /// `update.holder`, when another pod holds the claim).
+    fn update_export(
+        &mut self,
+        export_id: &str,
+        update: &export::ExportUpdate,
+    ) -> Result<Option<export::ExportRecord>, KoshaError> {
+        let _ = update;
+        Err(KoshaError::ControlPlane(format!(
+            "this control store holds no export {export_id}"
+        )))
+    }
+
+    /// Claim an active export for `holder`: it is pending, or running with
+    /// a claim older than `stale_after_ms` (its pod died), or already
+    /// `holder`'s. Marks it running, bumps `attempts` (unless `holder`
+    /// already had it) and refreshes the claim time. `Ok(None)` when it is
+    /// not claimable.
+    fn claim_export(
+        &mut self,
+        export_id: &str,
+        holder: &str,
+        stale_after_ms: u64,
+    ) -> Result<Option<export::ExportRecord>, KoshaError> {
+        let _ = (holder, stale_after_ms);
+        Err(KoshaError::ControlPlane(format!(
+            "this control store holds no export {export_id}"
+        )))
+    }
+
+    /// Remove export rows for good (hard delete of their namespace or
+    /// tenant). Returns how many went.
+    fn delete_exports(&mut self, export_ids: &[String]) -> Result<u64, KoshaError> {
+        if export_ids.is_empty() {
+            return Ok(0);
+        }
+        Err(KoshaError::ControlPlane(
+            "this control store holds no exports".into(),
         ))
     }
 }

@@ -37,3 +37,7 @@ ALTER TABLE IF EXISTS kosha.audit_log OWNER TO kosha;
 -- 007_billing.sql (#349). IF EXISTS for the same reason.
 ALTER TABLE IF EXISTS kosha.billing_accounts OWNER TO kosha;
 ALTER TABLE IF EXISTS kosha.billing_invoices OWNER TO kosha;
+-- 010_namespace_lifecycle.sql (#347). IF EXISTS for the same reason.
+ALTER TABLE IF EXISTS kosha.pods OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.deletion_acks OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.exports OWNER TO kosha;
