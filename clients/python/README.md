@@ -158,6 +158,24 @@ alongside. If the provider times out or fails, hits come back in search order an
 
 ## Changelog
 
+### 0.2.17
+
+- **Behavior change:** the transport retries what the server asks it to retry. A `429`
+  (any request: the server sends it only for work it refused before starting) and a
+  `502`/`503`/`504` on a read (search, count, get, `GET` routes) are retried after the
+  server's `Retry-After` plus jitter, or a full-jitter exponential backoff without one.
+  Attempts in total are `max_retries` (default 3), and no retry starts later than
+  `retry_budget` seconds (default 20) after the first attempt; a `Retry-After` that does not
+  fit the budget (a quota refusal says 60 s) raises at once. `5xx` on writes, `500` and
+  every other `4xx` (including `402`) are raised immediately, as before.
+  `retry_budget=0` restores the old behavior.
+- The attempts and the budget apply **per HTTP call**. A method that makes several calls
+  multiplies them: `msearch` (one search per body), `mget` (one search per id), `bulk`
+  (one call per namespace and operation, per `helpers.bulk` chunk) and `refresh=True` writes
+  (an extra flush) can each wait up to `retry_budget` once per call.
+- An error body that is not a JSON object (a proxy's HTML page, a JSON list) now raises
+  `KoshaRequestError` with the raw body as `error`, instead of an `AttributeError`.
+
 ### 0.2.16
 
 - Added the `consistency` option, `KoshaClient(..., consistency="strong" | "eventual")`
