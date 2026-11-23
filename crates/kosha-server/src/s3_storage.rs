@@ -3222,6 +3222,26 @@ mod error_path_tests {
         assert_short(&delete.to_string());
         let write = storage.write("acme/ns/seg/new.bin", b"x").unwrap_err();
         assert_short(&write.to_string());
+
+        // The WAL backend: an index request's error message carries these
+        // (`indexing error: …`).
+        use kosha_write::object_wal::WalObjectBackend;
+        let wal =
+            crate::s3_wal::S3WalBackend::new(&storage, std::time::Duration::from_secs(5)).unwrap();
+        let put = wal
+            .put_if_absent("_wal/w1/acme/ns/000001", b"x")
+            .unwrap_err();
+        assert_short(&put.to_string());
+        let put = wal.put("_wal/w1/acme/ns/000001", b"x").unwrap_err();
+        assert_short(&put.to_string());
+        let get = wal.get("_wal/w1/acme/ns/000001").unwrap_err();
+        assert_short(&get.to_string());
+        let list = wal.list("_wal/w1/").unwrap_err();
+        assert_short(&list.to_string());
+        let delete = wal
+            .delete(&["_wal/w1/acme/ns/000001".to_string()])
+            .unwrap_err();
+        assert_short(&delete.to_string());
         let _ = std::fs::remove_dir_all(&root);
     }
 

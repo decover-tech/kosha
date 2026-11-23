@@ -22,7 +22,7 @@ use std::time::Duration;
 use kosha_core::KoshaError;
 use kosha_write::object_wal::WalObjectBackend;
 
-use crate::s3_storage::{join_s3_key, ApplySse, ObjectSse, S3Storage};
+use crate::s3_storage::{join_s3_key, log_s3_error, ApplySse, ObjectSse, S3Storage};
 
 pub struct S3WalBackend {
     client: aws_sdk_s3::Client,
@@ -119,12 +119,13 @@ impl S3WalBackend {
                         Some(412 | 409) if conditional => std::io::ErrorKind::AlreadyExists,
                         _ => std::io::ErrorKind::Other,
                     };
+                    // The chain (role ARN, bucket, request ids) and the key
+                    // go to the pod log only: this message can reach a
+                    // tenant's response body (`indexing error: …`).
+                    let short = log_s3_error("put_object", &full, &error);
                     Err(std::io::Error::new(
                         kind,
-                        format!(
-                            "S3 put_object {full} (status {status:?}): {}",
-                            aws_sdk_s3::error::DisplayErrorContext(&error)
-                        ),
+                        format!("S3 put_object (status {status:?}): {short}"),
                     )
                     .into())
                 }
@@ -159,8 +160,8 @@ impl WalObjectBackend for S3WalBackend {
                         return Ok(None);
                     }
                     return Err(s3_error(format!(
-                        "S3 get_object {full}: {}",
-                        aws_sdk_s3::error::DisplayErrorContext(&error)
+                        "S3 get_object: {}",
+                        log_s3_error("get_object", &full, &error)
                     )));
                 }
             };
@@ -168,7 +169,12 @@ impl WalObjectBackend for S3WalBackend {
                 .body
                 .collect()
                 .await
-                .map_err(|e| s3_error(format!("S3 read body {full}: {e}")))?
+                .map_err(|e| {
+                    s3_error(format!(
+                        "S3 read body: {}",
+                        log_s3_error("read body", &full, &e)
+                    ))
+                })?
                 .into_bytes();
             Ok(Some(bytes.to_vec()))
         })
@@ -195,8 +201,8 @@ impl WalObjectBackend for S3WalBackend {
             while let Some(page) = pages.next().await {
                 let page = page.map_err(|e| {
                     s3_error(format!(
-                        "S3 list_objects_v2 {full}: {}",
-                        aws_sdk_s3::error::DisplayErrorContext(&e)
+                        "S3 list_objects_v2: {}",
+                        log_s3_error("list_objects_v2", &full, &e)
                     ))
                 })?;
                 for object in page.contents() {
@@ -228,8 +234,8 @@ impl WalObjectBackend for S3WalBackend {
                         .map(|_| ())
                         .map_err(|e| {
                             s3_error(format!(
-                                "S3 delete_object {key}: {}",
-                                aws_sdk_s3::error::DisplayErrorContext(&e)
+                                "S3 delete_object: {}",
+                                log_s3_error("delete_object", &key, &e)
                             ))
                         })
                 });

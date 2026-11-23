@@ -10250,47 +10250,10 @@ fn parse_doc_index_bytes(
 
 // ─── Atomic file rewrite ────────────────────────────────────────────────────
 
-/// Overwrite `path` atomically: write to a sibling temp file, then `rename`
-/// over the destination. POSIX (and Windows, via `MoveFileEx`-equivalent
-/// semantics `std::fs::rename` uses) guarantees a rename within the same
-/// directory is atomic — a concurrent reader always sees either the old
-/// complete file or the new complete one, never a truncated/partial one.
-///
-/// This matters specifically for files that get rewritten *in place* on a
-/// segment that's already published and actively being searched (unlike the
-/// original write during segment build, which completes before the segment
-/// is registered in the manifest and so can never race a reader). Plain
-/// `fs::write` truncates the destination before filling it back in, so a
-/// reader landing in that window sees a short read — for `footer.json` that
-/// surfaces as `serde_json` failing with "EOF while parsing a value" on an
-/// in-flight search.
-///
-/// The temp filename includes the PID and a per-process atomic counter so
-/// concurrent rewrites of the *same* file (e.g. two overlapping admin
-/// requests) never collide on the same temp path.
-fn atomic_write(path: &Path, data: &[u8]) -> Result<(), KoshaError> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let dir = path.parent().ok_or_else(|| {
-        KoshaError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("atomic_write: {} has no parent directory", path.display()),
-        ))
-    })?;
-    let file_name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
-        KoshaError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("atomic_write: {} has no file name", path.display()),
-        ))
-    })?;
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp_path = dir.join(format!(".{file_name}.tmp.{}.{n}", std::process::id()));
-
-    fs::write(&tmp_path, data)?;
-    fs::rename(&tmp_path, path)?;
-    Ok(())
-}
+// Footer and offsets rewrites on a published segment go through
+// `kosha_core::atomic_write` (temp file + rename): a search reading the
+// segment concurrently sees the old or the new file, never a short one.
+use kosha_core::atomic_write;
 
 // ─── Binary read helpers ────────────────────────────────────────────────────
 
