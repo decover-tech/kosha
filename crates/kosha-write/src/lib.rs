@@ -4982,6 +4982,155 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Finding 29: a query-path hydration leaves a segment on disk without
+    /// its vector index files (`vector*.idx` / `vector*.offsets` are only
+    /// fetched when a caller needs vectors). If compaction then merges that
+    /// segment, the vectors must survive: they are read from the doc store
+    /// / `doc_vectors.bin`, never from the index, and the merged index is
+    /// rebuilt from them. Both vector-index modes are checked.
+    ///
+    /// The second half pins the loud failure: an input whose
+    /// `doc_vectors.bin` is missing aborts the compaction with an error and
+    /// leaves the manifest untouched, rather than writing a merged segment
+    /// without the vectors.
+    #[test]
+    fn compaction_of_inputs_without_local_vector_index_keeps_every_vector() {
+        use kosha_segment::VectorCompactionMode;
+        fn vector(i: u64) -> Vec<f32> {
+            let mut s = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut next = || {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+            };
+            let c = (i % 16) as f32;
+            (0..16)
+                .map(|d| if d as f32 == c { 3.0 } else { 0.0 } + next() * 0.5)
+                .collect()
+        }
+        let doc = |id: u64| Document {
+            id: DocumentId(format!("d{id}")),
+            fields: vec![
+                Field::text("text", format!("doc {id}")),
+                Field::vector("emb", vector(id)),
+            ],
+        };
+        // Two inputs; the first is big enough (>= LIRE_ADOPT_MIN_VECTORS)
+        // that `lire` would try to seed from its (missing) postings.
+        let build = |dir: &std::path::Path| {
+            let idx = Indexer::new(dir.to_path_buf())
+                .with_flush_threshold(10_000)
+                .with_max_concurrent_flush_writers(1);
+            let ns = NamespaceId("vecidx".into());
+            idx.index_documents(ns.clone(), (0..1_200).map(doc).collect())
+                .unwrap();
+            idx.flush_namespace(&ns).unwrap();
+            idx.index_documents(ns.clone(), (1_200..1_250).map(doc).collect())
+                .unwrap();
+            idx.flush_namespace(&ns).unwrap();
+            let manifest = idx.manifest(&ns).unwrap();
+            assert_eq!(manifest.segments.len(), 2);
+            let seg_dirs: Vec<std::path::PathBuf> = manifest
+                .segments
+                .iter()
+                .map(|e| dir.join(&ns.0).join(&e.segment_id.0))
+                .collect();
+            (idx, ns, seg_dirs)
+        };
+        let remove_matching = |seg_dir: &std::path::Path, pred: &dyn Fn(&str) -> bool| {
+            let mut removed = 0;
+            for entry in std::fs::read_dir(seg_dir).unwrap().flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if pred(&name) {
+                    std::fs::remove_file(entry.path()).unwrap();
+                    removed += 1;
+                }
+            }
+            removed
+        };
+
+        for mode in [VectorCompactionMode::Lire, VectorCompactionMode::Rebuild] {
+            let dir = std::env::temp_dir().join(format!(
+                "kosha-compact-no-vecidx-{mode:?}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let (idx, ns, seg_dirs) = build(&dir);
+            for seg_dir in &seg_dirs {
+                assert!(
+                    remove_matching(seg_dir, &kosha_core::is_vector_index_file) > 0,
+                    "{mode:?}: input had vector index files to drop"
+                );
+            }
+
+            let result = idx
+                .compact_namespace_with_options(&ns, CompactOptions::full().with_vector_index(mode))
+                .unwrap();
+            assert!(result.merged, "{mode:?}");
+            let manifest = idx.manifest(&ns).unwrap();
+            assert_eq!(manifest.segments.len(), 1);
+            let reader = kosha_segment::SegmentReader::open(
+                dir.join(&ns.0).join(&manifest.segments[0].segment_id.0),
+            )
+            .unwrap();
+            let columns: Vec<(String, u32)> = reader
+                .footer()
+                .vector_fields
+                .clone()
+                .unwrap()
+                .into_iter()
+                .map(|m| (m.name, m.count))
+                .collect();
+            assert_eq!(columns, vec![("emb".into(), 1_250)], "{mode:?}");
+            for i in (0..1_250u64).step_by(37) {
+                let hits = reader.knn_search(&vector(i), 1, 1_000).unwrap().unwrap();
+                let rec = reader.doc_record_full(hits[0].0).unwrap().unwrap();
+                assert_eq!(rec.doc_id.0, format!("d{i}"), "{mode:?}");
+                let emb = rec.fields.iter().find(|f| f.name == "emb").unwrap();
+                let got: Vec<f32> = serde_json::from_str(&emb.value).unwrap();
+                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&got), bits(&vector(i)), "{mode:?} doc {i}");
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        // Vectors stored in a sidecar that is not local: refuse to merge.
+        let dir =
+            std::env::temp_dir().join(format!("kosha-compact-no-docvec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (idx, ns, seg_dirs) = build(&dir);
+        let before = idx.manifest(&ns).unwrap();
+        assert!(before
+            .segments
+            .iter()
+            .all(|e| before.segment_footer(&e.segment_id).unwrap().doc_vectors));
+        assert_eq!(
+            remove_matching(&seg_dirs[1], &|n| n == kosha_segment::DOC_VECTORS_FILE),
+            1
+        );
+        let err = idx
+            .compact_namespace_with_options(&ns, CompactOptions::full())
+            .expect_err("a merge without the input's vectors must fail");
+        assert!(
+            err.to_string().contains(kosha_segment::DOC_VECTORS_FILE),
+            "{err}"
+        );
+        let after = idx.manifest(&ns).unwrap();
+        assert_eq!(after.version, before.version, "manifest unchanged");
+        let ids = |m: &Manifest| -> Vec<SegmentId> {
+            m.segments.iter().map(|e| e.segment_id.clone()).collect()
+        };
+        assert_eq!(ids(&after), ids(&before));
+        let dirs = std::fs::read_dir(dir.join(&ns.0))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .count();
+        assert_eq!(dirs, 2, "no merged output left on disk");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// #204: a vector whose dimension differs from its field's is rejected
     /// at the write API, whether the field's dimension was fixed by a
     /// flushed segment, by buffered documents, or earlier in the batch.
