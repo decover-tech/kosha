@@ -378,6 +378,18 @@ fn vector_value_dim(value: &str) -> Option<VectorValueDim> {
     })
 }
 
+/// What this node holds for a namespace, as [`Indexer::while_quiesced`]
+/// reads it.
+#[derive(Debug, Clone)]
+pub struct LocalNamespace {
+    /// The local manifest, including segments not yet published.
+    pub manifest: Manifest,
+    /// Whether anything here is not in the control store yet: a manifest
+    /// version that was never published, buffered or WAL-recovered writes,
+    /// or pending deletes.
+    pub unpublished: bool,
+}
+
 struct NamespaceHandle {
     mutation: Mutex<()>,
     writes: Mutex<()>,
@@ -531,9 +543,9 @@ pub struct Indexer {
 impl Indexer {
     pub fn new(data_dir: PathBuf) -> Self {
         let wal_dir = data_dir.join("_wal");
-        if let Err(e) = std::fs::create_dir_all(&wal_dir) {
-            eprintln!("ERROR: cannot create WAL dir {}: {e}", wal_dir.display());
-        }
+        // No WAL dir = every acknowledged write would fail; stop here, like
+        // the failed recovery below, instead of at the first append.
+        kosha_core::create_dir_named(&wal_dir).unwrap_or_else(|e| panic!("WAL: {e}"));
         let (wal, records) = crate::wal::WalWriter::open(
             Arc::new(crate::wal::LocalWalStore::new(wal_dir)),
             crate::wal::GroupCommitConfig::from_env(),
@@ -2623,6 +2635,85 @@ impl Indexer {
         shared
     }
 
+    /// Finish discarding a deleted namespace whose storage reclaim is being
+    /// retried (#347), provided nothing was written to it since
+    /// [`Self::drop_namespace`]: it is still unknown, with an empty buffer,
+    /// no pending deletes and no WAL records awaiting replay.
+    ///
+    /// Then its WAL records are discarded again (a no-op when the first
+    /// discard succeeded) and `while_locked` runs under the namespace's
+    /// locks, as in `drop_namespace`: the place to remove its local segment
+    /// files. Returns the WAL files kept because other namespaces share
+    /// them.
+    ///
+    /// `Ok(None)` when the namespace holds anything: a new incarnation was
+    /// written (or recovered from the WAL) and its files now share the
+    /// namespace's directory. Nothing is touched and `while_locked` does
+    /// not run.
+    pub fn discard_if_untouched(
+        &self,
+        namespace: &NamespaceId,
+        while_locked: impl FnOnce(),
+    ) -> Result<Option<usize>, KoshaError> {
+        let handle = self.ns_handle(namespace);
+        let _writes = handle.writes.lock().unwrap();
+        let _compact = handle.compact.lock().unwrap();
+        let _mutation = handle.mutation.lock().unwrap();
+        {
+            let state = handle.state.lock().unwrap();
+            let buffered = state.buffer.as_ref().map_or(0, |b| b.documents.len());
+            if state.known
+                || buffered > 0
+                || !state.tombstones.is_empty()
+                || !state.recovered.is_empty()
+                || !state.recovered_deletes.is_empty()
+            {
+                return Ok(None);
+            }
+        }
+        // Still under the write locks: no record can be appended for the
+        // namespace between the check and the discard.
+        let shared = self.wal.discard_namespace(namespace)?;
+        while_locked();
+        Ok(Some(shared))
+    }
+
+    /// Run `sweep` while no write, flush, upsert, compaction or drop of
+    /// `namespace` is in flight on this node (the locks
+    /// [`Self::drop_namespace`] takes), handing it what this node holds for
+    /// the namespace at that moment; `None` when it is unknown here.
+    ///
+    /// For removing local files of a deleted incarnation (#347) without
+    /// touching the current one: under these locks every segment directory
+    /// this writer has produced for the namespace is listed by the manifest
+    /// in [`LocalNamespace`], published or not. A manifest a follower
+    /// installs ([`Self::restore_manifest`]) is not held back by them.
+    pub fn while_quiesced<R>(
+        &self,
+        namespace: &NamespaceId,
+        sweep: impl FnOnce(Option<LocalNamespace>) -> R,
+    ) -> R {
+        let handle = self.ns_handle(namespace);
+        let _writes = handle.writes.lock().unwrap();
+        let _compact = handle.compact.lock().unwrap();
+        let _mutation = handle.mutation.lock().unwrap();
+        let local = {
+            let state = handle.state.lock().unwrap();
+            state.known.then(|| LocalNamespace {
+                unpublished: state.published_version != state.manifest.version
+                    || state
+                        .buffer
+                        .as_ref()
+                        .is_some_and(|b| !b.documents.is_empty())
+                    || !state.tombstones.is_empty()
+                    || !state.recovered.is_empty()
+                    || !state.recovered_deletes.is_empty(),
+                manifest: state.manifest.clone(),
+            })
+        };
+        sweep(local)
+    }
+
     /// Forget a namespace this node only follows (a query replica's copy
     /// of a namespace deleted elsewhere): it reads as unknown until a
     /// manifest is restored for it again. Leaves the WAL alone, unlike
@@ -3996,6 +4087,40 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// #347: the purge reads a namespace under the writer's locks.
+    #[test]
+    fn while_quiesced_reports_unknown_published_and_unpublished_namespaces() {
+        let dir = std::env::temp_dir().join(format!("kosha-quiesced-{}", uuid::Uuid::new_v4()));
+        let idx = Indexer::new(dir.clone());
+        let ns = NamespaceId("t/quiesced".into());
+        assert!(idx.while_quiesced(&ns, |local| local.is_none()));
+        // Asking does not make the namespace known.
+        assert!(idx.manifest_version(&ns).is_none());
+        assert!(!idx.namespaces().contains(&ns));
+
+        idx.restore_manifest(ns.clone(), Manifest::empty(4));
+        let local = idx.while_quiesced(&ns, |local| local).unwrap();
+        assert_eq!(local.manifest.version, 4);
+        assert!(!local.unpublished, "a followed manifest is published");
+
+        let doc = Document {
+            id: DocumentId("a".into()),
+            fields: vec![Field::text("text", "hello")],
+        };
+        idx.index_documents(ns.clone(), vec![doc]).unwrap();
+        assert!(
+            idx.while_quiesced(&ns, |local| local).unwrap().unpublished,
+            "a buffered write"
+        );
+        idx.flush_namespace(&ns).unwrap();
+        let local = idx.while_quiesced(&ns, |local| local).unwrap();
+        assert!(local.unpublished, "a flushed, unpublished segment");
+        assert_eq!(local.manifest.segments.len(), 1);
+        publish(&idx, &ns);
+        assert!(!idx.while_quiesced(&ns, |local| local).unwrap().unpublished);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn drop_namespace_refuses_unpublished_writes_and_forgets_published_ones() {
         let dir = std::env::temp_dir().join(format!("kosha-drop-{}", uuid::Uuid::new_v4()));
@@ -4084,6 +4209,53 @@ mod tests {
         let live = live_records(&dir, &gone, &manifest);
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].doc_id.0, "d");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #347: retrying a deleted namespace's cleanup must never touch a new
+    /// incarnation that was written in the meantime.
+    #[test]
+    fn discard_if_untouched_runs_only_while_nothing_was_written_since_the_drop() {
+        let dir = std::env::temp_dir().join(format!("kosha-discard-{}", uuid::Uuid::new_v4()));
+        let ns = NamespaceId("t/gone".into());
+        let doc = |id: &str| Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field::text("text", "hello")],
+        };
+        let idx = Indexer::new(dir.clone());
+        idx.index_documents(ns.clone(), vec![doc("a")]).unwrap();
+        idx.flush_namespace(&ns).unwrap();
+        let published = idx.manifest(&ns).unwrap().version;
+
+        // Live namespace: refused, the callback never runs.
+        let mut ran = 0;
+        assert_eq!(idx.discard_if_untouched(&ns, || ran += 1).unwrap(), None);
+        assert_eq!(ran, 0);
+        assert!(idx.manifest(&ns).is_some());
+
+        // Dropped and not written since: the retry goes through, twice.
+        idx.drop_namespace(&ns, published + 1, || {}).unwrap();
+        assert_eq!(idx.discard_if_untouched(&ns, || ran += 1).unwrap(), Some(0));
+        assert_eq!(idx.discard_if_untouched(&ns, || ran += 1).unwrap(), Some(0));
+        assert_eq!(ran, 2);
+        assert!(idx.manifest(&ns).is_none());
+
+        // A buffered write to the new incarnation: refused, and the write
+        // survives, in memory and in the WAL.
+        idx.index_documents(ns.clone(), vec![doc("b")]).unwrap();
+        assert_eq!(idx.discard_if_untouched(&ns, || ran += 1).unwrap(), None);
+        assert_eq!(ran, 2);
+        assert_eq!(idx.pending_doc_count(&ns), 1);
+        drop(idx);
+        let restarted = Indexer::new(dir.clone());
+        assert!(restarted.pending_doc_count(&ns) > 0, "WAL record kept");
+        // Recovered records count as written too.
+        assert_eq!(
+            restarted.discard_if_untouched(&ns, || ran += 1).unwrap(),
+            None
+        );
+        assert_eq!(ran, 2);
+        drop(restarted);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -5862,7 +6034,7 @@ mod tests {
         );
         let seg_id = idx.manifest(&ns).unwrap().segments[0].segment_id.clone();
         let reader = kosha_segment::SegmentReader::open(dir.join("test").join(&seg_id.0)).unwrap();
-        let store = reader.filter_store();
+        let store = reader.try_filter_store().unwrap();
         // Merge order is not index order: key everything by document id.
         let records: Vec<_> = reader.iter_doc_records().map(|r| r.unwrap()).collect();
         let id_of = |seq: u32| records[seq as usize].doc_id.0.clone();

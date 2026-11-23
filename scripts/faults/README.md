@@ -91,11 +91,14 @@ final contents are exactly every id ever sent), flushes, and checks:
 
 `expected_failures.json` uses the integration suite's format: fnmatch globs over check ids,
 each mapped to a bug with its issue. A listed check that fails is reported as `xfail` and does
-not fail the job. With `--strict`, a listed check that passes also fails the job. The `s3-toxics` recovery and pre-restart count checks are listed for #368, which this suite
-found. After a connection reset on a WAL PUT, the S3 WAL can fence itself, and the ingest pod
-then refuses every write until it restarts. The post-restart checks
-(`:redrive-after-restart`, `:acked-present-after-restart`, `:doc-count-after-restart`) are
-not listed, and still hold. Delete each entry when its bug is fixed.
+not fail the job. With `--strict`, a listed check that passes also fails the job. Delete each
+entry when its bug is fixed.
+
+The list is empty now, so every check gates. The `s3-toxics` recovery and pre-restart count
+checks were listed for #368, which this suite found: during the S3 toxics the WAL writer made
+more failed PUTs to one key than it remembers, forgot the one that had landed, and then took
+its own object for another writer's. It fenced itself, and the ingest pod refused every write
+until it restarted.
 
 ## Not covered here
 

@@ -13,6 +13,13 @@
 //! (`KOSHA_SEARCH_QUEUE_DEPTH`), so is each tenant's share of it
 //! (`KOSHA_SEARCH_QUEUE_DEPTH_PER_TENANT`), and a waiter gives up after
 //! `KOSHA_SEARCH_QUEUE_TIMEOUT_MS`. The caller answers a shed with 429.
+//!
+//! The total bound is shared fairly too. When the queue is full and the
+//! arriving tenant holds less of it than the tenant with the most waiters,
+//! that tenant's newest waiter is shed and the arrival queues in its place
+//! (drop from the longest queue). So a tenant that fills the whole queue
+//! sheds its own requests, not another tenant's; an arrival is refused
+//! only when its tenant already has as large a share as anyone.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Condvar, Mutex};
@@ -40,6 +47,9 @@ pub(crate) struct Scheduler {
     ring: VecDeque<String>,
     /// Tickets handed a permit whose waiter has not claimed it yet.
     granted: HashSet<u64>,
+    /// Tickets shed to make room for another tenant (see
+    /// [`Self::evict_for`]) whose waiter has not noticed yet.
+    evicted: HashSet<u64>,
     next_ticket: u64,
     /// Queued plus granted-but-unclaimed tickets.
     waiters: usize,
@@ -125,6 +135,45 @@ impl Scheduler {
         any
     }
 
+    /// Make room in a full queue for an arrival from `tenant`: shed the
+    /// newest waiter of the tenant with the most waiters, if that tenant
+    /// would still have at least as many waiting as `tenant` afterwards.
+    /// Returns whether a place was freed.
+    pub(crate) fn evict_for(&mut self, tenant: &str) -> bool {
+        let mine = self.tenant_waiters(tenant);
+        // Ties go to the tenant earliest in the ring, so the choice does
+        // not depend on hash order.
+        let mut longest: Option<(&String, usize)> = None;
+        for name in &self.ring {
+            let len = self.queues.get(name).map_or(0, |q| q.tickets.len());
+            if longest.is_none_or(|(_, best)| len > best) {
+                longest = Some((name, len));
+            }
+        }
+        let Some((name, len)) = longest else {
+            return false;
+        };
+        // `len - 1 >= mine + 1`: otherwise the two would only swap places.
+        if name == tenant || len < mine + 2 {
+            return false;
+        }
+        let name = name.clone();
+        let Some(queue) = self.queues.get_mut(&name) else {
+            return false;
+        };
+        let Some(ticket) = queue.tickets.pop_back() else {
+            return false;
+        };
+        self.waiters -= 1;
+        self.evicted.insert(ticket);
+        true
+    }
+
+    /// Whether `ticket` was shed by [`Self::evict_for`].
+    fn take_evicted(&mut self, ticket: u64) -> bool {
+        self.evicted.remove(&ticket)
+    }
+
     /// Whether `ticket` holds a granted permit; if so the caller owns it.
     pub(crate) fn claim(&mut self, ticket: u64) -> bool {
         if self.granted.remove(&ticket) {
@@ -164,6 +213,8 @@ impl Scheduler {
 /// See the module doc.
 pub(crate) struct FairSemaphore {
     state: Mutex<Scheduler>,
+    /// Permits in all (free + held), for the shed log line.
+    permits: usize,
     cv: Condvar,
     /// Max requests waiting in all. `0` = unbounded.
     max_waiters: usize,
@@ -182,6 +233,7 @@ impl FairSemaphore {
     ) -> Self {
         Self {
             state: Mutex::new(Scheduler::new(permits)),
+            permits,
             cv: Condvar::new(),
             max_waiters,
             max_waiters_per_tenant,
@@ -203,13 +255,18 @@ impl FairSemaphore {
         }
         // Fast-fail on a saturated queue: waiting only to time out later
         // would burn the client's deadline for nothing.
-        if self.max_waiters > 0 && st.waiters >= self.max_waiters {
-            return Err(QueueShed::Full);
-        }
         if self.max_waiters_per_tenant > 0
             && st.tenant_waiters(tenant) >= self.max_waiters_per_tenant
         {
-            return Err(QueueShed::Full);
+            return Err(QueueShed::TenantFull);
+        }
+        if self.max_waiters > 0 && st.waiters >= self.max_waiters {
+            // Full: take a place from the tenant holding the most of the
+            // queue, unless this tenant already holds as much.
+            if !st.evict_for(tenant) {
+                return Err(QueueShed::Full);
+            }
+            self.cv.notify_all();
         }
         let ticket = st.enqueue(tenant, weight);
         if st.dispatch() {
@@ -219,6 +276,9 @@ impl FairSemaphore {
         loop {
             if st.claim(ticket) {
                 return Ok(FairPermit { sem: self });
+            }
+            if st.take_evicted(ticket) {
+                return Err(QueueShed::Full);
             }
             match deadline {
                 None => st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner()),
@@ -241,10 +301,42 @@ impl FairSemaphore {
         }
     }
 
+    /// Max requests one tenant may have waiting (`0` = no per-tenant cap).
+    pub(crate) fn max_waiters_per_tenant(&self) -> usize {
+        self.max_waiters_per_tenant
+    }
+
+    /// The queue as a shed sees it, for its log line (shed path only):
+    /// permits in all, permits held, requests waiting in all and in
+    /// `tenant`'s queue.
+    pub(crate) fn shed_snapshot(&self, tenant: &str) -> ShedSnapshot {
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        ShedSnapshot {
+            permits: self.permits,
+            in_use: self.permits.saturating_sub(st.permits),
+            waiters: st.waiters,
+            tenant_waiters: st.tenant_waiters(tenant),
+        }
+    }
+
+    /// How long a request may wait before it is shed (`None` = forever).
+    pub(crate) fn wait_timeout(&self) -> Option<Duration> {
+        self.wait_timeout
+    }
+
     /// Requests waiting for a permit right now (`kosha_search_queue_depth`).
     pub(crate) fn waiters(&self) -> usize {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).waiters
     }
+}
+
+/// See [`FairSemaphore::shed_snapshot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShedSnapshot {
+    pub(crate) permits: usize,
+    pub(crate) in_use: usize,
+    pub(crate) waiters: usize,
+    pub(crate) tenant_waiters: usize,
 }
 
 /// A held search permit; dropping it hands the permit to the next tenant.
@@ -394,7 +486,8 @@ mod tests {
         }
         assert_eq!(sem.waiters(), 2, "both waiters should be queued");
         let t = Instant::now();
-        assert!(matches!(sem.try_acquire("u", 1), Err(QueueShed::Full)));
+        // Same tenant: nobody holds more of the queue to take a place from.
+        assert!(matches!(sem.try_acquire("t", 1), Err(QueueShed::Full)));
         assert!(
             t.elapsed() < Duration::from_millis(40),
             "shed must be immediate"
@@ -408,6 +501,101 @@ mod tests {
             sem.try_acquire("t", 1).is_ok(),
             "a freed permit is acquirable"
         );
+    }
+
+    #[test]
+    fn a_full_queue_evicts_from_the_longest_tenant_queue() {
+        let mut s = Scheduler::new(0);
+        let flood: Vec<u64> = (0..4).map(|_| s.enqueue("flood", 1)).collect();
+        // The flooder itself gets no place from its own queue.
+        assert!(!s.evict_for("flood"));
+        // Another tenant takes the flooder's newest place.
+        assert!(s.evict_for("quiet"));
+        assert_eq!(s.waiters, 3);
+        assert!(s.take_evicted(flood[3]));
+        assert!(!s.take_evicted(flood[3]), "reported once");
+        s.enqueue("quiet", 1);
+        // flood 3, quiet 1: one more swap leaves 2 and 2.
+        assert!(s.evict_for("quiet"));
+        assert!(s.take_evicted(flood[2]));
+        s.enqueue("quiet", 1);
+        // Equal shares: nobody is evicted, in either direction.
+        assert!(!s.evict_for("quiet"));
+        assert!(!s.evict_for("flood"));
+        assert_eq!(s.waiters, 4);
+        // The evicted tickets are gone from the queue: only live ones are
+        // granted.
+        let mut granted = 0;
+        while s.release() {
+            let t: Vec<u64> = s.granted.iter().copied().collect();
+            assert!(!flood[2..].contains(&t[0]));
+            assert!(s.claim(t[0]));
+            s.permits = 0;
+            granted += 1;
+        }
+        assert_eq!(granted, 4);
+        assert_eq!(s.waiters, 0);
+        assert!(s.ring.is_empty() && s.queues.is_empty() && s.evicted.is_empty());
+
+        // 2 against 1 would only swap places: no eviction.
+        let mut s = Scheduler::new(0);
+        s.enqueue("a", 1);
+        s.enqueue("a", 1);
+        s.enqueue("b", 1);
+        assert!(!s.evict_for("b"));
+        // 2 against 0 leaves 1 and 1.
+        assert!(s.evict_for("c"));
+    }
+
+    /// The pod-wide queue bound must not let one tenant starve another
+    /// (#341): a tenant that fills every permit and the whole queue sheds
+    /// its own waiters when another tenant arrives.
+    #[test]
+    fn a_tenant_filling_the_whole_queue_does_not_shed_another_tenant() {
+        let sem = Arc::new(FairSemaphore::new(2, 4, 0, Some(Duration::from_secs(30))));
+        let held: Vec<_> = (0..2)
+            .map(|_| sem.try_acquire("flood", 1).unwrap())
+            .collect();
+        let flooders: Vec<_> = (0..4)
+            .map(|_| {
+                let s = Arc::clone(&sem);
+                std::thread::spawn(move || s.try_acquire("flood", 1).map(drop))
+            })
+            .collect();
+        let t0 = Instant::now();
+        while sem.waiters() < 4 && t0.elapsed() < Duration::from_secs(10) {
+            std::thread::yield_now();
+        }
+        assert_eq!(sem.waiters(), 4, "the flooder fills the queue");
+        // The flooder's own next request is shed: its share is the largest.
+        assert!(matches!(sem.try_acquire("flood", 1), Err(QueueShed::Full)));
+
+        let quiet = {
+            let s = Arc::clone(&sem);
+            std::thread::spawn(move || s.try_acquire("quiet", 1).map(drop))
+        };
+        // The quiet tenant queues; one flood waiter is shed for it at once,
+        // long before the 30s wait timeout.
+        let mut results = Vec::new();
+        let mut flooders = flooders;
+        while results.is_empty() && t0.elapsed() < Duration::from_secs(10) {
+            if let Some(i) = flooders.iter().position(|h| h.is_finished()) {
+                results.push(flooders.swap_remove(i).join().unwrap());
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        assert!(
+            matches!(results.first(), Some(Err(QueueShed::Full))),
+            "one flood waiter is shed: {results:?}"
+        );
+        assert_eq!(sem.waiters(), 4, "the queue stays at its bound");
+        drop(held);
+        assert!(quiet.join().unwrap().is_ok(), "the quiet tenant is served");
+        for h in flooders {
+            assert!(h.join().unwrap().is_ok(), "the remaining flood waiters run");
+        }
+        assert_eq!(sem.waiters(), 0);
     }
 
     #[test]
@@ -427,7 +615,10 @@ mod tests {
         while sem.waiters() < 1 && t0.elapsed() < Duration::from_secs(2) {
             std::thread::yield_now();
         }
-        assert!(matches!(sem.try_acquire("a", 1), Err(QueueShed::Full)));
+        assert!(matches!(
+            sem.try_acquire("a", 1),
+            Err(QueueShed::TenantFull)
+        ));
         let other = {
             let s = Arc::clone(&sem);
             std::thread::spawn(move || s.try_acquire("b", 1).is_ok())
@@ -438,5 +629,26 @@ mod tests {
         drop(held);
         assert!(first.join().unwrap());
         assert!(other.join().unwrap());
+    }
+
+    /// The shed log line's queue figures: permits held and waiting, in all
+    /// and for the shed tenant.
+    #[test]
+    fn shed_snapshot_reports_the_queue_a_shed_saw() {
+        let sem = FairSemaphore::new(1, 1, 0, Some(Duration::from_millis(1)));
+        let held = sem.try_acquire("a", 1).expect("a free permit");
+        assert_eq!(
+            sem.shed_snapshot("b"),
+            ShedSnapshot {
+                permits: 1,
+                in_use: 1,
+                waiters: 0,
+                tenant_waiters: 0
+            }
+        );
+        assert!(matches!(sem.try_acquire("b", 1), Err(QueueShed::Timeout)));
+        assert_eq!(sem.wait_timeout(), Some(Duration::from_millis(1)));
+        drop(held);
+        assert_eq!(sem.shed_snapshot("b").in_use, 0);
     }
 }

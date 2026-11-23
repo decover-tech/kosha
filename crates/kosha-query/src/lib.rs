@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -139,6 +139,38 @@ pub const DEFAULT_ADMISSION_TIMEOUT: Duration = Duration::from_secs(15);
 // but never the reverse — `admit` releases the ledger lock before asking the
 // cache to evict.
 
+/// One tenant's part of [`LedgerState`] (#342). A tenant leaves the map
+/// when every field is back to zero.
+#[derive(Default)]
+struct TenantLive {
+    /// This tenant's part of [`LedgerState::live`].
+    live: u64,
+    /// This tenant's part of [`LedgerState::reserved`].
+    reserved: u64,
+    /// This tenant's part of [`LedgerState::active`].
+    active: usize,
+    /// The estimate of each search of this tenant blocked in
+    /// [`MemoryLedger::admit`].
+    waiting: Vec<u64>,
+}
+
+impl TenantLive {
+    fn committed(&self) -> u64 {
+        self.live.saturating_add(self.reserved)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.live == 0 && self.reserved == 0 && self.active == 0 && self.waiting.is_empty()
+    }
+
+    /// Take one blocked search of `estimate` bytes off the waiting list.
+    fn stop_waiting(&mut self, estimate: u64) {
+        if let Some(pos) = self.waiting.iter().position(|e| *e == estimate) {
+            self.waiting.swap_remove(pos);
+        }
+    }
+}
+
 struct LedgerState {
     /// Bytes of all currently-referenced (constructed, not-yet-dropped)
     /// [`TrackedSegment`]s — cache-resident or pinned by in-flight requests.
@@ -154,6 +186,89 @@ struct LedgerState {
     /// oversized query degrades exactly as it did before this ledger existed
     /// (LRU thrash) instead of deadlocking or being permanently rejected.
     active: usize,
+    /// The same three figures per tenant, plus its blocked searches (#342).
+    tenants: HashMap<String, TenantLive>,
+}
+
+impl LedgerState {
+    /// Apply `change` to `tenant`'s figures, dropping the tenant from the
+    /// map once it holds nothing.
+    fn tenant(&mut self, tenant: &str, change: impl FnOnce(&mut TenantLive)) {
+        if let Some(entry) = self.tenants.get_mut(tenant) {
+            change(entry);
+            if entry.is_empty() {
+                self.tenants.remove(tenant);
+            }
+        } else {
+            let mut entry = TenantLive::default();
+            change(&mut entry);
+            if !entry.is_empty() {
+                self.tenants.insert(tenant.to_string(), entry);
+            }
+        }
+    }
+
+    /// How far over its share `tenant` is while it must leave free bytes
+    /// to another tenant's blocked search (#342), else `None`. It is held
+    /// back when it has a search admitted, it is over its weighted share
+    /// of `max_live_bytes` among the tenants holding or waiting for bytes,
+    /// and some other tenant has a search waiting that asks for bytes
+    /// within that tenant's own share (what it holds plus the waiting
+    /// estimate). A waiter asking for more than its share, such as one
+    /// larger than the whole watermark, holds nobody back: the bytes
+    /// withheld are not what keeps it out, and it could otherwise throttle
+    /// the other tenant for as long as it keeps retrying. A lone tenant is
+    /// never held back, and neither is a tenant with nothing admitted.
+    fn held_back_for_others(
+        &self,
+        tenant: &str,
+        max_live_bytes: u64,
+        shares: &TenantShares,
+    ) -> Option<u64> {
+        let mine = self.tenants.get(tenant)?;
+        if mine.active == 0 {
+            return None;
+        }
+        let total_weight: u128 = self
+            .tenants
+            .keys()
+            .map(|t| shares.weight(t) as u128)
+            .sum::<u128>()
+            .max(1);
+        let share_of =
+            |t: &str| (max_live_bytes as u128 * shares.weight(t) as u128 / total_weight) as u64;
+        let over_by = mine.committed().saturating_sub(share_of(tenant));
+        if over_by == 0 {
+            return None;
+        }
+        self.tenants
+            .iter()
+            .any(|(t, e)| {
+                t != tenant
+                    && e.waiting.iter().min().is_some_and(|smallest| {
+                        e.committed().saturating_add(*smallest) <= share_of(t)
+                    })
+            })
+            .then_some(over_by)
+    }
+}
+
+/// What [`MemoryLedger::admit`] asks the segment cache to evict (see
+/// [`SegmentCache::evict_idle`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmissionEvict {
+    /// Room for a search that fits under the live-bytes watermark: free
+    /// the bytes asked for, whoever holds them. The watermark is the
+    /// memory guard, so tenant shares decide only who gives first.
+    Room,
+    /// Room for a search larger than the whole watermark. No eviction
+    /// makes it fit (it is admitted alone or not at all), so the other
+    /// tenants keep their shares and floors.
+    RoomSparingShares,
+    /// The tenant is held back for another tenant's waiting search
+    /// (per-tenant shares): free its own idle entries, so it can get back
+    /// under its share and the waiter gets the bytes.
+    OwnIdle,
 }
 
 pub struct MemoryLedger {
@@ -161,6 +276,11 @@ pub struct MemoryLedger {
     cv: Condvar,
     max_live_bytes: u64,
     admission_timeout: Duration,
+    /// Whether [`Self::admit`] applies per-tenant shares (#342,
+    /// `KOSHA_ADMISSION_TENANT_SHARES`). Off by default.
+    tenant_shares_enabled: AtomicBool,
+    /// Tenant weights for those shares (see [`Searcher::set_tenant_shares`]).
+    shares: std::sync::RwLock<TenantShares>,
 }
 
 impl MemoryLedger {
@@ -170,70 +290,155 @@ impl MemoryLedger {
                 live: 0,
                 reserved: 0,
                 active: 0,
+                tenants: HashMap::new(),
             }),
             cv: Condvar::new(),
             max_live_bytes,
             admission_timeout,
+            tenant_shares_enabled: AtomicBool::new(false),
+            shares: std::sync::RwLock::new(TenantShares::from_env()),
         }
     }
 
-    fn add_live(&self, bytes: u64) {
+    fn add_live(&self, tenant: &str, bytes: u64) {
         let mut st = self.state.lock().unwrap();
         st.live = st.live.saturating_add(bytes);
+        st.tenant(tenant, |t| t.live = t.live.saturating_add(bytes));
     }
 
-    fn release_live(&self, bytes: u64) {
+    fn release_live(&self, tenant: &str, bytes: u64) {
         let mut st = self.state.lock().unwrap();
         st.live = st.live.saturating_sub(bytes);
+        st.tenant(tenant, |t| t.live = t.live.saturating_sub(bytes));
         drop(st);
         self.cv.notify_all();
     }
 
-    /// Reserve `estimate` bytes for a search, blocking (bounded) if that
-    /// would push `live + reserved` past the watermark. `evict_idle(needed)`
-    /// is invoked (with the ledger lock *released* — see the lock-order
-    /// invariant above) to ask the cache to free idle entries first.
+    /// Reserve `estimate` bytes for a search of `tenant`, blocking
+    /// (bounded) if that would push `live + reserved` past the watermark.
+    /// `evict_idle(needed, what)` is invoked (with the ledger lock
+    /// *released* — see the lock-order invariant above) to ask the cache
+    /// to free idle entries first. A search that fits under the watermark
+    /// asks for [`AdmissionEvict::Room`]: whatever idle bytes it takes, so
+    /// it is not shed (or admitted over the watermark) while evictable
+    /// memory sits in the cache. One larger than the whole watermark asks
+    /// for [`AdmissionEvict::RoomSparingShares`].
+    ///
+    /// Tenants (#342): with per-tenant shares enabled, a tenant that is
+    /// already over its weighted share of the watermark and has a search
+    /// admitted is not admitted again while another tenant's search waits
+    /// for bytes within its own share, so the bytes its searches free go
+    /// to that waiter first (see [`LedgerState::held_back_for_others`]).
+    /// A tenant held back first sheds its own idle cached bytes
+    /// ([`AdmissionEvict::OwnIdle`]) and goes ahead if that brings it back
+    /// under its share. The limit is work-conserving: it binds only while
+    /// another tenant waits, so a lone tenant keeps the whole watermark.
     fn admit(
         self: &Arc<Self>,
+        tenant: &str,
         estimate: u64,
-        evict_idle: impl Fn(u64),
+        evict_idle: impl Fn(u64, AdmissionEvict),
     ) -> Result<AdmissionPermit, KoshaError> {
         let deadline = Instant::now() + self.admission_timeout;
+        let by_tenant = self.tenant_shares_enabled.load(Ordering::Relaxed);
+        let shares = self
+            .shares
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let mut tried_evict = false;
+        let mut tried_shed = false;
+        let mut waiting = false;
         let mut st = self.state.lock().unwrap();
         loop {
             let committed = st.live.saturating_add(st.reserved);
             let fits = committed.saturating_add(estimate) <= self.max_live_bytes;
+            let held_back = if by_tenant {
+                st.held_back_for_others(tenant, self.max_live_bytes, &shares)
+            } else {
+                None
+            };
             // Anti-starvation: alone (no other admitted search) after one
             // eviction attempt → admit regardless of size. See
             // `LedgerState::active`.
-            if fits || (st.active == 0 && tried_evict) {
+            if (fits && held_back.is_none()) || (st.active == 0 && tried_evict) {
                 st.reserved = st.reserved.saturating_add(estimate);
                 st.active += 1;
+                st.tenant(tenant, |t| {
+                    t.reserved = t.reserved.saturating_add(estimate);
+                    t.active += 1;
+                    if waiting {
+                        t.stop_waiting(estimate);
+                    }
+                });
+                drop(st);
+                if waiting {
+                    // A tenant held back for this waiter may go ahead now.
+                    self.cv.notify_all();
+                }
                 return Ok(AdmissionPermit {
                     ledger: Arc::clone(self),
+                    tenant: tenant.to_string(),
                     remaining: Mutex::new(estimate),
                 });
             }
-            if !tried_evict {
+            if !fits && !tried_evict {
                 let needed = committed
                     .saturating_add(estimate)
                     .saturating_sub(self.max_live_bytes);
+                // Evicting cannot make a search larger than the whole
+                // watermark fit, so it does not cost the other tenants
+                // their shares; any other search gets the bytes it needs.
+                let what = if estimate > self.max_live_bytes {
+                    AdmissionEvict::RoomSparingShares
+                } else {
+                    AdmissionEvict::Room
+                };
                 drop(st);
-                evict_idle(needed);
+                evict_idle(needed, what);
                 tried_evict = true;
+                st = self.state.lock().unwrap();
+                continue;
+            }
+            if let (true, Some(over_by), false) = (fits, held_back, tried_shed) {
+                // Held back only for being over its share: idle cached
+                // bytes count toward that, and this is the one place the
+                // tenant can give them up (once per search).
+                drop(st);
+                evict_idle(over_by, AdmissionEvict::OwnIdle);
+                tried_shed = true;
                 st = self.state.lock().unwrap();
                 continue;
             }
             let now = Instant::now();
             if now >= deadline {
+                let active = st.active;
+                if waiting {
+                    st.tenant(tenant, |t| t.stop_waiting(estimate));
+                    drop(st);
+                    self.cv.notify_all();
+                }
+                if fits {
+                    // Shed by the per-tenant shares, not for lack of room.
+                    return Err(KoshaError::Overloaded(format!(
+                        "search fits under the {} live segment bytes watermark, \
+                         but tenant {tenant:?} is over its share of it and \
+                         another tenant's search waited for memory throughout \
+                         {:?} — retry with backoff",
+                        self.max_live_bytes, self.admission_timeout,
+                    )));
+                }
                 return Err(KoshaError::Overloaded(format!(
                     "search needs ~{estimate} more live segment bytes but \
                      {committed} of the {} watermark are already pinned by \
-                     {} in-flight search(es); nothing freed within {:?} — \
+                     {active} in-flight search(es); nothing freed within {:?} — \
                      retry with backoff",
-                    self.max_live_bytes, st.active, self.admission_timeout,
+                    self.max_live_bytes, self.admission_timeout,
                 )));
+            }
+            if !waiting {
+                waiting = true;
+                st.tenant(tenant, |t| t.waiting.push(estimate));
             }
             let (guard, _timeout) = self.cv.wait_timeout(st, deadline - now).unwrap();
             st = guard;
@@ -254,16 +459,23 @@ impl MemoryLedger {
 /// Delegates to the same `add_live`/`release_live` the `TrackedSegment`
 /// open-time accounting uses, so postings bytes and parsed-segment bytes
 /// share one `live` counter and one watermark — exactly the safety the
-/// per-segment cap alone couldn't provide at fleet scale.
-impl PostingsMemoryAccount for MemoryLedger {
+/// per-segment cap alone couldn't provide at fleet scale. One account is
+/// made per opened segment, so its deltas are charged to the segment's
+/// tenant (#342).
+struct TenantPostingsAccount {
+    ledger: Arc<MemoryLedger>,
+    tenant: String,
+}
+
+impl PostingsMemoryAccount for TenantPostingsAccount {
     fn add_postings(&self, bytes: u64) {
         if bytes > 0 {
-            self.add_live(bytes);
+            self.ledger.add_live(&self.tenant, bytes);
         }
     }
     fn release_postings(&self, bytes: u64) {
         if bytes > 0 {
-            self.release_live(bytes);
+            self.ledger.release_live(&self.tenant, bytes);
             // `release_live` notifies per release; aggregating many small
             // releases from a single cache drop would over-notify, but the
             // cache's snapshot-then-report discipline means one release per
@@ -281,6 +493,8 @@ pub struct TrackedSegment {
     reader: SegmentReader,
     bytes: u64,
     ledger: Arc<MemoryLedger>,
+    /// The tenant `bytes` are charged to in the ledger (#342).
+    tenant: String,
     /// Filter clause (as canonical JSON) → the documents of this segment
     /// that pass it. See [`Self::filter_set`].
     filter_sets: Mutex<HashMap<String, Arc<DocSet>>>,
@@ -297,12 +511,13 @@ const SPARSE_FILTER_RATIO: usize = 64;
 const MAX_FILTER_SETS_PER_SEGMENT: usize = 64;
 
 impl TrackedSegment {
-    fn new(reader: SegmentReader, bytes: u64, ledger: Arc<MemoryLedger>) -> Self {
-        ledger.add_live(bytes);
+    fn new(reader: SegmentReader, bytes: u64, ledger: Arc<MemoryLedger>, tenant: &str) -> Self {
+        ledger.add_live(tenant, bytes);
         Self {
             reader,
             bytes,
             ledger,
+            tenant: tenant.to_string(),
             filter_sets: Mutex::new(HashMap::new()),
         }
     }
@@ -353,7 +568,7 @@ impl std::ops::Deref for TrackedSegment {
 
 impl Drop for TrackedSegment {
     fn drop(&mut self) {
-        self.ledger.release_live(self.bytes);
+        self.ledger.release_live(&self.tenant, self.bytes);
     }
 }
 
@@ -364,6 +579,8 @@ impl Drop for TrackedSegment {
 /// is returned when the permit drops at the end of the search.
 pub struct AdmissionPermit {
     ledger: Arc<MemoryLedger>,
+    /// The tenant the reservation is charged to (#342).
+    tenant: String,
     remaining: Mutex<u64>,
 }
 
@@ -376,6 +593,9 @@ impl AdmissionPermit {
         if take > 0 {
             let mut st = self.ledger.state.lock().unwrap();
             st.reserved = st.reserved.saturating_sub(take);
+            st.tenant(&self.tenant, |t| {
+                t.reserved = t.reserved.saturating_sub(take)
+            });
             // No notify: the matching `live` increase (TrackedSegment::new)
             // keeps committed bytes net-unchanged, so no waiter can newly fit.
         }
@@ -388,6 +608,10 @@ impl Drop for AdmissionPermit {
         let mut st = self.ledger.state.lock().unwrap();
         st.reserved = st.reserved.saturating_sub(remaining);
         st.active = st.active.saturating_sub(1);
+        st.tenant(&self.tenant, |t| {
+            t.reserved = t.reserved.saturating_sub(remaining);
+            t.active = t.active.saturating_sub(1);
+        });
         drop(st);
         self.ledger.cv.notify_all();
     }
@@ -420,7 +644,19 @@ impl Drop for AdmissionPermit {
 /// per tenant (the first component of the namespace id — see
 /// [`kosha_core::tenancy`]) and evicts from the tenant furthest over its
 /// weighted share of `max_bytes`, least recently used first within that
-/// tenant, never taking a tenant below its floor while another can give.
+/// tenant, never taking a tenant below its floor while another can give
+/// or is over its share with every entry pinned by a running search.
+/// Eviction for admission ([`SegmentCache::evict_idle`]) also counts the
+/// tenant that is about to load and takes what tenants hold above their
+/// shares first. A search larger than the whole live-bytes watermark
+/// stops there, so a cold namespace that could never fit does not flush
+/// the other tenants' warm entries below their shares. A search that
+/// fits under the watermark is given the bytes it needs, below the
+/// shares if it must: the watermark is the memory guard.
+/// When the entry-count bound is the one exceeded, shares and the floor
+/// are counted in entries instead (the byte floor over the average entry
+/// size the budget allows), so a tenant opening many tiny segments evicts
+/// its own entries rather than another tenant's few large ones.
 /// Cache key: `(namespace, segment_id, load_vectors)`.
 type SegmentCacheKey = (String, String, bool);
 
@@ -518,12 +754,148 @@ impl SegmentCache {
         self.evict_idle_until(|len, total, _freed| len <= self.capacity && total <= self.max_bytes);
     }
 
-    /// Evict idle entries until at least `needed` bytes have been
-    /// freed, or no idle entries remain. Used by admission (see
+    /// Evict idle entries until at least `needed` bytes have been freed,
+    /// or nothing more may be taken. Used by admission (see
     /// [`MemoryLedger::admit`]) to free idle memory before making a search
-    /// wait on in-flight releases.
-    fn evict_idle(&self, needed: u64) {
-        self.evict_idle_until(|_len, _total, freed| freed >= needed);
+    /// wait on in-flight releases. Returns the bytes freed.
+    ///
+    /// The search belongs to tenant `requester` and is about to load
+    /// `estimate` bytes (#342); `wanted(key)` says which cached entries it
+    /// is about to read. Admission runs before the search pins anything,
+    /// and its estimate counts those entries as already loaded, so
+    /// evicting one frees nothing the search does not load straight back
+    /// (a cache miss, and bytes it was never admitted for).
+    ///
+    /// The requester counts as an active tenant holding its bytes plus
+    /// `estimate`. A tenant opening a cold namespace holds nothing yet, so
+    /// without this it would not count and the warm tenants would be the
+    /// only candidates, down to nothing. Victims are taken in this order,
+    /// least recently used first within a tenant:
+    ///
+    /// 1. What a tenant (the requester included) holds above both its
+    ///    weighted share of `max_bytes` and its floor, the tenant furthest
+    ///    over its share first. Entries the search wants are skipped.
+    ///    [`AdmissionEvict::RoomSparingShares`] stops here: when no entry
+    ///    may be taken the walk ends short of `needed`.
+    /// 2. For [`AdmissionEvict::Room`], where the bytes have to be found:
+    ///    the requester's other idle entries; then the other tenants'
+    ///    entries, one that keeps its floor before one that does not, and
+    ///    the furthest over (or least under) its share first; and last
+    ///    the entries the search wants.
+    ///
+    /// [`AdmissionEvict::OwnIdle`] takes only the requester's idle entries
+    /// the search does not want.
+    fn evict_idle(
+        &self,
+        needed: u64,
+        requester: &str,
+        estimate: u64,
+        what: AdmissionEvict,
+        wanted: impl Fn(&SegmentCacheKey) -> bool,
+    ) -> u64 {
+        let mut freed = 0u64;
+        let shares = self.shares();
+        let mut recency = self.recency.lock().unwrap();
+        let mut entries = self.entries.lock().unwrap();
+        let mut tenants = self.tenants.lock().unwrap();
+        while freed < needed {
+            recency.retain(|k| entries.contains_key(k));
+            let victim = {
+                let mut usage = tenants.usage();
+                match usage.iter_mut().find(|(t, _)| *t == requester) {
+                    Some((_, bytes)) => *bytes = bytes.saturating_add(estimate),
+                    None => usage.push((requester, estimate)),
+                }
+                // Each tenant's oldest idle entry the search does not
+                // want, and the oldest idle entry it does.
+                let mut oldest: HashMap<&str, (usize, u64)> = HashMap::new();
+                let mut oldest_wanted: Option<usize> = None;
+                for (pos, key) in recency.iter().enumerate() {
+                    let Some((arc, size)) = entries.get(key) else {
+                        continue;
+                    };
+                    if Arc::strong_count(arc) != 1 {
+                        continue;
+                    }
+                    if wanted(key) {
+                        oldest_wanted.get_or_insert(pos);
+                    } else {
+                        oldest
+                            .entry(tenant_of_namespace(&key.0))
+                            .or_insert((pos, *size));
+                    }
+                }
+                let own = oldest.get(requester).map(|(pos, _)| *pos);
+                if what == AdmissionEvict::OwnIdle {
+                    own
+                } else {
+                    let weighted = shares.shares(self.max_bytes, &usage);
+                    let floor = shares.floor(self.max_bytes, weighted.len());
+                    // Per tenant with an entry to give: whether it stays
+                    // at or above its share and its floor without the
+                    // entry, whether it keeps its floor, how far over its
+                    // share it is now, and the entry (oldest wins a tie).
+                    let candidates: Vec<(&str, bool, bool, i128, std::cmp::Reverse<usize>)> =
+                        weighted
+                            .iter()
+                            .filter_map(|(tenant, share)| {
+                                let (pos, size) = *oldest.get(tenant)?;
+                                let bytes = usage.iter().find(|(t, _)| t == tenant)?.1;
+                                let left = bytes.saturating_sub(size);
+                                Some((
+                                    *tenant,
+                                    left >= floor.max(*share),
+                                    left >= floor,
+                                    bytes as i128 - *share as i128,
+                                    std::cmp::Reverse(pos),
+                                ))
+                            })
+                            .collect();
+                    let above_share = candidates
+                        .iter()
+                        .filter(|(_, spare, ..)| *spare)
+                        .max_by_key(|(_, _, _, excess, pos)| (*excess, *pos))
+                        .map(|(.., pos)| pos.0);
+                    above_share.or_else(|| {
+                        if what != AdmissionEvict::Room {
+                            return None;
+                        }
+                        own.or_else(|| {
+                            candidates
+                                .iter()
+                                .filter(|(tenant, ..)| *tenant != requester)
+                                .max_by_key(|(_, _, keeps_floor, excess, pos)| {
+                                    (*keeps_floor, *excess, *pos)
+                                })
+                                .map(|(.., pos)| pos.0)
+                        })
+                        .or(oldest_wanted)
+                    })
+                }
+            };
+            let Some(pos) = victim else {
+                break;
+            };
+            let key = recency.remove(pos).expect("position from this walk");
+            if let Some((_, size)) = entries.remove(&key) {
+                // The Arc drops here, taking the ledger lock: allowed by
+                // the lock-order invariant (cache locks, then ledger).
+                self.total_bytes.fetch_sub(size, Ordering::Relaxed);
+                freed = freed.saturating_add(size);
+                let tenant = tenant_of_namespace(&key.0);
+                tenants.sub_bytes(tenant, size);
+                tenants.evicted(tenant);
+            }
+        }
+        if freed > 0 {
+            println!(
+                "segment cache evicted for admission: freed_mb={:.1} segments_left={} size_mb={:.1}",
+                freed as f64 / 1048576.0,
+                entries.len(),
+                self.total_bytes.load(Ordering::Relaxed) as f64 / 1048576.0
+            );
+        }
+        freed
     }
 
     /// Drop every cached entry for one segment (both `load_vectors`
@@ -544,6 +916,31 @@ impl SegmentCache {
         removed
     }
 
+    /// Drop every cached reader of the namespaces `matches` selects,
+    /// pinned or not. Returns how many went.
+    fn remove_namespaces(&self, matches: &dyn Fn(&str) -> bool) -> usize {
+        let mut entries = self.entries.lock().unwrap();
+        let mut tenants = self.tenants.lock().unwrap();
+        let doomed: Vec<_> = entries
+            .keys()
+            .filter(|key| matches(&key.0))
+            .cloned()
+            .collect();
+        let mut removed = Vec::with_capacity(doomed.len());
+        for key in doomed {
+            if let Some((reader, size)) = entries.remove(&key) {
+                self.total_bytes.fetch_sub(size, Ordering::Relaxed);
+                tenants.sub_bytes(tenant_of_namespace(&key.0), size);
+                removed.push(reader);
+            }
+        }
+        drop(tenants);
+        drop(entries);
+        // The readers drop here, outside the cache locks (dropping one
+        // takes the ledger lock).
+        removed.len()
+    }
+
     /// Per-tenant bytes, hits, misses and evictions.
     fn tenant_stats(&self) -> Vec<TenantCacheStats> {
         self.tenants.lock().unwrap().stats()
@@ -562,6 +959,8 @@ impl SegmentCache {
     /// exactly that, which is why its byte accounting drifted from real
     /// memory under concurrent load. If everything left is pinned, stop:
     /// bounding pinned memory is the admission gate's job, not eviction's.
+    /// For the same reason the walk stops rather than take a tenant below
+    /// its floor while the tenant over its share is fully pinned.
     fn evict_idle_until(&self, done: impl Fn(usize, u64, u64) -> bool) -> u64 {
         let mut freed = 0u64;
         let shares = self.shares();
@@ -575,7 +974,20 @@ impl SegmentCache {
             }
             // Stale recency keys (entry already gone) are dropped as found.
             recency.retain(|k| entries.contains_key(k));
-            let usage = tenants.usage();
+            // Which bound binds decides the currency of the tenant shares:
+            // past the entry bound (and not the byte bound), a tenant
+            // holding many tiny segments is the one over its share, not
+            // the one holding the most bytes (#342).
+            let by_entries = entries.len() > self.capacity && total <= self.max_bytes;
+            let usage: Vec<(&str, u64)> = if by_entries {
+                let mut counts: HashMap<&str, u64> = HashMap::new();
+                for key in entries.keys() {
+                    *counts.entry(tenant_of_namespace(&key.0)).or_insert(0) += 1;
+                }
+                counts.into_iter().collect()
+            } else {
+                tenants.usage()
+            };
             // One pass: each active tenant's least recently used idle entry.
             let mut oldest: HashMap<&str, (usize, u64)> = HashMap::new();
             let mut first_idle: Option<usize> = None;
@@ -595,10 +1007,49 @@ impl SegmentCache {
                     }
                 }
             }
-            let victim = shares
-                .pick_victim(self.max_bytes, &usage, |t| {
+            let picked = if by_entries {
+                // The byte floor in entries: the floor's worth of entries
+                // of the average size the budget allows, at least one.
+                let avg_entry = (self.max_bytes / self.capacity.max(1) as u64).max(1);
+                let floor_entries = (shares.min_bytes() / avg_entry).max(1);
+                shares.clone().with_min_bytes(floor_entries).pick_victim(
+                    self.capacity as u64,
+                    &usage,
+                    |t| oldest.get(t).map(|_| 1),
+                )
+            } else {
+                shares.pick_victim(self.max_bytes, &usage, |t| {
                     oldest.get(t).map(|(_, size)| *size)
                 })
+            };
+            // A tenant is not taken below its floor to make room for
+            // another tenant's pinned bytes (#342): when the tenant over
+            // its share has nothing idle, the overage is its running
+            // search's, and the next walk after that search ends takes it
+            // from there. Until then the cache stays over its budget;
+            // the live-bytes watermark is what bounds memory meanwhile.
+            let spared = !by_entries
+                && picked.is_some_and(|tenant| {
+                    let weighted = shares.shares(self.max_bytes, &usage);
+                    let floor = shares.floor(self.max_bytes, weighted.len());
+                    let bytes_of = |tenant: &str| {
+                        usage
+                            .iter()
+                            .find(|(t, _)| *t == tenant)
+                            .map_or(0, |(_, bytes)| *bytes)
+                    };
+                    let size = oldest.get(tenant).map_or(0, |(_, size)| *size);
+                    bytes_of(tenant).saturating_sub(size) < floor
+                        && weighted.iter().any(|(other, share)| {
+                            *other != tenant
+                                && !oldest.contains_key(other)
+                                && bytes_of(other) > *share
+                        })
+                });
+            if spared {
+                break;
+            }
+            let victim = picked
                 .and_then(|t| oldest.get(t).map(|(pos, _)| *pos))
                 .or(first_idle);
             drop(oldest);
@@ -1455,19 +1906,46 @@ struct CorpusStatsCache {
     entries: Mutex<HashMap<CorpusKey, Arc<CorpusEntry>>>,
     /// Weights for [`make_room_by_tenant`] (#342).
     shares: std::sync::RwLock<TenantShares>,
+    /// Per-tenant hits, misses and evictions (#342). Bytes are not tracked:
+    /// the cache is bounded by entry count. Lock order: `entries`, then
+    /// `tenants`.
+    tenants: Mutex<TenantLedger>,
 }
 
 impl CorpusStatsCache {
     fn get(&self, key: &CorpusKey) -> Option<Arc<CorpusEntry>> {
-        self.entries.lock().unwrap().get(key).cloned()
+        let hit = self.entries.lock().unwrap().get(key).cloned();
+        record_lookup(&self.tenants, &key.0, hit.is_some());
+        hit
     }
 
     fn insert(&self, key: CorpusKey, entry: Arc<CorpusEntry>) -> Arc<CorpusEntry> {
         let mut entries = self.entries.lock().unwrap();
         entries.retain(|k, _| corpus_entry_survives(k, &key));
         let shares = self.shares.read().unwrap_or_else(|e| e.into_inner());
-        make_room_by_tenant(&mut entries, CORPUS_STATS_MAX_ENTRIES, &shares);
+        let mut tenants = self.tenants.lock().unwrap();
+        make_room_by_tenant(
+            &mut entries,
+            CORPUS_STATS_MAX_ENTRIES,
+            &shares,
+            &mut tenants,
+        );
         Arc::clone(entries.entry(key).or_insert(entry))
+    }
+
+    fn tenant_stats(&self) -> Vec<TenantCacheStats> {
+        self.tenants.lock().unwrap().stats()
+    }
+}
+
+/// Count a lookup in a manifest-level cache against its namespace's tenant.
+fn record_lookup(ledger: &Mutex<TenantLedger>, namespace: &str, hit: bool) {
+    let mut ledger = ledger.lock().unwrap();
+    let tenant = tenant_of_namespace(namespace);
+    if hit {
+        ledger.hit(tenant);
+    } else {
+        ledger.miss(tenant);
     }
 }
 
@@ -1475,8 +1953,14 @@ impl CorpusStatsCache {
 /// `max` entries (#342): remove entries, oldest manifest version first,
 /// from the tenant holding the most entries relative to its weighted share
 /// of `max`, instead of clearing every tenant's entries at once. Each
-/// active tenant keeps at least one entry while another can give.
-fn make_room_by_tenant<V>(entries: &mut HashMap<CorpusKey, V>, max: usize, shares: &TenantShares) {
+/// active tenant keeps at least one entry while another can give. Each
+/// removal counts as an eviction of its tenant in `ledger`.
+fn make_room_by_tenant<V>(
+    entries: &mut HashMap<CorpusKey, V>,
+    max: usize,
+    shares: &TenantShares,
+    ledger: &mut TenantLedger,
+) {
     let shares = shares.clone().with_min_bytes(1);
     while !entries.is_empty() && entries.len() >= max {
         let mut counts: HashMap<&str, u64> = HashMap::new();
@@ -1499,6 +1983,7 @@ fn make_room_by_tenant<V>(entries: &mut HashMap<CorpusKey, V>, max: usize, share
         match victim {
             Some(key) => {
                 entries.remove(&key);
+                ledger.evicted(tenant_of_namespace(&key.0));
             }
             None => break,
         }
@@ -1600,19 +2085,33 @@ struct CeilingCache {
     entries: Mutex<HashMap<CorpusKey, Arc<CeilingEntry>>>,
     /// Weights for [`make_room_by_tenant`] (#342).
     shares: std::sync::RwLock<TenantShares>,
+    /// Per-tenant hits, misses and evictions, as in [`CorpusStatsCache`].
+    tenants: Mutex<TenantLedger>,
 }
 
 impl CeilingCache {
     fn get(&self, key: &CorpusKey) -> Option<Arc<CeilingEntry>> {
-        self.entries.lock().unwrap().get(key).cloned()
+        let hit = self.entries.lock().unwrap().get(key).cloned();
+        record_lookup(&self.tenants, &key.0, hit.is_some());
+        hit
     }
 
     fn insert(&self, key: CorpusKey, entry: Arc<CeilingEntry>) -> Arc<CeilingEntry> {
         let mut entries = self.entries.lock().unwrap();
         entries.retain(|k, _| corpus_entry_survives(k, &key));
         let shares = self.shares.read().unwrap_or_else(|e| e.into_inner());
-        make_room_by_tenant(&mut entries, CEILING_CACHE_MAX_ENTRIES, &shares);
+        let mut tenants = self.tenants.lock().unwrap();
+        make_room_by_tenant(
+            &mut entries,
+            CEILING_CACHE_MAX_ENTRIES,
+            &shares,
+            &mut tenants,
+        );
         Arc::clone(entries.entry(key).or_insert(entry))
+    }
+
+    fn tenant_stats(&self) -> Vec<TenantCacheStats> {
+        self.tenants.lock().unwrap().stats()
     }
 }
 
@@ -2066,15 +2565,62 @@ pub fn apply_highlight(
     pre_tag: &str,
     post_tag: &str,
 ) -> String {
-    let mut result = text.to_string();
+    // Lowercasing can change a character's UTF-8 length ("İ" is 2 bytes,
+    // its lowercase is 3), so an offset found in the lowercased text is not
+    // an offset into `text`. `bounds` records, for every character of
+    // `text`, where its lowercase form starts in `lowered` and where the
+    // character itself starts in `text`, so a match is mapped back to whole
+    // characters of the original.
+    let mut lowered = String::with_capacity(text.len());
+    let mut bounds: Vec<(usize, usize)> = Vec::with_capacity(text.len() + 1);
+    for (orig, c) in text.char_indices() {
+        bounds.push((lowered.len(), orig));
+        lowered.extend(c.to_lowercase());
+    }
+    bounds.push((lowered.len(), text.len()));
+    // Original-text byte range of the characters covering lowered[ls..le).
+    let to_original = |ls: usize, le: usize| -> (usize, usize) {
+        let first = bounds.partition_point(|&(l, _)| l <= ls) - 1;
+        let last = bounds.partition_point(|&(l, _)| l < le);
+        (bounds[first].1, bounds[last].1)
+    };
+
+    // One span per term: its first occurrence that does not overlap a span
+    // already taken. Spans are found on the untouched text and applied in a
+    // single pass, so a later term can never match inside an inserted tag.
+    let mut spans: Vec<(usize, usize)> = Vec::new();
     for term in query_terms {
-        let lower = term.to_lowercase();
-        if let Some(start) = result.to_lowercase().find(&lower) {
-            let (before, rest) = result.split_at(start);
-            let (matched, after) = rest.split_at(lower.len());
-            result = format!("{}{}{}{}{}", before, pre_tag, matched, post_tag, after);
+        let needle = term.to_lowercase();
+        if needle.is_empty() {
+            continue;
+        }
+        let mut from = 0;
+        while let Some(found) = lowered[from..].find(&needle) {
+            let ls = from + found;
+            let (start, end) = to_original(ls, ls + needle.len());
+            if spans.iter().all(|&(s, e)| end <= s || start >= e) {
+                spans.push((start, end));
+                break;
+            }
+            // Step one character forward in the lowered text.
+            from = ls + lowered[ls..].chars().next().map_or(1, char::len_utf8);
         }
     }
+    if spans.is_empty() {
+        return text.to_string();
+    }
+    spans.sort_unstable();
+    let mut result =
+        String::with_capacity(text.len() + spans.len() * (pre_tag.len() + post_tag.len()));
+    let mut cursor = 0;
+    for (start, end) in spans {
+        result.push_str(&text[cursor..start]);
+        result.push_str(pre_tag);
+        result.push_str(&text[start..end]);
+        result.push_str(post_tag);
+        cursor = end;
+    }
+    result.push_str(&text[cursor..]);
     result
 }
 
@@ -2569,6 +3115,12 @@ impl KnnMode {
 struct KnnPlan {
     /// The global probe budget: see [`Searcher::knn_plan`].
     cutoff: Option<(f32, usize)>,
+    /// Each probed segment's postings inside `cutoff`, already ranked
+    /// (#436), built from the centroid scores the cutoff itself came from
+    /// so the segment does not score and sort its centroids again. Empty
+    /// without a cutoff. A segment with a cutoff but no entry here (it
+    /// could not be opened by the plan) ranks its own postings.
+    rankings: HashMap<kosha_core::SegmentId, kosha_segment::KnnSegmentRanking>,
     /// Segments searched exactly over their filter-passing documents.
     exact_segments: HashSet<kosha_core::SegmentId>,
     mode: Option<KnnMode>,
@@ -2639,6 +3191,26 @@ pub struct SearchPhaseStats {
     /// global budget, which a cluster-aligned layout does not reduce on its
     /// own. Zero for non-kNN queries and on the per-segment fallback.
     pub knn_centroids_scanned: usize,
+    /// Where the posting scans of this kNN query spent their time (#435),
+    /// each summed across rayon workers (so they can exceed the wall-clock
+    /// `score_wall_ms` they are part of): reading posting bytes from local
+    /// disk, decoding them, and scoring entries against the query. Postings
+    /// served from a segment's decoded-posting cache
+    /// (`knn_postings_cached`) cost neither read nor decode. Zero for
+    /// non-kNN queries and for the legacy flat and late-interaction paths.
+    pub knn_read_ms: f64,
+    pub knn_decode_ms: f64,
+    pub knn_dot_ms: f64,
+    /// Time segments spent scoring and ranking their own centroids for a
+    /// budgeted probe (#436), summed across rayon workers like the three
+    /// above. `knn_plan` hands each segment its ranking, so this is zero
+    /// unless a segment had to rank for itself: one the plan could not
+    /// open, or a restricted probe (a filter, deleted documents) that ran
+    /// past its budget. The plan's own centroid scan is in `knn_plan_ms`.
+    pub knn_rank_ms: f64,
+    /// Of the postings scanned, how many came from a decoded-posting
+    /// cache.
+    pub knn_postings_cached: usize,
     /// Wall time of `knn_plan` (segment opens plus the centroid scan and
     /// budget cutoff), the part of a kNN query that is paid per segment
     /// before any posting is read. Zero for non-kNN queries. Disjoint
@@ -2740,6 +3312,22 @@ impl Bm25StatsUsed {
     }
 }
 
+impl OpenStatsCollector {
+    /// Adds one segment probe's posting-scan split (#435).
+    fn add_knn_scan(&self, scan: &kosha_segment::KnnScanStats) {
+        self.knn_read_nanos
+            .fetch_add(scan.read_nanos, Ordering::Relaxed);
+        self.knn_decode_nanos
+            .fetch_add(scan.decode_nanos, Ordering::Relaxed);
+        self.knn_dot_nanos
+            .fetch_add(scan.score_nanos, Ordering::Relaxed);
+        self.knn_rank_nanos
+            .fetch_add(scan.rank_nanos, Ordering::Relaxed);
+        self.knn_postings_cached
+            .fetch_add(scan.postings_cached, Ordering::Relaxed);
+    }
+}
+
 /// Shared-atomic collector threaded through the parallel scoring pass to
 /// build [`SearchPhaseStats`] (open counts/time come from inside
 /// `open_segment`, which runs concurrently per segment).
@@ -2755,6 +3343,13 @@ struct OpenStatsCollector {
     knn_segments: AtomicUsize,
     /// See [`SearchPhaseStats::knn_centroids_scanned`].
     knn_centroids: AtomicUsize,
+    /// Posting-scan phase split (#435) — see
+    /// [`SearchPhaseStats::knn_read_ms`] and its neighbours.
+    knn_read_nanos: AtomicU64,
+    knn_decode_nanos: AtomicU64,
+    knn_dot_nanos: AtomicU64,
+    knn_rank_nanos: AtomicU64,
+    knn_postings_cached: AtomicUsize,
     /// See [`SearchPhaseStats::wand_docs_scored`].
     wand_docs_scored: AtomicUsize,
     /// See [`SearchPhaseStats::wand_segments_skipped`].
@@ -2824,8 +3419,23 @@ impl Searcher {
         self.segment_cache.tenant_stats()
     }
 
+    /// Per-tenant hits, misses and evictions of the corpus-statistics
+    /// cache (#342), for `kosha_cache_*{cache="corpus_stats",tenant}`.
+    /// Bounded by entry count, so its bytes are not tracked.
+    pub fn corpus_stats_cache_tenant_stats(&self) -> Vec<TenantCacheStats> {
+        self.corpus_stats.tenant_stats()
+    }
+
+    /// Per-tenant hits, misses and evictions of the score-ceiling cache
+    /// (#342), for `kosha_cache_*{cache="ceiling",tenant}`.
+    pub fn ceiling_cache_tenant_stats(&self) -> Vec<TenantCacheStats> {
+        self.ceilings.tenant_stats()
+    }
+
     /// Set how the in-memory caches (parsed segments, corpus statistics,
-    /// score ceilings) split their budgets between tenants (#342). The
+    /// score ceilings) split their budgets between tenants (#342), and the
+    /// weights the admission gate uses when its per-tenant shares are on
+    /// ([`Self::set_admission_tenant_shares`]). The
     /// default comes from `KOSHA_CACHE_TENANT_MIN_BYTES` with equal
     /// weights.
     pub fn set_tenant_shares(&self, shares: TenantShares) {
@@ -2833,8 +3443,20 @@ impl Searcher {
             *lock.write().unwrap_or_else(|e| e.into_inner()) = shares.clone();
         };
         set(&self.segment_cache.shares);
+        set(&self.ledger.shares);
         set(&self.corpus_stats.shares);
         set(&self.ceilings.shares);
+    }
+
+    /// Turn per-tenant shares in the live-memory admission gate on or off
+    /// (#342, `KOSHA_ADMISSION_TENANT_SHARES`; off by default). When on, a
+    /// tenant already over its weighted share of the live-bytes watermark
+    /// is not admitted again while another tenant's search waits for
+    /// memory. See [`MemoryLedger::admit`].
+    pub fn set_admission_tenant_shares(&self, enabled: bool) {
+        self.ledger
+            .tenant_shares_enabled
+            .store(enabled, Ordering::Relaxed);
     }
 
     pub fn new(data_dir: PathBuf) -> Self {
@@ -2909,6 +3531,33 @@ impl Searcher {
 
     pub fn set_global_wand_threshold(&self, enabled: bool) {
         self.global_wand.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Forget everything cached in memory for the namespaces `matches`
+    /// selects (#347, a deleted namespace or tenant): parsed segments,
+    /// corpus statistics and score ceilings. Returns how many parsed
+    /// segments were dropped.
+    ///
+    /// A search already running keeps the readers it holds until it ends;
+    /// nothing here waits for it. Forgetting a namespace that still exists
+    /// only costs its next search a reload.
+    pub fn forget_namespaces(&self, matches: impl Fn(&str) -> bool) -> usize {
+        let removed = self.segment_cache.remove_namespaces(&matches);
+        self.corpus_stats
+            .entries
+            .lock()
+            .unwrap()
+            .retain(|key, _| !matches(&key.0));
+        self.ceilings
+            .entries
+            .lock()
+            .unwrap()
+            .retain(|key, _| !matches(&key.0));
+        self.draining
+            .lock()
+            .unwrap()
+            .retain(|(namespace, _), _| !matches(namespace));
+        removed
     }
 
     /// Stop caching a retired segment and report whether any reader of it
@@ -3013,7 +3662,14 @@ impl Searcher {
         // aggregate decoded-postings memory across all open segments counts
         // toward the admission watermark — the fleet-scale safety the
         // per-segment cap alone couldn't provide.
-        let postings_account: Arc<dyn PostingsMemoryAccount + Send + Sync> = self.ledger.clone();
+        // The account carries the segment's tenant, so those deltas are
+        // charged to it like the segment's own bytes (#342).
+        let tenant = tenant_of_namespace(namespace);
+        let postings_account: Arc<dyn PostingsMemoryAccount + Send + Sync> =
+            Arc::new(TenantPostingsAccount {
+                ledger: Arc::clone(&self.ledger),
+                tenant: tenant.to_string(),
+            });
         let reader = SegmentReader::open_with_footer_options(
             seg_dir,
             load_vectors,
@@ -3024,6 +3680,7 @@ impl Searcher {
             reader,
             approx_bytes,
             Arc::clone(&self.ledger),
+            tenant,
         ));
         if let Some(stats) = stats {
             stats.cold.fetch_add(1, Ordering::Relaxed);
@@ -3037,6 +3694,36 @@ impl Searcher {
         self.segment_cache
             .insert(key, Arc::clone(&tracked), approx_bytes);
         Ok(tracked)
+    }
+
+    /// The eviction [`MemoryLedger::admit`] asks for on behalf of a search
+    /// or warmup pass over `manifest`'s segments of `namespace` that is
+    /// about to load `estimate` bytes. The entries that pass is about to
+    /// read are named to the cache, which takes them last or not at all
+    /// (see [`SegmentCache::evict_idle`]).
+    fn evict_for_admission(
+        &self,
+        namespace: &NamespaceId,
+        manifest: &Manifest,
+        load_vectors: bool,
+        estimate: u64,
+        needed: u64,
+        what: AdmissionEvict,
+    ) {
+        let segments: HashSet<&str> = manifest
+            .segments
+            .iter()
+            .map(|entry| entry.segment_id.0.as_str())
+            .collect();
+        self.segment_cache.evict_idle(
+            needed,
+            tenant_of_namespace(&namespace.0),
+            estimate,
+            what,
+            |key| {
+                key.0 == namespace.0 && key.2 == load_vectors && segments.contains(key.1.as_str())
+            },
+        );
     }
 
     /// Opens and caches every manifest segment present locally, for
@@ -3104,9 +3791,10 @@ impl Searcher {
             })
             .sum();
 
-        let permit = self
-            .ledger
-            .admit(estimate, |needed| self.segment_cache.evict_idle(needed))?;
+        let tenant = tenant_of_namespace(&namespace.0);
+        let permit = self.ledger.admit(tenant, estimate, |needed, what| {
+            self.evict_for_admission(namespace, manifest, load_vectors, estimate, needed, what);
+        })?;
 
         let mut pinned = Vec::with_capacity(present.len());
         let mut opened = 0usize;
@@ -3188,7 +3876,7 @@ impl Searcher {
     /// already resident in every open segment's `LazyVectorIndex` (loaded
     /// from the small `vector.offsets` sidecar), so this pass does no
     /// posting I/O at all — the expensive part of a kNN query is
-    /// `hydrate_posting`, and that is precisely what the cutoff then
+    /// `scan_posting`, and that is precisely what the cutoff then
     /// prevents. The filter sets it counts are the ones scoring would
     /// build anyway, and stay cached on the segment for it.
     ///
@@ -3252,6 +3940,7 @@ impl Searcher {
         query: &SearchQuery,
         knn: &kosha_core::KnnQuery,
         cutoff: Option<(f32, usize)>,
+        rankings: &HashMap<kosha_core::SegmentId, kosha_segment::KnnSegmentRanking>,
         tombstones: Option<
             &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
         >,
@@ -3263,10 +3952,19 @@ impl Searcher {
         // (`limit_per` never reaches here: see the gate in `search_inner`).
         debug_assert!(query.limit_per.is_none());
         let fetch_k = knn.k;
-        let budget = match cutoff {
-            Some((max_distance, max_probes)) => kosha_segment::KnnProbeBudget::Within {
-                max_distance,
-                max_probes,
+        // This pass runs unfiltered requests only, so the one restriction
+        // a segment can have is its deleted documents.
+        let refill = kosha_segment::KnnRefill::BudgetedSegments;
+        let budget_for = |segment_id: &kosha_core::SegmentId| match cutoff {
+            // The plan's ranking of this segment's postings (#436), when
+            // it has one; the segment ranks its own otherwise.
+            Some((max_distance, max_probes)) => match rankings.get(segment_id) {
+                Some(ranking) => kosha_segment::KnnProbeBudget::Planned { ranking, refill },
+                None => kosha_segment::KnnProbeBudget::Within {
+                    max_distance,
+                    max_probes,
+                    refill,
+                },
             },
             None => kosha_segment::KnnProbeBudget::Nprobe(knn.num_candidates),
         };
@@ -3307,16 +4005,18 @@ impl Searcher {
                 let accept = |doc_seq: u32| dead.is_none_or(|seqs| !seqs.contains(&doc_seq));
                 let accept_dyn: Option<&dyn Fn(u32) -> bool> =
                     if dead.is_some() { Some(&accept) } else { None };
-                let found = reader
-                    .knn_candidates_fetching(
+                let (found, scan) = kosha_segment::with_knn_scan_stats(|| {
+                    reader.knn_candidates_fetching(
                         &knn.field,
                         &knn.vector,
                         fetch_k,
-                        budget,
+                        budget_for(&entry.segment_id),
                         accept_dyn,
                         vector_fetch,
-                    )?
-                    .ok()?;
+                    )
+                });
+                open_stats.add_knn_scan(&scan);
+                let found = found?.ok()?;
                 open_stats
                     .knn_postings
                     .fetch_add(found.postings, Ordering::Relaxed);
@@ -3613,6 +4313,7 @@ impl Searcher {
         };
         let mut plan = KnnPlan {
             cutoff: None,
+            rankings: HashMap::new(),
             exact_segments,
             mode: Some(mode),
             filtered_candidates,
@@ -3672,6 +4373,21 @@ impl Searcher {
         let (cutoff, rule) = knn_budget_cutoff(&mut all, budget, relative);
         plan.cutoff = Some((cutoff, budget));
         plan.cutoff_rule = rule;
+        // Hand every probed segment its postings inside the cutoff, ranked
+        // (#436). The scores are the ones the cutoff was just picked from,
+        // so the segment's ranking and the cutoff cannot drift apart, and
+        // the segment does not score its centroids a second time. Per
+        // segment this selects the few postings under the cutoff instead
+        // of sorting all of them.
+        plan.rankings = per_segment
+            .into_iter()
+            .filter(|info| !plan.exact_segments.contains(info.segment_id))
+            .filter_map(|info| {
+                let ranking =
+                    kosha_segment::KnnSegmentRanking::new(info.distances?, cutoff, budget);
+                Some((info.segment_id.clone(), ranking))
+            })
+            .collect();
         Ok(plan)
     }
 
@@ -4195,6 +4911,9 @@ impl Searcher {
         // flat segments, or budgeting disabled) — fall back to per-segment
         // `nprobe`.
         knn_cutoff: Option<(f32, usize)>,
+        // The plan's ranking of this segment's postings inside
+        // `knn_cutoff` (#436); `None` and the segment ranks its own.
+        knn_ranking: Option<&kosha_segment::KnnSegmentRanking>,
         // The plan put this segment on the exact path (#252): score every
         // filter-passing document's vector instead of probing.
         knn_exact: bool,
@@ -4216,11 +4935,10 @@ impl Searcher {
     ) -> Result<Option<SegmentOutput>, KoshaError> {
         let manifest_footer = manifest.segment_footer(&entry.segment_id);
         let seg_dir = manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id);
-        if !seg_dir.exists() {
-            return Ok(None);
-        }
 
         // Prune via footer blooms before opening inverted/filters/vectors.
+        // A pruned segment needs nothing local: a query node never
+        // hydrates it.
         if query.has_prunable_filter() || term_prune.is_some() {
             let footer = match manifest_footer {
                 Some(footer) => Some(std::borrow::Cow::Borrowed(footer)),
@@ -4238,6 +4956,16 @@ impl Searcher {
                     }
                 }
             }
+        }
+        // A segment the manifest lists and the query may match but that is
+        // not on local disk (evicted after hydration, or behind a stale
+        // hydration verdict) fails the search: skipping it would answer
+        // without its documents.
+        if !seg_dir.exists() {
+            return Err(KoshaError::NotFound(format!(
+                "{}: segment not local (not hydrated, or evicted from the disk cache)",
+                seg_dir.display()
+            )));
         }
 
         // Lexical/BM25 queries (no query.knn) never touch vectors or the
@@ -4303,6 +5031,7 @@ impl Searcher {
         // segment with no deletes pays one predictable branch per posting
         // and never calls into the set lookups at all.
         let restricted = filter_set.is_some() || segment_tombstones.is_some();
+        let filtered = filter_set.is_some();
         let rejected = |doc_seq: u32| -> bool { restricted && !accept(doc_seq) };
 
         // Columnar segments (#244) aggregate and sort straight from their
@@ -5572,6 +6301,16 @@ impl Searcher {
                     && accept(doc_seq)
             };
             let knn_restricted = restricted || knn_filter_set.is_some();
+            // A filter can put its only passing documents in a segment the
+            // global budget chose nothing from, so a filtered probe refills
+            // everywhere. Deleted documents alone do not move the nearest
+            // neighbours to another segment: a segment outside the cutoff
+            // stays unprobed, as it would be with no tombstone in it.
+            let knn_refill = if filtered || knn_filter_set.is_some() {
+                kosha_segment::KnnRefill::Always
+            } else {
+                kosha_segment::KnnRefill::BudgetedSegments
+            };
             let knn_accept_dyn: Option<&dyn Fn(u32) -> bool> = if knn_restricted {
                 Some(&knn_accept)
             } else {
@@ -5685,13 +6424,17 @@ impl Searcher {
                             .filter(|&doc_seq| knn_accept(doc_seq))
                             .collect(),
                     };
-                    match reader.knn_exact_filtered_fetching(
-                        &knn.field,
-                        &knn.vector,
-                        fetch_k,
-                        &candidates,
-                        vector_fetch,
-                    ) {
+                    let (exact, scan) = kosha_segment::with_knn_scan_stats(|| {
+                        reader.knn_exact_filtered_fetching(
+                            &knn.field,
+                            &knn.vector,
+                            fetch_k,
+                            &candidates,
+                            vector_fetch,
+                        )
+                    });
+                    open_stats.add_knn_scan(&scan);
+                    match exact {
                         Some(Ok(exact)) => {
                             open_stats
                                 .knn_postings
@@ -5727,26 +6470,39 @@ impl Searcher {
                                 .fetch_add(1, Ordering::Relaxed);
                         }
                     }
-                    let probe = match knn_cutoff {
-                        Some((cutoff, effective_budget)) => reader
-                            .knn_search_within_filtered_fetching(
+                    let (probe, scan) = kosha_segment::with_knn_scan_stats(|| match knn_cutoff {
+                        Some((cutoff, effective_budget)) => match knn_ranking {
+                            // The plan already ranked this segment's
+                            // postings inside the cutoff (#436).
+                            Some(ranking) => reader.knn_search_planned_fetching(
+                                &knn.field,
+                                &knn.vector,
+                                fetch_k,
+                                ranking,
+                                knn_accept_dyn,
+                                knn_refill,
+                                vector_fetch,
+                            ),
+                            None => reader.knn_search_within_filtered_fetching(
                                 &knn.field,
                                 &knn.vector,
                                 fetch_k,
                                 cutoff,
                                 effective_budget,
                                 knn_accept_dyn,
+                                knn_refill,
                                 vector_fetch,
-                            )
-                            .map(|r| {
-                                r.map(|(results, probes)| {
-                                    open_stats.knn_postings.fetch_add(probes, Ordering::Relaxed);
-                                    if probes > 0 {
-                                        open_stats.knn_segments.fetch_add(1, Ordering::Relaxed);
-                                    }
-                                    results
-                                })
-                            }),
+                            ),
+                        }
+                        .map(|r| {
+                            r.map(|(results, probes)| {
+                                open_stats.knn_postings.fetch_add(probes, Ordering::Relaxed);
+                                if probes > 0 {
+                                    open_stats.knn_segments.fetch_add(1, Ordering::Relaxed);
+                                }
+                                results
+                            })
+                        }),
                         None => reader
                             .knn_search_filtered_fetching(
                                 &knn.field,
@@ -5768,7 +6524,8 @@ impl Searcher {
                                     open_stats.knn_segments.fetch_add(1, Ordering::Relaxed);
                                 })
                             }),
-                    };
+                    });
+                    open_stats.add_knn_scan(&scan);
                     match probe {
                         Some(Ok(results)) => results,
                         Some(Err(e)) => {
@@ -6287,9 +7044,10 @@ impl Searcher {
                 }
             })
             .sum();
-        let permit = self
-            .ledger
-            .admit(estimate, |needed| self.segment_cache.evict_idle(needed))?;
+        let tenant = tenant_of_namespace(&namespace.0);
+        let permit = self.ledger.admit(tenant, estimate, |needed, what| {
+            self.evict_for_admission(namespace, manifest, load_vectors, estimate, needed, what);
+        })?;
         phase_stats.admit_wall_ms = t_admit.elapsed().as_secs_f64() * 1e3;
 
         // Legacy reading, for highlighting only: scoring analyzes the
@@ -6411,6 +7169,7 @@ impl Searcher {
                     query,
                     knn,
                     knn_plan.cutoff,
+                    &knn_plan.rankings,
                     tombstones,
                     &permit,
                     &open_stats,
@@ -6476,6 +7235,7 @@ impl Searcher {
                 &permit,
                 &open_stats,
                 knn_plan.cutoff,
+                knn_plan.rankings.get(&entry.segment_id),
                 knn_plan.exact_segments.contains(&entry.segment_id),
                 knn_global
                     .as_ref()
@@ -6567,6 +7327,12 @@ impl Searcher {
         phase_stats.knn_postings_probed = open_stats.knn_postings.load(Ordering::Relaxed);
         phase_stats.knn_segments_probed = open_stats.knn_segments.load(Ordering::Relaxed);
         phase_stats.knn_centroids_scanned = open_stats.knn_centroids.load(Ordering::Relaxed);
+        phase_stats.knn_read_ms = open_stats.knn_read_nanos.load(Ordering::Relaxed) as f64 / 1e6;
+        phase_stats.knn_decode_ms =
+            open_stats.knn_decode_nanos.load(Ordering::Relaxed) as f64 / 1e6;
+        phase_stats.knn_dot_ms = open_stats.knn_dot_nanos.load(Ordering::Relaxed) as f64 / 1e6;
+        phase_stats.knn_rank_ms = open_stats.knn_rank_nanos.load(Ordering::Relaxed) as f64 / 1e6;
+        phase_stats.knn_postings_cached = open_stats.knn_postings_cached.load(Ordering::Relaxed);
         phase_stats.knn_exact_vectors = open_stats.knn_exact_vectors.load(Ordering::Relaxed);
         if query.knn.is_some() && self.knn_rescore_stats_on() {
             phase_stats.knn_rescore_stats = true;
@@ -6677,7 +7443,7 @@ impl Searcher {
         if let Some(ref rank_by) = rank_by {
             candidates.sort_by(by_score_then_id);
             candidates.truncate(rank_by.window);
-            rescore_candidates(rank_by, &mut candidates);
+            rescore_candidates(rank_by, &query.filter_column_fields(), &mut candidates)?;
         }
 
         // ── Sort (score-only / sort-key candidates — no full field payloads) ──
@@ -6798,8 +7564,15 @@ impl Searcher {
         // so `doc_record_full` needs no further S3 round trip.
         let mut page = Vec::with_capacity(to - from);
         for cand in &candidates[from..to] {
+            // A hit's `doc_seq` came from this segment's own postings or
+            // vectors, so a record that is not there is a damaged segment,
+            // not a hit to leave off the page.
             let Some(doc_rec) = cand.reader.doc_record_full(cand.doc_seq)? else {
-                continue;
+                return Err(KoshaError::CorruptSegment(format!(
+                    "{}: hit doc_seq {} has no stored record",
+                    cand.reader.segment_dir().display(),
+                    cand.doc_seq
+                )));
             };
             let mut doc = ScoredDocument {
                 doc_id: cand.doc_id.clone(),
@@ -7937,8 +8710,15 @@ fn by_score_then_id(a: &HitCandidate, b: &HitCandidate) -> std::cmp::Ordering {
 
 /// Apply `rank_by` to `candidates` in place, keeping each hit's original
 /// score in `rank_details.base_score`. Candidates are grouped by segment so
-/// each segment's filter columns are located once.
-fn rescore_candidates(rank_by: &kosha_core::CompiledRankBy, candidates: &mut [HitCandidate]) {
+/// each segment's filter columns are located once. `fields` is the query's
+/// `filter_column_fields`, which holds the `rank_by` fields: only those
+/// columns are read (#244), and one that is not local fails the search
+/// rather than leaving every hit of the segment unranked.
+fn rescore_candidates(
+    rank_by: &kosha_core::CompiledRankBy,
+    fields: &std::collections::BTreeSet<String>,
+    candidates: &mut [HitCandidate],
+) -> Result<(), KoshaError> {
     let mut order: Vec<usize> = (0..candidates.len()).collect();
     order.sort_by_key(|&i| Arc::as_ptr(&candidates[i].reader) as usize);
     let mut start = 0;
@@ -7948,7 +8728,7 @@ fn rescore_candidates(rank_by: &kosha_core::CompiledRankBy, candidates: &mut [Hi
         while end < order.len() && Arc::ptr_eq(&candidates[order[end]].reader, &reader) {
             end += 1;
         }
-        let store = reader.filter_store();
+        let store = reader.filter_store_for(fields)?;
         let mut ranker = rank_by.for_segment(&store);
         for &i in &order[start..end] {
             let cand = &mut candidates[i];
@@ -7960,6 +8740,7 @@ fn rescore_candidates(rank_by: &kosha_core::CompiledRankBy, candidates: &mut [Hi
         }
         start = end;
     }
+    Ok(())
 }
 
 /// The order of the result list: the request's sort keys, or score
@@ -9624,6 +10405,59 @@ mod tests {
         assert!(d.highlight.is_none() && d.highlights.is_none());
     }
 
+    /// Lowercasing "İ" grows it from 2 to 3 bytes, so an offset found in
+    /// the lowercased text used to land past the end of the original (or
+    /// inside a character) and panic.
+    #[test]
+    fn apply_highlight_maps_offsets_through_case_folding() {
+        let t = |s: &str| vec![s.to_string()];
+        assert_eq!(
+            apply_highlight("İstanbul café", &t("café"), "<b>", "</b>"),
+            "İstanbul <b>café</b>"
+        );
+        assert_eq!(
+            apply_highlight("İİİİ the contract", &t("contract"), "<b>", "</b>"),
+            "İİİİ the <b>contract</b>"
+        );
+        assert_eq!(
+            apply_highlight("İstanbul hukuk bürosu", &t("hukuk"), "<em>", "</em>"),
+            "İstanbul <em>hukuk</em> bürosu"
+        );
+        // A match on the expanded character marks the whole character.
+        assert_eq!(apply_highlight("İstanbul", &t("i"), "[", "]"), "[İ]stanbul");
+        assert_eq!(
+            apply_highlight("STRASSE Straße", &t("straße"), "[", "]"),
+            "STRASSE [Straße]"
+        );
+        assert_eq!(apply_highlight("abc", &t(""), "[", "]"), "abc");
+    }
+
+    /// A later term must not match inside the tag inserted for an earlier
+    /// one, and overlapping matches must not nest.
+    #[test]
+    fn apply_highlight_never_matches_inserted_tags() {
+        let terms = |ts: &[&str]| ts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            apply_highlight("plan b for the plan", &terms(&["plan", "b"]), "<b>", "</b>"),
+            "<b>plan</b> <b>b</b> for the plan"
+        );
+        assert_eq!(
+            apply_highlight(
+                "contract member",
+                &terms(&["contract", "em"]),
+                "<em>",
+                "</em>"
+            ),
+            "<em>contract</em> m<em>em</em>ber"
+        );
+        // "tract" overlaps the span taken by "contract" and has no other
+        // occurrence, so it adds nothing.
+        assert_eq!(
+            apply_highlight("contract", &terms(&["contract", "tract"]), "[", "]"),
+            "[contract]"
+        );
+    }
+
     fn mk_query(text: &str, max: usize) -> SearchQuery {
         SearchQuery {
             query_text: text.into(),
@@ -10461,6 +11295,97 @@ mod tests {
     }
 
     #[test]
+    fn planned_segment_probes_equal_each_segment_ranking_its_own_postings() {
+        // #436: `knn_plan` hands every segment its postings inside the
+        // cutoff, ranked, instead of the segment scoring and sorting its
+        // centroids again. The search must return what the segments would
+        // have found ranking their own postings under the same cutoff and
+        // cap, and probe exactly as many postings and segments.
+        let dir = std::env::temp_dir().join("kosha-test-knn-planned-rankings");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        const SEGS: usize = 12;
+        const PER_SEG: usize = 400;
+        let (manifest, _) = mk_vector_corpus(&dir, "test", SEGS, PER_SEG);
+        let searcher = Searcher::new(dir.clone());
+
+        let readers: Vec<SegmentReader> = manifest
+            .segments
+            .iter()
+            .map(|entry| {
+                SegmentReader::open_with_options(dir.join("test").join(&entry.segment_id.0), true)
+                    .unwrap()
+            })
+            .collect();
+        for (angle, requested, k) in [(0.0f32, 9usize, 10usize), (1.1, 3, 5), (2.9, 40, 10)] {
+            let vector = vec![angle.cos(), angle.sin(), 0.0, 0.0];
+            let mut q = mk_query("", k);
+            q.knn = Some(kosha_core::KnnQuery {
+                query_text: None,
+                embedding_model: None,
+                field: "emb".into(),
+                vector: vector.clone(),
+                k,
+                num_candidates: requested,
+                filter: None,
+                vectors: None,
+                scoring: None,
+            });
+            let (r, stats) = searcher
+                .search_with_stats(&ns, &manifest, &q, None)
+                .unwrap();
+
+            // The same cutoff, from the same scores, by the same rule.
+            let bounds: Vec<Vec<f32>> = readers
+                .iter()
+                .map(|reader| reader.knn_centroid_distances("emb", &vector).unwrap())
+                .collect();
+            let mut all: Vec<f32> = bounds.iter().flatten().copied().collect();
+            assert_eq!(stats.knn_centroids_scanned, all.len());
+            let budget = effective_knn_budget(requested, all.len());
+            assert!(
+                budget < all.len(),
+                "the budget must cut something: {budget} of {}",
+                all.len()
+            );
+            let (cutoff, _) = knn_budget_cutoff(&mut all, budget, None);
+
+            // Each segment ranking its own postings (no plan).
+            let mut expect: Vec<(String, f64)> = Vec::new();
+            let (mut postings, mut segments) = (0usize, 0usize);
+            for (s, reader) in readers.iter().enumerate() {
+                let (hits, probes) = reader
+                    .knn_search_within_filtered("emb", &vector, k, cutoff, budget, None)
+                    .unwrap()
+                    .unwrap();
+                postings += probes;
+                segments += usize::from(probes > 0);
+                expect.extend(
+                    hits.into_iter()
+                        .map(|(doc_seq, score)| (format!("s{s:03}-d{doc_seq}"), score)),
+                );
+            }
+            expect.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            expect.truncate(k);
+            assert!(
+                expect.windows(2).all(|w| w[0].1 > w[1].1),
+                "the arc has no equal scores, so the order is unambiguous"
+            );
+
+            assert_eq!(stats.knn_postings_probed, postings, "angle {angle}");
+            assert_eq!(stats.knn_segments_probed, segments, "angle {angle}");
+            assert!(
+                segments < SEGS,
+                "some segment must sit wholly outside the cutoff"
+            );
+            let got: Vec<&str> = r.results.iter().map(|h| h.doc_id.0.as_str()).collect();
+            let want: Vec<&str> = expect.iter().map(|(id, _)| id.as_str()).collect();
+            assert_eq!(got, want, "angle {angle}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn segment_byte_charge_reflects_resident_size_not_on_disk_size() {
         // Issue #136's root cause: `approx_segment_bytes` charged the full
         // on-disk size of files the reader deliberately does NOT hold in
@@ -10755,8 +11680,784 @@ mod tests {
 
         // Evicting the now-idle entry drops the last Arc → live returns to
         // zero, i.e. eviction and actual memory release now coincide.
-        searcher.segment_cache.evict_idle(u64::MAX);
+        searcher
+            .segment_cache
+            .evict_idle(u64::MAX, "_legacy", 0, AdmissionEvict::Room, |_| false);
         assert_eq!(ledger_snapshot(&searcher).0, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A manifest over `count` one-document segments written under `ns`.
+    fn mk_tenant_namespace(root: &std::path::Path, ns: &str, count: usize) -> (Manifest, u64) {
+        let mut bytes = 0u64;
+        let mut segments = Vec::with_capacity(count);
+        for i in 0..count {
+            let seg = format!("s{i:03}");
+            let seg_dir = mk_segment(root, ns, &seg, "alpha");
+            bytes += approx_segment_bytes(&seg_dir, false);
+            segments.push(ManifestEntry {
+                segment_id: SegmentId(seg),
+                doc_count: 1,
+            });
+        }
+        let manifest = Manifest {
+            version: 1,
+            segments,
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            branch: None,
+            schema: None,
+            retired: Default::default(),
+            shards: None,
+        };
+        (manifest, bytes)
+    }
+
+    fn tenant_cache_stats(searcher: &Searcher, tenant: &str) -> TenantCacheStats {
+        searcher
+            .segment_cache_tenant_stats()
+            .into_iter()
+            .find(|s| s.tenant == tenant)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_cold_namespace_larger_than_the_cache_leaves_another_tenants_warm_floor() {
+        // #342 "Done when": tenant acme opening a cold namespace of twice
+        // the segment-cache budget must not flush tenant beta's warm set.
+        // Admission used to evict without knowing who asked: acme held no
+        // bytes yet, so beta was the only tenant the walk could take from,
+        // and it was taken to zero. Beta's warm set here is half the
+        // budget: its equal share once acme is active, so it keeps all of
+        // it. (Bytes a tenant holds above its share are given up, in
+        // `admission_eviction_for_an_oversized_search_spares_other_tenants_shares`.)
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-admission-tenant-floor-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        const WARM: usize = 8;
+        let beta_ns = NamespaceId("beta/docs".into());
+        let acme_ns = NamespaceId("acme/big".into());
+        const COLD: usize = 4 * WARM + 2;
+        let (beta_manifest, beta_bytes) = mk_tenant_namespace(&dir, &beta_ns.0, WARM);
+        let budget = 2 * beta_bytes;
+        let (acme_manifest, acme_bytes) = mk_tenant_namespace(&dir, &acme_ns.0, COLD);
+        assert!(acme_bytes >= 2 * budget, "{acme_bytes} vs budget {budget}");
+
+        let searcher = Searcher::with_memory_limits(
+            dir.clone(),
+            1_000,
+            budget,
+            2 * budget,
+            Duration::from_secs(5),
+        );
+        let min_bytes = kosha_core::tenancy::DEFAULT_TENANT_MIN_BYTES;
+        searcher.set_tenant_shares(TenantShares::new(min_bytes));
+        let query = mk_query("alpha", 10);
+
+        // Beta's namespace becomes warm.
+        for _ in 0..2 {
+            let result = searcher
+                .search(&beta_ns, &beta_manifest, &query, None)
+                .unwrap();
+            assert_eq!(result.total_hits, WARM);
+        }
+        assert_eq!(tenant_cache_stats(&searcher, "beta").bytes, beta_bytes);
+
+        // Acme's cold namespace: its estimate alone is the whole watermark,
+        // and every segment it opens stays pinned until its search ends.
+        let result = searcher
+            .search(&acme_ns, &acme_manifest, &query, None)
+            .unwrap();
+        assert_eq!(result.total_hits, COLD);
+
+        let floor = min_bytes.min(budget / 2);
+        let beta = tenant_cache_stats(&searcher, "beta");
+        assert!(
+            beta.bytes >= floor,
+            "beta keeps its floor ({floor}) through acme's cold load, has {}",
+            beta.bytes
+        );
+        let kept = beta_manifest
+            .segments
+            .iter()
+            .filter(|entry| {
+                searcher.segment_cache.contains(&(
+                    beta_ns.0.clone(),
+                    entry.segment_id.0.clone(),
+                    false,
+                ))
+            })
+            .count();
+        assert_eq!(kept, WARM);
+
+        // Beta's repeat search hits every segment it kept, with no miss.
+        let result = searcher
+            .search(&beta_ns, &beta_manifest, &query, None)
+            .unwrap();
+        assert_eq!(result.total_hits, WARM);
+        let after = tenant_cache_stats(&searcher, "beta");
+        assert!(after.hits - beta.hits >= kept as u64);
+        assert_eq!(after.misses - beta.misses, (WARM - kept) as u64);
+
+        // The same holds for a warmup pass over acme's namespace.
+        let beta = tenant_cache_stats(&searcher, "beta");
+        searcher
+            .segment_cache
+            .evict_idle(u64::MAX, "acme", 0, AdmissionEvict::OwnIdle, |_| false);
+        searcher
+            .warm_segments(&acme_ns, &acme_manifest, false)
+            .unwrap();
+        let after = tenant_cache_stats(&searcher, "beta");
+        assert!(
+            after.bytes >= floor,
+            "beta keeps its floor ({floor}) through acme's warmup, has {}",
+            after.bytes
+        );
+        assert!(after.bytes <= beta.bytes);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn admission_eviction_for_an_oversized_search_spares_other_tenants_shares() {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-admission-eviction-order-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut writer = SegmentWriter::new(SegmentId("s".into()), dir.clone());
+        writer.add_document(DocumentId("d".into()), vec![Field::text("t", "alpha")]);
+        writer.finalize(Bm25Params::default()).unwrap();
+        let ledger = Arc::new(MemoryLedger::new(u64::MAX, Duration::from_secs(1)));
+        let segment = |tenant: &str| {
+            Arc::new(TrackedSegment::new(
+                SegmentReader::open(dir.clone()).unwrap(),
+                100,
+                Arc::clone(&ledger),
+                tenant,
+            ))
+        };
+        let key = |ns: &str, i: usize| (ns.to_string(), format!("seg-{i}"), false);
+        let bytes =
+            |cache: &SegmentCache, tenant: &str| cache.tenants.lock().unwrap().bytes(tenant);
+
+        let cache = SegmentCache::new(10_000, 10_000);
+        *cache.shares.write().unwrap() = TenantShares::new(2_000);
+        for i in 0..60 {
+            cache.insert(key("beta/docs", i), segment("beta"), 100);
+        }
+        for i in 0..20 {
+            cache.insert(key("acme/old", i), segment("acme"), 100);
+        }
+        // Acme is about to load 5,000 bytes, more than the live watermark
+        // could ever hold, and asks for 3,000. It counts for its 2,000
+        // idle bytes plus the 5,000, each share is 5,000, and the two
+        // tenants give what they hold above it: acme its 2,000, beta
+        // (6,000) 1,000.
+        let sparing = AdmissionEvict::RoomSparingShares;
+        assert_eq!(
+            cache.evict_idle(3_000, "acme", 5_000, sparing, |_| false),
+            3_000
+        );
+        assert_eq!(bytes(&cache, "acme"), 0);
+        assert_eq!(bytes(&cache, "beta"), 5_000);
+        // Beta is at its share: nothing more to take, whatever is asked.
+        assert_eq!(
+            cache.evict_idle(u64::MAX, "acme", 5_000, sparing, |_| false),
+            0
+        );
+        assert_eq!(bytes(&cache, "beta"), 5_000);
+        // The entries beta gave were its least recently used.
+        assert!(!cache.contains(&key("beta/docs", 9)));
+        assert!(cache.contains(&key("beta/docs", 10)));
+        assert_eq!(ledger.state.lock().unwrap().tenants["beta"].live, 5_000);
+
+        // A low-weight tenant is trimmed to its floor, never below it:
+        // with acme weighing 9, beta's share is 1,000 and its floor 2,000.
+        *cache.shares.write().unwrap() = TenantShares::new(2_000).with_weights(Some(Arc::new(
+            |t: &str| {
+                if t == "acme" {
+                    9
+                } else {
+                    1
+                }
+            },
+        )));
+        assert_eq!(
+            cache.evict_idle(u64::MAX, "acme", 5_000, sparing, |_| false),
+            3_000
+        );
+        assert_eq!(bytes(&cache, "beta"), 2_000);
+        // A search that fits under the watermark has to be given its
+        // bytes, so for it the floor only decides the order.
+        assert_eq!(
+            cache.evict_idle(300, "acme", 5_000, AdmissionEvict::Room, |_| false),
+            300
+        );
+        assert_eq!(bytes(&cache, "beta"), 1_700);
+
+        // A pinned entry is never taken, the requester's own included.
+        let pinned = segment("acme");
+        cache.insert(key("acme/old", 0), Arc::clone(&pinned), 100);
+        assert_eq!(
+            cache.evict_idle(u64::MAX, "acme", 0, AdmissionEvict::OwnIdle, |_| false),
+            0
+        );
+        assert!(cache.contains(&key("acme/old", 0)));
+        drop(pinned);
+        // Shedding its own idle bytes, a tenant takes nobody else's.
+        assert_eq!(
+            cache.evict_idle(u64::MAX, "acme", 0, AdmissionEvict::OwnIdle, |_| false),
+            100
+        );
+        assert_eq!(bytes(&cache, "beta"), 1_700);
+
+        drop(cache);
+        assert!(ledger.state.lock().unwrap().tenants.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn admission_eviction_takes_over_share_tenants_before_the_requesters_warm_entries() {
+        // Admission runs before the search pins anything, so the
+        // requester's idle entries include the warm segments it is about
+        // to read. Taking those first cost an under-share tenant its own
+        // warm set while another tenant sat over its share.
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-admission-eviction-wanted-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut writer = SegmentWriter::new(SegmentId("s".into()), dir.clone());
+        writer.add_document(DocumentId("d".into()), vec![Field::text("t", "alpha")]);
+        writer.finalize(Bm25Params::default()).unwrap();
+        let ledger = Arc::new(MemoryLedger::new(u64::MAX, Duration::from_secs(1)));
+        let segment = |tenant: &str| {
+            Arc::new(TrackedSegment::new(
+                SegmentReader::open(dir.clone()).unwrap(),
+                100,
+                Arc::clone(&ledger),
+                tenant,
+            ))
+        };
+        let key = |ns: &str, i: usize| (ns.to_string(), format!("seg-{i}"), false);
+        let bytes =
+            |cache: &SegmentCache, tenant: &str| cache.tenants.lock().unwrap().bytes(tenant);
+        let cache = SegmentCache::new(10_000, 10_000);
+        *cache.shares.write().unwrap() = TenantShares::new(2_000);
+        // Beta's warm namespace is the least recently used of all.
+        for i in 0..30 {
+            cache.insert(key("beta/docs", i), segment("beta"), 100);
+        }
+        for i in 0..5 {
+            cache.insert(key("beta/other", i), segment("beta"), 100);
+        }
+        for i in 0..60 {
+            cache.insert(key("acme/docs", i), segment("acme"), 100);
+        }
+        let wanted = |key: &SegmentCacheKey| key.0 == "beta/docs";
+        let beta_docs = |cache: &SegmentCache| {
+            (0..30)
+                .filter(|i| cache.contains(&key("beta/docs", *i)))
+                .count()
+        };
+
+        // Beta searches beta/docs plus 1,000 new bytes and needs 500.
+        // It counts for 4,500, under its 5,000 share; acme (6,000) is
+        // over its own and gives.
+        assert_eq!(
+            cache.evict_idle(500, "beta", 1_000, AdmissionEvict::Room, wanted),
+            500
+        );
+        assert_eq!(bytes(&cache, "acme"), 5_500);
+        assert_eq!(bytes(&cache, "beta"), 3_500);
+
+        // A search larger than the whole watermark takes what is above
+        // the shares and no more.
+        let sparing = AdmissionEvict::RoomSparingShares;
+        assert_eq!(
+            cache.evict_idle(u64::MAX, "beta", 1_000, sparing, wanted),
+            500
+        );
+        assert_eq!(bytes(&cache, "acme"), 5_000);
+        assert_eq!(bytes(&cache, "beta"), 3_500);
+
+        // With nothing left above a share, a search that has to be given
+        // room takes the requester's entries it will not read, then the
+        // other tenant's below its share.
+        assert_eq!(
+            cache.evict_idle(700, "beta", 1_000, AdmissionEvict::Room, wanted),
+            700
+        );
+        assert_eq!(bytes(&cache, "beta"), 3_000);
+        assert_eq!(bytes(&cache, "acme"), 4_800);
+        assert_eq!(beta_docs(&cache), 30);
+        // Shedding its own idle bytes, it keeps the ones it will read.
+        assert_eq!(
+            cache.evict_idle(u64::MAX, "beta", 1_000, AdmissionEvict::OwnIdle, wanted),
+            0
+        );
+        // Those go last, when nothing else is idle.
+        assert_eq!(
+            cache.evict_idle(4_900, "beta", 1_000, AdmissionEvict::Room, wanted),
+            4_900
+        );
+        assert_eq!(bytes(&cache, "acme"), 0);
+        assert_eq!(beta_docs(&cache), 29);
+        assert!(!cache.contains(&key("beta/docs", 0)));
+
+        drop(cache);
+        assert!(ledger.state.lock().unwrap().tenants.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_search_under_its_share_keeps_its_warm_segments_through_admission() {
+        // The same through `Searcher::search`: beta is under its share,
+        // acme over its own, and another tenant's running search leaves
+        // half a segment less than beta's one new segment needs.
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-admission-keeps-warm-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let beta_ns = NamespaceId("beta/docs".into());
+        let acme_ns = NamespaceId("acme/docs".into());
+        let (beta_manifest, beta_bytes) = mk_tenant_namespace(&dir, &beta_ns.0, 5);
+        let unit = beta_bytes / 5;
+        let (acme_manifest, _) = mk_tenant_namespace(&dir, &acme_ns.0, 10);
+        let mut beta_warm = beta_manifest.clone();
+        beta_warm.segments.truncate(4);
+        let budget = 16 * unit;
+        let searcher = Searcher::with_memory_limits(
+            dir.clone(),
+            1_000,
+            budget,
+            2 * budget,
+            Duration::from_millis(50),
+        );
+        searcher.set_tenant_shares(TenantShares::new(
+            kosha_core::tenancy::DEFAULT_TENANT_MIN_BYTES,
+        ));
+        let query = mk_query("alpha", 10);
+        for _ in 0..2 {
+            searcher
+                .search(&acme_ns, &acme_manifest, &query, None)
+                .unwrap();
+            searcher.search(&beta_ns, &beta_warm, &query, None).unwrap();
+        }
+        let (live, _, _) = ledger_snapshot(&searcher);
+        let outstanding = searcher
+            .ledger
+            .admit("gamma", 2 * budget - live - unit / 2, |_, _| {})
+            .unwrap();
+
+        let beta = tenant_cache_stats(&searcher, "beta");
+        let acme = tenant_cache_stats(&searcher, "acme");
+        let result = searcher
+            .search(&beta_ns, &beta_manifest, &query, None)
+            .unwrap();
+        assert_eq!(result.total_hits, 5);
+        let beta_after = tenant_cache_stats(&searcher, "beta");
+        let acme_after = tenant_cache_stats(&searcher, "acme");
+        assert_eq!(
+            beta_after.evictions, beta.evictions,
+            "beta's warm segments are not evicted to admit beta's own search"
+        );
+        assert_eq!(
+            beta_after.misses - beta.misses,
+            1,
+            "only the new segment is a miss"
+        );
+        assert!(acme_after.evictions > acme.evictions);
+
+        drop(outstanding);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_search_that_fits_under_the_watermark_is_given_another_tenants_idle_bytes() {
+        // Beta's warm set is exactly its share of the cache. Acme's cold
+        // namespace fits under the live watermark only if some of it is
+        // evicted, and another search is in flight, so acme is never
+        // alone. Sparing beta's share here left acme waiting out the
+        // admission timeout (HTTP 429) with evictable memory in the cache.
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-admission-room-under-watermark-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        const WARM: usize = 8;
+        const COLD: usize = 3 * WARM + 2;
+        let beta_ns = NamespaceId("beta/docs".into());
+        let acme_ns = NamespaceId("acme/big".into());
+        let (beta_manifest, beta_bytes) = mk_tenant_namespace(&dir, &beta_ns.0, WARM);
+        let budget = 2 * beta_bytes;
+        let (acme_manifest, acme_bytes) = mk_tenant_namespace(&dir, &acme_ns.0, COLD);
+        assert!(acme_bytes < 2 * budget && acme_bytes + beta_bytes > 2 * budget);
+        let searcher = Searcher::with_memory_limits(
+            dir.clone(),
+            1_000,
+            budget,
+            2 * budget,
+            Duration::from_millis(50),
+        );
+        searcher.set_tenant_shares(TenantShares::new(
+            kosha_core::tenancy::DEFAULT_TENANT_MIN_BYTES,
+        ));
+        let query = mk_query("alpha", 10);
+        for _ in 0..2 {
+            searcher
+                .search(&beta_ns, &beta_manifest, &query, None)
+                .unwrap();
+        }
+        let outstanding = searcher.ledger.admit("gamma", 1, |_, _| {}).unwrap();
+
+        let result = searcher
+            .search(&acme_ns, &acme_manifest, &query, None)
+            .expect("admitted by evicting idle bytes, not shed");
+        assert_eq!(result.total_hits, COLD);
+        let beta = tenant_cache_stats(&searcher, "beta");
+        assert!(beta.evictions >= 1);
+        assert!(
+            beta.bytes >= beta_bytes / 2,
+            "beta gives what acme needs and no more, has {} of {beta_bytes}",
+            beta.bytes
+        );
+
+        drop(outstanding);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Block until `tenant` has `count` searches waiting in `admit`.
+    fn wait_for_waiters(ledger: &MemoryLedger, tenant: &str, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let waiting = ledger
+                .state
+                .lock()
+                .unwrap()
+                .tenants
+                .get(tenant)
+                .map_or(0, |t| t.waiting.len());
+            if waiting == count {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{tenant}: {waiting} waiting, expected {count}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn tenant_ledger(max_live_bytes: u64, timeout: Duration) -> Arc<MemoryLedger> {
+        let ledger = Arc::new(MemoryLedger::new(max_live_bytes, timeout));
+        ledger.tenant_shares_enabled.store(true, Ordering::Relaxed);
+        *ledger.shares.write().unwrap() = TenantShares::new(0);
+        ledger
+    }
+
+    #[test]
+    fn freed_live_bytes_go_to_another_tenants_waiting_search_first() {
+        // #342: acme fills the watermark and keeps asking for more. When
+        // one of its searches finishes, the bytes go to beta's waiting
+        // search, not back to acme, which is over its share.
+        const ACME_RETRIES: usize = 8;
+        let ledger = tenant_ledger(100, Duration::from_secs(30));
+        let first = ledger.admit("acme", 60, |_, _| {}).unwrap();
+        let second = ledger.admit("acme", 40, |_, _| {}).unwrap();
+
+        let (acme_tx, acme_rx) = std::sync::mpsc::channel();
+        let acme_threads: Vec<_> = (0..ACME_RETRIES)
+            .map(|_| {
+                let ledger = Arc::clone(&ledger);
+                let tx = acme_tx.clone();
+                std::thread::spawn(move || {
+                    tx.send(ledger.admit("acme", 40, |_, _| {}).unwrap())
+                        .unwrap();
+                })
+            })
+            .collect();
+        wait_for_waiters(&ledger, "acme", ACME_RETRIES);
+        let (beta_tx, beta_rx) = std::sync::mpsc::channel();
+        let beta_thread = {
+            let ledger = Arc::clone(&ledger);
+            std::thread::spawn(move || {
+                beta_tx
+                    .send(ledger.admit("beta", 40, |_, _| {}).unwrap())
+                    .unwrap();
+            })
+        };
+        wait_for_waiters(&ledger, "beta", 1);
+
+        // 40 bytes free up: enough for beta or for one acme retry.
+        drop(second);
+        let beta_permit = beta_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("beta is admitted as soon as the bytes free up");
+        {
+            let st = ledger.state.lock().unwrap();
+            assert_eq!(st.tenants["beta"].reserved, 40);
+            assert_eq!(st.tenants["acme"].reserved, 60);
+            assert_eq!(st.tenants["acme"].waiting.len(), ACME_RETRIES);
+        }
+        assert!(acme_rx.try_recv().is_err(), "no acme retry got in first");
+
+        // With beta served, acme's retries run one after another.
+        drop(beta_permit);
+        for _ in 0..ACME_RETRIES {
+            drop(acme_rx.recv_timeout(Duration::from_secs(20)).unwrap());
+        }
+        for thread in acme_threads {
+            thread.join().unwrap();
+        }
+        beta_thread.join().unwrap();
+        drop(first);
+        let st = ledger.state.lock().unwrap();
+        assert_eq!((st.live, st.reserved, st.active), (0, 0, 0));
+        assert!(st.tenants.is_empty());
+    }
+
+    #[test]
+    fn two_tenants_over_their_shares_do_not_hold_each_other_back() {
+        // Three tenants hold bytes, so each share is 33. Acme and beta (40
+        // each, with a search running) are both over theirs, and each has
+        // another search waiting. Neither may be held back for the other,
+        // or both would wait out the timeout with bytes free.
+        let ledger = tenant_ledger(100, Duration::from_secs(30));
+        let acme = ledger.admit("acme", 40, |_, _| {}).unwrap();
+        let beta = ledger.admit("beta", 40, |_, _| {}).unwrap();
+        ledger.add_live("gamma", 20);
+        let spawn = |tenant: &'static str| {
+            let ledger = Arc::clone(&ledger);
+            std::thread::spawn(move || ledger.admit(tenant, 9, |_, _| {}).unwrap())
+        };
+        let acme_waiter = spawn("acme");
+        let beta_waiter = spawn("beta");
+        wait_for_waiters(&ledger, "acme", 1);
+        wait_for_waiters(&ledger, "beta", 1);
+        // Gamma frees 19 bytes and keeps 1, so the shares stay at 33.
+        ledger.release_live("gamma", 19);
+        let acme_second = acme_waiter.join().unwrap();
+        let beta_second = beta_waiter.join().unwrap();
+        ledger.release_live("gamma", 1);
+        drop((acme, beta, acme_second, beta_second));
+        assert!(ledger.state.lock().unwrap().tenants.is_empty());
+    }
+
+    #[test]
+    fn a_lone_tenant_keeps_the_whole_live_watermark() {
+        let ledger = tenant_ledger(100, Duration::from_millis(50));
+        // Far over any share, but nobody else is waiting.
+        let first = ledger.admit("acme", 80, |_, _| {}).unwrap();
+        let second = ledger.admit("acme", 20, |_, _| {}).unwrap();
+        assert_eq!(ledger.state.lock().unwrap().tenants["acme"].reserved, 100);
+        // Full is still full: a further search waits, then is shed, and
+        // leaves no waiter behind.
+        assert!(matches!(
+            ledger.admit("acme", 1, |_, _| {}),
+            Err(KoshaError::Overloaded(_))
+        ));
+        assert!(matches!(
+            ledger.admit("beta", 1, |_, _| {}),
+            Err(KoshaError::Overloaded(_))
+        ));
+        {
+            let st = ledger.state.lock().unwrap();
+            assert_eq!(st.tenants["acme"].waiting.len(), 0);
+            assert!(!st.tenants.contains_key("beta"));
+        }
+        drop(first);
+        drop(second);
+        // Alone, an oversized search is admitted after one eviction
+        // attempt (the anti-starvation rule).
+        let evictions = AtomicUsize::new(0);
+        let oversized = ledger
+            .admit("acme", 1_000, |needed, what| {
+                assert_eq!(needed, 900);
+                assert_eq!(what, AdmissionEvict::RoomSparingShares);
+                evictions.fetch_add(1, Ordering::Relaxed);
+            })
+            .unwrap();
+        assert_eq!(evictions.load(Ordering::Relaxed), 1);
+        assert_eq!(ledger.state.lock().unwrap().tenants["acme"].reserved, 1_000);
+        drop(oversized);
+        assert!(ledger.state.lock().unwrap().tenants.is_empty());
+    }
+
+    #[test]
+    fn a_waiter_asking_for_more_than_its_share_holds_nobody_back() {
+        // Beta's search wants 70 of 100 bytes against a share of 50, and
+        // can only run once acme's search is done. Holding acme's further
+        // searches back for it would cost beta nothing and serialise
+        // acme for as long as beta keeps retrying.
+        let ledger = tenant_ledger(100, Duration::from_secs(30));
+        let first = ledger.admit("acme", 60, |_, _| {}).unwrap();
+        let beta_waiter = {
+            let ledger = Arc::clone(&ledger);
+            std::thread::spawn(move || ledger.admit("beta", 70, |_, _| {}).unwrap())
+        };
+        wait_for_waiters(&ledger, "beta", 1);
+        let started = Instant::now();
+        let second = ledger.admit("acme", 30, |_, _| {}).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(ledger.state.lock().unwrap().tenants["acme"].reserved, 90);
+        // Beta gets in once acme is done.
+        drop((first, second));
+        drop(beta_waiter.join().unwrap());
+        assert!(ledger.state.lock().unwrap().tenants.is_empty());
+    }
+
+    #[test]
+    fn a_tenant_held_back_sheds_its_idle_bytes_and_goes_ahead() {
+        // Acme is over its share of 50 only through 50 idle cached bytes
+        // (its running search holds 10). Held back for beta's waiting
+        // search, it is asked for its own idle bytes, and once it has
+        // given enough of them both searches run.
+        let ledger = tenant_ledger(100, Duration::from_secs(30));
+        ledger.add_live("acme", 50);
+        let first = ledger.admit("acme", 10, |_, _| {}).unwrap();
+        let beta_waiter = {
+            let ledger = Arc::clone(&ledger);
+            std::thread::spawn(move || ledger.admit("beta", 45, |_, _| {}).unwrap())
+        };
+        wait_for_waiters(&ledger, "beta", 1);
+
+        let asked = Mutex::new(Vec::new());
+        let second = ledger
+            .admit("acme", 5, |needed, what| {
+                asked.lock().unwrap().push((needed, what));
+                if what == AdmissionEvict::OwnIdle {
+                    // The cache evicts 20 idle bytes of acme's.
+                    ledger.release_live("acme", 20);
+                }
+            })
+            .unwrap();
+        assert_eq!(*asked.lock().unwrap(), vec![(10, AdmissionEvict::OwnIdle)]);
+        let beta = beta_waiter.join().unwrap();
+        {
+            let st = ledger.state.lock().unwrap();
+            assert_eq!(st.tenants["acme"].committed(), 45);
+            assert_eq!(st.tenants["beta"].reserved, 45);
+        }
+        drop((first, second, beta));
+        ledger.release_live("acme", 30);
+        assert!(ledger.state.lock().unwrap().tenants.is_empty());
+    }
+
+    #[test]
+    fn a_search_shed_by_tenant_shares_is_told_so() {
+        let ledger = tenant_ledger(100, Duration::from_millis(50));
+        let first = ledger.admit("acme", 90, |_, _| {}).unwrap();
+        // A search of beta's that stays blocked throughout.
+        ledger
+            .state
+            .lock()
+            .unwrap()
+            .tenant("beta", |t| t.waiting.push(10));
+        // Acme's next search fits (95 of 100) and is shed for its share.
+        let Err(KoshaError::Overloaded(message)) = ledger.admit("acme", 5, |_, _| {}) else {
+            panic!("held back for beta's waiting search");
+        };
+        assert!(message.contains("over its share"), "{message}");
+        assert!(!message.contains("needs ~"), "{message}");
+        // One that does not fit is still told how much it lacks.
+        let Err(KoshaError::Overloaded(message)) = ledger.admit("acme", 20, |_, _| {}) else {
+            panic!("110 of 100 bytes");
+        };
+        assert!(message.contains("needs ~20"), "{message}");
+        ledger
+            .state
+            .lock()
+            .unwrap()
+            .tenant("beta", |t| t.stop_waiting(10));
+        drop(first);
+        assert!(ledger.state.lock().unwrap().tenants.is_empty());
+    }
+
+    #[test]
+    fn tenant_shares_in_admission_are_off_unless_enabled() {
+        // Default behaviour is unchanged: acme, over its share, is not
+        // held back for beta's waiting search.
+        let ledger = Arc::new(MemoryLedger::new(100, Duration::from_secs(30)));
+        let first = ledger.admit("acme", 90, |_, _| {}).unwrap();
+        let beta_waiter = {
+            let ledger = Arc::clone(&ledger);
+            std::thread::spawn(move || ledger.admit("beta", 20, |_, _| {}).unwrap())
+        };
+        wait_for_waiters(&ledger, "beta", 1);
+        let second = ledger.admit("acme", 10, |_, _| {}).unwrap();
+        // Enabled, the same request waits behind beta.
+        drop(second);
+        ledger.tenant_shares_enabled.store(true, Ordering::Relaxed);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let acme_waiter = {
+            let ledger = Arc::clone(&ledger);
+            std::thread::spawn(move || {
+                tx.send(ledger.admit("acme", 10, |_, _| {}).unwrap())
+                    .unwrap();
+            })
+        };
+        wait_for_waiters(&ledger, "acme", 1);
+        assert!(rx.try_recv().is_err());
+        drop(first);
+        drop(beta_waiter.join().unwrap());
+        drop(rx.recv_timeout(Duration::from_secs(20)).unwrap());
+        acme_waiter.join().unwrap();
+        assert!(ledger.state.lock().unwrap().tenants.is_empty());
+    }
+
+    #[test]
+    fn live_bytes_are_charged_to_the_segments_tenant() {
+        let dir =
+            std::env::temp_dir().join(format!("kosha-test-tenant-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let acme_ns = NamespaceId("acme/docs".into());
+        let (acme_manifest, acme_bytes) = mk_tenant_namespace(&dir, &acme_ns.0, 3);
+        let (legacy_manifest, legacy_bytes) = mk_tenant_namespace(&dir, "bare", 2);
+        let searcher = Searcher::with_segment_cache_limits(dir.clone(), 100, u64::MAX);
+        let tenant_live = |tenant: &str| {
+            let st = searcher.ledger.state.lock().unwrap();
+            st.tenants.get(tenant).map_or(0, |t| t.live)
+        };
+
+        // Searches decode postings, so each tenant's live bytes are its
+        // segments plus its decoded-postings entries.
+        let query = mk_query("alpha", 10);
+        searcher
+            .search(&acme_ns, &acme_manifest, &query, None)
+            .unwrap();
+        searcher
+            .search(&NamespaceId("bare".into()), &legacy_manifest, &query, None)
+            .unwrap();
+        let (live, reserved, active) = ledger_snapshot(&searcher);
+        assert_eq!((reserved, active), (0, 0));
+        assert!(tenant_live("acme") >= acme_bytes);
+        assert!(tenant_live("_legacy") >= legacy_bytes);
+        assert_eq!(tenant_live("acme") + tenant_live("_legacy"), live);
+
+        // Dropping acme's segments (and their postings caches with them)
+        // returns its live bytes to zero and leaves the other tenant's.
+        let legacy_live = tenant_live("_legacy");
+        searcher
+            .segment_cache
+            .evict_idle(u64::MAX, "acme", 0, AdmissionEvict::OwnIdle, |_| false);
+        assert_eq!(tenant_live("acme"), 0);
+        assert_eq!(tenant_live("_legacy"), legacy_live);
+        assert_eq!(ledger_snapshot(&searcher).0, legacy_live);
+        searcher
+            .segment_cache
+            .evict_idle(u64::MAX, "_legacy", 0, AdmissionEvict::OwnIdle, |_| false);
+        assert!(searcher.ledger.state.lock().unwrap().tenants.is_empty());
+        assert_eq!(ledger_snapshot(&searcher), (0, 0, 0));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -10780,7 +12481,7 @@ mod tests {
             Duration::from_millis(50),
         );
         // Simulate an admitted in-flight search holding the watermark.
-        let outstanding = searcher.ledger.admit(1, |_| {}).unwrap();
+        let outstanding = searcher.ledger.admit("_legacy", 1, |_, _| {}).unwrap();
 
         let manifest = Manifest {
             version: 1,
@@ -11624,6 +13325,7 @@ mod tests {
                 SegmentReader::open(dir.clone()).unwrap(),
                 100,
                 Arc::clone(&ledger),
+                "_legacy",
             ))
         };
         let key = |ns: &str, i: usize| (ns.to_string(), format!("seg-{i}"), false);
@@ -11666,6 +13368,53 @@ mod tests {
     }
 
     #[test]
+    fn segment_cache_entry_bound_evicts_the_tenant_with_the_most_entries() {
+        // #342 review: when the entry-count bound binds (tiny upserts leave
+        // many small segments), tenant A flooding tiny segments must evict
+        // its own entries, not tenant B's few large ones.
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-segment-cache-entry-bound-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut writer = SegmentWriter::new(SegmentId("s".into()), dir.clone());
+        writer.add_document(DocumentId("d".into()), vec![Field::text("t", "alpha")]);
+        writer.finalize(Bm25Params::default()).unwrap();
+        let ledger = Arc::new(MemoryLedger::new(u64::MAX, Duration::from_secs(1)));
+        let segment = || {
+            Arc::new(TrackedSegment::new(
+                SegmentReader::open(dir.clone()).unwrap(),
+                100,
+                Arc::clone(&ledger),
+                "_legacy",
+            ))
+        };
+        let key = |ns: &str, i: usize| (ns.to_string(), format!("seg-{i}"), false);
+        // 100 entries / 100,000 bytes: 1,000 bytes per entry on average,
+        // so the 10,000-byte floor is 10 entries.
+        let cache = SegmentCache::new(100, 100_000);
+        *cache.shares.write().unwrap() = TenantShares::new(10_000);
+        for i in 0..20 {
+            cache.insert(key("beta/docs", i), segment(), 1_000);
+        }
+        for i in 0..500 {
+            cache.insert(key("acme/tiny", i), segment(), 1);
+            assert!(cache.entries.lock().unwrap().len() <= 100);
+        }
+        let stats = cache.tenant_stats();
+        let beta = stats.iter().find(|s| s.tenant == "beta").unwrap();
+        assert_eq!(beta.bytes, 20_000, "B is under its share of entries");
+        assert_eq!(beta.evictions, 0);
+        let hits = (0..20)
+            .filter(|i| cache.get(&key("beta/docs", *i)).is_some())
+            .count();
+        assert_eq!(hits, 20, "B's warm hit rate stays at 100%");
+        let acme = stats.iter().find(|s| s.tenant == "acme").unwrap();
+        assert_eq!(acme.evictions, 420);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn manifest_caches_make_room_from_the_busiest_tenant() {
         // #342: a tenant cycling through many namespaces used to clear
         // every tenant's corpus statistics once the cache filled.
@@ -11674,8 +13423,12 @@ mod tests {
         for i in 0..9 {
             entries.insert((format!("acme/ns-{i}"), i, 0, false), ());
         }
-        make_room_by_tenant(&mut entries, 10, &TenantShares::default());
+        let mut ledger = TenantLedger::default();
+        make_room_by_tenant(&mut entries, 10, &TenantShares::default(), &mut ledger);
         assert_eq!(entries.len(), 9);
+        let stats = ledger.stats();
+        assert_eq!(stats.len(), 1);
+        assert_eq!((stats[0].tenant.as_str(), stats[0].evictions), ("acme", 1));
         assert!(entries.contains_key(&("beta/docs".into(), 7, 0, false)));
         assert!(
             !entries.contains_key(&("acme/ns-0".into(), 0, 0, false)),
@@ -12989,7 +14742,7 @@ mod tests {
         // only opens `vector.idx` for real when a probed posting needs
         // hydrating — so a *warm* reader (already cached from a prior
         // search on the same `Searcher`) whose backing file then vanishes
-        // fails at hydration time, not at open time. `hydrate_posting`'s
+        // fails at hydration time, not at open time. `scan_posting`'s
         // one-shot admission also means the first touch of a posting is
         // never itself cached, so a second identical query is guaranteed to
         // re-hit disk rather than serve from the decoded-postings cache.
@@ -16490,6 +18243,119 @@ mod columnar_eval_differential_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A filter file that is not local when the filter is evaluated (evicted
+    /// from the disk cache after hydration, or behind a stale hydration
+    /// verdict) must fail the search, not read as "no values": that would
+    /// answer a `matterId` filter with zero hits from the segment, and the
+    /// per-segment filter-set cache would keep answering zero after the file
+    /// is back. Both formats: a columnar segment's column and TOC, a legacy
+    /// segment's `filters.bin`.
+    #[test]
+    fn filter_file_not_local_fails_the_search_and_is_not_cached() {
+        let root =
+            std::env::temp_dir().join(format!("kosha-q-filter-not-local-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ns = NamespaceId("ns".into());
+        let q: SearchQuery = serde_json::from_value(serde_json::json!({
+            "query_text": "contract", "max_results": 10,
+            "filter": {"term": {"matterId": "m1"}}, "exact_total_hits": true}))
+        .unwrap();
+        for (version, file) in [
+            (2, None),
+            (2, Some(kosha_core::FILTERS_TOC_FILE)),
+            (1, None),
+        ] {
+            let dir = root.join(format!("v{version}-{}", file.unwrap_or("col")));
+            let m = build(&dir, &[version, version]);
+            let want = Searcher::new(dir.clone())
+                .search(&ns, &m, &q, None)
+                .unwrap();
+            assert!(want.total_hits > 0, "vacuous query");
+            let seg = dir.join("ns").join("s0");
+            let footer = SegmentReader::read_footer(&seg).unwrap();
+            let file = match (file, footer.filter_columns.as_ref()) {
+                (Some(file), _) => file.to_string(),
+                (None, Some(columns)) => columns
+                    .iter()
+                    .find(|c| c.name == "matterId")
+                    .unwrap()
+                    .file_name(),
+                (None, None) => kosha_core::FILTERS_BIN_FILE.to_string(),
+            };
+            let stash = seg.join("stash");
+            std::fs::rename(seg.join(&file), &stash).unwrap();
+
+            let searcher = Searcher::new(dir.clone());
+            let cold = searcher.search(&ns, &m, &q, None);
+            std::fs::rename(&stash, seg.join(&file)).unwrap();
+            let back = searcher.search(&ns, &m, &q, None).unwrap();
+            assert_eq!(
+                back.total_hits, want.total_hits,
+                "v{version} {file}: once the file is local again the answer must be complete \
+                 (an incomplete answer from the not-local read was cached)"
+            );
+            assert!(
+                cold.is_err(),
+                "v{version} {file}: a filter file that is not local must fail the search, \
+                 got total_hits={} (want {})",
+                cold.map(|r| r.total_hits).unwrap_or_default(),
+                want.total_hits
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A whole segment directory missing locally (evicted after hydration,
+    /// or behind a stale hydration verdict) fails the search instead of
+    /// answering without that segment's documents. A segment the footer
+    /// blooms prune needs nothing local and is still skipped quietly.
+    #[test]
+    fn segment_not_local_fails_the_search_unless_pruned() {
+        let root =
+            std::env::temp_dir().join(format!("kosha-q-seg-not-local-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ns = NamespaceId("ns".into());
+        let mut m = build(&root, &[2, 2]);
+        // As on a query node: footers come with the manifest.
+        for entry in &m.segments {
+            let footer = SegmentReader::read_footer(&root.join("ns").join(&entry.segment_id.0));
+            m.segment_footers
+                .insert(entry.segment_id.clone(), Arc::new(footer.unwrap()));
+        }
+        let q = |filter: serde_json::Value| -> SearchQuery {
+            serde_json::from_value(serde_json::json!({
+                "query_text": "contract", "max_results": 10,
+                "filter": filter, "exact_total_hits": true}))
+            .unwrap()
+        };
+        let matter = q(serde_json::json!({"term": {"matterId": "m1"}}));
+        // A matter s1's bloom rules out (blooms have false positives, so
+        // pick one it actually rejects).
+        let s1_footer = m.segment_footer(&SegmentId("s1".into())).unwrap();
+        let nowhere = (0..)
+            .map(|i| q(serde_json::json!({"term": {"matterId": format!("no-such-matter-{i}")}})))
+            .find(|q| !q.segment_may_match_filters(s1_footer.filter_blooms.as_ref()))
+            .unwrap();
+        let want = Searcher::new(root.clone())
+            .search(&ns, &m, &matter, None)
+            .unwrap();
+        assert!(want.total_hits > 0, "vacuous query");
+        std::fs::remove_dir_all(root.join("ns").join("s1")).unwrap();
+        let searcher = Searcher::new(root.clone());
+        let got = searcher.search(&ns, &m, &matter, None);
+        assert!(
+            got.is_err(),
+            "a segment that is not local must fail the search, got total_hits={} (want {})",
+            got.map(|r| r.total_hits).unwrap_or_default(),
+            want.total_hits
+        );
+        assert_eq!(
+            searcher.search(&ns, &m, &nowhere, None).unwrap().total_hits,
+            0
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A query node hydrates only the columns `filter_column_fields`
     /// names (#244). Every query must answer the same from just those
     /// columns as from `filters.bin`: a column it reads but does not name
@@ -17213,8 +19079,10 @@ mod corpus_stats_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A segment whose footer can't be read here (listed in the manifest
-    /// but absent locally) makes namespace statistics incomplete. The
+    /// A segment that is not local makes namespace statistics incomplete.
+    /// On a query node that is a stats-only segment: the term bloom rules
+    /// it out of scoring (it lacks one of an AND query's terms) but it may
+    /// hold another term's `df`, and that hydration is best effort. The
     /// search must fall back to per-segment statistics — the documented
     /// pre-#246 behavior — rather than score with a `df` missing it.
     #[test]
@@ -17225,10 +19093,24 @@ mod corpus_stats_tests {
         let docs = random_corpus(&mut rng, 200);
         let groups = random_split(&mut rng, &docs, false);
         let (mut many, _) = write_segments(&dir, &ns.0, "many", &groups, 1);
-        many.segments.push(ManifestEntry {
-            segment_id: SegmentId("not-hydrated".into()),
-            doc_count: 50,
-        });
+        let stats_only = vec![Doc {
+            id: "stats-only".into(),
+            content: "alpha".into(),
+            matter: "m0".into(),
+        }];
+        let (extra, _) = write_segments(&dir, &ns.0, "stats-only", &[stats_only], 1);
+        let entry = extra.segments[0].clone();
+        let seg_dir = dir.join(&ns.0).join(&entry.segment_id.0);
+        let footer = SegmentReader::read_footer(&seg_dir).unwrap();
+        assert!(!footer
+            .term_bloom
+            .as_ref()
+            .unwrap()
+            .may_contain(kosha_core::fields::bloom_term("beta")));
+        many.segment_footers
+            .insert(entry.segment_id.clone(), Arc::new(footer));
+        many.segments.push(entry);
+        std::fs::remove_dir_all(&seg_dir).unwrap();
         let searcher = Searcher::new(dir.clone());
         let q = query("alpha beta", 50);
         let (r, stats) = searcher.search_with_stats(&ns, &many, &q, None).unwrap();
@@ -17521,7 +19403,7 @@ mod corpus_stats_tests {
         );
         let (manifest, locations) = write_segments(&dir, &ns.0, "s", &groups, 1);
         let searcher = Searcher::new(dir.clone());
-        let permit = searcher.ledger.admit(0, |_| {}).unwrap();
+        let permit = searcher.ledger.admit("_legacy", 0, |_, _| {}).unwrap();
         let open_stats = OpenStatsCollector::default();
         let mut checked = 0;
         for params in [
@@ -21912,7 +23794,7 @@ mod nested_attribute_tests {
         );
         writer.finalize(Bm25Params::default()).unwrap();
         let reader = kosha_segment::SegmentReader::open(root.join(&ns.0).join(&id.0)).unwrap();
-        let store = reader.filter_store();
+        let store = reader.try_filter_store().unwrap();
         let mut names: Vec<&String> = store.string_fields.keys().collect();
         names.sort();
         assert_eq!(names, vec!["k", "tags"]);
@@ -23618,7 +25500,7 @@ mod tracked_segment_filter_tests {
         let reader = SegmentReader::open(dir.clone()).unwrap();
         assert!(reader.has_filter_columns());
         let ledger = Arc::new(MemoryLedger::new(u64::MAX, Duration::from_secs(1)));
-        let segment = TrackedSegment::new(reader, 0, ledger);
+        let segment = TrackedSegment::new(reader, 0, ledger, "_legacy");
 
         let clause: FilterClause = serde_json::from_str(r#"{"term": {"a": "a1"}}"#).unwrap();
         assert_eq!(segment.filter_set("a", &clause).unwrap().count(), 4);

@@ -637,6 +637,8 @@ pub fn run(argv: impl IntoIterator<Item = String>) -> Result<()> {
     std::fs::create_dir_all(&data_dir)?;
     let database_url =
         std::env::var("DATABASE_URL").map_err(|_| "DATABASE_URL is required for migrate")?;
+    // Same TLS rule as the server (#343), before the first connection.
+    crate::internal_tls::check_database_url_env()?;
     let s3_config = S3Config::from_env().ok_or("KOSHA_S3_BUCKET is required for migrate")?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

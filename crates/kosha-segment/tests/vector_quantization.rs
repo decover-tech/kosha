@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use kosha_core::{Bm25Params, DocumentId, Field, SegmentId, VectorQuantization};
 use kosha_segment::{
-    SegmentReader, SegmentWriter, VectorQuantizationConfig, VectorStoreMode,
+    KnnRefill, SegmentReader, SegmentWriter, VectorQuantizationConfig, VectorStoreMode,
     I8_VECTOR_INDEX_VERSION, RADIUS_AWARE_VECTOR_INDEX_VERSION,
 };
 
@@ -294,6 +294,106 @@ fn filtered_probe_and_exact_path_work_on_i8_columns() {
         exact.hits.iter().map(|h| h.0).collect::<Vec<_>>(),
         got.iter().map(|h| h.0).collect::<Vec<_>>()
     );
+}
+
+/// A restriction that is deleted documents alone must not make a segment
+/// the global budget chose nothing from probe for `k` hits: with one
+/// tombstone per segment that turned the namespace-wide budget back into a
+/// per-segment probe. A filter still refills everywhere, and a segment the
+/// budget did reach still refills when deletes leave it short.
+#[test]
+fn a_deletes_only_restriction_does_not_refill_a_segment_outside_the_budget() {
+    let n = 500;
+    let dir = temp_dir("refill");
+    write(
+        &dir,
+        VectorStoreMode::Sidecar,
+        VectorQuantizationConfig::default(),
+        docs(n),
+    );
+    let reader = SegmentReader::open(dir.clone()).unwrap();
+    let query = vector(77_777, DIM);
+    assert!(reader.knn_centroid_distances("emb", &query).unwrap().len() > 2);
+    let live = |id: u32| id != 3;
+    let probe = |k: usize, cutoff: f32, max_probes: usize, refill: KnnRefill| {
+        reader
+            .knn_search_within_filtered_fetching(
+                "emb",
+                &query,
+                k,
+                cutoff,
+                max_probes,
+                Some(&live),
+                refill,
+                None,
+            )
+            .unwrap()
+            .unwrap()
+    };
+
+    // No posting of this segment is inside the cutoff.
+    let (hits, postings) = probe(
+        5,
+        f32::NEG_INFINITY,
+        usize::MAX,
+        KnnRefill::BudgetedSegments,
+    );
+    assert!(hits.is_empty(), "{hits:?}");
+    assert_eq!(postings, 0);
+    let (hits, postings) = probe(5, f32::NEG_INFINITY, usize::MAX, KnnRefill::Always);
+    assert_eq!(hits.len(), 5);
+    assert!(postings > 0);
+
+    // One posting is inside the budget and cannot hold `k` documents, so
+    // the probe continues outward in both modes.
+    for refill in [KnnRefill::BudgetedSegments, KnnRefill::Always] {
+        let (hits, postings) = probe(300, f32::MAX, 1, refill);
+        assert_eq!(hits.len(), 300, "{refill:?}");
+        assert!(postings > 1, "{refill:?}");
+        assert!(hits.iter().all(|(id, _)| *id != 3));
+    }
+}
+
+/// A unit-norm f32 column is scored with one dot product against the
+/// normalized query, and its centroids ranked the same way. The scores must
+/// still be the cosine similarity of the original vectors, whatever the
+/// query's magnitude.
+#[test]
+fn budgeted_probe_of_an_f32_column_returns_cosine_scores_for_any_query_magnitude() {
+    let n = 500;
+    let dir = temp_dir("unit-dot");
+    write(
+        &dir,
+        VectorStoreMode::Inline,
+        VectorQuantizationConfig::default(),
+        docs(n),
+    );
+    let reader = SegmentReader::open(dir.clone()).unwrap();
+    for seed in [77_777u64, 12_345, 999] {
+        let unit = vector(seed, DIM);
+        let want = brute_force(n, &unit, 10);
+        for scale in [1.0f32, 37.5, 0.001] {
+            let query: Vec<f32> = unit.iter().map(|x| x * scale).collect();
+            let got = knn_within(&reader, &query, 10);
+            assert_eq!(
+                got.iter().map(|h| h.0).collect::<Vec<_>>(),
+                want.iter().map(|h| h.0).collect::<Vec<_>>(),
+                "scale {scale}"
+            );
+            for ((_, score), (_, exact)) in got.iter().zip(&want) {
+                assert!((score - exact).abs() < 1e-5, "{score} vs {exact}");
+            }
+            // The centroid scores do not depend on the query's length.
+            let bounds = reader.knn_centroid_distances("emb", &query).unwrap();
+            let base = reader.knn_centroid_distances("emb", &unit).unwrap();
+            for (a, b) in bounds.iter().zip(&base) {
+                assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+            }
+        }
+    }
+    // A zero query scores 0 against everything, as cosine similarity does.
+    let zero = vec![0.0f32; DIM];
+    assert!(knn_within(&reader, &zero, 3).iter().all(|(_, s)| *s == 0.0));
 }
 
 #[test]

@@ -182,7 +182,8 @@ enum Commands {
         #[arg(long, value_name = "SECS", default_value_t = 600)]
         timeout: u64,
     },
-    /// Admin operations (need the server's KOSHA_ADMIN_API_KEY as --api-key)
+    /// Admin operations (need an admin credential as --api-key: an operator
+    /// credential, or the server's KOSHA_ADMIN_API_KEY)
     Admin {
         #[command(subcommand)]
         command: AdminCommands,
@@ -276,7 +277,135 @@ enum AdminCommands {
         /// Free-text note stored with the key
         #[arg(long, default_value = "")]
         description: String,
+        /// What the key may do: read (search, exists, stats), write (index,
+        /// delete, flush), admin (create/delete namespaces, schema).
+        /// Repeat or comma-separate; all three when omitted
+        #[arg(long = "scope", value_enum, value_delimiter = ',')]
+        scopes: Vec<KeyScope>,
+        /// Restrict the key to this namespace (repeatable); every namespace
+        /// of the tenant when omitted
+        #[arg(long = "namespace", value_name = "NAMESPACE")]
+        namespaces: Vec<String>,
+        /// Make the key expire this many seconds from now; never when omitted
+        #[arg(long, value_name = "SECS")]
+        expires_in_secs: Option<u64>,
     },
+    /// List API keys that are not revoked (never shows a key itself)
+    ListApiKeys {
+        /// Only this tenant's keys
+        #[arg(long)]
+        tenant: Option<String>,
+    },
+    /// Revoke an API key; servers stop accepting it within their key
+    /// refresh interval
+    RevokeApiKey {
+        /// The key's id, from `list-api-keys` or its creation
+        key_id: String,
+    },
+    /// Replace an API key without downtime: issue a new key with the same
+    /// tenant, scopes and namespaces, and keep the old one working for an
+    /// overlap window
+    ///
+    /// The new key is printed once, on stdout; store it now.
+    RotateApiKey {
+        /// The id of the key to replace
+        key_id: String,
+        /// How long the old key keeps working (server default: one day)
+        #[arg(long, value_name = "SECS")]
+        overlap_secs: Option<u64>,
+        /// Make the new key expire this many seconds from now
+        #[arg(long, value_name = "SECS")]
+        expires_in_secs: Option<u64>,
+    },
+    /// Remove the plaintext that keys created before scoped keys still
+    /// hold in the database. Run once every server is upgraded: the keys
+    /// keep working, but an older server build can no longer read them
+    ScrubPlaintextApiKeys,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum KeyScope {
+    Read,
+    Write,
+    Admin,
+}
+
+impl KeyScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            KeyScope::Read => "read",
+            KeyScope::Write => "write",
+            KeyScope::Admin => "admin",
+        }
+    }
+}
+
+/// The `POST /v1/admin/api-keys` body. Fields left out take the server's
+/// defaults: every scope, every namespace, no expiry.
+fn create_api_key_body(
+    tenant: &str,
+    description: &str,
+    scopes: &[KeyScope],
+    namespaces: &[String],
+    expires_in_secs: Option<u64>,
+) -> Value {
+    let mut body = serde_json::json!({"tenant_id": tenant, "description": description});
+    if !scopes.is_empty() {
+        body["scopes"] = scopes.iter().map(|s| s.as_str()).collect();
+    }
+    if !namespaces.is_empty() {
+        body["namespaces"] = serde_json::json!(namespaces);
+    }
+    if let Some(secs) = expires_in_secs {
+        body["expires_in_secs"] = serde_json::json!(secs);
+    }
+    body
+}
+
+/// One line per key of a `GET /v1/admin/api-keys` response.
+fn api_key_lines(value: &Value) -> Vec<String> {
+    let text = |v: &Value, field: &str| {
+        v.get(field)
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let list = |v: &Value, field: &str, none: &str| match v.get(field).and_then(|l| l.as_array()) {
+        Some(items) => items
+            .iter()
+            .filter_map(|i| i.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+        None => none.to_string(),
+    };
+    let time = |v: &Value, field: &str, none: &str| match v.get(field).and_then(|t| t.as_i64()) {
+        Some(at) => at.to_string(),
+        None => none.to_string(),
+    };
+    value
+        .get("api_keys")
+        .and_then(|k| k.as_array())
+        .map(|keys| {
+            keys.iter()
+                .map(|k| {
+                    let expired = k.get("expired").and_then(|e| e.as_bool()).unwrap_or(false);
+                    format!(
+                        "{}  tenant={}  scopes={}  namespaces={}  expires_at={}{}  last_used_at={}  {}",
+                        text(k, "key_id"),
+                        text(k, "tenant_id"),
+                        list(k, "scopes", ""),
+                        list(k, "namespaces", "*"),
+                        time(k, "expires_at", "never"),
+                        if expired { " (expired)" } else { "" },
+                        time(k, "last_used_at", "never"),
+                        text(k, "description"),
+                    )
+                    .trim_end()
+                    .to_string()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Subcommand)]
@@ -523,14 +652,100 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
             })?;
         }
         Commands::Admin {
+            command: AdminCommands::ListApiKeys { tenant },
+        } => {
+            let value = client
+                .list_api_keys(tenant.as_deref())
+                .map_err(admin_error)?;
+            print_value(&value, cli.json, |v| {
+                let lines = api_key_lines(v);
+                if lines.is_empty() {
+                    eprintln!("no API keys");
+                }
+                for line in lines {
+                    println!("{line}");
+                }
+                Ok(())
+            })?;
+        }
+        Commands::Admin {
+            command: AdminCommands::RevokeApiKey { key_id },
+        } => {
+            let value = client.revoke_api_key(&key_id).map_err(admin_error)?;
+            print_value(&value, cli.json, |_| {
+                println!(
+                    "revoked API key {key_id}; servers stop accepting it within their key \
+                     refresh interval"
+                );
+                Ok(())
+            })?;
+        }
+        Commands::Admin {
+            command:
+                AdminCommands::RotateApiKey {
+                    key_id,
+                    overlap_secs,
+                    expires_in_secs,
+                },
+        } => {
+            let mut body = serde_json::json!({ "key_id": key_id });
+            if let Some(secs) = overlap_secs {
+                body["overlap_secs"] = serde_json::json!(secs);
+            }
+            if let Some(secs) = expires_in_secs {
+                body["expires_in_secs"] = serde_json::json!(secs);
+            }
+            let value = client.rotate_api_key(body).map_err(admin_error)?;
+            let key = value
+                .get("api_key")
+                .and_then(|k| k.as_str())
+                .ok_or("server response has no api_key")?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                let old_expires = value
+                    .pointer("/replaces/expires_at")
+                    .and_then(|t| t.as_i64())
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "?".into());
+                eprintln!(
+                    "replacement for API key {key_id} (which keeps working until unix time \
+                     {old_expires}):"
+                );
+                println!("{key}");
+                eprintln!("this is the only time the key is shown; store it now.");
+            }
+        }
+        Commands::Admin {
+            command: AdminCommands::ScrubPlaintextApiKeys,
+        } => {
+            let value = client.scrub_plaintext_api_keys().map_err(admin_error)?;
+            print_value(&value, cli.json, |v| {
+                println!(
+                    "removed the plaintext of {} API key(s) from the database",
+                    v.get("scrubbed").and_then(|n| n.as_u64()).unwrap_or(0)
+                );
+                Ok(())
+            })?;
+        }
+        Commands::Admin {
             command:
                 AdminCommands::CreateApiKey {
                     tenant,
                     description,
+                    scopes,
+                    namespaces,
+                    expires_in_secs,
                 },
         } => {
             let value = client
-                .create_api_key(&tenant, &description)
+                .create_api_key(create_api_key_body(
+                    &tenant,
+                    &description,
+                    &scopes,
+                    &namespaces,
+                    expires_in_secs,
+                ))
                 .map_err(admin_error)?;
             let key = value
                 .get("api_key")
@@ -638,15 +853,16 @@ fn search_usage_error(message: String) -> clap::Error {
 }
 
 /// Explain an admin route's failure in plain words. The server answers 403
-/// when the request's key is not its `KOSHA_ADMIN_API_KEY` (or it has none
-/// configured), and 400 when the route needs a backend this server was
+/// when the request's key is neither an operator credential nor its
+/// `KOSHA_ADMIN_API_KEY` (or it has none configured), and 400 when the route needs a backend this server was
 /// not built or configured with (Postgres for API keys, S3 for import).
 fn admin_error(error: RequestError) -> ClientError {
     match error {
         RequestError::Http(http) if http.status == 403 => ClientError(format!(
-            "{} {} was refused (403: {}). Admin commands must authenticate with the \
-             server's KOSHA_ADMIN_API_KEY: pass it with --api-key, KOSHA_API_KEY or a \
-             profile. A server with no KOSHA_ADMIN_API_KEY set refuses every admin route.",
+            "{} {} was refused (403: {}). Admin commands must authenticate with an \
+             admin credential, an operator credential or the server's \
+             KOSHA_ADMIN_API_KEY: pass it with --api-key, KOSHA_API_KEY or a profile. A \
+             server with no usable admin credential refuses every admin route.",
             http.method, http.path, http.message
         )),
         RequestError::Http(http) if http.status == 400 && backend_unsupported(&http.message) => {
@@ -1566,14 +1782,147 @@ mod tests {
                     AdminCommands::CreateApiKey {
                         tenant,
                         description,
+                        scopes,
+                        namespaces,
+                        expires_in_secs,
                     },
             } => {
                 assert_eq!(tenant, "acme");
                 assert_eq!(description, "");
+                // Nothing but a tenant: the request is what it was before
+                // scoped keys, and the server issues a full-access key.
+                assert_eq!(
+                    create_api_key_body(
+                        &tenant,
+                        &description,
+                        &scopes,
+                        &namespaces,
+                        expires_in_secs
+                    ),
+                    serde_json::json!({"tenant_id": "acme", "description": ""})
+                );
             }
             _ => panic!("expected admin create-api-key"),
         }
         assert!(parse(&["admin", "create-api-key"]).is_err());
+    }
+
+    #[test]
+    fn admin_create_api_key_takes_scopes_namespaces_and_expiry() {
+        let cli = parse(&[
+            "admin",
+            "create-api-key",
+            "--tenant",
+            "acme",
+            "--scope",
+            "read,write",
+            "--scope",
+            "admin",
+            "--namespace",
+            "docs",
+            "--namespace",
+            "wiki",
+            "--expires-in-secs",
+            "3600",
+        ])
+        .unwrap();
+        let Commands::Admin {
+            command:
+                AdminCommands::CreateApiKey {
+                    tenant,
+                    description,
+                    scopes,
+                    namespaces,
+                    expires_in_secs,
+                },
+        } = cli.command
+        else {
+            panic!("expected admin create-api-key");
+        };
+        assert_eq!(
+            create_api_key_body(&tenant, &description, &scopes, &namespaces, expires_in_secs),
+            serde_json::json!({
+                "tenant_id": "acme",
+                "description": "",
+                "scopes": ["read", "write", "admin"],
+                "namespaces": ["docs", "wiki"],
+                "expires_in_secs": 3600,
+            })
+        );
+        assert!(parse(&[
+            "admin",
+            "create-api-key",
+            "--tenant",
+            "a",
+            "--scope",
+            "root"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn admin_key_lifecycle_commands_parse() {
+        assert!(matches!(
+            parse(&["admin", "list-api-keys"]).unwrap().command,
+            Commands::Admin {
+                command: AdminCommands::ListApiKeys { tenant: None }
+            }
+        ));
+        assert!(matches!(
+            parse(&["admin", "list-api-keys", "--tenant", "acme"]).unwrap().command,
+            Commands::Admin {
+                command: AdminCommands::ListApiKeys { tenant: Some(t) }
+            } if t == "acme"
+        ));
+        assert!(matches!(
+            parse(&["admin", "revoke-api-key", "abc"]).unwrap().command,
+            Commands::Admin {
+                command: AdminCommands::RevokeApiKey { key_id }
+            } if key_id == "abc"
+        ));
+        assert!(parse(&["admin", "revoke-api-key"]).is_err());
+        assert!(matches!(
+            parse(&["admin", "rotate-api-key", "abc", "--overlap-secs", "60"])
+                .unwrap()
+                .command,
+            Commands::Admin {
+                command: AdminCommands::RotateApiKey {
+                    key_id,
+                    overlap_secs: Some(60),
+                    expires_in_secs: None,
+                }
+            } if key_id == "abc"
+        ));
+        assert!(matches!(
+            parse(&["admin", "scrub-plaintext-api-keys"])
+                .unwrap()
+                .command,
+            Commands::Admin {
+                command: AdminCommands::ScrubPlaintextApiKeys
+            }
+        ));
+    }
+
+    #[test]
+    fn api_key_listing_reads_one_line_per_key() {
+        let lines = api_key_lines(&serde_json::json!({"api_keys": [
+            {"key_id": "aa11", "tenant_id": "acme", "description": "ci",
+             "scopes": ["read"], "namespaces": ["docs", "wiki"],
+             "expires_at": 1900000000, "expired": true, "last_used_at": 1800000000},
+            {"key_id": "bb22", "tenant_id": "beta", "description": "",
+             "scopes": ["read", "write", "admin"], "namespaces": null,
+             "expires_at": null, "expired": false, "last_used_at": null},
+        ]}));
+        assert_eq!(
+            lines,
+            [
+                "aa11  tenant=acme  scopes=read  namespaces=docs,wiki  \
+                 expires_at=1900000000 (expired)  last_used_at=1800000000  ci",
+                "bb22  tenant=beta  scopes=read,write,admin  namespaces=*  \
+                 expires_at=never  last_used_at=never",
+            ]
+        );
+        assert!(api_key_lines(&serde_json::json!({})).is_empty());
     }
 
     fn http_error(status: u16, message: &str) -> RequestError {

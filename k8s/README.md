@@ -11,6 +11,9 @@ bucket names, or IAM role ARNs are committed here.
                 (kosha-service, kosha-ingest-service), an HPA for the query
                 tier — env-agnostic defaults only (includes kosha NVMe
                 node-pool scheduling for the ingest Deployment; see below)
+      components/internal-tls/
+                opt-in: TLS between pods + HTTPS probes (see "Encryption in
+                transit"); not included by stage or prod
       stage/    floating `:main` image tag + larger memory for warm hydration
       prod/     versioned release image tag
 
@@ -197,9 +200,97 @@ volumeBindingMode: WaitForFirstConsumer
 reclaimPolicy: Delete
 ```
 
-Encryption in transit between pods (peer hydration, read-to-write
-forwarding) is not covered yet; it follows the HTTP server replacement
-(#259).
+## Encryption in transit
+
+The reference for every setting is `docs/configuration.md`, "TLS between
+pods" and "TLS to Postgres". Neither is turned on by the stage or prod
+overlays; turning them on is a per-cluster step.
+
+**Between pods.** `components/internal-tls` is an opt-in kustomize
+component. It sets the `KOSHA_TLS_*` and `KOSHA_INTERNAL_TLS*` values in the
+ConfigMap (HTTPS on port 8080, mTLS on `/internal/*`, HTTPS for peer
+hydration and write forwarding), switches `KOSHA_INGEST_HOST` on the query
+tier to `https://`, patches the readiness, startup and liveness probes
+of all three Deployments to `scheme: HTTPS`, and adds the
+`prometheus.io/scheme: https` pod annotation. Setting the certificate
+variables without the probe change makes every probe fail, so use the
+component rather than editing the ConfigMap. To include it from an overlay:
+
+```yaml
+# k8s/<overlay>/kustomization.yaml
+resources:
+  - ../base
+components:
+  - ../components/internal-tls
+```
+
+Before applying it:
+
+1. Create the `kosha-internal-tls` Secret (`tls.crt`, `tls.key`, `ca.crt`)
+   in the `kosha` namespace. `base/certificate-internal-tls.example.yaml`
+   is a cert-manager example. The Deployments already mount it at
+   `/etc/kosha/tls`.
+2. Move every other client of port 8080 to `https://` in the same change:
+   HTTPS is per port, so a pod with a certificate no longer answers plain
+   HTTP. In this repo that is the `curl` URL in `base/cronjob-segment-gc.yaml`
+   and `stage/cronjob-compaction.yaml` (they also need the CA, for example
+   `--cacert` with the Secret mounted); the component does not patch them.
+   Outside it, that is every service calling `kosha-service`.
+3. Check the Prometheus scrape job. `/metrics` is on the same port, so it
+   is HTTPS-only too (it needs no client certificate). The component adds
+   `prometheus.io/scheme: https` next to the existing `prometheus.io/*`
+   annotations, but that only takes effect if the scrape job relabels
+   `__meta_kubernetes_pod_annotation_prometheus_io_scheme` onto
+   `__scheme__`, and the job must be able to verify the certificate: give
+   it the internal CA (`tls_config.ca_file`, with
+   `server_name: kosha-internal` since pods are scraped by IP) or set
+   `insecure_skip_verify: true`. A job that keeps scraping `http://` fails
+   every scrape while the pods stay Ready, so watch `up` for the Kosha
+   targets after the rollout.
+4. Expect forwarded writes to fail while the rollout has ingest and query
+   pods on different schemes. Peer hydration falls back to S3 instead.
+
+The migrate Jobs (`base/job-migrate-namespace.yaml`,
+`stage/es-to-kosha-migration-job.yaml`) and the usage reconciliation CronJob
+(`base/cronjob-usage-reconcile.yaml`, #348) read the same ConfigMap but do not
+need the `kosha-internal-tls` Secret: they make no pod-to-pod connection
+and read only the `KOSHA_INTERNAL_TLS` mode, to apply the Postgres rule
+below.
+
+The component sets `KOSHA_INTERNAL_TLS=on`. Once every pod is on TLS, patch
+it to `required` in the overlay so a pod with a plaintext hop refuses to
+start.
+
+**To Postgres.** The connection is encrypted by the URL in `kosha-secret`
+(`database-url`, from the `KOSHA_DATABASE_URL` Environment secret), not by
+a ConfigMap value:
+
+    postgres://kosha:<password>@<host>:5432/kosha?sslmode=verify-full&sslrootcert=/etc/kosha/pg/ca.crt
+
+`sslrootcert` is the CA that signed the database's certificate, mounted
+into every pod that has `DATABASE_URL` (the three Deployments and the
+migrate Jobs), for example from a ConfigMap:
+
+```yaml
+# overlay patch, per Deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: kosha
+          volumeMounts:
+            - name: pg-ca
+              mountPath: /etc/kosha/pg
+              readOnly: true
+      volumes:
+        - name: pg-ca
+          configMap:
+            name: kosha-pg-ca   # key: ca.crt
+```
+
+`sslmode=require` encrypts without verifying the server and needs no CA.
+With `KOSHA_INTERNAL_TLS=required`, a URL whose `sslmode` is anything else
+than `require`, `verify-ca` or `verify-full` stops the pod at startup.
 
 ## Deploying
 

@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod branch;
 pub mod deletes;
+pub mod deletion;
 pub mod fields;
 pub mod fuzzy;
 pub mod gc;
@@ -215,6 +216,93 @@ pub trait ControlStore: Send + Sync {
             "this control store cannot remove namespace {}",
             id.0
         )))
+    }
+
+    // ── Deletion records (#347) ───────────────────────────────────────────
+    //
+    // See [`deletion`]. The defaults refuse, so a store without them never
+    // drops a namespace while silently recording nothing.
+
+    /// [`ControlStore::delete_namespace`] that also writes a pending
+    /// [`deletion::DeletionRecord`] for it, atomically: either the
+    /// namespace's rows are gone and the record exists, or nothing changed.
+    /// The record's `last_version` is the returned retired version.
+    fn delete_namespace_recorded(
+        &mut self,
+        id: &NamespaceId,
+        retire_at_least: u64,
+        deletion: &deletion::NewDeletion,
+    ) -> Result<(Manifest, u64, deletion::DeletionRecord), KoshaError> {
+        let _ = (retire_at_least, deletion);
+        Err(KoshaError::ControlPlane(format!(
+            "this control store cannot record the deletion of namespace {}",
+            id.0
+        )))
+    }
+
+    /// Write a pending record for a deletion that has no namespace row to
+    /// remove with it: a tenant, or a namespace only its writer knew.
+    fn begin_deletion(
+        &mut self,
+        deletion: &deletion::NewDeletion,
+        last_version: u64,
+    ) -> Result<deletion::DeletionRecord, KoshaError> {
+        let _ = last_version;
+        Err(KoshaError::ControlPlane(format!(
+            "this control store cannot record the deletion of {}",
+            deletion.subject
+        )))
+    }
+
+    /// Record one storage-reclaim attempt on a pending record: count it,
+    /// add `objects_deleted`, and either complete the record (`error` is
+    /// `None`: storage is verified empty) or keep it pending with `error`.
+    /// A completed record is returned unchanged. `NotFound` if there is no
+    /// such record.
+    fn record_deletion_attempt(
+        &mut self,
+        deletion_id: &str,
+        objects_deleted: u64,
+        error: Option<&str>,
+    ) -> Result<deletion::DeletionRecord, KoshaError> {
+        let _ = (objects_deleted, error);
+        Err(KoshaError::ControlPlane(format!(
+            "this control store holds no deletion record {deletion_id}"
+        )))
+    }
+
+    /// One deletion record by id.
+    fn deletion(&self, deletion_id: &str) -> Result<Option<deletion::DeletionRecord>, KoshaError> {
+        Err(KoshaError::ControlPlane(format!(
+            "this control store holds no deletion record {deletion_id}"
+        )))
+    }
+
+    /// Deletion records matching `filter`, oldest first.
+    fn deletions(
+        &self,
+        filter: &deletion::DeletionFilter,
+    ) -> Result<Vec<deletion::DeletionRecord>, KoshaError> {
+        let _ = filter;
+        Err(KoshaError::ControlPlane(
+            "this control store holds no deletion records".into(),
+        ))
+    }
+
+    /// Up to `limit` deletion records of any state, in
+    /// `(requested_at_ms, id)` order, strictly after `after` (from the
+    /// first record when `None`). For readers that work through every
+    /// record, such as each pod's cache purge (#347); see
+    /// [`deletion::DeletionPosition`] for what the order does not promise.
+    fn deletions_after(
+        &self,
+        after: Option<&deletion::DeletionPosition>,
+        limit: u32,
+    ) -> Result<Vec<deletion::DeletionRecord>, KoshaError> {
+        let _ = (after, limit);
+        Err(KoshaError::ControlPlane(
+            "this control store holds no deletion records".into(),
+        ))
     }
 }
 
@@ -1761,7 +1849,18 @@ impl LocalStorage {
 ///
 /// The temp filename includes the PID and a per-process atomic counter so
 /// concurrent writes to the *same* path never collide on the same temp file.
-fn atomic_write(path: &std::path::Path, data: &[u8]) -> Result<(), KoshaError> {
+pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> Result<(), KoshaError> {
+    atomic_write_with(path, |tmp| std::fs::write(tmp, data))
+}
+
+/// [`atomic_write`] with the temp file filled by `fill` (a copy, a
+/// stream): `path` only ever appears complete. When `fill` or the rename
+/// fails, the temp file is removed, so a failed write (`ENOSPC` part-way)
+/// leaves neither a truncated `path` nor a stray temp file.
+pub fn atomic_write_with(
+    path: &std::path::Path,
+    fill: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> Result<(), KoshaError> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1780,9 +1879,31 @@ fn atomic_write(path: &std::path::Path, data: &[u8]) -> Result<(), KoshaError> {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp_path = dir.join(format!(".{file_name}.tmp.{}.{n}", std::process::id()));
 
-    std::fs::write(&tmp_path, data)?;
-    std::fs::rename(&tmp_path, path)?;
+    let written = fill(&tmp_path).and_then(|()| std::fs::rename(&tmp_path, path));
+    if let Err(e) = written {
+        if let Err(rm) = std::fs::remove_file(&tmp_path) {
+            if rm.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "WARN: removing temp file {} after a failed write also failed: {rm}",
+                    tmp_path.display()
+                );
+            }
+        }
+        return Err(e.into());
+    }
     Ok(())
+}
+
+/// [`std::fs::create_dir_all`] whose error names the directory. A bare
+/// `io::Error` says only "Permission denied", and a write after an ignored
+/// failure reports NotFound on a file instead of the real cause.
+pub fn create_dir_named(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir).map_err(|e| dir_error(dir, e))
+}
+
+/// `e`, a failure to create `dir`, with `dir` in its message.
+pub fn dir_error(dir: &std::path::Path, e: std::io::Error) -> std::io::Error {
+    std::io::Error::new(e.kind(), format!("cannot create {}: {e}", dir.display()))
 }
 
 impl StorageBackend for LocalStorage {
@@ -1792,7 +1913,7 @@ impl StorageBackend for LocalStorage {
     fn write(&self, path: &str, data: &[u8]) -> Result<(), KoshaError> {
         let full = self.root.join(path);
         if let Some(dir) = full.parent() {
-            std::fs::create_dir_all(dir)?;
+            create_dir_named(dir)?;
         }
         atomic_write(&full, data)
     }
@@ -4855,16 +4976,6 @@ mod tests {
         assert!(!segment_may_match(&must, Some(&blooms)));
     }
 
-    /// Regression test for the staging incident this generalizes PR #45's
-    /// fix for: `SegmentWriter::finalize()` (and every other caller of
-    /// `StorageBackend::write`, e.g. WAL, the S3-hydration local cache
-    /// mirror) rewrites files through `LocalStorage::write`. A reader
-    /// racing a rewrite of the same path must never observe a
-    /// truncated/torn file — before `atomic_write`, plain `fs::write`
-    /// (truncate then fill) could hand back anywhere from 0 bytes up to a
-    /// partial mix, which is exactly how staging ended up with 0-byte
-    /// `doc_store.bin`/`footer.json` in already-published, already-synced
-    /// segments.
     /// A key under a directory that does not exist yet (`_warmset/query.json`
     /// on a fresh query pod) is written, not refused with NotFound.
     #[test]
@@ -4877,6 +4988,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Regression test for the staging incident this generalizes PR #45's
+    /// fix for: `SegmentWriter::finalize()` (and every other caller of
+    /// `StorageBackend::write`, e.g. WAL, the S3-hydration local cache
+    /// mirror) rewrites files through `LocalStorage::write`. A reader
+    /// racing a rewrite of the same path must never observe a
+    /// truncated/torn file — before `atomic_write`, plain `fs::write`
+    /// (truncate then fill) could hand back anywhere from 0 bytes up to a
+    /// partial mix, which is exactly how staging ended up with 0-byte
+    /// `doc_store.bin`/`footer.json` in already-published, already-synced
+    /// segments.
     #[test]
     fn concurrent_local_storage_write_never_yields_truncated_read() {
         let dir = std::env::temp_dir().join("kosha-core-test-atomic-write-race");
@@ -4924,6 +5045,37 @@ mod tests {
             "leftover temp files after atomic_write: {leftover:?}"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fill that fails part-way (`ENOSPC`, a broken download stream)
+    /// leaves the published file as it was and no temp file behind.
+    #[test]
+    fn failed_atomic_write_keeps_the_old_file_and_removes_its_temp() {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-core-test-atomic-write-fail-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("doc_store.bin");
+        std::fs::write(&path, b"complete").unwrap();
+
+        let result = atomic_write_with(&path, |tmp| {
+            std::fs::write(tmp, b"par")?;
+            Err(std::io::Error::other("no space left on device"))
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"complete");
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["doc_store.bin".to_string()],
+            "no temp file left"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

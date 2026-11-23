@@ -497,7 +497,7 @@ jobs:
               -e KOSHA_CACHE_MAX_BYTES=${{ env.CACHE_MAX_BYTES }} -e KOSHA_SEGMENT_CACHE_MAX_BYTES=51539607552 \
               -e KOSHA_SEGMENT_LIVE_MAX_BYTES=68719476736 -e KOSHA_SCORING_HYDRATE_CONCURRENCY=64 \
               -e KOSHA_ADMIN_API_KEY=sk-bench-admin \
-              -e KOSHA_DASHBOARD=on \
+              -e KOSHA_DASHBOARD=on -e KOSHA_SLOW_SEARCH_LOG_MS=0 \
               $WARMUP_ARGS $CACHE_ARGS $EXPERIMENT_ARGS \
               -v /data/kosha:/var/cache/kosha kosha-server:bench
             sudo docker start kosha

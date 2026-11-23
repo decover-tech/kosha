@@ -120,6 +120,11 @@ db-migrate: db-bootstrap
 	@KOSHA_DB_URL="$$(echo "$$DATABASE_URL" | sed -E 's#(/[^/?]+)(\?.*)?$$#/kosha\2#')"; \
 	psql "$$KOSHA_DB_URL" -v ON_ERROR_STOP=1 -f crates/kosha-control/migrations/001_create_kosha_tables.sql; \
 	psql "$$KOSHA_DB_URL" -v ON_ERROR_STOP=1 -f crates/kosha-control/migrations/003_writer_leases.sql; \
+	psql "$$KOSHA_DB_URL" -v ON_ERROR_STOP=1 -f crates/kosha-control/migrations/003_scoped_api_keys.sql; \
+	psql "$$KOSHA_DB_URL" -v ON_ERROR_STOP=1 -f crates/kosha-control/migrations/004_deletion_records.sql; \
+	psql "$$KOSHA_DB_URL" -v ON_ERROR_STOP=1 -f crates/kosha-control/migrations/005_usage_events.sql; \
+	psql "$$KOSHA_DB_URL" -v ON_ERROR_STOP=1 -f crates/kosha-control/migrations/006_orgs_users_projects.sql; \
+	psql "$$KOSHA_DB_URL" -v ON_ERROR_STOP=1 -f crates/kosha-control/migrations/007_billing.sql; \
 	psql "$$KOSHA_DB_URL" -v ON_ERROR_STOP=1 -f crates/kosha-control/migrations/002_grant_kosha_role.sql
 
 # ── All ────────────────────────────────────────────────────────────────────

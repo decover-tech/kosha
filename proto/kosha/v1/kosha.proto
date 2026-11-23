@@ -251,6 +251,34 @@ message DeleteNamespaceResponse {
   // (local segment files or S3 objects) could not be removed. They are
   // unreferenced and never reused by a re-created namespace.
   bool storage_reclaimed = 3;
+  // The durable record of this deletion (#347). `state` is "completed" only
+  // when the namespace's storage prefix was deleted and listed empty.
+  DeletionRecord deletion = 4;
+}
+
+// One hard delete of a namespace or a tenant, as the control store keeps it
+// (kosha.deletion_records). Holds identifiers and counters only.
+message DeletionRecord {
+  string id = 1;
+  // "namespace" or "tenant".
+  string scope = 2;
+  // Internal namespace id ("<tenant>/<name>") or tenant id, per `scope`.
+  string subject = 3;
+  optional string tenant_id = 4;
+  // The tenant deletion a namespace deletion is part of.
+  optional string parent_id = 5;
+  // Namespace scope: the manifest version the namespace retired at.
+  uint64 last_version = 6;
+  // "pending" (rows gone, stored objects may remain) or "completed".
+  string state = 7;
+  // Storage-reclaim attempts so far.
+  uint32 attempts = 8;
+  // Objects deleted from object storage, summed over the attempts.
+  uint64 objects_deleted = 9;
+  // Why the last attempt did not complete.
+  optional string last_error = 10;
+  uint64 requested_at_ms = 11;
+  optional uint64 completed_at_ms = 12;
 }
 
 // ─── Branching (issue #208) ─────────────────────────────────────────────────

@@ -210,13 +210,8 @@ impl WarmStorage for AppState {
                 .write(&path, &bytes)
                 .map_err(|e| format!("writing {path}: {e}"));
         }
-        let full = self.data_dir.join(&path);
-        if let Some(parent) = full.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        let tmp = full.with_extension("json.tmp");
-        std::fs::write(&tmp, &bytes)
-            .and_then(|_| std::fs::rename(&tmp, &full))
+        LocalStorage::new(self.data_dir.clone())
+            .write(&path, &bytes)
             .map_err(|e| format!("writing {path}: {e}"))
     }
 }
@@ -330,7 +325,7 @@ impl AppState {
             }
             FileClass::DocStore => {
                 let (files, bytes) = {
-                    let _permit = self.hydration_semaphore.acquire();
+                    let _permit = self.hydration_semaphore.acquire("warm_doc_store");
                     self.ensure_doc_store_local(&seg_paths, &request)
                 };
                 let mut missing = 0;
@@ -363,7 +358,7 @@ impl AppState {
                     }
                 }
                 {
-                    let _permit = self.hydration_semaphore.acquire();
+                    let _permit = self.hydration_semaphore.acquire("warm_vectors");
                     // Offsets sidecars first, as before: they are what an
                     // open reads.
                     let mut order: Vec<(&String, &Vec<PathBuf>)> = by_file.iter().collect();

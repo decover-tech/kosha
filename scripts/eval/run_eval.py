@@ -11,6 +11,9 @@ Usage: run_eval.py <evalset_dir> --mode quick|standard|full [--out DIR]
   quick     ~10 min  the quick tier; warm latency; 1 and 8 clients
   standard  ~30 min  every case; warm and cached latency; 1-16 clients
   full      ~60 min  standard, 1-32 clients, then a sustained mixed run
+  diagnose  ~10 min  experiments that test a cause, not a regression check:
+                     semantic recall as more vector groups are examined, and
+                     what a matter-wide count costs by shape
 Writes report.json, report.md, failures.jsonl and samples.jsonl.gz to --out.
 The report's start/end times bound the server logs that explain its numbers.
 """
@@ -31,7 +34,9 @@ MODES = {  # warm rounds, cached rounds, (clients, seconds each), sustained minu
     "quick": dict(warm=5, cached=0, ramp=((1, 8), 60), sustained=0),
     "standard": dict(warm=8, cached=1, ramp=((1, 4, 8, 16), 180), sustained=0),
     "full": dict(warm=8, cached=1, ramp=((1, 4, 8, 16, 32), 180), sustained=20),
+    "diagnose": {},
 }
+GROUP_BUDGETS = (100, 800, 1600, 3200, 6400, 20000)  # knn num_candidates; the server raises small ones to its floor
 LOAD_AREAS = ("word", "phrase", "word_grouped", "word_per_document", "document", "knn")
 WALK_PAGE = 1000
 
@@ -197,6 +202,63 @@ def load(clients, seconds, phase, semantic=True):
 
 report = {"matter": manifest["matter"], "evalset_version": manifest["version"], "mode": args.mode, "run_id": RUN_ID,
           "host": args.host, "namespace": args.namespace, "started": utc(), "cases": len(cases)}
+
+
+def diagnose():
+    """Each experiment changes one thing and reports what moved."""
+    out = [f"# Kosha diagnose: matter {manifest['matter'][:8]}, set {manifest['version']}", "", f"Started {report['started']} UTC, run id {RUN_ID}", ""]
+    for area in ("knn", "knn_filtered"):
+        semantic = [c for c in cases if c["area"] == area and not c["expect"].get("ambiguous")]
+        out += [f"Semantic recall as more vector groups are examined ({area}, {len(semantic)} cases)", "",
+                "| Groups asked for | Mean recall@10 | Cases at 1.0 | Top hit right | p50 ms | p95 ms | Errors |", "|---|---|---|---|---|---|---|"]
+        report[f"recall_by_groups_{area}"] = []
+        for budget in GROUP_BUDGETS:
+            recalls, tops, lat, errors = [], 0, [], 0
+            for case in semantic:
+                body = json.loads(json.dumps(case["request"]))
+                body["query"]["knn"]["contentEmbedding"]["num_candidates"] = budget
+                response, ms, error = send(case, f"groups-{budget}", body=body)
+                if error:
+                    errors += 1
+                    continue
+                r, top = recall(case, response)
+                recalls.append(r)
+                tops += top
+                lat.append(ms)
+            row = {"groups": budget, "mean_recall": round(sum(recalls) / max(1, len(recalls)), 3),
+                   "perfect": sum(r == 1.0 for r in recalls), "top_right": tops, **summary(lat), "errors": errors}
+            report[f"recall_by_groups_{area}"].append(row)
+            out.append(f"| {budget} | {row['mean_recall']} | {row['perfect']} of {len(recalls)} | {tops} | {row['p50']} | {row['p95']} | {errors} |")
+        out.append("")
+    scope = next(c for c in cases if c["id"] == "matter-001")["request"]["query"]
+    shapes = {
+        "count only": {"size": 0, "track_total_hits": True, "query": scope},
+        "distinct documents": {"size": 0, "query": scope, "aggs": {"a": {"cardinality": {"field": "documentId"}}}},
+        "file types, top 10": {"size": 0, "query": scope, "aggs": {"a": {"terms": {"field": "fileFormats", "size": 10}}}},
+        "tags, top 10": {"size": 0, "query": scope, "aggs": {"a": {"terms": {"field": "system_tags", "size": 10}}}},
+        "tags, top 1000": {"size": 0, "query": scope, "aggs": {"a": {"terms": {"field": "system_tags", "size": 1000}}}},
+        "documents, top 10": {"size": 0, "query": scope, "aggs": {"a": {"terms": {"field": "documentId", "size": 10}}}},
+        "documents, top 1000": {"size": 0, "query": scope, "aggs": {"a": {"terms": {"field": "documentId", "size": 1000}}}},
+    }
+    out += ["What a matter-wide count costs, by shape (10 warm requests each)", "", "| Shape | p50 ms | p95 ms | Errors |", "|---|---|---|---|"]
+    report["matter_wide"] = {}
+    probe = {"id": "matter-shape", "area": "matter"}
+    for name, body in shapes.items():
+        results = [send(probe, f"shape-{name}", body=body) for _ in range(11)][1:]  # the first warms it
+        lat = [ms for _, ms, error in results if not error]
+        report["matter_wide"][name] = {**summary(lat), "errors": len(results) - len(lat)}
+        out.append(f"| {name} | {pct(lat, 0.5)} | {pct(lat, 0.95)} | {len(results) - len(lat)} |")
+    report["ended"] = utc()
+    samples.close()
+    json.dump(report, open(os.path.join(args.out, "report.json"), "w"), indent=1)
+    open(os.path.join(args.out, "report.md"), "w").write("\n".join(out) + "\n")
+    print("\n".join(out))
+    print("EVAL_DONE", flush=True)
+    raise SystemExit(0)
+
+
+if args.mode == "diagnose":
+    diagnose()
 failures = open(os.path.join(args.out, "failures.jsonl"), "w")
 
 # ── 1. Correctness, on the first send of each case ─────────────────────────
@@ -215,7 +277,7 @@ for case in cases:
         except RuntimeError as e:
             problems = [f"request failed while reading all ids: {e}"]
             area["errors"] += 1
-        if "neighbours" in case["expect"]:
+        if "neighbours" in case["expect"] and not case["expect"].get("ambiguous"):
             r, same_top = recall(case, response)
             recalls.append(r)
             top1.append(same_top)

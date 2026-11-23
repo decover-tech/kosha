@@ -304,6 +304,9 @@ own document, or combine the two values into one leaf (`"name_org": "Ada|beta"`)
 - A built-in read-only dashboard at `/dashboard` (#214), off by default (`KOSHA_DASHBOARD=on`): the tenant's namespaces, per-namespace detail with a recent-latency sparkline, and a query console that shows hits, scores and the timing breakdown and flags `knn_degraded_segments` in red. It calls the normal API with the key pasted into the page. See [docs/dashboard.md](docs/dashboard.md).
 - Admin endpoints: create API key, rebuild filter blooms, backfill offset tables, compact a namespace (sync or async), compaction job and scheduler status, warmup status, import a namespace.
 - Schema migrations via `kosha-server migrate`.
+- Usage metering per tenant and namespace (#348), off by default (`KOSHA_USAGE_METERING=on`): searches, bytes returned and fetched, bytes and documents written, and an hourly stored-bytes snapshot, as idempotent raw events in `kosha.usage_events` (migration 005), read back with `GET /v1/usage`. See "Usage metering" in [docs/configuration.md](docs/configuration.md).
+- Usage reconciliation (#348): `GET /v1/admin/usage/reconcile` and the one-shot `kosha-server reconcile-usage` compare each namespace's stored-bytes snapshot with the objects under its storage prefix (listings only), separate what the manifest references from retired, untracked and stray objects, and flag storage without snapshots and snapshots without storage, deleted namespaces included. The command prints JSON and exits non-zero when a namespace is out of tolerance; `k8s/base/cronjob-usage-reconcile.yaml` runs it daily, shipped suspended. See "Reconciling stored bytes with object storage" in [docs/configuration.md](docs/configuration.md).
+- Billing (#349), off by default (`KOSHA_BILLING=on`): free, usage-based and enterprise plans from a JSON catalog, a monthly job that rates usage into invoices (`kosha.billing_accounts`, `kosha.billing_invoices`, migration 007), free-tier limits and non-payment restrictions (read-only, then suspended) enforced with `402`, and an optional Stripe provider. See "Billing" in [docs/configuration.md](docs/configuration.md).
 - Namespace branching (copy-on-write). `POST /v1/namespaces/{ns}/branch` with `{"name": "<branch>"}` creates a new namespace whose manifest lists the parent's segments and deletion bitmaps where they already are, so it takes the same time for 1M documents as for 10 and copies nothing. Writes, deletes, upserts and compactions on the branch go to the branch's own prefix; the parent's files and query results do not change. `GET /v1/namespaces/{ns}/branches` lists a namespace's branches (`GET .../stats` on a branch shows its parent and how many segments it still shares). `DELETE /v1/namespaces/{ns}/branch` deletes a branch and removes only the objects in its own prefix that no remaining manifest lists: segments a branch of the branch still uses are kept. Only branches can be deleted this way. Admin rewrites (`rebuild-filter-blooms`, `backfill-offset-tables`) on a branch skip the segments it shares with its parent. Segment GC never deletes an object a branch still lists, and `DELETE /v1/namespaces/{ns}` refuses (409) a namespace whose segments a branch still shares: delete the branches first. A sharded namespace cannot be branched yet.
 
 ### API and clients
@@ -451,6 +454,9 @@ the routes marked *write* to the ingest pod.
 | `GET /v1/healthz`, `GET /healthz`, `GET /readyz` | | Unauthenticated probes. |
 | `GET /metrics` | → Prometheus text format | Unauthenticated unless `KOSHA_METRICS_AUTH=admin`; see [docs/metrics.md](docs/metrics.md). |
 | `GET /dashboard` | | Read-only web UI, `KOSHA_DASHBOARD=on` only (404 otherwise); see [docs/dashboard.md](docs/dashboard.md). |
+| `GET /v1/usage` | → `{"tenant", "from", "to", "namespaces": [...], "total"}` | The caller's usage per namespace over `?from=&to=` (Unix seconds, default the last 30 days). 404 unless `KOSHA_USAGE_METERING=on`. `GET /v1/admin/usage[?tenant=]` is the admin view. |
+| `GET /v1/admin/usage/reconcile` | → `{"within_tolerance", "namespaces": [{"tenant", "namespace", "control_plane", "snapshot_bytes", "storage", "difference_bytes", "status"}], "totals", "unattributed", "skipped_prefixes", "warnings"}` | Admin key. Stored-bytes snapshots against object storage, per namespace; `?tenant=&tolerance=&tolerance_bytes=&max_snapshot_age=`. 404 unless `KOSHA_USAGE_METERING=on`. |
+| `GET /v1/billing` | → `{"tenant", "plan", "kind", "state", "free_tier_exceeded", "period", "usage", "accrued", "invoices"}` | The caller's plan, payment state, month-to-date usage with the charge accrued so far, and invoices. 404 unless `KOSHA_BILLING=on`. The admin routes are under `/v1/admin/billing/`. |
 | `GET /v1/stats` | | Admin key only. |
 | `/v1/admin/*` | | Admin key only; see the operations list above. |
 
@@ -470,8 +476,9 @@ under the namespace's publication lock:
    records in it.
 3. Its local segment directory and per-namespace caches are removed.
 4. With S3 configured, every object under the namespace's prefix
-   (`{KOSHA_S3_PREFIX}/{tenant}/{ns}/`) is deleted before the response returns.
-   If that fails, the namespace is still deleted and the response says
+   (`{KOSHA_S3_PREFIX}/{tenant}/{ns}/`) is deleted before the response returns,
+   and the prefix is then listed again. If the delete fails or the listing is
+   not empty, the namespace is still deleted and the response says
    `"storage_reclaimed": false`; the leftover objects are unreferenced, and a
    re-created namespace never reuses their keys.
 
@@ -480,6 +487,122 @@ manifest for it: within one manifest refresh (`KOSHA_MANIFEST_REFRESH_MS`,
 default 500 ms), or at once for a search with `max_staleness_seconds: 0`. Their local disk copies of its segments are not removed
 eagerly; the LRU cache (`KOSHA_CACHE_MAX_BYTES`) evicts them. Re-creating the
 namespace, explicitly or by writing to it, starts it empty.
+
+**Cached copies on every pod.** With `KOSHA_DELETION_PURGE_INTERVAL_MS` set
+(off by default), each pod of any role reads the deletion records it has not
+handled yet, at boot and then on that interval, and for every deleted
+namespace or tenant:
+
+- drops what it holds in memory for it: parsed segments, corpus statistics and
+  score ceilings, cached result pages, hydration verdicts, the unindexed tail;
+- removes its segment directories (byte-range spans included) from the local
+  disk.
+
+A namespace re-created under the same name shares the directory. Segment ids
+are never reused, so the pod keeps exactly the segments a current manifest
+lists (the control store's, a branch's, or its own unpublished ones, read
+under the writer's locks) and removes the rest. The retired version on the
+record tells a manifest of the deleted incarnation from one of the new. A
+directory written to in the last 5 seconds, pinned, or being fetched is left
+for the next sweep. So is a namespace on a writer pod whose first publish
+registered it after the sweep listed the control store: the writer asks the
+store again under its locks before it removes anything.
+
+A deletion record carries no per-pod acknowledgement: the control store has
+no list of pods to wait for. What holds for a pod that has the purge on and
+can read the control store:
+
+- it handles a record in the first pass that starts after the delete commits,
+  so within one interval plus the length of a pass. (Records are read in
+  request-time order with a 10-minute look-back; a delete whose transaction
+  stayed open longer than that is only seen after the pod restarts.)
+- for a deletion less than an hour old it sweeps the same namespace again 60
+  seconds later, and it repeats any sweep every 60 seconds while one left
+  something or failed. That removes what a search or fetch already running
+  wrote after the first sweep;
+- it sweeps a deleted tenant again every 60 seconds for as long as the tenant's
+  record is `pending`, and once more after the record is `completed`. A tenant
+  record is written before the tenant's namespaces are deleted, and a sweep
+  keeps whatever the control store still lists, so the sweep after completion
+  is the one that removes what has no record of its own: the tenant's branches
+  and directories no namespace was ever registered for. For those, the window
+  starts when the tenant record completes, not when the delete was requested;
+- a pod that was down handles every record in its first pass after boot.
+
+Not covered: a pod with the purge off; parsed segments a search already
+running still holds, until it ends; a pod that cannot read the control store,
+until it can; a writer pod holding unpublished writes for a namespace another
+pod deleted, until they are published or dropped; a branch deleted on its own
+with `DELETE /v1/namespaces/{ns}/branch`, which writes no deletion record (its
+cached copies leave a pod only by eviction, or when its tenant is deleted);
+freed disk blocks and the operating system's page cache. `GET /v1/stats`
+reports each pod's progress
+under `deletion_purge` (`caught_up`, `pending_sweeps`, `last_error`, counters).
+
+**Deletion records.** Step 1 also writes a deletion record
+(`kosha.deletion_records` in Postgres, migration 004) in the same transaction
+that drops the namespace, and the response returns it as `deletion`:
+
+```json
+{"namespace": "docs", "acknowledged": true, "storage_reclaimed": true,
+ "deletion": {"id": "del-…", "scope": "namespace", "subject": "acme/docs",
+              "tenant_id": "acme", "state": "completed", "attempts": 1,
+              "objects_deleted": 42, "last_error": null,
+              "requested_at_ms": 1790000000000, "completed_at_ms": 1790000000412}}
+```
+
+A record is `pending` until step 4 has deleted the prefix **and** listed it
+empty; only then is it `completed`. A record holds identifiers and counters,
+never document content, and is kept as the evidence that the erasure finished.
+What `completed` covers is the control store, the ingest pod's memory, WAL and
+disk, and object storage. It does not cover the caches of other pods, which
+each pod purges for itself within the window described above.
+
+| Method and path | Notes |
+|---|---|
+| `GET /v1/admin/deletions` | Records, oldest first. Filters: `?state=pending\|completed`, `?tenant=<id>`, `?limit=<n>`. |
+| `GET /v1/admin/deletions/{id}` | One record. |
+| `POST /v1/admin/deletions/resume` | *write*. Retry every pending record (or `{"id": "…"}` for one). Returns the records and how many are still pending. |
+| `DELETE /v1/admin/tenants/{tenant}` | *write*. Delete a tenant; see below. |
+
+A pending namespace record whose namespace was re-created in the meantime is
+not retried: the new incarnation writes into the same prefix. It completes
+after that namespace is deleted again. With the in-memory control store (no
+`DATABASE_URL`) records last only as long as the process.
+
+With `KOSHA_DELETION_RESUME_INTERVAL_MS` set (off by default), a writer pod
+(`ingest` or `standalone`) retries pending **namespace** records itself, at
+boot and then on that interval, under the same rule. A record that stays
+pending waits twice as long before each further try, up to one hour. Pending
+tenant records are left to `POST /v1/admin/deletions/resume`: a tenant pass
+deletes whatever keys and namespaces the tenant id has when it runs.
+
+A retry deletes the namespace's whole prefix in object storage, unattended,
+and the first one runs at boot, when a second writer pod can still be alive.
+Each automatic retry therefore takes the namespace's writer lease first and is
+skipped (and paused like a failed one) while another writer holds it; with the
+lease held no other writer can commit a manifest for the namespace between the
+"not re-created" check and the delete. A lease taken only for the retry is
+released again. With `KOSHA_WRITER_LEASE=off` nothing fences the other writer:
+do not set `KOSHA_DELETION_RESUME_INTERVAL_MS` where two writer pods can run at
+the same time (a rolling restart of the ingest pod included). The admin resume
+call takes no lease; run it against the pod that is the active writer.
+
+**Deleting a tenant** (`DELETE /v1/admin/tenants/{tenant}`, admin key) needs
+the body `{"confirm": "<tenant>"}` and is permanent. In order: the tenant's
+API keys are deleted from `kosha.api_keys` (and from the ingest pod's key
+snapshot at once; other pods drop them on their next refresh,
+`KOSHA_API_KEY_REFRESH_SECS`), its branches are deleted, each namespace is
+deleted as above with its own record, and whatever is left under
+`{KOSHA_S3_PREFIX}/{tenant}/` is deleted and the prefix listed empty. The
+response is 200 with `"completed": true` when all of that held, and 202 with
+the reasons in `errors` when something is left; the tenant's own record then
+stays `pending` and `POST /v1/admin/deletions/resume` (or repeating the
+request) continues it. Keys set through `KOSHA_API_KEYS` / `KOSHA_API_KEY`
+cannot be removed at runtime, so a tenant that still has one stays pending
+until the deployment's environment changes. Tenant ids starting with `_` or
+`.` are refused, and so is a tenant whose id is also the name of an unscoped
+(pre-#262) namespace, which stores its segments under the same prefix.
 
 ## Late interaction
 
@@ -614,7 +737,24 @@ rejected. Legacy callers that previously accessed bare stored namespaces need
 an explicit migration to tenant-scoped namespaces; this change does not rename
 existing data automatically.
 
-- Set `KOSHA_ADMIN_API_KEY` for `/v1/admin/*` and global `/stats` access.
+A namespace or branch name is a single path component: non-empty, not `.` or
+`..`, and free of `/`, `\` and control characters. Names of the exact form
+`_shard-NNNN` (four digits) are reserved, because `<tenant>/_shard-0001` is the
+storage layout of a shard of the bare namespace `<tenant>`. Other names starting
+with `_` or `.` are allowed. New API keys (`POST /v1/admin/api-keys`) refuse a
+tenant id starting with `_` or `.`, since namespaces under it would be accounted
+to the shared `_legacy` cache tenant; such ids already configured keep working,
+and the server logs a warning at startup for any in `KOSHA_API_KEYS`.
+
+- Set `KOSHA_ADMIN_API_KEY` for `/v1/admin/*` and global `/stats` access. With
+  a Postgres control plane, give each operator their own credential instead and
+  keep this one for bootstrap and break-glass; see
+  [Operator admin credentials](#operator-admin-credentials).
+- Organizations, users with roles (owner, admin, member, read-only), projects,
+  the tenants they own and an audit log of control-plane actions are managed
+  under `/v1/admin/users` and `/v1/admin/orgs`; see
+  [docs/organizations.md](docs/organizations.md). Existing tenants and keys need
+  no migration.
 - Set a separate `KOSHA_INTERNAL_API_KEY` on every peer participating in segment
   hydration. Tenant API keys do not authorize admin or peer-file access.
 - Both service capabilities are disabled when their respective secret is unset.
@@ -625,6 +765,129 @@ existing data automatically.
   are re-read every `KOSHA_API_KEY_REFRESH_SECS` (default 30), request bodies are
   capped at `KOSHA_MAX_BODY_BYTES` (default 64 MiB, 413 above it), and
   `KOSHA_LEGACY_ROUTES=off` turns the unversioned routes into 410s.
+
+### Scoped API keys (Postgres key registry)
+
+Keys in the Postgres registry carry scopes, an optional namespace allow-list
+and an optional expiry. The server enforces them on every tenant route, before
+a query pod forwards a write to the ingest pod:
+
+| Scope | Routes |
+|---|---|
+| `read` | search, exists, namespace stats, reading a schema, listing namespaces and branches, the tenant's own usage (`GET /v1/usage`) and billing state (`GET /v1/billing`) |
+| `write` | index, replace, delete documents, flush |
+| `admin` | create and delete namespaces and branches, change a namespace's schema or shards |
+
+Scopes are independent (`admin` does not include `write`). A request outside a
+key's scopes or namespaces gets a `403` naming what is missing; an expired key
+gets `401` "API key expired". The `admin` scope is tenant-level: `/v1/admin/*`
+still needs an admin credential. Env keys (`KOSHA_API_KEY`, `KOSHA_API_KEYS`)
+and every key created before scopes existed have all three scopes, every
+namespace and no expiry, so they behave as before. A key restricted to
+namespaces cannot use the routes that answer for the whole tenant (listing all
+namespaces, `GET /v1/usage`, `GET /v1/billing`), and can only create a
+namespace or branch whose name is on its list.
+
+Manage keys with the admin credential (`kosha admin ...` wraps these):
+
+| Route | Does |
+|---|---|
+| `POST /v1/admin/api-keys` | Create a key: `{"tenant_id", "description", "scopes": ["read"], "namespaces": ["docs"], "expires_in_secs": 86400}`. Only `tenant_id` is required. The key is in the response and is never shown again |
+| `GET /v1/admin/api-keys[?tenant_id=T]` | List keys that are not revoked: id, tenant, scopes, namespaces, `expires_at`, `last_used_at` (unix seconds). No secrets |
+| `POST /v1/admin/api-keys/revoke` | `{"key_id"}`. The pod that answers refuses the key at once, the others within `KOSHA_API_KEY_REFRESH_SECS` |
+| `POST /v1/admin/api-keys/rotate` | `{"key_id", "overlap_secs": 86400}`. Issues a replacement with the same tenant, scopes and namespaces; the old key keeps working for the overlap (default one day), so clients switch without downtime |
+| `POST /v1/admin/api-keys/scrub-plaintext` | Removes the plaintext that keys created before this feature still hold in the database |
+| `GET /v1/admin/api-keys/plaintext-count` | Read-only: `{"plaintext_rows": N, "scrub_due": true}`, the rows `scrub-plaintext` would rewrite. The server logs the same count at startup (`api keys: N row(s) still hold a plaintext key`) |
+
+Keys are stored as SHA-256 hashes; a key's `key_id` is that hash. Creating,
+rotating and revoking a key are recorded in the audit log, in the same
+transaction as the change; see [docs/organizations.md](docs/organizations.md#audit-log).
+`last_used_at` is written about once per refresh interval, not per request.
+
+### Operator admin credentials
+
+`KOSHA_ADMIN_API_KEY` is one secret shared by everyone who administers the
+deployment: it cannot expire, cannot be taken from one person, and the audit log
+can only say `operator` did something. With a Postgres control plane, each
+operator can hold a named credential instead. It opens exactly what the shared
+key opens (`/v1/admin/*`, global `/stats`, `/metrics` under
+`KOSHA_METRICS_AUTH=admin`), is sent the same way (`Authorization: Bearer` or
+`X-Api-Key`), and is recorded in the
+[audit log](docs/organizations.md#audit-log) as `operator:<name>`. When it is
+used to act for a user (`X-Kosha-Actor`), the entry's actor is that user and
+its detail carries `"via": "operator:<name>"`.
+
+| Route | Does |
+|---|---|
+| `POST /v1/admin/operators` | Issue a credential: `{"name": "alice", "description", "expires_in_secs": 7776000}`. Only `name` is required (1 to 64 of letters, digits, `. _ - @ +`). The credential is in the response and is never shown again. `409` if that operator already holds a usable one: rotate it |
+| `GET /v1/admin/operators` | List credentials that are not revoked: id, name, `expires_at`, `last_used_at`. No secrets |
+| `POST /v1/admin/operators/revoke` | `{"key_id"}` revokes one credential, `{"name"}` every credential of that operator. The pod that answers refuses them at once, the others within `KOSHA_API_KEY_REFRESH_SECS` |
+| `POST /v1/admin/operators/rotate` | `{"key_id", "overlap_secs": 86400}`. Issues a replacement for the same operator; the old credential keeps working for the overlap (default one day) |
+
+Operator credentials are stored in the key registry like tenant keys (hashed,
+same expiry, rotation and refresh), but the two never mix: an operator
+credential is not a key for any tenant, a tenant key (whatever its scopes) is
+not an admin credential, and the `/v1/admin/api-keys` routes neither list nor
+change operator credentials. Creating, rotating and revoking one is written to
+`kosha.audit_log` (`operator_credential.created` / `.rotated` / `.revoked`) with
+whoever did it, in the same transaction as the change.
+
+**Moving off the shared key.**
+
+1. With `KOSHA_ADMIN_API_KEY`, issue a credential for each operator
+   (`POST /v1/admin/operators`), and check each one works.
+2. Do the same for everything that is not a person but sends the shared key,
+   and switch each to its own credential. In this repository that is the
+   segment-GC CronJob (`k8s/base/cronjob-segment-gc.yaml`, which reads the
+   `admin-api-key` entry of `kosha-secret`: issue a credential named, say,
+   `segment-gc` and store it under that entry), plus whatever you run
+   yourself with the key: `kosha admin ...` and `scripts/create_api_key.py`
+   in CI or runbooks, scheduled compaction, a metrics scraper under
+   `KOSHA_METRICS_AUTH=admin`. A credential issued with `expires_in_secs`
+   stops such a job when it expires, so rotate it before then or issue it
+   without an expiry.
+3. Set `KOSHA_ADMIN_BOOTSTRAP_KEY=disabled` on every pod and restart. The shared
+   key is now refused like any unknown key (`401`), for people and for
+   automation alike: a job still sending it fails. It can stay in the pods'
+   `KOSHA_ADMIN_API_KEY` for step 4.
+4. To break glass (every operator credential lost, expired or revoked), set
+   `KOSHA_ADMIN_BOOTSTRAP_KEY=enabled` (or remove it) and restart: the shared key
+   works again. Rotate it afterwards if it was exposed.
+
+Leaving the variable unset keeps today's behaviour: the shared key and operator
+credentials both work. The server refuses to start on any other value. It does
+not stop you disabling the shared key while no operator credential is usable;
+it logs a warning at startup, and step 4 is the way back. During a rolling
+upgrade, pods still on a build without this feature refuse operator credentials
+(as an admin credential and as a tenant key), so issue them once every pod is
+upgraded. `/internal/*` and `KOSHA_INTERNAL_API_KEY` are unaffected.
+
+**Upgrading.** The migration (`003_scoped_api_keys.sql`, also applied by the
+server at startup) only adds columns and hashes existing keys; it leaves their
+plaintext in place, because pods still running the previous build read it. Roll
+every pod to the new build, then run `kosha admin scrub-plaintext-api-keys`
+once. Until every pod is upgraded, a key created through an upgraded pod is not
+accepted by the pods still on the old build. After the scrub the table holds no
+usable key, and a rollback to a build from
+before this feature would no longer accept Postgres keys (env keys are
+unaffected). The server's database role must own `kosha.api_keys`
+(`002_grant_kosha_role.sql`) or an admin must apply the migration first
+(`make db-migrate`).
+
+**Upgrading an instance that was set up with `make db-migrate`.** Tables created
+by the database admin belong to the admin until `002_grant_kosha_role.sql` hands
+them to the role the server connects as, and the migrations the server applies
+at startup cannot change that. Before this release 002 did not hand over
+`kosha.hydration_leases`, so on such an instance hydration-lease claims and
+namespace or tenant deletion fail with `permission denied for table
+hydration_leases`, and rolling out a new server image does not fix it. Re-run
+002 once as the database admin: `make db-migrate` (every step is safe to
+re-run), or that one file with `psql` against the `kosha` database.
+An instance where the server's role created the tables itself (no
+`make db-migrate`) is not affected. The server checks at startup and logs
+`WARNING: the database role this server connects as cannot read and write
+kosha.<table> ...` naming each table or sequence of schema `kosha` it cannot
+use; it still starts.
 
 A successful flush uploads its segment snapshot before publishing its manifest.
 Upload and manifest-store failures return errors and remain retryable. By
@@ -874,7 +1137,7 @@ the full contributor workflow: crate map, feature flags, benchmarks and PR conve
 The Postgres CAS integration test races independent writers and checks retries.
 Run it against a dedicated disposable database:
 
-    KOSHA_TEST_DATABASE_URL=postgres://... cargo test -p kosha-control --features postgres --test postgres_cas -- --ignored
+    KOSHA_TEST_DATABASE_URL=postgres://... cargo test -p kosha-control --features postgres --test postgres_cas --test orgs -- --ignored
 
 To measure single-document upsert write amplification against a real 500 MiB
 segment (including its stored filter payload):

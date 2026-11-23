@@ -12,12 +12,16 @@ The pods in `k8s/base/deployment.yaml`, `k8s/base/deployment-query.yaml` and
 Prometheus using the usual annotation-based pod discovery collects them with no extra
 configuration.
 
+With TLS between pods turned on (`k8s/components/internal-tls`), the port is HTTPS-only and
+the component adds `prometheus.io/scheme: https`. The scrape job then has to honor that
+annotation and trust the internal CA; see `k8s/README.md`, "Encryption in transit".
+
 ## Access
 
 | Setting | Effect |
 | --- | --- |
 | default | Unauthenticated, like `/healthz` and `/readyz` |
-| `KOSHA_METRICS_AUTH=admin` | Requires the `KOSHA_ADMIN_API_KEY` credential (`Authorization: Bearer <key>` or `X-Api-Key`); 403 without it. With no admin key configured, every scrape is refused |
+| `KOSHA_METRICS_AUTH=admin` | Requires the `KOSHA_ADMIN_API_KEY` credential or an operator credential (`Authorization: Bearer <key>` or `X-Api-Key`); 403 without it. With no admin key configured and no operator credential, every scrape is refused |
 | `KOSHA_METRICS=off` | `GET /metrics` returns 404 |
 
 The default exposes no tenant data: no series carries a namespace or tenant label. Leave the
@@ -35,11 +39,11 @@ plus `+Inf`.
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `kosha_search_requests_total` | counter | `outcome` | Search requests (`POST` and `GET`, every route form) by outcome. `ok`: HTTP 200. `rejected`: shed with HTTP 429, because the scoring queue was full (`KOSHA_SEARCH_QUEUE_DEPTH`) or the request hit a hydration or memory ceiling. `timeout`: shed with HTTP 429 after waiting `KOSHA_SEARCH_QUEUE_TIMEOUT_MS` for a scoring slot. `error`: any other status, including 4xx client errors |
+| `kosha_search_requests_total` | counter | `outcome` | Search requests (`POST` and `GET`, every route form) by outcome. `ok`: HTTP 200. `rejected`: shed with HTTP 429, because the scoring queue was full (`KOSHA_SEARCH_QUEUE_DEPTH`, or the tenant's `KOSHA_SEARCH_QUEUE_DEPTH_PER_TENANT`) or the request hit a hydration or memory ceiling. `timeout`: shed with HTTP 429 after waiting `KOSHA_SEARCH_QUEUE_TIMEOUT_MS` for a scoring slot. `error`: any other status, including 4xx client errors |
 | `kosha_search_duration_seconds` | histogram | none | Server-side wall-clock time of searches with outcome `ok`, from the handler's start to the response being ready. Includes result-cache hits |
 | `kosha_search_phase_seconds` | histogram | `phase` | Time a scored search spent in each phase. `queue`: waiting for a scoring slot. `hydrate`: making the segment files it needs local (near zero when warm). `score`: the scoring pass. The same numbers as `queue_ms`, `hydrate_ms` and `score_ms` in the `search timing:` log line. Result-cache hits are not observed |
 | `kosha_search_queue_depth` | gauge | none | Searches waiting for a scoring slot at scrape time |
-| `kosha_search_queue_rejections_total` | counter | none | Searches the scoring queue shed, whether because it was full or because the wait timed out. Each is also counted in `kosha_search_requests_total` as `rejected` or `timeout` |
+| `kosha_search_queue_rejections_total` | counter | none | Searches the scoring queue shed, whether because it was full (including a waiting search shed to make room for a tenant holding less of the full queue) or because the wait timed out. Each is also counted in `kosha_search_requests_total` as `rejected` or `timeout` |
 | `kosha_knn_degraded_segments_total` | counter | none | Segments a kNN search could not search by vector and skipped (the response's `knn_degraded_segments`, summed). Any increase means vector search silently returned fewer candidates |
 
 ### Writes
@@ -54,22 +58,44 @@ plus `+Inf`.
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `kosha_tenant_rejections_total` | counter | `reason` | Requests refused with HTTP 429 by a per-tenant limit or quota (#341, `KOSHA_TENANT_LIMITS_FILE`). `reason`: `tenant_qps_exceeded`, `tenant_concurrency_exceeded`, `tenant_write_rate_exceeded`, `namespace_quota_exceeded`, `doc_quota_exceeded`, `vector_dims_exceeded` or `body_too_large`, the same code as the response body's `reason`. A search refused here never reaches the scoring queue, so it is not counted in `kosha_search_requests_total`. Stays at zero without a limits file |
+| `kosha_tenant_rejections_total` | counter | `reason` | Requests refused with HTTP 429 by a per-tenant limit or quota (#341, `KOSHA_TENANT_LIMITS_FILE`). `reason`: `tenant_qps_exceeded`, `tenant_concurrency_exceeded`, `tenant_write_rate_exceeded`, `namespace_quota_exceeded`, `doc_quota_exceeded`, `vector_dims_exceeded`, `body_too_large` or `tenant_queue_full`, the same code as the response body's `reason`. A search refused by a limit from the file never reaches the scoring queue, so it is not counted in `kosha_search_requests_total`. `tenant_queue_full` is a search the scoring queue shed because its tenant already had `KOSHA_SEARCH_QUEUE_DEPTH_PER_TENANT` searches waiting; it is also counted in `kosha_search_queue_rejections_total` and as `rejected` in `kosha_search_requests_total`. Every other reason stays at zero without a limits file |
 
 ### Caches and hydration
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `kosha_cache_bytes` | gauge | `cache` (`tenant`) | `nvme`: bytes in the local read-through file cache (`KOSHA_DATA_DIR`). `segment`: approximate bytes of parsed segments held in memory (the `KOSHA_SEGMENT_CACHE_MAX_BYTES` ledger). `result`: bytes of cached `POST /search` responses (`KOSHA_RESULT_CACHE_MAX_BYTES`) |
-| `kosha_cache_evictions_total` | counter | `cache` (`tenant`) | `nvme`: evictions from the local file cache, one per file or directory (such as a segment) removed, whether by the `KOSHA_CACHE_MAX_BYTES` limit or by an explicit eviction. `segment`, `result`: entries evicted to stay within the cache's budget |
-| `kosha_cache_hits_total` | counter | `cache` (`tenant`) | Lookups that found their entry (#342). `nvme`: a search's segment whose scoring files were already local, counted per segment checked by a hydration pass and, for a warm search served from the cached hydration verdict, per manifest segment. `segment`: a parsed segment found in memory. `result`: a search answered from the result cache |
-| `kosha_cache_misses_total` | counter | `cache` (`tenant`) | Lookups that did not (#342). `nvme`: a search's segment that had to be hydrated. `segment`: a segment opened and parsed. `result`: a cacheable search that ran |
+| `kosha_cache_bytes` | gauge | `cache` (`tenant`) | `nvme`: bytes in the local read-through file cache (`KOSHA_DATA_DIR`). `segment`: approximate bytes of parsed segments held in memory (the `KOSHA_SEGMENT_CACHE_MAX_BYTES` ledger). `result`: bytes of cached `POST /search` responses (`KOSHA_RESULT_CACHE_MAX_BYTES`). Not reported for `corpus_stats` and `ceiling`, which are bounded by entry count |
+| `kosha_cache_evictions_total` | counter | `cache` (`tenant`) | `nvme`: evictions from the local file cache, one per file or directory (such as a segment) removed, whether by the `KOSHA_CACHE_MAX_BYTES` limit or by an explicit eviction. `segment`, `result`: entries evicted to stay within the cache's budget. `corpus_stats`, `ceiling`: manifest versions evicted to stay within the cache's entry bound (a version replaced by a newer one of the same namespace is not counted) |
+| `kosha_cache_hits_total` | counter | `cache` (`tenant`) | Lookups that found their entry (#342). `nvme`: a search's segment whose scoring files were already local, counted per segment checked by a hydration pass and, for a warm search served from the cached hydration verdict, per manifest segment. `segment`: a parsed segment found in memory. `result`: a search answered from the result cache. `corpus_stats`: a search whose namespace corpus statistics (BM25 totals) were cached for its manifest version. `ceiling`: the same for per-segment score ceilings |
+| `kosha_cache_misses_total` | counter | `cache` (`tenant`) | Lookups that did not (#342). `nvme`: a search's segment that had to be hydrated. `segment`: a segment opened and parsed. `result`: a cacheable search that ran. `corpus_stats`, `ceiling`: the manifest version's entry had to be built |
 | `kosha_hydrations_total` | counter | `source` | Segment files a hydration needed, by where they came from. `s3`: fetched from the object store. `peer`: streamed from the replica holding the hydration lease. `local`: already in the local cache when the fetch ran. Ranged span reads of doc stores and postings are not counted. Stays at zero without S3 |
 | `kosha_hydration_lease_outcome_total` | counter | `outcome` | Cross-replica hydration lease claims (S3 and Postgres builds with `POD_IP` set). `won`: this replica fetches the file. `streamed_from_peer`: another replica held the lease and served the bytes. `timeout`: the holder did not serve the bytes within the peer-fetch budget (or the fetch failed), and the file was fetched from S3 instead |
 | `kosha_segment_checksum_failures_total` | counter | none | Hydrated segment files that failed their `_COMMIT` size or CRC check, refetch failures included. The same number as `segment_checksum_failures` in `GET /v1/stats` |
 
 Values that already exist elsewhere in the server (cache bytes, NVMe evictions, checksum
 failures, queue depth) are read when Prometheus scrapes, not counted twice.
+
+The purge of deleted namespaces (`KOSHA_DELETION_PURGE_INTERVAL_MS`, #347) adds no family to
+`/metrics`. A segment directory it removes counts in `kosha_cache_evictions_total{cache="nvme"}`
+like any other explicit eviction. Its own counters are per pod, in the `deletion_purge` block of
+`GET /v1/stats`:
+
+| Field | Meaning |
+| --- | --- |
+| `enabled`, `interval_ms` | Whether the purge runs on this pod, and how often |
+| `caught_up` | Whether a pass since boot has read the deletion records to the end |
+| `last_pass_at_ms`, `watermark_ms` | When the last pass started (Unix ms, this pod's clock), and the newest `requested_at_ms` among the records handled |
+| `pending_sweeps` | Subjects waiting for another sweep: the repeat sweep after a deletion, or one that left something behind or failed |
+| `last_error` | The first error of the last pass, `null` when it had none |
+| `kosha_deletion_purge_passes_total` | Passes run |
+| `kosha_deletion_purge_records_total` | Deletion records handled for the first time |
+| `kosha_deletion_purge_sweeps_total` | Sweeps of one namespace or tenant, first and repeat sweeps together |
+| `kosha_deletion_purge_segment_dirs_removed_total`, `kosha_deletion_purge_bytes_removed_total` | Segment directories removed from the local disk, and their bytes |
+| `kosha_deletion_purge_parsed_segments_dropped_total` | Parsed segments dropped from memory |
+| `kosha_deletion_purge_deferred_total` | Directories or namespaces a sweep left for a later one (written to within the last 5 s, pinned, being fetched, or held by a writer's unpublished state) |
+| `kosha_deletion_purge_errors_total` | Passes or sweeps that failed (control store unreadable, a file that could not be removed) |
+| `kosha_deletion_resume_attempts_total`, `kosha_deletion_resume_completed_total` | Automatic retries of pending namespace records on a writer pod (`KOSHA_DELETION_RESUME_INTERVAL_MS`), and how many completed the record |
+| `kosha_deletion_resume_fenced_total` | Automatic retries skipped because the namespace's writer lease could not be taken (another writer pod holds it, or the lease store could not be reached) |
 
 Each cache keeps these figures per tenant (#342): the tenant is the first component of the
 `<tenant>/<name>` namespace id, and bare namespace ids from before tenants existed count as

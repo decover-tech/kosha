@@ -37,6 +37,11 @@ spec:
       containers:
         - name: kosha
           imagePullPolicy: Always
+          env:
+            # Test branch only: log every search's `search timing:` line
+            # (main defaults to 1000 ms, slow searches only).
+            - name: KOSHA_SLOW_SEARCH_LOG_MS
+              value: "0"
           resources:
             requests:
               cpu: "1"

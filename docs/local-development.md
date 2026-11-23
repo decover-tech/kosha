@@ -117,6 +117,7 @@ isolation section):
 | `KOSHA_API_KEY` | Tenant key for tenant `default` |
 | `KOSHA_API_KEYS` | Tenant keys, `key1=tenant1,key2=tenant2` |
 | `KOSHA_ADMIN_API_KEY` | Admin credential for `/v1/admin/*` and global `/stats` |
+| `KOSHA_ADMIN_BOOTSTRAP_KEY=disabled` | Refuse `KOSHA_ADMIN_API_KEY`, leaving only per-operator credentials (`POST /v1/admin/operators`) |
 | `KOSHA_INTERNAL_API_KEY` | Peer credential for `/internal/*`: segment hydration, and query pods reading the ingest pod's unindexed writes for strong-consistency searches (#255) |
 | `KOSHA_DEFAULT_CONSISTENCY` | `strong` (default) or `eventual`: whether a search that does not say also scans unindexed writes. A query pod without `KOSHA_INTERNAL_API_KEY` defaults to `eventual` |
 | `KOSHA_MAX_UNINDEXED_BYTES` / `KOSHA_MAX_UNINDEXED_DOCS` | Per-namespace cap on unindexed writes (default 2 GiB / unset; `0` disables); past it `/index` and `/replace` return 429 |
@@ -124,7 +125,7 @@ isolation section):
 | `KOSHA_AUTH=disabled` | Run with auth off (every request is tenant `dev`). Without it, a server with no credential configured (env or Postgres `kosha.api_keys`) refuses to start |
 | `KOSHA_API_KEY_REFRESH_SECS` | How often Postgres keys are re-read (default 30), so created keys work and deleted keys stop working without a restart |
 | `KOSHA_MAX_BODY_BYTES` | Request body cap, larger bodies get 413 (default 64 MiB) |
-| `KOSHA_LEGACY_ROUTES=off` | Unversioned `/index`, `/search`, ... routes answer 410. Usage per tenant is logged (`legacy route usage:`) to track the cutover |
+| `KOSHA_LEGACY_ROUTES=off` | Unversioned `/index`, `/search`, ... routes answer 410. Usage is logged (`legacy route usage since the last line:`, a count per route and the latest tenant) on first use and then at most hourly per pod, to track the cutover |
 
 On startup the server logs which control plane and S3 backend it bound, and
 how many manifests it restored. `/stats` exposes `control_plane`,

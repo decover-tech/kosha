@@ -1,0 +1,15 @@
+# The ingest pod serves HTTPS only once it has a server certificate, so the
+# query tier has to forward writes to https://.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kosha-query
+  namespace: kosha
+spec:
+  template:
+    spec:
+      containers:
+        - name: kosha
+          env:
+            - name: KOSHA_INGEST_HOST
+              value: https://kosha-ingest-service.kosha.svc.cluster.local:8080

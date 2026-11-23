@@ -485,6 +485,11 @@ pub(crate) fn handle_branch_create(
     }
     let parent = NamespaceId(tenant_namespace(tenant, namespace));
     let child = NamespaceId(tenant_namespace(tenant, &request.name));
+    // A branch is a new top-level namespace of the tenant: it counts
+    // against the namespace quota like any other (#341).
+    if let Err(rejection) = check_namespace_quota(state, &child) {
+        return rejection;
+    }
     match state.branch_namespace(&parent, &child) {
         Ok(manifest) => json_ok(&branch_summary(&child, &manifest)),
         Err(response) => response,

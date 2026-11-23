@@ -69,28 +69,46 @@ spec:
           env:
             # Overrides the ConfigMap's 40GiB value (see comment above) —
             # explicit container env wins over envFrom on key collision.
-            # ~20GiB leaves ~12GiB of the 32Gi limit for process baseline +
-            # concurrent per-request working memory, so the cache evicts
-            # gracefully instead of the pod getting OOMKilled.
+            # 16GiB (SC). The idle parsed-segment cache and the decoded
+            # vector postings cache (C = 4GiB, below) both count toward the
+            # live watermark (W = 20GiB, below). At SC 20 + C 4 = 24 > W the
+            # idle caches alone exceeded W: the segment cache never evicted
+            # on its own and every loading search fell into the synchronous
+            # admission-path eviction. SC 16 + C 4 = 20 = W fits; the RAM
+            # bound W + C = 24GiB of the 32Gi limit is unchanged. Cost: 4GiB
+            # less room for parsed segments.
             - name: KOSHA_SEGMENT_CACHE_MAX_BYTES
-              value: "21474836480"
+              value: "17179869184"
             # 64 GiB on the pod's own 100 GiB EBS volume (see volumes
             # below): two matters' segments no longer fit in 24 GiB, so the
             # cache evicted continuously. The headroom covers files pinned
             # by in-flight searches, which may take the cache past this cap.
             - name: KOSHA_CACHE_MAX_BYTES
               value: "68719476736"
-            # Live-bytes watermark (cache-resident + pinned by in-flight
-            # searches — see kosha_query::MemoryLedger). Must be set
-            # explicitly here: the code default is 2× the cache budget
-            # (40GiB), which exceeds the 32Gi container limit. 24GiB leaves
-            # ~8GiB of the limit for process baseline + working memory of
-            # the (KOSHA_MAX_CONCURRENT_SEARCHES, default 8) concurrent
-            # scoring passes. Same 24GiB figure as KOSHA_CACHE_MAX_BYTES
-            # above by coincidence, not by coupling — that one bounds disk
-            # (emptyDir/ephemeral-storage), this one bounds RAM.
+            # Live-bytes watermark W (cache-resident + pinned by in-flight
+            # searches + decoded postings — see kosha_query::MemoryLedger).
+            # Must be set explicitly here: the code default is 2× the cache
+            # budget (32GiB), which is the whole 32Gi container limit.
+            # 20GiB, not 24GiB, because decoded vector postings (C below)
+            # inserted after a search is admitted are not reserved by the
+            # ledger, so live can pass W by up to C: worst case
+            # W + C = 20 + 4 = 24GiB of the 32Gi limit, leaving ~8GiB for
+            # process baseline + working memory of the
+            # (KOSHA_MAX_CONCURRENT_SEARCHES, default 8) concurrent scoring
+            # passes. Unrelated to KOSHA_CACHE_MAX_BYTES above, which bounds
+            # disk (the EBS cache volume); this one bounds RAM.
             - name: KOSHA_SEGMENT_LIVE_MAX_BYTES
-              value: "25769803776"
+              value: "21474836480"
+            # Decoded vector postings C: one LRU for the whole process (all
+            # segments together), 4GiB; counted in W above. The code default
+            # is 512MiB. A posting decodes to ~435KB here, so the cache
+            # holds ~4GiB / 435KB ≈ 9,870 postings, and its second-touch
+            # window is the same size: one 489K-chunk query (1,610 probes,
+            # ~700MB) and one 1.8M-chunk query (~5,950 probes, ~2.6GB) each
+            # fit and are cached on their second run; a probe set larger
+            # than the cache is not admitted (it could only churn).
+            - name: KOSHA_VECTOR_POSTINGS_CACHE_MAX_BYTES
+              value: "4294967296"
             # No KOSHA_WARMUP_NAMESPACES: naming the namespace warmed every
             # matter in it (Decover keeps all matters in one namespace), which
             # hides the cold path the tests must measure. A new pod warms
@@ -108,7 +126,7 @@ spec:
             # segment's vector.idx alone is 1.6 GB and the matter's vector
             # indexes total 2.7 GB, so under the default a semantic search on
             # a cold pod was shed with a 429 every time and could never warm
-            # the pod. Still under the 24 GiB disk cache budget above.
+            # the pod. Still under the 64 GiB disk cache budget above.
             - name: KOSHA_HYDRATE_REQUEST_MAX_BYTES
               value: "8589934592"
             # Boot warm-up keeps at most 12 GiB local; the rest is fetched on
@@ -123,22 +141,18 @@ spec:
             # terminationGracePeriodSeconds below must stay above it.
             - name: KOSHA_HTTP_SHUTDOWN_GRACE_SECS
               value: "60"
-            # Decoded vector postings kept per segment: 2 GiB (default 32 MiB).
-            # A compacted segment's postings decode to up to 1.7 GB, and a
-            # semantic query examines hundreds of them, so with the default
-            # nearly every posting was re-read and re-decoded per query. On
-            # 60,000 real vectors scoring 684 postings took 118 ms with the
-            # default and 33 ms with the cache large enough to hold them.
-            # Total residency is still bounded by KOSHA_SEGMENT_LIVE_MAX_BYTES.
-            - name: KOSHA_VECTOR_POSTINGS_CACHE_MAX_BYTES
-              value: "2147483648"
             # A semantic query examines at least 32% of the namespace's vector
             # groups (default 5%). Measured on a 489K-chunk matter (5,020
             # groups, 100 queries against exact neighbours): 5% gives recall@10
             # 0.82, 16% gives 0.97, 32% gives 0.996 with the top hit right
-            # every time, at 76 ms p50 with the cache above.
+            # every time, at 76 ms p50 with warm vector postings.
             - name: KOSHA_KNN_BUDGET_FRACTION
               value: "0.32"
+            # Test branch only: log every search's `search timing:` line
+            # (main defaults to 1000 ms, slow searches only), so evals can
+            # break down fast requests too.
+            - name: KOSHA_SLOW_SEARCH_LOG_MS
+              value: "0"
           resources:
             requests:
               cpu: "2"

@@ -88,6 +88,9 @@ pub struct PostingSpanOutcome {
     /// `(segment dir, shard file)` whose ranges failed; the caller fetches
     /// the whole shard instead.
     pub whole_fallback: Vec<(PathBuf, String)>,
+    /// Why the first `whole_fallback` shard could not be served by range,
+    /// for the fallback's log line. Set on the failure path only.
+    pub fallback_error: Option<String>,
     /// Segments whose `inverted.idx` could not be read (`{rel}/inverted.idx`).
     pub missing: Vec<String>,
     /// Shard paths that just crossed a promotion threshold.
@@ -252,10 +255,13 @@ impl PostingSpanHydrator {
                         p.len
                     );
                     out.bytes += bytes.len() as u64;
+                    out.fallback_error
+                        .get_or_insert_with(|| format!("returned {} bytes", bytes.len()));
                     failed.insert(key);
                 }
                 Err(KoshaError::Overloaded(_)) => out.shed = true,
-                Err(_) => {
+                Err(e) => {
+                    out.fallback_error.get_or_insert_with(|| e.to_string());
                     failed.insert(key);
                 }
             }
@@ -365,21 +371,29 @@ pub fn fetch_file_spans(
             }
             Ok(bytes) => {
                 out.bytes += bytes.len() as u64;
+                out.error.get_or_insert_with(|| {
+                    format!("returned {} bytes, expected {}", bytes.len(), e - s)
+                });
                 out.failed = true;
             }
             Err(KoshaError::Overloaded(_)) => out.shed = true,
-            Err(_) => out.failed = true,
+            Err(err) => {
+                out.error.get_or_insert_with(|| err.to_string());
+                out.failed = true;
+            }
         }
     }
     out
 }
 
 /// See [`fetch_file_spans`].
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct FileSpanOutcome {
     pub gets: u64,
     pub bytes: u64,
     pub failed: bool,
+    /// The first failure's cause when `failed`, for the fallback log line.
+    pub error: Option<String>,
     pub shed: bool,
 }
 

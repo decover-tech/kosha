@@ -382,9 +382,9 @@ fn eval(
     let i8_readers = open(&i8_segs, 0);
     println!("\n## Memory\n");
     println!(
-        "(per-segment cap KOSHA_VECTOR_POSTINGS_CACHE_MAX_BYTES={})\n",
+        "(process-wide cap KOSHA_VECTOR_POSTINGS_CACHE_MAX_BYTES={})\n",
         std::env::var("KOSHA_VECTOR_POSTINGS_CACHE_MAX_BYTES")
-            .unwrap_or_else(|_| "default 32 MiB".into())
+            .unwrap_or_else(|_| "default 512 MiB".into())
     );
     println!("| | f32 | i8 | ratio |");
     println!("|---|---|---|---|");

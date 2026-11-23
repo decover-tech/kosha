@@ -6,8 +6,12 @@
 //! shards (`<name>/_shard-NNNN`) and internal prefixes (`_wal/...`) all
 //! belong to one shared [`LEGACY_TENANT`].
 //!
-//! [`TenantShares`] is the eviction policy every process-wide cache uses
-//! to keep one tenant's cold working set from flushing everybody else's:
+//! [`TenantShares`] is the eviction policy the process-wide caches use
+//! (NVMe files, parsed segments, results, and — counted in entries —
+//! corpus statistics and score ceilings) to keep one tenant's cold working
+//! set from flushing everybody else's. Decoded-postings caches live inside
+//! each open segment, so they are freed with their segment and inherit its
+//! tenant isolation from the parsed-segment cache's eviction. In each:
 //! the cache budget is split across the tenants holding bytes in it, by
 //! weight, and a victim is taken from the tenant furthest over its share.
 //! A tenant is never taken below a guaranteed floor
@@ -74,17 +78,19 @@ pub fn tenant_of_file_key(key: &str) -> &str {
     tenant_of_namespace(namespace)
 }
 
-/// True for a tenant id, or a tenant-supplied namespace or branch name,
-/// that would be mistaken for an internal or legacy layout: a leading `_`
-/// (shard components such as `_shard-0001`, internal prefixes) or `.`.
-/// Stored as `<tenant>/_shard-NNNN`, a tenant's namespace would be
-/// accounted to [`LEGACY_TENANT`], taking it out of its own cache share and
-/// hydration cap, so such names are reserved.
+/// True for a tenant-supplied namespace or branch name that collides with
+/// the shard layout: stored as `<tenant>/_shard-NNNN`, it would be read as
+/// a shard of the bare (pre-#262) namespace `<tenant>` — sharing its
+/// storage prefix and being accounted to [`LEGACY_TENANT`]. Only that exact
+/// shape is reserved; other names starting with `_` or `.` (for example
+/// `acme/_staging`) belong to their tenant and stay valid, so namespaces
+/// created before the reservation remain reachable.
 pub fn is_reserved_name(name: &str) -> bool {
-    name.starts_with('_') || name.starts_with('.')
+    is_shard_component(name)
 }
 
-fn is_shard_component(component: &str) -> bool {
+/// True for a shard component, `_shard-` followed by four digits.
+pub fn is_shard_component(component: &str) -> bool {
     component
         .strip_prefix("_shard-")
         .is_some_and(|d| d.len() == 4 && d.bytes().all(|b| b.is_ascii_digit()))
@@ -363,8 +369,11 @@ mod tests {
             "acme"
         );
         assert!(is_reserved_name("_shard-0001"));
-        assert!(is_reserved_name(".x"));
+        assert!(!is_reserved_name(".x"));
+        assert!(!is_reserved_name("_staging"));
+        assert!(!is_reserved_name("_shard-01"));
         assert!(!is_reserved_name("docs"));
+        assert_eq!(tenant_of_namespace("acme/_staging"), "acme");
         assert_eq!(tenant_of_segment_dir("acme/docs/seg-1"), "acme");
         assert_eq!(tenant_of_segment_dir("docs/seg-1"), LEGACY_TENANT);
     }
