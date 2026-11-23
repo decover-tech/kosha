@@ -352,6 +352,12 @@ own document, or combine the two values into one leaf (`"name_org": "Ada|beta"`)
 - Usage metering per tenant and namespace (#348), off by default (`KOSHA_USAGE_METERING=on`): searches, bytes returned and fetched, bytes and documents written, and an hourly stored-bytes snapshot, as idempotent raw events in `kosha.usage_events` (migration 005), read back with `GET /v1/usage`. See "Usage metering" in [docs/configuration.md](docs/configuration.md).
 - Usage reconciliation (#348): `GET /v1/admin/usage/reconcile` and the one-shot `kosha-server reconcile-usage` compare each namespace's stored-bytes snapshot with the objects under its storage prefix (listings only), separate what the manifest references from retired, untracked and stray objects, and flag storage without snapshots and snapshots without storage, deleted namespaces included. The command prints JSON and exits non-zero when a namespace is out of tolerance; `k8s/base/cronjob-usage-reconcile.yaml` runs it daily, shipped suspended. See "Reconciling stored bytes with object storage" in [docs/configuration.md](docs/configuration.md).
 - Billing (#349), off by default (`KOSHA_BILLING=on`): free, usage-based and enterprise plans from a JSON catalog, a monthly job that rates usage into invoices (`kosha.billing_accounts`, `kosha.billing_invoices`, migration 007), free-tier limits and non-payment restrictions (read-only, then suspended) enforced with `402`, and an optional Stripe provider. See "Billing" in [docs/configuration.md](docs/configuration.md).
+  Second part: signed Stripe webhooks (idempotent, polling `sync` kept as fallback), self-service
+  checkout and customer portal (`POST /v1/billing/checkout`, `POST /v1/billing/portal`, `admin`
+  scope), dunning retries and notices (log or HTTP webhook), an opt-in in-process scheduler for
+  close-period, sync and dunning (`KOSHA_BILLING_SCHEDULER=on`, one pod at a time), proration of
+  plan changes inside a month, and plan catalog hot reload. USD only, no tax. See "Billing" in
+  `docs/configuration.md`.
 - Namespace branching (copy-on-write). `POST /v1/namespaces/{ns}/branch` with `{"name": "<branch>"}` creates a new namespace whose manifest lists the parent's segments and deletion bitmaps where they already are, so it takes the same time for 1M documents as for 10 and copies nothing. Writes, deletes, upserts and compactions on the branch go to the branch's own prefix; the parent's files and query results do not change. `GET /v1/namespaces/{ns}/branches` lists a namespace's branches (`GET .../stats` on a branch shows its parent and how many segments it still shares). `DELETE /v1/namespaces/{ns}/branch` deletes a branch and removes only the objects in its own prefix that no remaining manifest lists: segments a branch of the branch still uses are kept. Only branches can be deleted this way. Admin rewrites (`rebuild-filter-blooms`, `backfill-offset-tables`) on a branch skip the segments it shares with its parent. Segment GC never deletes an object a branch still lists, and `DELETE /v1/namespaces/{ns}` refuses (409) a namespace whose segments a branch still shares: delete the branches first. A sharded namespace cannot be branched yet.
 
 ### API and clients
@@ -503,6 +509,8 @@ the routes marked *write* to the ingest pod.
 | `GET /v1/usage` | → `{"tenant", "from", "to", "namespaces": [...], "total"}` | The caller's usage per namespace over `?from=&to=` (Unix seconds, default the last 30 days). 404 unless `KOSHA_USAGE_METERING=on`. `GET /v1/admin/usage[?tenant=]` is the admin view. |
 | `GET /v1/admin/usage/reconcile` | → `{"within_tolerance", "namespaces": [{"tenant", "namespace", "control_plane", "snapshot_bytes", "storage", "difference_bytes", "status"}], "totals", "unattributed", "skipped_prefixes", "warnings"}` | Admin key. Stored-bytes snapshots against object storage, per namespace; `?tenant=&tolerance=&tolerance_bytes=&max_snapshot_age=`. 404 unless `KOSHA_USAGE_METERING=on`. |
 | `GET /v1/billing` | → `{"tenant", "plan", "kind", "state", "free_tier_exceeded", "period", "usage", "accrued", "invoices"}` | The caller's plan, payment state, month-to-date usage with the charge accrued so far, and invoices. 404 unless `KOSHA_BILLING=on`. The admin routes are under `/v1/admin/billing/`. |
+| `POST /v1/billing/checkout`, `POST /v1/billing/portal` | `{"success_url"?, "cancel_url"?}` / `{"return_url"?}` → `{"id", "url"}` | *admin* scope. A Stripe page to put a card on file and move to the catalog's `upgrade_plan`, and Stripe's customer portal. Off unless `KOSHA_BILLING_RETURN_URL` and a provider are set. |
+| `POST /v1/billing/webhooks/stripe` | Stripe event → `{"received", "duplicate", "outcome"}` | No API key: needs a valid `Stripe-Signature`. Off unless `KOSHA_STRIPE_WEBHOOK_SECRET` is set. |
 | `GET /v1/stats` | | Admin key only. |
 | `/v1/admin/*` | | Admin key only; see the operations list above. |
 
@@ -828,7 +836,7 @@ a query pod forwards a write to the ingest pod:
 |---|---|
 | `read` | search, exists, namespace stats, reading a schema, listing namespaces and branches, the tenant's own usage (`GET /v1/usage`) and billing state (`GET /v1/billing`) |
 | `write` | index, replace, delete documents, flush |
-| `admin` | create and delete namespaces and branches, change a namespace's schema or shards, manage the tenant's own keys (`/v1/api-keys`, below) |
+| `admin` | create and delete namespaces and branches, change a namespace's schema or shards, manage the tenant's own keys (`/v1/api-keys`, below), start a billing checkout or open the billing portal (`POST /v1/billing/checkout`, `POST /v1/billing/portal`) |
 
 Scopes are independent (`admin` does not include `write`). A request outside a
 key's scopes or namespaces gets a `403` naming what is missing; an expired key

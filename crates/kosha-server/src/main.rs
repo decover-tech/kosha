@@ -79,10 +79,15 @@ mod s3_wal;
 // The crash-point harness uploads to an in-memory bucket through the same
 // commit-marker sequence as S3, so it needs this module without `s3`.
 mod billing;
+mod billing_notify;
+mod billing_scheduler;
+#[cfg(test)]
+mod billing_stripe_tests;
 #[cfg(test)]
 mod billing_tests;
 #[cfg(all(test, feature = "failpoints"))]
 mod crash_points_tests;
+mod pipeline_metrics;
 #[cfg(any(feature = "s3", all(test, feature = "failpoints")))]
 #[cfg_attr(not(feature = "s3"), allow(dead_code))]
 mod segment_commit;
@@ -2161,7 +2166,7 @@ impl AppState {
                 .filter(|k| !k.is_empty()),
             publication_locks: Mutex::new(HashMap::new()),
             branch_lock: Mutex::new(()),
-            metrics: metrics::Metrics::from_env(),
+            metrics: pipeline_metrics::server_metrics(usage.as_ref(), billing.as_deref()),
             #[cfg(feature = "s3")]
             segment_checksum_failures: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "s3")]
@@ -6741,6 +6746,7 @@ fn main() {
     state.spawn_usage_flusher();
     state.spawn_usage_snapshotter();
     state.spawn_billing_refresher();
+    state.spawn_billing_scheduler();
     let listener = TcpListener::bind(&addr).expect("failed to bind HTTP listener");
     let config =
         http::Config::from_env(Duration::from_secs(io_timeout_secs), auth::max_body_bytes());
@@ -6844,6 +6850,15 @@ fn dispatch(state: &AppState, request: http::Request) -> http::Response {
         if response.status() >= 400 {
             log_request(&request_line, "-", body.len(), &response, started);
         }
+        return response;
+    }
+
+    // Stripe webhooks (#349): the signature on the body is the credential,
+    // so they are answered before API-key authentication, on whichever pod
+    // receives them (never forwarded).
+    if let Some(response) = billing::webhook_response(state, &request_line, &headers, &body) {
+        let response = http::Response::from_raw(response);
+        log_request(&request_line, "stripe", body.len(), &response, started);
         return response;
     }
 
@@ -7963,6 +7978,8 @@ fn route(
                 "/v1/api-keys",
                 "/v1/api-keys/rotate",
                 "/v1/api-keys/revoke",
+                billing::CHECKOUT_PATH,
+                billing::PORTAL_PATH,
             ]
             .contains(&bare_path)
         {
@@ -9214,26 +9231,32 @@ fn handle_delete(body: &[u8], state: &AppState) -> String {
         Some(shards) => kosha_core::sharding::shard_namespaces(&ns, shards)
             .into_iter()
             .filter(|shard| state.indexer.manifest_version(shard).is_some())
-            .try_fold(0, |total, shard| {
-                delete_in(state, &shard, &filter).map(|count| total + count)
+            .try_fold((0, 0), |(count, bytes), shard| {
+                delete_in(state, &shard, &filter).map(|(c, b)| (count + c, bytes + b))
             }),
     };
     match deleted {
-        Ok(count) => json_ok(&serde_json::json!({
+        Ok((count, bytes)) => {
+            if let Some(meter) = state.usage.as_ref() {
+                meter.record_delete(&ns, count as u64, bytes);
+            }
+            json_ok(&serde_json::json!({
             "deleted": count,
             "namespace": ns.0,
-        })),
+            }))
+        }
         Err(response) => response,
     }
 }
 
 /// Delete by query in one (unsharded or shard) namespace and publish.
-/// `Err` carries a ready-to-send error response.
+/// `Ok` is the documents deleted and their doc-store bytes (#348); `Err`
+/// carries a ready-to-send error response.
 fn delete_in(
     state: &AppState,
     ns: &NamespaceId,
     filter: &kosha_core::FilterClause,
-) -> Result<usize, String> {
+) -> Result<(usize, u64), String> {
     state.ensure_writable(ns)?;
     #[cfg(feature = "s3")]
     if let Some(manifest) = state.indexer.manifest_cloned(ns) {
@@ -9252,9 +9275,9 @@ fn delete_in(
         Some(m) => m,
         None => return Err(json_error(404, &format!("namespace '{}' not found", ns.0))),
     };
-    let count = state
+    let outcome = state
         .indexer
-        .delete_by_query(ns, &manifest, filter)
+        .delete_by_query_measured(ns, &manifest, filter)
         .map_err(|e| match e {
             // A filter the data cannot answer (e.g. `prefix` on a numeric
             // field) is the client's mistake, not a server fault.
@@ -9265,7 +9288,7 @@ fn delete_in(
     if let Err(e) = state.publish_namespace(ns) {
         return Err(publication_error("deletion publication failed", &e));
     }
-    Ok(count)
+    Ok((outcome.documents, outcome.stored_bytes))
 }
 
 // ─── GET /stats ──────────────────────────────────────────────────────────────

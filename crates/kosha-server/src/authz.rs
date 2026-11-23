@@ -14,8 +14,10 @@
 //!     and billing state (`GET /v1/billing`).
 //!   - `write`: index, replace, delete documents, flush.
 //!   - `admin`: create and delete namespaces and branches, change a
-//!     namespace's schema or shards, and manage the tenant's own API keys
-//!     (`/v1/api-keys`, `tenant_key_admin.rs`).
+//!     namespace's schema or shards, manage the tenant's own API keys
+//!     (`/v1/api-keys`, `tenant_key_admin.rs`), and start a self-service
+//!     checkout or open the billing portal (`POST /v1/billing/checkout`,
+//!     `POST /v1/billing/portal`).
 //!
 //! Usage and billing answer for the whole tenant (every namespace's usage,
 //! the plan, the invoices), so a key restricted to specific namespaces is
@@ -167,6 +169,12 @@ pub fn requirement(method: &str, path: &str) -> Requirement {
         }
         // A tenant reading its own usage (#348) and billing state (#349).
         ("GET", "/v1/usage" | "/v1/billing") => scoped(Read, Target::Tenant),
+        // Self-service billing (#349): putting a payment method on file
+        // moves the tenant to a paid plan, so it takes the admin scope.
+        ("POST", "/v1/billing/checkout" | "/v1/billing/portal") => scoped(Admin, Target::Tenant),
+        // Stripe's deliveries carry a signature, not a key; `dispatch`
+        // answers them before authentication.
+        ("POST", "/v1/billing/webhooks/stripe") => Requirement::Open,
         ("POST", "/v1/namespaces") => scoped(Admin, Target::Body("namespace")),
         // Legacy unversioned routes.
         ("POST", "/search" | "/exists") => scoped(Read, Target::Body("namespace")),
@@ -308,11 +316,18 @@ mod tests {
         ("POST", "/v1/api-keys", Scope::Admin),
         ("POST", "/v1/api-keys/rotate", Scope::Admin),
         ("POST", "/v1/api-keys/revoke", Scope::Admin),
+        ("POST", "/v1/billing/checkout", Scope::Admin),
+        ("POST", "/v1/billing/portal", Scope::Admin),
     ];
 
     /// The routes of `ROUTES` that answer for the whole tenant and refuse a
     /// namespace-restricted key.
-    const TENANT_WIDE: &[(&str, &str)] = &[("GET", "/v1/usage"), ("GET", "/v1/billing")];
+    const TENANT_WIDE: &[(&str, &str)] = &[
+        ("GET", "/v1/usage"),
+        ("GET", "/v1/billing"),
+        ("POST", "/v1/billing/checkout"),
+        ("POST", "/v1/billing/portal"),
+    ];
 
     /// The routes of `ROUTES` that answer for the whole tenant but narrow
     /// the answer to a restricted key's namespaces.
@@ -728,7 +743,7 @@ mod tests {
             let denied = authorize(&docs, method, path, b"").unwrap_err();
             assert!(denied.contains("whole tenant"), "{method} {path}: {denied}");
             // The same key without the namespace restriction may.
-            assert!(authorize(&key(&[Scope::Read], None), method, path, b"").is_ok());
+            assert!(authorize(&key(&all, None), method, path, b"").is_ok());
         }
         // Listing namespaces and the key routes narrow their answer to the
         // key's namespaces instead, so a restricted key may use them (with

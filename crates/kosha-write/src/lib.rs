@@ -496,6 +496,17 @@ impl Drop for WriterSlotGuard<'_> {
     }
 }
 
+/// What [`Indexer::delete_by_query_measured`] deleted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeleteOutcome {
+    /// Documents newly tombstoned.
+    pub documents: usize,
+    /// Their records' bytes in `doc_store.bin`, as stored (compressed when
+    /// the segment's doc store is). Zero for documents in legacy segments
+    /// written before `doc_store.offsets`.
+    pub stored_bytes: u64,
+}
+
 /// Thread-safe indexer with per-namespace isolation (DESIGN.md §7.1).
 ///
 /// Request handlers share one `Indexer` without a process-wide mutex: each
@@ -761,9 +772,23 @@ impl Indexer {
     pub fn delete_by_query(
         &self,
         namespace: &NamespaceId,
-        _manifest: &Manifest,
+        manifest: &Manifest,
         filter: &FilterClause,
     ) -> Result<usize, KoshaError> {
+        self.delete_by_query_measured(namespace, manifest, filter)
+            .map(|outcome| outcome.documents)
+    }
+
+    /// [`Self::delete_by_query`], also reporting the doc-store bytes of the
+    /// deleted documents (usage metering, #348). Measured from the
+    /// in-memory `doc_store.offsets` spans, so it reads nothing more than
+    /// the delete itself does.
+    pub fn delete_by_query_measured(
+        &self,
+        namespace: &NamespaceId,
+        _manifest: &Manifest,
+        filter: &FilterClause,
+    ) -> Result<DeleteOutcome, KoshaError> {
         let handle = self.ns_handle(namespace);
         let _writes = handle.writes.lock().unwrap();
         if self.needs_recovery_hydration(namespace) {
@@ -783,6 +808,7 @@ impl Indexer {
         // deletion in memory that the caller was told failed.
         let mut changes = Vec::new();
         let mut deleted_ids = HashSet::new();
+        let mut stored_bytes = 0u64;
         for entry in &state.manifest.segments {
             let seg_dir = state
                 .manifest
@@ -800,6 +826,10 @@ impl Indexer {
                     .doc_meta(*seq)
                     .ok_or_else(|| KoshaError::NotFound("delete doc metadata missing".into()))?;
                 deleted_ids.insert(DocumentId(meta.doc_id.to_owned()));
+                // `None` for a legacy segment without `doc_store.offsets`.
+                if let Some((_, length)) = reader.doc_span(*seq) {
+                    stored_bytes = stored_bytes.saturating_add(u64::from(length));
+                }
             }
             changes.push((entry.segment_id.clone(), matching));
         }
@@ -828,7 +858,10 @@ impl Indexer {
             state.manifest.version += 1;
         }
         state.manifest.tombstones = state.tombstones.clone();
-        Ok(total)
+        Ok(DeleteOutcome {
+            documents: total,
+            stored_bytes: if total > 0 { stored_bytes } else { 0 },
+        })
     }
 
     /// Get tombstoned doc_seqs for a namespace, keyed by segment.

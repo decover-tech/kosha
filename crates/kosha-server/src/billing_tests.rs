@@ -979,6 +979,11 @@ fn stripe_stub(invoice_status: &'static str) -> (String, Arc<Mutex<Vec<StubReque
                 .collect();
             let (status, answer) = match (method.as_str(), path.as_str()) {
                 ("POST", "/v1/customers") => (200, serde_json::json!({"id": "cus_stub1"})),
+                ("GET", "/v1/customers/cus_stub1") => (
+                    200,
+                    serde_json::json!({"id": "cus_stub1",
+                                       "invoice_settings": {"default_payment_method": null}}),
+                ),
                 ("POST", "/v1/invoices") => (
                     200,
                     serde_json::json!({"id": "in_stub1", "status": "draft"}),
@@ -1036,6 +1041,7 @@ fn stripe_provider_sends_the_invoice_as_items_in_cents() {
         unit: 1,
         unit_price_cents: 1,
         amount_cents,
+        plan: None,
     };
     let invoice = Invoice {
         id: "acme/2026-10".into(),
@@ -1051,7 +1057,7 @@ fn stripe_provider_sends_the_invoice_as_items_in_cents() {
         ],
         total_cents: 2695,
         issued_at_ms: 2,
-        due_at_ms: 3,
+        due_at_ms: 2 + 14 * DAY_MS,
         status: InvoiceStatus::Open,
         paid_at_ms: None,
         provider_invoice_id: None,
@@ -1080,6 +1086,8 @@ fn stripe_provider_sends_the_invoice_as_items_in_cents() {
         calls,
         vec![
             ("POST", "/v1/customers", "kosha-customer-acme & co"),
+            // No default payment method: the invoice is sent, not charged.
+            ("GET", "/v1/customers/cus_stub1", ""),
             ("POST", "/v1/invoices", "kosha-invoice-acme/2026-10"),
             (
                 "POST",
@@ -1105,13 +1113,13 @@ fn stripe_provider_sends_the_invoice_as_items_in_cents() {
     // Form values survive encoding.
     assert_eq!(requests[0].form["name"], "acme & co");
     assert_eq!(requests[0].form["metadata[kosha_tenant]"], "acme & co");
-    let draft = &requests[1].form;
+    let draft = &requests[2].form;
     assert_eq!(draft["customer"], "cus_stub1");
     assert_eq!(draft["collection_method"], "send_invoice");
     assert_eq!(draft["days_until_due"], "14");
     assert_eq!(draft["metadata[kosha_invoice_id]"], "acme/2026-10");
     // The items add up to the invoice total; the zero line is not sent.
-    let items: Vec<(&str, &str, &str)> = requests[2..4]
+    let items: Vec<(&str, &str, &str)> = requests[3..5]
         .iter()
         .map(|r| {
             (

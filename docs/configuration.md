@@ -347,11 +347,24 @@ What is recorded:
   attribution, not billing.
 - An accepted document write (`/documents`, legacy `/index` and `/replace`): `bytes_written`
   (each document's id plus every field's name and value, as submitted) and `documents_written`.
-  Recorded on the pod that executes the write. Deletes are not metered.
+  Recorded on the pod that executes the write.
+- An applied delete by query (`POST /v1/namespaces/{ns}/delete`, legacy `/delete`):
+  `documents_deleted` and `bytes_deleted`, the deleted documents' records in the doc store as
+  stored (compressed when the doc store is; 0 for documents in segments written before
+  `doc_store.offsets`). Nothing for a delete that matched nothing. The space itself comes back in
+  `stored_bytes` once compaction rewrites the segments. Deleting a whole namespace or tenant is not
+  a usage event: its deletion record (#347) and the end of its snapshots account for it.
 - Once an hour, on a pod that accepts writes: `stored_bytes`, the object bytes of every segment
   the namespace's manifest references. Shards are added up under their root namespace; a segment
   a branch inherits is counted on the namespace that owns it. The WAL and superseded segments not
   yet garbage-collected are not included.
+- With it, `vector_dimensions`: dimensions times vectors stored, `dim x count` over every vector
+  column plus `dim x tokens` over every late-interaction field of the same segments. The numbers
+  come from each segment's footer, read once per segment (from memory, the local disk or object
+  storage) and kept for as long as a manifest lists the segment, so a snapshot reads nothing more.
+  No format changed. A segment written before vector columns existed (#204) counts 0 until
+  compaction rewrites it. The summary reports `vector_dimension_hours` and
+  `vector_dimensions_latest`, like the stored-bytes fields.
 
 `GET /v1/usage` (the caller's tenant) and `GET /v1/admin/usage[?tenant=]` (admin key) summarize the
 raw events over `?from=&to=` (Unix seconds, `to` exclusive; default the last 30 days). The summary
@@ -360,6 +373,9 @@ adds `bytes_queried`, the billing meter for query volume: each search priced at 
 the same for whole-file, ranged and fully cached searches. `stored_byte_hours` is the sum of the
 hourly snapshots in the window; an hour with no writer running has no snapshot and contributes
 nothing (`stored_snapshots` counts the hours that did).
+
+The summary also reports `documents_deleted` and `bytes_deleted`. The pipeline's own counters are
+on `/metrics` (`kosha_usage_*`, see [metrics.md](metrics.md)).
 
 Delivery: a request appends its event to a spool file and returns; a background thread sends
 sealed spool files to the store and deletes each one after the store accepted it. The store ignores
@@ -423,7 +439,11 @@ plane does not list are found by listing the storage root and each tenant's dire
 `_usage`, `_warmset`) are named in `skipped_prefixes` and not listed.
 
 A difference is within tolerance when it is at most the larger of `tolerance` x the larger of the
-two numbers and `tolerance_bytes`. The snapshot of an hour is taken in the first minutes of that
+two numbers and `tolerance_bytes`. The byte floor never passes a non-zero snapshot against no
+referenced bytes at all: an `unknown` prefix whose objects no manifest covers reads `mismatch`, and
+a live namespace with an empty prefix reads `snapshot_without_storage`, however small the
+snapshot. The snapshot window starts at the top of the hour `max_snapshot_age` before now, so a
+one-hour window still sees the previous hour's snapshot before the current one is taken. The snapshot of an hour is taken in the first minutes of that
 hour and the listing is taken now, so a namespace that was written to or compacted in between
 differs by that much: run the job a few minutes past the hour, or allow for an hour of growth. On
 a node with S3, a segment flushed but not uploaded yet is in the snapshot (from local disk) and
@@ -456,12 +476,21 @@ and free-tier limits are computed from the usage events. Accounts and invoices a
 restart; local development only).
 
 **Plans.** `KOSHA_BILLING_PLANS_FILE` is a JSON price list. No prices are built in; the numbers
-below are an example. It is read at startup only: restart the pods to change it.
+below are an example. It is read at startup and reloaded by `POST /v1/admin/billing/catalog/reload`
+(on the pod that serves it) or, with `KOSHA_BILLING_PLANS_WATCH=on`, by every pod when the file's
+modification time or size changes (checked at each standings refresh). A reload is applied only
+when the file parses, validates and still has every plan an account is on; otherwise the pod keeps
+the catalog it has, logs why, and shows it as `catalog_error` in `GET /v1/admin/billing/accounts`.
+A catalog that uses the fields added in #349's second part (`upgrade_plan`,
+`dunning.retry_after_days`, the `vector_dimensions` meter) is refused by older binaries: roll the
+binary out before the file.
 
 ```json
 {
   "default_plan": "free",
-  "dunning": {"payment_terms_days": 14, "read_only_after_days": 7, "suspend_after_days": 21},
+  "upgrade_plan": "payg",
+  "dunning": {"payment_terms_days": 14, "read_only_after_days": 7, "suspend_after_days": 21,
+              "retry_after_days": [3, 5, 7]},
   "plans": {
     "free": {
       "kind": "free",
@@ -487,12 +516,15 @@ below are an example. It is read at startup only: restart the pods to change it.
   included amount is charged) or `enterprise` (rated like `usage`, never restricted automatically
   for non-payment).
 - `meters` prices the billable meters: `queries`, `bytes_queried`, `bytes_written` (see "Usage
-  metering") and `stored_bytes`, the average bytes stored over the month (byte-hours divided by the
-  hours in the month). The first `included` are free; the rest cost `unit_price_cents` per `unit`.
+  metering"), `stored_bytes`, the average bytes stored over the month (byte-hours divided by the
+  hours in the month), and `vector_dimensions`, the average vector dimensions stored, likewise. On
+  a free plan `stored_bytes` and `vector_dimensions` are compared with what is stored now. The first `included` are free; the rest cost `unit_price_cents` per `unit`.
   A meter a plan does not list is neither charged nor limited.
 - `limits` are the plan's tenant quota defaults, with the fields of a plan in
   `KOSHA_TENANT_LIMITS_FILE` ("Tenant limits"). Where that file also gives the tenant a limit, the
   file wins, field by field.
+- `upgrade_plan` is the plan a tenant moves to by completing a self-service checkout (below). It
+  must not be a free plan. Without it checkout is off.
 - `default_plan` is the plan of a tenant nobody put on one. Without it such a tenant is not
   billed, limited or restricted, which is what happens to every existing tenant when billing is
   first turned on.
@@ -502,16 +534,87 @@ rounded half up and the invoice total is the sum of its lines. `POST /v1/admin/b
 (`{"period": "YYYY-MM"}`, default last month) is the monthly job: one invoice per tenant, id
 `<tenant>/<YYYY-MM>`. It is safe to run again: an existing invoice is never re-rated, and one that
 could not be handed to the payment provider is handed over by the next run. Nothing schedules it;
-call it from a CronJob once every pod has delivered its usage for the month (usage that arrives
-after a period is closed is not on the invoice). An invoice is rated on the plan the tenant is on
-when the period is closed; plan changes inside a month are not prorated. An invoice that totals
-zero is recorded as paid.
+the scheduler below runs it, or call it from a CronJob once every pod has delivered its usage
+for the month (usage that arrives after a period is closed is not on the invoice). An invoice that
+totals zero is recorded as paid.
+
+**Proration.** A plan change made through `POST /v1/admin/billing/accounts` or a completed checkout
+is recorded (`kosha.billing_plan_changes`, migration 011). A month with recorded changes is cut at
+each change, and each stretch is rated on the plan in force during it: the usage recorded inside
+the stretch, with the plan's base fee and every meter's included amount multiplied by the
+stretch's share of the month (milliseconds) and rounded half up. Storage and vector dimensions are
+the stretch's byte-hours (dimension-hours) divided by the hours of the whole month, so a constant
+size costs the same however the month is cut. A free stretch charges nothing. Each line of such an
+invoice names its plan (`lines[].plan`). The invoice is issued on the plan in force at the end of
+the month, even when it is closed after a later change. A month without a recorded change is rated
+on one plan, exactly as before; so is every month of a tenant whose plan was changed before
+migration 011, or by an older binary. An account created inside the month was on the default plan
+(if any) before it. The free-tier limits and the `accrued` charge of `GET /v1/billing` use the
+current plan for the whole month to date.
 
 **Payment provider.** With `KOSHA_BILLING_PROVIDER=stripe` an invoice is sent to Stripe (a
-customer per tenant, an invoice with one item per charged line, `collection_method=send_invoice`),
-and `POST /v1/admin/billing/sync` copies paid and void results back. Without a provider invoices
-are only recorded, and a payment collected elsewhere is recorded with
-`POST /v1/admin/billing/invoices/mark-paid` (`{"invoice_id": ...}`).
+customer per tenant, an invoice with one item per charged line). A customer with a default payment
+method is charged automatically (`collection_method=charge_automatically`); anyone else is sent the
+invoice to pay on Stripe's hosted page (`send_invoice`, due when Kosha's invoice is). Without a
+provider invoices are only recorded, and a payment collected elsewhere is recorded with
+`POST /v1/admin/billing/invoices/mark-paid` (`{"invoice_id": ...}`). Amounts are US dollars;
+other currencies and tax are not supported (Stripe Tax is not used, and no tax line is added).
+
+**Webhooks.** With `KOSHA_STRIPE_WEBHOOK_SECRET` set, `POST /v1/billing/webhooks/stripe` takes
+Stripe's event deliveries. Point a Stripe webhook endpoint at it (at least `invoice.paid`,
+`invoice.payment_failed`, `invoice.finalized`, `invoice.voided`, `checkout.session.completed`,
+`customer.updated` and `payment_method.detached`). It needs no API key; each delivery must carry a
+`Stripe-Signature` whose `v1` HMAC-SHA256 of `"<t>.<body>"` matches one of the configured secrets
+(compared in constant time), with `t` within `KOSHA_STRIPE_WEBHOOK_TOLERANCE_SECS` of the pod's
+clock. To roll the endpoint secret, set both secrets (comma-separated) on the pods, roll it in
+Stripe, then remove the old one. Every event id is recorded once applied
+(`kosha.billing_webhook_events`), so a redelivery is acknowledged and changes nothing. A refused
+signature answers 400; an event that could not be applied (store down) answers 503 and Stripe
+delivers it again. Events: `invoice.paid` marks the invoice paid, `invoice.voided` void,
+`invoice.payment_failed` records a failure for dunning, `invoice.finalized` records Stripe's
+invoice id if the submission did not get to; `checkout.session.completed` completes a self-service
+upgrade; `customer.updated` and `payment_method.detached` keep the payment method on file
+current. Subscription events and anything else are acknowledged and ignored: Kosha rates and
+invoices usage itself and does not use Stripe subscriptions. `POST /v1/admin/billing/sync`
+(polling) stays as the fallback for a missed delivery. The route is answered by whichever pod
+receives it, never forwarded.
+
+**Self-service upgrade.** With a provider, `KOSHA_BILLING_RETURN_URL` and `upgrade_plan` in the
+catalog, `POST /v1/billing/checkout` (`{"success_url"?, "cancel_url"?}`, a tenant key with the
+`admin` scope) answers `{"id", "url"}`: a Stripe Checkout page in setup mode where the user enters
+a card. When it completes, the `checkout.session.completed` webhook makes the card the customer's
+default and moves the tenant to `upgrade_plan` (an enterprise tenant keeps its plan). From then on
+its invoices are charged automatically. `POST /v1/billing/portal` (`{"return_url"?}`, `admin`
+scope) opens Stripe's customer portal for changing the card and seeing invoices; it answers 409
+before the tenant has a Stripe customer. Redirect URLs default to `KOSHA_BILLING_RETURN_URL` (with
+`?checkout=success` / `?checkout=cancel`) and must be on its origin. Both routes stay open to a
+read-only or suspended tenant. `GET /v1/billing` adds `payment_method_on_file` and
+`upgrade_plan`.
+
+**Dunning.** A failed payment (the webhook, or a failed retry) is recorded per invoice. When the
+tenant has a payment method on file, the invoice is retried on the `retry_after_days` schedule
+(days after the first failure, each entry after the previous retry; `[3, 5, 7]` retries on days 3,
+8 and 15) and at once after a new payment method is put on file. Set `"retry_after_days": []` when
+Stripe's own automatic retries (Smart Retries) are on, or both will retry. Each open invoice gets a
+notice at each stage it reaches: `payment_failed`, `overdue` (past due), `read_only` and
+`suspended` (enterprise plans are never restricted and get neither), and `recovered` once a dunned
+invoice is paid. A notice goes out once per invoice (claimed in `kosha.billing_notices` before it
+is sent, released if sending fails); a pass that finds several new stages sends only the most
+severe one. Notices go to the log, or as a JSON `POST` to `KOSHA_BILLING_NOTIFY_URL` with
+`x-kosha-notice-id` and, with `KOSHA_BILLING_NOTIFY_SECRET`, an `x-kosha-signature` in Stripe's
+scheme; any 2xx answer is delivery. `POST /v1/admin/billing/dunning` runs a pass now. The account
+state itself still follows the oldest unpaid invoice's due date (below); dunning collects and
+tells, it does not change the clock.
+
+**Scheduler.** `KOSHA_BILLING_SCHEDULER=on` runs the jobs in the server. Every
+`KOSHA_BILLING_SCHEDULER_INTERVAL_SECS` each pod with it on tries to take the `billing-scheduler`
+lease (`kosha.billing_leases`, three intervals long); the holder flushes its usage spool, closes
+last month once `KOSHA_BILLING_CLOSE_DELAY_SECS` have passed since it ended (unless
+`kosha.billing_jobs` records it closed without errors), syncs payments from the provider every
+`KOSHA_BILLING_SYNC_INTERVAL_SECS`, runs a dunning pass and refreshes its standings. Every step is
+idempotent, so two pods running a tick at once (clocks that disagree about the lease) do no harm.
+Without Postgres the lease is per pod. Only last month is closed automatically: a month missed
+while the scheduler was off is closed with `close-period`.
 
 **Enforcement.** A refused request gets `402 Payment Required` with a JSON body
 `{error, reason, plan, state}`:
@@ -547,6 +650,16 @@ far, and its invoices. `GET /v1/admin/billing/accounts` and
 | `KOSHA_BILLING_REFRESH_SECS` | How often a pod rebuilds its snapshot of tenant standings | `60` | seconds |
 | `KOSHA_BILLING_PROVIDER` | `stripe`, or `none` to only record invoices | `none` | name |
 | `KOSHA_STRIPE_API_KEY` | Stripe secret key. Required with `KOSHA_BILLING_PROVIDER=stripe`; keep it in a secret, never in a tracked file | unset | secret |
+| `KOSHA_BILLING_PLANS_WATCH` | `on` makes every pod reload the plans file when its modification time or size changes (checked every `KOSHA_BILLING_REFRESH_SECS`) | off | flag |
+| `KOSHA_STRIPE_WEBHOOK_SECRET` | Stripe webhook signing secret(s) (`whsec_...`), comma-separated while rolling one. Turns `POST /v1/billing/webhooks/stripe` on; keep it in a secret | unset (route off) | secret |
+| `KOSHA_STRIPE_WEBHOOK_TOLERANCE_SECS` | How far a delivery's signed timestamp may be from the pod's clock | `300` | seconds |
+| `KOSHA_BILLING_RETURN_URL` | Where Stripe sends users back after checkout or the portal (`https://`, or `http://` for localhost). Turns `POST /v1/billing/checkout` and `POST /v1/billing/portal` on; redirect URLs a tenant passes must share its origin | unset (routes off) | URL |
+| `KOSHA_BILLING_NOTIFY_URL` | HTTP endpoint that receives dunning notices as JSON (`https://`, or `http://` for localhost). Unset: notices are logged | unset (log) | URL |
+| `KOSHA_BILLING_NOTIFY_SECRET` | Signs each notice (`x-kosha-signature`, HMAC-SHA256 in Stripe's scheme) | unset (unsigned) | secret |
+| `KOSHA_BILLING_SCHEDULER` | `on` runs close-period, sync and dunning in the server, one pod at a time | off | flag |
+| `KOSHA_BILLING_SCHEDULER_INTERVAL_SECS` | How often each pod tries to run a scheduler tick. Minimum 10 | `900` | seconds |
+| `KOSHA_BILLING_CLOSE_DELAY_SECS` | How long after a month ends the scheduler closes it, for every pod to deliver its usage | `7200` | seconds |
+| `KOSHA_BILLING_SYNC_INTERVAL_SECS` | How often the scheduler polls the provider for payments (the webhook fallback) | `3600` | seconds |
 | `KOSHA_STRIPE_API_BASE` | Base URL of the Stripe API. Must be `https://`; plain `http://` is accepted for `localhost`, `127.0.0.1` and `[::1]` only (the secret key is sent to it), and startup fails otherwise | `https://api.stripe.com` | URL |
 
 ## HTTP server and auth
