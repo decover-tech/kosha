@@ -281,8 +281,13 @@ impl AppState {
                     shards: None,
                     branch: None,
                 };
-                let o =
-                    self.hydrate_segments_for_search(ns, &subset, &warmup_probe_query(), &request);
+                let o = self.hydrate_segments_for_search(
+                    ns,
+                    &subset,
+                    &warmup_probe_query(),
+                    &request,
+                    None,
+                );
                 BatchOutcome {
                     files: o.files_fetched as u64,
                     bytes: o.bytes_fetched,
