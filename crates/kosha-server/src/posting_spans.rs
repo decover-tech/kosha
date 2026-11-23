@@ -325,7 +325,13 @@ impl PostingSpanHydrator {
     /// read) without counting as an eviction, so posting presence verdicts
     /// survive ([`Cache::drop_superseded_dir_unless_pinned`]). Either way
     /// its heat resets.
-    pub fn finish_promotion(&self, cache: &Cache, shard: &Path, landed: bool) {
+    pub fn finish_promotion(
+        &self,
+        cache: &Cache,
+        writes: &SpanWriteQueue,
+        shard: &Path,
+        landed: bool,
+    ) {
         self.promoting.lock().unwrap().remove(shard);
         self.heat.lock().unwrap().remove(shard);
         if !landed {
@@ -335,7 +341,7 @@ impl PostingSpanHydrator {
             return;
         };
         let key = format!("{rel}{}", span_cache::SPANS_SUFFIX);
-        if let Err(e) = cache.drop_superseded_dir_unless_pinned(&key) {
+        if let Err(e) = writes.drop_superseded(cache, &key) {
             eprintln!("WARN: failed to drop span cache {key}: {e}");
         }
     }
@@ -987,7 +993,7 @@ mod tests {
         std::fs::copy(f.remote.join(f.rel(&f.segs[0])).join(&file), &shard).unwrap();
         cache.note_external_write(&format!("{}/{file}", f.rel(&f.segs[0])));
         let with_whole = cache.total_size();
-        postings.finish_promotion(&cache, &shard, true);
+        postings.finish_promotion(&cache, &writes(), &shard, true);
         assert!(SpanIndex::load(&f.segs[0], &file).is_empty());
         assert!(cache.total_size() < with_whole);
         // Every term of the shard is now local: no GET.
