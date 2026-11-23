@@ -3,9 +3,6 @@
 # route (#350, plan acceptance 9). Every caller uses /v1; the legacy routes
 # exist only for external clients that have not migrated yet
 # (docs/api/versioning.md#legacy-routes).
-#
-# scripts/copy_es_to_kosha.py and scripts/gen_es_migration_job.py move to
-# /v1 under #353 and are not checked here yet.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -17,6 +14,7 @@ paths=(
   crates/kosha-cli/src
   scripts/bench
   scripts/soak
+  scripts/faults
   scripts/conformance
   scripts/integration
   scripts/eval
@@ -24,6 +22,9 @@ paths=(
   scripts/quickstart.py
   scripts/compare_search.py
   scripts/capture_cold_baseline.sh
+  scripts/copy_es_to_kosha.py
+  scripts/gen_es_migration_job.py
+  scripts/tests
 )
 existing=()
 for p in "${paths[@]}"; do

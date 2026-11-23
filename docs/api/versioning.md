@@ -139,7 +139,7 @@ routes: they are never gated (see
 
 | When | Step |
 |---|---|
-| The release that ships this (target 2026-12-15) | Headers and counter live; Kosha's own clients, bench and tools use only `/v1`; kosha-client 0.3.0. Stage: `KOSHA_LEGACY_ROUTES=off` (the stage backfill Job runs `kosha-server migrate` directly, so it does not use the HTTP routes; a manual `scripts/copy_es_to_kosha.py` run needs its tenant allowlisted until #353 moves it to `/v1`). |
+| The release that ships this (target 2026-12-15) | Headers and counter live; Kosha's own clients, bench and tools use only `/v1`; kosha-client 0.3.0. Stage: `KOSHA_LEGACY_ROUTES=off` (the stage backfill Job runs `kosha-server migrate` directly, and `scripts/copy_es_to_kosha.py` uses `/v1`, so neither needs the legacy routes). |
 | After stage is clean and prod shows 7 days of zero legacy traffic (or the stragglers are allowlisted) | Prod: `KOSHA_LEGACY_ROUTES=off` in `k8s/prod/configmap-patch.yaml`. |
 | 2027-03-01 | Self-hosted built-in default flips to `off`. |
 | 2027-06-01 (Sunset) | Handlers removed, provided `kosha_legacy_requests_total` read zero on managed deployments for 14 days; otherwise the Sunset is extended and announced. After removal the paths keep answering `410 legacy_route_disabled` for the rest of v1. |
