@@ -9,3 +9,14 @@ metadata:
 spec:
   minReplicas: 2
   maxReplicas: 6
+  # Scale down slowly: a new pod warms ~12 GB for ~5 minutes before it is
+  # ready, so dropping pods the moment CPU dips and adding cold ones on the
+  # next spike (2 -> 4 -> 2 within minutes during an eval) costs more than
+  # it saves.
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
