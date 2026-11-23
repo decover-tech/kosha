@@ -19,12 +19,13 @@ instead of giving a number. Defaults are per pod unless the row says
 otherwise. Every override is described in
 [configuration.md](configuration.md).
 
-Status codes on this page are the ones main returns as of commit `e174058`.
-The `/v1` error model in #350 changes some of them. Tenant quota refusals
-move from 429 to 403, and the tenant body cap moves from 429 to 413. Those
-rows say so. #350 adds `proto/kosha/v1/errors.proto`. Once that file exists,
-`check_guarantees.py` fails until this page's "Refusal today" column is
-replaced with the new status codes.
+Status codes on this page are those of the #350 error model, which this
+build ships (`crates/kosha-server/src/api_error.rs`, documented in
+[api/errors.md](api/errors.md)). Every error body carries a stable `code`
+and a `retryable` flag. A retryable error also carries `retry_after_ms` and
+a `Retry-After` header. A non-retryable one carries neither. Where a cell
+names a `code`, CI checks its HTTP status and retryability against
+`ErrorCode::status` and `ErrorCode::retryable` in that file.
 
 ---
 
@@ -157,7 +158,7 @@ checked row below, so it cannot drift from the code without CI failing.
 An unbounded `max_results`, `knn.k` or `num_candidates` costs memory and CPU
 on the pod that serves it. The memory admission and search queue limits
 below shed such a search with 429 rather than letting it take the pod down.
-Hard caps on these are tracked in #350.
+Hard caps on these are not yet set (remaining work after #352).
 
 ### Hard limits
 
@@ -165,7 +166,7 @@ These apply to every request, whatever the tenant's plan.
 
 | Limit | Value | When exceeded | Source |
 | --- | --- | --- | --- |
-| Request body | 64 MiB | 413, before the body is read when `Content-Length` is sent | `crates/kosha-server/src/auth.rs` (`max_body_bytes`), override `KOSHA_MAX_BODY_BYTES` |
+| Request body | 64 MiB | 413 `payload_too_large`, not retryable, before the body is read when `Content-Length` is sent | `crates/kosha-server/src/auth.rs` (`max_body_bytes`), override `KOSHA_MAX_BODY_BYTES` |
 | Histogram buckets per aggregation | 10,000 | 400 | `crates/kosha-core/src/histogram.rs` (`MAX_HISTOGRAM_BUCKETS`), no override |
 | Server-side embedding dimensions | 4096 | schema rejected (400) | `crates/kosha-core/src/analysis.rs` (`MAX_EMBEDDING_DIMS`), no override |
 | Shards per namespace | 256 | 400 | `crates/kosha-core/src/sharding.rs` (`MAX_SHARDS`), no override |
@@ -202,18 +203,19 @@ the term filter columns.
 ### Per-pod capacity
 
 Each pod sheds load rather than queueing without bound. Over these limits a
-request gets 503 or 429 with `Retry-After`, and it is safe to retry.
+request gets a retryable 503, 429 or 408 with `Retry-After`. The server did
+not apply it, so it is safe to retry.
 
 | Limit | Value | When exceeded | Source |
 | --- | --- | --- | --- |
-| Open HTTP connections | 1024 | 503 with `Retry-After` (below), connection closed | `crates/kosha-server/src/http.rs` (`Config::new`), override `KOSHA_HTTP_MAX_CONNECTIONS` |
-| Requests in flight | 256 | 503 with `Retry-After` (below) | `crates/kosha-server/src/http.rs` (`Config::new`), override `KOSHA_HTTP_MAX_INFLIGHT` |
-| Concurrent searches | 8 | queued up to the search queue depth (below), then 429 | `crates/kosha-server/src/main.rs` (search admission), override `KOSHA_MAX_CONCURRENT_SEARCHES` |
-| Search queue wait | 10,000 ms | 429 | `crates/kosha-server/src/main.rs` (search admission), override `KOSHA_SEARCH_QUEUE_TIMEOUT_MS` |
-| Request body read timeout | 300 s | 408 | `crates/kosha-server/src/main.rs` (`io_timeout_secs`), override `KOSHA_HTTP_IO_TIMEOUT_SECS` |
-| Search queue depth | 4 × permits | 429 | `crates/kosha-server/src/main.rs` (search admission, `permits * 4`), override `KOSHA_SEARCH_QUEUE_DEPTH` |
-| Unindexed backlog per namespace | 2 GiB | index and replace get 429 with `Retry-After` (below) until flushes catch up | `crates/kosha-server/src/unindexed.rs` (`DEFAULT_MAX_UNINDEXED_BYTES`), override `KOSHA_MAX_UNINDEXED_BYTES` (`0` disables) |
-| Connection and in-flight shed `Retry-After` | 1 s | sent with the 503 | `crates/kosha-server/src/http.rs` (`busy`, hard-coded), no override |
+| Open HTTP connections | 1024 | 503 `unavailable`, retryable, with `Retry-After` (below), connection closed | `crates/kosha-server/src/http.rs` (`Config::new`), override `KOSHA_HTTP_MAX_CONNECTIONS` |
+| Requests in flight | 256 | 503 `unavailable`, retryable, with `Retry-After` (below) | `crates/kosha-server/src/http.rs` (`Config::new`), override `KOSHA_HTTP_MAX_INFLIGHT` |
+| Concurrent searches | 8 | queued up to the search queue depth (below), then 429 `overloaded`, retryable | `crates/kosha-server/src/main.rs` (search admission), override `KOSHA_MAX_CONCURRENT_SEARCHES` |
+| Search queue wait | 10,000 ms | 429 `overloaded`, retryable | `crates/kosha-server/src/main.rs` (search admission), override `KOSHA_SEARCH_QUEUE_TIMEOUT_MS` |
+| Request body read timeout | 300 s | 408 `request_timeout`, retryable | `crates/kosha-server/src/main.rs` (`io_timeout_secs`), override `KOSHA_HTTP_IO_TIMEOUT_SECS` |
+| Search queue depth | 4 × permits | 429 `overloaded`, retryable | `crates/kosha-server/src/main.rs` (search admission, `permits * 4`), override `KOSHA_SEARCH_QUEUE_DEPTH` |
+| Unindexed backlog per namespace | 2 GiB | index and replace get 429 `overloaded`, retryable, with `Retry-After` (below) until flushes catch up | `crates/kosha-server/src/unindexed.rs` (`DEFAULT_MAX_UNINDEXED_BYTES`), override `KOSHA_MAX_UNINDEXED_BYTES` (`0` disables) |
+| Connection and in-flight shed `Retry-After` | 1 s | sent with the 503 | `crates/kosha-server/src/api_error.rs` (`DEFAULT_RETRY_AFTER`, which `busy` in `http.rs` uses because it sets no delay of its own), no override |
 | Unindexed backlog `Retry-After` | 1 s | sent with the 429 | `crates/kosha-server/src/unindexed.rs` (`BACKPRESSURE_RETRY_AFTER_SECS`), no override |
 
 Memory admission (`KOSHA_SEGMENT_LIVE_MAX_BYTES`, `KOSHA_ADMISSION_TIMEOUT_MS`)
@@ -229,19 +231,21 @@ Query limits apply on the pod that serves the search, and write limits on
 the ingest pod. A tenant's effective QPS therefore grows with the number of
 query replicas. Admin and internal credentials are never limited.
 
-| Field | Limits | Refusal today | After #350 |
-| --- | --- | --- | --- |
-| `qps` | searches per second | 429 `tenant_qps_exceeded` | 429, retryable |
-| `concurrent_queries` | searches in flight | 429 `tenant_concurrency_exceeded` | 429, retryable |
-| `write_docs_per_sec`, `write_bytes_per_sec` | write rate | 429 `tenant_write_rate_exceeded` | 429, retryable |
-| `namespaces` | namespaces held (branches count, shards do not) | 429 `namespace_quota_exceeded` with the quota `Retry-After` (below) | 403, not retryable |
-| `docs_per_namespace` | committed plus unflushed documents | 429 `doc_quota_exceeded` with the quota `Retry-After` (below) | 403, not retryable |
-| `vector_dims` | widest vector, supplied or embedded | 429 `vector_dims_exceeded` with the quota `Retry-After` (below) | 403, not retryable |
-| `max_body_bytes` | write body, under the pod cap | 429 `body_too_large` with the quota `Retry-After` (below) | 413, not retryable |
-
-| Setting | Value | Source |
+| Field | Limits | Refusal |
 | --- | --- | --- |
-| Tenant quota `Retry-After` | 60 s | `crates/kosha-server/src/tenant_limits.rs` (`QUOTA_RETRY_AFTER_MS`), no override |
+| `qps` | searches per second | 429 `tenant_qps_exceeded`, retryable, with `Retry-After` |
+| `concurrent_queries` | searches in flight | 429 `tenant_concurrency_exceeded`, retryable, with `Retry-After` |
+| `write_docs_per_sec`, `write_bytes_per_sec` | write rate | 429 `tenant_write_rate_exceeded`, retryable, with `Retry-After` |
+| `namespaces` | namespaces held (branches count, shards do not) | 403 `namespace_quota_exceeded`, not retryable, no `Retry-After` |
+| `docs_per_namespace` | committed plus unflushed documents | 403 `doc_quota_exceeded`, not retryable, no `Retry-After` |
+| `vector_dims` | widest vector, supplied or embedded | 403 `vector_dims_exceeded`, not retryable, no `Retry-After` |
+| `max_body_bytes` | write body, under the pod cap | 413 `payload_too_large`, not retryable, no `Retry-After` |
+
+Every tenant refusal keeps the pre-#350 `reason` and `limit` fields as
+deprecated aliases (`reason` is still `body_too_large` for the body cap).
+A quota or body-cap refusal tells the client nothing about when to retry:
+retrying the same request cannot succeed until an operator raises the
+limit or the tenant frees capacity.
 
 The namespace and document quotas are approximate. Concurrent creations can
 pass the namespace count together, and an unflushed upsert of an existing id
@@ -311,11 +315,13 @@ the following happens:
 - a row cites code that the script does not check;
 - a refusal or "limit today" cell states a number other than an HTTP status
   code, instead of pointing at the checked row that holds it;
+- a refusal cell names an error `code` whose status or retryability in
+  `crates/kosha-server/src/api_error.rs` differs from the cell;
 - a cited results file is missing, or does not contain the run id or date
   quoted;
 - a cited commit is not in git history;
-- `proto/kosha/v1/errors.proto` (#350) exists while the page still shows
-  the pre-#350 "Refusal today" status codes.
+- the page goes back to the pre-#350 "Refusal today" status codes while
+  `proto/kosha/v1/errors.proto` (#350) exists.
 
 To change a number, change the code or commit a new results file, then
 update this page in the same PR.

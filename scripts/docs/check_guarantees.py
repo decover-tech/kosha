@@ -23,9 +23,14 @@ both:
    point at the checked row that holds the value instead. That keeps a
    restated default from drifting while its checked row is updated.
 
+4. **Error codes.** A refusal cell that names a stable error ``code`` (in
+   backticks) must give the HTTP status ``ErrorCode::status`` returns for it
+   in ``crates/kosha-server/src/api_error.rs``, and must say "not retryable"
+   exactly when ``ErrorCode::retryable`` is false for it.
+
 It also fails on ``TBD``/``TODO`` on the page, if README.md does not link
 to the page, or if #350's error model has landed (``ERRORS_PROTO`` exists)
-while the page still shows the pre-#350 status codes (``PRE_350_MARKER``).
+while a table still has a pre-#350 status column (``PRE_350_COLUMNS``).
 
     python3 scripts/docs/check_guarantees.py            # check
     python3 scripts/docs/check_guarantees.py --self-test
@@ -46,10 +51,11 @@ from typing import Callable
 
 ROOT = Path(__file__).resolve().parents[2]
 PAGE = "docs/guarantees.md"
-# #350 adds this file. Its arrival means the page's pre-#350 status codes
-# (the "Refusal today" column) are stale and must be rewritten.
+# #350 added this file. While it exists, a table with a pre-#350 status
+# column ("Refusal today" / "After #350") is stale and fails.
 ERRORS_PROTO = "proto/kosha/v1/errors.proto"
-PRE_350_MARKER = "Refusal today"
+PRE_350_COLUMNS = ("Refusal today", "After #350")
+API_ERROR = "crates/kosha-server/src/api_error.rs"
 
 KIB = 1024
 UNITS = {
@@ -78,6 +84,9 @@ class Check:
     # Turns the matched integer into the page's value, for a number the code
     # derives from others (gets the match and the whole source file).
     derive: Callable[[int, str], int] | None = None
+    # (file, regex): a second file that must match, for a value that reaches
+    # the response only through code elsewhere (e.g. a default a caller uses).
+    requires: tuple[str, str] | None = None
 
 
 def _const(name: str, ty: str = r"\w+") -> str:
@@ -98,6 +107,13 @@ def _idle_flush_tick_ms(divisor: int, source: str) -> int:
     floor = int(re.search(_IDLE_TICK + r"\.max\(Duration::from_millis\((\d+)\)\)", source).group(2))
     return max(max_age // divisor, floor)
 
+
+_BUSY = (
+    r"fn busy\(message: &str, reason: &str, request_id: &str\) -> Response \{\s*"
+    r"Response::error_with_id\(\s*"
+    r"ApiError::new\(ErrorCode::Unavailable, message\)\.detail\(\"reason\", reason\),\s*"
+    r"request_id,\s*\)\s*\}"
+)
 
 # Only `impl Default for GroupCommitConfig`, not the tests' configs.
 _WAL_DEFAULT = r"impl Default for GroupCommitConfig \{\s*fn default\(\) -> Self \{\s*Self \{\s*"
@@ -148,13 +164,14 @@ CHECKS: list[Check] = [
     Check("Search queue depth", "crates/kosha-server/src/main.rs",
           r'"KOSHA_SEARCH_QUEUE_DEPTH"\)[\s\S]{0,300}?\.unwrap_or\(permits \* (\d+)\)',
           "count", "KOSHA_SEARCH_QUEUE_DEPTH"),
-    Check("Connection and in-flight shed `Retry-After`", "crates/kosha-server/src/http.rs",
-          r'fn busy\(message: &str\) -> Response \{[\s\S]{0,200}?"retry-after", "(\d+)"\)', "s"),
+    # `busy` builds a retryable `unavailable` error and sets no delay of its
+    # own, so the header carries `DEFAULT_RETRY_AFTER`. The `requires` regex
+    # spans the whole of `busy`, so a `.retry_after(..)` added there fails it.
+    Check("Connection and in-flight shed `Retry-After`", API_ERROR,
+          r"\bconst DEFAULT_RETRY_AFTER: Duration = Duration::from_secs\((\d+)\);", "s",
+          requires=("crates/kosha-server/src/http.rs", _BUSY)),
     Check("Unindexed backlog `Retry-After`", "crates/kosha-server/src/unindexed.rs",
           _const("BACKPRESSURE_RETRY_AFTER_SECS"), "s"),
-    # Per-tenant limits.
-    Check("Tenant quota `Retry-After`", "crates/kosha-server/src/tenant_limits.rs",
-          _const("QUOTA_RETRY_AFTER_MS"), "ms"),
     Check("Unindexed backlog per namespace", "crates/kosha-server/src/unindexed.rs",
           _const("DEFAULT_MAX_UNINDEXED_BYTES"), "bytes", "KOSHA_MAX_UNINDEXED_BYTES"),
     # Timings behind the guarantees.
@@ -179,7 +196,9 @@ CHECKS: list[Check] = [
 # Columns whose cells describe a refusal or summarise a limit. A number in one
 # of these would be an unchecked copy of a checked row, so only HTTP status
 # codes (4xx/5xx) and issue references (#NNN) are allowed.
-POINTER_COLUMNS = ("When exceeded", "Refusal today", "After #350", "Limit today", "Visible after")
+POINTER_COLUMNS = ("When exceeded", "Refusal", "Limit today", "Visible after")
+# Of those, the columns whose cells may name an error code to check.
+REFUSAL_COLUMNS = ("When exceeded", "Refusal")
 
 
 def stray_numbers(cell: str) -> list[str]:
@@ -274,6 +293,47 @@ def column(header: list[str], name: str) -> int | None:
     return None
 
 
+def error_codes(source: str) -> dict[str, tuple[int, bool]]:
+    """``{"payload_too_large": (413, False), ...}`` from api_error.rs."""
+
+    def fn_body(name: str) -> str:
+        m = re.search(rf"fn {name}\(self\)[^{{]*\{{([\s\S]*?)\n    \}}", source)
+        if not m:
+            raise ValueError(f"{API_ERROR}: fn {name}(self) not found")
+        return m.group(1)
+
+    names = dict(re.findall(r'Self::(\w+) => "([a-z_]+)"', fn_body("as_str")))
+    statuses: dict[str, int] = {}
+    for variants, status in re.findall(r"((?:\|?\s*Self::\w+\s*)+)=> (\d{3})", fn_body("status")):
+        for v in re.findall(r"Self::(\w+)", variants):
+            statuses[v] = int(status)
+    retryable = set(re.findall(r"Self::(\w+)", fn_body("retryable")))
+    if not names or set(names) != set(statuses):
+        raise ValueError(f"{API_ERROR}: as_str and status do not cover the same codes")
+    return {names[v]: (statuses[v], v in retryable) for v in names}
+
+
+def check_refusal(label: str, column_name: str, cell: str, codes: dict[str, tuple[int, bool]]) -> list[str]:
+    errors = []
+    for code in re.findall(r"`([a-z]+(?:_[a-z]+)+|[a-z]+)`", cell):
+        if code not in codes:
+            continue
+        status, retryable = codes[code]
+        stated = re.findall(r"\b[45]\d\d\b", cell)
+        if str(status) not in stated:
+            errors.append(
+                f"row {label!r}, column {column_name!r}: `{code}` is HTTP {status} "
+                f"in {API_ERROR}, the cell says {stated or 'no status'}"
+            )
+        says_not = "not retryable" in cell
+        if retryable == says_not or (retryable and "retryable" not in cell):
+            want = "retryable" if retryable else "not retryable"
+            errors.append(
+                f"row {label!r}, column {column_name!r}: `{code}` is {want} in {API_ERROR}; say so"
+            )
+    return errors
+
+
 # ─── checks ─────────────────────────────────────────────────────────────────
 
 
@@ -312,11 +372,20 @@ def check_page(root: Path, text: str, readme: str, verify_commits: bool | None =
         errors.append(f"{PAGE}: contains TBD/TODO")
     if "docs/guarantees.md" not in readme:
         errors.append("README.md: no link to docs/guarantees.md")
-    if (root / ERRORS_PROTO).is_file() and PRE_350_MARKER in text:
-        errors.append(
-            f"{PAGE}: {ERRORS_PROTO} exists, so #350's error model has landed, but the page "
-            f"still has the pre-#350 {PRE_350_MARKER!r} status codes: rewrite them"
-        )
+    if (root / ERRORS_PROTO).is_file():
+        for header, _ in tables(text):
+            stale = [h for h in header if h in PRE_350_COLUMNS]
+            if stale:
+                errors.append(
+                    f"{PAGE}: {ERRORS_PROTO} exists, so #350's error model has landed, but a "
+                    f"table still has the pre-#350 status column(s) {stale}: rewrite them"
+                )
+
+    try:
+        codes = error_codes((root / API_ERROR).read_text())
+    except (OSError, ValueError) as e:
+        errors.append(f"cannot read error codes: {e}")
+        codes = {}
 
     if verify_commits is None:
         verify_commits = not shallow_clone(root)
@@ -328,8 +397,12 @@ def check_page(root: Path, text: str, readme: str, verify_commits: bool | None =
         val_col = column(header, "Value")
         res_col = column(header, "Result file")
         pointer_cols = [i for i in (column(header, n) for n in POINTER_COLUMNS) if i is not None]
+        refusal_cols = [i for i in (column(header, n) for n in REFUSAL_COLUMNS) if i is not None]
         for row in rows:
             label = row[0]
+            for i in refusal_cols:
+                if i < len(row):
+                    errors.extend(check_refusal(label, header[i], row[i], codes))
             for i in pointer_cols:
                 if i < len(row) and stray_numbers(row[i]):
                     errors.append(
@@ -354,6 +427,12 @@ def check_page(root: Path, text: str, readme: str, verify_commits: bool | None =
                 if check.env and check.env not in src:
                     errors.append(f"row {label!r}: Source must name the override {check.env}")
                 try:
+                    if check.requires is not None:
+                        req_file, req_pattern = check.requires
+                        if not re.search(req_pattern, (root / req_file).read_text()):
+                            raise ValueError(
+                                f"{req_file} no longer matches what this value relies on: {req_pattern}"
+                            )
                     code = code_value(check, (root / check.file).read_text())
                     page = page_value(row[val_col])
                 except (OSError, ValueError) as e:
@@ -441,7 +520,7 @@ def self_test() -> None:
     errs = check_page(ROOT, broken, readme, verify_commits=False)
     assert any("does not exist" in e for e in errs), errs
     for old, new in [
-        ("| Tenant quota `Retry-After` | 60 s", "| Tenant quota `Retry-After` | 5 s"),
+        ("| Connection and in-flight shed `Retry-After` | 1 s", "| Connection and in-flight shed `Retry-After` | 2 s"),
         ("| Search queue depth | 4 ×", "| Search queue depth | 8 ×"),
         ("| Unindexed backlog `Retry-After` | 1 s", "| Unindexed backlog `Retry-After` | 2 s"),
     ]:
@@ -452,10 +531,32 @@ def self_test() -> None:
     assert broken != text, "self-test anchor missing: the Request size row"
     errs = check_page(ROOT, broken, readme, verify_commits=False)
     assert any("Request size" in e and "restating" in e for e in errs), errs
-    broken = text.replace("| 503 with `Retry-After` (below) |", "| 503, `Retry-After: 1` |", 1)
+    broken = text.replace("| 503 `unavailable`, retryable, with `Retry-After` (below) |",
+                          "| 503 `unavailable`, retryable, `Retry-After: 1` |", 1)
     assert broken != text, "self-test anchor missing: Requests in flight"
     assert any("Retry-After" in e or "Requests in flight" in e
                for e in check_page(ROOT, broken, readme, verify_commits=False))
+    # Refusal cells are checked against api_error.rs.
+    for old, new in [
+        ("| 403 `doc_quota_exceeded`, not retryable", "| 429 `doc_quota_exceeded`, not retryable"),
+        ("| 403 `doc_quota_exceeded`, not retryable", "| 403 `doc_quota_exceeded`, retryable"),
+        ("| 429 `tenant_qps_exceeded`, retryable", "| 429 `tenant_qps_exceeded`, not retryable"),
+        ("| 413 `payload_too_large`, not retryable, no", "| 429 `payload_too_large`, not retryable, no"),
+        ("| 408 `request_timeout`, retryable", "| 408 `request_timeout`"),
+    ]:
+        broken = text.replace(old, new, 1)
+        assert broken != text, f"self-test anchor missing: {old}"
+        errs = check_page(ROOT, broken, readme, verify_commits=False)
+        assert any("api_error.rs" in e for e in errs), (old, new, errs)
+    codes = error_codes((ROOT / API_ERROR).read_text())
+    assert codes["payload_too_large"] == (413, False), codes
+    assert codes["unavailable"] == (503, True), codes
+    assert codes["doc_quota_exceeded"] == (403, False), codes
+    # `busy` setting its own delay would bypass DEFAULT_RETRY_AFTER.
+    busy_src = (ROOT / "crates/kosha-server/src/http.rs").read_text()
+    assert re.search(_BUSY, busy_src), "self-test: _BUSY does not match http.rs"
+    assert not re.search(_BUSY, busy_src.replace(
+        '.detail("reason", reason),', '.detail("reason", reason).retry_after(d),', 1))
     assert stray_numbers("429 `doc_quota_exceeded`, 403 after #350") == []
     assert stray_numbers("retry 60 s") == ["60"]
     errs = check_page(ROOT, text, readme.replace("docs/guarantees.md", "x"), verify_commits=False)
