@@ -131,6 +131,7 @@ fn exact_is_identical_without_the_whole_file(n: usize, dim: usize, every: u32) {
             max_range.fetch_max(e - s, Ordering::Relaxed);
             put_span(dir, s, &remote[s as usize..e as usize]);
         }
+        Vec::new()
     };
     let reader = SegmentReader::open(node.clone()).unwrap();
     let got = reader

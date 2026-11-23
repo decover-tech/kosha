@@ -334,6 +334,7 @@ fn spans_fetched_promoted_or_evicted_between_postings_of_one_probe() {
             )
             .unwrap();
         }
+        Vec::new()
     };
     let (hits, probes) = fixture
         .reader

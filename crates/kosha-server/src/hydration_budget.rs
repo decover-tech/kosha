@@ -52,6 +52,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use kosha_segment::span_cache::SpanHolds;
+
 /// Default ceiling on the bytes one search request may hydrate before it is
 /// shed. Deliberately well above a healthy cold search's scoring set (tens
 /// to low hundreds of MB) and well below the multi-GB pull that motivated
@@ -654,6 +656,11 @@ pub struct RequestHydration {
     /// Background work that yields to request fetches on the
     /// [`HydrationBudget`] (see [`Self::background`]).
     background: bool,
+    /// Spans this request fetched that the span write queue could not take
+    /// (`span_writes`): in memory only, readable while held, so held until
+    /// the request is done with them. At most the bytes the request
+    /// fetched, which its `ceiling` bounds.
+    held_spans: Mutex<SpanHolds>,
 }
 
 impl RequestHydration {
@@ -667,6 +674,15 @@ impl RequestHydration {
             budget_expiries: AtomicU64::new(0),
             rid: crate::request_id(),
             background: false,
+            held_spans: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Keep `spans` readable until this request's accountant drops (see
+    /// `held_spans`).
+    pub fn hold_spans(&self, spans: SpanHolds) {
+        if !spans.is_empty() {
+            self.held_spans.lock().unwrap().extend(spans);
         }
     }
 

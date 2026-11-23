@@ -2222,7 +2222,7 @@ impl Part {
                     open_at(&self.tmp_path, self.start).await
                 }
                 .map_err(KoshaError::Io)?;
-                let streamed = stream_body_into(resp.body, file).await?;
+                let streamed = stream_body_into(resp.body, file, self.start).await?;
                 if streamed.bytes != want {
                     return Err(KoshaError::NotFound(format!(
                         "S3 read body: {} [{}, {}) ended after {} bytes",
@@ -2282,7 +2282,7 @@ async fn stream_body_to_file(
     let file = tokio::fs::File::create(tmp_path)
         .await
         .map_err(KoshaError::Io)?;
-    stream_body_into(body, file).await
+    stream_body_into(body, file, 0).await
 }
 
 /// Write a GET response body into `file` (at its current position) chunk
@@ -2307,6 +2307,7 @@ async fn stream_body_to_file(
 async fn stream_body_into(
     mut body: aws_sdk_s3::primitives::ByteStream,
     file: tokio::fs::File,
+    offset: u64,
 ) -> Result<StreamedFetch, KoshaError> {
     use tokio::io::AsyncWriteExt;
 
@@ -2337,6 +2338,19 @@ async fn stream_body_into(
     let t_flush = std::time::Instant::now();
     file.flush().await.map_err(KoshaError::Io)?;
     write_ms += t_flush.elapsed().as_secs_f64() * 1e3;
+
+    // Start writing the part to disk now rather than leaving it dirty
+    // until the kernel's background threshold (see `writeback`): a warm-up
+    // or a large hydration otherwise piles up gigabytes of dirty pages and
+    // the kernel then throttles every thread in the pod that writes.
+    if bytes > 0 {
+        let file = file.into_inner().into_std().await;
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || crate::writeback::start(&file, offset, bytes)).await
+        {
+            eprintln!("WARN: writeback start task failed: {e}");
+        }
+    }
 
     Ok(StreamedFetch { bytes, write_ms })
 }

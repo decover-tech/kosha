@@ -81,6 +81,7 @@ mod segment_commit;
 mod segment_gc;
 #[cfg(all(test, feature = "s3"))]
 mod segment_pin_tests;
+mod span_writes;
 mod tenant_limits;
 mod unindexed;
 mod usage;
@@ -91,6 +92,7 @@ mod usage_reconcile_tests;
 mod usage_tests;
 mod warm;
 mod warm_run;
+mod writeback;
 mod writer_lease;
 #[cfg(test)]
 mod writer_lease_tests;
@@ -106,6 +108,8 @@ use kosha_query::DocStoreHydrator;
 #[cfg(feature = "s3")]
 use kosha_query::PageSegment;
 use kosha_query::Searcher;
+#[cfg(feature = "s3")]
+use kosha_segment::span_cache::SpanHolds;
 use kosha_segment::SegmentReader;
 use kosha_write::Indexer;
 
@@ -252,6 +256,10 @@ struct AppState {
     posting_promotions: doc_spans::PromotionQueue,
     /// Process totals of posting bytes fetched, for `GET /stats`.
     posting_reads: posting_spans::PostingReadCounters,
+    /// Writes of fetched spans into the span cache, drained by the
+    /// `kosha-span-writer` thread so no request (or rayon scoring task)
+    /// writes to disk. See [`span_writes`].
+    span_writes: span_writes::SpanWriteQueue,
     /// Ceiling on concurrent `/search` executions
     /// (`KOSHA_MAX_CONCURRENT_SEARCHES`, default 8). Complements the
     /// searcher's own live-bytes admission gate (`kosha_query::MemoryLedger`):
@@ -2062,6 +2070,7 @@ impl AppState {
             #[cfg(feature = "s3")]
             posting_promotions: doc_spans::PromotionQueue::default(),
             posting_reads: posting_spans::PostingReadCounters::default(),
+            span_writes: span_writes::SpanWriteQueue::new(span_writes::SPAN_WRITE_QUEUE_BYTES),
             search_semaphore: {
                 let permits = std::env::var("KOSHA_MAX_CONCURRENT_SEARCHES")
                     .ok()
@@ -2198,15 +2207,53 @@ impl AppState {
                 .spawn(move || {
                     let start = Instant::now();
                     state.run_boot_warmup(&*state);
-                    state
-                        .warmup_complete
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                    println!(
-                        "warmup: complete in {:.1}s — pod is ready",
-                        start.elapsed().as_secs_f64()
-                    );
+                    let data_dir = state.data_dir.clone();
+                    state.finish_warmup(start, || writeback::sync_filesystem(&data_dir));
                 })
                 .expect("failed to spawn warmup thread");
+        }
+    }
+
+    /// The end of the boot warm-up: wait for `flush` to put what warm-up
+    /// wrote on disk, then mark the pod ready.
+    ///
+    /// The warm-up's files are buffered writes. Flipping ready with them
+    /// still dirty (4.4–5.1 GB measured on staging, about the kernel's
+    /// dirty limit) handed the first user requests a disk that needed 41–52
+    /// s more to drain at 125 MiB/s, during which the kernel throttled every
+    /// thread that wrote. Each warm file's writeback starts as it lands
+    /// (`writeback::start`), so what is left to wait for here is the tail
+    /// that the disk had not caught up with yet. It can never exceed the
+    /// kernel's dirty limit (≈ 6 GB on a query pod), so the wait is at most
+    /// ≈ 6 GB / 125 MiB/s ≈ 46 s, and on the measured warm-up the dirty
+    /// tail is ≈ 1.1 GB (≈ 9 s). A failed flush is logged and the pod goes
+    /// ready anyway (fail-open, as for the warm-up itself).
+    #[cfg_attr(not(any(test, feature = "s3")), allow(dead_code))]
+    fn finish_warmup(&self, start: Instant, flush: impl FnOnce() -> std::io::Result<()>) {
+        let mb = |b: u64| b / (1 << 20);
+        let before = writeback::dirty_bytes();
+        let flushed = Instant::now();
+        if let Err(e) = flush() {
+            eprintln!("WARN: warmup: flushing the cache disk failed: {e}; going ready anyway");
+        }
+        let flush_s = flushed.elapsed().as_secs_f64();
+        let after = writeback::dirty_bytes();
+        self.warmup_complete
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        match (before, after) {
+            (Some((dirty, wb)), Some((dirty_after, wb_after))) => println!(
+                "warmup: complete in {:.1}s — pod is ready (cache flush {flush_s:.1}s: node \
+                 dirty {} MB + writeback {} MB before, {} MB + {} MB after)",
+                start.elapsed().as_secs_f64(),
+                mb(dirty),
+                mb(wb),
+                mb(dirty_after),
+                mb(wb_after)
+            ),
+            _ => println!(
+                "warmup: complete in {:.1}s — pod is ready (cache flush {flush_s:.1}s)",
+                start.elapsed().as_secs_f64()
+            ),
         }
     }
 
@@ -3687,8 +3734,10 @@ impl AppState {
                 };
                 let outcome = {
                     let _permit = self.hydration_semaphore.acquire("page_docs");
-                    self.span_hydrator.hydrate(pages, &fetcher, &self.cache)
+                    self.span_hydrator
+                        .hydrate(pages, &fetcher, &self.span_writes)
                 };
+                request.hold_spans(outcome.held);
                 stats.rounds = outcome.rounds;
                 stats.ranged_gets = outcome.gets;
                 stats.ranged_bytes = outcome.bytes;
@@ -4182,6 +4231,9 @@ impl AppState {
                 }
                 n
             };
+            // As for an S3 download (`writeback`): drain at disk speed now,
+            // not once dirty memory reaches the kernel's throttle point.
+            writeback::start(&file, 0, 0);
             Ok(written)
         })();
         match written {
@@ -4648,9 +4700,10 @@ impl AppState {
                 &refs,
                 |i| targets[i].2,
                 &fetcher,
-                &self.cache,
+                &self.span_writes,
             )
         };
+        request.hold_spans(fetched.held);
         outcome.rounds += fetched.rounds;
         for (seg, (dir, _, _)) in fetched.segments.iter().zip(&targets) {
             outcome.bytes_fetched += seg.bytes;
@@ -4910,7 +4963,9 @@ impl AppState {
                     .iter()
                     .map(|(dir, rel)| (*dir, rel.as_str()))
                     .collect();
-                let fetched = doc_spans::fetch_doc_vectors_headers(&targets, &fetcher, &self.cache);
+                let fetched =
+                    doc_spans::fetch_doc_vectors_headers(&targets, &fetcher, &self.span_writes);
+                request.hold_spans(fetched.held);
                 outcome.rounds += fetched.rounds;
                 outcome.shed |= fetched.shed;
                 for seg in &fetched.segments {
@@ -5265,8 +5320,9 @@ impl AppState {
             let o = {
                 let _permit = self.hydration_semaphore.acquire("posting_spans");
                 self.posting_span_hydrator
-                    .hydrate(&ranged, terms, &fetcher, &self.cache)
+                    .hydrate(&ranged, terms, &fetcher, &self.span_writes)
             };
+            request.hold_spans(o.held);
             stats.rounds += o.rounds;
             stats.ranged_gets += o.gets;
             stats.ranged_bytes += o.bytes;
@@ -5350,7 +5406,9 @@ impl AppState {
     /// fetch the probed kNN postings' `vector.idx` ranges of one segment
     /// into the span cache (#245). A range that fails (not shed) falls back
     /// to the whole `vector.idx`, so the probe still reads every posting it
-    /// needs; anything still missing marks the segment degraded.
+    /// needs; anything still missing marks the segment degraded. Returns
+    /// the spans the probe must hold while it reads them (see
+    /// [`kosha_query::VectorSpanFetch`]).
     #[cfg(feature = "s3")]
     fn hydrate_vector_postings(
         &self,
@@ -5359,17 +5417,17 @@ impl AppState {
         ranges: &[(u64, u64)],
         request: &Arc<RequestHydration>,
         rid: &str,
-    ) -> posting_spans::PostingFetchStats {
+    ) -> (posting_spans::PostingFetchStats, SpanHolds) {
         let mut stats = posting_spans::PostingFetchStats::default();
         let Some(ref s3) = self.s3_storage else {
-            return stats;
+            return (stats, Vec::new());
         };
         let Some(rel) = seg
             .strip_prefix(&self.data_dir)
             .ok()
             .map(|p| p.to_string_lossy().replace('\\', "/"))
         else {
-            return stats;
+            return (stats, Vec::new());
         };
         let fetcher = doc_spans::S3RangeFetcher {
             s3,
@@ -5384,7 +5442,7 @@ impl AppState {
             ranges,
             self.posting_span_hydrator.coalesce_gap(),
             &fetcher,
-            &self.cache,
+            &self.span_writes,
         );
         stats.rounds = u64::from(o.gets > 0);
         stats.ranged_gets = o.gets;
@@ -5410,7 +5468,28 @@ impl AppState {
             );
         }
         self.posting_reads.record(&stats);
-        stats
+        (stats, o.held)
+    }
+
+    /// Start the thread that writes fetched spans into the span cache (see
+    /// [`span_writes`]). Only the S3 tier fetches spans.
+    fn spawn_span_writer(self: &Arc<Self>) {
+        #[cfg(feature = "s3")]
+        {
+            if self.s3_storage.is_none() {
+                return;
+            }
+            let weak = Arc::downgrade(self);
+            std::thread::Builder::new()
+                .name("kosha-span-writer".into())
+                .spawn(move || loop {
+                    let Some(state) = weak.upgrade() else { return };
+                    if let Some(job) = state.span_writes.pop_timeout(Duration::from_secs(1)) {
+                        state.span_writes.write(&state.cache, job);
+                    }
+                })
+                .expect("failed to spawn span writer thread");
+        }
     }
 
     /// Start the thread that promotes hot posting shards from ranged reads
@@ -6162,6 +6241,7 @@ fn main() {
     // Bind the listener first so a slow warmup doesn't delay the port;
     // `/readyz` keeps HPA/kube endpoints from sending traffic while it
     // runs (Tier 1 O2). Liveness (`/healthz`) is unaffected.
+    state.spawn_span_writer();
     state.spawn_warmup();
     state.spawn_rewarmer();
     state.spawn_warm_set_persister();
@@ -8736,6 +8816,7 @@ fn handle_stats(state: &AppState) -> String {
         "s3_prefix": s3_prefix,
         "doc_store_reads": state.doc_store_reads.to_json(state.doc_read_mode),
         "posting_reads": state.posting_reads.to_json(state.posting_read_mode),
+        "span_writes": state.span_writes.to_json(),
         // Process-wide count of scoring blocks varint-decoded (#385); a
         // bench diffs it around a run for blocks decoded per query.
         "scoring_blocks_decoded": kosha_segment::scoring_blocks_decoded(),
@@ -9094,8 +9175,10 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     let vector_fetch_stats = Mutex::new(posting_spans::PostingFetchStats::default());
     #[cfg(feature = "s3")]
     let fetch_vectors = |seg: &Path, file: &str, ranges: &[(u64, u64)]| {
-        let stats = state.hydrate_vector_postings(seg, file, ranges, &hydration_request, &rid);
+        let (stats, held) =
+            state.hydrate_vector_postings(seg, file, ranges, &hydration_request, &rid);
         vector_fetch_stats.lock().unwrap().add(&stats);
+        held
     };
     #[cfg(feature = "s3")]
     let vector_fetch: Option<kosha_query::VectorSpanFetch<'_>> = Some(&fetch_vectors);
@@ -9726,8 +9809,10 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
     let vector_fetch_stats = Mutex::new(posting_spans::PostingFetchStats::default());
     #[cfg(feature = "s3")]
     let fetch_vectors = |seg: &Path, file: &str, ranges: &[(u64, u64)]| {
-        let stats = state.hydrate_vector_postings(seg, file, ranges, &hydration_request, &rid);
+        let (stats, held) =
+            state.hydrate_vector_postings(seg, file, ranges, &hydration_request, &rid);
         vector_fetch_stats.lock().unwrap().add(&stats);
+        held
     };
     #[cfg(feature = "s3")]
     let vector_fetch: Option<kosha_query::VectorSpanFetch<'_>> = Some(&fetch_vectors);
@@ -19740,6 +19825,31 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Readiness waits for the warm-up's writes to reach disk: the pod is
+    /// not ready while the flush runs, and is once it returns, also when
+    /// it fails (fail-open, like the warm-up).
+    #[test]
+    fn readiness_waits_for_the_warmup_flush() {
+        for fails in [false, true] {
+            let state = test_state();
+            state
+                .warmup_complete
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            let mut flushed = false;
+            state.finish_warmup(Instant::now(), || {
+                assert!(!state.is_ready(), "ready before the warm-up flush ran");
+                flushed = true;
+                if fails {
+                    Err(std::io::Error::other("injected"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(flushed);
+            assert!(state.is_ready());
+        }
     }
 
     // ─── Multi-field highlighting (#195) ─────────────────────────────────

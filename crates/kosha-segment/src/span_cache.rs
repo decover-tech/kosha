@@ -20,12 +20,21 @@
 //! Span files live under the cache root like any other segment file, so the
 //! disk cache counts them toward its byte budget and its LRU may evict any
 //! of them; an evicted span is just a miss that the next query re-fetches.
+//!
+//! A fetched span is written to disk off the request path (kosha-server's
+//! background span writer), so between the fetch and the rename its bytes
+//! are a [`PendingSpan`] in memory, which every reader here serves exactly
+//! like a span file. A pending span whose write is queued counts as cached
+//! ([`SpanIndex::covers`]); one whose write was dropped (the writer's queue
+//! was full) stays readable only while whoever fetched it holds it, and
+//! never counts as cached, so no other reader skips a fetch on its account.
 
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, SystemTime};
 
 /// Suffix of the sparse cache directory next to a segment file.
@@ -53,11 +62,134 @@ pub fn parse_span_file_name(name: &str) -> Option<(u64, u64)> {
     (end > start).then_some((start, end))
 }
 
-/// The complete spans cached for one segment file, sorted by start.
+/// Bytes `[start, start + len)` of a segment file, fetched and held in
+/// memory while (or instead of) being written to its span directory. While
+/// any clone is alive, every reader in this module serves the range from
+/// these bytes; the last drop unregisters it.
+pub struct PendingSpan {
+    dir: PathBuf,
+    start: u64,
+    bytes: Vec<u8>,
+    queued: bool,
+}
+
+/// Pending spans a reader must keep alive until it has read them: the
+/// spans a fetch could not queue for writing (see [`PendingSpan`]).
+pub type SpanHolds = Vec<Arc<PendingSpan>>;
+
+type PendingRegistry = Mutex<HashMap<PathBuf, Vec<Weak<PendingSpan>>>>;
+
+fn pending_registry() -> &'static PendingRegistry {
+    static REGISTRY: OnceLock<PendingRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(Default::default)
+}
+
+/// Pending spans alive in the process, so a reader with none to consider
+/// (the common case) skips the registry lock.
+static PENDING_LIVE: AtomicUsize = AtomicUsize::new(0);
+
+impl PendingSpan {
+    /// Make `bytes`, the range starting at `start` of
+    /// `{segment_dir}/{file}`, readable through every span reader until the
+    /// returned value and all its clones drop. `queued`: a write of it to
+    /// the span directory is queued, so it counts as cached until then (the
+    /// writer renames the file into place before it lets go).
+    pub fn register(
+        segment_dir: &Path,
+        file: &str,
+        start: u64,
+        bytes: Vec<u8>,
+        queued: bool,
+    ) -> Arc<Self> {
+        let span = Arc::new(Self {
+            dir: spans_dir(segment_dir, file),
+            start,
+            bytes,
+            queued,
+        });
+        let mut registry = pending_registry().lock().unwrap();
+        registry
+            .entry(span.dir.clone())
+            .or_default()
+            .push(Arc::downgrade(&span));
+        PENDING_LIVE.fetch_add(1, Ordering::AcqRel);
+        span
+    }
+
+    pub fn start(&self) -> u64 {
+        self.start
+    }
+
+    pub fn end(&self) -> u64 {
+        self.start + self.bytes.len() as u64
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Where the span file goes: `{segment_dir}/{file}.spans/{name}`.
+    pub fn dest(&self) -> PathBuf {
+        self.dir.join(span_file_name(self.start, self.end()))
+    }
+
+    /// The span directory it belongs to.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The live pending spans of one span directory, sorted by start.
+    fn of_dir(dir: &Path) -> Vec<Arc<Self>> {
+        if PENDING_LIVE.load(Ordering::Acquire) == 0 {
+            return Vec::new();
+        }
+        let mut live: Vec<Arc<Self>> = {
+            let registry = pending_registry().lock().unwrap();
+            registry
+                .get(dir)
+                .map(|spans| spans.iter().filter_map(Weak::upgrade).collect())
+                .unwrap_or_default()
+        };
+        live.sort_unstable_by_key(|p| (p.start, p.end()));
+        live
+    }
+}
+
+impl Drop for PendingSpan {
+    fn drop(&mut self) {
+        let mut registry = pending_registry().lock().unwrap();
+        if let Some(spans) = registry.get_mut(&self.dir) {
+            // This span's own weak entry is dead by now (its strong count
+            // reached zero), as is any other that has not been pruned yet.
+            spans.retain(|w| w.strong_count() > 0);
+            if spans.is_empty() {
+                registry.remove(&self.dir);
+            }
+        }
+        PENDING_LIVE.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl std::fmt::Debug for PendingSpan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingSpan")
+            .field("dest", &self.dest())
+            .field("queued", &self.queued)
+            .finish()
+    }
+}
+
+/// The complete spans cached for one segment file, sorted by start: the
+/// span files on disk plus the [`PendingSpan`]s alive when it was taken,
+/// which it holds, so their bytes stay readable for as long as it lives.
 #[derive(Debug, Default, Clone)]
 pub struct SpanIndex {
     dir: PathBuf,
+    /// What counts as cached: `on_disk` plus queued pending spans.
     spans: Arc<Vec<(u64, u64)>>,
+    on_disk: Arc<Vec<(u64, u64)>>,
+    /// Sorted by start.
+    pending: Vec<Arc<PendingSpan>>,
 }
 
 /// Listings of span directories, keyed by directory, each valid while the
@@ -73,7 +205,7 @@ pub struct SpanIndex {
 /// Why the modification time is enough: a span appears by a rename into
 /// the directory and disappears by an unlink, and both change the
 /// directory's mtime; span files are never rewritten in place (see
-/// `write_span` in kosha-server). A listing is only cached when the
+/// kosha-server's `SpanWriteQueue::write`). A listing is only cached when the
 /// directory had been quiet for [`LISTING_QUIET`] when it was taken, so a
 /// change landing in the same timestamp tick as the listing cannot hide
 /// behind an equal mtime.
@@ -122,6 +254,26 @@ impl SpanIndex {
     /// stat per span); see [`ListingCache`].
     pub fn load(segment_dir: &Path, file: &str) -> Self {
         let dir = spans_dir(segment_dir, file);
+        let pending = PendingSpan::of_dir(&dir);
+        let mut index = Self::load_on_disk(dir);
+        if !pending.is_empty() {
+            let mut spans = index.on_disk.to_vec();
+            spans.extend(
+                pending
+                    .iter()
+                    .filter(|p| p.queued)
+                    .map(|p| (p.start, p.end())),
+            );
+            spans.sort_unstable();
+            spans.dedup();
+            index.spans = Arc::new(spans);
+            index.pending = pending;
+        }
+        index
+    }
+
+    /// The span files of `dir` alone (see [`Self::load`]).
+    fn load_on_disk(dir: PathBuf) -> Self {
         if !listing_cache_enabled() {
             return Self::list(dir);
         }
@@ -129,15 +281,12 @@ impl SpanIndex {
             // No directory: an empty index, and nothing worth caching.
             return Self {
                 dir,
-                spans: Arc::default(),
+                ..Self::default()
             };
         };
         if let Some((at, spans)) = listing_cache().read().unwrap().get(&dir) {
             if *at == before {
-                return Self {
-                    dir,
-                    spans: Arc::clone(spans),
-                };
+                return Self::from_disk(dir, Arc::clone(spans));
             }
         }
         let listed = Self::list(dir);
@@ -151,7 +300,7 @@ impl SpanIndex {
             if cache.len() >= LISTING_CACHE_MAX_DIRS {
                 cache.clear();
             }
-            cache.insert(listed.dir.clone(), (before, Arc::clone(&listed.spans)));
+            cache.insert(listed.dir.clone(), (before, Arc::clone(&listed.on_disk)));
         } else {
             cache.remove(&listed.dir);
         }
@@ -173,26 +322,48 @@ impl SpanIndex {
             }
         }
         spans.sort_unstable();
+        Self::from_disk(dir, Arc::new(spans))
+    }
+
+    fn from_disk(dir: PathBuf, on_disk: Arc<Vec<(u64, u64)>>) -> Self {
         Self {
             dir,
-            spans: Arc::new(spans),
+            spans: Arc::clone(&on_disk),
+            on_disk,
+            pending: Vec::new(),
         }
     }
 
     /// A cached span containing all of `[start, end)`, if any.
     pub fn covering(&self, start: u64, end: u64) -> Option<(u64, u64)> {
-        // Spans may overlap (two queries fetching neighbouring ranges), so
-        // any span starting at or before `start` may be the one.
-        let upto = self.spans.partition_point(|&(s, _)| s <= start);
-        self.spans[..upto]
-            .iter()
-            .rev()
-            .find(|&&(_, e)| e >= end)
-            .copied()
+        covering_in(&self.spans, start, end)
     }
 
     pub fn covers(&self, start: u64, end: u64) -> bool {
         start == end || self.covering(start, end).is_some()
+    }
+
+    /// [`Self::covers`] by a span file alone: what a caller that records
+    /// "this range is local" beyond this index's lifetime must ask, since a
+    /// pending span is in memory only until its write lands (or never).
+    pub fn covers_on_disk(&self, start: u64, end: u64) -> bool {
+        start == end || covering_in(&self.on_disk, start, end).is_some()
+    }
+
+    /// The pending span holding all of `[start, end)`, if any.
+    fn pending_covering(&self, start: u64, end: u64) -> Option<&PendingSpan> {
+        let upto = self.pending.partition_point(|p| p.start <= start);
+        self.pending[..upto]
+            .iter()
+            .rev()
+            .find(|p| p.end() >= end)
+            .map(Arc::as_ref)
+    }
+
+    /// `[start, end)` out of a pending span, when one holds it.
+    fn read_pending(&self, start: u64, end: u64) -> Option<&[u8]> {
+        let p = self.pending_covering(start, end)?;
+        Some(&p.bytes[(start - p.start) as usize..(end - p.start) as usize])
     }
 
     /// Read `[start, end)` out of whichever cached span holds it. `None`
@@ -201,7 +372,10 @@ impl SpanIndex {
         if start == end {
             return Some(Vec::new());
         }
-        let (s, e) = self.covering(start, end)?;
+        if let Some(bytes) = self.read_pending(start, end) {
+            return Some(bytes.to_vec());
+        }
+        let (s, e) = covering_in(&self.on_disk, start, end)?;
         let mut file = fs::File::open(self.dir.join(span_file_name(s, e))).ok()?;
         file.seek(SeekFrom::Start(start - s)).ok()?;
         let mut buf = vec![0u8; (end - start) as usize];
@@ -223,7 +397,10 @@ impl SpanIndex {
                 if start == end {
                     return Some(Vec::new());
                 }
-                let span = self.covering(start, end)?;
+                if let Some(bytes) = self.read_pending(start, end) {
+                    return Some(bytes.to_vec());
+                }
+                let span = covering_in(&self.on_disk, start, end)?;
                 if open.as_ref().is_none_or(|(s, _)| *s != span) {
                     open = fs::File::open(self.dir.join(span_file_name(span.0, span.1)))
                         .ok()
@@ -240,11 +417,14 @@ impl SpanIndex {
 
     /// The cached span starting at offset 0 (a file header), read whole.
     pub fn read_prefix(&self) -> Option<Vec<u8>> {
-        let &(_, end) = self
-            .spans
+        let end = self
+            .on_disk
             .iter()
-            .filter(|&&(s, _)| s == 0)
-            .max_by_key(|&&(_, e)| e)?;
+            .copied()
+            .chain(self.pending.iter().map(|p| (p.start, p.end())))
+            .filter(|&(s, _)| s == 0)
+            .map(|(_, e)| e)
+            .max()?;
         self.read(0, end)
     }
 
@@ -252,14 +432,27 @@ impl SpanIndex {
         &self.spans
     }
 
+    /// No span to read from, on disk or in memory.
     pub fn is_empty(&self) -> bool {
-        self.spans.is_empty()
+        self.spans.is_empty() && self.pending.is_empty()
     }
 
-    /// Bytes held on disk (overlaps counted twice, as they are stored).
+    /// Bytes cached (overlaps counted twice, as they are stored).
     pub fn total_bytes(&self) -> u64 {
         self.spans.iter().map(|(s, e)| e - s).sum()
     }
+}
+
+/// A span of sorted `spans` containing all of `[start, end)`, if any.
+fn covering_in(spans: &[(u64, u64)], start: u64, end: u64) -> Option<(u64, u64)> {
+    // Spans may overlap (two queries fetching neighbouring ranges), so any
+    // span starting at or before `start` may be the one.
+    let upto = spans.partition_point(|&(s, _)| s <= start);
+    spans[..upto]
+        .iter()
+        .rev()
+        .find(|&&(_, e)| e >= end)
+        .copied()
 }
 
 /// Read `[start, start + len)` of `segment_dir/file` from local disk: the
@@ -432,7 +625,11 @@ impl LocalRangeReader {
         let Some(spans) = &self.spans else {
             return false;
         };
-        let Some(span) = spans.covering(start, end) else {
+        if let Some(bytes) = spans.read_pending(start, end) {
+            self.buf[..n].copy_from_slice(bytes);
+            return true;
+        }
+        let Some(span) = covering_in(&spans.on_disk, start, end) else {
             return false;
         };
         if self
@@ -591,6 +788,52 @@ mod tests {
         }
         let cached = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
         println!("listing 730 spans: {listed:.1} us listed, {cached:.2} us cached");
+        let _ = fs::remove_dir_all(&seg);
+    }
+
+    /// A pending span serves every reader from memory while it lives; a
+    /// queued one counts as cached, a dropped one only reads; the last
+    /// drop unregisters it, and a reader that captured it keeps it.
+    #[test]
+    fn pending_spans_read_like_span_files_while_held() {
+        let seg = tmp("pending");
+        let file = "vector.idx";
+        put(&seg, file, 0, b"DISK");
+        let bytes: Vec<u8> = (0..32u8).collect();
+        let queued = PendingSpan::register(&seg, file, 100, bytes.clone(), true);
+        let dropped = PendingSpan::register(&seg, file, 200, vec![9u8; 8], false);
+        let idx = SpanIndex::load(&seg, file);
+        assert_eq!(idx.spans(), &[(0, 4), (100, 132)]);
+        assert!(idx.covers(104, 108) && !idx.covers_on_disk(104, 108));
+        assert!(!idx.covers(200, 208), "a dropped span is not cached");
+        assert_eq!(idx.read(104, 108).as_deref(), Some(&bytes[4..8]));
+        assert_eq!(idx.read(202, 204).as_deref(), Some(&[9u8, 9][..]));
+        assert_eq!(
+            idx.read_many(&[(0, 4), (130, 132), (200, 201)]),
+            vec![
+                Some(b"DISK".to_vec()),
+                Some(bytes[30..].to_vec()),
+                Some(vec![9])
+            ]
+        );
+        assert_eq!(
+            read_local_range(&seg, file, u64::MAX, 110, 2).as_deref(),
+            Some(&bytes[10..12])
+        );
+        let mut reader = LocalRangeReader::new(&seg, file);
+        assert_eq!(reader.read(u64::MAX, 0, 4), Some(&b"DISK"[..]));
+        assert_eq!(reader.read(u64::MAX, 120, 4), Some(&bytes[20..24]));
+        assert_eq!(reader.read(u64::MAX, 207, 1), Some(&[9u8][..]));
+
+        drop((queued, dropped));
+        // Captured by `idx` and `reader`: still readable through them.
+        assert_eq!(idx.read(104, 108).as_deref(), Some(&bytes[4..8]));
+        assert_eq!(reader.read(u64::MAX, 200, 2), Some(&[9u8, 9][..]));
+        drop((idx, reader));
+        let idx = SpanIndex::load(&seg, file);
+        assert_eq!(idx.spans(), &[(0, 4)]);
+        assert_eq!(idx.read(104, 108), None);
+        assert_eq!(read_local_range(&seg, file, u64::MAX, 200, 2), None);
         let _ = fs::remove_dir_all(&seg);
     }
 
