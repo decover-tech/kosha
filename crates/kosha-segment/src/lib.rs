@@ -1952,6 +1952,49 @@ pub fn knn_needs_doc_vectors(footer: Option<&Footer>) -> bool {
     footer.is_some_and(|f| f.vector_fields.is_none() && f.doc_vectors)
 }
 
+/// Whether a query node should hold this segment's `doc_vectors.bin`
+/// WHOLE, i.e. whether background promotion and warm-up fetch it.
+///
+/// Only a quantized (i8 / RaBitQ) column needs the whole file: the
+/// default per-segment kNN path rescores its shortlist from it, and
+/// without it returns quantized estimates as final scores
+/// ([`SegmentReader::rescores_quantized_locally`]). An f32 column never
+/// rescores, and every other reader works from ranges — page documents'
+/// vectors ([`SegmentReader::doc_is_local`]), exact filtered kNN
+/// (`knn_exact_filtered_fetching`) and global rescoring
+/// (`knn_exact_scores_fetching`) — so for f32 columns the whole file (as
+/// large as the f32 vector index) is never worth its download or its
+/// disk. A legacy footer that lists no columns cannot say, so it keeps
+/// the whole file as before. `false` when the segment has no sidecar.
+pub fn doc_vectors_kept_whole(footer: &Footer) -> bool {
+    footer.doc_vectors
+        && footer
+            .vector_fields
+            .as_ref()
+            .is_none_or(|cols| cols.iter().any(|c| !c.quantization.is_f32()))
+}
+
+/// An upper bound on `doc_vectors.bin`'s header length from the footer
+/// alone, at least [`DOC_VECTORS_HEADER_PROBE`]: 12 bytes per entry, at
+/// most one entry per document per vector column, plus the field table.
+/// Reading this many bytes first fetches the whole header in one round
+/// (any surplus is the first vectors). A legacy footer that lists no
+/// columns gives the plain probe.
+pub fn doc_vectors_header_estimate(footer: &Footer) -> u64 {
+    let Some(cols) = footer.vector_fields.as_ref() else {
+        return DOC_VECTORS_HEADER_PROBE;
+    };
+    let names: u64 = cols.iter().map(|c| 4 + c.name.len() as u64).sum();
+    let entries = footer.doc_count as u64 * cols.len() as u64;
+    (12 + names + 12 * entries).max(DOC_VECTORS_HEADER_PROBE)
+}
+
+/// [`doc_vectors_kept_whole`] for `segment_dir`'s local `footer.json`;
+/// `false` if it can't be read (as [`segment_uses_doc_vectors`]).
+pub fn segment_keeps_doc_vectors_whole(segment_dir: &Path) -> bool {
+    SegmentReader::read_footer(segment_dir).is_ok_and(|footer| doc_vectors_kept_whole(&footer))
+}
+
 /// The files a kNN on `field` needs from `segment_dir` (#204), each paired
 /// with whether the segment cannot be searched without it. Decided from
 /// the local `footer.json`:
@@ -4077,6 +4120,29 @@ pub struct DocVectors {
     file_len: u64,
 }
 
+/// Span-cache listings of one segment, kept across the documents of one
+/// result page ([`SegmentReader::page_doc_is_local`],
+/// [`SegmentReader::page_doc_record`]): a listing is a `read_dir` plus a
+/// stat of every cached span, so taking one per document cost a page
+/// `documents x spans` stats.
+#[derive(Default)]
+pub struct PageSpans {
+    doc_store: Option<span_cache::SpanIndex>,
+    doc_vectors: Option<span_cache::SpanIndex>,
+}
+
+/// Which sidecar vectors a visit reads, in which runs: see
+/// [`DocVectors::visit_field_vectors`].
+#[derive(Default)]
+struct VectorRuns {
+    /// Entry indices of the wanted vectors, ascending.
+    wanted: Vec<usize>,
+    /// `[start, end)` into `wanted`, one per run.
+    runs: Vec<(usize, usize)>,
+    /// The `[start, end)` file bytes of each run.
+    ranges: Vec<(u64, u64)>,
+}
+
 impl DocVectors {
     /// Open a whole local `doc_vectors.bin`, checking its length against
     /// the header.
@@ -4163,16 +4229,27 @@ impl DocVectors {
     /// `(field name, vector)` for every vector stored for `doc_seq`, in the
     /// document's field order. One local read.
     pub fn vectors_for(&self, doc_seq: u32) -> Result<Vec<(&str, Vec<f32>)>, KoshaError> {
+        self.vectors_for_reusing(doc_seq, &mut None)
+    }
+
+    /// [`Self::vectors_for`] keeping the span listing in `spans` across
+    /// calls (see [`span_cache::read_local_range_reusing`]).
+    pub fn vectors_for_reusing(
+        &self,
+        doc_seq: u32,
+        spans: &mut Option<span_cache::SpanIndex>,
+    ) -> Result<Vec<(&str, Vec<f32>)>, KoshaError> {
         let (start, end) = self.entry_range(doc_seq);
         let Some((span_start, span_end)) = self.doc_span(doc_seq) else {
             return Ok(Vec::new());
         };
-        let buf = span_cache::read_local_range(
+        let buf = span_cache::read_local_range_reusing(
             &self.segment_dir,
             DOC_VECTORS_FILE,
             self.file_len,
             span_start,
             span_end - span_start,
+            spans,
         )
         .ok_or_else(|| {
             KoshaError::NotFound(format!(
@@ -4229,7 +4306,7 @@ impl DocVectors {
 
     /// Calls `visit(doc_seq, vector)` for `field`'s vector of every
     /// document in `doc_seqs` (ascending) that has one, in `doc_seq` order,
-    /// and returns how many were visited.
+    /// and returns how many were visited. Reads the whole local file.
     ///
     /// Built for exact kNN over a filtered set (#252): vectors that sit
     /// close together in the file (gaps up to [`Self::COALESCE_GAP`]) are
@@ -4240,48 +4317,105 @@ impl DocVectors {
         &self,
         field: &str,
         doc_seqs: &[u32],
-        mut visit: impl FnMut(u32, &[f32]),
+        visit: impl FnMut(u32, &[f32]),
     ) -> Result<usize, KoshaError> {
-        let Some(field_idx) = self.fields.iter().position(|name| name == field) else {
+        let plan = self.field_vector_runs(field, doc_seqs);
+        if plan.wanted.is_empty() {
             return Ok(0);
+        }
+        let mut file = fs::File::open(self.segment_dir.join(DOC_VECTORS_FILE))?;
+        self.visit_runs(&plan, visit, |start, end, buf| {
+            buf.resize((end - start) as usize, 0);
+            file.seek(SeekFrom::Start(start))?;
+            file.read_exact(buf)?;
+            Ok(())
+        })
+    }
+
+    /// The byte ranges [`Self::visit_field_vectors`] reads for `field`'s
+    /// vectors of `doc_seqs` (ascending), in file order: the ranges a
+    /// reader without the whole file fetches into the span cache first.
+    pub fn field_vector_ranges(&self, field: &str, doc_seqs: &[u32]) -> Vec<(u64, u64)> {
+        self.field_vector_runs(field, doc_seqs).ranges
+    }
+
+    /// [`Self::visit_field_vectors`] reading each of
+    /// [`Self::field_vector_ranges`] from the sparse span cache instead of
+    /// the whole file (#245). Same vectors, same order, same arithmetic for
+    /// the caller. `Err` when a range is not cached (never fetched, or
+    /// evicted since).
+    pub fn visit_field_vectors_cached(
+        &self,
+        spans: &span_cache::SpanIndex,
+        field: &str,
+        doc_seqs: &[u32],
+        visit: impl FnMut(u32, &[f32]),
+    ) -> Result<usize, KoshaError> {
+        let plan = self.field_vector_runs(field, doc_seqs);
+        self.visit_runs(&plan, visit, |start, end, buf| {
+            *buf = spans.read(start, end).ok_or_else(|| {
+                KoshaError::NotFound(format!(
+                    "{DOC_VECTORS_FILE} bytes {start}..{end} are not cached in segment {:?}",
+                    self.segment_dir
+                ))
+            })?;
+            Ok(())
+        })
+    }
+
+    /// Entry indices of `field`'s vectors of `doc_seqs` (ascending), and
+    /// the runs they are read in.
+    fn field_vector_runs(&self, field: &str, doc_seqs: &[u32]) -> VectorRuns {
+        let mut plan = VectorRuns::default();
+        let Some(field_idx) = self.fields.iter().position(|name| name == field) else {
+            return plan;
         };
         let field_idx = field_idx as u32;
-        // Entry indices of the wanted vectors, ascending (entries are
-        // sorted by doc_seq, and so is `doc_seqs`).
-        let mut wanted: Vec<usize> = Vec::with_capacity(doc_seqs.len());
+        // Entries are sorted by doc_seq, and so is `doc_seqs`.
         let mut from = 0usize;
         for &doc_seq in doc_seqs {
             let start = from + self.entries[from..].partition_point(|e| e.0 < doc_seq);
             let mut i = start;
             while i < self.entries.len() && self.entries[i].0 == doc_seq {
                 if self.entries[i].1 == field_idx {
-                    wanted.push(i);
+                    plan.wanted.push(i);
                 }
                 i += 1;
             }
             from = i;
         }
-        if wanted.is_empty() {
-            return Ok(0);
-        }
         let end_of = |i: usize| self.offsets[i] + self.entries[i].2 as u64 * 4;
-        let mut file = fs::File::open(self.segment_dir.join(DOC_VECTORS_FILE))?;
-        let mut buf: Vec<u8> = Vec::new();
-        let mut vector: Vec<f32> = Vec::new();
         let mut run_start = 0usize;
-        while run_start < wanted.len() {
+        while run_start < plan.wanted.len() {
+            let first = self.offsets[plan.wanted[run_start]];
             let mut run_end = run_start + 1;
-            while run_end < wanted.len()
-                && self.offsets[wanted[run_end]] <= end_of(wanted[run_end - 1]) + Self::COALESCE_GAP
+            while run_end < plan.wanted.len()
+                && self.offsets[plan.wanted[run_end]]
+                    <= end_of(plan.wanted[run_end - 1]) + Self::COALESCE_GAP
+                && end_of(plan.wanted[run_end]) - first <= Self::MAX_RUN_BYTES
             {
                 run_end += 1;
             }
-            let span_start = self.offsets[wanted[run_start]];
-            let span_end = end_of(wanted[run_end - 1]);
-            buf.resize((span_end - span_start) as usize, 0);
-            file.seek(SeekFrom::Start(span_start))?;
-            file.read_exact(&mut buf)?;
-            for &i in &wanted[run_start..run_end] {
+            plan.runs.push((run_start, run_end));
+            plan.ranges.push((first, end_of(plan.wanted[run_end - 1])));
+            run_start = run_end;
+        }
+        plan
+    }
+
+    /// Decode every run of `plan`, reading its bytes into the buffer with
+    /// `read(start, end, buf)`, and visit its vectors in `doc_seq` order.
+    fn visit_runs(
+        &self,
+        plan: &VectorRuns,
+        mut visit: impl FnMut(u32, &[f32]),
+        mut read: impl FnMut(u64, u64, &mut Vec<u8>) -> Result<(), KoshaError>,
+    ) -> Result<usize, KoshaError> {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut vector: Vec<f32> = Vec::new();
+        for (&(run_start, run_end), &(span_start, span_end)) in plan.runs.iter().zip(&plan.ranges) {
+            read(span_start, span_end, &mut buf)?;
+            for &i in &plan.wanted[run_start..run_end] {
                 let at = (self.offsets[i] - span_start) as usize;
                 let dim = self.entries[i].2 as usize;
                 vector.clear();
@@ -4294,15 +4428,21 @@ impl DocVectors {
                 );
                 visit(self.entries[i].0, &vector);
             }
-            run_start = run_end;
         }
-        Ok(wanted.len())
+        Ok(plan.wanted.len())
     }
 
     /// Largest gap between two wanted vectors that
     /// [`Self::visit_field_vectors`] reads through rather than seeking
     /// over: reading 64 KiB costs about what one more seek does.
     pub const COALESCE_GAP: u64 = 64 * 1024;
+
+    /// Most bytes one run reads at once. Without a cap a dense candidate
+    /// set (every document of a one-matter segment) is a single run the
+    /// size of the whole file — a 2 GB buffer for one segment's exact kNN.
+    /// 8 MiB is ~2,700 768-dim vectors per read: still a few large
+    /// sequential reads, at a bounded heap cost per scoring thread.
+    pub const MAX_RUN_BYTES: u64 = 8 * 1024 * 1024;
 
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -7665,12 +7805,21 @@ impl SegmentReader {
     /// is corruption and fails loudly: returning the empty value would let
     /// a compaction write the document out without its vector.
     fn sidecar_vectors(&self, record: &DocRecord) -> Result<Vec<(usize, Vec<f32>)>, KoshaError> {
+        self.sidecar_vectors_reusing(record, &mut None)
+    }
+
+    /// [`Self::sidecar_vectors`] keeping the span listing in `spans`.
+    fn sidecar_vectors_reusing(
+        &self,
+        record: &DocRecord,
+        spans: &mut Option<span_cache::SpanIndex>,
+    ) -> Result<Vec<(usize, Vec<f32>)>, KoshaError> {
         let is_placeholder = |f: &Field| f.field_type == FieldType::Vector && f.value.is_empty();
         if !self.footer.doc_vectors || !record.fields.iter().any(is_placeholder) {
             return Ok(Vec::new());
         }
         let dv = self.doc_vectors()?;
-        let mut stored = dv.vectors_for(record.doc_seq)?.into_iter();
+        let mut stored = dv.vectors_for_reusing(record.doc_seq, spans)?.into_iter();
         let mut out = Vec::new();
         for (index, field) in record.fields.iter().enumerate() {
             if !is_placeholder(field) {
@@ -8756,8 +8905,10 @@ impl SegmentReader {
     /// postings full of documents the filter throws away, and keep going
     /// outward until it has found `k` that pass.
     ///
-    /// Vectors are read from `doc_vectors.bin` (#243) when the segment has
-    /// it locally and it holds `field`; otherwise every posting of the
+    /// Vectors are read from `doc_vectors.bin` (#243) when it holds
+    /// `field` and is local — the whole file, or its header with the
+    /// candidates' ranges fetched through `fetch` (see
+    /// [`Self::knn_exact_from_sidecar`]); otherwise every posting of the
     /// column is hydrated and filtered (the only way to see every vector
     /// of a segment that stores them inline). Scores are the posting
     /// probe's: cosine similarity, which on the sidecar's raw vectors is
@@ -8802,43 +8953,8 @@ impl SegmentReader {
                 source: ExactKnnSource::Sidecar,
             }));
         }
-        if self.footer.doc_vectors && self.segment_dir.join(DOC_VECTORS_FILE).exists() {
-            match self.doc_vectors() {
-                Ok(dv) if dv.has_field(field) => {
-                    let mut scored: Vec<(u32, f64)> = Vec::with_capacity(candidates.len());
-                    let visited = dv.visit_field_vectors(field, candidates, |doc_seq, v| {
-                        // A stray vector of another dimension was never
-                        // indexed (see `SegmentWriter::unindexed_vectors`),
-                        // so it is not a candidate on the probe path either.
-                        if v.len() == query.len() {
-                            scored.push((
-                                doc_seq,
-                                kosha_vector_spfresh::cosine_similarity(query, v) as f64,
-                            ));
-                        }
-                    });
-                    match visited {
-                        Ok(_) => {
-                            let vectors_scored = scored.len();
-                            return Some(Ok(ExactKnnResult {
-                                hits: top_k_by_score(scored, k),
-                                vectors_scored,
-                                postings_hydrated: 0,
-                                source: ExactKnnSource::Sidecar,
-                            }));
-                        }
-                        Err(e) => eprintln!(
-                            "WARN: exact kNN could not read {DOC_VECTORS_FILE} of {}: {e} — scoring from vector postings instead",
-                            self.segment_dir.display()
-                        ),
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => eprintln!(
-                    "WARN: exact kNN could not open {DOC_VECTORS_FILE} of {}: {e} — scoring from vector postings instead",
-                    self.segment_dir.display()
-                ),
-            }
+        if let Some(result) = self.knn_exact_from_sidecar(field, query, k, candidates, fetch) {
+            return Some(Ok(result));
         }
         // No usable sidecar: every posting, filtered while it is scored.
         self.prefetch_vector_postings(vi, 0..vi.ranges.len(), fetch);
@@ -8873,6 +8989,120 @@ impl SegmentReader {
             postings_hydrated: vi.ranges.len(),
             source: ExactKnnSource::Postings,
         }))
+    }
+
+    /// [`Self::knn_exact_filtered_fetching`]'s sidecar path: every
+    /// candidate's `field` vector from `doc_vectors.bin`, scored exactly.
+    ///
+    /// Read from the whole local file when it is there, otherwise — header
+    /// local (whole file or cached header span) — from the candidates'
+    /// ranges in the span cache, fetching the missing ones through `fetch`
+    /// first. Both read the same bytes and score them with the same
+    /// function in the same order, so the hits are identical either way: a
+    /// query node need not hold the whole file (as large as the f32 vector
+    /// index) to answer exactly.
+    ///
+    /// `None` sends the caller to the postings: the segment stores vectors
+    /// inline, the sidecar holds no `field`, its header is not local, or a
+    /// read failed (logged).
+    fn knn_exact_from_sidecar(
+        &self,
+        field: &str,
+        query: &[f32],
+        k: usize,
+        candidates: &[u32],
+        fetch: Option<VectorSpanFetch<'_>>,
+    ) -> Option<ExactKnnResult> {
+        if !self.footer.doc_vectors {
+            return None;
+        }
+        let whole = self.segment_dir.join(DOC_VECTORS_FILE).exists();
+        let dv = if whole {
+            match self.doc_vectors() {
+                Ok(dv) => dv,
+                Err(e) => {
+                    eprintln!(
+                        "WARN: exact kNN could not open {DOC_VECTORS_FILE} of {}: {e} — scoring from vector postings instead",
+                        self.segment_dir.display()
+                    );
+                    return None;
+                }
+            }
+        } else {
+            match self.local_doc_vectors() {
+                Some(dv) => dv,
+                None => {
+                    // Rare: the scoring hydration fetches the header for a
+                    // filtered kNN (best-effort), so this is a shed or
+                    // failed fetch, or a caller without hydration.
+                    eprintln!(
+                        "WARN: exact kNN on '{field}' in {}: {DOC_VECTORS_FILE} header not local \
+                         (not hydrated, or its fetch failed) — scoring all {} vector postings \
+                         instead of {} candidate vectors",
+                        self.segment_dir.display(),
+                        self.vector_field(field)
+                            .ok()
+                            .flatten()
+                            .and_then(|index| index.lazy.as_ref().map(|vi| vi.ranges.len()))
+                            .unwrap_or(0),
+                        candidates.len()
+                    );
+                    return None;
+                }
+            }
+        };
+        if !dv.has_field(field) {
+            return None;
+        }
+        let mut scored: Vec<(u32, f64)> = Vec::with_capacity(candidates.len());
+        // A stray vector of another dimension was never indexed (see
+        // `SegmentWriter::unindexed_vectors`), so it is not a candidate on
+        // the probe path either.
+        let score = |doc_seq: u32, v: &[f32]| {
+            if v.len() == query.len() {
+                scored.push((
+                    doc_seq,
+                    kosha_vector_spfresh::cosine_similarity(query, v) as f64,
+                ));
+            }
+        };
+        let visited = if whole {
+            dv.visit_field_vectors(field, candidates, score)
+        } else {
+            let ranges = dv.field_vector_ranges(field, candidates);
+            let mut spans = span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE);
+            if let Some(fetch) = fetch {
+                let missing: Vec<(u64, u64)> = ranges
+                    .iter()
+                    .copied()
+                    .filter(|&(start, end)| !spans.covers(start, end))
+                    .collect();
+                if !missing.is_empty() {
+                    fetch(&self.segment_dir, DOC_VECTORS_FILE, &missing);
+                    spans = span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE);
+                }
+            }
+            dv.visit_field_vectors_cached(&spans, field, candidates, score)
+        };
+        match visited {
+            Ok(_) => {
+                let vectors_scored = scored.len();
+                Some(ExactKnnResult {
+                    hits: top_k_by_score(scored, k),
+                    vectors_scored,
+                    postings_hydrated: 0,
+                    source: ExactKnnSource::Sidecar,
+                })
+            }
+            Err(e) => {
+                eprintln!(
+                    "WARN: exact kNN could not read {DOC_VECTORS_FILE} of {} ({}): {e} — scoring from vector postings instead",
+                    self.segment_dir.display(),
+                    if whole { "whole file" } else { "cached ranges" },
+                );
+                None
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9496,15 +9726,56 @@ impl SegmentReader {
     /// disk for `Lazy` segments — use only for documents actually being
     /// materialized into a response, not during scoring.
     pub fn doc_record_full(&self, doc_seq: u32) -> Result<Option<DocRecord>, KoshaError> {
-        let mut record = self.doc_record_stored(doc_seq)?;
-        if let Some(record) = record.as_mut() {
-            self.fill_doc_vectors(record)?;
+        self.page_doc_record(doc_seq, true, &mut PageSpans::default())
+    }
+
+    /// [`Self::doc_record_full`] for one document of a result page:
+    /// span-cache listings are kept in `spans` across the page's documents
+    /// of this segment (one listing per file per page, not per document),
+    /// and with `vectors` false the sidecar vectors are not read at all —
+    /// their `Vector` fields stay empty placeholders, for a page whose
+    /// `_source` returns none of them (see [`Self::page_reads_doc_vectors`]).
+    pub fn page_doc_record(
+        &self,
+        doc_seq: u32,
+        vectors: bool,
+        spans: &mut PageSpans,
+    ) -> Result<Option<DocRecord>, KoshaError> {
+        let mut record = self.doc_record_stored_reusing(doc_seq, &mut spans.doc_store)?;
+        if let Some(record) = record.as_mut().filter(|_| vectors) {
+            for (index, vector) in self.sidecar_vectors_reusing(record, &mut spans.doc_vectors)? {
+                record.fields[index].value = serde_json::to_string(&vector)?;
+            }
         }
         Ok(record)
     }
 
+    /// Whether a result page returning the fields `returns` keeps needs this
+    /// segment's sidecar vectors: some `Vector` field it stores in
+    /// `doc_vectors.bin` is returned. Only single-vector fields go there,
+    /// each with a column in the footer (a bag stays inline), so the
+    /// footer's column names cover the sidecar's; a legacy footer that
+    /// lists none cannot say, so it reads them. `false` without a sidecar.
+    pub fn page_reads_doc_vectors(&self, returns: impl Fn(&str) -> bool) -> bool {
+        self.footer.doc_vectors
+            && self
+                .footer
+                .vector_fields
+                .as_ref()
+                .is_none_or(|cols| cols.iter().any(|c| returns(&c.name)))
+    }
+
     /// The record as stored in `doc_store.bin`, vector placeholders and all.
     fn doc_record_stored(&self, doc_seq: u32) -> Result<Option<DocRecord>, KoshaError> {
+        self.doc_record_stored_reusing(doc_seq, &mut None)
+    }
+
+    /// [`Self::doc_record_stored`] keeping the span listing in `spans`.
+    fn doc_record_stored_reusing(
+        &self,
+        doc_seq: u32,
+        spans: &mut Option<span_cache::SpanIndex>,
+    ) -> Result<Option<DocRecord>, KoshaError> {
         match &self.doc_store {
             DocStoreAccess::Eager(records) => Ok(records.get(doc_seq as usize).cloned()),
             DocStoreAccess::Lazy {
@@ -9518,12 +9789,13 @@ impl SegmentReader {
                 // The whole file when it is complete, else the sparse span
                 // cache (#245). Neither → the plain read below, which fails
                 // with the same IO error as before spans existed.
-                let buf = match span_cache::read_local_range(
+                let buf = match span_cache::read_local_range_reusing(
                     &self.segment_dir,
                     DOC_STORE_FILE,
                     index.complete_len(),
                     entry.offset,
                     entry.length as u64,
+                    spans,
                 ) {
                     Some(buf) => buf,
                     None => {
@@ -9595,24 +9867,34 @@ impl SegmentReader {
     /// bytes. Out-of-range `doc_seq`s are "local" (there is nothing to
     /// fetch; `doc_record_full` returns `None`).
     pub fn doc_is_local(&self, doc_seq: u32) -> bool {
-        if self.has_local_doc_store() {
-            return true;
-        }
+        self.page_doc_is_local(doc_seq, true, &mut PageSpans::default())
+    }
+
+    /// [`Self::doc_is_local`] for one document of a result page, keeping
+    /// span listings in `spans` across the page's documents of this
+    /// segment. With `vectors` false (the page returns no sidecar field,
+    /// see [`Self::page_reads_doc_vectors`]) only the record must be local.
+    pub fn page_doc_is_local(&self, doc_seq: u32, vectors: bool, spans: &mut PageSpans) -> bool {
+        let vectors = vectors && self.footer.doc_vectors;
         let DocStoreAccess::Lazy { index, .. } = &self.doc_store else {
-            // Eager record, but a sidecar whose file is absent.
-            return false;
+            // Eager record: local; its vectors only with the whole sidecar.
+            return !vectors || self.has_local_doc_store();
         };
         let Some(entry) = index.entries.get(doc_seq as usize) else {
             return true;
         };
         let record_local =
             file_is_complete(&self.segment_dir.join(DOC_STORE_FILE), index.complete_len())
-                || span_cache::SpanIndex::load(&self.segment_dir, DOC_STORE_FILE)
+                || spans
+                    .doc_store
+                    .get_or_insert_with(|| {
+                        span_cache::SpanIndex::load(&self.segment_dir, DOC_STORE_FILE)
+                    })
                     .covers(entry.offset, entry.offset + entry.length as u64);
         if !record_local {
             return false;
         }
-        if !self.footer.doc_vectors {
+        if !vectors {
             return true;
         }
         let Some(dv) = self.local_doc_vectors() else {
@@ -9622,7 +9904,11 @@ impl SegmentReader {
             None => true,
             Some((start, end)) => {
                 file_is_complete(&self.segment_dir.join(DOC_VECTORS_FILE), dv.file_len())
-                    || span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE)
+                    || spans
+                        .doc_vectors
+                        .get_or_insert_with(|| {
+                            span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE)
+                        })
                         .covers(start, end)
             }
         }

@@ -40,6 +40,11 @@ pub struct PageSegment<'a> {
     /// The page's documents in this segment that still need bytes, in page
     /// order, deduplicated.
     pub doc_seqs: Vec<u32>,
+    /// Whether the page returns any of this segment's sidecar vector
+    /// fields ([`SegmentReader::page_reads_doc_vectors`]). `false` (e.g.
+    /// `_source.excludes` names the embedding): only the records' bytes are
+    /// needed, not `doc_vectors.bin`'s header or vector spans.
+    pub vectors: bool,
 }
 
 /// Optional callback the searcher invokes, after ranking and before field
@@ -7526,48 +7531,76 @@ impl Searcher {
                 phase_stats.page_segments.push(dir.to_path_buf());
             }
         }
+        // Per page segment: whether the page returns its sidecar vectors,
+        // and its span listings, taken once per segment rather than per
+        // document (see `kosha_segment::PageSpans`).
+        let mut page_readers: Vec<(&Arc<TrackedSegment>, bool, kosha_segment::PageSpans)> =
+            Vec::new();
+        let mut page_idx: Vec<usize> = Vec::with_capacity(to.saturating_sub(from));
+        for cand in &candidates[from..to] {
+            let reader = &cand.reader;
+            let i = match page_readers
+                .iter()
+                .position(|(r, _, _)| Arc::ptr_eq(r, reader))
+            {
+                Some(i) => i,
+                None => {
+                    let vectors = reader.page_reads_doc_vectors(|f| query.returns_field(f));
+                    page_readers.push((reader, vectors, Default::default()));
+                    page_readers.len() - 1
+                }
+            };
+            page_idx.push(i);
+        }
         if let Some(ensure_doc_store) = doc_store_hydrator {
-            let mut page_segs: Vec<(&Arc<TrackedSegment>, Vec<u32>)> = Vec::new();
-            for cand in &candidates[from..to] {
-                if cand.reader.doc_is_local(cand.doc_seq) {
+            let mut page_segs: Vec<(usize, Vec<u32>)> = Vec::new();
+            for (cand, &i) in candidates[from..to].iter().zip(&page_idx) {
+                let (reader, vectors, spans) = &mut page_readers[i];
+                if reader.page_doc_is_local(cand.doc_seq, *vectors, spans) {
                     continue;
                 }
-                match page_segs
-                    .iter_mut()
-                    .find(|(reader, _)| Arc::ptr_eq(reader, &cand.reader))
-                {
+                match page_segs.iter_mut().find(|(seg, _)| *seg == i) {
                     Some((_, seqs)) => {
                         if !seqs.contains(&cand.doc_seq) {
                             seqs.push(cand.doc_seq);
                         }
                     }
-                    None => page_segs.push((&cand.reader, vec![cand.doc_seq])),
+                    None => page_segs.push((i, vec![cand.doc_seq])),
                 }
             }
             if !page_segs.is_empty() {
                 let request: Vec<PageSegment<'_>> = page_segs
                     .into_iter()
-                    .map(|(reader, doc_seqs)| PageSegment {
-                        segment_dir: reader.segment_dir(),
-                        reader,
-                        doc_seqs,
+                    .map(|(i, doc_seqs)| {
+                        let (reader, vectors, _) = &page_readers[i];
+                        PageSegment {
+                            segment_dir: reader.segment_dir(),
+                            reader,
+                            doc_seqs,
+                            vectors: *vectors,
+                        }
                     })
                     .collect();
                 ensure_doc_store(&request);
             }
+        }
+        // Fresh listings for the reads: the hydrator just added spans.
+        for (_, _, spans) in &mut page_readers {
+            *spans = Default::default();
         }
 
         // Materialize fields / highlights only for the returned page — the
         // only place a `Lazy` segment's full field content is ever read
         // from disk (one seek+read per document, not the whole segment).
         // Every page document is now local — whole file or cached span —
-        // so `doc_record_full` needs no further S3 round trip.
+        // so reading it needs no further S3 round trip.
         let mut page = Vec::with_capacity(to - from);
-        for cand in &candidates[from..to] {
+        for (cand, &i) in candidates[from..to].iter().zip(&page_idx) {
+            let (reader, vectors, spans) = &mut page_readers[i];
             // A hit's `doc_seq` came from this segment's own postings or
             // vectors, so a record that is not there is a damaged segment,
             // not a hit to leave off the page.
-            let Some(doc_rec) = cand.reader.doc_record_full(cand.doc_seq)? else {
+            let Some(doc_rec) = reader.page_doc_record(cand.doc_seq, *vectors, spans)? else {
                 return Err(KoshaError::CorruptSegment(format!(
                     "{}: hit doc_seq {} has no stored record",
                     cand.reader.segment_dir().display(),
