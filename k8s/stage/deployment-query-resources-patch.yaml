@@ -117,6 +117,12 @@ spec:
             # evicted, 22 replacements rejected).
             - name: KOSHA_WARMUP_BUDGET_BYTES
               value: "12G"
+            # Let in-flight searches finish when a pod is removed: a cold
+            # search can take 30-40 s, and the 25 s default cut them off
+            # ("connection(s) still open after the 25s shutdown grace").
+            # terminationGracePeriodSeconds below must stay above it.
+            - name: KOSHA_HTTP_SHUTDOWN_GRACE_SECS
+              value: "60"
             # Decoded vector postings kept per segment: 2 GiB (default 32 MiB).
             # A compacted segment's postings decode to up to 1.7 GB, and a
             # semantic query examines hundreds of them, so with the default
@@ -145,6 +151,7 @@ spec:
       # The image runs as uid 10001 and a new EBS volume's root belongs to
       # root, so the volume is handed to that group (an emptyDir is
       # world-writable, which hid this).
+      terminationGracePeriodSeconds: 75
       securityContext:
         fsGroup: 10001
         fsGroupChangePolicy: OnRootMismatch
