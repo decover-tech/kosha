@@ -11857,7 +11857,7 @@ fn log_search_timing(
         "search timing: ns={} total_ms={:.1} wall_ms={:.1} hydrate_ms={:.1} hydrate_files={} \
          hydrate_mb={:.1} queue_ms={:.1} admit_ms={:.1} bm25_stats={} bm25_stats_ms={:.2} \
          score_ms={:.1} materialize_ms={:.1} opens_cold={} opens_cached={} \
-         open_total_ms={:.1} knn_postings={} knn_segments={} knn_centroids={} knn_plan_ms={:.1} knn_plan_exact_centroids={} knn_plan_prep_ms={:.2} knn_plan_s1_ms={:.2} knn_plan_sel_ms={:.2} knn_plan_s2_ms={:.2} knn_plan_rank_ms={:.2} knn_mode={} knn_exact_vectors={} \
+         open_total_ms={:.1} knn_postings={} knn_segments={} knn_centroids={} knn_plan_ms={:.1} knn_plan_exact_centroids={} knn_mode={} knn_exact_vectors={} \
          knn_filtered={} knn_degraded={} hits={} page_gets={} \
          page_ranged_kb={:.1} page_whole_files={} page_whole_mb={:.1} s3_rounds={} \
          s3_bytes={} postings_gets={} postings_ranged_kb={:.1} postings_whole_files={} \
@@ -11883,11 +11883,6 @@ fn log_search_timing(
         phases.knn_centroids_scanned,
         phases.knn_plan_ms,
         phases.knn_plan_exact_centroids,
-        phases.knn_plan_split_ms[0],
-        phases.knn_plan_split_ms[1],
-        phases.knn_plan_split_ms[2],
-        phases.knn_plan_split_ms[3],
-        phases.knn_plan_split_ms[4],
         phases.knn_mode.map_or("-", |mode| mode.as_str()),
         phases.knn_exact_vectors,
         phases

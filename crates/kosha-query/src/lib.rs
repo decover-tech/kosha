@@ -3182,8 +3182,6 @@ struct KnnPlan {
     cutoff_rule: Option<KnnCutoffRule>,
     /// See [`SearchPhaseStats::knn_plan_exact_centroids`].
     exact_centroids: usize,
-    /// Bench diagnostics: see `SearchPhaseStats::knn_plan_split_ms`.
-    split: [f64; 5],
 }
 
 /// One probed segment as kNN planning sees it: the scores of its
@@ -3248,9 +3246,6 @@ struct KnnRankedPostings {
     rankings: Vec<kosha_segment::KnnSegmentRanking>,
     /// Postings that were given an exact score.
     exact_centroids: usize,
-    /// Bench diagnostics: ms in stage 1, selecting U, stage 2, and the
-    /// cutoff plus rankings.
-    split: [f64; 4],
 }
 
 /// Picks the global probe cutoff over `sources`' postings and ranks each
@@ -3332,7 +3327,6 @@ fn knn_rank_postings<S: KnnPlanSource>(
         rule,
         rankings,
         exact_centroids: total,
-        split: [0.0; 4],
     }
 }
 
@@ -3349,7 +3343,6 @@ fn knn_rank_postings_two_stage<S: KnnPlanSource>(
         Exact(Vec<f32>),
         Bounds(kosha_segment::KnnCentroidScoreBounds),
     }
-    let t_s1 = Instant::now();
     let stage1: Vec<Stage1> = sources
         .par_iter()
         .map(|source| {
@@ -3364,8 +3357,6 @@ fn knn_rank_postings_two_stage<S: KnnPlanSource>(
         })
         .collect();
 
-    let s1_ms = t_s1.elapsed().as_secs_f64() * 1e3;
-    let t_sel = Instant::now();
     // U: the `budget`-th smallest upper bound.
     let mut upper: Vec<f32> = Vec::with_capacity(total);
     for stage in &stage1 {
@@ -3388,8 +3379,6 @@ fn knn_rank_postings_two_stage<S: KnnPlanSource>(
         })
         .1;
     drop(upper);
-    let sel_ms = t_sel.elapsed().as_secs_f64() * 1e3;
-    let t_s2 = Instant::now();
 
     // Stage two: exact scores for the candidates only.
     enum Stage2 {
@@ -3428,8 +3417,6 @@ fn knn_rank_postings_two_stage<S: KnnPlanSource>(
         })
         .collect();
 
-    let s2_ms = t_s2.elapsed().as_secs_f64() * 1e3;
-    let t_rank = Instant::now();
     let mut all: Vec<f32> = Vec::new();
     let mut exact_centroids = 0usize;
     for stage in &stage2 {
@@ -3465,7 +3452,6 @@ fn knn_rank_postings_two_stage<S: KnnPlanSource>(
         cutoff,
         rule,
         rankings,
-        split: [s1_ms, sel_ms, s2_ms, t_rank.elapsed().as_secs_f64() * 1e3],
         exact_centroids,
     })
 }
@@ -3565,9 +3551,6 @@ pub struct SearchPhaseStats {
     /// is every centroid of the segments the budget is shared between.
     /// Zero for non-kNN queries and on the per-segment fallback.
     pub knn_plan_exact_centroids: usize,
-    /// Bench diagnostics: ms of the plan spent before ranking (segment
-    /// opens, counts), in stage 1, selecting U, stage 2, cutoff + rankings.
-    pub knn_plan_split_ms: [f64; 5],
     /// Segment directories holding at least one document of the returned
     /// page, deduplicated, in page order: the segments whose doc store this
     /// search read. The server's access tracker (#213) counts these as
@@ -4529,7 +4512,6 @@ impl Searcher {
         permit: &AdmissionPermit,
         open_stats: &OpenStatsCollector,
     ) -> Result<KnnPlan, KoshaError> {
-        let t_plan0 = Instant::now();
         let budgeted = knn_global_budget_enabled();
         let requested = knn.num_candidates.max(1);
         let prunable = query.has_prunable_filter();
@@ -4729,7 +4711,6 @@ impl Searcher {
             filtered_candidates,
             cutoff_rule: None,
             exact_centroids: 0,
-            split: [0.0; 5],
         };
 
         if !budgeted {
@@ -4790,15 +4771,7 @@ impl Searcher {
         };
         // Score the centroids, pick the cutoff and rank every probed
         // segment's postings inside it: see `knn_rank_postings`.
-        let prep_ms = t_plan0.elapsed().as_secs_f64() * 1e3;
         let ranked = knn_rank_postings(&sources, budget, relative, self.knn_plan_i8);
-        plan.split = [
-            prep_ms,
-            ranked.split[0],
-            ranked.split[1],
-            ranked.split[2],
-            ranked.split[3],
-        ];
         plan.cutoff = Some((ranked.cutoff, budget));
         plan.cutoff_rule = ranked.rule;
         plan.exact_centroids = ranked.exact_centroids;
@@ -7565,7 +7538,6 @@ impl Searcher {
         phase_stats.knn_filtered_candidates = knn_plan.filtered_candidates;
         phase_stats.knn_cutoff_rule = knn_plan.cutoff_rule;
         phase_stats.knn_plan_exact_centroids = knn_plan.exact_centroids;
-        phase_stats.knn_plan_split_ms = knn_plan.split;
 
         // ── global bound-driven rescoring (#381) ───────────────────────
         // Off by default. Unfiltered single-vector kNN only: a filtered
