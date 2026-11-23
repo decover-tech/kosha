@@ -188,10 +188,19 @@ func (n *Namespace) BulkIndexSeq(ctx context.Context, docs iter.Seq[Document], o
 		}
 		size := len(raw) + 1
 		if old, dup := cur.sizes[doc.Id]; dup {
-			cur.docs[doc.Id] = doc
-			cur.sizes[doc.Id] = size
-			cur.bytes += size - old
-			continue
+			if envelopeBytes+cur.bytes-old+size <= maxBytes {
+				cur.docs[doc.Id] = doc
+				cur.sizes[doc.Id] = size
+				cur.bytes += size - old
+				continue
+			}
+			// The larger body no longer fits: drop the earlier occurrence
+			// (never sent, and the later one wins) and place this one like
+			// a new id, so the batch never grows past maxBytes.
+			cur.order = slices.DeleteFunc(cur.order, func(id string) bool { return id == doc.Id })
+			delete(cur.docs, doc.Id)
+			delete(cur.sizes, doc.Id)
+			cur.bytes -= old
 		}
 		if len(cur.order) > 0 && (len(cur.order) >= maxDocs || envelopeBytes+cur.bytes+size > maxBytes) {
 			dispatch()

@@ -232,6 +232,29 @@ func TestBulkByteCap(t *testing.T) {
 	}
 }
 
+// A repeated id whose new body no longer fits must not grow the batch past
+// the cap: the earlier occurrence is dropped and the new one starts a batch.
+func TestBulkByteCapWithGrowingDuplicate(t *testing.T) {
+	f := newFake(t, indexedHandler)
+	one := len(mustJSON(mkDoc(1, ""))) + 1
+	docs := []Document{mkDoc(1, ""), mkDoc(2, ""), mkDoc(1, "grown")}
+	res, err := testClient(t, f.URL).Namespace("n").BulkIndex(context.Background(), docs, BulkOptions{MaxBytesPerBatch: 2*one + 15, Concurrency: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got [][]string
+	for _, r := range f.requests() {
+		got = append(got, batchIDs(r))
+	}
+	if res.Batches != 2 || fmt.Sprint(got) != "[[d0002] [d0001]]" {
+		t.Fatalf("batches %v", got)
+	}
+	last := f.requests()[1].Body["documents"].([]any)[0].(map[string]any)
+	if n := len(last["fields"].([]any)); n != 2 {
+		t.Fatalf("the later occurrence must win, got %d fields", n)
+	}
+}
+
 func TestBulkFailureStopsAndReports(t *testing.T) {
 	f := newFake(t, func(n int, r recorded, w http.ResponseWriter) {
 		if slices.Contains(batchIDs(r), "d0005") {

@@ -14,9 +14,16 @@ name: release-clients
 # AWS OIDC role and EKS deploys must stay one edit away from nothing an SDK
 # tag can reach (a `clients/...` tag does not match `v*`).
 #
-# Credentials: none stored. npm uses trusted publishing (OIDC, `id-token:
-# write`; configure the trusted publisher for decover-tech/kosha +
-# release-clients.yml on npmjs.com first), PyPI uses trusted publishing too
+# Credentials: none stored in steady state. npm uses trusted publishing
+# (OIDC, `id-token: write`; configure the trusted publisher for
+# decover-tech/kosha + release-clients.yml + environment `npm` on
+# npmjs.com). npm only lets a trusted publisher be configured on a package
+# that already exists, so the FIRST publish of @decover/kosha (0.1.0) runs
+# on a short-lived granular token instead (ADR-351 open question 5): store
+# it as the `NPM_TOKEN` secret of the `npm` environment, push the tag,
+# configure the trusted publisher, then revoke the token and delete the
+# secret. With the secret absent the step runs on OIDC alone. See
+# clients/typescript/README.md "Releasing". PyPI uses trusted publishing too
 # (configure the publisher for decover-tech/kosha + release-clients.yml +
 # environment `pypi` on pypi.org first), and the Go module needs no
 # credentials at all. The GitHub release uses the job's own GITHUB_TOKEN.
@@ -92,6 +99,10 @@ jobs:
       - name: Publish
         env:
           EVENT: ${{ github.event_name }}
+          # First publish only (see the header): the npm CLI tries trusted
+          # publishing first and falls back to this token. Empty once the
+          # secret is deleted. GitHub masks it in logs; nothing echoes it.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           case "$VERSION" in *-*) dist_tag=next ;; *) dist_tag=latest ;; esac
           if [ "$EVENT" = push ]; then

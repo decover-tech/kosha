@@ -123,6 +123,18 @@ describe("bulkIndex", () => {
     ]);
   });
 
+  it("never grows a batch past the byte cap when a repeated id gets larger", async () => {
+    server = await fakeServer((req, res) => json(res, 200, { indexed_count: req.body.documents.length }));
+    const ns = new Kosha({ baseUrl: server.url, apiKey: "k" }).namespace("n");
+    const one = new TextEncoder().encode(JSON.stringify(doc(1))).length + 1;
+    const cap = one * 2 + 15;
+    const out = await ns.bulkIndex([doc(1), doc(2), doc(1, "grown")], { maxBytesPerBatch: cap, concurrency: 1 });
+    expect(out.batches).toBe(2);
+    expect(server.requests.map((r) => r.body.documents.map((d: Document) => d.id))).toEqual([["d0002"], ["d0001"]]);
+    expect(server.requests[1]!.body.documents[0].fields).toHaveLength(2);
+    for (const r of server.requests) expect(new TextEncoder().encode(JSON.stringify(r.body)).length).toBeLessThanOrEqual(cap);
+  });
+
   it("reports the failed batch's ids and stops by default", async () => {
     server = await fakeServer((req, res) => {
       if (req.body.documents.some((d: Document) => d.id === "d0005")) return json(res, 400, errorBody("invalid_argument", false));

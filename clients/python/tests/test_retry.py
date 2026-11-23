@@ -239,3 +239,20 @@ def test_parse_retry_after():
     assert parse_retry_after("Wed, 21 Oct 2026 07:28:03 GMT", now) == 3000
     assert parse_retry_after("soon") is None
     assert parse_retry_after(None) is None
+
+
+def test_client_constructor_accepts_every_documented_retry_setting():
+    """RETRY.md's Defaults table names these as the Python settings."""
+    from kosha_client import KoshaClient
+
+    c = KoshaClient(
+        "http://kosha.invalid",
+        api_key="k",
+        max_retries=5,
+        base_delay_ms=1,
+        max_delay_ms=2,
+        max_retry_after_ms=5,
+        total_budget_ms=10,
+    )
+    t = c._transport
+    assert (t.max_retries, t.base_delay_ms, t.max_delay_ms, t.max_retry_after_ms, t.total_budget_ms) == (5, 1, 2, 5, 10)

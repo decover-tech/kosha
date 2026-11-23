@@ -188,9 +188,16 @@ def bulk_index(
             doc_id = doc["id"]
             size = len(encode_json(doc)) + 1  # the bytes sent, plus its comma
             if doc_id in current:
-                current_bytes += size - current[doc_id][1]
-                current[doc_id] = (doc, size)
-                continue
+                old = current[doc_id][1]
+                if ENVELOPE_BYTES + current_bytes - old + size <= max_bytes_per_batch:
+                    current_bytes += size - old
+                    current[doc_id] = (doc, size)
+                    continue
+                # The larger body no longer fits: drop the earlier occurrence
+                # (never sent, and the later one wins) and place this one like
+                # a new id, so the batch never grows past the cap.
+                del current[doc_id]
+                current_bytes -= old
             if current and (len(current) >= max_docs_per_batch or ENVELOPE_BYTES + current_bytes + size > max_bytes_per_batch):
                 dispatch()
             # A later write to an id still in flight waits for it, so the

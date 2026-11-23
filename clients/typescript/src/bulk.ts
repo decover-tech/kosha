@@ -102,7 +102,14 @@ export async function bulkIndex(
     if (stopped) break;
     const bytes = encoder.encode(JSON.stringify(doc)).length + 1;
     const existing = current.get(doc.id);
-    if (existing === undefined) {
+    if (existing !== undefined && ENVELOPE_BYTES + currentBytes - existing.bytes + bytes > maxBytesPerBatch) {
+      // The larger body no longer fits: drop the earlier occurrence (never
+      // sent, and the later one wins) and place this one like a new id, so
+      // the batch never grows past maxBytesPerBatch.
+      current.delete(doc.id);
+      currentBytes -= existing.bytes;
+    }
+    if (!current.has(doc.id)) {
       if (current.size > 0 && (current.size >= maxDocsPerBatch || ENVELOPE_BYTES + currentBytes + bytes > maxBytesPerBatch)) {
         await dispatch();
       }
@@ -117,8 +124,9 @@ export async function bulkIndex(
       current.set(doc.id, { doc, bytes });
       currentBytes += bytes;
     } else {
+      const prev = current.get(doc.id)!;
       current.set(doc.id, { doc, bytes });
-      currentBytes += bytes - existing.bytes;
+      currentBytes += bytes - prev.bytes;
     }
   }
   if (!stopped && current.size > 0) await dispatch();

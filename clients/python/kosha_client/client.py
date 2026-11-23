@@ -15,7 +15,15 @@ from typing import Any, Iterable, Iterator, Sequence
 
 from . import native
 from .compat import Transport as CompatTransport
-from .transport import KoshaRequestError, Transport, json_default
+from .transport import (
+    DEFAULT_BASE_DELAY_MS,
+    DEFAULT_MAX_DELAY_MS,
+    DEFAULT_MAX_RETRY_AFTER_MS,
+    DEFAULT_TOTAL_BUDGET_MS,
+    KoshaRequestError,
+    Transport,
+    json_default,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +90,10 @@ class KoshaClient:
         pool_maxsize: int = 20,
         consistency: str | None = None,
         retry_non_idempotent: bool = False,
+        base_delay_ms: float = DEFAULT_BASE_DELAY_MS,
+        max_delay_ms: float = DEFAULT_MAX_DELAY_MS,
+        max_retry_after_ms: float = DEFAULT_MAX_RETRY_AFTER_MS,
+        total_budget_ms: float = DEFAULT_TOTAL_BUDGET_MS,
         **kwargs: Any,
     ) -> None:
         # Retries (clients/conformance/RETRY.md): ``max_retries`` counts
@@ -90,6 +102,10 @@ class KoshaClient:
         # was sent is retried only for idempotent operations, unless
         # ``retry_non_idempotent``. ``retry_on_timeout=False`` stops every
         # transport-error retry (timeouts, resets, refused connections, DNS).
+        # ``base_delay_ms``/``max_delay_ms`` shape the full-jitter backoff;
+        # a server delay over ``max_retry_after_ms`` is reported, not slept
+        # through; no sleep may end past ``total_budget_ms`` after the first
+        # attempt.
         # Normalise the Kosha base URL.  Resolution order:
         #   1. ``hosts`` arg (opensearchpy-compatible)
         #   2. ``KOSHA_HOST`` env var (customer-friendly)
@@ -132,6 +148,10 @@ class KoshaClient:
             max_retries=max_retries,
             retry_on_timeout=retry_on_timeout,
             retry_non_idempotent=retry_non_idempotent,
+            base_delay_ms=base_delay_ms,
+            max_delay_ms=max_delay_ms,
+            max_retry_after_ms=max_retry_after_ms,
+            total_budget_ms=total_budget_ms,
         )
 
         # Read-your-writes (#255): ``"strong"`` searches also scan writes the

@@ -127,3 +127,30 @@ npm run typecheck && npm test && npm run build
 
 The shared conformance suite (`../conformance`) runs with
 `npm run test:conformance` against a live server; see its README.
+
+## Releasing
+
+Pushing a `clients/typescript/vX.Y.Z` tag runs `.github/workflows/release-clients.yml`,
+which publishes `@decover/kosha@X.Y.Z` with provenance. Steady state uses
+npm trusted publishing (OIDC), so no token is stored.
+
+The first publish needs one manual pass, because npm lets a trusted
+publisher be configured only on a package that already exists
+(ADR-351 open question 5):
+
+1. Secure the `@decover` scope on npmjs.com (organization owned by the
+   maintainers, 2FA required).
+2. Create a granular access token that can publish `@decover/kosha` only,
+   with a short expiry, and store it as the `NPM_TOKEN` secret of the
+   `npm` environment in the GitHub repository.
+3. Push the `clients/typescript/v0.1.0` tag. The job falls back to the token.
+4. On npmjs.com, add the trusted publisher: repository `decover-tech/kosha`,
+   workflow `release-clients.yml`, environment `npm`.
+5. Revoke the token and delete the `NPM_TOKEN` secret. Later tags publish on
+   OIDC alone.
+
+Remaining work: steps 1-5 are done by a maintainer outside the repository
+and have not been done yet. Whether npm still requires the package to exist
+before a trusted publisher can be added has not been re-checked; if it no
+longer does, skip steps 2, 3 and 5 and configure the publisher before the
+first tag.

@@ -146,6 +146,15 @@ def test_bulk_index_splits_on_the_byte_cap():
     assert [[i for i, _ in b] for b in t.batches] == [["d0001", "d0002"], ["big"], ["d0003"]]
 
 
+def test_bulk_index_byte_cap_holds_when_a_repeated_id_grows():
+    """A later, larger write to an id already in the batch starts a new batch."""
+    t = IndexTransport()
+    one = len(json.dumps(doc(1), separators=(",", ":")).encode()) + 1
+    out = client_with(t).bulk_index("n", [doc(1), doc(2), doc(1, tag="grown")], max_bytes_per_batch=2 * one + 15, concurrency=1)
+    assert out["batches"] == 2
+    assert [[i for i, _ in b] for b in t.batches] == [["d0002"], ["d0001"]]
+
+
 def test_bulk_index_caps_the_bytes_actually_sent():
     """The cap bounds the HTTP body, non-ASCII text and envelope included."""
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer

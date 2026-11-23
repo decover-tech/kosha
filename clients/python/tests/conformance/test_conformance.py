@@ -271,9 +271,9 @@ def make_client(api_key: str, tag: str, settings: dict | None = None) -> KoshaCl
         kw["max_retries"] = settings["max_attempts"]
     if "retry_non_idempotent" in settings:
         kw["retry_non_idempotent"] = settings["retry_non_idempotent"]
-    c = KoshaClient(URL, **kw)
     if "total_budget_ms" in settings:
-        c._transport.total_budget_ms = settings["total_budget_ms"]
+        kw["total_budget_ms"] = settings["total_budget_ms"]
+    c = KoshaClient(URL, **kw)
     c._transport.headers["X-Conformance-Case"] = tag
     return c
 
