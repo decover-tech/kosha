@@ -5,6 +5,17 @@
         "description": "`NullValue` is a singleton enumeration to represent the null value for the\n`Value` type union.\n\nThe JSON representation for `NullValue` is JSON `null`.",
         "type": "string"
       },
+      "protobufStruct": {
+        "description": "`Struct` represents a structured data value, consisting of fields\nwhich map to dynamically typed values. In some languages, `Struct`\nmight be supported by a native representation. For example, in\nscripting languages like JS a struct is represented as an\nobject. The details of that representation are described together\nwith the proto support for the language.\n\nThe JSON representation for `Struct` is JSON object.",
+        "properties": {
+          "fields": {
+            "additionalProperties": {},
+            "description": "Unordered map of dynamically typed values.",
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
       "v1ErrorResponse": {
         "description": "The body of every non-2xx JSON response, on every route (ADR-350 §b).\nSee docs/api/errors.md for the code table.",
         "properties": {
@@ -67,7 +78,7 @@
             "type": "integer"
           },
           "retryable": {
-            "description": "Whether the identical request may succeed later. The server did not\napply it (except a forwarded write with `details.outcome: \"unknown\"`).",
+            "description": "Whether the identical request may succeed later; true only when the\nserver did not apply it. A forwarded write whose outcome is unknown\n(`details.outcome: \"unknown\"`) says false: retry it only if the\noperation is idempotent.",
             "type": "boolean"
           }
         },
@@ -2154,6 +2165,16 @@
             },
             "description": "A successful response."
           },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/protobufStruct"
+                }
+              }
+            },
+            "description": "Accepted: with `async: true` the compaction runs in the background; poll `GET /v1/admin/compaction-jobs/{id}` with the returned job id."
+          },
           "400": {
             "content": {
               "application/json": {
@@ -3865,6 +3886,24 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "description": "Page size (default 100, at most 1000).",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Only events older than this event id: the previous page's `next_before`.",
+            "in": "query",
+            "name": "before",
+            "schema": {
+              "format": "int64",
+              "type": "integer"
             }
           }
         ],
@@ -5851,6 +5890,16 @@
               }
             },
             "description": "A successful response."
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/protobufStruct"
+                }
+              }
+            },
+            "description": "Accepted: the deletion is recorded but not complete (`completed: false`); finish it with `POST /v1/admin/deletions/resume`."
           },
           "400": {
             "content": {

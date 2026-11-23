@@ -814,6 +814,10 @@ mod tests {
     #[test]
     fn namespaces_are_encoded_as_one_path_segment() {
         assert_eq!(encode_path_segment("tenant/ns a"), "tenant%2Fns%20a");
-        assert_eq!(crate::url_decode(&encode_path_segment("t/x-1")), "t/x-1");
+        assert_eq!(crate::path_decode(&encode_path_segment("t/x-1")), "t/x-1");
+        assert_eq!(
+            crate::path_decode(&encode_path_segment("c++ café")),
+            "c++ café"
+        );
     }
 }

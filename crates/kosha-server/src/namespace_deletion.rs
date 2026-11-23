@@ -650,7 +650,7 @@ pub(crate) fn route_admin(request_line: &str, body: &[u8], state: &AppState) -> 
     let bare = path.split('?').next().unwrap_or(path);
     match (method, bare) {
         ("DELETE", _) if bare.starts_with("/v1/admin/tenants/") => {
-            let tenant = url_decode(&bare["/v1/admin/tenants/".len()..]);
+            let tenant = crate::path_decode(&bare["/v1/admin/tenants/".len()..]);
             Some(handle_delete_tenant(&tenant, body, state, auth::global()))
         }
         ("POST", "/v1/admin/deletions/resume") => {
@@ -658,7 +658,7 @@ pub(crate) fn route_admin(request_line: &str, body: &[u8], state: &AppState) -> 
         }
         ("GET", "/v1/admin/deletions") => Some(handle_list_deletions(path, state)),
         ("GET", _) if bare.starts_with("/v1/admin/deletions/") => {
-            let id = url_decode(&bare["/v1/admin/deletions/".len()..]);
+            let id = crate::path_decode(&bare["/v1/admin/deletions/".len()..]);
             Some(handle_get_deletion(&id, state))
         }
         _ => None,

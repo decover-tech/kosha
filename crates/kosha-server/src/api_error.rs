@@ -12,6 +12,9 @@
 //!   server did not apply it. Every retryable response also carries
 //!   `retry_after_ms` and a `Retry-After` header (whole seconds, at least 1),
 //!   by construction: [`ApiError`] adds both whenever the code is retryable.
+//!   A response whose request may have been applied (a forwarded write with
+//!   `details.outcome: "unknown"`) says `retryable: false` whatever its code
+//!   ([`ApiError::not_retryable`]).
 //! - `request_id` echoes `X-Request-Id`, which every response carries.
 //!
 //! `proto/kosha/v1/errors.proto` describes the body; its `code` enum and
@@ -352,6 +355,9 @@ pub(crate) struct ApiError {
     message: String,
     details: serde_json::Map<String, serde_json::Value>,
     retry_after: Option<Duration>,
+    /// Set by [`ApiError::not_retryable`]: this instance says
+    /// `retryable: false` although its code is retryable.
+    not_retryable: bool,
     /// Deprecated top-level fields kept for old clients (`reason`, `limit`).
     aliases: Vec<(&'static str, serde_json::Value)>,
     headers: Vec<(String, String)>,
@@ -380,6 +386,7 @@ impl ApiError {
             message,
             details: serde_json::Map::new(),
             retry_after: None,
+            not_retryable: false,
             aliases: Vec::new(),
             headers: Vec::new(),
             log_detail,
@@ -415,6 +422,20 @@ impl ApiError {
         self
     }
 
+    /// Mark this response `retryable: false`, with no `Retry-After`, even
+    /// though its code is retryable: the server may have applied the
+    /// request (a forwarded write whose outcome is unknown), so replaying it
+    /// is safe only for an idempotent operation, which the client decides.
+    pub(crate) fn not_retryable(mut self) -> Self {
+        self.not_retryable = true;
+        self
+    }
+
+    /// Whether the body says `retryable: true`.
+    fn retryable(&self) -> bool {
+        self.code.retryable() && !self.not_retryable
+    }
+
     /// A deprecated top-level field (ADR-350 §b "Deprecated aliases").
     pub(crate) fn alias(mut self, key: &'static str, value: impl Into<serde_json::Value>) -> Self {
         self.aliases.push((key, value.into()));
@@ -432,8 +453,7 @@ impl ApiError {
     }
 
     fn retry_after_ms(&self) -> Option<u64> {
-        self.code
-            .retryable()
+        self.retryable()
             .then(|| self.retry_after.unwrap_or(DEFAULT_RETRY_AFTER))
             .map(|d| (d.as_millis() as u64).max(1))
     }
@@ -443,7 +463,7 @@ impl ApiError {
         let mut body = serde_json::Map::new();
         body.insert("error".into(), self.message.clone().into());
         body.insert("code".into(), self.code.as_str().into());
-        body.insert("retryable".into(), self.code.retryable().into());
+        body.insert("retryable".into(), self.retryable().into());
         if let Some(ms) = self.retry_after_ms() {
             body.insert("retry_after_ms".into(), ms.into());
         }
@@ -602,6 +622,22 @@ mod tests {
         assert!(body.get("retry_after_ms").is_none());
     }
 
+    /// A forwarded write whose outcome is unknown keeps its 503 code but
+    /// tells the client not to replay it blindly.
+    #[test]
+    fn not_retryable_overrides_a_retryable_code() {
+        let raw = ApiError::new(ErrorCode::Unavailable, "forward failed")
+            .detail("outcome", "unknown")
+            .not_retryable()
+            .into_raw();
+        let (status, headers, body) = parts(&raw);
+        assert_eq!(status, 503);
+        assert_eq!(body["code"], "unavailable");
+        assert_eq!(body["retryable"], false);
+        assert!(body.get("retry_after_ms").is_none());
+        assert_eq!(header(&headers, "retry-after"), None);
+    }
+
     #[test]
     fn request_ids_are_sanitized_or_generated() {
         assert_eq!(begin_request(Some("abc-123\r\nx: y")), "abc-123xy");
@@ -712,7 +748,7 @@ mod tests {
              | field | meaning |\n|---|---|\n\
              | `error` | Human-readable. Not stable: never parse it. |\n\
              | `code` | The stable machine contract (table below). |\n\
-             | `retryable` | The identical request may succeed later, and the server did not apply it. A forwarded write whose outcome is unknown says so in `details.outcome: \"unknown\"`. |\n\
+             | `retryable` | The identical request may succeed later, and the server did not apply it. A forwarded write whose outcome is unknown (the ingest pod may have applied it) says `retryable: false` and `details.outcome: \"unknown\"`, whatever its code; retry it only if the operation is idempotent. |\n\
              | `retry_after_ms` | Present exactly when `retryable` is true. The `Retry-After` header carries the same delay in whole seconds (at least 1). |\n\
              | `request_id` | Equals the `X-Request-Id` response header (the caller's, sanitized, or a generated one). Quote it in bug reports. |\n\
              | `details` | Code-specific; keys are only ever added. |\n\

@@ -313,3 +313,34 @@ func TestBulkLastOccurrenceWins(t *testing.T) {
 		t.Fatalf("order %v", order)
 	}
 }
+
+func TestPagedRequestKeepsSortFieldsOutOfExcludes(t *testing.T) {
+	excl := []string{"tag", "title"}
+	sortSpec := []map[string]any{{"tag": map[string]any{"order": "desc"}}}
+	body, keys, desc, err := pagedRequest(SearchRequest{Sort: &sortSpec, SourceExcludes: &excl}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(*body.SourceExcludes, []string{"title"}) {
+		t.Fatalf("source_excludes = %v", *body.SourceExcludes)
+	}
+	if !slices.Equal(keys, []string{"tag", "_id"}) || !slices.Equal(desc, []bool{true, false}) {
+		t.Fatalf("keys = %v, desc = %v", keys, desc)
+	}
+}
+
+func TestCursorUsesListElement(t *testing.T) {
+	id := "d1"
+	hit := Hit{DocId: &id, Fields: &[]Field{{Name: "tags", Value: `["b","a","c"]`}}}
+	if got := cursorFor(hit, []string{"tags", "_id"}, []bool{false, false}); !slices.Equal(got, []string{"a", "d1"}) {
+		t.Fatalf("asc cursor = %v", got)
+	}
+	if got := cursorFor(hit, []string{"tags", "_id"}, []bool{true, false}); !slices.Equal(got, []string{"c", "d1"}) {
+		t.Fatalf("desc cursor = %v", got)
+	}
+	for in, want := range map[string]string{"[]": "", "[x": "[x", "plain": "plain", "[1,true]": "1"} {
+		if got := sortValueOf(in, false); got != want {
+			t.Fatalf("sortValueOf(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

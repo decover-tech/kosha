@@ -70,12 +70,23 @@ func IsIdempotent(method, path string) bool {
 }
 
 // retryableStatus applies RETRY.md rules 1 and 2 to an error response.
-func retryableStatus(status int, body []byte, idempotent bool) bool {
+// replaySafe is idempotent or the caller's WithRetryNonIdempotent opt-in.
+func retryableStatus(status int, body []byte, idempotent, replaySafe bool) bool {
 	var parsed struct {
 		Retryable *bool `json:"retryable"`
+		Details   struct {
+			Outcome string `json:"outcome"`
+		} `json:"details"`
 	}
-	if json.Unmarshal(body, &parsed) == nil && parsed.Retryable != nil {
-		return *parsed.Retryable
+	if json.Unmarshal(body, &parsed) == nil {
+		// The write may have been applied (a forwarded write that timed
+		// out): replay it only when that is safe, whatever retryable says.
+		if parsed.Details.Outcome == "unknown" {
+			return replaySafe
+		}
+		if parsed.Retryable != nil {
+			return *parsed.Retryable
+		}
 	}
 	switch status {
 	case 429, 503:

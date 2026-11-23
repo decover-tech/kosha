@@ -96,6 +96,44 @@
     ]
   },
   {
+    "id": "retry.outcome_unknown_not_replayed",
+    "description": "Synthetic fault: a forwarded namespace create whose outcome is unknown is not replayed, even from an older server that said retryable:true (RETRY.md rule 1 exception).",
+    "covers": ["KoshaService_CreateNamespace"],
+    "faults": [
+      {
+        "match": { "method": "POST", "path_suffix": "/v1/namespaces" },
+        "times": 1,
+        "respond": {
+          "status": 503,
+          "body": { "error": "the ingest pod could not be reached", "code": "unavailable", "retryable": true, "retry_after_ms": 100, "request_id": "fault-3", "details": { "reason": "ingest_unreachable", "outcome": "unknown" } }
+        }
+      }
+    ],
+    "steps": [
+      {
+        "op": "create_namespace",
+        "expect": { "error": { "kind": "http", "status": 503, "code": "unavailable" }, "attempts": 1 }
+      }
+    ]
+  },
+  {
+    "id": "retry.outcome_unknown_idempotent_replayed",
+    "description": "Synthetic fault: a forwarded flush whose outcome is unknown says retryable:false, and is still replayed because flush is idempotent.",
+    "covers": ["KoshaService_Flush"],
+    "setup": [{ "op": "create_namespace" }],
+    "faults": [
+      {
+        "match": { "method": "POST", "path_suffix": "/flush" },
+        "times": 1,
+        "respond": {
+          "status": 503,
+          "body": { "error": "the ingest pod could not be reached", "code": "unavailable", "retryable": false, "request_id": "fault-4", "details": { "reason": "ingest_unreachable", "outcome": "unknown" } }
+        }
+      }
+    ],
+    "steps": [{ "op": "flush", "expect": { "ok": true, "attempts": 2 } }]
+  },
+  {
     "id": "retry.tenant_qps_live",
     "description": "Against a live qps:1 limit, back-to-back searches still succeed; the second sees at least one 429.",
     "covers": ["KoshaService_Search"],

@@ -98,8 +98,21 @@ def is_idempotent(method: str, path: str) -> bool:
     return m == "POST" and len(parts) == 4 and parts[3] in _IDEMPOTENT_ACTIONS
 
 
-def retryable_status(status: int, body: Any, idempotent: bool) -> bool:
-    """RETRY.md rules 1 and 2: the body's ``retryable`` decides when present."""
+def retryable_status(
+    status: int, body: Any, idempotent: bool, replay_safe: bool | None = None
+) -> bool:
+    """RETRY.md rules 1 and 2: the body's ``retryable`` decides when present.
+
+    ``replay_safe`` is ``idempotent`` or the caller's ``retry_non_idempotent``
+    opt-in. A body with ``details.outcome == "unknown"`` (a forwarded write
+    that may have been applied) is retried only when replay is safe,
+    whatever ``retryable`` says.
+    """
+    if replay_safe is None:
+        replay_safe = idempotent
+    details = body.get("details") if isinstance(body, dict) else None
+    if isinstance(details, dict) and details.get("outcome") == "unknown":
+        return replay_safe
     if isinstance(body, dict) and isinstance(body.get("retryable"), bool):
         return body["retryable"]
     if status in (429, 503):
@@ -235,7 +248,9 @@ class Transport:
                 if request_id and not err.get("request_id"):
                     err = {**err, "request_id": request_id}
                 error = KoshaRequestError(e.code, err.get("error", str(e)), err, retry_after_ms=delay)
-                retry = retryable_status(e.code, err, idempotent)
+                retry = retryable_status(
+                    e.code, err, idempotent, idempotent or self.retry_non_idempotent
+                )
                 cause = e
             except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
                 reason = e.reason if isinstance(e, urllib.error.URLError) else e

@@ -71,11 +71,11 @@ pub fn requirement(method: &str, path: &str) -> Requirement {
         let Some((ns, action)) = rest.rsplit_once('/') else {
             // The bare `/v1/namespaces/{ns}`.
             return match method {
-                "DELETE" => scoped(Admin, Target::Path(crate::url_decode(rest))),
+                "DELETE" => scoped(Admin, Target::Path(crate::path_decode(rest))),
                 _ => Requirement::Unknown,
             };
         };
-        let ns = crate::url_decode(ns);
+        let ns = crate::path_decode(ns);
         let scope = match (method, action) {
             ("POST", "search" | "exists") => Read,
             ("GET", "schema" | "branches" | "stats") => Read,

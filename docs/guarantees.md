@@ -116,17 +116,26 @@ the pod check the manifest version before it answers.
 | Idle flush check | every 250 ms (a quarter of the idle flush, at least 50 ms) | `crates/kosha-server/src/main.rs` (`idle_flush_tick`), follows `KOSHA_FLUSH_MAX_AGE_MS` |
 
 The idle timer measures a namespace's age from its oldest pending document.
-With no other trigger, a document is therefore visible to `eventual` reads
-at most about 1.25 s after its write (1000 ms plus one 250 ms check), plus
-the segment build. A document written while older ones are pending is
-published sooner.
+With no other trigger, a namespace becomes due for an idle flush about
+1.25 s after its oldest pending write (1000 ms plus one 250 ms check). That
+is when the flush starts, not when the document is visible, and there is no
+upper bound on visibility. One timer thread flushes and publishes every due
+namespace in turn and waits one check interval after each pass, so a
+document also waits for its own segment build and publish and for the
+flushes and publishes of every namespace ahead of it in that pass and the
+one before. With many active namespaces or large buffers this adds seconds.
+That is the likely source of the tail in the first measurement below (21
+namespaces, p99 4.6 s); that run did not record flush timings.
+A document written while older ones are pending is published sooner.
 
 | Measurement | p50 | p99 | Result file |
 | --- | --- | --- | --- |
 | Write-to-visible, `eventual` read, idle and size flush only (no deletes), one standalone pod on a developer laptop, 3 min, 70 samples, 2026-11-22, commit `e174058` | 0.46 s | 4.642 s | `scripts/soak/results/2026-11-22-local-no-delete.md` |
 | Write-to-visible, `eventual` read, mixed workload with 20% delete-by-query (deletes also flush), same setup, 60 samples, 2026-11-22, commit `e174058` | 0.027 s | 3.659 s | `scripts/soak/results/2026-11-22-local.md` |
 
-Use the first row for the idle-flush path. In the second row, deletes
+Use the first row for the idle-flush path; its p99 is well over the
+1.25 s idle-flush trigger, most likely because of the serialized flushes
+described above. In the second row, deletes
 flushed the namespaces often, so its p50 is not a typical write-to-visible
 time. Both runs are short and local, and each p99 is the single slowest
 sample. They are not production guarantees.

@@ -577,7 +577,7 @@
             "type": "integer"
           },
           "retryable": {
-            "description": "Whether the identical request may succeed later. The server did not\napply it (except a forwarded write with `details.outcome: \"unknown\"`).",
+            "description": "Whether the identical request may succeed later; true only when the\nserver did not apply it. A forwarded write whose outcome is unknown\n(`details.outcome: \"unknown\"`) says false: retry it only if the\noperation is idempotent.",
             "type": "boolean"
           }
         },

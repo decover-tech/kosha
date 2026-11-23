@@ -2015,7 +2015,8 @@ class KoshaClient:
         (``{"query_text": "", "filter": {...}, "sort": [...]}``), not
         OpenSearch DSL. The sort always ends in an ``_id`` tie-break
         (appended when missing; the default is ``_id`` ascending), sort
-        fields are added to ``source_includes`` when it is set, and
+        fields are added to ``source_includes`` when it is set and removed
+        from ``source_excludes``, and
         ``page_size`` (default: ``max_results``, else 500) is the page size.
         Iteration stops on a short page. A document that exists and is
         unchanged for the whole iteration is yielded exactly once, in sort

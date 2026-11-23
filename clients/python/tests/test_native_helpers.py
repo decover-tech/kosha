@@ -224,3 +224,25 @@ def test_bulk_index_last_occurrence_wins():
     order = [x for b in t.batches for x in b]
     assert order.index(("d0000", "b")) > order.index(("d0000", "a"))
     assert ("d0003", "c") in order and ("d0003", "a") not in order
+
+
+def test_paged_request_keeps_sort_fields_out_of_excludes():
+    from kosha_client.native import paged_request
+
+    body, keys, desc = paged_request(
+        {"query_text": "", "sort": [{"tag": {"order": "desc"}}], "source_excludes": ["tag", "title"]}, 10
+    )
+    assert body["source_excludes"] == ["title"]
+    assert keys == ["tag", "_id"]
+    assert desc == [True, False]
+
+
+def test_cursor_uses_the_list_element_the_server_sorts_by():
+    from kosha_client.native import cursor_for, sort_value_of
+
+    hit = {"doc_id": "d1", "fields": [{"name": "tags", "value": '["b","a","c"]'}]}
+    assert cursor_for(hit, ["tags", "_id"], [False, False]) == ["a", "d1"]
+    assert cursor_for(hit, ["tags", "_id"], [True, False]) == ["c", "d1"]
+    assert sort_value_of("[]", False) == ""
+    assert sort_value_of("[x", False) == "[x"
+    assert sort_value_of("plain", True) == "plain"

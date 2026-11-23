@@ -10,7 +10,11 @@ three SDKs and those cases together.
 1. **The server says.** If the error body is JSON with a boolean
    `retryable`, retry if and only if it is `true`, for every operation. The
    server only says `true` when it did not apply the request
-   (docs/api/errors.md).
+   (docs/api/errors.md). One exception wins over `retryable`: a body with
+   `details.outcome: "unknown"` (a query pod forwarded the write and the
+   ingest pod may have applied it) is handled like rule 4, retried only for
+   idempotent operations unless the caller opts in. The server says
+   `retryable: false` there; older builds said `true`.
 2. **No `retryable` field** (an older server, a proxy, the HTTP layer):
    - 429 and 503: retry, for every operation (the request was rejected
      before it was applied);

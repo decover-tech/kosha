@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { Kosha, KoshaConfigError, KoshaConnectionError, KoshaError, KoshaTimeoutError, isIdempotent } from "../src/index.js";
-import { parseRetryAfter } from "../src/retry.js";
+import { parseRetryAfter, retryableStatus } from "../src/retry.js";
 import { errorBody, fakeServer, json, type FakeServer } from "./fake-server.js";
 
 let server: FakeServer | undefined;
@@ -23,6 +23,15 @@ async function caught(p: Promise<unknown>): Promise<KoshaError> {
 }
 
 describe("retry policy", () => {
+  it("replays an outcome-unknown write only when that is safe", () => {
+    const unknown = { retryable: true, details: { outcome: "unknown" } };
+    expect(retryableStatus(503, unknown, false)).toBe(false);
+    expect(retryableStatus(503, unknown, true)).toBe(true);
+    expect(retryableStatus(503, { ...unknown, retryable: false }, true)).toBe(true);
+    expect(retryableStatus(503, unknown, false, true)).toBe(true);
+    expect(retryableStatus(503, { retryable: true }, false)).toBe(true);
+  });
+
   it("honours Retry-After on a 429, then succeeds", async () => {
     let n = 0;
     server = await fakeServer((_req, res) => {

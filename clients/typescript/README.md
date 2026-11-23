@@ -65,8 +65,10 @@ for await (const hit of docs.searchAll({ query_text: "", filter: { term: { tag: 
 The sort always ends in an `_id` tie-break (added when missing; the default
 sort is `_id` ascending). The cursor for the next page is built from the
 last hit: `_id` is its id, `_score` its score, any other key its stored
-value, so **sort fields must be stored** (`stored: true`); when you set
-`source_includes`, searchAll adds the sort fields to it. A document that
+value (for a list value, the element the server sorted by: the smallest
+ascending, the largest descending), so **sort fields must be stored**
+(`stored: true`); searchAll adds the sort fields to `source_includes` when
+you set it and removes them from `source_excludes`. A document that
 exists and is unchanged for the whole iteration is yielded exactly once, in
 sort order; this is not a snapshot. `from`, `search_after`, `rerank` and kNN
 or hybrid bodies are rejected with `KoshaConfigError`.

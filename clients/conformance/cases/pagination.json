@@ -42,6 +42,40 @@
           "page_size": 10
         },
         "expect": { "count": 36, "unique": true }
+      },
+      {
+        "op": "search_all",
+        "args": { "body": { "query_text": "", "filter": { "exists": { "field": "tag" } }, "sort": [{ "tag": { "order": "desc" } }], "source_excludes": ["tag"] }, "page_size": 100 },
+        "expect": { "count": 250, "unique": true }
+      },
+      {
+        "op": "search_all",
+        "args": { "body": { "query_text": "", "filter": { "exists": { "field": "tag" } }, "sort": [{ "tag": { "order": "asc" } }], "source_excludes": ["tag"] }, "page_size": 100 },
+        "expect": { "count": 250, "unique": true }
+      }
+    ]
+  },
+  {
+    "id": "pagination.by_list_keyword",
+    "description": "search_all sorted by a list-valued keyword: the cursor is the element the server sorted by (smallest ascending, largest descending), not the stored list text.",
+    "covers": ["KoshaService_Search"],
+    "setup": [
+      { "op": "create_namespace", "args": { "schema": { "fields": { "tags": { "type": "keyword", "stored": true, "indexed": true } } } } },
+      {
+        "op": "upsert",
+        "args": { "documents": { "generate": { "count": 250, "id": "d{i:04}", "fields": { "tags": { "type": "Keyword", "value": "[\"k{i%5}\",\"j{i%3}\"]" } } } } }
+      }
+    ],
+    "steps": [
+      {
+        "op": "search_all",
+        "args": { "body": { "query_text": "", "filter": { "exists": { "field": "tags" } }, "sort": [{ "tags": { "order": "asc" } }] }, "page_size": 100 },
+        "expect": { "count": 250, "unique": true }
+      },
+      {
+        "op": "search_all",
+        "args": { "body": { "query_text": "", "filter": { "exists": { "field": "tags" } }, "sort": [{ "tags": { "order": "desc" } }] }, "page_size": 100 },
+        "expect": { "count": 250, "unique": true }
       }
     ]
   },

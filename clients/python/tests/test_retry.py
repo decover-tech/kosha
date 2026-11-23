@@ -15,6 +15,7 @@ from kosha_client.transport import (
     Transport,
     is_idempotent,
     parse_retry_after,
+    retryable_status,
 )
 
 
@@ -82,6 +83,15 @@ def transport(url, **kw):
 
 def err(code, retryable, **extra):
     return {"error": f"{code} happened", "code": code, "retryable": retryable, "request_id": "req-1", **extra}
+
+
+def test_outcome_unknown_is_replayed_only_when_safe():
+    unknown = {"retryable": True, "details": {"outcome": "unknown"}}
+    assert not retryable_status(503, unknown, idempotent=False)
+    assert retryable_status(503, unknown, idempotent=True)
+    assert retryable_status(503, {**unknown, "retryable": False}, idempotent=True)
+    assert retryable_status(503, unknown, idempotent=False, replay_safe=True)
+    assert retryable_status(503, {"retryable": True}, idempotent=False)
 
 
 def test_retry_after_is_honoured(serve):

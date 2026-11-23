@@ -120,7 +120,7 @@ export class Transport {
         }
         serverDelay = serverDelayMs(parsed, res.headers);
         error = KoshaError.fromResponse(res.status, parsed, res.headers, serverDelay);
-        retry = retryableStatus(res.status, parsed, idempotent);
+        retry = retryableStatus(res.status, parsed, idempotent, idempotent || opts.retryNonIdempotent === true);
       } catch (err) {
         if (opts.signal?.aborted) throw opts.signal.reason;
         if (err instanceof SyntaxError) {

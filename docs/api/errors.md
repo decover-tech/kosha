@@ -13,7 +13,7 @@ Every non-2xx JSON response from the Kosha API, on every route, has this body (`
 |---|---|
 | `error` | Human-readable. Not stable: never parse it. |
 | `code` | The stable machine contract (table below). |
-| `retryable` | The identical request may succeed later, and the server did not apply it. A forwarded write whose outcome is unknown says so in `details.outcome: "unknown"`. |
+| `retryable` | The identical request may succeed later, and the server did not apply it. A forwarded write whose outcome is unknown (the ingest pod may have applied it) says `retryable: false` and `details.outcome: "unknown"`, whatever its code; retry it only if the operation is idempotent. |
 | `retry_after_ms` | Present exactly when `retryable` is true. The `Retry-After` header carries the same delay in whole seconds (at least 1). |
 | `request_id` | Equals the `X-Request-Id` response header (the caller's, sanitized, or a generated one). Quote it in bug reports. |
 | `details` | Code-specific; keys are only ever added. |

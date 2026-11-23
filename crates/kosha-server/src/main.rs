@@ -6528,7 +6528,8 @@ fn legacy_route(request_line: &str) -> Option<(&str, &'static str)> {
 /// (`details.reason: "ingest_unreachable"`), and a client retries on
 /// `retryable: true` after `Retry-After`. When the failure came after the
 /// request may have reached the ingest pod, `details.outcome` is
-/// `"unknown"`: the write may have been applied.
+/// `"unknown"` and `retryable` is false: the write may have been applied,
+/// so only a client that knows the operation is idempotent replays it.
 fn forward_to_ingest(
     client: &reqwest::blocking::Client,
     ingest_host: &str,
@@ -6591,9 +6592,12 @@ fn forward_to_ingest(
             .redact("the ingest pod could not be reached")
             .detail("reason", "ingest_unreachable");
             // A connect failure never reached the ingest pod; anything later
-            // (a timeout, a reset) may have been applied there.
+            // (a timeout, a reset) may have been applied there, so the body
+            // must not say retryable: replaying a namespace create or a
+            // branch call would answer 409/404 for a write that succeeded.
+            // The client retries it only if the operation is idempotent.
             if !e.is_connect() {
-                error = error.detail("outcome", "unknown");
+                error = error.detail("outcome", "unknown").not_retryable();
             }
             error.into_raw()
         }
@@ -6743,7 +6747,7 @@ fn route_checked(
                 Some((ns, _action)) => ns,
                 None => rest.split('?').next().unwrap_or(rest),
             };
-            if !valid_namespace_component(&url_decode(ns)) {
+            if !valid_namespace_component(&path_decode(ns)) {
                 return api_error(ErrorCode::InvalidArgument, "invalid namespace");
             }
         }
@@ -7040,7 +7044,7 @@ fn route_inner(
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
         return match path.strip_suffix("/unindexed") {
             Some(ns) if !ns.is_empty() => {
-                unindexed::handle_internal_unindexed(&url_decode(ns), query, state)
+                unindexed::handle_internal_unindexed(&path_decode(ns), query, state)
             }
             _ => api_error(ErrorCode::NotFound, "not found"),
         };
@@ -7103,7 +7107,7 @@ fn extract_namespace(request_line: &str, prefix: &str, suffix: &str) -> Option<S
     if ns.is_empty() || ns.contains('/') {
         return None;
     }
-    Some(url_decode(ns))
+    Some(path_decode(ns))
 }
 
 /// `POST /v1/namespaces` (optionally with a query string).
@@ -7132,7 +7136,7 @@ fn bare_namespace(request_line: &str, method: &str) -> Option<String> {
     if ns.is_empty() || ns.contains('/') {
         return None;
     }
-    Some(url_decode(ns))
+    Some(path_decode(ns))
 }
 
 // ─── POST /v1/namespaces, DELETE /v1/namespaces/{ns} ────────────────────────
@@ -11159,7 +11163,7 @@ fn internal_segment_response(request_line: &str, state: &AppState) -> http::Resp
             .strip_prefix("GET /internal/segment/")
             .and_then(|rest| rest.split(' ').next())
             .unwrap_or("");
-        let relative_path = url_decode(raw.split('?').next().unwrap_or(raw));
+        let relative_path = path_decode(raw.split('?').next().unwrap_or(raw));
         let local_path = match state.cache.path_for(&relative_path) {
             Ok(p) => p,
             Err(_) => {
@@ -11447,21 +11451,43 @@ fn raw_response(status_code: u16, body: &str) -> String {
 }
 
 /// Minimal URL decoder: decodes %XX and + → space.
+/// Decode a query-string value (`application/x-www-form-urlencoded`):
+/// `+` is a space and `%XX` escapes are UTF-8 bytes.
 fn url_decode(input: &str) -> String {
-    let mut result = String::with_capacity(input.len());
-    let mut chars = input.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '+' => result.push(' '),
-            '%' => {
-                let hi = chars.next().and_then(|c| c.to_digit(16)).unwrap_or(0);
-                let lo = chars.next().and_then(|c| c.to_digit(16)).unwrap_or(0);
-                result.push((hi as u8 * 16 + lo as u8) as char);
-            }
-            _ => result.push(c),
+    percent_decode(input, true)
+}
+
+/// Decode one URL path segment (RFC 3986): `%XX` escapes are UTF-8 bytes
+/// and `+` is a literal plus, as every SDK sends it (Go's
+/// `url.PathEscape` leaves it unescaped), so a namespace named `c++` or
+/// `café` is the namespace the client asked for.
+fn path_decode(input: &str) -> String {
+    percent_decode(input, false)
+}
+
+/// Collect the decoded bytes, then read them as UTF-8 (an invalid sequence
+/// becomes U+FFFD). A `%` not followed by two hex digits stays literal.
+fn percent_decode(input: &str, plus_is_space: bool) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let hex = |j: usize| bytes.get(j).and_then(|c| (*c as char).to_digit(16));
+        match b {
+            b'+' if plus_is_space => out.push(b' '),
+            b'%' => match (hex(i + 1), hex(i + 2)) {
+                (Some(hi), Some(lo)) => {
+                    out.push((hi * 16 + lo) as u8);
+                    i += 2;
+                }
+                _ => out.push(b'%'),
+            },
+            _ => out.push(b),
         }
+        i += 1;
     }
-    result
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 impl Drop for AppState {
@@ -11482,6 +11508,32 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpStream;
     use std::path::Path;
+
+    /// A path segment keeps `+` and decodes UTF-8 escapes; a query value
+    /// still reads `+` as a space.
+    #[test]
+    fn path_and_query_decoding() {
+        assert_eq!(path_decode("a+b"), "a+b");
+        assert_eq!(path_decode("c%2B%2B"), "c++");
+        assert_eq!(path_decode("caf%C3%A9"), "café");
+        assert_eq!(path_decode("50%"), "50%");
+        assert_eq!(path_decode("%zz"), "%zz");
+        assert_eq!(url_decode("a+b"), "a b");
+        assert_eq!(url_decode("caf%C3%A9+x"), "café x");
+        assert_eq!(
+            extract_namespace(
+                "POST /v1/namespaces/a+b/search HTTP/1.1",
+                "POST /v1/namespaces/",
+                "/search"
+            )
+            .as_deref(),
+            Some("a+b")
+        );
+        assert_eq!(
+            bare_namespace("DELETE /v1/namespaces/caf%C3%A9 HTTP/1.1", "DELETE").as_deref(),
+            Some("café")
+        );
+    }
 
     #[derive(Clone)]
     pub(crate) struct SharedManifestStore {

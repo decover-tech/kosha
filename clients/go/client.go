@@ -185,7 +185,7 @@ func (c *Client) Do(ctx context.Context, method, path string, body, out any, opt
 			e := newError(status, header, respBody, delay)
 			e.Attempts = attempt
 			failure = e
-			retry = retryableStatus(status, respBody, idempotent)
+			retry = retryableStatus(status, respBody, idempotent, idempotent || cfg.retryNonIdempotent)
 		}
 
 		if !retry || attempt >= cfg.maxAttempts {

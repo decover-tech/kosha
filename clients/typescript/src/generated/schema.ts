@@ -628,8 +628,10 @@ export interface components {
              */
             retry_after_ms?: number;
             /**
-             * @description Whether the identical request may succeed later. The server did not
-             *     apply it (except a forwarded write with `details.outcome: "unknown"`).
+             * @description Whether the identical request may succeed later; true only when the
+             *     server did not apply it. A forwarded write whose outcome is unknown
+             *     (`details.outcome: "unknown"`) says false: retry it only if the
+             *     operation is idempotent.
              */
             retryable?: boolean;
         };

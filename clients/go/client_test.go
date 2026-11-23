@@ -87,6 +87,25 @@ func asError(t *testing.T, err error) *Error {
 	return e
 }
 
+func TestOutcomeUnknownReplayedOnlyWhenSafe(t *testing.T) {
+	unknown := []byte(`{"retryable":true,"details":{"outcome":"unknown"}}`)
+	if retryableStatus(503, unknown, false, false) {
+		t.Fatal("non-idempotent outcome-unknown write was retried")
+	}
+	if !retryableStatus(503, unknown, true, true) {
+		t.Fatal("idempotent outcome-unknown write was not retried")
+	}
+	if !retryableStatus(503, []byte(`{"retryable":false,"details":{"outcome":"unknown"}}`), true, true) {
+		t.Fatal("idempotent outcome-unknown write with retryable:false was not retried")
+	}
+	if !retryableStatus(503, unknown, false, true) {
+		t.Fatal("opt-in did not apply")
+	}
+	if !retryableStatus(503, []byte(`{"retryable":true}`), false, false) {
+		t.Fatal("retryable:true was not honoured")
+	}
+}
+
 func TestRetryAfterHonoured(t *testing.T) {
 	f := newFake(t, func(n int, _ recorded, w http.ResponseWriter) {
 		if n == 0 {

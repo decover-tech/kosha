@@ -56,9 +56,11 @@ for hit, err := range docs.SearchAll(ctx, req, 500) {
 
 The sort always ends in an `_id` tie-break (added when missing; the default
 sort is `_id` ascending). The next page's cursor comes from the last hit
-(`_id`: its id, `_score`: its score, any other key: its stored value), so
-**sort fields must be stored**; when `SourceIncludes` is set the sort fields
-are added to it. A document that exists and is unchanged for the whole
+(`_id`: its id, `_score`: its score, any other key: its stored value, or for
+a list value the element the server sorted by: the smallest ascending, the
+largest descending), so **sort fields must be stored**; the sort fields are
+added to `SourceIncludes` when it is set and removed from `SourceExcludes`.
+A document that exists and is unchanged for the whole
 iteration is yielded exactly once, in sort order; this is not a snapshot.
 
 ### Many documents: `BulkIndex`

@@ -9,6 +9,7 @@ bodies (``{"query_text": ..., "filter": ...}``, ``{"id": ..., "fields":
 
 from __future__ import annotations
 
+import json
 import threading
 import urllib.parse
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -56,8 +57,18 @@ def _sort_key(entry: Any) -> str:
     raise KoshaConfigError(f"search_all: unsupported sort entry {entry!r}")
 
 
-def paged_request(body: dict, page_size: int) -> tuple[dict, list[str]]:
-    """The body search_all sends for each page, and its sort keys."""
+def _is_descending(entry: dict, key: str) -> bool:
+    spec = entry.get(key)
+    return isinstance(spec, dict) and spec.get("order") == "desc"
+
+
+def paged_request(body: dict, page_size: int) -> tuple[dict, list[str], list[bool]]:
+    """The body search_all sends for each page, its sort keys, and whether
+    each key sorts descending.
+
+    Sort fields are kept in ``source_includes`` and taken out of
+    ``source_excludes``: the cursor is read from them.
+    """
     if "from" in body:
         raise KoshaConfigError("search_all pages with search_after; do not set from")
     if "search_after" in body:
@@ -70,9 +81,11 @@ def paged_request(body: dict, page_size: int) -> tuple[dict, list[str]]:
         raise KoshaConfigError("page_size must be a positive integer")
     sort = [{e: {"order": "asc"}} if isinstance(e, str) else dict(e) for e in body.get("sort") or []]
     keys = [_sort_key(e) for e in sort]
+    descending = [_is_descending(e, k) for e, k in zip(sort, keys)]
     if not keys or keys[-1] != "_id":
         sort.append(dict(_ID_ASC))
         keys.append("_id")
+        descending.append(False)
     out = {**body, "sort": sort, "max_results": page_size}
     if body.get("source_includes") is not None:
         include = list(body["source_includes"])
@@ -80,7 +93,37 @@ def paged_request(body: dict, page_size: int) -> tuple[dict, list[str]]:
             if k not in ("_id", "_score") and k not in include:
                 include.append(k)
         out["source_includes"] = include
-    return out, keys
+    if body.get("source_excludes") is not None:
+        out["source_excludes"] = [f for f in body["source_excludes"] if f not in keys]
+    return out, keys, descending
+
+
+def _element_string(element: Any) -> str | None:
+    """A list element as the server reads it (``list_elements``)."""
+    if isinstance(element, bool):
+        return "true" if element else "false"
+    if isinstance(element, (str, int, float)):
+        return str(element)
+    return None
+
+
+def sort_value_of(value: str, descending: bool) -> str:
+    """The value the server sorts a stored field value by: a JSON list (a
+    multi-valued keyword) by its smallest element ascending and its largest
+    descending, an empty list as missing (``""``)."""
+    trimmed = value.strip()
+    if not (value.startswith("[") and trimmed.endswith("]")):
+        return value
+    try:
+        parsed = json.loads(trimmed)
+    except ValueError:
+        return value
+    if not isinstance(parsed, list):
+        return value
+    elements = [s for s in (_element_string(e) for e in parsed) if s is not None]
+    if not elements:
+        return ""
+    return max(elements) if descending else min(elements)
 
 
 def _score_string(score: Any) -> str:
@@ -89,19 +132,23 @@ def _score_string(score: Any) -> str:
     return repr(score) if isinstance(score, float) else str(score)
 
 
-def cursor_for(hit: dict, keys: list[str]) -> list[str]:
-    """The search_after cursor after ``hit`` (the kosha-cli rule)."""
+def cursor_for(hit: dict, keys: list[str], descending: list[bool] | None = None) -> list[str]:
+    """The search_after cursor after ``hit``: the value the server sorted it
+    by for each key (``sort_value_of`` for a list value)."""
+    descending = descending or []
     sort_values = hit.get("sort")
     if isinstance(sort_values, list) and len(sort_values) == len(keys):
         return [str(v) for v in sort_values]
     out = []
-    for k in keys:
+    for i, k in enumerate(keys):
         if k == "_id":
             out.append(hit.get("doc_id") or "")
         elif k == "_score":
             out.append(_score_string(hit.get("score") or 0))
         else:
-            out.append(next((f.get("value", "") for f in hit.get("fields") or [] if f.get("name") == k), ""))
+            value = next((f.get("value") for f in hit.get("fields") or [] if f.get("name") == k), None)
+            desc = i < len(descending) and descending[i]
+            out.append(sort_value_of(value, desc) if isinstance(value, str) else "")
     return out
 
 
@@ -109,7 +156,7 @@ def search_all(transport: Any, namespace: str, body: dict, page_size: int | None
     """Yield every hit of ``body`` page by page; see ``KoshaClient.search_all``."""
     if page_size is None:
         page_size = int(body["max_results"]) if body.get("max_results") is not None else DEFAULT_PAGE_SIZE
-    request, keys = paged_request(body, page_size)
+    request, keys, descending = paged_request(body, page_size)
     path = ns_path(namespace, "search")
     cursor: list[str] | None = None
     while True:
@@ -118,7 +165,7 @@ def search_all(transport: Any, namespace: str, body: dict, page_size: int | None
         yield from hits
         if len(hits) < page_size:
             return
-        nxt = cursor_for(hits[-1], keys)
+        nxt = cursor_for(hits[-1], keys, descending)
         if cursor is not None and nxt == cursor:
             raise KoshaConfigError("search_all: the cursor did not advance (is a sort field stored and returned?)")
         cursor = nxt

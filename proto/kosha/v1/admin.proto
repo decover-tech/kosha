@@ -370,6 +370,13 @@ service AdminService {
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       responses: {
+        key: "202"
+        value: {
+          description: "Accepted: with `async: true` the compaction runs in the background; poll `GET /v1/admin/compaction-jobs/{id}` with the returned job id."
+          schema: {json_schema: {ref: ".google.protobuf.Struct"}}
+        }
+      }
+      responses: {
         key: "408"
         value: {
           description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
@@ -805,6 +812,13 @@ service AdminService {
       body: "body"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "202"
+        value: {
+          description: "Accepted: the deletion is recorded but not complete (`completed: false`); finish it with `POST /v1/admin/deletions/resume`."
+          schema: {json_schema: {ref: ".google.protobuf.Struct"}}
+        }
+      }
       responses: {
         key: "408"
         value: {
@@ -2040,4 +2054,11 @@ message CreateOrgTenantApiKeyRequest {
 
 message ListAuditLogRequest {
   string org = 1;
+  // Page size (default 100, at most 1000).
+  optional uint32 limit = 2;
+  // Only events older than this event id: the previous page's `next_before`.
+  optional int64 before = 3 [(grpc.gateway.protoc_gen_openapiv2.options.openapiv2_field) = {
+    type: INTEGER
+    format: "int64"
+  }];
 }

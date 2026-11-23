@@ -47,8 +47,10 @@ message ErrorResponse {
       "unavailable"
     ]
   }];
-  // Whether the identical request may succeed later. The server did not
-  // apply it (except a forwarded write with `details.outcome: "unknown"`).
+  // Whether the identical request may succeed later; true only when the
+  // server did not apply it. A forwarded write whose outcome is unknown
+  // (`details.outcome: "unknown"`) says false: retry it only if the
+  // operation is idempotent.
   bool retryable = 3;
   // Present exactly when `retryable` is true; the `Retry-After` header
   // carries the same delay in whole seconds.

@@ -43,8 +43,19 @@ export function isIdempotent(method: string, path: string): boolean {
   return false;
 }
 
-/** Whether an HTTP error response may be retried (RETRY.md rules 1 and 2). */
-export function retryableStatus(status: number, body: unknown, idempotent: boolean): boolean {
+/**
+ * Whether an HTTP error response may be retried (RETRY.md rules 1 and 2).
+ * `replaySafe` is `idempotent` or the caller's `retryNonIdempotent` opt-in.
+ */
+export function retryableStatus(
+  status: number,
+  body: unknown,
+  idempotent: boolean,
+  replaySafe: boolean = idempotent,
+): boolean {
+  // The write may have been applied (a forwarded write that timed out):
+  // replay it only when that is safe, whatever `retryable` says.
+  if (isRecord(body) && isRecord(body.details) && body.details.outcome === "unknown") return replaySafe;
   if (isRecord(body) && typeof body.retryable === "boolean") return body.retryable;
   if (status === 429 || status === 503) return true;
   if (status === 502 || status === 504) return idempotent;

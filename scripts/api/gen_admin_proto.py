@@ -32,6 +32,26 @@ QUERY_PARAMS = {
         ("tenant", "string", "Narrow to one tenant."),
         ("limit", "uint32", "At most this many records."),
     ],
+    "AdminService_ListAuditLog": [
+        ("limit", "uint32", "Page size (default 100, at most 1000)."),
+        (
+            "before",
+            "int64",
+            "Only events older than this event id: the previous page's `next_before`.",
+        ),
+    ],
+}
+
+# Operations that also answer 202 Accepted, and what that means.
+ACCEPTED = {
+    "AdminService_CompactNamespace": (
+        "Accepted: with `async: true` the compaction runs in the background; "
+        "poll `GET /v1/admin/compaction-jobs/{id}` with the returned job id."
+    ),
+    "AdminService_DeleteTenant": (
+        "Accepted: the deletion is recorded but not complete (`completed: false`); "
+        "finish it with `POST /v1/admin/deletions/resume`."
+    ),
 }
 
 ROW = re.compile(r'admin\(\s*"(GET|POST|DELETE)",\s*"([^"]+)",\s*"(AdminService_\w+)",\s*\w+,?\s*\)')
@@ -96,6 +116,18 @@ def _retry_response(status, doc):
         "        }\n"
         "      }\n"
     ) % (status, doc)
+
+
+def _accepted_response(doc):
+    return (
+        "      responses: {\n"
+        '        key: "202"\n'
+        "        value: {\n"
+        '          description: "%s"\n'
+        "          schema: {json_schema: {ref: \".google.protobuf.Struct\"}}\n"
+        "        }\n"
+        "      }\n"
+    ) % doc
 
 
 # The per-operation copies of the responses that carry Retry-After.
@@ -248,6 +280,7 @@ def render():
             # Per operation: the generator drops headers of file-level
             # responses (grpc-gateway v2.24.0), so every retryable status
             # is repeated here with its Retry-After.
+            + (_accepted_response(ACCEPTED[op]) if op in ACCEPTED else "")
             + RETRY_RESPONSES
             + "      extensions: {\n"
             '        key: "x-kosha-error-codes"\n'

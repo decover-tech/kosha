@@ -182,3 +182,26 @@ describe("bulkIndex", () => {
     expect(order).not.toContain("d0003:a");
   });
 });
+
+describe("searchAll cursor details", () => {
+  it("keeps sort fields out of source_excludes", async () => {
+    const { pagedRequest } = await import("../src/paginate.js");
+    const { body, keys, descending } = pagedRequest(
+      { query_text: "", sort: [{ tag: { order: "desc" } }], source_excludes: ["tag", "title"] },
+      10,
+    );
+    expect(body.source_excludes).toEqual(["title"]);
+    expect(keys).toEqual(["tag", "_id"]);
+    expect(descending).toEqual([true, false]);
+  });
+
+  it("uses the list element the server sorts by", async () => {
+    const { cursorFor, sortValueOf } = await import("../src/paginate.js");
+    const hit = { doc_id: "d1", fields: [{ name: "tags", value: '["b","a","c"]' }] } as Hit;
+    expect(cursorFor(hit, ["tags", "_id"], [false, false])).toEqual(["a", "d1"]);
+    expect(cursorFor(hit, ["tags", "_id"], [true, false])).toEqual(["c", "d1"]);
+    expect(sortValueOf("[]", false)).toBe("");
+    expect(sortValueOf("[x", false)).toBe("[x");
+    expect(sortValueOf("plain", true)).toBe("plain");
+  });
+});

@@ -419,8 +419,10 @@ type V1ErrorResponse struct {
 	// carries the same delay in whole seconds.
 	RetryAfterMs *int64 `json:"retry_after_ms,omitempty"`
 
-	// Retryable Whether the identical request may succeed later. The server did not
-	// apply it (except a forwarded write with `details.outcome: "unknown"`).
+	// Retryable Whether the identical request may succeed later; true only when the
+	// server did not apply it. A forwarded write whose outcome is unknown
+	// (`details.outcome: "unknown"`) says false: retry it only if the
+	// operation is idempotent.
 	Retryable *bool `json:"retryable,omitempty"`
 }
 
