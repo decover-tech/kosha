@@ -8505,6 +8505,37 @@ impl SegmentReader {
         }))
     }
 
+    /// Offline analysis only (`kosha-cluster-eval --trace`): reads
+    /// `field`'s f32 posting column once, sequentially, the way
+    /// [`Self::vector_posting_layout`] does, and calls `visit(posting,
+    /// centroid, bytes, doc_seqs, vectors)` for every posting, where
+    /// `bytes` is the posting's length in `vector.idx` (what a probe of it
+    /// reads) and `vectors` is `doc_seqs.len()` rows of `dim` floats. The
+    /// two buffers are reused between calls. `Ok(false)` when the column is
+    /// not a lazy clustered f32 index (absent, flat, quantized).
+    pub fn for_each_f32_vector_posting(
+        &self,
+        field: &str,
+        mut visit: impl FnMut(usize, &[f32], u32, &[u32], &[f32]),
+    ) -> Result<bool, KoshaError> {
+        let Some(index) = self.vector_field(field)? else {
+            return Ok(false);
+        };
+        let Some(vi) = index.lazy.as_ref().filter(|vi| !vi.quantized) else {
+            return Ok(false);
+        };
+        let mut file = std::io::BufReader::new(fs::File::open(&vi.vector_idx_path)?);
+        let (mut buf, mut ids, mut vectors) = (Vec::new(), Vec::new(), Vec::new());
+        for (i, (centroid, &(offset, length))) in vi.centroid_rows().zip(&vi.ranges).enumerate() {
+            file.seek(SeekFrom::Start(offset))?;
+            buf.resize(length as usize, 0);
+            file.read_exact(&mut buf)?;
+            decode_f32_entries_into(&buf, vi.dim, &mut ids, &mut vectors);
+            visit(i, centroid, length, &ids, &vectors);
+        }
+        Ok(true)
+    }
+
     /// The flat (legacy / missing-sidecar) vectors of this segment's first
     /// vector column — empty when it is served lazily or has none.
     pub fn vector_store(&self) -> VectorStore {
