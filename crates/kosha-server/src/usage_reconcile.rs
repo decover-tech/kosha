@@ -877,7 +877,11 @@ type Snapshots = HashMap<(String, String), (u64, u64)>;
 
 /// The latest `stored_bytes` snapshot of each namespace inside the window.
 fn latest_snapshots(usage: &dyn UsageStore, options: &Options) -> Result<Snapshots, KoshaError> {
-    let from_ms = options.now_ms.saturating_sub(options.max_snapshot_age_ms);
+    // Rounded down to the start of an hour: snapshots are stamped with the
+    // start of theirs, so a window of exactly one hour opened at 07:02
+    // would otherwise begin after the 06:00 snapshot while the 07:00 one
+    // is not taken yet.
+    let from_ms = options.now_ms.saturating_sub(options.max_snapshot_age_ms) / HOUR_MS * HOUR_MS;
     let to_ms = options.now_ms.saturating_add(1);
     let mut latest = Snapshots::new();
     for bucket in usage.hourly(options.tenant.as_deref(), from_ms, to_ms)? {
@@ -908,6 +912,14 @@ fn judge(
         let difference = difference.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
         (difference, options.allowed(storage.referenced_bytes, bytes))
     });
+    // The byte floor of the tolerance is for two measurements of the same
+    // segments taken minutes apart. A snapshot of something against no
+    // referenced bytes at all is not that: an `unknown` prefix (whose
+    // referenced bytes are always 0) holding untracked objects, or a live
+    // namespace whose prefix is empty. Those never read `match`, however
+    // small the snapshot.
+    let nothing_referenced =
+        snapshot.is_some_and(|(_, bytes)| bytes > 0) && storage.referenced_bytes == 0;
     let has_storage = storage.objects > 0;
     // A namespace can leave the control plane without a deletion record
     // (branch deletion, `migrate-namespace`). Its last snapshots stay in
@@ -933,7 +945,11 @@ fn judge(
         (_, Some(_)) if left_quietly && !has_storage => Status::Removed,
         (_, None) if has_storage => Status::StorageWithoutSnapshot,
         (_, None) => Status::Empty,
-        (_, Some((difference, allowed))) if difference.unsigned_abs() <= allowed => Status::Match,
+        (_, Some((difference, allowed)))
+            if !nothing_referenced && difference.unsigned_abs() <= allowed =>
+        {
+            Status::Match
+        }
         (_, Some(_)) if has_storage => Status::Mismatch,
         (_, Some(_)) => Status::SnapshotWithoutStorage,
     };

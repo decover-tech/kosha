@@ -536,10 +536,105 @@ fn a_repeated_snapshot_of_the_same_hour_is_idempotent_across_processes() {
     let rows = store.inner.row_count();
     let restarted = boot();
     // The new process does not know the hour was snapshotted; the store does.
+    // Two events: `stored_bytes` and `vector_dimensions`.
     assert_eq!(usage::run_snapshot_tick(&restarted, now), 1);
     let report = flush(&restarted);
-    assert_eq!((report.events, report.stored_rows), (1, 0));
+    assert_eq!((report.events, report.stored_rows), (2, 0));
     assert_eq!(store.inner.row_count(), rows);
+}
+
+/// A delete by query is metered with the documents it removed and their
+/// doc-store bytes; one that matches nothing emits nothing. The hourly
+/// snapshot carries `vector_dimensions` from the segments' footers, read
+/// once per segment.
+#[test]
+fn deletes_and_vector_dimensions_are_metered() {
+    let (state, store) = metered_state();
+    let vector = |id: &str, dims: usize| {
+        let v: Vec<f32> = (0..dims).map(|i| i as f32 + 0.5).collect();
+        serde_json::json!({"id": id, "fields": [
+            {"name": "title", "field_type": "Text", "value": format!("doc {id}")},
+            {"name": "emb", "field_type": "Vector", "value": serde_json::to_string(&v).unwrap()}
+        ]})
+    };
+    ok(call(
+        &state,
+        "acme",
+        "POST /v1/namespaces/docs/documents",
+        serde_json::json!({"documents": [vector("a", 8), vector("b", 8), vector("c", 8), doc("d", "no vector")]}),
+    ));
+    ok(call(
+        &state,
+        "acme",
+        "POST /v1/namespaces/docs/flush",
+        serde_json::json!({}),
+    ));
+    let now = unix_millis();
+    assert_eq!(usage::run_snapshot_tick(&state, now), 1);
+    let stats = state.usage.as_ref().unwrap().stats();
+    assert_eq!(stats.footer_reads.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.vector_snapshots.load(Ordering::Relaxed), 1);
+
+    let deleted = ok(call(
+        &state,
+        "acme",
+        "POST /v1/namespaces/docs/delete",
+        serde_json::json!({"filter": {"match_all": {}}}),
+    ));
+    assert_eq!(body_of(&deleted)["deleted"], 4);
+    // Nothing matched: nothing metered.
+    ok(call(
+        &state,
+        "acme",
+        "POST /v1/namespaces/docs/delete",
+        serde_json::json!({"filter": {"term": {"nope": "zzz"}}}),
+    ));
+    flush(&state);
+    let usage = stored_usage(&store, "acme");
+    let docs = usage.iter().find(|u| u.namespace == "docs").unwrap();
+    assert_eq!(docs.documents_deleted, 4);
+    assert!(docs.bytes_deleted > 0, "{docs:?}");
+    // Three 8-dimension vectors in one segment.
+    assert_eq!(docs.vector_dimensions_latest, Some(3 * 8));
+    assert_eq!(docs.vector_dimension_hours, 3 * 8);
+
+    // The next hour: the same segment, its footer not read again.
+    assert_eq!(usage::run_snapshot_tick(&state, now + HOUR_MS), 1);
+    assert_eq!(stats.footer_reads.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.vector_snapshots.load(Ordering::Relaxed), 2);
+    flush(&state);
+    let usage = stored_usage(&store, "acme");
+    let docs = usage.iter().find(|u| u.namespace == "docs").unwrap();
+    assert_eq!(docs.vector_dimension_hours, 2 * 3 * 8);
+}
+
+#[test]
+fn footer_vector_dimensions_counts_columns_and_bags() {
+    let mut footer: kosha_core::Footer = serde_json::from_value(serde_json::json!({
+        "segment_id": "s", "doc_count": 3, "total_field_length": 0, "avg_field_length": 0.0,
+        "bm25_params": {"k1": 1.2, "b": 0.75}, "created_at": "now"
+    }))
+    .unwrap();
+    // A legacy footer (no column inventory) counts nothing.
+    assert_eq!(usage::footer_vector_dimensions(&footer), 0);
+    footer.vector_fields = Some(vec![
+        serde_json::from_value(
+            serde_json::json!({"name": "a", "dim": 768, "count": 10, "slot": 0}),
+        )
+        .unwrap(),
+        serde_json::from_value(serde_json::json!({"name": "b", "dim": 4, "count": 2, "slot": 1}))
+            .unwrap(),
+    ]);
+    footer.multi_vectors = vec![kosha_core::MultiVectorField {
+        name: "m".into(),
+        dim: 128,
+        docs: 2,
+        tokens: 50,
+    }];
+    assert_eq!(
+        usage::footer_vector_dimensions(&footer),
+        768 * 10 + 4 * 2 + 128 * 50
+    );
 }
 
 /// A sharded namespace is metered as one namespace: its shards' segments
