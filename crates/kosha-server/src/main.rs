@@ -79,6 +79,8 @@ mod crash_points_tests;
 #[cfg_attr(not(feature = "s3"), allow(dead_code))]
 mod segment_commit;
 mod segment_gc;
+#[cfg(all(test, feature = "s3"))]
+mod segment_pin_tests;
 mod tenant_limits;
 mod unindexed;
 mod usage;
@@ -2803,6 +2805,7 @@ impl AppState {
                 manifest,
                 &query,
                 &RequestHydration::unlimited(),
+                None,
             );
             if outcome.missing.is_empty() && !outcome.bloom_pruned {
                 self.completed_hydrations
@@ -3749,26 +3752,33 @@ impl AppState {
         (files, bytes)
     }
 
-    /// Pin every segment directory of `manifest` in the disk cache until
-    /// the returned guard drops.
-    fn pin_segments(&self, ns: &NamespaceId, manifest: &kosha_core::Manifest) -> SegmentPins<'_> {
-        let keys: Vec<String> = manifest
-            .segments
-            .iter()
-            .filter_map(|entry| {
-                let dir = manifest.segment_dir(&self.data_dir, ns, &entry.segment_id);
-                dir.strip_prefix(&self.data_dir)
-                    .ok()
-                    .map(|rel| rel.to_string_lossy().into_owned())
-            })
-            .collect();
-        for key in &keys {
-            self.cache.pin(key);
-        }
-        SegmentPins {
+    /// A search's disk-cache pins, until the returned guard drops: to start
+    /// with, the `footer.json` of every segment `manifest` holds no cached
+    /// footer for. The searcher prunes segments with those footers read
+    /// from disk (`Manifest::footer_or_read`), so it needs them for every
+    /// segment, including the ones it never hydrates: one evicted
+    /// mid-search leaves its segment unpruned, and the search fails on a
+    /// segment it was never meant to read. The directories of the segments
+    /// it does read are added once hydration has chosen them
+    /// ([`search_segment_sets`]), before anything is fetched for them.
+    #[cfg(feature = "s3")]
+    fn pin_search_footers(
+        &self,
+        ns: &NamespaceId,
+        manifest: &kosha_core::Manifest,
+    ) -> SegmentPins<'_> {
+        let mut pins = SegmentPins {
             cache: &self.cache,
-            keys,
+            data_dir: &self.data_dir,
+            keys: Vec::new(),
+        };
+        for entry in &manifest.segments {
+            if manifest.segment_footer(&entry.segment_id).is_none() {
+                let dir = manifest.segment_dir(&self.data_dir, ns, &entry.segment_id);
+                pins.hold(&dir.join("footer.json"));
+            }
         }
+        pins
     }
 
     /// Fetch a batch of `(logical_path, projected_size_bytes)` pairs into
@@ -4046,13 +4056,17 @@ impl AppState {
         manifest: &kosha_core::Manifest,
         query: &SearchQuery,
         request: &Arc<RequestHydration>,
+        // A search's pins (see `AppState::pin_search_footers`): the
+        // segments chosen below are added before any of their files is
+        // fetched. `None` for warm-up, which reads nothing afterwards.
+        pins: Option<&mut SegmentPins<'_>>,
     ) -> HydrationOutcome {
-        let term_prune = kosha_query::term_bloom_prune_mode(query);
         // The query is analyzed per segment with the chains its footer
         // records (#220), so which terms (and posting-blob shards) a
         // segment needs depends on its footer.
         let query_analysis = kosha_query::QueryAnalysis::new(query);
-        let needs_bloom_check = query.has_prunable_filter() || term_prune.is_some();
+        let needs_bloom_check =
+            query.has_prunable_filter() || kosha_query::term_bloom_prune_mode(query).is_some();
         // Single-vector kNN reads its column's index; late interaction
         // (#205) reads the field's multivec files instead (below).
         let knn_field = query
@@ -4172,23 +4186,21 @@ impl AppState {
             posting_terms_for_query(query, &query_analysis, analyses.iter().copied());
         let stats_terms = kosha_query::namespace_stats_terms(query, analyses.iter().copied())
             .filter(|t| !t.is_empty());
-        let mut to_hydrate: Vec<PathBuf> = Vec::new();
-        let mut stats_only: Vec<PathBuf> = Vec::new();
-        for (entry, seg_path) in manifest.segments.iter().zip(all_seg_paths.iter().cloned()) {
-            // Borrowed, never cloned: footers hold every bloom. A segment
-            // with no cached footer was already read (once) into
-            // `fetched_footers` above.
-            let footer = segment_footer(entry);
-            match segment_search_hydration(
-                query,
-                needs_bloom_check,
-                term_prune.map(|mode| (&query_analysis, mode)),
-                stats_terms.as_deref(),
-                footer,
-            ) {
-                SegmentHydration::Scoring => to_hydrate.push(seg_path),
-                SegmentHydration::StatsOnly => stats_only.push(seg_path),
-                SegmentHydration::Skip => {}
+        // Footers borrowed, never cloned: they hold every bloom. A segment
+        // with no cached footer was already read (once) into
+        // `fetched_footers` above.
+        let (to_hydrate, stats_only) = search_segment_sets(
+            query,
+            &query_analysis,
+            stats_terms.as_deref(),
+            all_seg_paths
+                .iter()
+                .cloned()
+                .zip(manifest.segments.iter().map(segment_footer)),
+        );
+        if let Some(pins) = pins {
+            for seg_path in to_hydrate.iter().chain(&stats_only) {
+                pins.hold(seg_path);
             }
         }
         // The filter files each segment needs for this query (#244): its
@@ -4808,6 +4820,9 @@ impl AppState {
     /// [`kosha_segment::POSTING_BLOB_SHARDS`] shard files). Sub-ms when the
     /// shards are already local and the presence cache has already seen
     /// them this manifest version — see `posting_blob_presence`.
+    ///
+    /// Also adds to `pins` the segments the search reads, chosen as
+    /// `hydrate_segments_for_search` chooses them, before fetching anything.
     #[cfg(feature = "s3")]
     fn ensure_query_posting_blobs(
         &self,
@@ -4815,37 +4830,53 @@ impl AppState {
         manifest: &kosha_core::Manifest,
         query: &SearchQuery,
         request: &Arc<RequestHydration>,
+        pins: &mut SegmentPins<'_>,
     ) -> HydrationOutcome {
-        // Footers are local whenever the namespace verdict is cached (it
-        // means every segment's scoring set is present).
-        let analyses: Vec<Option<kosha_core::SegmentAnalysis>> = manifest
-            .segments
-            .iter()
-            .map(|entry| {
-                let dir = manifest.segment_dir(&self.data_dir, ns, &entry.segment_id);
-                manifest
-                    .footer_or_read(&entry.segment_id, || {
-                        kosha_segment::SegmentReader::read_footer(&dir).ok()
-                    })
-                    .and_then(|footer| footer.analysis.clone())
-            })
-            .collect();
-        let query_analysis = kosha_query::QueryAnalysis::new(query);
-        let posting_files = posting_blob_files_for_query(
-            query,
-            &query_analysis,
-            analyses.iter().map(Option::as_ref),
-        );
-        let posting_terms =
-            posting_terms_for_query(query, &query_analysis, analyses.iter().map(Option::as_ref));
-        if posting_files.is_empty() {
-            return HydrationOutcome::default();
-        }
         let seg_paths: Vec<PathBuf> = manifest
             .segments
             .iter()
             .map(|entry| manifest.segment_dir(&self.data_dir, ns, &entry.segment_id))
             .collect();
+        // Footers are local whenever the namespace verdict is cached (it
+        // means every segment's scoring set is present). Held together for
+        // this call, as `hydrate_segments_for_search` holds the ones it
+        // reads: usually borrowed from the manifest, which caches them.
+        let footers: Vec<Option<std::borrow::Cow<'_, kosha_core::Footer>>> = manifest
+            .segments
+            .iter()
+            .zip(&seg_paths)
+            .map(|(entry, dir)| {
+                manifest.footer_or_read(&entry.segment_id, || {
+                    kosha_segment::SegmentReader::read_footer(dir).ok()
+                })
+            })
+            .collect();
+        let analyses: Vec<Option<&kosha_core::SegmentAnalysis>> = footers
+            .iter()
+            .map(|footer| footer.as_deref().and_then(|f| f.analysis.as_ref()))
+            .collect();
+        let query_analysis = kosha_query::QueryAnalysis::new(query);
+        let stats_terms = kosha_query::namespace_stats_terms(query, analyses.iter().copied())
+            .filter(|t| !t.is_empty());
+        let (scoring, stats_only) = search_segment_sets(
+            query,
+            &query_analysis,
+            stats_terms.as_deref(),
+            seg_paths
+                .iter()
+                .cloned()
+                .zip(footers.iter().map(Option::as_deref)),
+        );
+        for seg_path in scoring.iter().chain(&stats_only) {
+            pins.hold(seg_path);
+        }
+        let posting_files =
+            posting_blob_files_for_query(query, &query_analysis, analyses.iter().copied());
+        let posting_terms =
+            posting_terms_for_query(query, &query_analysis, analyses.iter().copied());
+        if posting_files.is_empty() {
+            return HydrationOutcome::default();
+        }
         self.ensure_query_postings(
             ns,
             manifest,
@@ -8638,11 +8669,13 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     // See `hydration_budget`.
     #[cfg(feature = "s3")]
     let hydration_request = Arc::new(RequestHydration::new(state.hydrate_request_max_bytes));
-    // Hold this search's segments in the disk cache until it returns: once
+    // Hold what this search reads in the disk cache until it returns: once
     // the working set reaches KOSHA_CACHE_MAX_BYTES, files fetched for it
     // otherwise evicted files it had just checked, and it failed with
-    // "segment hydration failed".
-    let _segment_pins = state.pin_segments(&ns, manifest);
+    // "segment hydration failed". Only what it reads — see `SegmentPins`;
+    // hydration adds the segments it chooses.
+    #[cfg(feature = "s3")]
+    let mut segment_pins = state.pin_search_footers(&ns, manifest);
     // Read stamp for the disk-cache policy (#389): files this search
     // hydrates do not count its own read as a re-read. 0 when off.
     let cache_read_at = state.begin_cache_read();
@@ -8687,10 +8720,21 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
             // sub-ms when the shards are already local: one metadata stat
             // per term-shard per split segment.
             state.record_warm_nvme_hits(&ns, manifest);
-            state.ensure_query_posting_blobs(&ns, manifest, search_query, &hydration_request)
+            state.ensure_query_posting_blobs(
+                &ns,
+                manifest,
+                search_query,
+                &hydration_request,
+                &mut segment_pins,
+            )
         } else {
-            let outcome =
-                state.hydrate_segments_for_search(&ns, manifest, search_query, &hydration_request);
+            let outcome = state.hydrate_segments_for_search(
+                &ns,
+                manifest,
+                search_query,
+                &hydration_request,
+                Some(&mut segment_pins),
+            );
             // Cache what this pass verified: the static scoring set is
             // local for this manifest version, so future warm queries with
             // matching-or-lesser needs skip the per-segment static checks
@@ -9299,11 +9343,13 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
     // See `hydration_budget`.
     #[cfg(feature = "s3")]
     let hydration_request = Arc::new(RequestHydration::new(state.hydrate_request_max_bytes));
-    // Hold this search's segments in the disk cache until it returns: once
+    // Hold what this search reads in the disk cache until it returns: once
     // the working set reaches KOSHA_CACHE_MAX_BYTES, files fetched for it
     // otherwise evicted files it had just checked, and it failed with
-    // "segment hydration failed".
-    let _segment_pins = state.pin_segments(&ns, manifest);
+    // "segment hydration failed". Only what it reads — see `SegmentPins`;
+    // hydration adds the segments it chooses.
+    #[cfg(feature = "s3")]
+    let mut segment_pins = state.pin_search_footers(&ns, manifest);
 
     let cache_read_at = state.begin_cache_read();
     let t_hydrate = Instant::now();
@@ -9327,10 +9373,21 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
             // Posting blobs are per-query and outside the cached verdict —
             // see `handle_search_post` for the full rationale.
             state.record_warm_nvme_hits(&ns, manifest);
-            state.ensure_query_posting_blobs(&ns, manifest, &query, &hydration_request)
+            state.ensure_query_posting_blobs(
+                &ns,
+                manifest,
+                &query,
+                &hydration_request,
+                &mut segment_pins,
+            )
         } else {
-            let outcome =
-                state.hydrate_segments_for_search(&ns, manifest, &query, &hydration_request);
+            let outcome = state.hydrate_segments_for_search(
+                &ns,
+                manifest,
+                &query,
+                &hydration_request,
+                Some(&mut segment_pins),
+            );
             // Only merge when unfiltered — see `HydrationOutcome::bloom_pruned`
             // and `handle_search_post` for the full rationale.
             if outcome.missing.is_empty() && !outcome.bloom_pruned {
@@ -11111,6 +11168,38 @@ fn segment_search_hydration(
     }
 }
 
+/// The segments a search for `query` reads beyond their footers, as
+/// [`segment_search_hydration`] decides each from its footer: the ones it
+/// scores (whose files later phases also read: page doc stores, vector
+/// postings, kNN rescoring) and the ones it reads only for namespace BM25
+/// `df` (`stats_only`). The searcher prunes the rest with the same bloom
+/// checks and never opens them.
+#[cfg(feature = "s3")]
+fn search_segment_sets<'f>(
+    query: &SearchQuery,
+    analysis: &kosha_query::QueryAnalysis,
+    stats_terms: Option<&[String]>,
+    segments: impl IntoIterator<Item = (PathBuf, Option<&'f kosha_core::Footer>)>,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let term_prune = kosha_query::term_bloom_prune_mode(query);
+    let needs_bloom_check = query.has_prunable_filter() || term_prune.is_some();
+    let (mut scoring, mut stats_only) = (Vec::new(), Vec::new());
+    for (seg_path, footer) in segments {
+        match segment_search_hydration(
+            query,
+            needs_bloom_check,
+            term_prune.map(|mode| (analysis, mode)),
+            stats_terms,
+            footer,
+        ) {
+            SegmentHydration::Scoring => scoring.push(seg_path),
+            SegmentHydration::StatsOnly => stats_only.push(seg_path),
+            SegmentHydration::Skip => {}
+        }
+    }
+    (scoring, stats_only)
+}
+
 /// Whether scoring/materialization needs `filters.bin`. Broad lexical
 /// queries with default score/_id ranking do not: they use only postings,
 /// doc metadata, and page doc stores.
@@ -11334,12 +11423,31 @@ fn json_ok<T: serde::Serialize>(value: &T) -> String {
     )
 }
 
-/// Disk-cache pins on a search's segment directories, released on drop.
+/// Disk-cache pins on what a search reads, released on drop. Only what it
+/// reads: all Decover matters share one namespace, so pinning every
+/// segment of it for each in-flight search stopped all eviction under
+/// steady traffic and let the cache grow past `KOSHA_CACHE_MAX_BYTES`.
+#[cfg(feature = "s3")]
 struct SegmentPins<'a> {
     cache: &'a Cache,
+    data_dir: &'a Path,
     keys: Vec<String>,
 }
 
+#[cfg(feature = "s3")]
+impl SegmentPins<'_> {
+    /// Pin `path` (a segment directory, which holds every file under it,
+    /// or one file) until the guard drops.
+    fn hold(&mut self, path: &Path) {
+        if let Ok(rel) = path.strip_prefix(self.data_dir) {
+            let key = rel.to_string_lossy().into_owned();
+            self.cache.pin(&key);
+            self.keys.push(key);
+        }
+    }
+}
+
+#[cfg(feature = "s3")]
 impl Drop for SegmentPins<'_> {
     fn drop(&mut self) {
         for key in &self.keys {
@@ -16860,6 +16968,7 @@ mod tests {
             &manifest,
             &base_query,
             &RequestHydration::unlimited(),
+            None,
         );
         assert!(
             !unfiltered.bloom_pruned,
@@ -16876,6 +16985,7 @@ mod tests {
             &manifest,
             &filtered_query,
             &RequestHydration::unlimited(),
+            None,
         );
         assert!(
             filtered.bloom_pruned,
@@ -17209,6 +17319,7 @@ mod tests {
             &manifest,
             &warmup_like,
             &RequestHydration::unlimited(),
+            None,
         );
         assert!(outcome.missing.is_empty() && !outcome.bloom_pruned);
         state
@@ -17282,6 +17393,7 @@ mod tests {
             &manifest,
             &sorted_unfiltered,
             &RequestHydration::unlimited(),
+            None,
         );
         assert!(
             outcome3.missing.is_empty() && !outcome3.bloom_pruned,
