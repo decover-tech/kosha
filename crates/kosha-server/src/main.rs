@@ -14328,6 +14328,93 @@ mod tests {
     }
 
     #[test]
+    fn percentiles_over_http_and_bad_percents_are_400() {
+        let state = test_state();
+        let ns = NamespaceId("pctns".into());
+        let doc = |id: &str, kind: &str, ms: i64| Document {
+            id: DocumentId(id.into()),
+            fields: vec![
+                Field::text("text", "request"),
+                Field::keyword("kind", kind),
+                Field::integer("ms", ms),
+            ],
+        };
+        // Two flushes, so the percentiles merge across two segments.
+        for batch in [
+            vec![
+                doc("1", "read", 10),
+                doc("2", "read", 20),
+                doc("3", "write", 100),
+            ],
+            vec![
+                doc("4", "read", 30),
+                doc("5", "read", 40),
+                doc("6", "write", 300),
+            ],
+        ] {
+            state.indexer.index_documents(ns.clone(), batch).unwrap();
+            state.indexer.flush_namespace(&ns).unwrap();
+        }
+        state.publish_namespace(&ns).unwrap();
+
+        let post = |aggs: &str| {
+            let body = format!(
+                r#"{{"namespace":"pctns","query_text":"request","max_results":0,"aggs":{aggs}}}"#
+            );
+            handle_search_post(body.as_bytes(), &state)
+        };
+        let resp = post(
+            r#"{"latency":{"percentiles":{"field":"ms","percents":[0,50,100]}},
+                "as_list":{"percentiles":{"field":"ms","percents":[50],"keyed":false}},
+                "by_kind":{"terms":{"field":"kind"},
+                           "aggs":{"p":{"percentiles":{"field":"ms","percents":[50]}}}}}"#,
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let v: serde_json::Value =
+            serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+        let aggs = &v["aggregations"];
+        // Sorted: 10, 20, 30, 40, 100, 300. The median interpolates
+        // between 30 and 40.
+        assert_eq!(
+            aggs["latency"],
+            serde_json::json!({"values": {"0.0": 10.0, "50.0": 35.0, "100.0": 300.0}}),
+            "{v}"
+        );
+        assert_eq!(
+            aggs["as_list"],
+            serde_json::json!({"values": [{"key": 50.0, "value": 35.0}]}),
+            "{v}"
+        );
+        assert_eq!(
+            aggs["by_kind"],
+            serde_json::json!({"buckets": [
+                {"key": "read", "doc_count": 4, "p": {"values": {"50.0": 25.0}}},
+                {"key": "write", "doc_count": 2, "p": {"values": {"50.0": 200.0}}},
+            ]}),
+            "{v}"
+        );
+
+        for (aggs, needle) in [
+            (
+                r#"{"x":{"percentiles":{"field":"ms","percents":[101]}}}"#,
+                "between 0 and 100",
+            ),
+            (
+                r#"{"x":{"percentiles":{"field":"ms","percents":[]}}}"#,
+                "must not be empty",
+            ),
+            (
+                r#"{"x":{"percentiles":{"field":"ms","tdigest":{"compression":200}}}}"#,
+                "`tdigest` is not supported yet",
+            ),
+        ] {
+            let resp = post(aggs);
+            assert!(resp.starts_with("HTTP/1.1 400"), "{aggs}: {resp}");
+            assert!(resp.contains(needle), "{aggs}: {resp}");
+        }
+    }
+
+    #[test]
     fn histogram_aggregations_over_http_and_bad_intervals_are_400() {
         // Issue #219: `histogram` / `date_histogram` over `/search`, and a
         // garbage interval or unsupported calendar interval is a 400;
