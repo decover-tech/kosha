@@ -530,11 +530,32 @@ impl ShardView {
 /// `AppState::segment_is_complete` themselves afterward, same as the owner
 /// does, so a failed fetch is never mistaken for a successful one.
 #[cfg(feature = "s3")]
-#[derive(Default)]
 struct SegmentFetch {
     done: Mutex<bool>,
     cv: Condvar,
+    /// The segment, and which hydration owns its fetch
+    /// ([`HYDRATE_OWNER_SEGMENTS`] or [`HYDRATE_OWNER_SCORING`]), for a
+    /// waiter's slow-wait log line.
+    seg_path: PathBuf,
+    owner: &'static str,
+    /// Bytes the owner's whole batch fetched, set by `complete_owned`.
+    owner_bytes: std::sync::atomic::AtomicU64,
 }
+
+/// `SegmentFetch::owner` of a full-segment hydration
+/// (`ensure_segments_local`: index, compaction, admin rewrites).
+#[cfg(feature = "s3")]
+const HYDRATE_OWNER_SEGMENTS: &str = "full_segment";
+/// `SegmentFetch::owner` of a search's scoring-set hydration
+/// (`ensure_scoring_files_local`).
+#[cfg(feature = "s3")]
+const HYDRATE_OWNER_SCORING: &str = "scoring_set";
+
+/// A wait for a hydration slot or for another request's fetch longer than
+/// this is logged: a healthy cold fetch is well under it, and past it the
+/// request's latency is mostly queueing.
+#[cfg_attr(not(feature = "s3"), allow(dead_code))]
+const SLOW_HYDRATION_WAIT: Duration = Duration::from_secs(5);
 
 /// Minimal counting semaphore built on `Mutex`/`Condvar`, for S3
 /// hydration: synchronous from the caller's point of view (it runs on the
@@ -560,13 +581,26 @@ impl Semaphore {
 
     /// Block until a permit is available, then hold it until the returned
     /// guard is dropped. Unbounded: for callers where waiting is always
-    /// preferable to failing.
-    fn acquire(&self) -> SemaphorePermit<'_> {
+    /// preferable to failing. A wait over [`SLOW_HYDRATION_WAIT`] is logged
+    /// naming `phase`, the hydration that waited.
+    fn acquire(&self, phase: &str) -> SemaphorePermit<'_> {
         let mut permits = self.permits.lock().unwrap();
+        let started = (*permits == 0).then(Instant::now);
         while *permits == 0 {
             permits = self.cv.wait(permits).unwrap();
         }
         *permits -= 1;
+        drop(permits);
+        if let Some(waited) = started.map(|t| t.elapsed()) {
+            if waited >= SLOW_HYDRATION_WAIT {
+                eprintln!(
+                    "WARN: hydration slot wait: phase={phase} waited_ms={} \
+                     (KOSHA_MAX_CONCURRENT_HYDRATIONS){}",
+                    waited.as_millis(),
+                    request_id()
+                );
+            }
+        }
         SemaphorePermit { sem: self }
     }
 }
@@ -912,6 +946,7 @@ type OwnedFetches = Vec<(PathBuf, Arc<SegmentFetch>)>;
 fn partition_for_hydration(
     in_flight: &Mutex<HashMap<PathBuf, Arc<SegmentFetch>>>,
     seg_paths: &[PathBuf],
+    owner: &'static str,
     is_complete: impl Fn(&Path) -> bool,
 ) -> (OwnedFetches, Vec<Arc<SegmentFetch>>) {
     let mut owned = Vec::new();
@@ -924,7 +959,13 @@ fn partition_for_hydration(
         match guard.get(seg_path) {
             Some(existing) => waiting.push(Arc::clone(existing)),
             None => {
-                let entry = Arc::new(SegmentFetch::default());
+                let entry = Arc::new(SegmentFetch {
+                    done: Mutex::new(false),
+                    cv: Condvar::new(),
+                    seg_path: seg_path.clone(),
+                    owner,
+                    owner_bytes: std::sync::atomic::AtomicU64::new(0),
+                });
                 guard.insert(seg_path.clone(), Arc::clone(&entry));
                 owned.push((seg_path.clone(), entry));
             }
@@ -937,11 +978,19 @@ fn partition_for_hydration(
 /// and remove each entry from `in_flight` so a future cache miss can retry
 /// it — must be called exactly once per batch returned by
 /// `partition_for_hydration`, whether the fetch succeeded or failed.
+/// `bytes` is what the batch fetched, for waiters' slow-wait log line.
 #[cfg(feature = "s3")]
-fn complete_owned(in_flight: &Mutex<HashMap<PathBuf, Arc<SegmentFetch>>>, owned: &OwnedFetches) {
+fn complete_owned(
+    in_flight: &Mutex<HashMap<PathBuf, Arc<SegmentFetch>>>,
+    owned: &OwnedFetches,
+    bytes: u64,
+) {
     let mut guard = in_flight.lock().unwrap();
     for (seg_path, entry) in owned {
         guard.remove(seg_path);
+        entry
+            .owner_bytes
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
         let mut done = entry.done.lock().unwrap();
         *done = true;
         entry.cv.notify_all();
@@ -949,14 +998,39 @@ fn complete_owned(in_flight: &Mutex<HashMap<PathBuf, Arc<SegmentFetch>>>, owned:
 }
 
 /// Block until every entry in `waiting` has been signalled complete by its
-/// owner (see `complete_owned`).
+/// owner (see `complete_owned`). A wait over [`SLOW_HYDRATION_WAIT`] is
+/// logged once, naming the segment waited on longest and its owner.
 #[cfg(feature = "s3")]
 fn wait_for(waiting: &[Arc<SegmentFetch>]) {
+    if waiting.is_empty() {
+        return;
+    }
+    let started = Instant::now();
+    let mut slowest: Option<(Duration, &SegmentFetch)> = None;
     for entry in waiting {
+        let t = Instant::now();
         let mut done = entry.done.lock().unwrap();
         while !*done {
             done = entry.cv.wait(done).unwrap();
         }
+        drop(done);
+        let waited = t.elapsed();
+        if slowest.is_none_or(|(w, _)| waited > w) {
+            slowest = Some((waited, entry));
+        }
+    }
+    let waited = started.elapsed();
+    if let Some((_, entry)) = slowest.filter(|_| waited >= SLOW_HYDRATION_WAIT) {
+        eprintln!(
+            "WARN: hydrate waited on other requests' fetches: waited_ms={} segments={} \
+             slowest={} owner={} owner_batch_mb={:.1}{}",
+            waited.as_millis(),
+            waiting.len(),
+            entry.seg_path.display(),
+            entry.owner,
+            entry.owner_bytes.load(std::sync::atomic::Ordering::Relaxed) as f64 / (1024.0 * 1024.0),
+            request_id()
+        );
     }
 }
 
@@ -3245,6 +3319,7 @@ impl AppState {
         let (owned, waiting) = partition_for_hydration(
             &self.in_flight_segments,
             seg_paths,
+            HYDRATE_OWNER_SEGMENTS,
             Self::segment_is_complete,
         );
 
@@ -3252,7 +3327,7 @@ impl AppState {
             // Bound total concurrent hydration *operations* server-wide —
             // released as soon as this operation's fetch is done, before
             // waiters below get to run.
-            let _permit = self.hydration_semaphore.acquire();
+            let _permit = self.hydration_semaphore.acquire("full_segment");
 
             let mut logical_paths: Vec<(String, u64)> = Vec::new();
             for (seg_path, _) in &owned {
@@ -3335,7 +3410,7 @@ impl AppState {
             }
 
             drop(_permit);
-            complete_owned(&self.in_flight_segments, &owned);
+            complete_owned(&self.in_flight_segments, &owned, outcome.bytes_fetched);
         }
 
         wait_for(&waiting);
@@ -3536,7 +3611,7 @@ impl AppState {
                     request,
                 };
                 let outcome = {
-                    let _permit = self.hydration_semaphore.acquire();
+                    let _permit = self.hydration_semaphore.acquire("page_docs");
                     self.span_hydrator.hydrate(pages, &fetcher, &self.cache)
                 };
                 stats.rounds = outcome.rounds;
@@ -3594,7 +3669,7 @@ impl AppState {
     fn promote_doc_store(&self, seg: &Path) {
         let t = Instant::now();
         let (files, bytes) = {
-            let _permit = self.hydration_semaphore.acquire();
+            let _permit = self.hydration_semaphore.acquire("promote_doc_store");
             self.ensure_doc_store_local(&[seg.to_path_buf()], &RequestHydration::unlimited())
         };
         let landed = file_present_nonempty(&seg.join(kosha_segment::DOC_STORE_FILE))
@@ -4348,27 +4423,32 @@ impl AppState {
         let vectors_ranged = self.posting_read_mode == doc_spans::ReadMode::Ranged;
         let filters_of = |p: &Path| filter_files.get(p).map(Vec::as_slice).unwrap_or(&[]);
         let mut outcome = HydrationOutcome::default();
-        let (owned, waiting) = partition_for_hydration(&self.in_flight_segments, seg_paths, |p| {
-            let complete = Self::scoring_complete(
-                p,
-                knn_field,
-                vectors_ranged,
-                filters_of(p),
-                manifest_footers.get(p).copied(),
-            );
-            // A search's segment found with its scoring files already local
-            // is a disk-cache hit for its tenant; one that must hydrate is a
-            // miss (#342, `kosha_cache_{hits,misses}{cache="nvme"}`).
-            if let Ok(rel) = p.strip_prefix(&self.data_dir) {
-                let rel = rel.to_string_lossy();
-                self.cache
-                    .record_lookup(kosha_core::tenancy::tenant_of_segment_dir(&rel), complete);
-            }
-            complete
-        });
+        let (owned, waiting) = partition_for_hydration(
+            &self.in_flight_segments,
+            seg_paths,
+            HYDRATE_OWNER_SCORING,
+            |p| {
+                let complete = Self::scoring_complete(
+                    p,
+                    knn_field,
+                    vectors_ranged,
+                    filters_of(p),
+                    manifest_footers.get(p).copied(),
+                );
+                // A search's segment found with its scoring files already local
+                // is a disk-cache hit for its tenant; one that must hydrate is a
+                // miss (#342, `kosha_cache_{hits,misses}{cache="nvme"}`).
+                if let Ok(rel) = p.strip_prefix(&self.data_dir) {
+                    let rel = rel.to_string_lossy();
+                    self.cache
+                        .record_lookup(kosha_core::tenancy::tenant_of_segment_dir(&rel), complete);
+                }
+                complete
+            },
+        );
 
         if !owned.is_empty() {
-            let _permit = self.hydration_semaphore.acquire();
+            let _permit = self.hydration_semaphore.acquire("scoring_set");
 
             // Which vector files a kNN needs is read from each segment's
             // footer (#204), so a footer known neither from the manifest nor
@@ -4679,7 +4759,7 @@ impl AppState {
             }
 
             drop(_permit);
-            complete_owned(&self.in_flight_segments, &owned);
+            complete_owned(&self.in_flight_segments, &owned, outcome.bytes_fetched);
         }
 
         wait_for(&waiting);
@@ -4870,7 +4950,7 @@ impl AppState {
                 request,
             };
             let o = {
-                let _permit = self.hydration_semaphore.acquire();
+                let _permit = self.hydration_semaphore.acquire("posting_spans");
                 self.posting_span_hydrator
                     .hydrate(&ranged, terms, &fetcher, &self.cache)
             };
@@ -5037,7 +5117,7 @@ impl AppState {
         };
         let t = Instant::now();
         let (files, bytes) = {
-            let _permit = self.hydration_semaphore.acquire();
+            let _permit = self.hydration_semaphore.acquire("promote_posting_shard");
             self.ensure_files_local(&[seg.to_path_buf()], &file, &RequestHydration::unlimited())
         };
         let landed = file_present_nonempty(shard);
@@ -5077,7 +5157,7 @@ impl AppState {
             return HydrationOutcome::default();
         }
 
-        let _permit = self.hydration_semaphore.acquire();
+        let _permit = self.hydration_semaphore.acquire("posting_blobs");
 
         // Presence-cache read (Tier 1 O3): an `Arc` snapshot (refcount
         // bump, no clone) of whichever (segment, shard) pairs are already
@@ -15108,10 +15188,10 @@ mod tests {
         // where waiting beats failing (hydration), so this change is scoped
         // to the search path.
         let sem = Arc::new(Semaphore::new(1));
-        let held = sem.acquire();
+        let held = sem.acquire("test");
         let s = Arc::clone(&sem);
         let t = std::thread::spawn(move || {
-            let _p = s.acquire();
+            let _p = s.acquire("test");
             true
         });
         std::thread::sleep(Duration::from_millis(30));
@@ -16559,6 +16639,7 @@ mod tests {
                     let (owned, waiting) = partition_for_hydration(
                         &in_flight,
                         std::slice::from_ref(&seg_path),
+                        HYDRATE_OWNER_SCORING,
                         |_| hydrated.load(Ordering::SeqCst),
                     );
                     if !owned.is_empty() {
@@ -16568,7 +16649,7 @@ mod tests {
                         // waiters instead of also becoming owners.
                         std::thread::sleep(Duration::from_millis(50));
                         hydrated.store(true, Ordering::SeqCst);
-                        complete_owned(&in_flight, &owned);
+                        complete_owned(&in_flight, &owned, 0);
                     } else {
                         wait_for(&waiting);
                     }
@@ -17128,6 +17209,7 @@ mod tests {
                     let (owned, waiting) = partition_for_hydration(
                         &in_flight,
                         std::slice::from_ref(&seg_path),
+                        HYDRATE_OWNER_SCORING,
                         |_| false,
                     );
                     if !owned.is_empty() {
@@ -17135,7 +17217,7 @@ mod tests {
                         // The fetch "failed": nothing marks the segment
                         // complete, but completion must still be signalled
                         // so waiters don't hang forever.
-                        complete_owned(&in_flight, &owned);
+                        complete_owned(&in_flight, &owned, 0);
                     } else {
                         wait_for(&waiting);
                         // A waiter must be released promptly (this test
@@ -17169,7 +17251,7 @@ mod tests {
         std::thread::scope(|scope| {
             for _ in 0..6 {
                 scope.spawn(|| {
-                    let _permit = sem.acquire();
+                    let _permit = sem.acquire("test");
                     let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
                     max_seen.fetch_max(cur, Ordering::SeqCst);
                     std::thread::sleep(Duration::from_millis(20));

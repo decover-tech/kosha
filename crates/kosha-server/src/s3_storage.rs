@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use kosha_core::{KoshaError, LocalStorage, ObjectMeta, StorageBackend};
 
-use crate::hydration_budget::{HydrationBudget, RequestHydration};
+use crate::hydration_budget::{BudgetPermit, HydrationBudget, RequestHydration};
 use crate::segment_commit;
 
 /// Join a configured key prefix with a logical (unprefixed) path, the same
@@ -1729,16 +1729,9 @@ async fn fetch_one(
         TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let t_transfer = std::time::Instant::now();
-    let streamed = get_object_streamed_with_retry(
-        client,
-        bucket,
-        &s3_key,
-        kosha_core::tenancy::tenant_of_file_key(path),
-        &tmp_path,
-        budget,
-        &request,
-    )
-    .await;
+    let streamed =
+        get_object_streamed_with_retry(client, bucket, &s3_key, path, &tmp_path, budget, &request)
+            .await;
     let transfer_ms = t_transfer.elapsed().as_secs_f64() * 1e3;
     let streamed = match streamed {
         Ok(s) => s,
@@ -1785,7 +1778,7 @@ async fn get_object_streamed_with_retry(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     key: &str,
-    tenant: &str,
+    path: &str,
     tmp_path: &Path,
     budget: Option<Arc<HydrationBudget>>,
     request: &Arc<RequestHydration>,
@@ -1812,24 +1805,8 @@ async fn get_object_streamed_with_retry(
                     "hydration of {key} would put this request over its byte ceiling"
                 )));
             }
-            let _permit = match budget.as_ref() {
-                Some(budget) => {
-                    let t_wait = std::time::Instant::now();
-                    let permit = budget.acquire(tenant, projected);
-                    request.record_wait(t_wait.elapsed());
-                    match permit {
-                        Some(permit) => Some(permit),
-                        None => {
-                            request.refund(projected);
-                            request.mark_shed();
-                            return Err(KoshaError::Overloaded(format!(
-                                "hydration of {key} waited out the in-flight byte budget"
-                            )));
-                        }
-                    }
-                }
-                None => None,
-            };
+            let _permit =
+                reserve_budget(budget.as_ref(), request, "hydration of", path, projected).await?;
 
             let streamed = stream_body_to_file(resp.body, tmp_path).await;
             match streamed {
@@ -1942,6 +1919,52 @@ async fn stream_body_to_file(
     Ok(StreamedFetch { bytes, write_ms })
 }
 
+/// Reserve `bytes` of the process-wide in-flight budget for logical
+/// `path`, already charged to `request`. On an expired wait the charge is
+/// refunded, the request shed, and the first expiry per request logged
+/// with the budget's state; the error reads "`what` `path` waited out the
+/// in-flight byte budget". A request shed while this fetch waited gets
+/// its permit back and the fetch skipped. `None` budget: nothing to
+/// reserve.
+async fn reserve_budget(
+    budget: Option<&Arc<HydrationBudget>>,
+    request: &RequestHydration,
+    what: &str,
+    path: &str,
+    bytes: u64,
+) -> Result<Option<BudgetPermit>, KoshaError> {
+    let Some(budget) = budget else {
+        return Ok(None);
+    };
+    let t_wait = std::time::Instant::now();
+    let permit = budget
+        .acquire(kosha_core::tenancy::tenant_of_file_key(path), bytes)
+        .await;
+    let waited = t_wait.elapsed();
+    request.record_wait(waited);
+    match permit {
+        // Shed while it waited (another of its fetches expired or crossed
+        // the ceiling): the response will be a 429, so streaming this
+        // object would only take budget other requests are waiting on.
+        Ok(permit) if request.is_shed() => {
+            drop(permit);
+            request.refund(bytes);
+            Err(KoshaError::Overloaded(format!(
+                "{what} {path} skipped: request shed while waiting for in-flight budget"
+            )))
+        }
+        Ok(permit) => Ok(Some(permit)),
+        Err(expired) => {
+            request.refund(bytes);
+            request.mark_shed();
+            request.note_budget_expired(path, bytes, waited, &expired);
+            Err(KoshaError::Overloaded(format!(
+                "{what} {path} waited out the in-flight byte budget"
+            )))
+        }
+    }
+}
+
 /// Fetch one byte range for [`S3Storage::read_ranges`]: from the local file
 /// when the whole object is already on disk (files at their real path are
 /// only ever renamed into place complete), otherwise as an S3 ranged GET.
@@ -1982,24 +2005,7 @@ async fn fetch_range_one(
             "ranged read of {path} would put this request over its byte ceiling"
         )));
     }
-    let _permit = match budget {
-        Some(budget) => {
-            let t_wait = std::time::Instant::now();
-            let permit = budget.acquire(kosha_core::tenancy::tenant_of_file_key(path), length);
-            request.record_wait(t_wait.elapsed());
-            match permit {
-                Some(permit) => Some(permit),
-                None => {
-                    request.refund(length);
-                    request.mark_shed();
-                    return Err(KoshaError::Overloaded(format!(
-                        "ranged read of {path} waited out the in-flight byte budget"
-                    )));
-                }
-            }
-        }
-        None => None,
-    };
+    let _permit = reserve_budget(budget.as_ref(), request, "ranged read of", path, length).await?;
 
     let s3_key = join_s3_key(prefix, path);
     let range = format!("bytes={}-{}", offset, offset + length - 1);
@@ -2307,6 +2313,46 @@ pub(crate) fn sum_segment_sizes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fetch admitted to the in-flight budget after its request was shed
+    /// (by another of its fetches) is skipped: its permit is handed back at
+    /// once for requests still being served, and its charge refunded.
+    #[test]
+    fn a_fetch_admitted_after_its_request_was_shed_is_skipped() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let budget = Arc::new(HydrationBudget::with_tenant_cap(
+            100,
+            100,
+            std::time::Duration::from_secs(5),
+        ));
+        let request = Arc::new(RequestHydration::new(1_000));
+        rt.block_on(async {
+            let holder = budget.acquire("acme", 100).await.unwrap();
+            assert!(request.charge(60));
+            let waiting = tokio::spawn({
+                let (budget, request) = (Arc::clone(&budget), Arc::clone(&request));
+                async move {
+                    reserve_budget(Some(&budget), &request, "hydration of", "acme/seg/x", 60)
+                        .await
+                        .map(|p| p.is_some())
+                }
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            // Another fetch of the same request sheds it, then budget frees.
+            request.mark_shed();
+            drop(holder);
+            let result = waiting.await.unwrap();
+            assert!(
+                matches!(result, Err(KoshaError::Overloaded(_))),
+                "a shed request's fetch must not stream: {result:?}"
+            );
+        });
+        assert_eq!(budget.in_flight(), 0, "the permit is handed back");
+        assert_eq!(request.fetched_bytes(), 0, "the charge is refunded");
+    }
 
     #[test]
     fn sum_segment_sizes_groups_by_segment_and_filters_files() {
