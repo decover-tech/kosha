@@ -6032,7 +6032,7 @@ mod tests {
         );
         let seg_id = idx.manifest(&ns).unwrap().segments[0].segment_id.clone();
         let reader = kosha_segment::SegmentReader::open(dir.join("test").join(&seg_id.0)).unwrap();
-        let store = reader.filter_store();
+        let store = reader.try_filter_store().unwrap();
         // Merge order is not index order: key everything by document id.
         let records: Vec<_> = reader.iter_doc_records().map(|r| r.unwrap()).collect();
         let id_of = |seq: u32| records[seq as usize].doc_id.0.clone();
