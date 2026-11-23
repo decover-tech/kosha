@@ -55,6 +55,12 @@
 # ratio the original sizing established (24Gi cache budget / 40Gi limit =
 # 60% used, matching 12Gi/20Gi before) rather than just raising one knob and
 # leaving the others to drift out of proportion again.
+#
+# 2026-11: the two paragraphs above describe the emptyDir cache, which this
+# patch has since replaced with a per-pod EBS volume (volumes at the end).
+# The disk cache is now bounded by that volume (100Gi) and
+# KOSHA_CACHE_MAX_BYTES (64GiB), not by ephemeral-storage, so a full cache
+# can no longer evict the pod or fill the node's root disk.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -81,8 +87,8 @@ spec:
               value: "17179869184"
             # 64 GiB on the pod's own 100 GiB EBS volume (see volumes
             # below): two matters' segments no longer fit in 24 GiB, so the
-            # cache evicted continuously. The headroom covers files pinned
-            # by in-flight searches, which may take the cache past this cap.
+            # cache evicted continuously. This cap is NOT a hard bound on
+            # the volume: see the OPEN RISK note at `volumes` below.
             - name: KOSHA_CACHE_MAX_BYTES
               value: "68719476736"
             # Live-bytes watermark W (cache-resident + pinned by in-flight
@@ -109,11 +115,22 @@ spec:
             # than the cache is not admitted (it could only churn).
             - name: KOSHA_VECTOR_POSTINGS_CACHE_MAX_BYTES
               value: "4294967296"
-            # No KOSHA_WARMUP_NAMESPACES: naming the namespace warmed every
-            # matter in it (Decover keeps all matters in one namespace), which
-            # hides the cold path the tests must measure. A new pod warms
-            # what pods were actually searching (the usage warm set, on by
-            # default) within KOSHA_WARMUP_BUDGET_BYTES below.
+            # No KOSHA_WARMUP_NAMESPACES: Decover keeps every matter in one
+            # namespace (default/paragraph_index_hnsw), so naming it made
+            # each new pod load every customer's matter before /readyz,
+            # whether or not anyone searched it. A new pod instead warms what
+            # pods were actually searching (the usage warm set,
+            # KOSHA_WARMUP_USAGE, on by default) within
+            # KOSHA_WARMUP_BUDGET_BYTES below.
+            # Trade-offs of dropping it: (1) the manifest refresher no longer
+            # prefetches a new version's scoring set before swapping it in,
+            # so the first search after a compaction pays that fetch;
+            # (2) it was originally added for backend's delta catch-up
+            # (catchup_es_to_kosha.py, CronJob every 20 min): match_all +
+            # sort _id + search_after with no matter filter, so each page
+            # needs the scoring files of every segment in the namespace and
+            # is shed with 429 on a cold pod. LATENT: that CronJob is
+            # suspended on staging; it will fail if re-enabled as is.
             # Posting blobs on (the code default). They were switched off when
             # the namespace had 206,756 of them and warming held /readyz for
             # ~25 minutes; compaction has since left 256 per segment (1,536
@@ -153,6 +170,11 @@ spec:
             # break down fast requests too.
             - name: KOSHA_SLOW_SEARCH_LOG_MS
               value: "0"
+          # ephemeral-storage no longer holds the disk cache: the cache is on
+          # the pod's own EBS volume (volumes below), which the kubelet does
+          # not count against this limit. It now covers only the writable
+          # layer and logs. Values kept as they were; lowering them is a
+          # separate change.
           resources:
             requests:
               cpu: "2"
@@ -162,10 +184,15 @@ spec:
               cpu: "4"
               ephemeral-storage: "40Gi"
               memory: "32Gi"
-      # The image runs as uid 10001 and a new EBS volume's root belongs to
-      # root, so the volume is handed to that group (an emptyDir is
-      # world-writable, which hid this).
+      # Above KOSHA_HTTP_SHUTDOWN_GRACE_SECS (60) so the kubelet's SIGKILL
+      # does not land before the server's own drain deadline; 15 s covers
+      # process exit after the drain.
       terminationGracePeriodSeconds: 75
+      # The image runs as uid 10001 (Dockerfile) and a new EBS volume's root
+      # belongs to root, so creating the WAL dir on it failed; the volume is
+      # handed to group 10001 (an emptyDir is world-writable, which hid
+      # this). OnRootMismatch skips the recursive chown when the root
+      # already matches, which on a fresh empty volume costs nothing.
       securityContext:
         fsGroup: 10001
         fsGroupChangePolicy: OnRootMismatch
@@ -173,6 +200,24 @@ spec:
       # deleted with it, instead of an emptyDir on the node's 50 GB root
       # disk: warming two matters filled that disk (DiskPressure, the pod
       # evicted, 22 replacements rejected on the same node).
+      # 100Gi holds the 64 GiB KOSHA_CACHE_MAX_BYTES cap plus some
+      # overshoot. OPEN RISK, not a bound: every search pins every segment
+      # dir of its namespace's manifest (pin_segments in kosha-server
+      # main.rs), and all Decover matters share one namespace, so while any
+      # search is in flight nothing in the cache is evictable. Overshoot is
+      # then limited only by what overlapping searches fetch: worst wave
+      # 8 concurrent searches x 8 GiB (KOSHA_HYDRATE_REQUEST_MAX_BYTES) =
+      # 64 GiB on top of a full 64 GiB cache = 128 GiB, against ~93-95 GiB
+      # writable by uid 10001 (ext4 reserves 5% for root). A separate fix
+      # to pin only the segments a search hydrates is in progress; until
+      # then a full volume makes cache writes fail with ENOSPC (the volume
+      # is not counted as ephemeral-storage, so the kubelet does not evict
+      # the pod); how searches surface that has not been tested.
+      # `emptyDir: null` removes base's
+      # emptyDir from this strategic-merge patch (a volume has one source).
+      # The storage class is the cluster's EBS class, as in
+      # scripts/eval/k8s/collector.yaml. Cost: one gp3 100 GiB volume per
+      # pod (HPA 2-6 pods).
       volumes:
         - name: cache
           emptyDir: null
