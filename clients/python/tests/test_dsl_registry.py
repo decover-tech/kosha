@@ -31,9 +31,10 @@ CASES = os.path.join(
     os.path.dirname(__file__), "..", "..", "..", "scripts", "conformance", "dsl", "cases.yaml"
 )
 
-# KoshaClient methods that are not Elasticsearch APIs: a Kosha helper and
-# the connection lifecycle.
-NOT_APIS = {"rerank_spec", "close"}
+# KoshaClient methods that are not Elasticsearch APIs: Kosha helpers (the
+# native /v1 search_all and bulk_index are pinned by clients/conformance,
+# not by the DSL matrix) and the connection lifecycle.
+NOT_APIS = {"rerank_spec", "close", "search_all", "bulk_index"}
 
 
 @pytest.fixture(scope="module")

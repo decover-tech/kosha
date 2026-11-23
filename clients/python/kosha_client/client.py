@@ -11,10 +11,19 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from typing import Any, Sequence
+from typing import Any, Iterable, Iterator, Sequence
 
+from . import native
 from .compat import Transport as CompatTransport
-from .transport import KoshaRequestError, Transport, json_default
+from .transport import (
+    DEFAULT_BASE_DELAY_MS,
+    DEFAULT_MAX_DELAY_MS,
+    DEFAULT_MAX_RETRY_AFTER_MS,
+    DEFAULT_TOTAL_BUDGET_MS,
+    KoshaRequestError,
+    Transport,
+    json_default,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,8 +89,23 @@ class KoshaClient:
         retry_on_timeout: bool = True,
         pool_maxsize: int = 20,
         consistency: str | None = None,
+        retry_non_idempotent: bool = False,
+        base_delay_ms: float = DEFAULT_BASE_DELAY_MS,
+        max_delay_ms: float = DEFAULT_MAX_DELAY_MS,
+        max_retry_after_ms: float = DEFAULT_MAX_RETRY_AFTER_MS,
+        total_budget_ms: float = DEFAULT_TOTAL_BUDGET_MS,
         **kwargs: Any,
     ) -> None:
+        # Retries (clients/conformance/RETRY.md): ``max_retries`` counts
+        # attempts (1 = fail fast). 429/503 and ``"retryable": true`` errors
+        # are retried after the server's delay; a timeout after the request
+        # was sent is retried only for idempotent operations, unless
+        # ``retry_non_idempotent``. ``retry_on_timeout=False`` stops every
+        # transport-error retry (timeouts, resets, refused connections, DNS).
+        # ``base_delay_ms``/``max_delay_ms`` shape the full-jitter backoff;
+        # a server delay over ``max_retry_after_ms`` is reported, not slept
+        # through; no sleep may end past ``total_budget_ms`` after the first
+        # attempt.
         # Normalise the Kosha base URL.  Resolution order:
         #   1. ``hosts`` arg (opensearchpy-compatible)
         #   2. ``KOSHA_HOST`` env var (customer-friendly)
@@ -123,6 +147,11 @@ class KoshaClient:
             timeout=timeout,
             max_retries=max_retries,
             retry_on_timeout=retry_on_timeout,
+            retry_non_idempotent=retry_non_idempotent,
+            base_delay_ms=base_delay_ms,
+            max_delay_ms=max_delay_ms,
+            max_retry_after_ms=max_retry_after_ms,
+            total_budget_ms=total_budget_ms,
         )
 
         # Read-your-writes (#255): ``"strong"`` searches also scan writes the
@@ -1974,6 +2003,64 @@ class KoshaClient:
 
     def close(self) -> None:
         pass
+
+    # ── Native /v1 helpers (#351; same behaviour as the TS and Go SDKs) ────
+
+    def search_all(
+        self, namespace: str, body: dict, page_size: int | None = None
+    ) -> Iterator[dict]:
+        """Yield every hit of a native search body, paging with ``search_after``.
+
+        ``body`` is a Kosha-native ``/v1`` search body
+        (``{"query_text": "", "filter": {...}, "sort": [...]}``), not
+        OpenSearch DSL. The sort always ends in an ``_id`` tie-break
+        (appended when missing; the default is ``_id`` ascending), sort
+        fields are added to ``source_includes`` when it is set, and
+        ``page_size`` (default: ``max_results``, else 500) is the page size.
+        Iteration stops on a short page. A document that exists and is
+        unchanged for the whole iteration is yielded exactly once, in sort
+        order; this is not a snapshot.
+
+        ``from``, ``search_after``, ``rerank`` and kNN or hybrid bodies are
+        rejected with ``KoshaConfigError`` (a ``ValueError``).
+        """
+        return native.search_all(self._transport, namespace, body, page_size)
+
+    def bulk_index(
+        self,
+        namespace: str,
+        documents: Iterable[dict],
+        max_docs_per_batch: int = 500,
+        max_bytes_per_batch: int = 8 * 1024 * 1024,
+        concurrency: int = 2,
+        on_error: str = "stop",
+    ) -> dict:
+        """Upsert native documents (``{"id", "fields": [...]}``) in batches.
+
+        A batch closes at ``max_docs_per_batch`` documents, or before its
+        request body (the compact UTF-8 JSON actually sent, envelope
+        included) would pass ``max_bytes_per_batch`` bytes, so the cap can be
+        set to a tenant's ``max_body_bytes``; a single larger document is
+        sent alone. Up to ``concurrency`` batches are in flight,
+        each through the retry policy. A document whose id is in a batch
+        still in flight waits for it, and within a batch the last occurrence
+        of an id wins. Never flushes.
+
+        Returns ``{"indexed", "batches", "failures": [{"batch_index",
+        "ids", "error"}]}``. With ``on_error="stop"`` (the default) the
+        first failed batch stops dispatching, in-flight batches finish, and
+        ``BulkError`` is raised with that result as ``.result``;
+        ``"continue"`` reports failures in the result instead.
+        """
+        return native.bulk_index(
+            self._transport,
+            namespace,
+            documents,
+            max_docs_per_batch=max_docs_per_batch,
+            max_bytes_per_batch=max_bytes_per_batch,
+            concurrency=concurrency,
+            on_error=on_error,
+        )
 
 
 # Aggregation types the translator passes through; part of the DSL registry

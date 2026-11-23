@@ -1,0 +1,244 @@
+name: release-clients
+
+# Publishes the TypeScript, Go and Python SDKs (#351, ADR-351 §c). Only a
+# tag publishes:
+#
+#   tag clients/typescript/vX.Y.Z -> npm @decover/kosha@X.Y.Z (dist-tag
+#                                    "latest", or "next" for a prerelease)
+#   tag clients/go/vX.Y.Z         -> the Go module proxy picks up
+#                                    github.com/decover-tech/kosha/clients/go@vX.Y.Z
+#   tag clients/python/vX.Y.Z     -> PyPI kosha-client==X.Y.Z (replaces the
+#                                    manual `make client-python-publish`)
+#
+# Kept out of release.yml on purpose: that workflow's `v*` tag trigger,
+# AWS OIDC role and EKS deploys must stay one edit away from nothing an SDK
+# tag can reach (a `clients/...` tag does not match `v*`).
+#
+# Credentials: none stored in steady state. npm uses trusted publishing
+# (OIDC, `id-token: write`; configure the trusted publisher for
+# decover-tech/kosha + release-clients.yml + environment `npm` on
+# npmjs.com). npm only lets a trusted publisher be configured on a package
+# that already exists, so the FIRST publish of @decover/kosha (0.1.0) runs
+# on a short-lived granular token instead (ADR-351 open question 5): store
+# it as the `NPM_TOKEN` secret of the `npm` environment, push the tag,
+# configure the trusted publisher, then revoke the token and delete the
+# secret. With the secret absent the step runs on OIDC alone. See
+# clients/typescript/README.md "Releasing". PyPI uses trusted publishing too
+# (configure the publisher for decover-tech/kosha + release-clients.yml +
+# environment `pypi` on pypi.org first), and the Go module needs no
+# credentials at all. The GitHub release uses the job's own GITHUB_TOKEN.
+# Nothing here echoes a secret; refs reach shell scripts only through env.
+#
+# workflow_dispatch rehearses a release without publishing: the same checks,
+# then `npm publish --dry-run` (TypeScript), a local module check (Go), or a
+# build plus `twine check` (Python). Tags are never moved or deleted; retract
+# a bad Go version in go.mod, `npm deprecate` a bad npm version and yank a
+# bad PyPI release.
+
+on:
+  push:
+    tags:
+      - "clients/typescript/v*"
+      - "clients/go/v*"
+      - "clients/python/v*"
+  workflow_dispatch:
+    inputs:
+      sdk:
+        description: SDK to rehearse (dry run; nothing is published)
+        type: choice
+        options: [typescript, go, python]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-clients-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  npm:
+    name: npm @decover/kosha
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/clients/typescript/v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.sdk == 'typescript')
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: write # the GitHub release
+      id-token: write # npm trusted publishing + provenance
+    defaults:
+      run:
+        working-directory: clients/typescript
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # Node 24 ships npm >= 11.5, which trusted publishing needs.
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: The version agrees with the tag
+        env:
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(node -p "require('./package.json').version")
+          grep -q "VERSION = \"$version\"" src/version.ts \
+            || { echo "::error::src/version.ts does not say $version"; exit 1; }
+          if [ "$EVENT" = push ] && [ "${TAG#clients/typescript/v}" != "$version" ]; then
+            echo "::error::tag $TAG does not match package.json version $version"; exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: npx --no-install publint
+
+      - name: Publish
+        env:
+          EVENT: ${{ github.event_name }}
+          # First publish only (see the header): the npm CLI tries trusted
+          # publishing first and falls back to this token. Empty once the
+          # secret is deleted. GitHub masks it in logs; nothing echoes it.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          case "$VERSION" in *-*) dist_tag=next ;; *) dist_tag=latest ;; esac
+          if [ "$EVENT" = push ]; then
+            npm publish --provenance --access public --tag "$dist_tag"
+          else
+            npm publish --dry-run --access public --tag "$dist_tag"
+          fi
+
+      - name: GitHub release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          awk -v v="$VERSION" '$0 ~ "^## \\[" v "\\]" {on=1; next} /^## \[/ {on=0} on' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          flag=""; case "$VERSION" in *-*) flag="--prerelease" ;; esac
+          gh release create "$TAG" --title "TypeScript SDK $VERSION" --notes-file "$RUNNER_TEMP/notes.md" $flag
+
+  go:
+    name: go module
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/clients/go/v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.sdk == 'go')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # the GitHub release
+    defaults:
+      run:
+        working-directory: clients/go
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: clients/go/go.mod
+          cache: false
+
+      - name: The version agrees with the tag
+        env:
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(sed -n 's/^const Version = "\(.*\)"$/\1/p' version.go)
+          [ -n "$version" ] || { echo "::error::no Version in version.go"; exit 1; }
+          if [ "$EVENT" = push ] && [ "${TAG#clients/go/v}" != "$version" ]; then
+            echo "::error::tag $TAG does not match kosha.Version $version"; exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Standard library only
+        run: test "$(go list -m all)" = "github.com/decover-tech/kosha/clients/go"
+      - run: go vet ./...
+      - run: go test -race ./...
+
+      # The module proxy fetches the tag from the public repo on first
+      # request; asking for it now makes the version resolvable at once and
+      # proves the tag is well-formed.
+      - name: Publish to the module proxy
+        if: github.event_name == 'push'
+        working-directory: ${{ runner.temp }}
+        run: |
+          for i in 1 2 3 4 5; do
+            GOPROXY=https://proxy.golang.org \
+              go list -m "github.com/decover-tech/kosha/clients/go@v$VERSION" && exit 0
+            sleep $((i * 10))
+          done
+          echo "::error::proxy.golang.org did not resolve v$VERSION"; exit 1
+
+      - name: GitHub release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          awk -v v="$VERSION" '$0 ~ "^## \\[" v "\\]" {on=1; next} /^## \[/ {on=0} on' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          flag=""; case "$VERSION" in *-*) flag="--prerelease" ;; esac
+          gh release create "$TAG" --title "Go SDK $VERSION" --notes-file "$RUNNER_TEMP/notes.md" $flag
+
+  pypi:
+    name: PyPI kosha-client
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/clients/python/v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.sdk == 'python')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: write # the GitHub release
+      id-token: write # PyPI trusted publishing
+    defaults:
+      run:
+        working-directory: clients/python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: The version agrees with the tag
+        env:
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          grep -qx "### $version" README.md \
+            || { echo "::error::README.md has no '### $version' changelog entry"; exit 1; }
+          if [ "$EVENT" = push ] && [ "${TAG#clients/python/v}" != "$version" ]; then
+            echo "::error::tag $TAG does not match pyproject.toml version $version"; exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Unit tests
+        run: |
+          python -m pip install --upgrade pip
+          # pyyaml: tests/test_dsl_registry.py reads scripts/conformance/dsl/cases.yaml
+          python -m pip install -e . pytest pyyaml build twine
+          python -m pytest tests/ -q
+
+      - name: Build and check the distributions
+        run: |
+          rm -rf dist
+          python -m build
+          python -m twine check --strict dist/*
+
+      # Trusted publishing: the action trades the job's OIDC token for a
+      # short-lived upload token, so nothing is stored or printed.
+      - name: Publish
+        if: github.event_name == 'push'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: clients/python/dist
+
+      - name: GitHub release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          awk -v v="$VERSION" '$0 == "### " v {on=1; next} /^##/ {on=0} on' README.md > "$RUNNER_TEMP/notes.md"
+          flag=""; case "$VERSION" in *[a-z]*) flag="--prerelease" ;; esac
+          gh release create "$TAG" --title "Python client $VERSION" --notes-file "$RUNNER_TEMP/notes.md" $flag

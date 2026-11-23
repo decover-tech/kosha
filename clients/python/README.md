@@ -57,8 +57,33 @@ route's bare 404, logs a warning once, and falls back to the deprecated
 server is safe. Turn `KOSHA_LEGACY_ROUTES` off only once the server is on
 0.9.0 or later. `KoshaRequestError`
 carries the server's error model: `code`, `retryable`, `retry_after_ms` and
-`request_id` (see [docs/api/errors.md](../../docs/api/errors.md)). The client
-does not retry on HTTP status yet; retry when `retryable` is true.
+`request_id` (see [docs/api/errors.md](../../docs/api/errors.md)), plus
+`attempts`.
+
+**Retries.** Every request follows the retry policy the TypeScript and Go
+SDKs share ([clients/conformance/RETRY.md](../conformance/RETRY.md)): an
+error the server marks `"retryable": true` (or a bare 429/503 from an older
+server or a proxy) is retried after the server's `retry_after_ms` /
+`Retry-After`, else with jittered backoff; `"retryable": false` (a quota) is
+never retried. `max_retries` (default 3) counts attempts, so `max_retries=1`
+fails fast. A connection that could not be opened is retried for every
+operation; a timeout after the request was sent only for idempotent ones
+(search, upsert, merge, including the deprecated `POST /replace` fallback,
+delete-by-query, flush, every GET), unless you pass
+`retry_non_idempotent=True`. `retry_on_timeout=False` turns off every
+transport-error retry (timeouts, resets, refused connections, DNS
+failures), as in 0.2.x; HTTP error responses still follow the policy.
+
+**Native helpers.** `search_all(namespace, body, page_size=None)` yields
+every hit of a native `/v1` search body, paging with `search_after` (the
+sort gets an `_id` tie-break); `bulk_index(namespace, documents, ...)`
+upserts native documents in batches by count and bytes, with bounded
+concurrency and per-batch failures (`BulkError.result`). A batch closes
+before its request body (the bytes actually sent, envelope included) would
+pass `max_bytes_per_batch`, so the cap can be set to a tenant's
+`max_body_bytes`. They take Kosha's
+own bodies, not OpenSearch DSL, and behave like `searchAll` / `bulkIndex`
+in the TypeScript and Go SDKs.
 
 ## Supported APIs
 
@@ -173,6 +198,27 @@ alongside. If the provider times out or fails, hits come back in search order an
 `resp["rerank"] == {"degraded": True, "reason": ...}`.
 
 ## Changelog
+
+### 0.3.0
+
+- Calls only the `/v1` API (see "Current state").
+- **Behavior change:** HTTP errors are retried under the shared policy
+  ([clients/conformance/RETRY.md](../conformance/RETRY.md)): 429 and 503,
+  and any error with `"retryable": true`, are retried (up to `max_retries`
+  attempts in total, 3 by default) after the server's delay. `max_retries=1`
+  restores fail-fast.
+- **Behavior change:** a timeout after the request was sent is no longer
+  retried for non-idempotent operations (namespace create, schema put,
+  branches, shards) unless `retry_non_idempotent=True`. Merges sent to the
+  deprecated `POST /replace` (pre-0.9 servers) still count as idempotent.
+- `retry_on_timeout=False` still stops every transport-error retry,
+  refused connections and DNS failures included, as in 0.2.x.
+- **Behavior change:** request bodies are compact UTF-8 JSON (no spaces,
+  non-ASCII text unescaped), the same bytes the TypeScript and Go SDKs send.
+  The server reads them the same; bodies with non-ASCII text are smaller.
+- `KoshaRequestError` gains `code` (falling back to a tenant-limit
+  `reason`), `retryable`, `retry_after_ms`, `request_id` and `attempts`.
+- New `search_all()` and `bulk_index()` native helpers.
 
 ### 0.2.16
 

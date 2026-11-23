@@ -1,0 +1,6 @@
+{
+  "tenants": {
+    "conformance-small": { "max_body_bytes": 4096 },
+    "conformance-limited": { "qps": 1 }
+  }
+}

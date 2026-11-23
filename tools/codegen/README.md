@@ -53,14 +53,27 @@ conformance workflow runs the wire check against a live stack.
 
 ## Clients from the spec
 
-Generate types or clients in any language from the OpenAPI 3 document, for
-example:
+The TypeScript and Go SDKs (#351, ADR-351) take their **types** from the
+public OpenAPI 3 document; their transport, retries, pagination and bulk
+helpers are hand-written:
 
-```bash
-npx openapi-typescript api/openapi/v1/kosha.openapi.json -o kosha.d.ts
+```
+proto/kosha/v1/*.proto
+  -> make openapi   -> api/openapi/v1/kosha.openapi.json (checked in)
+  -> make clients-gen
+       -> clients/typescript/src/generated/schema.ts   (openapi-typescript, pinned in package-lock.json)
+       -> clients/go/zz_generated_types.go             (oapi-codegen models only, pinned in clients/go/tools/go.mod)
 ```
 
-The TypeScript and Go SDKs (#351) are generated this way.
+Both outputs are committed; `make clients-gen-check` (CI: `clients.yml`)
+regenerates them and fails on drift. A proto change that renames a schema
+therefore breaks the SDKs' hand-written alias files (`src/types.ts`,
+`types.go`) at build time instead of changing their public API silently.
+The shared conformance suite in `clients/conformance` pins behaviour across
+the Python, TypeScript and Go SDKs.
+
+Other languages can generate from the same document, for example
+`npx openapi-typescript api/openapi/v1/kosha.openapi.json -o kosha.d.ts`.
 
 ## Versioning
 
