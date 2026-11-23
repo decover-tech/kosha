@@ -2725,6 +2725,17 @@ pub fn knn_global_rescore_from_env() -> bool {
     )
 }
 
+/// `KOSHA_KNN_GLOBAL_RESCORE_MAX` (experimental): the most quantized
+/// candidates one query's global rescoring reads exact vectors for; see
+/// [`Searcher::with_knn_global_rescore_max`]. Unset, `0` or unparseable
+/// means no cap.
+fn knn_global_rescore_max_from_env() -> Option<usize> {
+    std::env::var("KOSHA_KNN_GLOBAL_RESCORE_MAX")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&m| m > 0)
+}
+
 /// `KOSHA_KNN_RESCORE_STATS` (#381): `1`, `true` or `on` counts, per kNN
 /// query, the quantized segments the default per-segment path probed and
 /// how many of them returned unrescored estimates (no whole local
@@ -3387,6 +3398,10 @@ pub struct Searcher {
     /// [`Searcher::with_knn_global_rescore`]. Default from
     /// `KOSHA_KNN_GLOBAL_RESCORE`, off.
     knn_global_rescore: bool,
+    /// Cap on the candidates global rescoring reads exact vectors for: see
+    /// [`Searcher::with_knn_global_rescore_max`]. Default from
+    /// `KOSHA_KNN_GLOBAL_RESCORE_MAX`, none.
+    knn_global_rescore_max: Option<usize>,
     /// Per-segment rescoring counters (#381): see
     /// [`Searcher::with_knn_rescore_stats`]. Default from
     /// `KOSHA_KNN_RESCORE_STATS`, off.
@@ -3510,6 +3525,7 @@ impl Searcher {
             knn_exact_threshold: knn_exact_threshold_from_env(),
             knn_exact_fraction: knn_exact_fraction_from_env(),
             knn_global_rescore: knn_global_rescore_from_env(),
+            knn_global_rescore_max: knn_global_rescore_max_from_env(),
             knn_rescore_stats: knn_rescore_stats_from_env(),
         }
     }
@@ -3606,6 +3622,21 @@ impl Searcher {
     /// `KOSHA_KNN_GLOBAL_RESCORE` and is off.
     pub fn with_knn_global_rescore(mut self, enabled: bool) -> Self {
         self.knn_global_rescore = enabled;
+        self
+    }
+
+    /// Caps how many quantized candidates global rescoring
+    /// ([`Searcher::knn_global_rescore`]) reads exact vectors for, per
+    /// query. Without a cap every candidate the error bounds cannot rule
+    /// out is rescored, which is exact up to the bounds' confidence but
+    /// unbounded in cost: where estimates are close together (loose
+    /// bounds relative to the score spread) that is a large share of all
+    /// candidates. With a cap of `max`, only the `max` best by estimate
+    /// among them are rescored and the rest are dropped, so the result is
+    /// no longer guaranteed by the bounds. `None` (the default, or
+    /// `KOSHA_KNN_GLOBAL_RESCORE_MAX` unset or `0`) means no cap.
+    pub fn with_knn_global_rescore_max(mut self, max: Option<usize>) -> Self {
+        self.knn_global_rescore_max = max.filter(|&m| m > 0);
         self
     }
 
@@ -4031,6 +4062,26 @@ impl Searcher {
             .collect();
         let threshold = kosha_segment::kth_lower_bound(&all, fetch_k);
         let reaches = |c: &kosha_segment::KnnCandidate| threshold.is_none_or(|t| c.upper() >= t);
+        // The cap (`with_knn_global_rescore_max`): when more quantized
+        // candidates reach the threshold than it allows, keep the best by
+        // estimate. Exact (f32) segments are not capped; their candidates
+        // cost no read.
+        let estimate_floor: Option<f64> = self.knn_global_rescore_max.and_then(|max| {
+            let mut estimates: Vec<f64> = probed
+                .iter()
+                .filter(|(_, _, found)| !found.exact)
+                .flat_map(|(_, _, found)| found.candidates.iter())
+                .filter(|c| reaches(c))
+                .map(|c| c.estimate)
+                .collect();
+            if estimates.len() <= max {
+                return None;
+            }
+            let (_, floor, _) = estimates.select_nth_unstable_by(max - 1, |a, b| {
+                b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            Some(*floor)
+        });
 
         // 3-4. Rescore the survivors, per segment, in parallel.
         struct Rescored {
@@ -4043,8 +4094,12 @@ impl Searcher {
             probed
                 .par_iter()
                 .map(|(segment_id, reader, found)| {
-                    let survivors: Vec<&kosha_segment::KnnCandidate> =
-                        found.candidates.iter().filter(|c| reaches(c)).collect();
+                    let survivors: Vec<&kosha_segment::KnnCandidate> = found
+                        .candidates
+                        .iter()
+                        .filter(|c| reaches(c))
+                        .filter(|c| found.exact || estimate_floor.is_none_or(|f| c.estimate >= f))
+                        .collect();
                     let mut out = Rescored {
                         segment: GlobalKnnSegment::default(),
                         selected: 0,
@@ -14122,6 +14177,50 @@ mod tests {
             assert_eq!(off.knn_rescore_candidates, 0);
             assert_eq!(off.knn_rescored, 0);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn knn_global_rescore_max_caps_the_exact_vector_reads() {
+        // The cap bounds how many quantized candidates are rescored; with
+        // no cap, or one above the selected count, nothing changes.
+        use kosha_core::VectorQuantization::{RaBitQ, F32};
+        let (dir, ns, manifest, _) = global_rescore_corpus("cap", &[RaBitQ, F32, RaBitQ, RaBitQ]);
+        let uncapped = Searcher::new(dir.clone())
+            .with_knn_global_rescore(true)
+            .with_knn_global_rescore_max(None);
+        let q = global_rescore_query(global_rescore_vector(700_001), 10);
+        let (full, full_stats) = uncapped
+            .search_with_stats(&ns, &manifest, &q, None)
+            .unwrap();
+        assert!(full_stats.knn_rescore_selected > 20, "fixture too easy");
+        let cap = 20;
+        let capped = Searcher::new(dir.clone())
+            .with_knn_global_rescore(true)
+            .with_knn_global_rescore_max(Some(cap));
+        let (r, stats) = capped.search_with_stats(&ns, &manifest, &q, None).unwrap();
+        assert!(
+            stats.knn_rescore_selected <= cap,
+            "{}",
+            stats.knn_rescore_selected
+        );
+        assert_eq!(stats.knn_rescored, stats.knn_rescore_selected);
+        assert_eq!(r.results.len(), full.results.len());
+        let loose = Searcher::new(dir.clone())
+            .with_knn_global_rescore(true)
+            .with_knn_global_rescore_max(Some(full_stats.knn_rescore_selected));
+        let (same, same_stats) = loose.search_with_stats(&ns, &manifest, &q, None).unwrap();
+        assert_eq!(
+            same_stats.knn_rescore_selected,
+            full_stats.knn_rescore_selected
+        );
+        let ids = |r: &SearchResult| {
+            r.results
+                .iter()
+                .map(|h| h.doc_id.0.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&same), ids(&full));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
