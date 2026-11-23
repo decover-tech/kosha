@@ -39,7 +39,9 @@ use kosha_core::{BoolFilter, DocSet, FilterClause, FilterColumnKind, KoshaError,
 use crate::filter_columns::{ColumnValue, FilterColumn, NumericColumn, StringColumn, ZONE_BLOCK};
 
 /// Where the evaluator gets columns from. `Ok(None)` means the segment has
-/// no such column or it is not local yet; either way it holds no values.
+/// no such column, so it holds no values. A column the segment has but
+/// whose file is not local must be an error, never `Ok(None)`: read as
+/// "no values" it silently drops the segment's matches.
 pub trait ColumnSource {
     fn column(
         &self,
@@ -795,10 +797,13 @@ mod tests {
         let clause: FilterClause =
             serde_json::from_value(serde_json::json!({"term": {"matterId": "m1"}})).unwrap();
 
-        // Not hydrated yet: matches nothing, and is not cached.
+        // Not local: an error (never "matches nothing"), and not cached.
         std::fs::remove_file(&path).unwrap();
         let fresh = SegmentReader::open(dir.clone()).unwrap();
-        assert!(fresh.evaluate_filter(&clause).unwrap().is_empty());
+        assert!(matches!(
+            fresh.evaluate_filter(&clause),
+            Err(KoshaError::NotFound(_))
+        ));
         std::fs::write(&path, &bytes).unwrap();
         assert_eq!(fresh.evaluate_filter(&clause).unwrap().count(), 1429);
 

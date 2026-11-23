@@ -6135,8 +6135,14 @@ pub struct DocMetaRef<'a> {
 /// same rule per file: `filters.toc` and each `filters-NNN.col` is cached
 /// only once a read found it present. A query node hydrates only the
 /// columns its queries touch, so [`Self::store_for`] adds columns to the
-/// cached compatibility [`FilterStore`] as they land, and a column that
-/// is still missing is simply retried on the next call.
+/// cached compatibility [`FilterStore`] as they land.
+///
+/// A filter file the footer says exists but that is not on local disk
+/// (never hydrated, or evicted from the disk cache) is an error, never "no
+/// values": read as empty, a `matterId` filter matched nothing in the
+/// segment, and the searcher's per-segment filter-set cache then kept that
+/// empty answer after the file came back. The error is not cached either,
+/// so the next call reads the disk again.
 struct LazyFilters {
     segment_dir: PathBuf,
     doc_count: u32,
@@ -6173,52 +6179,47 @@ impl LazyFilters {
     /// bytes resident.)
     ///
     /// Only a read that finds the file *present* is cached. A read that
-    /// finds it missing/empty returns a fresh (empty) store for that one
-    /// call but leaves the cache unset, so the *next* call re-reads from
-    /// disk — self-healing once hydration actually lands, instead of
-    /// permanently committing to whatever the first, possibly-premature,
-    /// read happened to see. The writer always emits filters.bin (even
-    /// with zero fields, the header is present), so an empty raw read is
-    /// unambiguously "file isn't local yet," never "this segment has no
-    /// filterable fields" — a genuinely field-less segment's file is
+    /// finds it missing/empty is an error for that one call and leaves the
+    /// cache unset, so the *next* call re-reads from disk — self-healing
+    /// once hydration actually lands. The writer always emits filters.bin
+    /// (even with zero fields, the header is present), so an empty raw
+    /// read is unambiguously "file isn't local," never "this segment has
+    /// no filterable fields" — a genuinely field-less segment's file is
     /// non-empty (just a zero-entry header) and caches normally on first
-    /// read, so this retry loop only ever runs during the brief hydration
-    /// race, not on every query against a filter-less segment.
+    /// read.
     fn legacy(&self, state: &mut FilterState) -> Result<Arc<FilterStore>, KoshaError> {
         if let Some(store) = state.legacy.as_ref() {
             return Ok(Arc::clone(store));
         }
         let raw = SegmentReader::read_filters_raw(&self.segment_dir);
         if raw.is_empty() {
-            eprintln!(
-                "WARN: filters.bin missing/empty at first use for {} — filtered queries against this segment will match nothing until it hydrates; retrying on next use",
-                self.segment_dir.display()
-            );
-            // Deliberately not cached — leave `state.legacy` as `None` so
-            // the next call re-reads instead of trusting this premature
-            // empty parse forever.
-            return Ok(Arc::new(SegmentReader::parse_filters(&raw)?));
+            // Not cached: `state.legacy` stays `None`, so the next call
+            // re-reads once hydration lands the file.
+            return Err(self.not_local(kosha_core::FILTERS_BIN_FILE));
         }
         let store = Arc::new(SegmentReader::parse_filters(&raw)?);
         state.legacy = Some(Arc::clone(&store));
         Ok(store)
     }
 
-    /// `filters.toc`, or `None` while it is not local (not cached).
-    fn toc(
-        &self,
-        state: &mut FilterState,
-    ) -> Result<Option<Arc<filter_columns::FiltersToc>>, KoshaError> {
+    /// The error for a filter file the footer lists but that is not on
+    /// local disk. See the type's doc comment.
+    fn not_local(&self, file: &str) -> KoshaError {
+        KoshaError::NotFound(format!(
+            "{}/{file}: filter file not local (not hydrated, or evicted from the disk cache); \
+             the filter cannot be evaluated",
+            self.segment_dir.display()
+        ))
+    }
+
+    /// `filters.toc`; an error while it is not local (not cached).
+    fn toc(&self, state: &mut FilterState) -> Result<Arc<filter_columns::FiltersToc>, KoshaError> {
         if let Some(toc) = state.toc.as_ref() {
-            return Ok(Some(Arc::clone(toc)));
+            return Ok(Arc::clone(toc));
         }
         let path = self.segment_dir.join(kosha_core::FILTERS_TOC_FILE);
         let Some(bytes) = filter_columns::read_present(&path)? else {
-            eprintln!(
-                "WARN: filters.toc missing/empty at first use for {} — filtered queries against this segment will match nothing until it hydrates; retrying on next use",
-                self.segment_dir.display()
-            );
-            return Ok(None);
+            return Err(self.not_local(kosha_core::FILTERS_TOC_FILE));
         };
         let toc = filter_columns::FiltersToc::decode(&bytes).map_err(|e| {
             KoshaError::CorruptSegment(format!("{}: {e}", self.segment_dir.display()))
@@ -6233,27 +6234,27 @@ impl LazyFilters {
         }
         let toc = Arc::new(toc);
         state.toc = Some(Arc::clone(&toc));
-        Ok(Some(toc))
+        Ok(toc)
     }
 
-    /// Read and decode one column file; `Ok(None)` while it is not local.
-    /// A present but damaged file is an error: it fails the query rather
-    /// than quietly matching nothing.
+    /// Read and decode one column file. Not local, or present but damaged,
+    /// is an error: it fails the query rather than quietly matching nothing.
     fn read_column(
         &self,
         meta: &kosha_core::FilterColumnMeta,
-    ) -> Result<Option<filter_columns::FilterColumn>, KoshaError> {
+    ) -> Result<filter_columns::FilterColumn, KoshaError> {
         let file = meta.file_name();
         let Some(bytes) = filter_columns::read_present(&self.segment_dir.join(&file))? else {
-            return Ok(None);
+            return Err(self.not_local(&file));
         };
         let what = format!("{}/{file} ({:?})", self.segment_dir.display(), meta.name);
-        filter_columns::decode_column(&bytes, meta.kind, self.doc_count, &what).map(Some)
+        filter_columns::decode_column(&bytes, meta.kind, self.doc_count, &what)
     }
 
     /// The compatibility [`FilterStore`] holding at least every column
-    /// named in `fields` (all columns for `None`) that is local. Legacy
-    /// segments ignore `fields`: `filters.bin` holds every column.
+    /// named in `fields` (all columns for `None`); an error when one of
+    /// them is not local. Legacy segments ignore `fields`: `filters.bin`
+    /// holds every column.
     fn store_for(
         &self,
         fields: Option<&std::collections::BTreeSet<String>>,
@@ -6262,9 +6263,7 @@ impl LazyFilters {
         if !self.columnar {
             return self.legacy(&mut state);
         }
-        let Some(toc) = self.toc(&mut state)? else {
-            return Ok(Arc::new(FilterStore::default()));
-        };
+        let toc = self.toc(&mut state)?;
         let wanted: Vec<&kosha_core::FilterColumnMeta> = toc
             .columns
             .iter()
@@ -6274,21 +6273,10 @@ impl LazyFilters {
         if wanted.is_empty() {
             return Ok(Arc::clone(&state.merged));
         }
-        let mut loaded = Vec::new();
-        for meta in wanted {
-            match self.read_column(meta)? {
-                Some(column) => loaded.push((meta, column)),
-                None => eprintln!(
-                    "WARN: filter column {} ({:?}) missing at use for {} — filters on it match nothing until it hydrates; retrying on next use",
-                    meta.file_name(),
-                    meta.name,
-                    self.segment_dir.display()
-                ),
-            }
-        }
-        if loaded.is_empty() {
-            return Ok(Arc::clone(&state.merged));
-        }
+        let loaded = wanted
+            .into_iter()
+            .map(|meta| Ok((meta, self.read_column(meta)?)))
+            .collect::<Result<Vec<_>, KoshaError>>()?;
         // Copy-on-grow: readers holding the previous Arc keep it. Rare —
         // only when a query touches a column this segment has not loaded.
         let mut store = (*state.merged).clone();
@@ -6301,7 +6289,7 @@ impl LazyFilters {
     }
 
     /// One column, decoded and cached. `Ok(None)` when the segment has no
-    /// such column, or (columnar) its file is not local yet — not cached.
+    /// such column; an error (not cached) when its file is not local.
     fn column(
         &self,
         name: &str,
@@ -6314,16 +6302,11 @@ impl LazyFilters {
             return Ok(Some(Arc::clone(column)));
         }
         let column = if self.columnar {
-            let Some(toc) = self.toc(&mut state)? else {
-                return Ok(None);
-            };
+            let toc = self.toc(&mut state)?;
             let Some(meta) = toc.find(name, kind) else {
                 return Ok(None);
             };
-            match self.read_column(meta)? {
-                Some(column) => column,
-                None => return Ok(None),
-            }
+            self.read_column(meta)?
         } else {
             let store = self.legacy(&mut state)?;
             let column = match kind {
@@ -6342,8 +6325,8 @@ impl LazyFilters {
                     .map(|e| FilterColumn::Float(NumericColumn::from_entries(e))),
             };
             match column {
-                Some(column) if state.legacy.is_some() => column,
-                _ => return Ok(None),
+                Some(column) => column,
+                None => return Ok(None),
             }
         };
         let column = Arc::new(column);
@@ -9049,9 +9032,11 @@ impl SegmentReader {
     }
 
     /// The segment's filter columns, parsed on first use (see
-    /// [`LazyFilters`]). Queries without filters/aggregations/field sorts
-    /// never call this, and never pay the parse.
-    pub fn filter_store(&self) -> Arc<FilterStore> {
+    /// [`LazyFilters`]); an unreadable store logs and reads as empty, so
+    /// only tests use it. Search and admin paths use the fallible
+    /// [`Self::filter_store_for`] / [`Self::try_filter_store`].
+    #[cfg(test)]
+    fn filter_store(&self) -> Arc<FilterStore> {
         self.try_filter_store().unwrap_or_else(|e| {
             eprintln!(
                 "ERROR: filter columns of {} unreadable: {e}",
@@ -9061,9 +9046,9 @@ impl SegmentReader {
         })
     }
 
-    /// [`Self::filter_store`] that reports a damaged columnar filter file
-    /// (#244) as an error instead of an empty store. Callers that filter,
-    /// sort or aggregate use this so corruption fails the request closed.
+    /// Every filter column of the segment. A damaged (#244) or not-local
+    /// filter file is an error, never an empty store, so the request fails
+    /// closed.
     pub fn try_filter_store(&self) -> Result<Arc<FilterStore>, KoshaError> {
         self.filters.store_for(None)
     }
@@ -9089,9 +9074,9 @@ impl SegmentReader {
 
     /// One filter column, decoded on first use and cached (#244). Works on
     /// both formats: a legacy segment builds it from `filters.bin`.
-    /// `Ok(None)` when the segment has no such column or its file is not
-    /// local yet (a missing file is never cached, so a later call sees it
-    /// once hydrated). `Err` when the file is present but damaged.
+    /// `Ok(None)` when the segment has no such column. `Err` when its file
+    /// is not local (never cached, so a later call sees it once hydrated)
+    /// or is present but damaged.
     pub fn filter_column(
         &self,
         field: &str,
@@ -9844,35 +9829,28 @@ impl SegmentReader {
         })
     }
 
-    /// Raw bytes of `filters.bin` — empty when the file is absent (a
-    /// segment with no filter fields). Parsing is deferred to first use;
-    /// see [`LazyFilters`].
+    /// Raw bytes of `filters.bin` — empty when the file is not local (the
+    /// writer always emits at least its 4-byte header). Parsing is
+    /// deferred to first use; see [`LazyFilters`].
     fn read_filters_raw(segment_dir: &Path) -> Vec<u8> {
         fs::read(segment_dir.join("filters.bin")).unwrap_or_default()
     }
 
     /// Eagerly read every filter column, in whichever format `footer`
     /// says the segment uses — for the bloom-rewrite admin path, which
-    /// always needs the parsed form. A columnar segment must have its TOC
-    /// and every column local; a missing one is an error here (a rebuilt
-    /// bloom must not silently drop a field).
+    /// always needs the parsed form. Every filter file must be local; a
+    /// missing one is an error here (a rebuilt bloom must not silently
+    /// drop a field, or prune the segment from every filtered query).
     fn read_filters_any(segment_dir: &Path, footer: &Footer) -> Result<FilterStore, KoshaError> {
-        if footer.filter_columns.is_none() {
-            return Self::parse_filters(&Self::read_filters_raw(segment_dir));
-        }
         let filters = LazyFilters {
             segment_dir: segment_dir.to_path_buf(),
             doc_count: footer.doc_count,
-            columnar: true,
+            columnar: footer.filter_columns.is_some(),
             state: Mutex::new(FilterState::default()),
         };
-        if !filter_columns::filter_files_present(segment_dir, footer) {
-            return Err(KoshaError::NotFound(format!(
-                "{}: columnar filter files not all local",
-                segment_dir.display()
-            )));
-        }
-        Ok((*filters.store_for(None)?).clone())
+        let store = filters.store_for(None)?;
+        drop(filters);
+        Ok(Arc::unwrap_or_clone(store))
     }
 
     /// Parse filter columns from raw `filters.bin` bytes. Empty/short input
@@ -14428,11 +14406,19 @@ mod filter_column_format_tests {
         assert!(store.integer_fields.is_empty());
 
         // A later query touches `pages`, whose column lands afterwards: the
-        // missing read is not cached, and the store grows once it is local.
-        let missing = r.filter_store_for(&fields(&["matterId", "pages"])).unwrap();
-        assert!(!missing.integer_fields.contains_key("pages"));
+        // read while it is not local is an error (never "no values"), is
+        // not cached, and the store grows once it is local.
+        assert!(matches!(
+            r.filter_store_for(&fields(&["matterId", "pages"])),
+            Err(KoshaError::NotFound(_))
+        ));
+        assert!(matches!(
+            r.filter_column("pages", FilterColumnKind::Integer),
+            Err(KoshaError::NotFound(_))
+        ));
+        // A column the segment does not have is still "no values".
         assert!(r
-            .filter_column("pages", FilterColumnKind::Integer)
+            .filter_column("nope", FilterColumnKind::String)
             .unwrap()
             .is_none());
         let v2 = temp_dir("subset-src");
@@ -14461,8 +14447,10 @@ mod filter_column_format_tests {
         let stash = dir.join("toc.stash");
         fs::rename(dir.join(FILTERS_TOC_FILE), &stash).unwrap();
         let r = SegmentReader::open_with_options(dir.clone(), false).unwrap();
-        let store = r.try_filter_store().unwrap();
-        assert!(store.string_fields.is_empty());
+        assert!(matches!(r.try_filter_store(), Err(KoshaError::NotFound(_))));
+        assert!(r
+            .filter_column("matterId", FilterColumnKind::String)
+            .is_err());
         assert!(r.filters.state.lock().unwrap().toc.is_none());
         fs::rename(&stash, dir.join(FILTERS_TOC_FILE)).unwrap();
         let store = r.try_filter_store().unwrap();
@@ -14531,6 +14519,17 @@ mod filter_column_format_tests {
         let any = &footer.filter_columns.as_ref().unwrap()[0];
         fs::remove_file(dir.join(any.file_name())).unwrap();
         assert!(SegmentReader::rewrite_filter_blooms(&dir).is_err());
+        let _ = fs::remove_dir_all(&dir);
+
+        // Same for a legacy segment's `filters.bin`: rebuilt from nothing,
+        // its blooms would prune the segment from every filtered query.
+        let dir = temp_dir("bloom-rewrite-v1");
+        write(&dir, 1, &docs());
+        fs::remove_file(dir.join(kosha_core::FILTERS_BIN_FILE)).unwrap();
+        assert!(matches!(
+            SegmentReader::rewrite_filter_blooms(&dir),
+            Err(KoshaError::NotFound(_))
+        ));
         let _ = fs::remove_dir_all(&dir);
     }
 
