@@ -1,0 +1,159 @@
+# In-cluster log collector for eval runs: runs `bundle.py follow` inside the
+# kosha namespace so pod log streams survive the laptop sleeping, and pods the
+# autoscaler adds and removes mid-run are still captured.
+#
+# Not part of the k8s/ overlays: applied by hand for eval runs with
+# `kubectl apply -k scripts/eval` (usage in scripts/eval/bundle.py docstring).
+#
+# Read-only RBAC in namespace kosha only, its own ServiceAccount (no IAM role),
+# no secrets. Logs stay on the PVC until fetched; the PVC survives pod restarts,
+# and a restarted follow resumes each pod's log from its last saved line.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kosha-eval-collector
+  labels:
+    app: kosha-eval-collector
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kosha-eval-collector
+  labels:
+    app: kosha-eval-collector
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kosha-eval-collector
+  labels:
+    app: kosha-eval-collector
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kosha-eval-collector
+subjects:
+  - kind: ServiceAccount
+    name: kosha-eval-collector
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kosha-eval-collector
+  labels:
+    app: kosha-eval-collector
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: gp2
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kosha-eval-collector
+  labels:
+    app: kosha-eval-collector
+spec:
+  replicas: 1
+  # The PVC is ReadWriteOnce: the old pod must let go before the new one mounts.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: kosha-eval-collector
+  template:
+    metadata:
+      labels:
+        app: kosha-eval-collector
+      annotations:
+        # A consolidation mid-run would drop the streams of short-lived pods.
+        karpenter.sh/do-not-disrupt: "true"
+    spec:
+      serviceAccountName: kosha-eval-collector
+      terminationGracePeriodSeconds: 5
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: collector
+          image: python:3.12.13-slim-bookworm
+          env:
+            - name: KUBECTL_VERSION
+              value: v1.34.13
+            # sha256 of https://dl.k8s.io/release/v1.34.13/bin/linux/amd64/kubectl
+            - name: KUBECTL_SHA256
+              value: b4bb494e9466a7a94bb851414548bc0d3e2f8da90757e6eccc3371e648648591
+            - name: PATH
+              value: /tools:/usr/local/bin:/usr/bin:/bin
+            - name: KUBECONFIG
+              value: /tools/kubeconfig
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              python3 - <<'EOF'
+              import hashlib, os, urllib.request
+              v, want = os.environ["KUBECTL_VERSION"], os.environ["KUBECTL_SHA256"]
+              data = urllib.request.urlopen(f"https://dl.k8s.io/release/{v}/bin/linux/amd64/kubectl", timeout=300).read()
+              if hashlib.sha256(data).hexdigest() != want:
+                  raise SystemExit("kubectl checksum mismatch")
+              open("/tools/kubectl", "wb").write(data)
+              os.chmod("/tools/kubectl", 0o755)
+              EOF
+              # kubectl only falls back to in-cluster config when no flag is set,
+              # and bundle.py passes --request-timeout: point it at the SA token.
+              sa=/var/run/secrets/kubernetes.io/serviceaccount
+              cat > "$KUBECONFIG" <<EOF
+              apiVersion: v1
+              kind: Config
+              clusters: [{name: in-cluster, cluster: {server: "https://kubernetes.default.svc", certificate-authority: $sa/ca.crt}}]
+              users: [{name: sa, user: {tokenFile: $sa/token}}]
+              contexts: [{name: in-cluster, context: {cluster: in-cluster, user: sa, namespace: kosha}}]
+              current-context: in-cluster
+              EOF
+              # follow returns once /data/run/STOP exists; deleting /data/run starts a fresh collection.
+              while :; do
+                [ -e /data/run/STOP ] || python3 /app/bundle.py follow /data/run
+                sleep 15
+              done
+          # Measured on staging: 85Mi working set and under 10m CPU while
+          # tailing 4 pods (~18Mi per `kubectl logs -f`). 512Mi covers ~25 pods.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tools
+              mountPath: /tools
+            - name: app
+              mountPath: /app
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: kosha-eval-collector
+        - name: tools
+          emptyDir: {}
+        - name: app
+          configMap:
+            name: kosha-eval-collector

@@ -8,6 +8,16 @@ Needs kubectl access to the cluster; run it beside run_eval.py.
 `finish` adds events, pod and data state, each pod's local files, and writes
 analysis.md: errors and latency per pod, pod age when it failed, and what
 the server did for the slow and semantic requests.
+
+In-cluster follow (survives the laptop sleeping; k8s/collector.yaml):
+  apply      kubectl apply -k scripts/eval      starts following into /data/run
+  run start  optional, drops earlier logs; collection restarts within 15 s:
+             kubectl -n kosha exec deploy/kosha-eval-collector -- \
+               sh -c 'touch /data/run/STOP; sleep 20; rm -rf /data/run'
+  run end    mkdir -p <dir> && kubectl -n kosha exec deploy/kosha-eval-collector -- \
+               tar cf - -C /data/run logs | tar xf - -C <dir>
+             bundle.py finish <dir> <samples.jsonl.gz>    on the laptop, as before
+  delete     kubectl delete -k scripts/eval      also deletes the saved logs
 """
 import collections
 import gzip
@@ -28,7 +38,7 @@ def kubectl(*args, namespace=NS):
 
 
 def pods():
-    return [p for p in kubectl("get", "pods", "-o", "name").split() if "loader" not in p]
+    return [p for p in kubectl("get", "pods", "-o", "name").split() if "loader" not in p and "eval-collector" not in p]
 
 
 def last_time(path):
@@ -45,6 +55,12 @@ def last_time(path):
 
 def follow(out):
     os.makedirs(f"{out}/logs", exist_ok=True)
+    # Pods with nothing saved yet are read from when collection first started,
+    # so a pod that appears mid-run (or is still Pending when first seen) keeps
+    # its startup lines. Kept in a file so a restarted follow uses the same time.
+    if not os.path.exists(f"{out}/started"):
+        open(f"{out}/started", "w").write(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    started = open(f"{out}/started").read().strip()
     tails = {}
     while not os.path.exists(f"{out}/STOP"):
         for pod in pods():
@@ -52,10 +68,9 @@ def follow(out):
             # restart it from the last saved line so the gap is filled.
             if pod not in tails or tails[pod].poll() is not None:
                 path = f"{out}/logs/{pod.split('/')[-1]}.log"
-                since = last_time(path)
                 tails[pod] = subprocess.Popen(
                     ["kubectl", "-n", NS, "logs", "-f", "--timestamps",
-                     f"--since-time={since}" if since else "--since=1s", pod],
+                     f"--since-time={last_time(path) or started}", pod],
                     stdout=open(path, "a"), stderr=subprocess.DEVNULL)
         time.sleep(15)
     for tail in tails.values():
