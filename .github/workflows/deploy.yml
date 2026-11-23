@@ -34,6 +34,11 @@ on:
         required: false
         type: boolean
         default: false
+      build_only:
+        description: "Experiment branches only: build and push the image (needs build_from_ref) and skip the deploy job, so the main Deployments keep their image."
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   # Build an image from the ref this run was dispatched on and push it to the
@@ -106,7 +111,7 @@ jobs:
     name: Deploy to EKS (${{ inputs.environment }})
     needs: build
     # Run when the build succeeded, and also when it was not asked for.
-    if: always() && (needs.build.result == 'success' || needs.build.result == 'skipped')
+    if: always() && (needs.build.result == 'success' || needs.build.result == 'skipped') && !inputs.build_only
     runs-on: nonprod-runner-kosha
     environment: ${{ inputs.environment }}
     permissions:
