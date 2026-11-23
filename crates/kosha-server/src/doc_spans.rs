@@ -38,10 +38,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 
+use crate::span_writes::SpanWriteQueue;
+
 use kosha_cache::Cache;
 use kosha_core::KoshaError;
 use kosha_query::PageSegment;
-use kosha_segment::span_cache::{self, SpanIndex};
+use kosha_segment::span_cache::{self, SpanHolds, SpanIndex};
 use kosha_segment::{
     doc_vectors_header_len, DOC_STORE_FILE, DOC_VECTORS_FILE, DOC_VECTORS_HEADER_PROBE,
 };
@@ -225,6 +227,9 @@ pub struct SpanOutcome {
     /// Segments the ranged path could not serve; the caller fetches their
     /// whole files instead.
     pub whole_fallback: Vec<PathBuf>,
+    /// Why the first `whole_fallback` segment could not be served by range,
+    /// for the fallback's log line. Set on the failure path only.
+    pub fallback_error: Option<String>,
     /// Segments that just crossed a promotion threshold; the caller queues
     /// a background whole-file hydration and then calls
     /// [`SpanHydrator::finish_promotion`].
@@ -232,6 +237,9 @@ pub struct SpanOutcome {
     /// A range was refused by the request's byte ceiling or the in-flight
     /// budget. Not retried as a whole-file fetch (that would be larger).
     pub shed: bool,
+    /// Fetched spans the write queue could not take: readable only while
+    /// held, so the caller keeps them until the page is read.
+    pub held: SpanHolds,
 }
 
 #[derive(Default)]
@@ -269,6 +277,18 @@ impl SpanHydrator {
         }
     }
 
+    pub fn config(&self) -> &SpanConfig {
+        &self.cfg
+    }
+
+    /// Ranged GETs and bytes `segment_dir` has drawn since its heat last
+    /// reset — what put it over a promotion threshold, for the promotion's
+    /// start line.
+    pub fn heat(&self, segment_dir: &Path) -> Option<(u64, u64)> {
+        let heat = self.heat.lock().unwrap();
+        heat.get(segment_dir).map(|h| (h.gets, h.bytes))
+    }
+
     fn rel(&self, segment_dir: &Path) -> Option<String> {
         segment_dir
             .strip_prefix(&self.data_dir)
@@ -284,7 +304,7 @@ impl SpanHydrator {
         &self,
         pages: &[PageSegment<'_>],
         fetcher: &dyn RangeFetcher,
-        cache: &Cache,
+        writes: &SpanWriteQueue,
     ) -> SpanOutcome {
         let mut out = SpanOutcome::default();
         let mut fallback = vec![false; pages.len()];
@@ -302,14 +322,16 @@ impl SpanHydrator {
 
         // ── Round 1: sidecar headers ─────────────────────────────────────
         let header_segs: Vec<usize> = (0..pages.len())
-            .filter(|&i| !fallback[i] && !pages[i].reader.has_local_doc_vectors_header())
+            .filter(|&i| {
+                !fallback[i] && pages[i].vectors && !pages[i].reader.has_local_doc_vectors_header()
+            })
             .collect();
         if !header_segs.is_empty() {
             let targets: Vec<(&Path, &str)> = header_segs
                 .iter()
                 .map(|&i| (pages[i].segment_dir, rels[i].as_deref().unwrap()))
                 .collect();
-            let fetched = fetch_doc_vectors_headers(&targets, fetcher, cache);
+            let fetched = fetch_doc_vectors_headers(&targets, fetcher, writes);
             out.rounds += fetched.rounds;
             out.shed |= fetched.shed;
             for (&i, seg) in header_segs.iter().zip(fetched.segments) {
@@ -352,7 +374,9 @@ impl SpanHydrator {
                     // and the page skips it; nothing to fetch.
                     None => continue,
                 }
-                if reader.uses_doc_vectors() {
+                // A page whose `_source` returns no sidecar field needs
+                // none of its vector bytes.
+                if page.vectors && reader.uses_doc_vectors() {
                     match reader.doc_vectors_span(doc_seq) {
                         Ok(Some((s, e))) => {
                             if !dv_whole && !dv_idx.covers(s, e) {
@@ -360,7 +384,9 @@ impl SpanHydrator {
                             }
                         }
                         Ok(None) => {}
-                        Err(_) => {
+                        Err(e) => {
+                            out.fallback_error
+                                .get_or_insert_with(|| format!("doc_vectors span: {e}"));
                             fallback[i] = true;
                             break;
                         }
@@ -372,7 +398,11 @@ impl SpanHydrator {
             }
             let rel = rels[i].as_deref().unwrap();
             for (file, ranges) in [(DOC_STORE_FILE, ds_ranges), (DOC_VECTORS_FILE, dv_ranges)] {
-                for (s, e) in span_cache::coalesce(ranges, self.cfg.coalesce_gap) {
+                for (s, e) in span_cache::coalesce_capped(
+                    ranges,
+                    self.cfg.coalesce_gap,
+                    crate::posting_spans::MAX_RANGE_BYTES,
+                ) {
                     reqs.push((format!("{rel}/{file}"), s, e - s));
                     pending.push(Pending {
                         seg: i,
@@ -393,15 +423,11 @@ impl SpanHydrator {
                     Ok(bytes) if p.exact.is_none_or(|n| n == bytes.len() as u64) => {
                         out.bytes += bytes.len() as u64;
                         seg_bytes[p.seg] += bytes.len() as u64;
-                        let page = &pages[p.seg];
-                        self.persist(
-                            cache,
-                            page.segment_dir,
-                            &rels[p.seg],
-                            p.file,
-                            p.start,
-                            &bytes,
-                        );
+                        if let Some(rel) = rels[p.seg].as_deref() {
+                            let dir = pages[p.seg].segment_dir;
+                            out.held
+                                .extend(writes.persist(dir, rel, p.file, p.start, bytes));
+                        }
                     }
                     Ok(bytes) => {
                         eprintln!(
@@ -413,10 +439,17 @@ impl SpanHydrator {
                             bytes.len(),
                             p.exact
                         );
+                        out.fallback_error.get_or_insert_with(|| {
+                            format!("{} returned {} bytes", p.file, bytes.len())
+                        });
                         fallback[p.seg] = true;
                     }
                     Err(KoshaError::Overloaded(_)) => out.shed = true,
-                    Err(_) => fallback[p.seg] = true,
+                    Err(e) => {
+                        out.fallback_error
+                            .get_or_insert_with(|| format!("{}: {e}", p.file));
+                        fallback[p.seg] = true;
+                    }
                 }
             }
         }
@@ -429,7 +462,11 @@ impl SpanHydrator {
                 out.whole_fallback.push(page.segment_dir.to_path_buf());
                 continue;
             }
-            if seg_gets[i] == 0 {
+            // Heat counts toward a promotion only while one would fetch
+            // something: an f32 segment whose `doc_store.bin` is already
+            // whole keeps reading its page vectors by range, and
+            // re-promoting it would fetch nothing and drop nothing.
+            if seg_gets[i] == 0 || !promotion_would_fetch(page.segment_dir, page.reader) {
                 continue;
             }
             let h = heat.entry(page.segment_dir.to_path_buf()).or_default();
@@ -444,31 +481,24 @@ impl SpanHydrator {
         out
     }
 
-    /// Write one fetched range into the span cache and account it in the
-    /// disk cache. Written to a temp name and renamed, so a reader never
-    /// sees a partial span (it would ignore one anyway: the name carries
-    /// the length). Failure to persist is logged, not fatal: the page then
-    /// fails to materialize and the client retries, like any IO error.
-    fn persist(
+    /// A background whole-file hydration for `segment_dir` finished. When
+    /// the whole files `landed`, the spans of each file now whole are
+    /// redundant (the whole file wins every read) and are dropped from disk
+    /// and from the cache's accounting — not as an eviction, so posting
+    /// presence verdicts survive
+    /// ([`Cache::drop_superseded_dir_unless_pinned`]). A `doc_vectors.bin`
+    /// kept remote (f32 columns, see
+    /// [`kosha_segment::doc_vectors_kept_whole`]) keeps its spans: they are
+    /// still how its vectors are read. Either way the
+    /// segment's heat resets, so a failed promotion may be retried after
+    /// another threshold's worth of reads.
+    pub fn finish_promotion(
         &self,
         cache: &Cache,
+        writes: &SpanWriteQueue,
         segment_dir: &Path,
-        rel: &Option<String>,
-        file: &str,
-        start: u64,
-        bytes: &[u8],
+        landed: bool,
     ) {
-        if let Some(rel) = rel {
-            persist_span(cache, segment_dir, rel, file, start, bytes);
-        }
-    }
-
-    /// A background whole-file hydration for `segment_dir` finished. When
-    /// the whole files `landed`, its spans are redundant (the whole file
-    /// wins every read) and are dropped from disk and from the cache's
-    /// accounting. Either way the segment's heat resets, so a failed
-    /// promotion may be retried after another threshold's worth of reads.
-    pub fn finish_promotion(&self, cache: &Cache, segment_dir: &Path, landed: bool) {
         self.promoting.lock().unwrap().remove(segment_dir);
         self.heat.lock().unwrap().remove(segment_dir);
         if !landed {
@@ -478,56 +508,28 @@ impl SpanHydrator {
             return;
         };
         for file in [DOC_STORE_FILE, DOC_VECTORS_FILE] {
+            if !std::fs::metadata(segment_dir.join(file)).is_ok_and(|m| m.len() > 0) {
+                continue;
+            }
             let key = format!("{rel}/{file}{}", span_cache::SPANS_SUFFIX);
-            if let Err(e) = cache.evict_dir_unless_pinned(&key) {
+            if let Err(e) = writes.drop_superseded(cache, &key) {
                 eprintln!("WARN: failed to drop span cache {key}: {e}");
             }
         }
     }
 }
 
-/// Write one fetched range `[start, start + bytes.len())` of
-/// `{segment_dir}/{file}` into the span cache and account it in the disk
-/// cache under `{rel}/{file}.spans/…`. Written to a temp name and renamed,
-/// so a reader never sees a partial span (it would ignore one anyway: the
-/// name carries the length). Failure to persist is logged, not fatal: the
-/// read that needed it then fails and the client retries, like any IO
-/// error.
-pub(crate) fn persist_span(
-    cache: &Cache,
-    segment_dir: &Path,
-    rel: &str,
-    file: &str,
-    start: u64,
-    bytes: &[u8],
-) {
-    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-    if bytes.is_empty() {
-        return;
-    }
-    let dir = span_cache::spans_dir(segment_dir, file);
-    let name = span_cache::span_file_name(start, start + bytes.len() as u64);
-    let dest = dir.join(&name);
-    if std::fs::metadata(&dest).is_ok_and(|m| m.len() == bytes.len() as u64) {
-        return;
-    }
-    let tmp = dir.join(format!(
-        ".tmp.{}.{}",
-        std::process::id(),
-        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    let written = std::fs::create_dir_all(&dir)
-        .and_then(|_| std::fs::write(&tmp, bytes))
-        .and_then(|_| std::fs::rename(&tmp, &dest));
-    match written {
-        Ok(()) => {
-            cache.note_external_write(&format!("{rel}/{file}{}/{name}", span_cache::SPANS_SUFFIX))
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            eprintln!("WARN: failed to persist span {}: {e}", dest.display());
-        }
-    }
+/// Whether promoting `segment_dir` would fetch anything: its
+/// `doc_store.bin` is not whole yet, or its `doc_vectors.bin` is kept whole
+/// ([`kosha_segment::doc_vectors_kept_whole`]) and is not local yet.
+fn promotion_would_fetch(segment_dir: &Path, reader: &kosha_segment::SegmentReader) -> bool {
+    let whole = |file: &str, len: Option<u64>| {
+        std::fs::metadata(segment_dir.join(file))
+            .is_ok_and(|m| m.len() > 0 && len.is_none_or(|len| m.len() >= len))
+    };
+    !whole(DOC_STORE_FILE, reader.doc_store_len())
+        || (kosha_segment::doc_vectors_kept_whole(reader.footer())
+            && !whole(DOC_VECTORS_FILE, None))
 }
 
 /// How fetching one segment's `doc_vectors.bin` header went — see
@@ -577,7 +579,20 @@ pub fn doc_vectors_header_local(segment_dir: &Path) -> bool {
 pub fn fetch_doc_vectors_headers(
     targets: &[(&Path, &str)],
     fetcher: &dyn RangeFetcher,
-    cache: &Cache,
+    writes: &SpanWriteQueue,
+) -> HeadersFetched {
+    fetch_doc_vectors_headers_probing(targets, |_| DOC_VECTORS_HEADER_PROBE, fetcher, writes)
+}
+
+/// [`fetch_doc_vectors_headers`] with the first read of target `i` sized
+/// `probe(i)` bytes: a caller that knows the header's likely length (see
+/// [`kosha_segment::doc_vectors_header_estimate`]) fetches it in one round
+/// instead of a probe plus the rest.
+pub fn fetch_doc_vectors_headers_probing(
+    targets: &[(&Path, &str)],
+    probe: impl Fn(usize) -> u64,
+    fetcher: &dyn RangeFetcher,
+    writes: &SpanWriteQueue,
 ) -> HeadersFetched {
     let mut out = HeadersFetched {
         segments: vec![
@@ -594,9 +609,11 @@ pub fn fetch_doc_vectors_headers(
         return out;
     }
     let key = |rel: &str| format!("{rel}/{DOC_VECTORS_FILE}");
+    let probe_len: Vec<u64> = (0..targets.len()).map(&probe).collect();
     let probes: Vec<(String, u64, u64)> = targets
         .iter()
-        .map(|(_, rel)| (key(rel), 0, DOC_VECTORS_HEADER_PROBE))
+        .zip(&probe_len)
+        .map(|((_, rel), &len)| (key(rel), 0, len))
         .collect();
     out.rounds += 1;
     let mut rest: Vec<(usize, Vec<u8>, u64)> = Vec::new();
@@ -617,13 +634,15 @@ pub fn fetch_doc_vectors_headers(
         match doc_vectors_header_len(&prefix) {
             Ok(Ok(_)) => {
                 let (dir, rel) = targets[i];
-                persist_span(cache, dir, rel, DOC_VECTORS_FILE, 0, &prefix);
+                // Never dropped: completeness checks and single-flight
+                // waiters read it after this request is done with it.
+                writes.persist_required(dir, rel, DOC_VECTORS_FILE, 0, prefix);
                 seg.status = HeaderStatus::Cached;
             }
             // A full probe that ended inside the header: fetch the rest. A
             // short probe was the whole file, so a header still incomplete
             // there is corrupt.
-            Ok(Err(need)) if prefix.len() as u64 == DOC_VECTORS_HEADER_PROBE => {
+            Ok(Err(need)) if prefix.len() as u64 == probe_len[i] => {
                 rest.push((i, prefix, need));
             }
             _ => {}
@@ -655,7 +674,7 @@ pub fn fetch_doc_vectors_headers(
                     && matches!(doc_vectors_header_len(&prefix), Ok(Ok(_)))
                 {
                     let (dir, rel) = targets[i];
-                    persist_span(cache, dir, rel, DOC_VECTORS_FILE, 0, &prefix);
+                    writes.persist_required(dir, rel, DOC_VECTORS_FILE, 0, prefix);
                     seg.status = HeaderStatus::Cached;
                 }
             }
@@ -695,7 +714,6 @@ impl PromotionQueue {
         q.pop_front()
     }
 
-    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.queue.lock().unwrap().len()
     }
@@ -889,6 +907,47 @@ mod tests {
         serde_json::from_value(serde_json::json!({"query_text": text, "max_results": k})).unwrap()
     }
 
+    /// [`SpanHydrator::hydrate`] with its span writes done before it
+    /// returns, as the background writer would do them.
+    fn hydrate_now(
+        hydrator: &SpanHydrator,
+        pages: &[PageSegment<'_>],
+        store: &dyn RangeFetcher,
+        cache: &Cache,
+    ) -> SpanOutcome {
+        let writes = SpanWriteQueue::new(
+            crate::span_writes::SPAN_WRITE_QUEUE_BYTES,
+            crate::span_writes::SPAN_HELD_BYTES,
+        );
+        let o = hydrator.hydrate(pages, store, &writes);
+        writes.drain(cache);
+        o
+    }
+
+    /// [`fetch_doc_vectors_headers_probing`], likewise.
+    fn headers_probing_now(
+        targets: &[(&Path, &str)],
+        probe: impl Fn(usize) -> u64,
+        store: &dyn RangeFetcher,
+        cache: &Cache,
+    ) -> HeadersFetched {
+        let writes = SpanWriteQueue::new(
+            crate::span_writes::SPAN_WRITE_QUEUE_BYTES,
+            crate::span_writes::SPAN_HELD_BYTES,
+        );
+        let o = fetch_doc_vectors_headers_probing(targets, probe, store, &writes);
+        writes.drain(cache);
+        o
+    }
+
+    fn headers_now(
+        targets: &[(&Path, &str)],
+        store: &dyn RangeFetcher,
+        cache: &Cache,
+    ) -> HeadersFetched {
+        headers_probing_now(targets, |_| DOC_VECTORS_HEADER_PROBE, store, cache)
+    }
+
     /// Run one search whose page hydration goes through `hydrator`,
     /// returning the result and the summed outcome.
     fn search(
@@ -903,7 +962,7 @@ mod tests {
         let calls = Mutex::new(0usize);
         let ensure = |pages: &[PageSegment<'_>]| {
             *calls.lock().unwrap() += 1;
-            let o = hydrator.hydrate(pages, store, cache);
+            let o = hydrate_now(hydrator, pages, store, cache);
             let mut acc = outcome.lock().unwrap();
             acc.gets += o.gets;
             acc.bytes += o.bytes;
@@ -1089,6 +1148,103 @@ mod tests {
         assert_eq!(store.gets(), before);
     }
 
+    /// A `doc_vectors.bin` header is never dropped, even with a span write
+    /// queue that can take nothing: completeness checks
+    /// (`doc_vectors_header_local`) and single-flight waiters read it after
+    /// the fetching request is done, so it must count as local until it
+    /// lands on disk.
+    #[test]
+    fn a_full_write_queue_never_drops_a_header() {
+        let f = fixture("dv-required", 1, 40, true, |_| false);
+        let seg = f.data.join(&f.ns.0).join("s0");
+        let store = CountingStore::new(f.remote.clone());
+        let full = SpanWriteQueue::new(0, 0);
+        let fetched = fetch_doc_vectors_headers(&[(&seg, "ns/s0")], &store, &full);
+        assert_eq!(fetched.segments[0].status, HeaderStatus::Cached);
+        assert!(doc_vectors_header_local(&seg), "local while queued");
+        assert!(full.queued_bytes() > 0);
+        assert_eq!(full.stats().dropped, 0);
+        let cache = Cache::new(f.data.clone());
+        full.drain(&cache);
+        assert!(doc_vectors_header_local(&seg), "and on disk after");
+    }
+
+    /// A header longer than the fixed probe takes two rounds; sized from
+    /// the footer (`doc_vectors_header_estimate`) it takes one, and an
+    /// estimate past the end of a small file still lands the header.
+    #[test]
+    fn footer_sized_header_probe_is_one_round() {
+        for (docs, fixed_rounds) in [(6000, 2), (40, 1)] {
+            let f = fixture("dv-probe", 1, docs, true, |_| false);
+            let seg = f.data.join(&f.ns.0).join("s0");
+            let footer = SegmentReader::read_footer(&seg).unwrap();
+            let estimate = kosha_segment::doc_vectors_header_estimate(&footer);
+            let cache = Cache::new(f.data.clone());
+
+            let store = CountingStore::new(f.remote.clone());
+            let fixed = headers_now(&[(&seg, "ns/s0")], &store, &cache);
+            assert_eq!(fixed.rounds, fixed_rounds, "{docs} docs");
+            std::fs::remove_dir_all(span_cache::spans_dir(&seg, DOC_VECTORS_FILE)).unwrap();
+            assert!(!doc_vectors_header_local(&seg));
+
+            let store = CountingStore::new(f.remote.clone());
+            let sized = headers_probing_now(&[(&seg, "ns/s0")], |_| estimate, &store, &cache);
+            assert_eq!(sized.segments[0].status, HeaderStatus::Cached);
+            assert_eq!(sized.rounds, 1, "{docs} docs");
+            assert_eq!(store.gets(), 1);
+            assert!(doc_vectors_header_local(&seg));
+            assert!(!seg.join(DOC_VECTORS_FILE).exists());
+        }
+    }
+
+    /// A page whose `_source` excludes the embedding (as every Decover
+    /// search does) needs no sidecar bytes: no header probe, no vector
+    /// span, one record GET per segment — and the warm repeat is free.
+    #[test]
+    fn page_excluding_the_vector_fetches_nothing_of_doc_vectors() {
+        let f = fixture("sidecar-excluded", 2, 6000, true, |i| {
+            i == 5500 || i == 5501
+        });
+        let store = CountingStore::new(f.remote.clone());
+        let cache = Cache::new(f.data.clone());
+        let hydrator = SpanHydrator::new(f.data.clone(), SpanConfig::default());
+        let searcher = Searcher::new(f.data.clone());
+        let mut q = query("needle", 10);
+        q.source_excludes = Some(vec!["emb".into()]);
+
+        let (r, o, _) = search(&f, &searcher, &hydrator, &store, &cache, &q);
+        assert_eq!(r.results.len(), 4);
+        for doc in &r.results {
+            assert!(doc.fields.iter().all(|fl| fl.name != "emb"));
+            assert!(doc.fields.iter().any(|fl| fl.name == "t"));
+        }
+        assert!(o.whole_fallback.is_empty());
+        assert_eq!(store.gets(), 2, "one record GET per segment, nothing else");
+        for s in 0..2 {
+            let seg = f.data.join(&f.ns.0).join(format!("s{s}"));
+            assert!(!seg.join(DOC_VECTORS_FILE).exists());
+            assert!(
+                !span_cache::spans_dir(&seg, DOC_VECTORS_FILE).exists(),
+                "no doc_vectors.bin header or span fetched"
+            );
+        }
+
+        let before = store.gets();
+        let (r2, _, calls) = search(&f, &searcher, &hydrator, &store, &cache, &q);
+        assert_eq!(r2.results.len(), 4);
+        assert_eq!(calls, 0);
+        assert_eq!(store.gets(), before);
+
+        // The same page returning the vector then fetches just its spans.
+        q.source_excludes = None;
+        let (r3, _, calls) = search(&f, &searcher, &hydrator, &store, &cache, &q);
+        assert_eq!(calls, 1);
+        assert!(r3
+            .results
+            .iter()
+            .all(|d| d.fields.iter().any(|fl| fl.name == "emb")));
+    }
+
     /// Research #388: in a namespace mixing a zstd doc store (s0) with a
     /// raw one (s1), a cold page still costs one ranged GET per segment for
     /// the records (plus the vector header and spans), fetches exactly the
@@ -1213,7 +1369,7 @@ mod tests {
             seg.join(DOC_STORE_FILE),
         )
         .unwrap();
-        hydrator.finish_promotion(&cache, &seg, true);
+        hydrator.finish_promotion(&cache, &SpanWriteQueue::new(0, 0), &seg, true);
         assert!(!span_cache::spans_dir(&seg, DOC_STORE_FILE).exists());
         assert_eq!(
             cache.total_size(),
@@ -1231,6 +1387,72 @@ mod tests {
         assert_eq!(store.gets(), gets);
     }
 
+    /// An f32 sidecar segment's promotion lands `doc_store.bin` alone:
+    /// `doc_vectors.bin` stays remote (`doc_vectors_kept_whole`), so its
+    /// spans are kept — page vectors are still read from them, with no GET
+    /// — and the vector-only ranged reads that follow never queue the
+    /// segment for a promotion that would fetch nothing.
+    #[test]
+    fn f32_sidecar_promotion_keeps_vector_spans_and_does_not_requeue() {
+        let f = fixture("promote-f32", 1, 1000, true, |i| i % 50 == 0);
+        let store = CountingStore::new(f.remote.clone());
+        let cache = Cache::new(f.data.clone());
+        let cfg = SpanConfig {
+            coalesce_gap: 0,
+            promote_after_gets: 3,
+            promote_after_bytes: 0,
+        };
+        let hydrator = SpanHydrator::new(f.data.clone(), cfg);
+        let searcher = Searcher::new(f.data.clone());
+        let seg = f.data.join(&f.ns.0).join("s0");
+        assert!(!kosha_segment::segment_keeps_doc_vectors_whole(&seg));
+
+        let mut q = query("needle", 4);
+        let (_, o, _) = search(&f, &searcher, &hydrator, &store, &cache, &q);
+        assert_eq!(o.promote, vec![seg.clone()]);
+        let dv_spans = SpanIndex::load(&seg, DOC_VECTORS_FILE).total_bytes();
+        assert!(dv_spans > 0);
+
+        // What `promote_doc_store` fetches for this segment: the doc store.
+        std::fs::copy(
+            f.remote.join(&f.ns.0).join("s0").join(DOC_STORE_FILE),
+            seg.join(DOC_STORE_FILE),
+        )
+        .unwrap();
+        let before = cache.total_size();
+        hydrator.finish_promotion(&cache, &SpanWriteQueue::new(0, 0), &seg, true);
+        assert!(!span_cache::spans_dir(&seg, DOC_STORE_FILE).exists());
+        assert_eq!(
+            SpanIndex::load(&seg, DOC_VECTORS_FILE).total_bytes(),
+            dv_spans,
+            "vector spans are still how this segment's vectors are read"
+        );
+        assert!(cache.total_size() < before);
+        assert!(!seg.join(DOC_VECTORS_FILE).exists());
+
+        // The same page again: records from the whole file, vectors from
+        // the kept spans — no GET.
+        let gets = store.gets();
+        let (r, _, calls) = search(&f, &searcher, &hydrator, &store, &cache, &q);
+        assert_eq!(r.results.len(), 4);
+        assert!(r
+            .results
+            .iter()
+            .all(|d| d.fields.iter().any(|fl| fl.name == "emb")));
+        assert_eq!(calls, 0);
+        assert_eq!(store.gets(), gets);
+
+        // New pages read only vector spans: past the GET threshold, but
+        // never re-queued (a promotion would fetch nothing).
+        for from in [4, 8, 12] {
+            q.from = from;
+            let (r, o, _) = search(&f, &searcher, &hydrator, &store, &cache, &q);
+            assert_eq!(r.results.len(), 4);
+            assert!(o.gets > 0);
+            assert!(o.promote.is_empty(), "re-queued at from={from}");
+        }
+    }
+
     #[test]
     fn failed_ranges_and_legacy_segments_fall_back_to_whole_files() {
         let f = fixture("fallback", 1, 50, false, |i| i < 3);
@@ -1244,8 +1466,9 @@ mod tests {
             segment_dir: &seg,
             reader: &reader,
             doc_seqs: vec![0, 1, 2],
+            vectors: true,
         }];
-        let o = hydrator.hydrate(&pages, &store, &cache);
+        let o = hydrate_now(&hydrator, &pages, &store, &cache);
         assert_eq!(o.whole_fallback, vec![seg.clone()]);
         assert!(o.promote.is_empty());
 
@@ -1267,8 +1490,9 @@ mod tests {
             segment_dir: &legacy,
             reader: &legacy_reader,
             doc_seqs: vec![0],
+            vectors: true,
         }];
-        let o = hydrator.hydrate(&pages, &store, &cache);
+        let o = hydrate_now(&hydrator, &pages, &store, &cache);
         assert_eq!(o.whole_fallback, vec![legacy]);
         assert_eq!(store.gets(), 0);
     }
@@ -1321,7 +1545,7 @@ mod tests {
 
         let store = CountingStore::new(remote.clone());
         let cache = Cache::new(data.clone());
-        let fetched = fetch_doc_vectors_headers(&[(&seg, "ns/legacy-vec")], &store, &cache);
+        let fetched = headers_now(&[(&seg, "ns/legacy-vec")], &store, &cache);
         assert_eq!(fetched.segments[0].status, HeaderStatus::Cached);
         assert_eq!(fetched.rounds, 1);
         assert!(doc_vectors_header_local(&seg));
@@ -1351,7 +1575,7 @@ mod tests {
         // A missing object fails the segment, without a whole-file fetch.
         let missing = data.join("ns/gone");
         std::fs::create_dir_all(&missing).unwrap();
-        let fetched = fetch_doc_vectors_headers(&[(&missing, "ns/gone")], &store, &cache);
+        let fetched = headers_now(&[(&missing, "ns/gone")], &store, &cache);
         assert_eq!(fetched.segments[0].status, HeaderStatus::Failed);
         std::fs::remove_dir_all(&root).ok();
     }

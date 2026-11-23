@@ -146,10 +146,18 @@ fn plaintext_rows_from_before_the_migration_keep_working_and_can_be_scrubbed() {
         &[&t],
     );
     assert!(plain.iter().any(|(k,)| k == &before));
+    // ... and the read-only count says the scrub is due, changing nothing.
+    assert!(store.count_plaintext_api_keys().unwrap() >= 2);
+    let still_plain: Vec<(String,)> = sql(
+        "SELECT api_key FROM kosha.api_keys WHERE tenant_id = $1 ORDER BY api_key",
+        &[&t],
+    );
+    assert_eq!(still_plain, plain);
 
     // ...after which no row of the table holds a usable key, and the keys
     // still authenticate by hash.
     assert!(store.scrub_plaintext_api_keys().unwrap() >= 2);
+    assert_eq!(store.count_plaintext_api_keys().unwrap(), 0);
     let scrubbed: Vec<(String, String)> = sql(
         "SELECT api_key, key_hash FROM kosha.api_keys WHERE tenant_id = $1",
         &[&t],
@@ -302,4 +310,362 @@ fn last_used_only_moves_forward() {
         .unwrap();
     assert_eq!(last_used(&a.record.key_hash), Some(1_900_000_000));
     assert_eq!(last_used(&b.record.key_hash), Some(1_800_000_000));
+}
+
+/// An operator name no other test (or earlier run) uses.
+fn operator(label: &str) -> String {
+    format!("{label}-{}", uuid::Uuid::new_v4())
+}
+
+/// The audit rows about one operator's credentials, oldest first.
+fn operator_audit(name: &str) -> Vec<(String, String, serde_json::Value)> {
+    sql::<(String, String, String)>(
+        "SELECT actor, action, detail FROM kosha.audit_log \
+         WHERE target_type = 'operator' AND target_id = $1 AND org_id IS NULL ORDER BY id",
+        &[name],
+    )
+    .into_iter()
+    .map(|(actor, action, detail)| (actor, action, serde_json::from_str(&detail).unwrap()))
+    .collect()
+}
+
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn operator_credentials_are_hashed_named_and_audited() {
+    use kosha_control::api_keys::{operator_name, operator_tenant_id};
+    let store = PgStore::new(&url()).unwrap();
+    let alice = operator("alice");
+    let expires = now() + 3600;
+    let issued = store
+        .create_operator_credential(&alice, "on call", Some(expires), "operator")
+        .unwrap()
+        .expect("the name is free");
+    assert!(issued.api_key.starts_with("sk-"));
+    assert_eq!(issued.record.key_hash, hash_api_key(&issued.api_key));
+    assert_eq!(
+        operator_name(&issued.record.tenant_id),
+        Some(alice.as_str())
+    );
+    assert_eq!(issued.record.expires_at, Some(expires));
+
+    // Stored like any key since #346: hash and placeholder, never the key,
+    // and with no tenant scope at all.
+    let stored: Vec<(String, String, String)> = sql(
+        "SELECT api_key, key_hash, scopes FROM kosha.api_keys WHERE tenant_id = $1",
+        &[&operator_tenant_id(&alice)],
+    );
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].0, format!(" sha256:{}", issued.record.key_hash));
+    assert_eq!(stored[0].1, issued.record.key_hash);
+    assert_eq!(stored[0].2, "");
+
+    let listed = store.list_operator_credentials().unwrap();
+    let mine: Vec<_> = listed
+        .iter()
+        .filter(|c| operator_name(&c.tenant_id) == Some(alice.as_str()))
+        .collect();
+    assert_eq!(mine, vec![&issued.record]);
+    assert_eq!(mine[0].description, "on call");
+    // Nothing in the operator listing is a tenant key.
+    assert!(listed.iter().all(|c| operator_name(&c.tenant_id).is_some()));
+
+    // A name identifies one operator: a second usable credential is refused
+    // and changes nothing.
+    assert!(store
+        .create_operator_credential(&alice, "again", None, "operator:mallory")
+        .unwrap()
+        .is_none());
+    // The store itself refuses a name the routes would have refused.
+    for bad in ["", "a/b", "al ice", "_operator/x"] {
+        assert!(
+            store
+                .create_operator_credential(bad, "", None, "operator")
+                .is_err(),
+            "{bad:?}"
+        );
+    }
+
+    let audit = operator_audit(&alice);
+    assert_eq!(audit.len(), 1, "{audit:?}");
+    assert_eq!(audit[0].0, "operator");
+    assert_eq!(audit[0].1, "operator_credential.created");
+    assert_eq!(audit[0].2["key_id"], issued.record.key_hash.as_str());
+    assert_eq!(audit[0].2["expires_at"], expires);
+    assert!(!audit[0].2.to_string().contains(&issued.api_key));
+}
+
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn operator_credentials_and_tenant_keys_never_mix() {
+    use kosha_control::OperatorCredentials;
+    let store = PgStore::new(&url()).unwrap();
+    let alice = operator("alice");
+    let credential = store
+        .create_operator_credential(&alice, "", None, "operator")
+        .unwrap()
+        .unwrap();
+    let t = tenant("mixed");
+    let key = store.create_api_key(&full_access(&t)).unwrap();
+    let (credential_id, key_id) = (&credential.record.key_hash, &key.record.key_hash);
+
+    // The tenant-key side does not see, validate, revoke or rotate an
+    // operator credential.
+    assert_eq!(store.validate_api_key(&credential.api_key), None);
+    let tenant_keys = store.list_api_keys(None).unwrap();
+    assert!(tenant_keys.iter().any(|k| &k.key_hash == key_id));
+    assert!(tenant_keys.iter().all(|k| &k.key_hash != credential_id));
+    assert!(tenant_keys
+        .iter()
+        .all(|k| !k.tenant_id.starts_with("_operator/")));
+    assert!(!store.revoke_api_key(credential_id).unwrap());
+    assert!(store
+        .rotate_api_key(credential_id, 60, None)
+        .unwrap()
+        .is_none());
+
+    // The operator side does not see, revoke or rotate a tenant key.
+    let operators = store.list_operator_credentials().unwrap();
+    assert!(operators.iter().any(|c| &c.key_hash == credential_id));
+    assert!(operators.iter().all(|c| &c.key_hash != key_id));
+    assert!(store
+        .revoke_operator_credentials(OperatorCredentials::KeyHash(key_id), "operator")
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .rotate_operator_credential(key_id, 60, None, "operator")
+        .unwrap()
+        .is_none());
+    assert_eq!(store.validate_api_key(&key.api_key), Some(t.clone()));
+
+    // What a server loads holds both, each exactly once.
+    let all = store.list_all_credentials().unwrap();
+    for id in [credential_id, key_id] {
+        assert_eq!(all.iter().filter(|k| &k.key_hash == id).count(), 1);
+    }
+    // None of the refused calls left an audit row or changed a credential.
+    assert_eq!(operator_audit(&alice).len(), 1);
+    assert!(store
+        .list_operator_credentials()
+        .unwrap()
+        .iter()
+        .any(|c| &c.key_hash == credential_id && c.expires_at.is_none()));
+}
+
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn operator_credentials_rotate_and_revoke_with_an_audit_trail() {
+    use kosha_control::api_keys::operator_name;
+    use kosha_control::OperatorCredentials;
+    let store = PgStore::new(&url()).unwrap();
+    let alice = operator("alice");
+    let by_alice = format!("operator:{alice}");
+    let first = store
+        .create_operator_credential(&alice, "laptop", None, "operator")
+        .unwrap()
+        .unwrap();
+
+    // Rotation: same operator and description, a new secret, and the old
+    // credential kept only for the overlap.
+    let before = now();
+    let rotated = store
+        .rotate_operator_credential(&first.record.key_hash, 600, None, &by_alice)
+        .unwrap()
+        .expect("active credential");
+    assert_ne!(rotated.new.api_key, first.api_key);
+    assert_eq!(rotated.new.record.tenant_id, first.record.tenant_id);
+    assert_eq!(rotated.new.record.description, "laptop");
+    assert_eq!(rotated.new.record.expires_at, None);
+    assert!((before + 599..=now() + 601).contains(&rotated.old_expires_at));
+    let mine = |store: &PgStore| -> Vec<kosha_control::ApiKeyRecord> {
+        store
+            .list_operator_credentials()
+            .unwrap()
+            .into_iter()
+            .filter(|c| operator_name(&c.tenant_id) == Some(alice.as_str()))
+            .collect()
+    };
+    assert_eq!(mine(&store).len(), 2);
+    // While a credential of that name still works, the name is taken.
+    assert!(store
+        .create_operator_credential(&alice, "", None, "operator")
+        .unwrap()
+        .is_none());
+
+    // Revoking one credential leaves the operator's other one alone.
+    let revoked = store
+        .revoke_operator_credentials(
+            OperatorCredentials::KeyHash(&first.record.key_hash),
+            &by_alice,
+        )
+        .unwrap();
+    assert_eq!(
+        revoked,
+        vec![(first.record.key_hash.clone(), alice.clone())]
+    );
+    assert_eq!(mine(&store), vec![rotated.new.record.clone()]);
+    assert!(store
+        .revoke_operator_credentials(
+            OperatorCredentials::KeyHash(&first.record.key_hash),
+            &by_alice
+        )
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .rotate_operator_credential(&first.record.key_hash, 600, None, &by_alice)
+        .unwrap()
+        .is_none());
+
+    // Offboarding: every credential of the operator, by name. Rotate once
+    // more first, so there are two to revoke.
+    let again = store
+        .rotate_operator_credential(&rotated.new.record.key_hash, 600, None, "operator")
+        .unwrap()
+        .unwrap();
+    assert_eq!(mine(&store).len(), 2);
+    let mut gone = store
+        .revoke_operator_credentials(OperatorCredentials::Operator(&alice), "operator:bob")
+        .unwrap();
+    gone.sort();
+    let mut expected = vec![
+        (rotated.new.record.key_hash.clone(), alice.clone()),
+        (again.new.record.key_hash.clone(), alice.clone()),
+    ];
+    expected.sort();
+    assert_eq!(gone, expected);
+    assert!(mine(&store).is_empty());
+    assert!(store
+        .list_all_credentials()
+        .unwrap()
+        .iter()
+        .all(|c| operator_name(&c.tenant_id) != Some(alice.as_str())));
+    // The name is free again.
+    assert!(store
+        .create_operator_credential(&alice, "", None, "operator")
+        .unwrap()
+        .is_some());
+
+    let audit = operator_audit(&alice);
+    let trail: Vec<(&str, &str)> = audit
+        .iter()
+        .map(|(actor, action, _)| (actor.as_str(), action.as_str()))
+        .collect();
+    assert_eq!(
+        trail,
+        vec![
+            ("operator", "operator_credential.created"),
+            (by_alice.as_str(), "operator_credential.rotated"),
+            (by_alice.as_str(), "operator_credential.revoked"),
+            ("operator", "operator_credential.rotated"),
+            ("operator:bob", "operator_credential.revoked"),
+            ("operator:bob", "operator_credential.revoked"),
+            ("operator", "operator_credential.created"),
+        ]
+    );
+    let rotation = &audit[1].2;
+    assert_eq!(rotation["key_id"], rotated.new.record.key_hash.as_str());
+    assert_eq!(
+        rotation["replaces"]["key_id"],
+        first.record.key_hash.as_str()
+    );
+    assert_eq!(rotation["replaces"]["expires_at"], rotated.old_expires_at);
+}
+
+/// The operator's key routes are audited (#345): one row per change, in
+/// the change's transaction, holding neither a key nor a whole key id.
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn create_rotate_and_revoke_are_audited_without_secrets() {
+    let store = PgStore::new(&url()).unwrap();
+    let t = tenant("audited");
+    let expires = now() + 3600;
+    let created = store
+        .create_api_key(&NewApiKey {
+            tenant_id: t.clone(),
+            description: "ci".into(),
+            scopes: Scopes::of(&[Scope::Read, Scope::Write]),
+            namespaces: Some(vec!["docs".into()]),
+            expires_at: Some(expires),
+        })
+        .unwrap();
+    let rotated = store
+        .rotate_api_key(&created.record.key_hash, 600, None)
+        .unwrap()
+        .expect("active key");
+    assert!(store.revoke_api_key(&rotated.new.record.key_hash).unwrap());
+    // Changes that did not happen leave no row.
+    assert!(!store.revoke_api_key(&rotated.new.record.key_hash).unwrap());
+    assert!(!store.revoke_api_key(&hash_api_key("sk-unknown")).unwrap());
+    assert!(store
+        .rotate_api_key(&hash_api_key("sk-unknown"), 600, None)
+        .unwrap()
+        .is_none());
+
+    // A tenant no organization owns: recorded with no organization.
+    type Audit = (Option<String>, String, String, String, String);
+    let rows: Vec<Audit> = sql(
+        "SELECT org_id, actor, action, target_type, detail FROM kosha.audit_log \
+         WHERE target_id = $1 ORDER BY id",
+        &[&t],
+    );
+    let details: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(org_id, actor, _, target_type, detail)| {
+            assert_eq!(org_id, &None);
+            assert_eq!(actor, "operator");
+            assert_eq!(target_type, "tenant");
+            serde_json::from_str(detail).unwrap()
+        })
+        .collect();
+    let actions: Vec<&str> = rows.iter().map(|row| row.2.as_str()).collect();
+    assert_eq!(
+        actions,
+        ["api_key.created", "api_key.rotated", "api_key.revoked"]
+    );
+    let suffix = |key: &str| key[key.len() - 4..].to_string();
+    let id_prefix = |hash: &str| hash[..12].to_string();
+    assert_eq!(
+        details[0],
+        serde_json::json!({
+            "key_suffix": suffix(&created.api_key),
+            "key_id_prefix": id_prefix(&created.record.key_hash),
+            "description": "ci",
+            "scopes": ["read", "write"],
+            "namespaces": ["docs"],
+            "expires_at": expires,
+        })
+    );
+    // The replacement keeps the scopes and namespaces; the old key's
+    // deadline (the overlap, sooner than its own expiry) is recorded.
+    assert_eq!(
+        details[1],
+        serde_json::json!({
+            "key_suffix": suffix(&rotated.new.api_key),
+            "key_id_prefix": id_prefix(&rotated.new.record.key_hash),
+            "description": "ci",
+            "scopes": ["read", "write"],
+            "namespaces": ["docs"],
+            "expires_at": null,
+            "replaces": {
+                "key_id_prefix": id_prefix(&created.record.key_hash),
+                "expires_at": rotated.old_expires_at,
+            },
+        })
+    );
+    assert_eq!(
+        details[2],
+        serde_json::json!({
+            "key_id_prefix": id_prefix(&rotated.new.record.key_hash),
+            "description": "ci",
+        })
+    );
+    for (.., detail) in &rows {
+        for secret in [
+            &created.api_key,
+            &rotated.new.api_key,
+            &created.record.key_hash,
+            &rotated.new.record.key_hash,
+        ] {
+            assert!(!detail.contains(secret.as_str()), "{detail}");
+        }
+    }
 }

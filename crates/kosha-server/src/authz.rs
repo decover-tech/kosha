@@ -10,15 +10,26 @@
 //!
 //! Scopes by route:
 //!   - `read`: search, exists, namespace stats, reading a schema, listing
-//!     namespaces and branches.
+//!     namespaces and branches, and the tenant's own usage (`GET /v1/usage`)
+//!     and billing state (`GET /v1/billing`).
 //!   - `write`: index, replace, delete documents, flush.
 //!   - `admin`: create and delete namespaces and branches, change a
 //!     namespace's schema or shards.
+//!
+//! Usage and billing answer for the whole tenant (every namespace's usage,
+//! the plan, the invoices), so, like listing namespaces, a key restricted
+//! to specific namespaces is refused there whatever its scopes. The routes
+//! that delete a tenant or change its plan are under `/v1/admin/` and take
+//! the admin credential, never a tenant key.
 //!
 //! **Keep [`requirement`] in step with `route_inner`'s dispatch table.** A
 //! tenant route missing here is not left open: it classifies as
 //! [`Requirement::Unknown`], which only a key with every scope and no
 //! namespace restriction passes.
+//! The tests read `route_inner`'s source and fail for a route it serves
+//! that has no scope here, whether it is matched by a `"METHOD /path"`
+//! literal, by a predicate helper or by a module it delegates to (the last
+//! two are listed in the tests' `DELEGATES`).
 
 use crate::auth::Principal;
 use kosha_control::Scope;
@@ -26,7 +37,7 @@ use kosha_control::Scope;
 /// Where a route names the namespace(s) it acts on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
-    /// The tenant as a whole (listing namespaces).
+    /// The tenant as a whole (listing namespaces, usage, billing).
     Tenant,
     /// Named in the path.
     Path(String),
@@ -90,6 +101,8 @@ pub fn requirement(method: &str, path: &str) -> Requirement {
     match (method, bare) {
         (_, "/healthz" | "/v1/healthz" | "/stats" | "/v1/stats") => Requirement::Open,
         ("GET", "/v1/namespaces") => scoped(Read, Target::Tenant),
+        // A tenant reading its own usage (#348) and billing state (#349).
+        ("GET", "/v1/usage" | "/v1/billing") => scoped(Read, Target::Tenant),
         ("POST", "/v1/namespaces") => scoped(Admin, Target::Body("namespace")),
         // Legacy unversioned routes.
         ("POST", "/search" | "/exists") => scoped(Read, Target::Body("namespace")),
@@ -164,7 +177,8 @@ pub fn authorize(
     let Some(wanted) = target_namespaces(&target, body) else {
         return Err(match target {
             Target::Tenant => {
-                "this API key is restricted to specific namespaces and cannot list all namespaces"
+                "this API key is restricted to specific namespaces and cannot use a route \
+                 that covers the whole tenant"
             }
             _ => "this API key is restricted to specific namespaces and the request names none",
         }
@@ -202,10 +216,14 @@ mod tests {
         ("GET", "/v1/namespaces/docs/branches", Scope::Read),
         ("GET", "/v1/namespaces/docs/stats", Scope::Read),
         ("GET", "/v1/namespaces", Scope::Read),
+        ("GET", "/v1/usage", Scope::Read),
+        ("GET", "/v1/usage?from=1&to=2", Scope::Read),
+        ("GET", "/v1/billing", Scope::Read),
         ("POST", "/search", Scope::Read),
         ("POST", "/exists", Scope::Read),
         ("GET", "/search?ns=docs&q=x", Scope::Read),
         ("POST", "/v1/namespaces/docs/documents", Scope::Write),
+        ("POST", "/v1/namespaces/docs/replace", Scope::Write),
         ("POST", "/v1/namespaces/docs/flush", Scope::Write),
         ("POST", "/v1/namespaces/docs/delete", Scope::Write),
         ("POST", "/index", Scope::Write),
@@ -219,6 +237,331 @@ mod tests {
         ("POST", "/v1/namespaces/docs/branch", Scope::Admin),
         ("DELETE", "/v1/namespaces/docs/branch", Scope::Admin),
     ];
+
+    /// The routes of `ROUTES` that answer for the whole tenant.
+    const TENANT_WIDE: &[(&str, &str)] = &[
+        ("GET", "/v1/namespaces"),
+        ("GET", "/v1/usage"),
+        ("GET", "/v1/billing"),
+    ];
+
+    /// The body of `route_inner` in main.rs, after its signature.
+    fn route_inner_body() -> &'static str {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("\nfn route_inner(")
+            .expect("route_inner in main.rs");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").expect("the end of route_inner")];
+        let open = ") -> String {\n";
+        &body[body.find(open).expect("route_inner's signature") + open.len()..]
+    }
+
+    const METHODS: [&str; 5] = ["GET", "POST", "PUT", "PATCH", "DELETE"];
+
+    /// The `"METHOD /path` literals in `text`, as `(method, sample path)`.
+    /// `extract_namespace(request_line, "POST /v1/namespaces/", "/search")`
+    /// becomes `POST /v1/namespaces/docs/search`.
+    fn route_literals(text: &str) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        // Every other piece of a split on '"' is the inside of a string
+        // literal (the table has no escaped quotes).
+        let literals: Vec<&str> = text.split('"').skip(1).step_by(2).collect();
+        for (i, literal) in literals.iter().enumerate() {
+            let Some((method, path)) = literal.split_once(' ') else {
+                continue;
+            };
+            if !METHODS.contains(&method) || !path.starts_with('/') {
+                continue;
+            }
+            let path = path.trim_end_matches([' ', '?']);
+            let path = match path {
+                "/v1/namespaces/" => {
+                    format!("{path}docs{}", literals.get(i + 1).copied().unwrap_or(""))
+                }
+                _ => path.to_string(),
+            };
+            found.push((method.to_string(), path));
+        }
+        found
+    }
+
+    /// A dispatch condition of `route_inner` that carries no
+    /// `"METHOD /path"` literal: a predicate helper, or a module it hands
+    /// the request line to.
+    #[derive(Clone, Copy)]
+    struct Delegate {
+        /// The call, as written in `route_inner`'s condition.
+        call: &'static str,
+        /// Every route it serves, as `(method, sample path)`.
+        routes: &'static [(&'static str, &'static str)],
+        /// When the call dispatches in another file: that file's source and
+        /// the opening of the function called.
+        source: Option<(&'static str, &'static str)>,
+    }
+
+    /// Every such condition. A new helper or delegated module in
+    /// `route_inner` gets a line here, with the routes it serves; tenant
+    /// routes among them then need a scope in [`requirement`] and a line in
+    /// `ROUTES`, like the routes matched by a literal.
+    const DELEGATES: &[Delegate] = &[
+        Delegate {
+            call: "is_create_namespace_route(request_line)",
+            routes: &[("POST", "/v1/namespaces")],
+            source: None,
+        },
+        Delegate {
+            call: "bare_namespace(request_line, \"DELETE\")",
+            routes: &[("DELETE", "/v1/namespaces/docs")],
+            source: None,
+        },
+        Delegate {
+            call: "is_list_namespaces_route(request_line)",
+            routes: &[("GET", "/v1/namespaces")],
+            source: None,
+        },
+        Delegate {
+            call: "billing::route(request_line, body, tenant, state)",
+            routes: &crate::billing::ROUTES,
+            source: Some((include_str!("billing.rs"), "\npub(crate) fn route(")),
+        },
+        Delegate {
+            call: "api_key_admin::handle(request_line, body)",
+            routes: &[
+                ("POST", "/v1/admin/api-keys"),
+                ("GET", "/v1/admin/api-keys"),
+                ("POST", "/v1/admin/api-keys/revoke"),
+                ("POST", "/v1/admin/api-keys/rotate"),
+                ("POST", "/v1/admin/api-keys/scrub-plaintext"),
+            ],
+            source: Some((include_str!("api_key_admin.rs"), "\npub(crate) fn handle(")),
+        },
+        Delegate {
+            call: "namespace_deletion::route_admin(request_line, body, state)",
+            routes: &[
+                ("DELETE", "/v1/admin/tenants/acme"),
+                ("POST", "/v1/admin/deletions/resume"),
+                ("GET", "/v1/admin/deletions"),
+                ("GET", "/v1/admin/deletions/del_1"),
+            ],
+            source: Some((
+                include_str!("namespace_deletion.rs"),
+                "\npub(crate) fn route_admin(",
+            )),
+        },
+    ];
+
+    /// What `route_inner`'s body (or a stand-in for it) dispatches on that
+    /// these tests cannot account for: a top-level statement that is not an
+    /// `if`, or an `if` whose condition has neither a `"METHOD /path"`
+    /// literal nor a call listed in `delegates`. Empty when every dispatch
+    /// is accounted for.
+    fn unrecognised_dispatches(body: &str, delegates: &[Delegate]) -> Vec<String> {
+        let mut unknown = Vec::new();
+        // Statements of the function itself are indented by four spaces.
+        for line in body.lines() {
+            let Some(statement) = line.strip_prefix("    ") else {
+                continue;
+            };
+            let fine = statement.starts_with(' ')
+                || statement.starts_with("if ")
+                || statement.starts_with("//")
+                || ["{", "}", "api_error(ErrorCode::NotFound, \"not found\")"].contains(&statement);
+            if !fine {
+                unknown.push(statement.to_string());
+            }
+        }
+        for chunk in format!("\n{body}").split("\n    if ").skip(1) {
+            // A condition ends at the `{` that closes its line, or stands
+            // alone on the line after a multi-line condition.
+            let condition = chunk.split("{\n").next().unwrap_or(chunk).trim();
+            if route_literals(condition).is_empty()
+                && !delegates.iter().any(|d| condition.contains(d.call))
+            {
+                unknown.push(condition.to_string());
+            }
+        }
+        unknown
+    }
+
+    /// The paths a delegated module's dispatch function matches on: each
+    /// `"/v1/...` or `"METHOD /v1/...` string literal in the body of the
+    /// function that opens with `function`.
+    fn delegate_paths<'a>(source: &'a str, function: &str) -> Vec<&'a str> {
+        let start = source
+            .find(function)
+            .unwrap_or_else(|| panic!("{function:?} not found; update DELEGATES"));
+        let code = &source[start..];
+        let code = &code[..code.find("\n}\n").expect("the end of the function")];
+        let mut paths = Vec::new();
+        for (at, _) in code.match_indices("/v1/") {
+            let before = &code[..at];
+            let quoted = before.ends_with('"')
+                || METHODS
+                    .iter()
+                    .any(|method| before.ends_with(&format!("\"{method} ")));
+            if quoted {
+                let path = &code[at..];
+                paths.push(&path[..path.find('"').unwrap_or(path.len())]);
+            }
+        }
+        paths
+    }
+
+    /// A route added to `route_inner`, in any of the three ways it
+    /// dispatches (a `"METHOD /path"` literal, a predicate helper, a
+    /// delegated module), without a line in [`requirement`] would be
+    /// refused for every restricted key. This fails instead, naming the
+    /// route or the dispatch it cannot account for.
+    #[test]
+    fn every_route_route_inner_matches_is_classified() {
+        let body = route_inner_body();
+        let mut routes = route_literals(body);
+        // The scan found the table, not a fragment of it.
+        assert!(routes.len() >= 30, "{routes:?}");
+        for expected in [
+            ("POST", "/v1/namespaces/docs/search"),
+            ("DELETE", "/v1/namespaces/docs/branch"),
+            ("GET", "/v1/usage"),
+            ("POST", "/index"),
+            ("GET", "/stats"),
+        ] {
+            assert!(
+                routes
+                    .iter()
+                    .any(|(m, p)| (m.as_str(), p.as_str()) == expected),
+                "{expected:?} not found in route_inner"
+            );
+        }
+        // Nothing is dispatched in a way the scan does not see.
+        let unknown = unrecognised_dispatches(body, DELEGATES);
+        assert!(
+            unknown.is_empty(),
+            "route_inner dispatches on something these tests cannot see; add it to \
+             DELEGATES with the routes it serves: {unknown:#?}"
+        );
+        for delegate in DELEGATES {
+            assert!(
+                body.contains(delegate.call),
+                "'{}' is no longer in route_inner; update DELEGATES",
+                delegate.call
+            );
+            routes.extend(
+                delegate
+                    .routes
+                    .iter()
+                    .map(|(method, path)| (method.to_string(), path.to_string())),
+            );
+            // A tenant path the module matches on is among its routes.
+            let matched = delegate
+                .source
+                .map(|(source, function)| delegate_paths(source, function))
+                .unwrap_or_default();
+            for path in matched {
+                if requirement("GET", path) == Requirement::Service {
+                    continue;
+                }
+                assert!(
+                    delegate.routes.iter().any(|(method, route)| {
+                        route.starts_with(path)
+                            && requirement(method, route) != Requirement::Service
+                    }),
+                    "'{}' matches on the tenant path {path}, which is not among its \
+                     routes in DELEGATES",
+                    delegate.call
+                );
+            }
+        }
+        for (method, path) in &routes {
+            let needs = requirement(method, path);
+            assert_ne!(
+                needs,
+                Requirement::Unknown,
+                "{method} {path} is served but has no scope in authz::requirement"
+            );
+            // A tenant route is in the table the scope tests walk.
+            if let Requirement::Scoped { scope, .. } = needs {
+                assert!(
+                    ROUTES.iter().any(|&(m, p, s)| m == method
+                        && p.split('?').next() == Some(path.as_str())
+                        && s == scope),
+                    "{method} {path} ('{}') is missing from ROUTES",
+                    scope.as_str()
+                );
+            }
+        }
+    }
+
+    /// The guard above sees all three dispatch styles: a route added
+    /// through a helper or a delegated module, with no literal in
+    /// `route_inner`, is reported until `DELEGATES` accounts for it.
+    #[test]
+    fn a_route_dispatched_without_a_literal_is_reported() {
+        let known = r#"    if is_list_namespaces_route(request_line) {
+        return a();
+    }
+
+    // A comment.
+    if request_line.starts_with("GET /v1/usage ")
+        || request_line.starts_with("GET /v1/usage?")
+    {
+        return b();
+    }
+
+    api_error(ErrorCode::NotFound, "not found")"#;
+        assert_eq!(
+            unrecognised_dispatches(known, DELEGATES),
+            Vec::<String>::new()
+        );
+        for (added, reported) in [
+            (
+                r#"    if let Some(ns) = bare_namespace(request_line, "PATCH") {
+        return c();
+    }"#,
+                r#"let Some(ns) = bare_namespace(request_line, "PATCH")"#,
+            ),
+            (
+                r#"    if let Some(r) = snapshots::route(request_line, body, state) {
+        return r;
+    }"#,
+                "let Some(r) = snapshots::route(request_line, body, state)",
+            ),
+            (
+                r#"    match snapshots::route(request_line) {
+        Some(r) => return r,
+        None => {}
+    }"#,
+                "match snapshots::route(request_line) {",
+            ),
+        ] {
+            assert_eq!(
+                unrecognised_dispatches(&format!("{added}\n{known}"), DELEGATES),
+                vec![reported.to_string()],
+                "{added}"
+            );
+        }
+        // The real table minus one entry: the helper it covered is reported.
+        let without_delete: Vec<Delegate> = DELEGATES
+            .iter()
+            .copied()
+            .filter(|d| !d.call.starts_with("bare_namespace"))
+            .collect();
+        assert_eq!(
+            unrecognised_dispatches(route_inner_body(), &without_delete),
+            vec![r#"let Some(ns) = bare_namespace(request_line, "DELETE")"#.to_string()]
+        );
+        // A delegated module's paths are read from its dispatch function,
+        // not from comments or the rest of the file.
+        assert_eq!(
+            delegate_paths(
+                "fn gate() { \"/v1/elsewhere\" }\nfn route() {\n    (\"GET\", \"/v1/billing\");\n    \
+                 // `GET /v1/usage`\n    extract(r, \"GET /v1/namespaces/\", \"/x\")\n}\n\
+                 fn after() { \"/v1/later\" }\n",
+                "\nfn route("
+            ),
+            vec!["/v1/billing", "/v1/namespaces/"]
+        );
+    }
 
     #[test]
     fn each_route_needs_exactly_its_scope() {
@@ -278,7 +621,7 @@ mod tests {
         let docs_only = key(&all, Some(&["docs", "docs-branch"]));
         let other_only = key(&all, Some(&["other"]));
         for &(method, path, _) in ROUTES {
-            if path == "/v1/namespaces" && method == "GET" {
+            if TENANT_WIDE.contains(&(method, path.split('?').next().unwrap())) {
                 continue;
             }
             assert!(
@@ -297,8 +640,15 @@ mod tests {
     fn namespace_restricted_keys_fail_closed() {
         let all = [Scope::Read, Scope::Write, Scope::Admin];
         let docs = key(&all, Some(&["docs"]));
-        // Listing spans the tenant.
-        assert!(authorize(&docs, "GET", "/v1/namespaces", b"").is_err());
+        // Listing, usage and billing span the tenant: the answer would
+        // name namespaces (or money) the key was not given.
+        for &(method, path) in TENANT_WIDE {
+            let denied = authorize(&docs, method, path, b"").unwrap_err();
+            assert!(denied.contains("whole tenant"), "{method} {path}: {denied}");
+            // The same key without the namespace restriction may.
+            assert!(authorize(&key(&[Scope::Read], None), method, path, b"").is_ok());
+        }
+        assert!(authorize(&docs, "GET", "/v1/usage?from=1&to=2", b"").is_err());
         // A branch must be allowed by name as well as its parent.
         let branch = "/v1/namespaces/docs/branch";
         assert!(authorize(&docs, "POST", branch, br#"{"name":"scratch"}"#)

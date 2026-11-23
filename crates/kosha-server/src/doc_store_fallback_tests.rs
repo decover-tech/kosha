@@ -15,21 +15,22 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 
 const BUCKET: &str = "kosha-test";
-const NS: &str = "offsets-fallback";
+pub(super) const NS: &str = "offsets-fallback";
 
 /// Path-style S3 that serves GetObject / HeadObject from a directory, 404s
 /// (`NoSuchKey`) anything absent, and records every key it was asked for.
 /// ListObjectsV2 returns the matching keys. Nothing else is implemented:
 /// the search path needs nothing else.
-struct FakeS3 {
+pub(super) struct FakeS3 {
     endpoint: String,
     /// `{root}/{key}` is the object `key`.
-    root: PathBuf,
-    gets: Arc<Mutex<Vec<String>>>,
+    pub(super) root: PathBuf,
+    /// Every key fetched with GET, in order.
+    pub(super) gets: Arc<Mutex<Vec<String>>>,
 }
 
 impl FakeS3 {
-    fn start(root: PathBuf) -> Self {
+    pub(super) fn start(root: PathBuf) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let gets: Arc<Mutex<Vec<String>>> = Arc::default();
@@ -185,7 +186,7 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn temp_dir(tag: &str) -> PathBuf {
+pub(super) fn temp_dir(tag: &str) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
         "kosha-test-offsets-fallback-{tag}-{}-{}",
@@ -201,7 +202,7 @@ fn temp_dir(tag: &str) -> PathBuf {
 /// uploaded to a fresh fake bucket. Returns the bucket and the manifest the
 /// writer produced, with the writer's own cached footers (format_version 2)
 /// in it: the "modern manifest" shape.
-fn uploaded_namespace() -> (FakeS3, kosha_core::Manifest) {
+pub(super) fn uploaded_namespace() -> (FakeS3, kosha_core::Manifest) {
     let writer_dir = temp_dir("writer");
     let state = AppState::new(writer_dir.clone());
     let ns = NamespaceId(NS.into());
@@ -239,6 +240,11 @@ fn uploaded_namespace() -> (FakeS3, kosha_core::Manifest) {
 /// A query node with an empty local cache, reading segments from `s3`, and
 /// serving `manifest`.
 fn cold_query_node(s3: &FakeS3, manifest: kosha_core::Manifest) -> AppState {
+    cold_node(s3, NS, manifest)
+}
+
+/// [`cold_query_node`] for namespace `ns`.
+pub(super) fn cold_node(s3: &FakeS3, ns: &str, manifest: kosha_core::Manifest) -> AppState {
     let mut state = AppState::new(temp_dir("query"));
     let cfg = s3_storage::S3Config {
         bucket: BUCKET.into(),
@@ -260,7 +266,7 @@ fn cold_query_node(s3: &FakeS3, manifest: kosha_core::Manifest) -> AppState {
     state.s3_storage = Some(storage);
     state
         .indexer
-        .restore_manifest(NamespaceId(NS.into()), manifest);
+        .restore_manifest(NamespaceId(ns.into()), manifest);
     state
 }
 
@@ -305,7 +311,7 @@ fn hydrate_scoring_set(state: &AppState, text: &str) -> HydrationOutcome {
     let query: kosha_core::SearchQuery =
         serde_json::from_value(serde_json::json!({"query_text": text, "max_results": 20})).unwrap();
     let request = Arc::new(RequestHydration::new(u64::MAX));
-    state.hydrate_segments_for_search(&ns, &manifest, &query, &request)
+    state.hydrate_segments_for_search(&ns, &manifest, &query, &request, None)
 }
 
 fn fallbacks(state: &AppState) -> u64 {

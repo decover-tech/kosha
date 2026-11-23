@@ -14,7 +14,7 @@
       "rejected": 3
     },
     "aggregation": {
-      "supported": 6,
+      "supported": 7,
       "partial": 1,
       "rejected": 3
     },
@@ -1377,9 +1377,42 @@
       }
     },
     {
+      "id": "aggregation.percentiles",
+      "category": "aggregation",
+      "construct": "percentiles (percents, keyed)",
+      "outcome": "supported",
+      "note": "Top level or under a bucket aggregation. Exact up to 4,096 values per aggregation or bucket, then a DDSketch within 1% relative error.",
+      "verified": "live",
+      "es_body": {
+        "size": 0,
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "exists": {
+                  "field": "status"
+                }
+              }
+            ]
+          }
+        },
+        "aggs": {
+          "spread": {
+            "percentiles": {
+              "field": "amount",
+              "percents": [
+                50,
+                95
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
       "id": "aggregation.unsupported",
       "category": "aggregation",
-      "construct": "stats, percentiles, top_hits, filter(s), range, significant_terms, nested, ...",
+      "construct": "stats, top_hits, filter(s), range, significant_terms, nested, ...",
       "outcome": "rejected",
       "note": "Any other aggregation type is refused by name.",
       "rejected_by": "client",

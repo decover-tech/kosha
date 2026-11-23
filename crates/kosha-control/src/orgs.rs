@@ -97,8 +97,18 @@ impl Role {
 pub enum Actor {
     /// The admin credential's holder acting for itself. Not bound by roles.
     Operator,
+    /// The holder of a named operator admin credential (#346) acting for
+    /// itself. Has the operator's powers; the name is what the audit log
+    /// records.
+    NamedOperator(String),
     /// A user (by id), bound by their role in the organization.
     User(String),
+    /// A user a named operator's credential (#346) vouched for: the request
+    /// carried that credential and named the user. Exactly a
+    /// [`Actor::User`] for every rule; the audit row still says
+    /// `user:<id>`, and its detail gains `"via": "operator:<name>"`, so the
+    /// credential that made the request is never lost.
+    VouchedUser { user_id: String, operator: String },
 }
 
 impl Actor {
@@ -106,7 +116,25 @@ impl Actor {
     pub fn label(&self) -> String {
         match self {
             Actor::Operator => "operator".to_string(),
-            Actor::User(id) => format!("user:{id}"),
+            Actor::NamedOperator(name) => format!("operator:{name}"),
+            Actor::User(id) | Actor::VouchedUser { user_id: id, .. } => format!("user:{id}"),
+        }
+    }
+
+    /// The user the actor is, `None` for an operator acting for itself.
+    pub fn user_id(&self) -> Option<&str> {
+        match self {
+            Actor::Operator | Actor::NamedOperator(_) => None,
+            Actor::User(id) | Actor::VouchedUser { user_id: id, .. } => Some(id),
+        }
+    }
+
+    /// The audit label of the named operator credential that vouched for
+    /// this user, when there is one: what an audit row's `via` holds.
+    pub fn vouched_by(&self) -> Option<String> {
+        match self {
+            Actor::VouchedUser { operator, .. } => Some(format!("operator:{operator}")),
+            _ => None,
         }
     }
 }
@@ -379,9 +407,9 @@ fn check_tenant_id(tenant_id: &str) -> Result<(), OrgError> {
 // ── Authorization ───────────────────────────────────────────────────────────
 
 fn require_operator(actor: &Actor, what: &str) -> Result<(), OrgError> {
-    match actor {
-        Actor::Operator => Ok(()),
-        Actor::User(_) => Err(OrgError::Forbidden(format!("only the operator can {what}"))),
+    match actor.user_id() {
+        None => Ok(()),
+        Some(_) => Err(OrgError::Forbidden(format!("only the operator can {what}"))),
     }
 }
 
@@ -393,9 +421,9 @@ fn require_org(tx: &mut dyn OrgTx, org_id: &str, lock: bool) -> Result<Organizat
 /// The actor's role in the organization: `None` for the operator, who is
 /// not bound by roles. A user who is not a member is refused.
 fn actor_role(tx: &mut dyn OrgTx, actor: &Actor, org_id: &str) -> Result<Option<Role>, OrgError> {
-    match actor {
-        Actor::Operator => Ok(None),
-        Actor::User(user_id) => tx
+    match actor.user_id() {
+        None => Ok(None),
+        Some(user_id) => tx
             .member_role(org_id, user_id)?
             .map(Some)
             .ok_or_else(|| OrgError::Forbidden("not a member of this organization".into())),
@@ -449,8 +477,13 @@ fn audit(
     action: &'static str,
     target_type: &'static str,
     target_id: &str,
-    detail: serde_json::Value,
+    mut detail: serde_json::Value,
 ) -> Result<(), OrgError> {
+    // A user's action made through a named operator's credential says so:
+    // without it the row could not be told from the user's own.
+    if let (Some(via), Some(fields)) = (actor.vouched_by(), detail.as_object_mut()) {
+        fields.insert("via".into(), serde_json::Value::String(via));
+    }
     tx.insert_audit(&NewAuditEvent {
         org_id: org_id.map(str::to_string),
         actor: actor.label(),
@@ -496,7 +529,7 @@ pub fn create_user(
 
 /// A user's record: the operator may read any, a user only their own.
 pub fn get_user(store: &dyn OrgStore, actor: &Actor, user_id: &str) -> Result<User, OrgError> {
-    if let Actor::User(id) = actor {
+    if let Some(id) = actor.user_id() {
         if id != user_id {
             return Err(OrgError::Forbidden("users can only read themselves".into()));
         }
@@ -518,23 +551,23 @@ pub fn create_org(
 ) -> Result<Organization, OrgError> {
     check_slug("organization", slug)?;
     check_text("name", name, MAX_NAME_LEN, true)?;
-    let owner = match (actor, owner_user_id) {
-        (Actor::User(id), Some(owner)) if owner != id => {
+    let owner = match (actor.user_id(), owner_user_id) {
+        (Some(id), Some(owner)) if owner != id => {
             return Err(OrgError::Forbidden(
                 "only the operator can create an organization for another user".into(),
             ))
         }
-        (Actor::User(id), _) => id.clone(),
-        (Actor::Operator, Some(owner)) => owner.to_string(),
-        (Actor::Operator, None) => {
+        (Some(id), _) => id.to_string(),
+        (None, Some(owner)) => owner.to_string(),
+        (None, None) => {
             return Err(OrgError::Invalid("missing 'owner_user_id'".into()));
         }
     };
     run(store, |tx| {
         if tx.user(&owner)?.is_none() {
-            return Err(match actor {
-                Actor::User(_) => OrgError::Forbidden("unknown acting user".into()),
-                Actor::Operator => OrgError::NotFound(format!("user '{owner}' not found")),
+            return Err(match actor.user_id() {
+                Some(_) => OrgError::Forbidden("unknown acting user".into()),
+                None => OrgError::NotFound(format!("user '{owner}' not found")),
             });
         }
         let org = Organization {
@@ -659,7 +692,7 @@ pub fn remove_member(
 ) -> Result<(), OrgError> {
     run(store, |tx| {
         require_org(tx, org_id, true)?;
-        let leaving = matches!(actor, Actor::User(id) if id == user_id);
+        let leaving = actor.user_id() == Some(user_id);
         let acting = if leaving {
             actor_role(tx, actor, org_id)?
         } else {
@@ -850,30 +883,9 @@ pub fn create_api_key(
     })
 }
 
-/// The operator's `POST /v1/admin/api-keys`: a key for any tenant id,
-/// linked to an organization or not. Audited against the tenant's
-/// organization when it has one. The caller validates `tenant_id`.
-pub fn create_operator_api_key(
-    store: &dyn OrgStore,
-    tenant_id: &str,
-    description: &str,
-) -> Result<ApiKey, OrgError> {
-    run(store, |tx| {
-        let org_id = tx.tenant(tenant_id)?.map(|t| t.org_id);
-        let key = new_api_key(tenant_id, description);
-        tx.insert_api_key(&key)?;
-        audit(
-            tx,
-            &Actor::Operator,
-            org_id.as_deref(),
-            "api_key.created",
-            "tenant",
-            tenant_id,
-            key_detail(&key),
-        )?;
-        Ok(key)
-    })
-}
+// The operator's `POST /v1/admin/api-keys` (a key for any tenant id, with
+// scopes, namespaces and an expiry) is `PgStore::create_api_key`, which
+// writes its own `api_key.created` row: see `api_key_store`.
 
 /// One page of the organization's audit log, newest first. Page with
 /// `before` = the last `id` of the previous page.

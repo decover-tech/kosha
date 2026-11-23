@@ -295,6 +295,8 @@ pub(crate) struct Scrape {
     pub segment_checksum_failures: u64,
     /// Per-tenant bytes, hits, misses and evictions of every cache (#342).
     pub cache_tenants: Vec<CacheTenantSample>,
+    /// The background span writer's totals (`span_writes`).
+    pub span_writes: crate::span_writes::SpanWriteStats,
 }
 
 /// Encodes the latest [`Scrape`]. Counters only move forward (`fetch_max`)
@@ -306,6 +308,11 @@ struct ScrapeCollector {
     segment_bytes: AtomicU64,
     nvme_evictions: AtomicU64,
     checksum_failures: AtomicU64,
+    /// `kosha_span_writes` by outcome: written, dropped, inline, failed.
+    span_writes: [AtomicU64; 4],
+    span_dropped_bytes: AtomicU64,
+    span_queued_bytes: AtomicU64,
+    span_held_bytes: AtomicU64,
     cache_tenants: Mutex<Vec<CacheTenantSample>>,
     /// Label the `kosha_cache_*` families by tenant (#342).
     tenant_labels: bool,
@@ -323,6 +330,19 @@ impl ScrapeCollector {
             .fetch_max(s.nvme_evictions, Ordering::Relaxed);
         self.checksum_failures
             .fetch_max(s.segment_checksum_failures, Ordering::Relaxed);
+        let w = &s.span_writes;
+        for (counter, value) in self
+            .span_writes
+            .iter()
+            .zip([w.written, w.dropped, w.inline, w.failed])
+        {
+            counter.fetch_max(value, Ordering::Relaxed);
+        }
+        self.span_dropped_bytes
+            .fetch_max(w.dropped_bytes, Ordering::Relaxed);
+        self.span_queued_bytes
+            .store(w.queued_bytes, Ordering::Relaxed);
+        self.span_held_bytes.store(w.held_bytes, Ordering::Relaxed);
     }
 }
 
@@ -408,6 +428,48 @@ impl Collector for ScrapeCollector {
             None,
             failures.metric_type(),
         )?)?;
+
+        let mut family = encoder.encode_descriptor(
+            "kosha_span_writes",
+            "Fetched spans by what became of their write: written by the background \
+             writer, dropped (queue full; held by the fetching request), written inline \
+             (queue and held cap full), or failed.",
+            None,
+            MetricType::Counter,
+        )?;
+        for (outcome, value) in ["written", "dropped", "inline", "failed"]
+            .into_iter()
+            .zip(&self.span_writes)
+        {
+            encode_value(
+                &mut family,
+                &[("outcome", outcome)],
+                MetricType::Counter,
+                load(value),
+            )?;
+        }
+        let dropped = ConstCounter::new(load(&self.span_dropped_bytes));
+        dropped.encode(encoder.encode_descriptor(
+            "kosha_span_writes_dropped_bytes",
+            "Bytes of span writes dropped because the write queue was full.",
+            None,
+            dropped.metric_type(),
+        )?)?;
+        for (name, help, value) in [
+            (
+                "kosha_span_write_queue_bytes",
+                "Span bytes queued for the background writer.",
+                &self.span_queued_bytes,
+            ),
+            (
+                "kosha_span_held_bytes",
+                "Bytes of dropped span writes held in memory by the requests that fetched them.",
+                &self.span_held_bytes,
+            ),
+        ] {
+            let gauge = ConstGauge::new(load(value));
+            gauge.encode(encoder.encode_descriptor(name, help, None, gauge.metric_type())?)?;
+        }
         Ok(())
     }
 }
@@ -857,6 +919,13 @@ pub(crate) mod tests {
                 cache_sample("corpus_stats", "acme", 0, 8, 2, 1),
                 cache_sample("ceiling", "beta", 0, 4, 1, 0),
             ],
+            span_writes: crate::span_writes::SpanWriteStats {
+                written: 9,
+                dropped: 2,
+                dropped_bytes: 4096,
+                held_bytes: 1024,
+                ..Default::default()
+            },
         });
         parse_exposition(&text).unwrap_or_else(|e| panic!("{e}\n{text}"))
     }
@@ -992,6 +1061,10 @@ pub(crate) mod tests {
             "kosha_hydration_lease_outcome_total",
             "kosha_knn_degraded_segments_total",
             "kosha_segment_checksum_failures_total",
+            "kosha_span_writes_total",
+            "kosha_span_writes_dropped_bytes_total",
+            "kosha_span_write_queue_bytes",
+            "kosha_span_held_bytes",
             "kosha_tenant_rejections_total",
         ] {
             assert!(names.contains(name), "{name} missing from {names:?}");
@@ -1006,6 +1079,19 @@ pub(crate) mod tests {
             assert!(doc.contains(family), "{family} is not in docs/metrics.md");
         }
         assert_eq!(value(&samples, "kosha_search_queue_depth", &[]), Some(3.0));
+        assert_eq!(
+            value(
+                &samples,
+                "kosha_span_writes_total",
+                &[("outcome", "dropped")]
+            ),
+            Some(2.0)
+        );
+        assert_eq!(
+            value(&samples, "kosha_span_writes_dropped_bytes_total", &[]),
+            Some(4096.0)
+        );
+        assert_eq!(value(&samples, "kosha_span_held_bytes", &[]), Some(1024.0));
         assert_eq!(
             value(&samples, "kosha_cache_bytes", &[("cache", "nvme")]),
             Some(4096.0)

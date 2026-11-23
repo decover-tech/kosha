@@ -15,9 +15,10 @@
 //!      coalesces the rest per shard (`coalesce_gap`) and fetches them all
 //!      in one concurrent batch of ranged GETs — one S3 round trip;
 //!   3. persists every range in the sparse span cache
-//!      (`{segment}/postings-XX.bin.spans/`), under the disk cache's byte
-//!      accounting, where `SplitInvertedIndex` reads it when the whole shard
-//!      is absent. A warm repeat therefore makes no GET;
+//!      (`{segment}/postings-XX.bin.spans/`, written by the background span
+//!      writer, see `span_writes`), under the disk cache's byte
+//!      accounting, where `SplitInvertedIndex` reads it when the whole
+//!      shard is absent. A warm repeat therefore makes no GET;
 //!   4. promotes a shard that keeps being range-read (`promote_after_gets`
 //!      / `promote_after_bytes`) to a whole local file in the background,
 //!      then drops its spans. The whole file always wins over spans.
@@ -41,9 +42,10 @@ use std::sync::Mutex;
 
 use kosha_cache::Cache;
 use kosha_core::KoshaError;
-use kosha_segment::span_cache::{self, SpanIndex};
+use kosha_segment::span_cache::{self, SpanHolds, SpanIndex};
 
-use crate::doc_spans::{persist_span, RangeFetcher, ReadMode, SpanConfig};
+use crate::doc_spans::{RangeFetcher, ReadMode, SpanConfig};
+use crate::span_writes::SpanWriteQueue;
 
 /// Default tuning: postings of one shard are usually close together (terms
 /// hash to shards, so one query's terms rarely share one), so the gap
@@ -83,11 +85,17 @@ pub struct PostingSpanOutcome {
     pub gets: u64,
     pub bytes: u64,
     /// `(segment rel path, presence key)` for every term now known readable
-    /// locally or absent from that segment.
+    /// locally or absent from that segment. A span whose write is queued
+    /// confirms its term (a write that then fails invalidates the presence
+    /// cache through `SpanWriteQueue::failures`); a dropped one, held only
+    /// by this request, does not.
     pub confirmed: Vec<(String, String)>,
     /// `(segment dir, shard file)` whose ranges failed; the caller fetches
     /// the whole shard instead.
     pub whole_fallback: Vec<(PathBuf, String)>,
+    /// Why the first `whole_fallback` shard could not be served by range,
+    /// for the fallback's log line. Set on the failure path only.
+    pub fallback_error: Option<String>,
     /// Segments whose `inverted.idx` could not be read (`{rel}/inverted.idx`).
     pub missing: Vec<String>,
     /// Shard paths that just crossed a promotion threshold.
@@ -95,6 +103,9 @@ pub struct PostingSpanOutcome {
     /// A range was refused by the request's byte ceiling or the in-flight
     /// budget.
     pub shed: bool,
+    /// Fetched spans the write queue could not take: readable only while
+    /// held, so the caller keeps them until the query has been scored.
+    pub held: SpanHolds,
 }
 
 #[derive(Default)]
@@ -149,7 +160,7 @@ impl PostingSpanHydrator {
         segments: &[PathBuf],
         terms: &[String],
         fetcher: &dyn RangeFetcher,
-        cache: &Cache,
+        writes: &SpanWriteQueue,
     ) -> PostingSpanOutcome {
         let mut out = PostingSpanOutcome::default();
         let mut reqs: Vec<(String, u64, u64)> = Vec::new();
@@ -184,12 +195,10 @@ impl PostingSpanHydrator {
                 let end = span.start + span.len;
                 let whole_local = std::fs::metadata(seg.join(&span.file))
                     .is_ok_and(|m| m.is_file() && m.len() >= end && m.len() > 0);
-                let covered = whole_local
-                    || indexes
-                        .entry(span.file.clone())
-                        .or_insert_with(|| SpanIndex::load(seg, &span.file))
-                        .covers(span.start, end);
-                if covered {
+                let index = indexes
+                    .entry(span.file.clone())
+                    .or_insert_with(|| SpanIndex::load(seg, &span.file));
+                if whole_local || index.covers(span.start, end) {
                     out.confirmed
                         .push((rel.to_string(), presence_key(&span.term)));
                 } else {
@@ -203,7 +212,9 @@ impl PostingSpanHydrator {
             let mut files: Vec<_> = by_file.into_iter().collect();
             files.sort_by(|a, b| a.0.cmp(b.0));
             for (file, ranges) in files {
-                for (s, e) in span_cache::coalesce(ranges, self.cfg.coalesce_gap) {
+                for (s, e) in
+                    span_cache::coalesce_capped(ranges, self.cfg.coalesce_gap, MAX_RANGE_BYTES)
+                {
                     reqs.push((format!("{rel}/{file}"), s, e - s));
                     pending.push(Pending {
                         seg: i,
@@ -232,14 +243,13 @@ impl PostingSpanHydrator {
                 Ok(bytes) if bytes.len() as u64 == p.len => {
                     out.bytes += p.len;
                     heat.1 += p.len;
-                    persist_span(
-                        cache,
+                    out.held.extend(writes.persist(
                         &segments[p.seg],
                         rels[p.seg].as_deref().unwrap_or_default(),
                         &p.file,
                         p.start,
-                        &bytes,
-                    );
+                        bytes,
+                    ));
                 }
                 Ok(bytes) => {
                     eprintln!(
@@ -252,17 +262,21 @@ impl PostingSpanHydrator {
                         p.len
                     );
                     out.bytes += bytes.len() as u64;
+                    out.fallback_error
+                        .get_or_insert_with(|| format!("returned {} bytes", bytes.len()));
                     failed.insert(key);
                 }
                 Err(KoshaError::Overloaded(_)) => out.shed = true,
-                Err(_) => {
+                Err(e) => {
+                    out.fallback_error.get_or_insert_with(|| e.to_string());
                     failed.insert(key);
                 }
             }
         }
 
-        // Confirm terms whose span is now cached. A failed shard goes
-        // whole; its terms are confirmed by the next query's local check.
+        // Confirm terms whose span is now cached (on disk or queued; not a
+        // dropped write). A failed shard goes whole; its terms are
+        // confirmed by the next query's local check.
         for (i, spans) in waiting.iter().enumerate() {
             let Some(rel) = rels[i].as_deref() else {
                 continue;
@@ -308,8 +322,16 @@ impl PostingSpanHydrator {
 
     /// A background whole-shard hydration of `shard` finished. When it
     /// `landed`, the shard's spans are dropped (the whole file wins every
-    /// read). Either way its heat resets.
-    pub fn finish_promotion(&self, cache: &Cache, shard: &Path, landed: bool) {
+    /// read) without counting as an eviction, so posting presence verdicts
+    /// survive ([`Cache::drop_superseded_dir_unless_pinned`]). Either way
+    /// its heat resets.
+    pub fn finish_promotion(
+        &self,
+        cache: &Cache,
+        writes: &SpanWriteQueue,
+        shard: &Path,
+        landed: bool,
+    ) {
         self.promoting.lock().unwrap().remove(shard);
         self.heat.lock().unwrap().remove(shard);
         if !landed {
@@ -319,15 +341,26 @@ impl PostingSpanHydrator {
             return;
         };
         let key = format!("{rel}{}", span_cache::SPANS_SUFFIX);
-        if let Err(e) = cache.evict_dir_unless_pinned(&key) {
+        if let Err(e) = writes.drop_superseded(cache, &key) {
             eprintln!("WARN: failed to drop span cache {key}: {e}");
         }
     }
 }
 
+/// Most bytes one coalesced ranged GET asks for — of kNN postings and
+/// sidecar vectors ([`fetch_file_spans`]), term postings and page records
+/// — a whole-object download's part size
+/// (`s3_storage::DOWNLOAD_PART_BYTES`). A single input range larger than
+/// this (one huge posting or record) is still one GET: ranges are never
+/// split, a reader needs each inside one cached span.
+pub(crate) const MAX_RANGE_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(feature = "s3")]
+const _: () = assert!(MAX_RANGE_BYTES == crate::s3_storage::DOWNLOAD_PART_BYTES);
+
 /// Fetch `ranges` (`[start, end)`, any order) of `{segment_dir}/{file}`
 /// into the span cache in one batch of coalesced ranged GETs, skipping what
-/// is already cached. Used for kNN postings of `vector.idx`, whose offsets
+/// is already cached. The writes are queued ([`SpanWriteQueue`]), never
+/// done here: this runs inside a segment's scoring task on the rayon pool. Used for kNN postings of `vector.idx`, whose offsets
 /// the reader takes from `vector.offsets` (#245). Returns the GETs, bytes,
 /// and whether any range failed for a reason other than load shedding (the
 /// caller then fetches the whole file) or was shed.
@@ -338,7 +371,7 @@ pub fn fetch_file_spans(
     ranges: &[(u64, u64)],
     coalesce_gap: u64,
     fetcher: &dyn RangeFetcher,
-    cache: &Cache,
+    writes: &SpanWriteQueue,
 ) -> FileSpanOutcome {
     let mut out = FileSpanOutcome::default();
     let have = SpanIndex::load(segment_dir, file);
@@ -347,7 +380,11 @@ pub fn fetch_file_spans(
         .copied()
         .filter(|&(s, e)| !have.covers(s, e))
         .collect();
-    let merged = span_cache::coalesce(need, coalesce_gap);
+    // Bounded like a whole-object download's parts: an exact kNN can ask
+    // for every vector posting of a column, or every candidate vector of a
+    // one-matter segment (~2 GB on staging), and as one coalesced range
+    // that was a single GET held in memory whole.
+    let merged = span_cache::coalesce_capped(need, coalesce_gap, MAX_RANGE_BYTES);
     if merged.is_empty() {
         return out;
     }
@@ -361,26 +398,38 @@ pub fn fetch_file_spans(
         match result {
             Ok(bytes) if bytes.len() as u64 == e - s => {
                 out.bytes += bytes.len() as u64;
-                persist_span(cache, segment_dir, rel, file, s, &bytes);
+                out.held
+                    .extend(writes.persist(segment_dir, rel, file, s, bytes));
             }
             Ok(bytes) => {
                 out.bytes += bytes.len() as u64;
+                out.error.get_or_insert_with(|| {
+                    format!("returned {} bytes, expected {}", bytes.len(), e - s)
+                });
                 out.failed = true;
             }
             Err(KoshaError::Overloaded(_)) => out.shed = true,
-            Err(_) => out.failed = true,
+            Err(err) => {
+                out.error.get_or_insert_with(|| err.to_string());
+                out.failed = true;
+            }
         }
     }
     out
 }
 
 /// See [`fetch_file_spans`].
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct FileSpanOutcome {
     pub gets: u64,
     pub bytes: u64,
     pub failed: bool,
+    /// The first failure's cause when `failed`, for the fallback log line.
+    pub error: Option<String>,
     pub shed: bool,
+    /// Fetched spans the write queue could not take: readable only while
+    /// held, so the reader keeps them until it has read the ranges.
+    pub held: SpanHolds,
 }
 
 /// Process-lifetime posting read totals for `GET /stats`.
@@ -673,6 +722,28 @@ mod tests {
             .collect()
     }
 
+    fn writes() -> SpanWriteQueue {
+        SpanWriteQueue::new(
+            crate::span_writes::SPAN_WRITE_QUEUE_BYTES,
+            crate::span_writes::SPAN_HELD_BYTES,
+        )
+    }
+
+    /// [`PostingSpanHydrator::hydrate`] with its span writes done before it
+    /// returns, as the background writer would do them.
+    fn hydrate_now(
+        postings: &PostingSpanHydrator,
+        segs: &[PathBuf],
+        terms: &[String],
+        store: &dyn RangeFetcher,
+        cache: &Cache,
+    ) -> PostingSpanOutcome {
+        let writes = writes();
+        let o = postings.hydrate(segs, terms, store, &writes);
+        writes.drain(cache);
+        o
+    }
+
     /// Postings round then the search, whose page docs and kNN postings go
     /// through ranged reads on `store`.
     fn search(
@@ -683,21 +754,52 @@ mod tests {
         cache: &Cache,
         q: &SearchQuery,
     ) -> Result<(Vec<String>, PostingSpanOutcome), KoshaError> {
+        // The background writer, run inline: every span is on disk before
+        // the read that needs it.
+        search_writing(f, searcher, postings, store, &writes(), Some(cache), q)
+    }
+
+    /// [`search`] queueing its span writes on `writes`, which are written
+    /// after each fetch when `drain` names the cache, and otherwise left
+    /// for a writer that is not running, as a stalled background writer
+    /// would leave them. The request holds what the queue drops, as the
+    /// server does.
+    fn search_writing(
+        f: &Fixture,
+        searcher: &Searcher,
+        postings: &PostingSpanHydrator,
+        store: &Store,
+        writes: &SpanWriteQueue,
+        drain: Option<&Cache>,
+        q: &SearchQuery,
+    ) -> Result<(Vec<String>, PostingSpanOutcome), KoshaError> {
+        let drain = || {
+            if let Some(cache) = drain {
+                writes.drain(cache);
+            }
+        };
+        let held: Mutex<SpanHolds> = Mutex::new(SpanHolds::new());
         // The terms the server's hydration asks for: every reading of the
         // query (#220) plus per-field keys and norms (#249). The fixture's
         // segments use the default analysis.
         let terms = kosha_query::QueryAnalysis::new(q).union_terms([None]);
-        let outcome = if terms.is_empty() {
+        let mut outcome = if terms.is_empty() {
             PostingSpanOutcome::default()
         } else {
-            postings.hydrate(&f.segs, &terms, store, cache)
+            postings.hydrate(&f.segs, &terms, store, writes)
         };
+        drain();
+        held.lock().unwrap().append(&mut outcome.held);
         let docs = SpanHydrator::new(f.data.clone(), SpanConfig::default());
         let ensure = |pages: &[PageSegment<'_>]| {
-            docs.hydrate(pages, store, cache);
+            let o = docs.hydrate(pages, store, writes);
+            drain();
+            held.lock().unwrap().extend([o.held]);
         };
         let fetch_vectors = |seg: &Path, file: &str, ranges: &[(u64, u64)]| {
-            fetch_file_spans(&f.rel(seg), seg, file, ranges, 64 * 1024, store, cache);
+            let o = fetch_file_spans(&f.rel(seg), seg, file, ranges, 64 * 1024, store, writes);
+            drain();
+            o.held
         };
         let (result, _) = searcher.search_with_hydrators(
             &f.ns,
@@ -732,7 +834,8 @@ mod tests {
         assert_eq!(got, want, "ranged reads return the fully local answer");
         let (rounds, gets, bytes) = store.snapshot();
         let total = f.remote_bytes();
-        // Every query term is now confirmed in every segment.
+        // Every query term is now confirmed in every segment: the cold query
+        // fills the presence cache, so a warm repeat never re-plans spans.
         assert_eq!(o.confirmed.len(), 3 * f.segs.len());
         println!(
             "cold BM25: {rounds} round trips, {gets} GETs, {bytes} bytes of {total} \
@@ -843,7 +946,7 @@ mod tests {
         f.scaffold(&store, false);
         store.fail.store(true, Ordering::SeqCst);
         let terms = vec!["w17".to_string(), "absent-term".to_string()];
-        let o = postings.hydrate(&f.segs, &terms, &store, &cache);
+        let o = hydrate_now(&postings, &f.segs, &terms, &store, &cache);
         assert_eq!(o.whole_fallback.len(), 1);
         assert_eq!(
             o.whole_fallback[0].1,
@@ -877,12 +980,12 @@ mod tests {
             .take(3)
             .collect();
         same.insert(0, "w1".into());
-        let o1 = postings.hydrate(&f.segs, &same[..1], &store, &cache);
+        let o1 = hydrate_now(&postings, &f.segs, &same[..1], &store, &cache);
         assert!(o1.promote.is_empty());
-        let o2 = postings.hydrate(&f.segs, &same[1..2], &store, &cache);
+        let o2 = hydrate_now(&postings, &f.segs, &same[1..2], &store, &cache);
         let shard = f.segs[0].join(&file);
         assert_eq!(o2.promote, vec![shard.clone()]);
-        let o3 = postings.hydrate(&f.segs, &same[2..3], &store, &cache);
+        let o3 = hydrate_now(&postings, &f.segs, &same[2..3], &store, &cache);
         assert!(o3.promote.is_empty(), "queued once while pending");
         assert!(cache.total_size() > before);
 
@@ -890,11 +993,11 @@ mod tests {
         std::fs::copy(f.remote.join(f.rel(&f.segs[0])).join(&file), &shard).unwrap();
         cache.note_external_write(&format!("{}/{file}", f.rel(&f.segs[0])));
         let with_whole = cache.total_size();
-        postings.finish_promotion(&cache, &shard, true);
+        postings.finish_promotion(&cache, &writes(), &shard, true);
         assert!(SpanIndex::load(&f.segs[0], &file).is_empty());
         assert!(cache.total_size() < with_whole);
         // Every term of the shard is now local: no GET.
-        let o4 = postings.hydrate(&f.segs, &same, &store, &cache);
+        let o4 = hydrate_now(&postings, &f.segs, &same, &store, &cache);
         assert_eq!(o4.gets, 0);
         assert_eq!(o4.confirmed.len(), same.len());
     }
@@ -953,6 +1056,149 @@ mod tests {
         assert_eq!(store.snapshot().2, bytes);
     }
 
+    /// No span is written on a scoring thread. With the background writer
+    /// stalled outright, cold kNN and BM25 searches running concurrently on
+    /// a single rayon thread all finish with the right answer and nothing
+    /// lands on disk: the probes read the fetched postings from memory.
+    /// Before, each fetched span was written by the scoring task itself
+    /// before it read it back, so a writer stalled in the kernel's dirty
+    /// throttling stalled the rayon pool and every search queued behind it.
+    /// Once the writer runs, the spans are on disk and a repeat is free.
+    #[test]
+    fn stalled_span_writer_never_blocks_scoring() {
+        let f = fixture("stalled-writer", 2, 3000, true);
+        let store = Store::new(f.remote.clone());
+        let cache = Cache::new(f.data.clone());
+        let postings = PostingSpanHydrator::new(f.data.clone(), default_config());
+        let knn = query(serde_json::json!({
+            "query_text": "",
+            "knn": {"field": "emb", "vector": vector_for(1234), "k": 5, "num_candidates": 4},
+            "max_results": 5
+        }));
+        let bm25 = query(serde_json::json!({"query_text": "w0 w977 w1954", "max_results": 10}));
+        let want = [reference(&f, &knn), reference(&f, &bm25)];
+        f.scaffold(&store, true);
+        let writes = writes();
+        let searcher = Searcher::new(f.data.clone());
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        // Four concurrent searches whose parallel scoring all runs on one
+        // rayon thread: one blocked task would block them all.
+        let got: Vec<Vec<String>> = std::thread::scope(|scope| {
+            let runs: Vec<_> = [&knn, &bm25, &knn, &bm25]
+                .into_iter()
+                .map(|q| {
+                    let (f, searcher, postings, store, writes, pool) =
+                        (&f, &searcher, &postings, &store, &writes, &pool);
+                    scope.spawn(move || {
+                        pool.install(|| {
+                            search_writing(f, searcher, postings, store, writes, None, q)
+                                .unwrap()
+                                .0
+                        })
+                    })
+                })
+                .collect();
+            runs.into_iter().map(|r| r.join().unwrap()).collect()
+        });
+        assert_eq!(
+            got,
+            [&want[0], &want[1], &want[0], &want[1]].map(|w| w.clone())
+        );
+        assert!(writes.queued_bytes() > 0, "the spans wait for the writer");
+        // Queued spans count as cached: every query term is confirmed
+        // (presence cache filled) without a GET, though none is on disk yet.
+        let gets = store.snapshot().1;
+        let terms = kosha_query::QueryAnalysis::new(&bm25).union_terms([None]);
+        let o = postings.hydrate(&f.segs, &terms, &store, &writes);
+        assert_eq!(o.confirmed.len(), 3 * f.segs.len());
+        assert_eq!((o.gets, store.snapshot().1), (0, gets));
+        for seg in &f.segs {
+            for file in [
+                kosha_segment::VECTOR_IDX_FILE,
+                kosha_segment::DOC_STORE_FILE,
+            ] {
+                assert!(
+                    !span_cache::spans_dir(seg, file).exists(),
+                    "nothing written while the writer is stalled: {}",
+                    seg.display()
+                );
+            }
+        }
+
+        writes.drain(&cache);
+        assert_eq!(writes.queued_bytes(), 0);
+        let gets = store.snapshot().1;
+        for (q, want) in [&knn, &bm25].into_iter().zip(&want) {
+            let (got, _) = search(
+                &f,
+                &Searcher::new(f.data.clone()),
+                &postings,
+                &store,
+                &cache,
+                q,
+            )
+            .unwrap();
+            assert_eq!(&got, want);
+        }
+        assert_eq!(
+            store.snapshot().1,
+            gets,
+            "warm repeats read the written spans"
+        );
+    }
+
+    /// A span write queue that can take nothing drops every write; the
+    /// searches that fetched the spans still answer correctly from the
+    /// spans they hold, and nothing is cached for the next one.
+    #[test]
+    fn dropped_span_writes_still_answer_correctly() {
+        let f = fixture("dropped-writes", 2, 3000, true);
+        let store = Store::new(f.remote.clone());
+        let postings = PostingSpanHydrator::new(f.data.clone(), default_config());
+        let knn = query(serde_json::json!({
+            "query_text": "",
+            "knn": {"field": "emb", "vector": vector_for(1234), "k": 5, "num_candidates": 4},
+            "max_results": 5
+        }));
+        let bm25 = query(serde_json::json!({"query_text": "w0 w977 w1954", "max_results": 10}));
+        f.scaffold(&store, true);
+        let full = SpanWriteQueue::new(0, crate::span_writes::SPAN_HELD_BYTES);
+        for q in [&knn, &bm25] {
+            let want = reference(&f, q);
+            let searcher = Searcher::new(f.data.clone());
+            let (got, o) =
+                search_writing(&f, &searcher, &postings, &store, &full, None, q).unwrap();
+            assert_eq!(got, want);
+            if q.query_text.is_empty() {
+                continue;
+            }
+            // Terms whose spans were only held are not confirmed local.
+            let absent = o.confirmed.len();
+            let gets = store.snapshot().1;
+            let (again, o2) =
+                search_writing(&f, &searcher, &postings, &store, &full, None, q).unwrap();
+            assert_eq!(again, want);
+            assert!(
+                store.snapshot().1 > gets,
+                "nothing was cached: fetched again"
+            );
+            assert_eq!(o2.confirmed.len(), absent);
+        }
+        // Only `doc_vectors.bin` headers are queued: they are never dropped.
+        assert!(
+            full.queued_bytes()
+                <= f.segs.len() as u64 * 2 * kosha_segment::DOC_VECTORS_HEADER_PROBE
+        );
+        assert_eq!(full.stats().held_bytes, 0, "released with the requests");
+        let stats = full.to_json();
+        assert!(stats["dropped"].as_u64().unwrap() > 0, "{stats}");
+        assert_eq!(stats["written"], 0);
+        assert!(!span_cache::spans_dir(&f.segs[0], kosha_segment::VECTOR_IDX_FILE).exists());
+    }
+
     /// Scale report, not a CI test: `KOSHA_BENCH_SEGS` segments of
     /// `KOSHA_BENCH_DOCS` docs, `KOSHA_BENCH_QUERIES` distinct cold
     /// three-term queries (a fresh local data dir each), each S3 round trip
@@ -1003,9 +1249,8 @@ mod tests {
                 f.scaffold(&store, false);
                 let terms = kosha_segment::tokenize(&q.query_text);
                 let posting_bytes = if mode == "ranged" {
-                    PostingSpanHydrator::new(f.data.clone(), default_config())
-                        .hydrate(&f.segs, &terms, &slow, &cache)
-                        .bytes
+                    let postings = PostingSpanHydrator::new(f.data.clone(), default_config());
+                    hydrate_now(&postings, &f.segs, &terms, &slow, &cache).bytes
                 } else {
                     // Whole shards, one concurrent batch.
                     let mut reqs = Vec::new();
@@ -1031,8 +1276,10 @@ mod tests {
                     n
                 };
                 let docs_h = SpanHydrator::new(f.data.clone(), SpanConfig::default());
+                let writes = writes();
                 let ensure = |pages: &[PageSegment<'_>]| {
-                    docs_h.hydrate(pages, &slow, &cache);
+                    let _ = docs_h.hydrate(pages, &slow, &writes);
+                    writes.drain(&cache);
                 };
                 Searcher::new(f.data.clone())
                     .search_with_doc_store_hydrator(&f.ns, &f.manifest, &q, None, Some(&ensure))

@@ -21,7 +21,7 @@ annotation and trust the internal CA; see `k8s/README.md`, "Encryption in transi
 | Setting | Effect |
 | --- | --- |
 | default | Unauthenticated, like `/healthz` and `/readyz` |
-| `KOSHA_METRICS_AUTH=admin` | Requires the `KOSHA_ADMIN_API_KEY` credential (`Authorization: Bearer <key>` or `X-Api-Key`); 403 without it. With no admin key configured, every scrape is refused |
+| `KOSHA_METRICS_AUTH=admin` | Requires the `KOSHA_ADMIN_API_KEY` credential or an operator credential (`Authorization: Bearer <key>` or `X-Api-Key`); 403 without it. With no admin key configured and no operator credential, every scrape is refused |
 | `KOSHA_METRICS=off` | `GET /metrics` returns 404 |
 
 The default exposes no tenant data: no series carries a namespace or tenant label. Leave the
@@ -66,15 +66,41 @@ plus `+Inf`.
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
 | `kosha_cache_bytes` | gauge | `cache` (`tenant`) | `nvme`: bytes in the local read-through file cache (`KOSHA_DATA_DIR`). `segment`: approximate bytes of parsed segments held in memory (the `KOSHA_SEGMENT_CACHE_MAX_BYTES` ledger). `result`: bytes of cached `POST /search` responses (`KOSHA_RESULT_CACHE_MAX_BYTES`). Not reported for `corpus_stats` and `ceiling`, which are bounded by entry count |
-| `kosha_cache_evictions_total` | counter | `cache` (`tenant`) | `nvme`: evictions from the local file cache, one per file or directory (such as a segment) removed, whether by the `KOSHA_CACHE_MAX_BYTES` limit or by an explicit eviction. `segment`, `result`: entries evicted to stay within the cache's budget. `corpus_stats`, `ceiling`: manifest versions evicted to stay within the cache's entry bound (a version replaced by a newer one of the same namespace is not counted) |
+| `kosha_cache_evictions_total` | counter | `cache` (`tenant`) | `nvme`: evictions from the local file cache, one per file or directory (such as a segment) removed, whether by the `KOSHA_CACHE_MAX_BYTES` limit or by an explicit eviction. A span directory dropped because a promotion landed its whole file is not counted: nothing became less local. `segment`, `result`: entries evicted to stay within the cache's budget. `corpus_stats`, `ceiling`: manifest versions evicted to stay within the cache's entry bound (a version replaced by a newer one of the same namespace is not counted) |
 | `kosha_cache_hits_total` | counter | `cache` (`tenant`) | Lookups that found their entry (#342). `nvme`: a search's segment whose scoring files were already local, counted per segment checked by a hydration pass and, for a warm search served from the cached hydration verdict, per manifest segment. `segment`: a parsed segment found in memory. `result`: a search answered from the result cache. `corpus_stats`: a search whose namespace corpus statistics (BM25 totals) were cached for its manifest version. `ceiling`: the same for per-segment score ceilings |
 | `kosha_cache_misses_total` | counter | `cache` (`tenant`) | Lookups that did not (#342). `nvme`: a search's segment that had to be hydrated. `segment`: a segment opened and parsed. `result`: a cacheable search that ran. `corpus_stats`, `ceiling`: the manifest version's entry had to be built |
 | `kosha_hydrations_total` | counter | `source` | Segment files a hydration needed, by where they came from. `s3`: fetched from the object store. `peer`: streamed from the replica holding the hydration lease. `local`: already in the local cache when the fetch ran. Ranged span reads of doc stores and postings are not counted. Stays at zero without S3 |
 | `kosha_hydration_lease_outcome_total` | counter | `outcome` | Cross-replica hydration lease claims (S3 and Postgres builds with `POD_IP` set). `won`: this replica fetches the file. `streamed_from_peer`: another replica held the lease and served the bytes. `timeout`: the holder did not serve the bytes within the peer-fetch budget (or the fetch failed), and the file was fetched from S3 instead |
 | `kosha_segment_checksum_failures_total` | counter | none | Hydrated segment files that failed their `_COMMIT` size or CRC check, refetch failures included. The same number as `segment_checksum_failures` in `GET /v1/stats` |
+| `kosha_span_writes_total` | counter | `outcome` | Fetched byte ranges (kNN postings, term postings, page documents, sidecar headers) by what became of their write into the span cache. `written`: written by the background span writer. `dropped`: the writer's queue (256 MiB) was full; the span was held in memory by the request that fetched it and not cached. `inline`: queue and held cap (1 GiB) both full; written on the fetching thread (a scoring thread for kNN), which brings back the disk stall this writer removes. Expected 0 at target load: **alert on any increase**, it means the cache disk is far behind the fetch rate. `failed`: a write that did not complete (it invalidates the posting presence cache). The same numbers as `span_writes` in `GET /v1/stats` |
+| `kosha_span_writes_dropped_bytes_total` | counter | none | Bytes of the `dropped` span writes above |
+| `kosha_span_write_queue_bytes` | gauge | none | Span bytes queued for the background writer (at most 256 MiB, plus never-dropped header spans) |
+| `kosha_span_held_bytes` | gauge | none | Bytes of dropped span writes held in memory by in-flight requests (at most 1 GiB) |
 
 Values that already exist elsewhere in the server (cache bytes, NVMe evictions, checksum
 failures, queue depth) are read when Prometheus scrapes, not counted twice.
+
+The purge of deleted namespaces (`KOSHA_DELETION_PURGE_INTERVAL_MS`, #347) adds no family to
+`/metrics`. A segment directory it removes counts in `kosha_cache_evictions_total{cache="nvme"}`
+like any other explicit eviction. Its own counters are per pod, in the `deletion_purge` block of
+`GET /v1/stats`:
+
+| Field | Meaning |
+| --- | --- |
+| `enabled`, `interval_ms` | Whether the purge runs on this pod, and how often |
+| `caught_up` | Whether a pass since boot has read the deletion records to the end |
+| `last_pass_at_ms`, `watermark_ms` | When the last pass started (Unix ms, this pod's clock), and the newest `requested_at_ms` among the records handled |
+| `pending_sweeps` | Subjects waiting for another sweep: the repeat sweep after a deletion, or one that left something behind or failed |
+| `last_error` | The first error of the last pass, `null` when it had none |
+| `kosha_deletion_purge_passes_total` | Passes run |
+| `kosha_deletion_purge_records_total` | Deletion records handled for the first time |
+| `kosha_deletion_purge_sweeps_total` | Sweeps of one namespace or tenant, first and repeat sweeps together |
+| `kosha_deletion_purge_segment_dirs_removed_total`, `kosha_deletion_purge_bytes_removed_total` | Segment directories removed from the local disk, and their bytes |
+| `kosha_deletion_purge_parsed_segments_dropped_total` | Parsed segments dropped from memory |
+| `kosha_deletion_purge_deferred_total` | Directories or namespaces a sweep left for a later one (written to within the last 5 s, pinned, being fetched, or held by a writer's unpublished state) |
+| `kosha_deletion_purge_errors_total` | Passes or sweeps that failed (control store unreadable, a file that could not be removed) |
+| `kosha_deletion_resume_attempts_total`, `kosha_deletion_resume_completed_total` | Automatic retries of pending namespace records on a writer pod (`KOSHA_DELETION_RESUME_INTERVAL_MS`), and how many completed the record |
+| `kosha_deletion_resume_fenced_total` | Automatic retries skipped because the namespace's writer lease could not be taken (another writer pod holds it, or the lease store could not be reached) |
 
 Each cache keeps these figures per tenant (#342): the tenant is the first component of the
 `<tenant>/<name>` namespace id, and bare namespace ids from before tenants existed count as

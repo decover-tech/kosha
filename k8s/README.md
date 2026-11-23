@@ -251,7 +251,8 @@ Before applying it:
    pods on different schemes. Peer hydration falls back to S3 instead.
 
 The migrate Jobs (`base/job-migrate-namespace.yaml`,
-`stage/es-to-kosha-migration-job.yaml`) read the same ConfigMap but do not
+`stage/es-to-kosha-migration-job.yaml`) and the usage reconciliation CronJob
+(`base/cronjob-usage-reconcile.yaml`, #348) read the same ConfigMap but do not
 need the `kosha-internal-tls` Secret: they make no pod-to-pod connection
 and read only the `KOSHA_INTERNAL_TLS` mode, to apply the Postgres rule
 below.

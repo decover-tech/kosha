@@ -124,6 +124,51 @@ pub fn hash_api_key(key: &str) -> String {
     hex
 }
 
+/// The `tenant_id` prefix of an operator admin credential's row (#346).
+///
+/// Operator credentials live in the key registry next to tenant keys, so
+/// they share its hashing, expiry, rotation and revocation. The prefix is
+/// what tells them apart, and it can never be a tenant: a tenant id may not
+/// contain `/` (new keys refuse it, and every tenant route answers 403
+/// "invalid tenant" for one), so a server build that does not know about
+/// operator credentials cannot use such a row as a tenant key either.
+pub const OPERATOR_TENANT_PREFIX: &str = "_operator/";
+
+/// Longest operator name accepted.
+pub const MAX_OPERATOR_NAME_LEN: usize = 64;
+
+/// An operator's name: 1 to 64 ASCII letters, digits, `.`, `_`, `-`, `@` or
+/// `+`, starting with a letter or digit (`alice`, `alice@example.com`,
+/// `ci-deploy`). It is written into the audit log as `operator:<name>`.
+pub fn valid_operator_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_OPERATOR_NAME_LEN
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'@' | b'+'))
+}
+
+/// The registry `tenant_id` of the operator `name`'s credentials.
+pub fn operator_tenant_id(name: &str) -> String {
+    format!("{OPERATOR_TENANT_PREFIX}{name}")
+}
+
+/// The operator a registry row belongs to; `None` for a tenant key (and for
+/// an operator row whose name this build would not have issued).
+pub fn operator_name(tenant_id: &str) -> Option<&str> {
+    tenant_id
+        .strip_prefix(OPERATOR_TENANT_PREFIX)
+        .filter(|name| valid_operator_name(name))
+}
+
+/// Whether a registry row is an operator credential rather than a tenant
+/// key, whatever follows the prefix: a malformed operator row must still
+/// never be treated as a tenant key.
+pub fn is_operator_tenant_id(tenant_id: &str) -> bool {
+    tenant_id.starts_with(OPERATOR_TENANT_PREFIX)
+}
+
 /// One row of the key registry. Never carries the key itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiKeyRecord {
@@ -184,6 +229,36 @@ mod tests {
         );
         assert_eq!(Scopes::from_column(""), Scopes::NONE);
         assert!(Scopes::from_column("everything").is_empty());
+    }
+
+    #[test]
+    fn operator_rows_are_told_apart_by_a_prefix_no_tenant_can_have() {
+        assert_eq!(operator_tenant_id("alice"), "_operator/alice");
+        assert_eq!(operator_name("_operator/alice"), Some("alice"));
+        assert_eq!(
+            operator_name("_operator/alice@example.com"),
+            Some("alice@example.com")
+        );
+        assert_eq!(operator_name("acme"), None);
+        assert_eq!(operator_name("_operator"), None);
+        // A malformed operator row names nobody, and is still not a tenant.
+        for bad in ["_operator/", "_operator/a/b", "_operator/ alice"] {
+            assert_eq!(operator_name(bad), None, "{bad}");
+            assert!(is_operator_tenant_id(bad), "{bad}");
+        }
+        assert!(!is_operator_tenant_id("acme"));
+        assert!(!is_operator_tenant_id("_legacy"));
+
+        for good in ["a", "alice", "ci-deploy", "a.b_c+d@example.com", "9lives"] {
+            assert!(valid_operator_name(good), "{good}");
+        }
+        let long = "a".repeat(MAX_OPERATOR_NAME_LEN + 1);
+        for bad in [
+            "", "-alice", ".alice", "al ice", "a/b", "a:b", "al\u{e9}", &long,
+        ] {
+            assert!(!valid_operator_name(bad), "{bad}");
+        }
+        assert!(valid_operator_name(&"a".repeat(MAX_OPERATOR_NAME_LEN)));
     }
 
     #[test]

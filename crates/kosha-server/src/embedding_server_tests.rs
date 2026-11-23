@@ -278,6 +278,21 @@ fn a_segment_of_another_model_is_skipped_and_counted_degraded() {
     assert_eq!(status, 200, "{body}");
     assert!(ids(&body).is_empty(), "{body}");
     assert_eq!(body["knn_degraded_segments"], 1, "{body}");
+    // Skipped by design, not lost to an error: the searcher reports no
+    // failed segment, which is what keeps the answer above a 200, not a 503.
+    let manifest = state.indexer.manifest(&ns).unwrap();
+    let query: SearchQuery = serde_json::from_value(serde_json::json!({
+        "query_text": "",
+        "knn": {"field": "emb", "vector": vec![0.125f32; 64], "k": 4, "embedding_model": "mock-b"},
+    }))
+    .unwrap();
+    let (result, phases) = state
+        .searcher
+        .search_with_stats(&ns, &manifest, &query, None)
+        .unwrap();
+    assert_eq!(result.knn_degraded_segments, Some(1));
+    assert!(phases.knn_failed_segments.is_empty());
+    assert!(phases.knn_corrupt_segments.is_empty());
 }
 
 #[test]

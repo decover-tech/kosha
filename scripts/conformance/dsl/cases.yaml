@@ -560,9 +560,19 @@
   expect:
     response_nonempty: [aggregations.lo.value, aggregations.hi.value, aggregations.n.value]
 
+- id: aggregation.percentiles
+  category: aggregation
+  construct: percentiles (percents, keyed)
+  kinds: [percentiles]
+  outcome: supported
+  es_body: {size: 0, query: {bool: {filter: [{exists: {field: status}}]}}, aggs: {spread: {percentiles: {field: amount, percents: [50, 95]}}}}
+  note: Top level or under a bucket aggregation. Exact up to 4,096 values per aggregation or bucket, then a DDSketch within 1% relative error.
+  expect:
+    response_nonempty: [aggregations.spread.values]
+
 - id: aggregation.unsupported
   category: aggregation
-  construct: stats, percentiles, top_hits, filter(s), range, significant_terms, nested, ...
+  construct: stats, top_hits, filter(s), range, significant_terms, nested, ...
   outcome: rejected
   es_body: {size: 0, query: {bool: {filter: [{exists: {field: status}}]}}, aggs: {s: {stats: {field: amount}}}}
   note: Any other aggregation type is refused by name.

@@ -184,6 +184,66 @@ async fn migrate_once(pool: &sqlx::PgPool) -> Result<(), (sqlx::Error, &'static 
     tx.commit().await.map_err(|e| (e, FAILED))
 }
 
+/// The tables and sequences of schema `kosha` that the connected role cannot
+/// fully use: a table it cannot `SELECT`, `INSERT`, `UPDATE` and `DELETE`, or
+/// a sequence it cannot draw from. One `relname` per row, in name order.
+///
+/// The embedded migrations run as the server's role and only create what is
+/// missing, so they succeed on an instance whose tables an admin created
+/// (`make db-migrate`) even when `002_grant_kosha_role.sql` never handed one
+/// of them over. That was `kosha.hydration_leases` until #426: the server
+/// booted, and every lease claim and namespace deletion then failed with
+/// "permission denied". Only an admin can repair it, so the server reports it
+/// at startup (`warn_about_unusable_relations`).
+pub const UNUSABLE_RELATIONS_SQL: &str = "\
+    SELECT c.relname::text \
+    FROM pg_catalog.pg_class c \
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+    WHERE n.nspname = 'kosha' \
+      AND c.relkind IN ('r', 'p', 'S') \
+      AND CASE c.relkind \
+            WHEN 'S' THEN NOT has_sequence_privilege(c.oid, 'USAGE') \
+            ELSE NOT (has_table_privilege(c.oid, 'SELECT') \
+                  AND has_table_privilege(c.oid, 'INSERT') \
+                  AND has_table_privilege(c.oid, 'UPDATE') \
+                  AND has_table_privilege(c.oid, 'DELETE')) \
+          END \
+    ORDER BY 1";
+
+/// What the server logs at startup when [`UNUSABLE_RELATIONS_SQL`] finds
+/// something. `None` when `relations` is empty.
+pub fn unusable_relations_warning(relations: &[String]) -> Option<String> {
+    if relations.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = relations.iter().map(|r| format!("kosha.{r}")).collect();
+    Some(format!(
+        "WARNING: the database role this server connects as cannot read and write {}. \
+         Requests that touch {} will fail with \"permission denied\" until a database admin \
+         re-runs crates/kosha-control/migrations/002_grant_kosha_role.sql on this database \
+         (`make db-migrate` does; it is safe to re-run). See \"Upgrading\" in the README.",
+        names.join(", "),
+        if names.len() == 1 { "it" } else { "them" },
+    ))
+}
+
+/// Report, without failing the boot, relations of schema `kosha` the server's
+/// role cannot use. A pod that refused to start here would turn a partly
+/// working instance into an outage on upgrade.
+async fn warn_about_unusable_relations(pool: &sqlx::PgPool) {
+    match sqlx::query_scalar::<_, String>(UNUSABLE_RELATIONS_SQL)
+        .fetch_all(pool)
+        .await
+    {
+        Ok(relations) => {
+            if let Some(warning) = unusable_relations_warning(&relations) {
+                eprintln!("{warning}");
+            }
+        }
+        Err(e) => eprintln!("could not check the privileges on schema kosha: {e}"),
+    }
+}
+
 /// Remove a namespace's manifest and registry rows inside `tx` and raise its
 /// retired version (see [`ControlStore::delete_namespace`]). The caller
 /// commits. `NamespaceNotFound` when there is no such namespace; the caller
@@ -263,8 +323,22 @@ impl PgStore {
         // Run migrations inline (no external migrator dependency), serialized
         // across processes by an advisory lock (#330).
         rt.block_on(run_migrations(&pool))?;
+        // The migrations cannot fix ownership (002 is the admin's); say so
+        // now if a table is out of this role's reach.
+        // A pod builds several stores on one database: once is enough.
+        static CHECKED: std::sync::Once = std::sync::Once::new();
+        CHECKED.call_once(|| rt.block_on(warn_about_unusable_relations(&pool)));
 
         Ok(Self { pool, rt })
+    }
+
+    /// The tables and sequences of schema `kosha` this store's role cannot
+    /// fully use (see [`UNUSABLE_RELATIONS_SQL`]). Empty on a healthy
+    /// instance.
+    pub fn unusable_relations(&self) -> Result<Vec<String>, String> {
+        self.rt
+            .block_on(sqlx::query_scalar::<_, String>(UNUSABLE_RELATIONS_SQL).fetch_all(&self.pool))
+            .map_err(|e| format!("privilege check failed: {e}"))
     }
 
     /// Bounded attempts for the initial connect, mirroring
@@ -706,6 +780,15 @@ impl ControlStore for PgStore {
 
     fn deletions(&self, filter: &DeletionFilter) -> Result<Vec<DeletionRecord>, KoshaError> {
         self.rt.block_on(crate::deletion::list(&self.pool, filter))
+    }
+
+    fn deletions_after(
+        &self,
+        after: Option<&kosha_core::deletion::DeletionPosition>,
+        limit: u32,
+    ) -> Result<Vec<DeletionRecord>, KoshaError> {
+        self.rt
+            .block_on(crate::deletion::list_after(&self.pool, after, limit))
     }
 
     fn list_namespaces(&self) -> Vec<NamespaceId> {

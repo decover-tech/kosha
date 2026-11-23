@@ -19,16 +19,25 @@
 //! dedicated `KOSHA_ADMIN_API_KEY` / `KOSHA_INTERNAL_API_KEY` credentials,
 //! checked in `main.rs` (`service_authorized`).
 //!
+//! Operators can also hold their own named admin credentials (#346,
+//! `operator_admin.rs`). They are rows of the same Postgres registry, so
+//! they are loaded, refreshed, expired and revoked exactly like tenant keys,
+//! but [`KeyStore::lookup`] never accepts one as a tenant key: only
+//! [`KeyStore::lookup_operator`] does. `KOSHA_ADMIN_API_KEY` stays the
+//! bootstrap and break-glass credential until `KOSHA_ADMIN_BOOTSTRAP_KEY`
+//! switches it off ([`bootstrap_admin_key`]).
+//!
 //! Fail closed: if no credential of any kind is configured at startup, the
 //! server refuses to start, unless `KOSHA_AUTH=disabled` is set explicitly.
 //! Then every request is tenant `dev` (local development only). Before this,
 //! an empty key table or a failed Postgres connect silently turned auth off.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
+use kosha_control::api_keys::{is_operator_tenant_id, operator_name};
 use kosha_control::{hash_api_key, ApiKeyRecord, Scopes};
 
 /// Parse the env-var tenant key sources into one map. Empty keys and
@@ -175,8 +184,47 @@ impl KeyStore {
         if found.expires_at.is_some_and(|at| now >= at) {
             return Err(Rejected::Expired);
         }
+        // An operator admin credential is never a tenant key.
+        if is_operator_tenant_id(&found.principal.tenant) {
+            return Err(Rejected::Unknown);
+        }
         found.last_used.fetch_max(now, Ordering::Relaxed);
         Ok(found.principal.clone())
+    }
+
+    /// The operator a named admin credential (#346) belongs to.
+    pub fn lookup_operator(&self, key: &str) -> Result<String, Rejected> {
+        self.lookup_operator_at(key, unix_now())
+    }
+
+    /// [`Self::lookup_operator`] at an explicit time (unix seconds). Like a
+    /// tenant key, the credential is rejected from the second it expires,
+    /// and from this pod's next refresh after it is revoked. A tenant key
+    /// is never an operator credential, whatever its scopes.
+    pub fn lookup_operator_at(&self, key: &str, now: i64) -> Result<String, Rejected> {
+        if key.is_empty() {
+            return Err(Rejected::Unknown);
+        }
+        let db = self.db.read().unwrap();
+        let found = db.get(&hash_api_key(key)).ok_or(Rejected::Unknown)?;
+        let name = operator_name(&found.principal.tenant).ok_or(Rejected::Unknown)?;
+        if found.expires_at.is_some_and(|at| now >= at) {
+            return Err(Rejected::Expired);
+        }
+        found.last_used.fetch_max(now, Ordering::Relaxed);
+        Ok(name.to_string())
+    }
+
+    /// How many operator admin credentials in the snapshot are usable at
+    /// `now` (unix seconds).
+    pub fn active_operator_credentials(&self, now: i64) -> usize {
+        self.db
+            .read()
+            .unwrap()
+            .values()
+            .filter(|key| operator_name(&key.principal.tenant).is_some())
+            .filter(|key| key.expires_at.is_none_or(|at| now < at))
+            .count()
     }
 
     pub fn len(&self) -> usize {
@@ -285,7 +333,8 @@ impl KeyStore {
             eprintln!("api keys: failed to record last_used_at: {e}");
         }
         let _registry = self.registry_guard();
-        let rows = store.list_api_keys(None).map_err(|e| e.to_string())?;
+        // Tenant keys and operator admin credentials alike.
+        let rows = store.list_all_credentials().map_err(|e| e.to_string())?;
         self.replace_db_keys(rows);
         Ok(self.db.read().unwrap().len())
     }
@@ -375,10 +424,61 @@ fn env_nonempty(var: &str) -> bool {
     std::env::var(var).is_ok_and(|v| !v.trim().is_empty())
 }
 
+/// Whether `KOSHA_ADMIN_BOOTSTRAP_KEY` leaves the shared
+/// `KOSHA_ADMIN_API_KEY` credential in force. Unset or empty is `enabled`,
+/// which is how every deployment ran before operator credentials (#346).
+/// An unrecognized value is an error: a typo must neither keep a credential
+/// alive that the operator meant to switch off, nor switch one off silently.
+pub fn parse_bootstrap_admin_key_flag(value: Option<&str>) -> Result<bool, String> {
+    let value = value.map(str::trim).unwrap_or("");
+    match value.to_ascii_lowercase().as_str() {
+        "" | "enabled" | "on" | "true" | "1" => Ok(true),
+        "disabled" | "off" | "false" | "0" => Ok(false),
+        _ => Err(format!(
+            "invalid KOSHA_ADMIN_BOOTSTRAP_KEY '{value}' (expected 'enabled' or 'disabled')"
+        )),
+    }
+}
+
+/// The shared admin credential a request may present: `admin_api_key`
+/// (`KOSHA_ADMIN_API_KEY`), unless it is empty or `flag`
+/// (`KOSHA_ADMIN_BOOTSTRAP_KEY`) disables it. An invalid flag yields no
+/// credential, so nothing is accepted by mistake; `init_global` refuses to
+/// start on one.
+pub fn bootstrap_admin_key_from(admin_api_key: Option<&str>, flag: Option<&str>) -> Option<String> {
+    if !parse_bootstrap_admin_key_flag(flag).unwrap_or(false) {
+        return None;
+    }
+    admin_api_key.filter(|k| !k.is_empty()).map(str::to_string)
+}
+
+/// [`bootstrap_admin_key_from`] the process environment.
+pub fn bootstrap_admin_key() -> Option<String> {
+    bootstrap_admin_key_from(
+        std::env::var("KOSHA_ADMIN_API_KEY").ok().as_deref(),
+        std::env::var("KOSHA_ADMIN_BOOTSTRAP_KEY").ok().as_deref(),
+    )
+}
+
 /// Build the auth config from the environment, load keys, start the
 /// refresh thread, and install it globally. Exits the process if no
 /// credential is configured and auth wasn't explicitly disabled.
 pub fn init_global() {
+    let bootstrap_flag = std::env::var("KOSHA_ADMIN_BOOTSTRAP_KEY").ok();
+    let bootstrap_enabled = match parse_bootstrap_admin_key_flag(bootstrap_flag.as_deref()) {
+        Ok(enabled) => enabled,
+        Err(e) => {
+            eprintln!("FATAL: {e}. Refusing to start.");
+            std::process::exit(1);
+        }
+    };
+    if !bootstrap_enabled {
+        println!(
+            "admin credentials: KOSHA_ADMIN_BOOTSTRAP_KEY=disabled — KOSHA_ADMIN_API_KEY is \
+             not accepted; only operator credentials reach /v1/admin/*"
+        );
+    }
+
     if env_flag_disabled("KOSHA_AUTH") {
         eprintln!(
             "WARNING: ******************************************************************\n\
@@ -430,10 +530,32 @@ pub fn init_global() {
             Ok(n) => println!("api keys: loaded {n} key(s) from postgres"),
             Err(e) => eprintln!("api keys: initial postgres load failed: {e}"),
         }
+        // The plaintext scrub (#346) stays a manual step, so say when it
+        // is due.
+        #[cfg(feature = "postgres")]
+        if let Some(count) = store.pg().map(|pg| pg.count_plaintext_api_keys()) {
+            match count {
+                Ok(0) => println!("api keys: no row holds a plaintext key"),
+                Ok(n) => println!(
+                    "api keys: {n} row(s) still hold a plaintext key; once every pod runs a \
+                     build with hashed keys, remove them with \
+                     POST /v1/admin/api-keys/scrub-plaintext"
+                ),
+                Err(e) => eprintln!("api keys: could not count plaintext rows: {e}"),
+            }
+        }
+    }
+    if !bootstrap_enabled && store.active_operator_credentials(unix_now()) == 0 {
+        eprintln!(
+            "WARN: admin credentials: KOSHA_ADMIN_BOOTSTRAP_KEY=disabled and no usable \
+             operator credential was loaded; /v1/admin/* is unreachable until one is, or \
+             until the bootstrap key is enabled again"
+        );
     }
 
-    let service_keys =
-        env_nonempty("KOSHA_ADMIN_API_KEY") || env_nonempty("KOSHA_INTERNAL_API_KEY");
+    // A switched-off bootstrap key is not a configured credential.
+    let service_keys = (bootstrap_enabled && env_nonempty("KOSHA_ADMIN_API_KEY"))
+        || env_nonempty("KOSHA_INTERNAL_API_KEY");
     if store.len() == 0 && !service_keys {
         eprintln!(
             "FATAL: no API keys configured (postgres kosha.api_keys empty or unreachable; \
@@ -569,36 +691,113 @@ pub const LEGACY_SUNSET: &str = "Tue, 01 Jun 2027 00:00:00 GMT";
 pub const LEGACY_DEPRECATION_LINK: &str =
     "https://github.com/decover-tech/kosha/blob/main/docs/api/versioning.md#legacy-routes";
 
-/// Requests counted since the last log line, and when that line was written.
-type UsageWindow = (u64, Option<Instant>);
+/// The unversioned Phase 1 routes, as `record_legacy_use` counts them.
+const LEGACY_ROUTES: [&str; 7] = [
+    "/index", "/exists", "/replace", "/search", "/flush", "/delete", "/stats",
+];
 
-/// Per-tenant legacy route usage, so the cutover to `/v1` can be tracked
-/// from logs. Logs the first use of each (tenant, route), then at most once
-/// a minute with the count since the last line, so hot search traffic
-/// doesn't flood the log.
-pub fn record_legacy_use(tenant: &str, route: &str) {
-    static USAGE: OnceLock<Mutex<HashMap<(String, String), UsageWindow>>> = OnceLock::new();
-    let mut usage = USAGE.get_or_init(Default::default).lock().unwrap();
-    let entry = usage
-        .entry((tenant.to_string(), route.to_string()))
-        .or_insert((0, None));
-    entry.0 += 1;
-    let due = entry
-        .1
-        .is_none_or(|t| t.elapsed() >= Duration::from_secs(60));
-    if due {
-        println!(
-            "legacy route usage: tenant={tenant} route={route} requests={} \
+/// How often the legacy-route usage line is written, at most.
+const LEGACY_LOG_INTERVAL_S: u64 = 3600;
+
+/// Legacy route usage counted since the last log line: one atomic counter
+/// per route and the time the next line is due, so the per-request cost is
+/// an atomic add and a clock read, with no lock and no allocation.
+struct LegacyUsage {
+    counts: [AtomicU64; LEGACY_ROUTES.len()],
+    /// Seconds since `started` at which the next line may be written.
+    next_log_s: AtomicU64,
+}
+
+impl LegacyUsage {
+    const fn new() -> Self {
+        Self {
+            counts: [const { AtomicU64::new(0) }; LEGACY_ROUTES.len()],
+            next_log_s: AtomicU64::new(0),
+        }
+    }
+
+    /// Count one use of `route` at `now_s`; the log line when one is due
+    /// (the first use, then at most once per `LEGACY_LOG_INTERVAL_S`).
+    fn record(&self, tenant: &str, route: &str, now_s: u64) -> Option<String> {
+        let i = LEGACY_ROUTES.iter().position(|r| *r == route)?;
+        self.counts[i].fetch_add(1, Ordering::Relaxed);
+        let due = self.next_log_s.load(Ordering::Relaxed);
+        if now_s < due
+            || self
+                .next_log_s
+                .compare_exchange(
+                    due,
+                    now_s + LEGACY_LOG_INTERVAL_S,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+        {
+            return None;
+        }
+        let counts: Vec<String> = LEGACY_ROUTES
+            .iter()
+            .zip(&self.counts)
+            .filter_map(|(route, count)| {
+                let n = count.swap(0, Ordering::Relaxed);
+                (n > 0).then(|| format!("{route}={n}"))
+            })
+            .collect();
+        Some(format!(
+            "legacy route usage since the last line: {} latest_tenant={tenant} \
              (unversioned routes are deprecated; migrate to /v1/namespaces/{{ns}}/...)",
-            entry.0
-        );
-        *entry = (0, Some(Instant::now()));
+            counts.join(" ")
+        ))
+    }
+}
+
+/// Legacy route usage, so the cutover to `/v1` can be tracked from logs:
+/// a line on the first use, then at most once an hour per pod with each
+/// route's count since the last line. Runs on every legacy request (the
+/// backend's searches among them), so it takes no lock and allocates only
+/// when it logs.
+pub fn record_legacy_use(tenant: &str, route: &str) {
+    static USAGE: LegacyUsage = LegacyUsage::new();
+    static STARTED: OnceLock<Instant> = OnceLock::new();
+    let now_s = STARTED.get_or_init(Instant::now).elapsed().as_secs();
+    if let Some(line) = USAGE.record(tenant, route, now_s) {
+        println!("{line}");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_usage_logs_first_use_then_at_most_hourly() {
+        let usage = LegacyUsage::new();
+        let first = usage
+            .record("acme", "/search", 0)
+            .expect("first use is logged");
+        assert!(first.contains("/search=1"), "{first}");
+        for s in 1..LEGACY_LOG_INTERVAL_S {
+            assert_eq!(usage.record("acme", "/search", s), None);
+        }
+        assert_eq!(usage.record("beta", "/index", 10), None);
+        let next = usage
+            .record("acme", "/search", LEGACY_LOG_INTERVAL_S)
+            .expect("logged again after the interval");
+        assert!(
+            next.contains(&format!("/search={LEGACY_LOG_INTERVAL_S}")),
+            "{next}"
+        );
+        assert!(next.contains("/index=1"), "{next}");
+        assert_eq!(
+            usage.record("acme", "/search", LEGACY_LOG_INTERVAL_S + 1),
+            None
+        );
+        assert_eq!(
+            usage.record("acme", "/v1/other", 1 << 40),
+            None,
+            "not a legacy route"
+        );
+    }
 
     #[test]
     fn env_keys_parse_tenants() {
@@ -730,6 +929,129 @@ mod tests {
         assert!(store.lookup_at("sk-new", 1_999).is_ok());
         assert_eq!(store.lookup_at("sk-old", 2_000), Err(Rejected::Expired));
         assert!(store.lookup_at("sk-new", 2_000).is_ok());
+    }
+
+    fn operator_record(key: &str, name: &str) -> ApiKeyRecord {
+        ApiKeyRecord {
+            scopes: Scopes::NONE,
+            ..record(key, &kosha_control::api_keys::operator_tenant_id(name))
+        }
+    }
+
+    #[test]
+    fn operator_credentials_identify_an_operator_and_are_never_tenant_keys() {
+        let store = KeyStore::with_keys(parse_env_keys(None, Some("boot")));
+        store.replace_db_keys(vec![
+            operator_record("sk-alice", "alice"),
+            record("sk-tenant", "acme"),
+        ]);
+        assert_eq!(store.lookup_operator("sk-alice").as_deref(), Ok("alice"));
+        // Not a tenant key, on any route.
+        assert_eq!(store.lookup("sk-alice"), Err(Rejected::Unknown));
+        // Tenant keys (full access included) and env keys are not operators.
+        assert_eq!(store.lookup_operator("sk-tenant"), Err(Rejected::Unknown));
+        assert_eq!(store.lookup_operator("boot"), Err(Rejected::Unknown));
+        assert_eq!(store.lookup_operator(""), Err(Rejected::Unknown));
+        assert_eq!(store.lookup_operator("sk-nobody"), Err(Rejected::Unknown));
+        // Neither the hash nor the row's tenant id is a credential.
+        assert_eq!(
+            store.lookup_operator(&hash_api_key("sk-alice")),
+            Err(Rejected::Unknown)
+        );
+        assert_eq!(
+            store.lookup_operator("_operator/alice"),
+            Err(Rejected::Unknown)
+        );
+        assert!(store.lookup("sk-tenant").is_ok());
+    }
+
+    #[test]
+    fn a_malformed_operator_row_is_neither_an_operator_nor_a_tenant() {
+        let store = KeyStore::with_keys(HashMap::new());
+        store.replace_db_keys(vec![
+            record("sk-empty", "_operator/"),
+            record("sk-nested", "_operator/a/b"),
+        ]);
+        for key in ["sk-empty", "sk-nested"] {
+            assert_eq!(store.lookup_operator(key), Err(Rejected::Unknown), "{key}");
+            assert_eq!(store.lookup(key), Err(Rejected::Unknown), "{key}");
+        }
+        assert_eq!(store.active_operator_credentials(0), 0);
+    }
+
+    #[test]
+    fn operator_credentials_expire_and_are_revoked_like_keys() {
+        let store = KeyStore::with_keys(HashMap::new());
+        store.replace_db_keys(vec![
+            ApiKeyRecord {
+                expires_at: Some(1_000),
+                ..operator_record("sk-temp", "alice")
+            },
+            operator_record("sk-bob", "bob"),
+        ]);
+        assert_eq!(
+            store.lookup_operator_at("sk-temp", 999).as_deref(),
+            Ok("alice")
+        );
+        assert_eq!(store.active_operator_credentials(999), 2);
+        assert_eq!(
+            store.lookup_operator_at("sk-temp", 1_000),
+            Err(Rejected::Expired)
+        );
+        assert_eq!(store.lookup_at("sk-temp", 1_000), Err(Rejected::Expired));
+        assert_eq!(store.active_operator_credentials(1_000), 1);
+
+        // Revoked on this pod at once ...
+        store.remove_db_key(&hash_api_key("sk-bob"));
+        assert_eq!(store.lookup_operator("sk-bob"), Err(Rejected::Unknown));
+        // ... and on the others by the refresh that no longer lists it.
+        store.upsert_db_key(operator_record("sk-carol", "carol"));
+        assert!(store.lookup_operator("sk-carol").is_ok());
+        store.replace_db_keys(Vec::new());
+        assert_eq!(store.lookup_operator("sk-carol"), Err(Rejected::Unknown));
+    }
+
+    #[test]
+    fn operator_credential_use_is_recorded_for_last_used_at() {
+        let store = KeyStore::with_keys(HashMap::new());
+        store.replace_db_keys(vec![operator_record("sk-alice", "alice")]);
+        store.lookup_operator_at("sk-alice", 700).unwrap();
+        // A refused tenant-route lookup of it records nothing.
+        store.lookup_at("sk-alice", 900).unwrap_err();
+        assert_eq!(
+            store.take_last_used(),
+            vec![(hash_api_key("sk-alice"), 700)]
+        );
+    }
+
+    #[test]
+    fn bootstrap_admin_key_is_on_by_default_and_fails_closed_on_a_bad_flag() {
+        // Unset or empty: exactly what every deployment had before.
+        for flag in [None, Some(""), Some("  "), Some("enabled"), Some("ON")] {
+            assert_eq!(parse_bootstrap_admin_key_flag(flag), Ok(true), "{flag:?}");
+            assert_eq!(
+                bootstrap_admin_key_from(Some("sk-admin"), flag).as_deref(),
+                Some("sk-admin"),
+                "{flag:?}"
+            );
+        }
+        for flag in ["disabled", "off", "false", "0", " Disabled "] {
+            assert_eq!(
+                parse_bootstrap_admin_key_flag(Some(flag)),
+                Ok(false),
+                "{flag}"
+            );
+            assert_eq!(bootstrap_admin_key_from(Some("sk-admin"), Some(flag)), None);
+        }
+        // A typo is an error, and accepts nothing.
+        for flag in ["disable", "no", "yes", "2"] {
+            let e = parse_bootstrap_admin_key_flag(Some(flag)).unwrap_err();
+            assert!(e.contains("KOSHA_ADMIN_BOOTSTRAP_KEY"), "{e}");
+            assert_eq!(bootstrap_admin_key_from(Some("sk-admin"), Some(flag)), None);
+        }
+        // No key configured is no credential, whatever the flag.
+        assert_eq!(bootstrap_admin_key_from(None, None), None);
+        assert_eq!(bootstrap_admin_key_from(Some(""), Some("enabled")), None);
     }
 
     #[test]
