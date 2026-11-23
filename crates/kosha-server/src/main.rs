@@ -3130,7 +3130,6 @@ impl AppState {
     /// Cache footers parsed during a search's hydration on the manifest(s)
     /// that list their segments. A merged sharded view's segment ids are
     /// `_shard-XXXX/{id}`: those footers belong to the shard namespace.
-    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
     fn remember_search_footers(
         &self,
         ns: &NamespaceId,
@@ -4202,6 +4201,82 @@ impl AppState {
         }
     }
 
+    /// The footer phase's fetch: `footer.json` for every `manifest`
+    /// segment the manifest carries no footer for. A local copy that does
+    /// not match the CRC the manifest records for a rewritten footer (bloom
+    /// rebuild) is the old one and is removed first, so it is fetched
+    /// again. Returns the files and bytes downloaded.
+    #[cfg(feature = "s3")]
+    fn fetch_missing_footers(
+        &self,
+        ns: &NamespaceId,
+        manifest: &kosha_core::Manifest,
+        request: &Arc<RequestHydration>,
+    ) -> (usize, u64) {
+        let mut missing = Vec::new();
+        for entry in &manifest.segments {
+            if manifest.segment_footer(&entry.segment_id).is_some() {
+                continue;
+            }
+            let seg_path = manifest.segment_dir(&self.data_dir, ns, &entry.segment_id);
+            if let Some(&expected) = manifest.footer_crc32.get(&entry.segment_id) {
+                let path = seg_path.join("footer.json");
+                if let Ok(bytes) = std::fs::read(&path) {
+                    if crc32fast::hash(&bytes) != expected {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+            missing.push(seg_path);
+        }
+        self.ensure_files_local(&missing, "footer.json", request)
+    }
+
+    /// Parse the local `footer.json` of every `manifest` segment the
+    /// manifest carries no footer for, and cache each on the in-memory
+    /// manifest(s): later queries (and later manifest versions, via
+    /// `restore_manifest`'s carry-over) skip both the fetch and the parse.
+    /// Returns the footers parsed. A file that is missing, unparsable, not
+    /// the CRC-recorded rewrite or of another segment is left out.
+    fn remember_local_footers(
+        &self,
+        ns: &NamespaceId,
+        manifest: &kosha_core::Manifest,
+    ) -> HashMap<kosha_core::SegmentId, Arc<kosha_core::Footer>> {
+        let footers: HashMap<kosha_core::SegmentId, Arc<kosha_core::Footer>> = manifest
+            .segments
+            .iter()
+            .filter(|entry| manifest.segment_footer(&entry.segment_id).is_none())
+            .filter_map(|entry| {
+                let seg_path = manifest.segment_dir(&self.data_dir, ns, &entry.segment_id);
+                let bytes = std::fs::read(seg_path.join("footer.json")).ok()?;
+                // Still not the recorded rewrite (e.g. S3 fetch failed and
+                // left nothing usable): don't cache or prune with it.
+                if manifest
+                    .footer_crc32
+                    .get(&entry.segment_id)
+                    .is_some_and(|&expected| crc32fast::hash(&bytes) != expected)
+                {
+                    return None;
+                }
+                let footer: kosha_core::Footer = serde_json::from_slice(&bytes).ok()?;
+                // A footer.json from a different segment id (a corrupt or
+                // misplaced file) must not be cached under this id. In a
+                // merged sharded view (#207) the entry id carries the
+                // shard's path component; the footer keeps the shard-local
+                // id it was written with.
+                let own_id = kosha_core::sharding::split_merged_segment_id(&entry.segment_id)
+                    .map_or_else(|| entry.segment_id.clone(), |(_, local)| local);
+                (footer.segment_id == entry.segment_id || footer.segment_id == own_id)
+                    .then(|| (entry.segment_id.clone(), Arc::new(footer)))
+            })
+            .collect();
+        if !footers.is_empty() {
+            self.remember_search_footers(ns, &footers);
+        }
+        footers
+    }
+
     /// Hydrate only the **scoring set** for segments that might match the
     /// query (footer filter + term bloom prune first), skipping the bulk
     /// `doc_store.bin` for Lazy segments. Returns the relative paths of
@@ -4248,77 +4323,11 @@ impl AppState {
             .map(|entry| manifest.segment_dir(&self.data_dir, ns, &entry.segment_id))
             .collect();
 
-        let missing_manifest_footer_paths: Vec<PathBuf> = manifest
-            .segments
-            .iter()
-            .filter(|entry| manifest.segment_footer(&entry.segment_id).is_none())
-            .map(|entry| manifest.segment_dir(&self.data_dir, ns, &entry.segment_id))
-            .collect();
-
-        // A footer rewritten after commit (bloom rebuild) is recorded by CRC
-        // in the manifest. A local copy that doesn't match is the old one:
-        // remove it so the hydration below fetches the current file.
-        for entry in &manifest.segments {
-            let Some(&expected) = manifest.footer_crc32.get(&entry.segment_id) else {
-                continue;
-            };
-            if manifest.segment_footer(&entry.segment_id).is_some() {
-                continue;
-            }
-            let path = manifest
-                .segment_dir(&self.data_dir, ns, &entry.segment_id)
-                .join("footer.json");
-            if let Ok(bytes) = std::fs::read(&path) {
-                if crc32fast::hash(&bytes) != expected {
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
-        }
-
-        // New manifests carry the search footer metadata inline, so cold
-        // search can skip the footer-first S3 phase entirely. Legacy
-        // manifests fall back to hydrating footer.json for pruning and
-        // format detection.
-        let (footer_files, footer_bytes) =
-            self.ensure_files_local(&missing_manifest_footer_paths, "footer.json", request);
-
-        // Persisted manifests no longer carry footers (#241), so the
-        // fallback above is now the normal path for segments this pod has
-        // not seen yet. Parse each such footer once and cache it on the
-        // in-memory manifest: later queries (and later manifest versions,
-        // via `restore_manifest`'s carry-over) skip both the S3 fetch and
-        // the local parse for it.
-        let fetched_footers: HashMap<kosha_core::SegmentId, Arc<kosha_core::Footer>> = manifest
-            .segments
-            .iter()
-            .filter(|entry| manifest.segment_footer(&entry.segment_id).is_none())
-            .filter_map(|entry| {
-                let seg_path = manifest.segment_dir(&self.data_dir, ns, &entry.segment_id);
-                let bytes = std::fs::read(seg_path.join("footer.json")).ok()?;
-                // Still not the recorded rewrite (e.g. S3 fetch failed and
-                // left nothing usable): don't cache or prune with it.
-                if manifest
-                    .footer_crc32
-                    .get(&entry.segment_id)
-                    .is_some_and(|&expected| crc32fast::hash(&bytes) != expected)
-                {
-                    return None;
-                }
-                let footer: kosha_core::Footer = serde_json::from_slice(&bytes).ok()?;
-                // A footer.json from a different segment id (a corrupt or
-                // misplaced file) must not be cached under this id. In a
-                // merged sharded view (#207) the entry id carries the
-                // shard's path component; the footer keeps the shard-local
-                // id it was written with.
-                let own_id = kosha_core::sharding::split_merged_segment_id(&entry.segment_id)
-                    .map_or_else(|| entry.segment_id.clone(), |(_, local)| local);
-                (footer.segment_id == entry.segment_id || footer.segment_id == own_id)
-                    .then(|| (entry.segment_id.clone(), Arc::new(footer)))
-            })
-            .collect();
-        if !fetched_footers.is_empty() {
-            self.remember_search_footers(ns, &fetched_footers);
-        }
+        // Persisted manifests no longer carry footers (#241): the footer
+        // phase fetches `footer.json` for segments this pod has not seen
+        // yet and caches each parsed footer on the in-memory manifest.
+        let (footer_files, footer_bytes) = self.fetch_missing_footers(ns, manifest, request);
+        let fetched_footers = self.remember_local_footers(ns, manifest);
 
         let segment_footer = |entry: &kosha_core::ManifestEntry| {
             manifest
@@ -20818,17 +20827,35 @@ mod tests {
     }
 
     impl warm_run::WarmStorage for MirrorStorage {
-        fn class_sizes(
-            &self,
-            ns: &NamespaceId,
-        ) -> Result<HashMap<(String, warm::FileClass), u64>, String> {
-            Ok(warm_run::local_class_sizes(&self.remote.join(&ns.0)))
+        fn list_objects(&self, ns: &NamespaceId) -> Result<Vec<(String, u64)>, String> {
+            Ok(warm_run::local_objects(&self.remote.join(&ns.0)))
+        }
+
+        fn fetch_footers(&self, ns: &NamespaceId, manifest: &kosha_core::Manifest) -> (u64, u64) {
+            let mut o = (0, 0);
+            for entry in &manifest.segments {
+                let seg = &entry.segment_id.0;
+                let to = self.local.join(&ns.0).join(seg);
+                if manifest.segment_footer(&entry.segment_id).is_some()
+                    || to.join("footer.json").exists()
+                {
+                    continue;
+                }
+                fs::create_dir_all(&to).unwrap();
+                o.1 += fs::copy(
+                    self.remote.join(&ns.0).join(seg).join("footer.json"),
+                    to.join("footer.json"),
+                )
+                .unwrap();
+                o.0 += 1;
+            }
+            o
         }
 
         fn warm_batch(
             &self,
             ns: &NamespaceId,
-            _manifest: &kosha_core::Manifest,
+            manifest: &kosha_core::Manifest,
             class: warm::FileClass,
             segments: &[String],
         ) -> warm_run::BatchOutcome {
@@ -20843,7 +20870,11 @@ mod tests {
                     // scaffolding so the segment opens.
                     let c = warm::FileClass::of_file(&name).unwrap_or(warm::FileClass::Scoring);
                     let dest = to.join(&name);
-                    if c != class || !f.path().is_file() || dest.exists() {
+                    if c != class
+                        || !f.path().is_file()
+                        || dest.exists()
+                        || !warm_run::warm_fetches(manifest, seg, &name)
+                    {
                         continue;
                     }
                     o.bytes += fs::copy(f.path(), &dest).unwrap();
@@ -20986,15 +21017,19 @@ mod tests {
                 .manifest(&ns)
                 .map(|m| m.version)
         );
-        // ...and every file of the merged segment is local.
+        // ...and every file of the merged segment that warm-up downloads
+        // is local; the filter files the unfiltered probe never fetches
+        // (`warm_run::warm_fetches`) are left to the first filtered search.
+        let installed = query.indexer.manifest_shared(&ns).unwrap();
         for f in fs::read_dir(ingest.data_dir.join(&ns.0).join(&merged[0]))
             .unwrap()
             .flatten()
         {
-            assert!(
-                merged_dir.join(f.file_name()).is_file(),
-                "{:?} not warmed",
-                f.file_name()
+            let name = f.file_name().to_string_lossy().into_owned();
+            assert_eq!(
+                merged_dir.join(&name).is_file(),
+                warm_run::warm_fetches(&installed, &merged[0], &name),
+                "{name}"
             );
         }
         // The idle namespace's new segment stays cold until queried.
@@ -21127,7 +21162,12 @@ mod tests {
         let shared = shared_store();
         let ingest = warm_ingest(&shared, &["big"]);
         let ns = seed_segments(&ingest, "big", 3);
-        let sizes = warm_run::local_class_sizes(&ingest.data_dir.join(&ns.0));
+        // The bytes warm-up downloads (`warm_run::warm_fetches`).
+        let stored = shared.inner.lock().unwrap().manifest(&ns).unwrap().clone();
+        let sizes = warm_run::warm_class_sizes(
+            warm_run::local_objects(&ingest.data_dir.join(&ns.0)),
+            &stored,
+        );
         let scoring: u64 = sizes
             .iter()
             .filter(|((_, c), _)| *c == warm::FileClass::Scoring)
@@ -21199,6 +21239,108 @@ mod tests {
         assert_eq!(rewarm.warmed_items, 0);
         assert!(rewarm.skipped_items > 0);
         assert_eq!(pod.warmup_status_json()["rewarms"][0]["warmed_items"], 0);
+    }
+
+    /// Finding 26: a boot pass plans its budget from the files it
+    /// downloads. A query pod's manifest arrives without footers (#241), so
+    /// the plan used to count every f32 `doc_vectors.bin` (never fetched,
+    /// #454) and every `filters.bin` (the unfiltered scaffolding probe never
+    /// fetches it) and skipped segments the budget had room for. Quantized
+    /// and legacy segments still need their sidecar whole: counted and
+    /// fetched.
+    #[test]
+    fn boot_plan_counts_only_the_files_warmup_fetches() {
+        use kosha_core::VectorQuantization::{F32, I8};
+        let shared = shared_store();
+        let ingest = warm_ingest(&shared, &["vec"]);
+        let ns = seed_segments(&ingest, "vec", 4);
+        let segments = stored_segments(&shared, &ns);
+        let remote = ingest.data_dir.join(&ns.0);
+        // Each published segment rewritten with a sidecar vector column:
+        // two f32, one i8 and one legacy (a footer listing no columns).
+        for (i, seg) in segments.iter().enumerate() {
+            let dir = remote.join(seg);
+            fs::remove_dir_all(&dir).unwrap();
+            let mut w =
+                kosha_segment::SegmentWriter::new(kosha_core::SegmentId(seg.clone()), dir.clone())
+                    .with_vector_store_mode(kosha_segment::VectorStoreMode::Sidecar)
+                    .with_vector_quantization(kosha_segment::VectorQuantizationConfig::all(
+                        if i == 2 { I8 } else { F32 },
+                    ));
+            for d in 0..64 {
+                w.add_document(
+                    DocumentId(format!("d{d}")),
+                    vec![
+                        Field::text("title", format!("segment {i} doc {d}")),
+                        Field::keyword("matter_id", format!("m{}", d % 4)),
+                        Field::vector("emb", (0..32).map(|k| (d * 32 + k) as f32).collect()),
+                    ],
+                );
+            }
+            w.finalize(Default::default()).unwrap();
+            if i == 3 {
+                let path = dir.join("footer.json");
+                let mut footer: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                footer["vector_fields"] = serde_json::Value::Null;
+                fs::write(&path, serde_json::to_vec(&footer).unwrap()).unwrap();
+            }
+        }
+        // A query pod reads the manifest from Postgres, which stores no
+        // footers (#241, `skip_serializing`): nor does this shared store.
+        shared
+            .inner
+            .lock()
+            .unwrap()
+            .manifest_mut(&ns)
+            .unwrap()
+            .segment_footers
+            .clear();
+        let objects = warm_run::local_objects(&remote);
+        let size = |seg: &str, file: &str| {
+            objects
+                .iter()
+                .find(|(rel, _)| *rel == format!("{seg}/{file}"))
+                .map(|(_, b)| *b)
+                .unwrap_or_else(|| panic!("{seg}/{file} not written"))
+        };
+        let listed: u64 = warm_run::group_class_sizes(objects.clone()).values().sum();
+        let not_fetched: u64 = size(&segments[0], kosha_segment::DOC_VECTORS_FILE)
+            + size(&segments[1], kosha_segment::DOC_VECTORS_FILE)
+            + segments
+                .iter()
+                .map(|s| size(s, kosha_core::FILTERS_BIN_FILE))
+                .sum::<u64>();
+        let fetched = listed - not_fetched;
+
+        // A budget that holds exactly the files warm-up downloads.
+        let mut pod = warm_query_replica(&shared);
+        pod.warmup_namespaces = vec![ns.0.clone()];
+        pod.warming = warm_run::Warming::new(
+            warm::WarmConfig {
+                budget_bytes: Some(fetched),
+                ..Default::default()
+            },
+            warm::AccessConfig::default(),
+        );
+        let storage = MirrorStorage::new(&ingest.data_dir, &pod.data_dir, &scratch_dir("wf"));
+        let report = pod.run_boot_warmup(&storage);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.skipped_items, 0, "{:?}", report.skipped);
+        assert_eq!(report.warmed_items, 4 * 4, "every class of every segment");
+        assert_eq!(report.warmed_bytes, fetched, "planned");
+        assert_eq!(report.fetched_bytes, fetched, "planned == fetched");
+        for (i, seg) in segments.iter().enumerate() {
+            let dir = pod.data_dir.join(&ns.0).join(seg);
+            assert!(dir.join(kosha_segment::DOC_STORE_FILE).is_file(), "{seg}");
+            assert_eq!(
+                dir.join(kosha_segment::DOC_VECTORS_FILE).is_file(),
+                i >= 2,
+                "{seg}: doc_vectors.bin only for the quantized and legacy segments"
+            );
+            assert!(!dir.join(kosha_core::FILTERS_BIN_FILE).exists(), "{seg}");
+        }
     }
 
     #[test]
