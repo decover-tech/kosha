@@ -3738,6 +3738,12 @@ pub struct SearchPhaseStats {
     /// page is missing their nearest neighbours, so the server answers 503
     /// instead of a partial 200. Empty for a non-kNN query.
     pub knn_failed_segments: Vec<kosha_core::SegmentId>,
+    /// Of `knn_failed_segments`, those whose loaded vector column has a
+    /// valid header but a corrupt body (no usable `vector.offsets`, and the
+    /// whole `vector.idx` does not parse). The flag is fixed when the
+    /// segment is opened, so the cached reader stays corrupt until the
+    /// server evicts it and its local vector index files (self-heal).
+    pub knn_corrupt_segments: Vec<kosha_core::SegmentId>,
 }
 
 /// Which BM25 collection statistics a search actually scored with.
@@ -6802,6 +6808,8 @@ impl Searcher {
         let mut knn_segment_degraded = false;
         // Degraded by an error, not by design: see `knn_failed_segment`.
         let mut knn_segment_failed = false;
+        // The failure is a corrupt vector index body, fixed at open.
+        let mut knn_segment_corrupt = false;
         // Hybrid only: this segment's vector hits, nearest first, kept out
         // of `seg_hits` so the two retrievers can be ranked separately.
         let mut knn_hits: Vec<(u32, f64)> = Vec::new();
@@ -6976,6 +6984,9 @@ impl Searcher {
                                 .fetch_add(exact.vectors_scored, Ordering::Relaxed);
                             exact.hits
                         }
+                        // A client error, not a lost segment: a 400, never
+                        // a retried 503.
+                        Some(Err(e @ KoshaError::InvalidQuery(_))) => return Err(e),
                         Some(Err(e)) => {
                             eprintln!(
                                 "WARN: exact knn failed for a v2 vector index in {}: {e} — treating as no vector hits for this segment",
@@ -7058,6 +7069,8 @@ impl Searcher {
                     open_stats.add_knn_scan(&scan);
                     match probe {
                         Some(Ok(results)) => results,
+                        // As above: a client error is a 400.
+                        Some(Err(e @ KoshaError::InvalidQuery(_))) => return Err(e),
                         Some(Err(e)) => {
                             eprintln!(
                                 "WARN: knn_search failed for a v2 vector index in {}: {e} — treating as no vector hits for this segment",
@@ -7107,6 +7120,7 @@ impl Searcher {
                         );
                         knn_segment_degraded = true;
                         knn_segment_failed = true;
+                        knn_segment_corrupt = true;
                     }
                     Vec::new()
                 }
@@ -7373,7 +7387,10 @@ impl Searcher {
             total_hits,
             hits_capped: false,
             knn_segment_degraded,
-            knn_failed_segment: knn_segment_failed.then(|| entry.segment_id.clone()),
+            knn_failed_segment: knn_segment_failed.then(|| KnnSegmentFailure {
+                segment: entry.segment_id.clone(),
+                corrupt_index: knn_segment_corrupt,
+            }),
         }))
     }
 
@@ -7900,9 +7917,14 @@ impl Searcher {
             if output.knn_segment_degraded {
                 knn_degraded_segments += 1;
             }
-            phase_stats
-                .knn_failed_segments
-                .extend(output.knn_failed_segment);
+            if let Some(failure) = output.knn_failed_segment {
+                if failure.corrupt_index {
+                    phase_stats
+                        .knn_corrupt_segments
+                        .push(failure.segment.clone());
+                }
+                phase_stats.knn_failed_segments.push(failure.segment);
+            }
             for (agg_name, result) in output.aggs {
                 all_aggs.entry(agg_name).or_default().merge(result);
             }
@@ -8879,7 +8901,15 @@ struct SegmentOutput {
     /// a corrupt `vector.idx` body). `None` for a segment skipped by design
     /// (another embedding model, #209), which stays a degraded 200. See
     /// `SearchPhaseStats::knn_failed_segments`.
-    knn_failed_segment: Option<kosha_core::SegmentId>,
+    knn_failed_segment: Option<KnnSegmentFailure>,
+}
+
+/// A segment whose kNN search failed (see `SegmentOutput::knn_failed_segment`).
+struct KnnSegmentFailure {
+    segment: kosha_core::SegmentId,
+    /// The failure is a corrupt `vector.idx` body (see
+    /// `SearchPhaseStats::knn_corrupt_segments`).
+    corrupt_index: bool,
 }
 
 /// What [`rrf_fuse`] hands back to `search_inner`.
@@ -15429,6 +15459,8 @@ mod tests {
         );
         // Lost to an error, so reported as failed: the server answers 503.
         assert_eq!(stats.knn_failed_segments, vec![SegmentId("s1".into())]);
+        // A corrupt body: the server may self-heal it by re-downloading.
+        assert_eq!(stats.knn_corrupt_segments, vec![SegmentId("s1".into())]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -15523,6 +15555,8 @@ mod tests {
         );
         // Lost to an error, so reported as failed: the server answers 503.
         assert_eq!(stats.knn_failed_segments, vec![SegmentId("s1".into())]);
+        // Not a corrupt index: nothing to re-download.
+        assert!(stats.knn_corrupt_segments.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

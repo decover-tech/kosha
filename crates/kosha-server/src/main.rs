@@ -375,6 +375,12 @@ struct AppState {
     /// low-thousands entries; per-query cost is a single `HashMap` lookup,
     /// vs. 17 syscalls on the legacy path.
     completed_hydrations: Mutex<HashMap<(String, u64), HydrationVerdict>>,
+    /// When each `(namespace, segment)` last had its corrupt vector index
+    /// evicted for re-download ([`AppState::heal_corrupt_vector_indexes`]).
+    /// Entries older than [`KNN_SELF_HEAL_INTERVAL`] are dropped on every
+    /// heal attempt, so it holds only the segments healed in that window.
+    #[cfg(feature = "s3")]
+    knn_self_heals: Mutex<HashMap<(String, String), Instant>>,
     /// Whole-response cache for POST /search — see [`ResultCache`].
     result_cache: Mutex<ResultCache>,
     /// Rerank providers (`SearchQuery.rerank`) and their metrics; see
@@ -2270,6 +2276,8 @@ impl AppState {
             deletion_purge: deletion_purge::PurgeState::default(),
             gc_lock: Mutex::new(()),
             completed_hydrations: Mutex::new(HashMap::new()),
+            #[cfg(feature = "s3")]
+            knn_self_heals: Mutex::new(HashMap::new()),
             result_cache: Mutex::new(result_cache),
             rerankers: rerank::RerankRegistry::from_env(),
             embedders: embedding::EmbedderRegistry::from_env(),
@@ -3312,6 +3320,78 @@ impl AppState {
             .lock()
             .unwrap()
             .remove(&(ns.0.clone(), manifest_version));
+    }
+
+    /// Self-heal for segments whose vector column loaded with a corrupt
+    /// body (`SearchPhaseStats::knn_corrupt_segments`). The searcher keeps
+    /// that verdict on its cached reader, and the local files are whole
+    /// (they land by rename), so re-checking presence finds nothing to
+    /// fetch: without this, every kNN touching the segment is a 503 until
+    /// the pod restarts. Forget the reader, then evict the segment's
+    /// fetched vector index files unless a search holds the segment
+    /// pinned (that search may be between hydrating and opening it); the
+    /// next search re-downloads them. At most once per segment per
+    /// [`KNN_SELF_HEAL_INTERVAL`]: when the object in S3 is itself corrupt
+    /// the 503 persists (its ERROR line names the segment) without a
+    /// download per request. Call with this request's own pins released.
+    #[cfg(feature = "s3")]
+    fn heal_corrupt_vector_indexes(
+        &self,
+        ns: &NamespaceId,
+        manifest: &kosha_core::Manifest,
+        segments: &[kosha_core::SegmentId],
+    ) {
+        if segments.is_empty() || self.s3_storage.is_none() {
+            return;
+        }
+        let rid = request_id();
+        for segment in segments {
+            let key = (ns.0.clone(), segment.0.clone());
+            {
+                let mut heals = self.knn_self_heals.lock().unwrap();
+                heals.retain(|_, at| at.elapsed() < KNN_SELF_HEAL_INTERVAL);
+                if heals.contains_key(&key) {
+                    eprintln!(
+                        "WARN: kNN self-heal: segment {} re-downloaded its vector index less \
+                         than {} s ago and is still corrupt (corrupt in S3?); not fetching \
+                         again yet{rid}",
+                        segment.0,
+                        KNN_SELF_HEAL_INTERVAL.as_secs()
+                    );
+                    continue;
+                }
+            }
+            let dir = manifest.segment_dir(&self.data_dir, ns, segment);
+            let Ok(dir_key) = dir.strip_prefix(&self.data_dir) else {
+                continue;
+            };
+            self.searcher.forget_segment(ns, segment);
+            match self.cache.evict_files_unless_pinned(
+                &dir_key.to_string_lossy(),
+                kosha_core::is_vector_index_file,
+            ) {
+                Ok(Some(bytes)) => {
+                    self.knn_self_heals
+                        .lock()
+                        .unwrap()
+                        .insert(key, Instant::now());
+                    eprintln!(
+                        "WARN: kNN self-heal: evicted the corrupt vector index of segment {} \
+                         ({bytes} bytes); the next search re-downloads it{rid}",
+                        segment.0
+                    );
+                }
+                Ok(None) => eprintln!(
+                    "WARN: kNN self-heal: segment {} is in use by another search; \
+                     its corrupt vector index stays until a later 503 retries{rid}",
+                    segment.0
+                ),
+                Err(e) => eprintln!(
+                    "ERROR: kNN self-heal: evicting the vector index of segment {} failed: {e}{rid}",
+                    segment.0
+                ),
+            }
+        }
     }
 
     /// Drop every per-namespace cache entry this node keeps for a deleted
@@ -9611,6 +9691,11 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
                 )
             }) {
                 log_timing(result.total_hits, result.knn_degraded_segments);
+                #[cfg(feature = "s3")]
+                {
+                    drop(segment_pins);
+                    state.heal_corrupt_vector_indexes(&ns, manifest, &phases.knn_corrupt_segments);
+                }
                 return response;
             }
             if let Some(ref provider) = reranker {
@@ -10242,6 +10327,11 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
                 result.knn_degraded_segments,
                 t_request.elapsed().as_secs_f64() * 1e3,
             );
+            #[cfg(feature = "s3")]
+            {
+                drop(segment_pins);
+                state.heal_corrupt_vector_indexes(&ns, manifest, &phases.knn_corrupt_segments);
+            }
             resp
         }
         Err(e) => {
@@ -12101,6 +12191,13 @@ fn knn_shed_response(degraded: u32, shed: Option<String>) -> Option<String> {
     Some(hydration_shed_response())
 }
 
+/// The least time between two re-downloads of one segment's corrupt vector
+/// index ([`AppState::heal_corrupt_vector_indexes`]). A local corruption
+/// heals on the first; a corrupt object in S3 costs one download of the
+/// column per segment per interval instead of one per request.
+#[cfg(feature = "s3")]
+const KNN_SELF_HEAL_INTERVAL: Duration = Duration::from_secs(600);
+
 /// A kNN answer that lost segments to an error is a 503 with `Retry-After`,
 /// never a 200: the page is missing those segments' nearest neighbours, and
 /// neither the backend nor the Python client reads `knn_degraded_segments`,
@@ -12111,7 +12208,9 @@ fn knn_shed_response(degraded: u32, shed: Option<String>) -> Option<String> {
 /// a segment skipped by design (another embedding model, #209) is not in it
 /// and stays a degraded 200. Checked after [`knn_shed_response`]: a shed
 /// request is a 429 whatever else went wrong. Not cached: only a 200 enters
-/// the result cache.
+/// the result cache. A corrupt vector index is not fixed by re-checking
+/// presence; the handler heals it after this, once its own pins are
+/// released ([`AppState::heal_corrupt_vector_indexes`]).
 fn knn_failed_response(
     state: &AppState,
     ns: &NamespaceId,
@@ -17539,6 +17638,134 @@ mod tests {
             serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..]).unwrap();
         assert_eq!(body["reason"], "knn_segments_unavailable", "{body}");
         assert_eq!(body["knn_failed_segments"], 2, "{body}");
+    }
+
+    /// A two-segment kNN node reading whole `vector.idx` files, with a
+    /// v2 index whose column can be corrupted.
+    #[cfg(feature = "s3")]
+    fn corrupt_vector_node(
+        ns: &str,
+    ) -> (
+        crate::doc_store_fallback_tests::FakeS3,
+        AppState,
+        kosha_core::Manifest,
+        Vec<PathBuf>,
+    ) {
+        let (s3, mut state, manifest, seg_paths) = single_flight_node(
+            ns,
+            |w| w.with_vector_store_mode(kosha_segment::VectorStoreMode::Sidecar),
+            |i| {
+                vec![
+                    Field::text("text", format!("contract clause {i}")),
+                    Field::vector("emb", vec![1.0, i as f32, 0.5, 0.0]),
+                ]
+            },
+        );
+        state.posting_read_mode = doc_spans::ReadMode::Whole;
+        (s3, state, manifest, seg_paths)
+    }
+
+    /// A kNN search of `ns` on `state`, not served from the result cache.
+    #[cfg(feature = "s3")]
+    fn corrupt_vector_search(state: &AppState, ns: &str) -> (u16, serde_json::Value) {
+        let body = serde_json::json!({
+            "namespace": ns,
+            "query_text": "",
+            "no_cache": true,
+            "max_results": 3,
+            "knn": {"field": "emb", "vector": [1.0, 0.0, 0.5, 0.0], "k": 3, "num_candidates": 100},
+        });
+        let resp = handle_search_post(body.to_string().as_bytes(), state);
+        let json: serde_json::Value =
+            serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..]).unwrap_or_default();
+        (status_of(&resp), json)
+    }
+
+    /// Give a segment's vector column a valid header over a corrupt body
+    /// and an unusable `vector.offsets`, the shape
+    /// `SegmentReader::vector_index_degraded` reports (no sidecar to fall
+    /// back on, and the whole file does not parse).
+    #[cfg(feature = "s3")]
+    fn corrupt_vector_column(dir: &Path) {
+        let idx = dir.join("vector.idx");
+        let mut bytes = fs::read(&idx).unwrap();
+        bytes.truncate(bytes.len() - 3);
+        fs::write(&idx, &bytes).unwrap();
+        fs::write(dir.join("vector.offsets"), b"not an offsets sidecar").unwrap();
+    }
+
+    /// A corrupt vector index on the pod's disk heals itself: the first
+    /// search is a 503 (its reader is cached corrupt), it evicts the
+    /// reader and the local vector index files, and the retry downloads
+    /// them again and answers in full.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn a_corrupt_local_vector_index_is_a_503_then_heals_on_the_retry() {
+        const NS: &str = "vector-heal";
+        let (_s3, state, manifest, seg_paths) = corrupt_vector_node(NS);
+        let search = |state: &AppState| corrupt_vector_search(state, NS);
+        let (status, full) = search(&state);
+        assert_eq!(status, 200, "{full}");
+        let want = full["results"].clone();
+        assert!(!want.as_array().unwrap().is_empty(), "{full}");
+        // Corrupt on disk, under a fresh reader.
+        for (dir, entry) in seg_paths.iter().zip(&manifest.segments) {
+            corrupt_vector_column(dir);
+            state
+                .searcher
+                .forget_segment(&NamespaceId(NS.into()), &entry.segment_id);
+        }
+        let (status, body) = search(&state);
+        assert_eq!(status, 503, "{body}");
+        assert_eq!(body["reason"], "knn_segments_unavailable", "{body}");
+        for dir in &seg_paths {
+            assert!(!dir.join("vector.idx").exists(), "evicted for re-download");
+            assert!(
+                dir.join("inverted.idx").exists(),
+                "only the vector index goes"
+            );
+        }
+        let (status, body) = search(&state);
+        assert_eq!(status, 200, "the retry re-downloads and heals: {body}");
+        assert_eq!(body["knn_degraded_segments"], 0, "{body}");
+        assert_eq!(body["results"], want, "{body}");
+    }
+
+    /// When the object in S3 is itself corrupt, every search stays a 503,
+    /// but the column is re-downloaded at most once per
+    /// `KNN_SELF_HEAL_INTERVAL`, not once per request.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn a_corrupt_vector_index_in_s3_stays_a_503_without_a_download_per_request() {
+        const NS: &str = "vector-corrupt-s3";
+        let (s3, state, manifest, _) = corrupt_vector_node(NS);
+        let search = |state: &AppState| corrupt_vector_search(state, NS);
+        for entry in &manifest.segments {
+            corrupt_vector_column(&s3.root.join(NS).join(&entry.segment_id.0));
+        }
+        let vector_gets = || {
+            s3.gets
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|k| k.ends_with("vector.idx"))
+                .count()
+        };
+        let (status, body) = search(&state);
+        assert_eq!(status, 503, "{body}");
+        let first = vector_gets();
+        assert!(first > 0, "the cold search fetched the column");
+        // One re-download after the first heal...
+        let (status, body) = search(&state);
+        assert_eq!(status, 503, "still corrupt in S3: {body}");
+        let second = vector_gets();
+        assert!(second > first, "healed once: {first} -> {second}");
+        // ...and none after: the heal is rate-limited.
+        for _ in 0..3 {
+            let (status, body) = search(&state);
+            assert_eq!(status, 503, "{body}");
+        }
+        assert_eq!(vector_gets(), second, "no download per request");
     }
 
     /// The 503's contract: nothing for a search with no failed segment
