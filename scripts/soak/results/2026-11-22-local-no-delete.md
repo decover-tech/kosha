@@ -12,9 +12,9 @@ documents.
   --compact-every 0 --visible-every 2 --delete-frac 0
   --run-id local-20261122-nodelete`. The driver neither flushes nor compacts,
   and sends no deletes. Inserts are 70% of write requests and re-upserts 30%.
-- **Commit:** `78cd18c` (branch `roadmap/phase-i--352`). That branch changes no
-  file under `crates/` since `e174058`, so the server is the same code as the
-  first run. `cargo build --release -p kosha-server --no-default-features`.
+- **Commit:** `e174058` server code (main, the PR #426 merge). The run was
+  built from a #352 docs branch that changed no file under `crates/` since
+  `e174058`, so the server is the same code as the first run. `cargo build --release -p kosha-server --no-default-features`.
 - **Date:** 2026-11-22.
 - **Setup:** one standalone server (no S3, local WAL, in-memory control
   plane) on an Apple M5 laptop, with the driver on the same machine. Every

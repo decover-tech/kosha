@@ -15,7 +15,7 @@ both:
 2. **Measurements.** Each row of a table with a ``Result file`` column must
    cite a committed results file that exists. Every run id (11 digits) and
    date (YYYY-MM-DD) in the row must appear in that file. The commit in the
-   row must exist in git history (skipped, with a note, in a shallow clone).
+   row must be reachable from HEAD (skipped, with a note, in a shallow clone).
 
 3. **No unchecked restatements.** Cells in the columns named in
    ``POINTER_COLUMNS`` (refusal and at-a-glance columns) may not state a
@@ -289,8 +289,14 @@ def shallow_clone(root: Path) -> bool:
 
 
 def commit_exists(root: Path, sha: str) -> bool:
+    """True when ``sha`` is a commit reachable from HEAD.
+
+    Object existence alone is not enough: a commit from a rebased or deleted
+    local branch still exists in the object store but is absent from any
+    clone CI makes.
+    """
     return subprocess.run(
-        ["git", "cat-file", "-e", f"{sha}^{{commit}}"],
+        ["git", "merge-base", "--is-ancestor", sha, "HEAD"],
         cwd=root, capture_output=True,
     ).returncode == 0
 

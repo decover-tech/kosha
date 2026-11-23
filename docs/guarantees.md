@@ -122,7 +122,7 @@ published sooner.
 
 | Measurement | p50 | p99 | Result file |
 | --- | --- | --- | --- |
-| Write-to-visible, `eventual` read, idle and size flush only (no deletes), one standalone pod on a developer laptop, 3 min, 70 samples, 2026-11-22, commit `78cd18c` | 0.46 s | 4.642 s | `scripts/soak/results/2026-11-22-local-no-delete.md` |
+| Write-to-visible, `eventual` read, idle and size flush only (no deletes), one standalone pod on a developer laptop, 3 min, 70 samples, 2026-11-22, commit `e174058` | 0.46 s | 4.642 s | `scripts/soak/results/2026-11-22-local-no-delete.md` |
 | Write-to-visible, `eventual` read, mixed workload with 20% delete-by-query (deletes also flush), same setup, 60 samples, 2026-11-22, commit `e174058` | 0.027 s | 3.659 s | `scripts/soak/results/2026-11-22-local.md` |
 
 Use the first row for the idle-flush path. In the second row, deletes
