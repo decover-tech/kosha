@@ -1923,7 +1923,9 @@ async fn stream_body_to_file(
 /// `path`, already charged to `request`. On an expired wait the charge is
 /// refunded, the request shed, and the first expiry per request logged
 /// with the budget's state; the error reads "`what` `path` waited out the
-/// in-flight byte budget". `None` budget: nothing to reserve.
+/// in-flight byte budget". A request shed while this fetch waited gets
+/// its permit back and the fetch skipped. `None` budget: nothing to
+/// reserve.
 async fn reserve_budget(
     budget: Option<&Arc<HydrationBudget>>,
     request: &RequestHydration,
@@ -1941,6 +1943,16 @@ async fn reserve_budget(
     let waited = t_wait.elapsed();
     request.record_wait(waited);
     match permit {
+        // Shed while it waited (another of its fetches expired or crossed
+        // the ceiling): the response will be a 429, so streaming this
+        // object would only take budget other requests are waiting on.
+        Ok(permit) if request.is_shed() => {
+            drop(permit);
+            request.refund(bytes);
+            Err(KoshaError::Overloaded(format!(
+                "{what} {path} skipped: request shed while waiting for in-flight budget"
+            )))
+        }
         Ok(permit) => Ok(Some(permit)),
         Err(expired) => {
             request.refund(bytes);
@@ -2301,6 +2313,46 @@ pub(crate) fn sum_segment_sizes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fetch admitted to the in-flight budget after its request was shed
+    /// (by another of its fetches) is skipped: its permit is handed back at
+    /// once for requests still being served, and its charge refunded.
+    #[test]
+    fn a_fetch_admitted_after_its_request_was_shed_is_skipped() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let budget = Arc::new(HydrationBudget::with_tenant_cap(
+            100,
+            100,
+            std::time::Duration::from_secs(5),
+        ));
+        let request = Arc::new(RequestHydration::new(1_000));
+        rt.block_on(async {
+            let holder = budget.acquire("acme", 100).await.unwrap();
+            assert!(request.charge(60));
+            let waiting = tokio::spawn({
+                let (budget, request) = (Arc::clone(&budget), Arc::clone(&request));
+                async move {
+                    reserve_budget(Some(&budget), &request, "hydration of", "acme/seg/x", 60)
+                        .await
+                        .map(|p| p.is_some())
+                }
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            // Another fetch of the same request sheds it, then budget frees.
+            request.mark_shed();
+            drop(holder);
+            let result = waiting.await.unwrap();
+            assert!(
+                matches!(result, Err(KoshaError::Overloaded(_))),
+                "a shed request's fetch must not stream: {result:?}"
+            );
+        });
+        assert_eq!(budget.in_flight(), 0, "the permit is handed back");
+        assert_eq!(request.fetched_bytes(), 0, "the charge is refunded");
+    }
 
     #[test]
     fn sum_segment_sizes_groups_by_segment_and_filters_files() {
