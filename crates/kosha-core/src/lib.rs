@@ -1873,6 +1873,18 @@ fn atomic_write(path: &std::path::Path, data: &[u8]) -> Result<(), KoshaError> {
     Ok(())
 }
 
+/// [`std::fs::create_dir_all`] whose error names the directory. A bare
+/// `io::Error` says only "Permission denied", and a write after an ignored
+/// failure reports NotFound on a file instead of the real cause.
+pub fn create_dir_named(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir).map_err(|e| dir_error(dir, e))
+}
+
+/// `e`, a failure to create `dir`, with `dir` in its message.
+pub fn dir_error(dir: &std::path::Path, e: std::io::Error) -> std::io::Error {
+    std::io::Error::new(e.kind(), format!("cannot create {}: {e}", dir.display()))
+}
+
 impl StorageBackend for LocalStorage {
     fn read(&self, path: &str) -> Result<Vec<u8>, KoshaError> {
         Ok(std::fs::read(self.root.join(path))?)
@@ -1880,7 +1892,7 @@ impl StorageBackend for LocalStorage {
     fn write(&self, path: &str, data: &[u8]) -> Result<(), KoshaError> {
         let full = self.root.join(path);
         if let Some(dir) = full.parent() {
-            std::fs::create_dir_all(dir)?;
+            create_dir_named(dir)?;
         }
         atomic_write(&full, data)
     }
@@ -4943,16 +4955,6 @@ mod tests {
         assert!(!segment_may_match(&must, Some(&blooms)));
     }
 
-    /// Regression test for the staging incident this generalizes PR #45's
-    /// fix for: `SegmentWriter::finalize()` (and every other caller of
-    /// `StorageBackend::write`, e.g. WAL, the S3-hydration local cache
-    /// mirror) rewrites files through `LocalStorage::write`. A reader
-    /// racing a rewrite of the same path must never observe a
-    /// truncated/torn file — before `atomic_write`, plain `fs::write`
-    /// (truncate then fill) could hand back anywhere from 0 bytes up to a
-    /// partial mix, which is exactly how staging ended up with 0-byte
-    /// `doc_store.bin`/`footer.json` in already-published, already-synced
-    /// segments.
     /// A key under a directory that does not exist yet (`_warmset/query.json`
     /// on a fresh query pod) is written, not refused with NotFound.
     #[test]
@@ -4965,6 +4967,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Regression test for the staging incident this generalizes PR #45's
+    /// fix for: `SegmentWriter::finalize()` (and every other caller of
+    /// `StorageBackend::write`, e.g. WAL, the S3-hydration local cache
+    /// mirror) rewrites files through `LocalStorage::write`. A reader
+    /// racing a rewrite of the same path must never observe a
+    /// truncated/torn file — before `atomic_write`, plain `fs::write`
+    /// (truncate then fill) could hand back anywhere from 0 bytes up to a
+    /// partial mix, which is exactly how staging ended up with 0-byte
+    /// `doc_store.bin`/`footer.json` in already-published, already-synced
+    /// segments.
     #[test]
     fn concurrent_local_storage_write_never_yields_truncated_read() {
         let dir = std::env::temp_dir().join("kosha-core-test-atomic-write-race");

@@ -210,13 +210,8 @@ impl WarmStorage for AppState {
                 .write(&path, &bytes)
                 .map_err(|e| format!("writing {path}: {e}"));
         }
-        let full = self.data_dir.join(&path);
-        if let Some(parent) = full.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        let tmp = full.with_extension("json.tmp");
-        std::fs::write(&tmp, &bytes)
-            .and_then(|_| std::fs::rename(&tmp, &full))
+        LocalStorage::new(self.data_dir.clone())
+            .write(&path, &bytes)
             .map_err(|e| format!("writing {path}: {e}"))
     }
 }
