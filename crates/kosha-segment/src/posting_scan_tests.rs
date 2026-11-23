@@ -1073,7 +1073,7 @@ fn segment_ranking_selects_what_the_full_sort_did() {
                     "len {len}, cutoff {max_distance}, cap {max_probes}"
                 );
                 // The full ranking a refill continues from starts with it.
-                let all = KnnSegmentRanking::rank_all(ranking.bounds());
+                let all = KnnSegmentRanking::rank_all(ranking.bounds().unwrap());
                 let prefix: Vec<u32> = all[..ranking.budgeted().len()]
                     .iter()
                     .map(|&(i, _)| i)
@@ -1133,6 +1133,22 @@ fn planned_probe_matches_the_segment_ranking_its_own_postings() {
         for max_distance in plan_cutoffs(&bounds) {
             for max_probes in [0usize, 1, 3, postings, usize::MAX] {
                 let ranking = KnnSegmentRanking::new(bounds.clone(), max_distance, max_probes);
+                // The ranking two-stage planning hands over: only the
+                // postings that could be inside the budget carry a score
+                // (here: those under the cutoff and every third other).
+                let candidates: Vec<(u32, f32)> = bounds
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, &d)| d <= max_distance || i % 3 == 0)
+                    .map(|(i, &d)| (i as u32, d))
+                    .collect();
+                let partial = KnnSegmentRanking::from_candidates(
+                    postings,
+                    &candidates,
+                    max_distance,
+                    max_probes,
+                );
+                assert_eq!(partial.budgeted(), ranking.budgeted());
                 for (name, accept) in accepts {
                     for refill in [KnnRefill::Always, KnnRefill::BudgetedSegments] {
                         for k in [0usize, 1, 10, DOCS * 2] {
@@ -1178,6 +1194,21 @@ fn planned_probe_matches_the_segment_ranking_its_own_postings() {
                                 "planned vs unplanned: {context}"
                             );
                             assert_eq!(planned.1, expect.1, "postings probed: {context}");
+                            // A ranking without the scores of the postings
+                            // outside the budget: a refill scores the
+                            // segment itself and probes the same postings.
+                            let from_partial = fixture
+                                .reader
+                                .knn_search_planned_fetching(
+                                    FIELD, query, k, &partial, accept, refill, None,
+                                )
+                                .unwrap()
+                                .unwrap();
+                            assert_eq!(
+                                (bits(&from_partial.0), from_partial.1),
+                                (bits(&planned.0), planned.1),
+                                "candidates-only ranking: {context}"
+                            );
                             // Above a tie at the cut the reference (a
                             // stable sort of everything) and the running
                             // top-k agree; compare scores, which are
@@ -1202,6 +1233,12 @@ fn planned_probe_matches_the_segment_ranking_its_own_postings() {
                                 ranking: &ranking,
                                 refill,
                             });
+                            let with_partial = candidates(KnnProbeBudget::Planned {
+                                ranking: &partial,
+                                refill,
+                            });
+                            assert_eq!(with_partial.candidates, with_plan.candidates, "{context}");
+                            assert_eq!(with_partial.postings, with_plan.postings, "{context}");
                             let without = candidates(KnnProbeBudget::Within {
                                 max_distance,
                                 max_probes,
