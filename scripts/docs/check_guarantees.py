@@ -28,6 +28,16 @@ both:
    in ``crates/kosha-server/src/api_error.rs``, and must say "not retryable"
    exactly when ``ErrorCode::retryable`` is false for it.
 
+5. **No unchecked constants in prose.** A paragraph outside a table that
+   cites a ``crates/`` file may not name a constant (a backticked
+   ``SCREAMING_CASE`` identifier other than a ``KOSHA_*`` variable) that no
+   ``CHECKS`` entry reads: the value belongs in a checked table row.
+
+6. **Derived prose figures.** The idle-flush trigger the prose quotes
+   ("about 1.25 s after its oldest pending write (1000 ms plus one 250 ms
+   check)", "the 1.25 s idle-flush trigger") must equal the idle flush plus
+   one idle flush check, as the code computes them.
+
 It also fails on ``TBD``/``TODO`` on the page, if README.md does not link
 to the page, or if #350's error model has landed (``ERRORS_PROTO`` exists)
 while a table still has a pre-#350 status column (``PRE_350_COLUMNS``).
@@ -138,6 +148,10 @@ CHECKS: list[Check] = [
           _const("MAX_MAX_EXPANSIONS"), "count"),
     Check("Fuzzy edit distance", "crates/kosha-core/src/fuzzy.rs",
           _const("MAX_FUZZY_EDITS"), "count"),
+    Check("New namespace or branch name", "crates/kosha-core/src/tenancy.rs",
+          _const("MAX_NAMESPACE_NAME_BYTES"), "bytes"),
+    Check("New API key's tenant id", "crates/kosha-core/src/tenancy.rs",
+          _const("MAX_TENANT_ID_BYTES"), "bytes"),
     # Defaults that bound a response.
     Check("`max_results` (top-k) default", "crates/kosha-core/src/lib.rs",
           r"fn default_max_results\(\) -> usize \{\s*(\d+)\s*\}", "count"),
@@ -337,6 +351,67 @@ def check_refusal(label: str, column_name: str, cell: str, codes: dict[str, tupl
 # ─── checks ─────────────────────────────────────────────────────────────────
 
 
+def prose_paragraphs(text: str) -> list[str]:
+    """Blank-line separated blocks of the page, table lines dropped."""
+    out = []
+    for block in re.split(r"\n\s*\n", text):
+        lines = [l for l in block.splitlines() if not l.lstrip().startswith("|")]
+        if lines:
+            out.append("\n".join(lines))
+    return out
+
+
+def check_prose_constants(text: str) -> list[str]:
+    """A prose paragraph citing code may only name constants CHECKS reads."""
+    checked = " ".join(c.pattern for c in CHECKS)
+    errors = []
+    for para in prose_paragraphs(text):
+        if "crates/" not in para:
+            continue
+        for name in re.findall(r"`([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)`", para):
+            if name.startswith("KOSHA_") or re.search(rf"\b{name}\b", checked):
+                continue
+            errors.append(
+                f"{PAGE}: prose cites the code constant `{name}`, which no CHECKS entry reads: "
+                "put its value in a checked table row"
+            )
+    return errors
+
+
+IDLE_TRIGGER = re.compile(r"(\d+(?:\.\d+)?) s(?: after its oldest pending write|\s+idle-flush trigger)")
+IDLE_PARTS = re.compile(r"\((\d+) ms plus one (\d+) ms check\)")
+
+
+def check_idle_flush_prose(root: Path, text: str) -> list[str]:
+    """The quoted idle-flush trigger is the idle flush plus one check."""
+    by_label = {c.label: c for c in CHECKS}
+    try:
+        values = {}
+        for label in ("Idle flush", "Idle flush check"):
+            check = by_label[label]
+            values[label] = code_value(check, (root / check.file).read_text())[1]
+    except (KeyError, OSError, ValueError) as e:
+        return [f"cannot compute the idle-flush trigger: {e}"]
+    idle, tick = values["Idle flush"], values["Idle flush check"]
+    errors = []
+    flat = " ".join(text.split())
+    triggers = IDLE_TRIGGER.findall(flat)
+    if not triggers:
+        errors.append(f"{PAGE}: the idle-flush trigger figure is gone; update check_idle_flush_prose")
+    for t in triggers:
+        if round(float(t) * 1000) != idle + tick:
+            errors.append(
+                f"{PAGE}: the idle-flush trigger is stated as {t} s, but the idle flush "
+                f"({idle} ms) plus one check ({tick} ms) is {(idle + tick) / 1000:g} s"
+            )
+    for a, b in IDLE_PARTS.findall(flat):
+        if (int(a), int(b)) != (idle, tick):
+            errors.append(
+                f"{PAGE}: '({a} ms plus one {b} ms check)' should be ({idle} ms plus one {tick} ms check)"
+            )
+    return errors
+
+
 def shallow_clone(root: Path) -> bool:
     try:
         out = subprocess.run(
@@ -446,6 +521,9 @@ def check_page(root: Path, text: str, readme: str, verify_commits: bool | None =
             if res_col is not None and res_col < len(row):
                 measured_rows += 1
                 errors.extend(check_measurement(root, label, row, row[res_col], verify_commits))
+
+    errors.extend(check_prose_constants(text))
+    errors.extend(check_idle_flush_prose(root, text))
 
     for label in by_label:
         if label not in seen:
@@ -569,6 +647,28 @@ def self_test() -> None:
     )
     assert code_value(tick, tick_src.format("1000")) == ("ms", 250)
     assert code_value(tick, tick_src.format("100")) == ("ms", 50)
+
+    # The name limits are checked rows.
+    for old, new in [
+        ("| New namespace or branch name | 120 bytes", "| New namespace or branch name | 100 bytes"),
+        ("| New API key's tenant id | 80 bytes", "| New API key's tenant id | 64 bytes"),
+    ]:
+        broken = text.replace(old, new, 1)
+        assert broken != text, f"self-test anchor missing: {old}"
+        errs = check_page(ROOT, broken, readme, verify_commits=False)
+        assert any("tenancy.rs" in e for e in errs), (old, errs)
+    # A prose paragraph citing an unchecked constant fails.
+    errs = check_prose_constants("See `crates/x.rs` (`MAX_UNCHECKED_THING`).\n")
+    assert errs and "MAX_UNCHECKED_THING" in errs[0], errs
+    assert check_prose_constants("See `crates/x.rs` (`MAX_SHARDS`, `KOSHA_FOO`).\n") == []
+    assert check_prose_constants("| `crates/x.rs` | `MAX_UNCHECKED_THING` |\n") == []
+    # The derived idle-flush trigger follows the code.
+    for old, new in [("1.25 s after", "1.5 s after"), ("1.25 s idle-flush", "2 s idle-flush"),
+                     ("1000 ms plus one 250 ms", "1000 ms plus one 500 ms")]:
+        broken = text.replace(old, new, 1)
+        assert broken != text, f"self-test anchor missing: {old}"
+        errs = check_page(ROOT, broken, readme, verify_commits=False)
+        assert any("idle-flush trigger" in e or "ms check" in e for e in errs), (old, errs)
 
     # Once #350's errors.proto exists, the pre-#350 status column fails.
     with tempfile.TemporaryDirectory() as tmp:

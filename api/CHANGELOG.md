@@ -19,8 +19,10 @@ enforces it on the public document.
   `ErrorResponse.code` values it can return, for typed SDK errors.
 - Shared `408 request_timeout`, `501 not_implemented` and
   `502 upstream_error` responses; the admin document also gains `408`,
-  `413` and `501`. `408` and `502` declare `Retry-After`, and so does the
-  public `409` (sent with `write_conflict`).
+  `413` and `501`. `408` and `502` declare `Retry-After`, and so does
+  `409` in both documents (sent with `write_conflict`; on the admin
+  document, an import that loses a manifest race). The admin `404` also
+  names `namespace_not_found` (the namespace maintenance routes).
 - `details.reason: "unindexed_backlog"` on the write-backpressure 429.
 - `GET /v1/healthz` and the errors sent before a request reaches its
   handler (413 body cap, 408 body timeout, 503 capacity) carry
@@ -55,9 +57,16 @@ enforces it on the public document.
 - A `/v1/namespaces/{namespace}/...` request body that is not a JSON
   object is `400 invalid_argument` (a JSON array was passed through, and
   could name a namespace other than the path's).
-- Namespace and branch names are at most 120 bytes, and a new API key's
-  tenant id at most 80 bytes (`400 invalid_argument`). A longer name was
-  accepted and its writes then failed to flush ("File name too long").
+- A new namespace or branch name is at most 120 bytes, and a new API
+  key's tenant id at most 80 bytes (`400 invalid_argument` when it is
+  created: explicitly, as a branch, or by a first write). A longer name
+  was accepted, and with a long tenant id its writes then failed to flush
+  ("File name too long"). A namespace created before the limit with a
+  longer name stays reachable: it can still be searched, written and
+  deleted.
+- A `/` in the query string no longer moves where the server reads the
+  namespace from a `/v1/namespaces/{namespace}...` path, so it cannot
+  carry a reserved name (`_shard-NNNN`) or `..` past validation.
 
 ## [0.10.0]
 

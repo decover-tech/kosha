@@ -90,33 +90,41 @@ INT64 = (
 )
 
 
-# The file-level error responses: (status, description, sends Retry-After).
+RETRY_AFTER_DOC = "Seconds to wait before retrying."
+
+# The file-level error responses: (status, description, the Retry-After
+# header's description, or None when the status never sends one).
 ADMIN_RESPONSES = (
-        ("400", "invalid_argument", False),
-        ("401", "unauthenticated", False),
-        ("403", "permission_denied", False),
-        ("404", "not_found", False),
-        ("405", "method_not_allowed", False),
+        ("400", "invalid_argument", None),
+        ("401", "unauthenticated", None),
+        ("403", "permission_denied", None),
+        ("404", "not_found, namespace_not_found", None),
+        ("405", "method_not_allowed", None),
         (
             "408",
             "request_timeout: the request body did not arrive in time; "
             "retry after `Retry-After` seconds",
-            True,
+            RETRY_AFTER_DOC,
         ),
-        ("409", "already_exists, conflict", False),
-        ("413", "payload_too_large", False),
-        ("500", "internal", False),
+        (
+            "409",
+            "already_exists, conflict, write_conflict; write_conflict is "
+            "retryable after `Retry-After` seconds",
+            "Seconds to wait before retrying; sent with write_conflict only.",
+        ),
+        ("413", "payload_too_large", None),
+        ("500", "internal", None),
         (
             "501",
             "not_implemented: this server was built or configured without the "
             "feature (an embedding provider, s3, postgres); not retryable",
-            False,
+            None,
         ),
-        ("503", "unavailable; retry after `Retry-After` seconds", True),
+        ("503", "unavailable; retry after `Retry-After` seconds", RETRY_AFTER_DOC),
 )
 
 
-def _retry_response(status, doc):
+def _retry_response(status, doc, header_doc):
     return (
         "      responses: {\n"
         '        key: "%s"\n'
@@ -127,12 +135,12 @@ def _retry_response(status, doc):
         '            key: "Retry-After"\n'
         "            value: {\n"
         '              type: "integer"\n'
-        '              description: "Seconds to wait before retrying."\n'
+        '              description: "%s"\n'
         "            }\n"
         "          }\n"
         "        }\n"
         "      }\n"
-    ) % (status, doc)
+    ) % (status, doc, header_doc)
 
 
 def _accepted_response(doc):
@@ -149,7 +157,9 @@ def _accepted_response(doc):
 
 # The per-operation copies of the responses that carry Retry-After.
 RETRY_RESPONSES = "".join(
-    _retry_response(status, doc) for status, doc, retry in ADMIN_RESPONSES if retry
+    _retry_response(status, doc, header_doc)
+    for status, doc, header_doc in ADMIN_RESPONSES
+    if header_doc
 )
 
 
@@ -192,7 +202,7 @@ def swagger_option():
     lines.append("  }")
     for key in ("BearerAuth", "ApiKeyAuth"):
         lines += ["  security: {", '    security_requirement: {key: "%s"}' % key, "  }"]
-    for status, doc, retry in ADMIN_RESPONSES:
+    for status, doc, header_doc in ADMIN_RESPONSES:
         lines += [
             "  responses: {",
             '    key: "%s"' % status,
@@ -200,13 +210,13 @@ def swagger_option():
             '      description: "%s"' % doc,
             '      schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}',
         ]
-        if retry:
+        if header_doc:
             lines += [
                 "      headers: {",
                 '        key: "Retry-After"',
                 "        value: {",
                 '          type: "integer"',
-                '          description: "Seconds to wait before retrying."',
+                '          description: "%s"' % header_doc,
                 "        }",
                 "      }",
             ]
@@ -217,13 +227,16 @@ def swagger_option():
 
 # The codes an admin operation can return (`x-kosha-error-codes`, for typed
 # SDK errors). The admin API is beta, so one superset serves every
-# operation; the public spec lists codes per operation.
+# operation; the public spec lists codes per operation. namespace_not_found
+# comes from the namespace maintenance routes (compact, rebuild blooms,
+# backfill, gc), write_conflict from an import that loses a manifest race.
 ADMIN_ERROR_CODES = (
     "already_exists",
     "conflict",
     "internal",
     "invalid_argument",
     "method_not_allowed",
+    "namespace_not_found",
     "not_found",
     "not_implemented",
     "payload_too_large",
@@ -231,6 +244,7 @@ ADMIN_ERROR_CODES = (
     "request_timeout",
     "unauthenticated",
     "unavailable",
+    "write_conflict",
 )
 ADMIN_ERROR_CODES_TEXT = ", ".join('{string_value: "%s"}' % c for c in ADMIN_ERROR_CODES)
 

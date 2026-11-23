@@ -184,18 +184,20 @@ These apply to every request, whatever the tenant's plan.
 | `rank_by` window | 10,000 | 400 | `crates/kosha-core/src/rank.rs` (`MAX_RANK_BY_WINDOW`), no override |
 | Fuzzy `max_expansions` | 1024 | 400 | `crates/kosha-core/src/fuzzy.rs` (`MAX_MAX_EXPANSIONS`), no override |
 | Fuzzy edit distance | 2 | 400 | `crates/kosha-core/src/fuzzy.rs` (`MAX_FUZZY_EDITS`), no override |
+| New namespace or branch name | 120 bytes of UTF-8 | 400 `invalid_argument`, not retryable, when the namespace or branch is created (explicitly or by a first write). An existing longer name stays reachable | `crates/kosha-core/src/tenancy.rs` (`MAX_NAMESPACE_NAME_BYTES`), no override |
+| New API key's tenant id | 80 bytes of UTF-8 | 400 `invalid_argument`, not retryable, when the key is registered. Existing keys are not re-checked | `crates/kosha-core/src/tenancy.rs` (`MAX_TENANT_ID_BYTES`), no override |
 
 Aggregations nest one level deep: a bucket aggregation may hold metric
 sub-aggregations only. `terms` and `composite` sizes are not capped.
 
 Namespace and branch names are one path component: not empty, not `.` or
 `..`, with no `/`, `\` or control characters, and not of the form
-`_shard-NNNN`. They are at most 120 bytes of UTF-8 (a longer name is a
-400 `invalid_argument`): a namespace is a directory, its segment directory
+`_shard-NNNN`. A new name's length is capped (the "New namespace or
+branch name" row above): a namespace is a directory, its segment directory
 names embed the tenant and the namespace, and filesystems cap a path
-component at 255 bytes. A new API key's tenant id is at most 80 bytes for
-the same reason (`crates/kosha-core/src/tenancy.rs`,
-`MAX_NAMESPACE_NAME_BYTES` and `MAX_TENANT_ID_BYTES`, no override).
+component at 255 bytes. A new API key's tenant id is capped for the same
+reason (the "New API key's tenant id" row). A namespace created before the
+cap with a longer name can still be searched, written and deleted.
 
 ### Defaults that bound a response
 

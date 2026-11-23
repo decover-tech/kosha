@@ -169,7 +169,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -207,7 +207,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -267,13 +275,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       },
@@ -340,7 +350,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -378,7 +388,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -438,13 +456,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -513,7 +533,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -551,7 +571,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -611,13 +639,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -686,7 +716,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -724,7 +754,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -784,13 +822,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -847,7 +887,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -885,7 +925,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -945,13 +993,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -1020,7 +1070,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -1058,7 +1108,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -1118,13 +1176,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -1181,7 +1241,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -1219,7 +1279,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -1279,13 +1347,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       },
@@ -1352,7 +1422,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -1390,7 +1460,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -1450,13 +1528,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -1525,7 +1605,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -1563,7 +1643,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -1623,13 +1711,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -1696,7 +1786,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -1734,7 +1824,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -1794,13 +1892,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -1869,7 +1969,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -1907,7 +2007,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -1967,13 +2075,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -2030,7 +2140,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -2068,7 +2178,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -2128,13 +2246,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -2213,7 +2333,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -2251,7 +2371,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -2311,13 +2439,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -2384,7 +2514,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -2422,7 +2552,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -2482,13 +2620,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -2545,7 +2685,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -2583,7 +2723,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -2643,13 +2791,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -2733,7 +2883,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -2771,7 +2921,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -2831,13 +2989,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -2906,7 +3066,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -2944,7 +3104,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -3004,13 +3172,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -3077,7 +3247,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -3115,7 +3285,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -3175,13 +3353,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -3250,7 +3430,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -3288,7 +3468,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -3348,13 +3536,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -3423,7 +3613,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -3461,7 +3651,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -3521,13 +3719,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -3606,7 +3806,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -3644,7 +3844,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -3704,13 +3912,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -3785,7 +3995,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -3823,7 +4033,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -3883,13 +4101,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -3982,7 +4202,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -4020,7 +4240,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -4080,13 +4308,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -4161,7 +4391,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -4199,7 +4429,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -4259,13 +4497,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       },
@@ -4350,7 +4590,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -4388,7 +4628,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -4448,13 +4696,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -4537,7 +4787,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -4575,7 +4825,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -4635,13 +4893,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -4736,7 +4996,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -4774,7 +5034,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -4834,13 +5102,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -4915,7 +5185,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -4953,7 +5223,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -5013,13 +5291,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       },
@@ -5104,7 +5384,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -5142,7 +5422,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -5202,13 +5490,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -5283,7 +5573,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -5321,7 +5611,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -5381,13 +5679,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       },
@@ -5472,7 +5772,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -5510,7 +5810,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -5570,13 +5878,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -5671,7 +5981,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -5709,7 +6019,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -5769,13 +6087,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -5844,7 +6164,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -5882,7 +6202,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -5942,13 +6270,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -6037,7 +6367,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -6075,7 +6405,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -6135,13 +6473,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -6226,7 +6566,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -6264,7 +6604,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -6324,13 +6672,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -6409,7 +6759,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -6447,7 +6797,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -6507,13 +6865,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -6588,7 +6948,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -6626,7 +6986,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -6686,13 +7054,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -6749,7 +7119,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -6787,7 +7157,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -6847,13 +7225,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }
@@ -6910,7 +7290,7 @@
                 }
               }
             },
-            "description": "not_found"
+            "description": "not_found, namespace_not_found"
           },
           "405": {
             "content": {
@@ -6948,7 +7328,15 @@
                 }
               }
             },
-            "description": "already_exists, conflict"
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "413": {
             "content": {
@@ -7008,13 +7396,15 @@
           "internal",
           "invalid_argument",
           "method_not_allowed",
+          "namespace_not_found",
           "not_found",
           "not_implemented",
           "payload_too_large",
           "permission_denied",
           "request_timeout",
           "unauthenticated",
-          "unavailable"
+          "unavailable",
+          "write_conflict"
         ],
         "x-stability-level": "beta"
       }

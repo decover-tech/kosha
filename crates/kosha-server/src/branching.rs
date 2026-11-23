@@ -480,7 +480,7 @@ pub(crate) fn handle_branch_create(
             )
         }
     };
-    if !valid_namespace_component(&request.name) {
+    if !crate::valid_new_namespace_name(&request.name) {
         return api_error(ErrorCode::InvalidArgument, "invalid branch name");
     }
     if request.name == namespace {

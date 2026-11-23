@@ -6660,17 +6660,36 @@ fn valid_name_component(name: &str) -> bool {
 
 use kosha_core::tenancy::{MAX_NAMESPACE_NAME_BYTES, MAX_TENANT_ID_BYTES};
 
-/// A namespace or branch name a tenant supplies: a valid component of at
-/// most [`MAX_NAMESPACE_NAME_BYTES`] that is not a shard component
-/// (`_shard-NNNN`). Stored as `<tenant>/_shard-0001` it would be read as a
-/// shard of the bare namespace `<tenant>` (and accounted to `_legacy`) —
-/// see [`kosha_core::tenancy::is_reserved_name`]. Other names starting with
+/// A namespace or branch name a tenant addresses: a valid component that
+/// is not a shard component (`_shard-NNNN`). Stored as
+/// `<tenant>/_shard-0001` it would be read as a shard of the bare namespace
+/// `<tenant>` (and accounted to `_legacy`) — see
+/// [`kosha_core::tenancy::is_reserved_name`]. Other names starting with
 /// `_` or `.` stay valid, so namespaces created before #342 remain
-/// reachable.
+/// reachable. No length limit: that applies only to a name being created
+/// ([`valid_new_namespace_name`]), so a longer namespace created before the
+/// limit stays reachable and deletable.
 fn valid_namespace_component(name: &str) -> bool {
-    valid_name_component(name)
-        && name.len() <= MAX_NAMESPACE_NAME_BYTES
-        && !kosha_core::tenancy::is_reserved_name(name)
+    valid_name_component(name) && !kosha_core::tenancy::is_reserved_name(name)
+}
+
+/// A namespace or branch name being created (explicitly, as a branch, or
+/// by a first write): [`valid_namespace_component`] and at most
+/// [`MAX_NAMESPACE_NAME_BYTES`], so its segment directory names fit the
+/// filesystem.
+fn valid_new_namespace_name(name: &str) -> bool {
+    valid_namespace_component(name) && name.len() <= MAX_NAMESPACE_NAME_BYTES
+}
+
+/// A namespace name a tenant request may address: [`valid_namespace_component`],
+/// and either within [`MAX_NAMESPACE_NAME_BYTES`] or already existing.
+/// A request naming a new over-long namespace would auto-create it (a
+/// first write), so it is refused like an explicit creation would be;
+/// an existing one, created before the limit, is grandfathered.
+fn addressable_namespace(state: &AppState, tenant: &str, name: &str) -> bool {
+    valid_namespace_component(name)
+        && (name.len() <= MAX_NAMESPACE_NAME_BYTES
+            || !namespace_is_new(state, &NamespaceId(tenant_namespace(tenant, name))))
 }
 
 /// A tenant id that may own namespaces: ids starting with `_` or `.` are
@@ -6765,11 +6784,15 @@ fn route_checked(
         if let Some(rest) = path.strip_prefix("/v1/namespaces/") {
             // `/v1/namespaces/{ns}/{action}`, or the bare
             // `/v1/namespaces/{ns}` that `DELETE` addresses.
+            // The query string goes first: a '/' in it must not move the
+            // split (`DELETE /v1/namespaces/_shard-0001?x=/` would
+            // otherwise validate `_shard-0001?x=` and delete the shard).
+            let rest = rest.split('?').next().unwrap_or(rest);
             let ns = match rest.rsplit_once('/') {
                 Some((ns, _action)) => ns,
-                None => rest.split('?').next().unwrap_or(rest),
+                None => rest,
             };
-            if !valid_namespace_component(&path_decode(ns)) {
+            if !addressable_namespace(state, tenant, &path_decode(ns)) {
                 return api_error(ErrorCode::InvalidArgument, "invalid namespace");
             }
         }
@@ -6802,7 +6825,7 @@ fn route_checked(
             let Some(ns) = value.get("namespace").and_then(|v| v.as_str()) else {
                 return api_error(ErrorCode::InvalidArgument, "missing namespace");
             };
-            if !valid_namespace_component(ns) {
+            if !addressable_namespace(state, tenant, ns) {
                 return api_error(
                     ErrorCode::InvalidArgument,
                     "invalid namespace; use an unqualified namespace name",
@@ -6829,7 +6852,7 @@ fn route_checked(
                         return api_error(ErrorCode::InvalidArgument, "duplicate namespace");
                     }
                     let ns = url_decode(raw);
-                    if !valid_namespace_component(&ns) {
+                    if !addressable_namespace(state, tenant, &ns) {
                         return api_error(ErrorCode::InvalidArgument, "invalid namespace");
                     }
                     // The original escaped component is preserved; tenant names
@@ -7308,7 +7331,7 @@ fn handle_create_namespace(body: &[u8], tenant: &str, state: &AppState) -> Strin
     let Some(name) = request.get("namespace").and_then(|v| v.as_str()) else {
         return api_error(ErrorCode::InvalidArgument, "missing 'namespace'");
     };
-    if !valid_namespace_component(name) {
+    if !valid_new_namespace_name(name) {
         return api_error(
             ErrorCode::InvalidArgument,
             "invalid namespace; use an unqualified namespace name",
@@ -11922,6 +11945,123 @@ mod tests {
         );
     }
 
+    /// The namespace name limit applies to a namespace being created, not to
+    /// one created before the limit existed: that stays readable, writable
+    /// and deletable. A new over-long name is refused however it would be
+    /// created (explicitly, as a branch, or by a first write).
+    #[test]
+    fn namespace_name_limit_applies_only_to_new_namespaces() {
+        let state = test_state();
+        let long = "a".repeat(MAX_NAMESPACE_NAME_BYTES + 30);
+        let ns = NamespaceId(tenant_namespace("acme", &long));
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                vec![Document {
+                    id: DocumentId("d1".into()),
+                    fields: vec![Field::text("title", "quick fox")],
+                }],
+            )
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        let ok = |resp: String| {
+            assert_eq!(status_of(&resp), 200, "{resp}");
+            body_of(&resp)
+        };
+        let found = ok(v1(
+            &state,
+            "acme",
+            &format!("POST /v1/namespaces/{long}/search"),
+            serde_json::json!({"query_text": "quick"}),
+        ));
+        assert_eq!(found["total_hits"], 1);
+        ok(v1(
+            &state,
+            "acme",
+            &format!("POST /v1/namespaces/{long}/documents"),
+            one_doc("d2", "slow dog"),
+        ));
+        ok(v1(
+            &state,
+            "acme",
+            &format!("GET /v1/namespaces/{long}/stats"),
+            serde_json::Value::Null,
+        ));
+        ok(v1(
+            &state,
+            "acme",
+            &format!("DELETE /v1/namespaces/{long}"),
+            serde_json::Value::Null,
+        ));
+
+        let new_long = "b".repeat(MAX_NAMESPACE_NAME_BYTES + 1);
+        let refused = |resp: String| assert_eq!(status_of(&resp), 400, "{resp}");
+        refused(v1(
+            &state,
+            "acme",
+            &format!("POST /v1/namespaces/{new_long}/documents"),
+            one_doc("d1", "quick fox"),
+        ));
+        refused(v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces",
+            serde_json::json!({"namespace": new_long}),
+        ));
+        ok(v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/parent/documents",
+            one_doc("d1", "quick fox"),
+        ));
+        ok(v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/parent/flush",
+            serde_json::json!({}),
+        ));
+        refused(v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/parent/branch",
+            serde_json::json!({"name": new_long}),
+        ));
+        assert!(namespace_is_new(
+            &state,
+            &NamespaceId(tenant_namespace("acme", &new_long))
+        ));
+    }
+
+    /// A '/' in the query string must not move the namespace split: the
+    /// reserved shard name and `..` stay refused on the bare `DELETE`.
+    #[test]
+    fn query_string_cannot_bypass_namespace_validation() {
+        let state = test_state();
+        let shard = NamespaceId("acme/_shard-0001".into());
+        state
+            .indexer
+            .index_documents(
+                shard.clone(),
+                vec![Document {
+                    id: DocumentId("d".into()),
+                    fields: vec![Field::text("title", "hello")],
+                }],
+            )
+            .unwrap();
+        state.indexer.flush_namespace(&shard).unwrap();
+        for line in [
+            "DELETE /v1/namespaces/_shard-0001",
+            "DELETE /v1/namespaces/_shard-0001?x=/",
+            "DELETE /v1/namespaces/..?a=/",
+            "GET /v1/namespaces/_shard-0001/stats?x=/",
+        ] {
+            let resp = v1(&state, "acme", line, serde_json::Value::Null);
+            assert_eq!(status_of(&resp), 400, "{line}: {resp}");
+        }
+        assert!(state.indexer.manifest(&shard).is_some());
+    }
+
     /// #342 review: a namespace with a leading `_` (written before the
     /// shard-name reservation, which covers only `_shard-NNNN`) stays
     /// writable, searchable and deletable, and a tenant id with a leading
@@ -11974,15 +12114,20 @@ mod tests {
         assert!(valid_name_component("_ops"));
         assert!(valid_namespace_component("_staging"));
         assert!(!valid_namespace_component("_shard-0001"));
-        assert!(valid_namespace_component(
+        assert!(valid_new_namespace_name(
             &"a".repeat(MAX_NAMESPACE_NAME_BYTES)
         ));
-        assert!(!valid_namespace_component(
+        assert!(!valid_new_namespace_name(
             &"a".repeat(MAX_NAMESPACE_NAME_BYTES + 1)
         ));
         // Bytes, not chars: 'é' is two bytes in UTF-8.
-        assert!(!valid_namespace_component(
+        assert!(!valid_new_namespace_name(
             &"é".repeat(MAX_NAMESPACE_NAME_BYTES / 2 + 1)
+        ));
+        assert!(!valid_new_namespace_name("_shard-0001"));
+        // Addressing an existing name has no length limit.
+        assert!(valid_namespace_component(
+            &"a".repeat(MAX_NAMESPACE_NAME_BYTES + 1)
         ));
         assert!(valid_new_key_tenant_id(&"t".repeat(MAX_TENANT_ID_BYTES)));
         assert!(!valid_new_key_tenant_id(
