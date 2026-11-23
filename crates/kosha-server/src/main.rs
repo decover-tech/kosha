@@ -3711,7 +3711,7 @@ impl AppState {
 
     /// The `doc store promote start:` line: which segment, which files and
     /// how large (one LIST of the segment, a promotion's only extra
-    /// request), what triggered it and how many more are queued. Rare (a
+    /// request, skipped when every file is already local), what triggered it and how many more are queued. Rare (a
     /// few per pod per hour), and the only place a multi-GB background
     /// download shows up before it finishes.
     #[cfg(feature = "s3")]
@@ -3728,10 +3728,15 @@ impl AppState {
             .strip_prefix(&self.data_dir)
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let sizes = s3.list_remote_with_sizes(&rel).unwrap_or_else(|e| {
-            eprintln!("WARN: doc store promote: listing {rel} for file sizes failed: {e}");
+        // Nothing left to fetch (already whole): no LIST.
+        let sizes = if wanted.is_empty() {
             Vec::new()
-        });
+        } else {
+            s3.list_remote_with_sizes(&rel).unwrap_or_else(|e| {
+                eprintln!("WARN: doc store promote: listing {rel} for file sizes failed: {e}");
+                Vec::new()
+            })
+        };
         let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
         let mut total = 0u64;
         let files: Vec<String> = wanted

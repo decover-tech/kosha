@@ -1865,6 +1865,14 @@ impl PartSource for S3PartSource {
                         .await
                         .map_err(|e| KoshaError::NotFound(format!("S3 get_object: {e}")))?
                 }
+                // The object no longer has the first part's ETag: it was
+                // replaced mid-download. Retrying cannot fix that.
+                Err(e) if e.raw_response().map(|r| r.status().as_u16()) == Some(412) => {
+                    return Err(KoshaError::CorruptSegment(format!(
+                        "S3 object {key} changed during a download in parts \
+                         (If-Match failed): {e}"
+                    )))
+                }
                 Err(e) => return Err(KoshaError::NotFound(format!("S3 get_object: {e}"))),
             };
             let len = resp.content_length().unwrap_or(0).max(0) as u64;
@@ -1906,7 +1914,7 @@ fn content_range_total(header: &str) -> Option<u64> {
 /// exactly one GET. The whole size is charged to `request` up front, so a
 /// request ceiling still sheds before a byte is streamed. Later parts are
 /// conditional on the first part's ETag, so an object replaced mid-download
-/// fails the fetch instead of splicing two versions.
+/// fails the fetch at once (no retry) instead of splicing two versions.
 ///
 /// A request fetch reserves its first part once the response reveals its
 /// size (as whole fetches always did); every later part, and every part of
@@ -2128,7 +2136,11 @@ impl Part {
             .await;
             match result {
                 Ok(streamed) => return Ok(streamed),
-                Err(e @ KoshaError::Overloaded(_)) => return Err(e),
+                // A shed, or an object replaced mid-download: retrying
+                // cannot help.
+                Err(e @ (KoshaError::Overloaded(_) | KoshaError::CorruptSegment(_))) => {
+                    return Err(e)
+                }
                 Err(e) => match backoffs.next() {
                     Some(delay) => {
                         eprintln!(
@@ -2699,6 +2711,8 @@ mod tests {
         fail_once: std::sync::Mutex<Vec<u64>>,
         /// Parts starting here always fail.
         fail_always: Option<u64>,
+        /// Later parts find the object replaced (If-Match fails).
+        replaced: bool,
     }
 
     impl MemSource {
@@ -2710,6 +2724,7 @@ mod tests {
                 gets: Default::default(),
                 fail_once: Default::default(),
                 fail_always: None,
+                replaced: false,
             };
             tweak(&mut source);
             Arc::new(source)
@@ -2736,6 +2751,9 @@ mod tests {
                 };
                 if fail {
                     return Err(KoshaError::NotFound(format!("injected failure at {start}")));
+                }
+                if this.replaced && start > 0 {
+                    return Err(KoshaError::CorruptSegment("If-Match failed".into()));
                 }
                 let total = this.data.len() as u64;
                 let (s, e) = if this.ignore_range {
@@ -2857,6 +2875,29 @@ mod tests {
             files_in(&dir)
         );
         assert_eq!(request.fetched_bytes(), 0, "charge refunded");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An object replaced mid-download (If-Match fails on a later part)
+    /// fails the fetch on that part's first attempt — no retries — and
+    /// leaves nothing behind.
+    #[test]
+    fn an_object_replaced_mid_download_fails_without_retrying() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = scratch_dir("replaced");
+        let dest = dir.join("f.bin");
+        let source = MemSource::with(25, |s| s.replaced = true);
+        let request = Arc::new(RequestHydration::new(u64::MAX));
+        let result = download(&rt, &source, &dest, 10, &request);
+        assert!(
+            matches!(result, Err(KoshaError::CorruptSegment(_))),
+            "{:?}",
+            result.err()
+        );
+        assert_eq!(source.gets(), 3, "one GET per part, none retried");
+        assert!(!dest.exists());
+        assert!(files_in(&dir).is_empty(), "{:?}", files_in(&dir));
+        assert_eq!(request.fetched_bytes(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

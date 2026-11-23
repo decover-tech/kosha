@@ -76,6 +76,11 @@ pub const DEFAULT_TENANT_FRACTION: f64 = 0.5;
 /// (512 MiB) plus the largest single part a request fetch reserves.
 pub const BACKGROUND_FRACTION: f64 = 0.25;
 
+/// A background wait this long is logged once (it never expires): request
+/// fetches have kept the budget, or a tenant-capped request waiter has
+/// kept promotions paused, for a minute.
+pub const BACKGROUND_WAIT_WARN: Duration = Duration::from_secs(60);
+
 /// `KOSHA_HYDRATE_TENANT_MAX_INFLIGHT_BYTES`, else
 /// [`DEFAULT_TENANT_FRACTION`] of `capacity`.
 pub fn tenant_cap_from_env(capacity: u64) -> u64 {
@@ -317,10 +322,13 @@ impl HydrationBudget {
     /// the budget) times out and is shed.
     ///
     /// A `background` fetch (promotion) yields to request fetches: it is
-    /// admitted only while no request fetch waits, holds at most
+    /// admitted only while no request fetch waits — including one held
+    /// back by its own tenant cap rather than by the global budget, which
+    /// therefore also pauses promotions until it is served or expires — holds at most
     /// [`BACKGROUND_FRACTION`] of the budget across all background fetches
     /// (one is admitted alone past that share, like the global rule), and
-    /// is not part of any tenant's accounting. It never expires: nothing is
+    /// is not part of any tenant's accounting. It never expires (a wait over
+    /// [`BACKGROUND_WAIT_WARN`] is logged once): nothing is
     /// waiting on it but its own promotion, and callers reserve before
     /// sending the GET, so no S3 response is held open while it waits.
     pub async fn acquire_for(
@@ -330,7 +338,10 @@ impl HydrationBudget {
         bytes: u64,
         background: bool,
     ) -> Result<BudgetPermit, BudgetExpired> {
-        let deadline = (!background).then(|| tokio::time::Instant::now() + self.wait_timeout);
+        let started = tokio::time::Instant::now();
+        let deadline = (!background).then(|| started + self.wait_timeout);
+        // Background only: when to log that this wait is still going.
+        let mut warn_at = background.then(|| started + BACKGROUND_WAIT_WARN);
         let mut registration = Registration {
             budget: self,
             tenant,
@@ -417,14 +428,44 @@ impl HydrationBudget {
                 }
                 freed.as_mut().enable();
             }
-            match deadline {
+            match (deadline, warn_at) {
                 // Timing out just re-runs the check once more, then expires.
-                Some(deadline) => {
+                (Some(deadline), _) => {
                     let _ = tokio::time::timeout_at(deadline, freed).await;
                 }
-                None => freed.await,
+                (None, Some(at)) => {
+                    if tokio::time::timeout_at(at, freed).await.is_err() {
+                        warn_at = None;
+                        self.warn_background_wait(key, bytes, started.elapsed());
+                    }
+                }
+                (None, None) => freed.await,
             }
         }
+    }
+
+    /// Log, once per wait, a background fetch still waiting after
+    /// [`BACKGROUND_WAIT_WARN`], with what is holding the budget.
+    fn warn_background_wait(&self, key: &str, bytes: u64, waited: Duration) {
+        let st = self.state.lock().unwrap();
+        let (oldest, largest) = st.notable_holders();
+        let holder =
+            |h: &Option<Box<HolderSnapshot>>| h.as_ref().map_or("-".into(), |h| h.to_string());
+        let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "WARN: promotion budget wait: key={key} want_mb={:.1} waited_ms={} \
+             in_flight_mb={:.1}/{:.1} promotion_mb={:.1}/{:.1} request_waiters={} \
+             oldest_holder={} largest_holder={} (still waiting; promotions yield to request fetches)",
+            mb(bytes),
+            waited.as_millis(),
+            mb(st.in_flight),
+            mb(self.capacity),
+            mb(st.background_in_flight),
+            mb(self.background_capacity),
+            st.waiting.values().map(Vec::len).sum::<usize>(),
+            holder(&oldest),
+            holder(&largest),
+        );
     }
 
     /// Whether `bytes` for `tenant` may be admitted now. See
@@ -1215,6 +1256,33 @@ mod tests {
                 .expect("the request fetch is served first");
             bg.await.unwrap().expect("then the background fetch");
             assert_eq!(budget.in_flight(), 0);
+        });
+    }
+
+    /// A background wait never expires: past [`BACKGROUND_WAIT_WARN`] it is
+    /// logged once and keeps waiting, and is admitted when budget frees.
+    #[test]
+    fn a_background_wait_outlives_the_warning_and_is_admitted() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let budget = Arc::new(HydrationBudget::with_tenant_cap(
+            100,
+            100,
+            Duration::from_secs(30),
+        ));
+        rt.block_on(async {
+            let held = budget.acquire("acme", 100).await.unwrap();
+            let bg = tokio::spawn({
+                let budget = Arc::clone(&budget);
+                async move { budget.acquire_for("acme", "p", 10, true).await.map(|_| ()) }
+            });
+            tokio::time::sleep(BACKGROUND_WAIT_WARN + Duration::from_secs(30)).await;
+            assert!(!bg.is_finished(), "still waiting, not expired");
+            drop(held);
+            bg.await.unwrap().expect("admitted once budget frees");
         });
     }
 
