@@ -26,7 +26,8 @@
 //! Callers are identified by an [`Actor`]: the operator (the holder of the
 //! server's admin credential acting for itself) or a user id the admin
 //! credential's holder vouches for. Nothing here authenticates a user; that
-//! is the job of the sign-up/login layer that will sit in front of it.
+//! is [`crate::identity`]'s job (sign-up, passwords, sessions, SSO), after
+//! which the console acts as [`Actor::User`].
 
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
