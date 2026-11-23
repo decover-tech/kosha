@@ -328,6 +328,14 @@ fn main() {
     // samples: read / decode / dot ms (across scoring threads), postings
     // served from the decoded cache, postings scanned.
     let mut scan = (0.0f64, 0.0f64, 0.0f64, 0usize, 0usize);
+    // Of the same samples (#436): `knn_plan` wall ms, the scoring pass's
+    // wall ms, the ms segments spent ranking their own centroids (summed
+    // over threads), and centroids the plan scored.
+    let mut phases = (0.0f64, 0.0f64, 0.0f64, 0usize);
+    // FNV-1a over every warm kNN sample's hits (document id and score
+    // bits, in order): two builds that return the same top-k for the same
+    // knobs print the same digest.
+    let mut digest: u64 = 0xcbf29ce484222325;
     for (label, key, query) in shapes {
         let variants: Vec<SearchQuery> = (0..distinct as u64)
             .map(|n| {
@@ -353,6 +361,20 @@ fn main() {
                 scan.2 += stats.knn_dot_ms;
                 scan.3 += stats.knn_postings_cached;
                 scan.4 += stats.knn_postings_probed;
+                phases.0 += stats.knn_plan_ms;
+                phases.1 += stats.score_wall_ms;
+                phases.2 += stats.knn_rank_ms;
+                phases.3 += stats.knn_centroids_scanned;
+                for hit in &r.results {
+                    let bytes = hit
+                        .doc_id
+                        .0
+                        .bytes()
+                        .chain(hit.score.to_bits().to_le_bytes());
+                    for b in bytes {
+                        digest = (digest ^ b as u64).wrapping_mul(0x100000001b3);
+                    }
+                }
             }
         }
         warm.push((label, key, Dist::from_samples(samples)));
@@ -399,6 +421,16 @@ fn main() {
         100.0 * scan.3 as f64 / scan.4.max(1) as f64,
     );
 
+    println!(
+        "warm kNN phases per query (mean): knn_plan {:.3}ms, score wall {:.3}ms, segment centroid \
+         ranking {:.3}ms (summed over threads); {:.0} centroids scored by the plan",
+        per_query(phases.0),
+        per_query(phases.1),
+        per_query(phases.2),
+        per_query(phases.3 as f64),
+    );
+    println!("warm kNN top-k digest (ids and score bits of every sample): {digest:016x}");
+
     if let Ok(path) = std::env::var("KOSHA_BENCH_JSON") {
         let warm_json: serde_json::Map<String, serde_json::Value> = warm
             .iter()
@@ -420,6 +452,13 @@ fn main() {
                 "decode_ms": per_query(scan.1),
                 "dot_ms": per_query(scan.2),
                 "cached_fraction": scan.3 as f64 / scan.4.max(1) as f64,
+            },
+            "warm_knn_phases": {
+                "knn_plan_ms": per_query(phases.0),
+                "score_wall_ms": per_query(phases.1),
+                "knn_rank_ms": per_query(phases.2),
+                "centroids_per_query": per_query(phases.3 as f64),
+                "topk_digest": format!("{digest:016x}"),
             },
         });
         std::fs::write(&path, serde_json::to_string_pretty(&report).unwrap())

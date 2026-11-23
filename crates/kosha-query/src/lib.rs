@@ -3115,6 +3115,12 @@ impl KnnMode {
 struct KnnPlan {
     /// The global probe budget: see [`Searcher::knn_plan`].
     cutoff: Option<(f32, usize)>,
+    /// Each probed segment's postings inside `cutoff`, already ranked
+    /// (#436), built from the centroid scores the cutoff itself came from
+    /// so the segment does not score and sort its centroids again. Empty
+    /// without a cutoff. A segment with a cutoff but no entry here (it
+    /// could not be opened by the plan) ranks its own postings.
+    rankings: HashMap<kosha_core::SegmentId, kosha_segment::KnnSegmentRanking>,
     /// Segments searched exactly over their filter-passing documents.
     exact_segments: HashSet<kosha_core::SegmentId>,
     mode: Option<KnnMode>,
@@ -3195,6 +3201,13 @@ pub struct SearchPhaseStats {
     pub knn_read_ms: f64,
     pub knn_decode_ms: f64,
     pub knn_dot_ms: f64,
+    /// Time segments spent scoring and ranking their own centroids for a
+    /// budgeted probe (#436), summed across rayon workers like the three
+    /// above. `knn_plan` hands each segment its ranking, so this is zero
+    /// unless a segment had to rank for itself: one the plan could not
+    /// open, or a restricted probe (a filter, deleted documents) that ran
+    /// past its budget. The plan's own centroid scan is in `knn_plan_ms`.
+    pub knn_rank_ms: f64,
     /// Of the postings scanned, how many came from a decoded-posting
     /// cache.
     pub knn_postings_cached: usize,
@@ -3308,6 +3321,8 @@ impl OpenStatsCollector {
             .fetch_add(scan.decode_nanos, Ordering::Relaxed);
         self.knn_dot_nanos
             .fetch_add(scan.score_nanos, Ordering::Relaxed);
+        self.knn_rank_nanos
+            .fetch_add(scan.rank_nanos, Ordering::Relaxed);
         self.knn_postings_cached
             .fetch_add(scan.postings_cached, Ordering::Relaxed);
     }
@@ -3333,6 +3348,7 @@ struct OpenStatsCollector {
     knn_read_nanos: AtomicU64,
     knn_decode_nanos: AtomicU64,
     knn_dot_nanos: AtomicU64,
+    knn_rank_nanos: AtomicU64,
     knn_postings_cached: AtomicUsize,
     /// See [`SearchPhaseStats::wand_docs_scored`].
     wand_docs_scored: AtomicUsize,
@@ -3924,6 +3940,7 @@ impl Searcher {
         query: &SearchQuery,
         knn: &kosha_core::KnnQuery,
         cutoff: Option<(f32, usize)>,
+        rankings: &HashMap<kosha_core::SegmentId, kosha_segment::KnnSegmentRanking>,
         tombstones: Option<
             &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
         >,
@@ -3935,13 +3952,19 @@ impl Searcher {
         // (`limit_per` never reaches here: see the gate in `search_inner`).
         debug_assert!(query.limit_per.is_none());
         let fetch_k = knn.k;
-        let budget = match cutoff {
-            // This pass runs unfiltered requests only, so the one
-            // restriction a segment can have is its deleted documents.
-            Some((max_distance, max_probes)) => kosha_segment::KnnProbeBudget::Within {
-                max_distance,
-                max_probes,
-                refill: kosha_segment::KnnRefill::BudgetedSegments,
+        // This pass runs unfiltered requests only, so the one restriction
+        // a segment can have is its deleted documents.
+        let refill = kosha_segment::KnnRefill::BudgetedSegments;
+        let budget_for = |segment_id: &kosha_core::SegmentId| match cutoff {
+            // The plan's ranking of this segment's postings (#436), when
+            // it has one; the segment ranks its own otherwise.
+            Some((max_distance, max_probes)) => match rankings.get(segment_id) {
+                Some(ranking) => kosha_segment::KnnProbeBudget::Planned { ranking, refill },
+                None => kosha_segment::KnnProbeBudget::Within {
+                    max_distance,
+                    max_probes,
+                    refill,
+                },
             },
             None => kosha_segment::KnnProbeBudget::Nprobe(knn.num_candidates),
         };
@@ -3987,7 +4010,7 @@ impl Searcher {
                         &knn.field,
                         &knn.vector,
                         fetch_k,
-                        budget,
+                        budget_for(&entry.segment_id),
                         accept_dyn,
                         vector_fetch,
                     )
@@ -4290,6 +4313,7 @@ impl Searcher {
         };
         let mut plan = KnnPlan {
             cutoff: None,
+            rankings: HashMap::new(),
             exact_segments,
             mode: Some(mode),
             filtered_candidates,
@@ -4349,6 +4373,21 @@ impl Searcher {
         let (cutoff, rule) = knn_budget_cutoff(&mut all, budget, relative);
         plan.cutoff = Some((cutoff, budget));
         plan.cutoff_rule = rule;
+        // Hand every probed segment its postings inside the cutoff, ranked
+        // (#436). The scores are the ones the cutoff was just picked from,
+        // so the segment's ranking and the cutoff cannot drift apart, and
+        // the segment does not score its centroids a second time. Per
+        // segment this selects the few postings under the cutoff instead
+        // of sorting all of them.
+        plan.rankings = per_segment
+            .into_iter()
+            .filter(|info| !plan.exact_segments.contains(info.segment_id))
+            .filter_map(|info| {
+                let ranking =
+                    kosha_segment::KnnSegmentRanking::new(info.distances?, cutoff, budget);
+                Some((info.segment_id.clone(), ranking))
+            })
+            .collect();
         Ok(plan)
     }
 
@@ -4872,6 +4911,9 @@ impl Searcher {
         // flat segments, or budgeting disabled) — fall back to per-segment
         // `nprobe`.
         knn_cutoff: Option<(f32, usize)>,
+        // The plan's ranking of this segment's postings inside
+        // `knn_cutoff` (#436); `None` and the segment ranks its own.
+        knn_ranking: Option<&kosha_segment::KnnSegmentRanking>,
         // The plan put this segment on the exact path (#252): score every
         // filter-passing document's vector instead of probing.
         knn_exact: bool,
@@ -6420,8 +6462,19 @@ impl Searcher {
                         }
                     }
                     let (probe, scan) = kosha_segment::with_knn_scan_stats(|| match knn_cutoff {
-                        Some((cutoff, effective_budget)) => reader
-                            .knn_search_within_filtered_fetching(
+                        Some((cutoff, effective_budget)) => match knn_ranking {
+                            // The plan already ranked this segment's
+                            // postings inside the cutoff (#436).
+                            Some(ranking) => reader.knn_search_planned_fetching(
+                                &knn.field,
+                                &knn.vector,
+                                fetch_k,
+                                ranking,
+                                knn_accept_dyn,
+                                knn_refill,
+                                vector_fetch,
+                            ),
+                            None => reader.knn_search_within_filtered_fetching(
                                 &knn.field,
                                 &knn.vector,
                                 fetch_k,
@@ -6430,16 +6483,17 @@ impl Searcher {
                                 knn_accept_dyn,
                                 knn_refill,
                                 vector_fetch,
-                            )
-                            .map(|r| {
-                                r.map(|(results, probes)| {
-                                    open_stats.knn_postings.fetch_add(probes, Ordering::Relaxed);
-                                    if probes > 0 {
-                                        open_stats.knn_segments.fetch_add(1, Ordering::Relaxed);
-                                    }
-                                    results
-                                })
-                            }),
+                            ),
+                        }
+                        .map(|r| {
+                            r.map(|(results, probes)| {
+                                open_stats.knn_postings.fetch_add(probes, Ordering::Relaxed);
+                                if probes > 0 {
+                                    open_stats.knn_segments.fetch_add(1, Ordering::Relaxed);
+                                }
+                                results
+                            })
+                        }),
                         None => reader
                             .knn_search_filtered_fetching(
                                 &knn.field,
@@ -7106,6 +7160,7 @@ impl Searcher {
                     query,
                     knn,
                     knn_plan.cutoff,
+                    &knn_plan.rankings,
                     tombstones,
                     &permit,
                     &open_stats,
@@ -7171,6 +7226,7 @@ impl Searcher {
                 &permit,
                 &open_stats,
                 knn_plan.cutoff,
+                knn_plan.rankings.get(&entry.segment_id),
                 knn_plan.exact_segments.contains(&entry.segment_id),
                 knn_global
                     .as_ref()
@@ -7266,6 +7322,7 @@ impl Searcher {
         phase_stats.knn_decode_ms =
             open_stats.knn_decode_nanos.load(Ordering::Relaxed) as f64 / 1e6;
         phase_stats.knn_dot_ms = open_stats.knn_dot_nanos.load(Ordering::Relaxed) as f64 / 1e6;
+        phase_stats.knn_rank_ms = open_stats.knn_rank_nanos.load(Ordering::Relaxed) as f64 / 1e6;
         phase_stats.knn_postings_cached = open_stats.knn_postings_cached.load(Ordering::Relaxed);
         phase_stats.knn_exact_vectors = open_stats.knn_exact_vectors.load(Ordering::Relaxed);
         if query.knn.is_some() && self.knn_rescore_stats_on() {
@@ -11210,6 +11267,97 @@ mod tests {
             "expected >=4 of 5 results inside brute-force top-10, got {overlap} ({got:?})"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn planned_segment_probes_equal_each_segment_ranking_its_own_postings() {
+        // #436: `knn_plan` hands every segment its postings inside the
+        // cutoff, ranked, instead of the segment scoring and sorting its
+        // centroids again. The search must return what the segments would
+        // have found ranking their own postings under the same cutoff and
+        // cap, and probe exactly as many postings and segments.
+        let dir = std::env::temp_dir().join("kosha-test-knn-planned-rankings");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        const SEGS: usize = 12;
+        const PER_SEG: usize = 400;
+        let (manifest, _) = mk_vector_corpus(&dir, "test", SEGS, PER_SEG);
+        let searcher = Searcher::new(dir.clone());
+
+        let readers: Vec<SegmentReader> = manifest
+            .segments
+            .iter()
+            .map(|entry| {
+                SegmentReader::open_with_options(dir.join("test").join(&entry.segment_id.0), true)
+                    .unwrap()
+            })
+            .collect();
+        for (angle, requested, k) in [(0.0f32, 9usize, 10usize), (1.1, 3, 5), (2.9, 40, 10)] {
+            let vector = vec![angle.cos(), angle.sin(), 0.0, 0.0];
+            let mut q = mk_query("", k);
+            q.knn = Some(kosha_core::KnnQuery {
+                query_text: None,
+                embedding_model: None,
+                field: "emb".into(),
+                vector: vector.clone(),
+                k,
+                num_candidates: requested,
+                filter: None,
+                vectors: None,
+                scoring: None,
+            });
+            let (r, stats) = searcher
+                .search_with_stats(&ns, &manifest, &q, None)
+                .unwrap();
+
+            // The same cutoff, from the same scores, by the same rule.
+            let bounds: Vec<Vec<f32>> = readers
+                .iter()
+                .map(|reader| reader.knn_centroid_distances("emb", &vector).unwrap())
+                .collect();
+            let mut all: Vec<f32> = bounds.iter().flatten().copied().collect();
+            assert_eq!(stats.knn_centroids_scanned, all.len());
+            let budget = effective_knn_budget(requested, all.len());
+            assert!(
+                budget < all.len(),
+                "the budget must cut something: {budget} of {}",
+                all.len()
+            );
+            let (cutoff, _) = knn_budget_cutoff(&mut all, budget, None);
+
+            // Each segment ranking its own postings (no plan).
+            let mut expect: Vec<(String, f64)> = Vec::new();
+            let (mut postings, mut segments) = (0usize, 0usize);
+            for (s, reader) in readers.iter().enumerate() {
+                let (hits, probes) = reader
+                    .knn_search_within_filtered("emb", &vector, k, cutoff, budget, None)
+                    .unwrap()
+                    .unwrap();
+                postings += probes;
+                segments += usize::from(probes > 0);
+                expect.extend(
+                    hits.into_iter()
+                        .map(|(doc_seq, score)| (format!("s{s:03}-d{doc_seq}"), score)),
+                );
+            }
+            expect.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            expect.truncate(k);
+            assert!(
+                expect.windows(2).all(|w| w[0].1 > w[1].1),
+                "the arc has no equal scores, so the order is unambiguous"
+            );
+
+            assert_eq!(stats.knn_postings_probed, postings, "angle {angle}");
+            assert_eq!(stats.knn_segments_probed, segments, "angle {angle}");
+            assert!(
+                segments < SEGS,
+                "some segment must sit wholly outside the cutoff"
+            );
+            let got: Vec<&str> = r.results.iter().map(|h| h.doc_id.0.as_str()).collect();
+            let want: Vec<&str> = expect.iter().map(|(id, _)| id.as_str()).collect();
+            assert_eq!(got, want, "angle {angle}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

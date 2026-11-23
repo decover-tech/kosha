@@ -6371,14 +6371,14 @@ struct LazyVectorIndex {
     /// columns' postings never alias in the segment's shared cache.
     slot: u32,
     dim: usize,
-    /// Parallel to `ranges` — kept as a separate `Vec<Vec<f32>>` (not a
-    /// `Vec<VectorPostingIndex>`) so `knn_search` can pass it straight to
-    /// `kosha_vector_spfresh::nearest_centroids` without cloning every
-    /// centroid on every query.
-    centroids: Vec<Vec<f32>>,
-    /// `(offset, length)` into `vector.idx`, parallel to `centroids`.
+    /// Every posting's centroid in one row-major matrix (#436): row `i`,
+    /// `dim` floats, is posting `i`'s centroid — see [`Self::centroid`].
+    /// One allocation, so the per-query scan over all of them reads memory
+    /// sequentially instead of chasing a pointer per centroid.
+    centroids: Vec<f32>,
+    /// `(offset, length)` into `vector.idx`, one per posting.
     ranges: Vec<(u64, u32)>,
-    /// Parallel to `centroids` — max cosine distance from each posting's
+    /// Parallel to `ranges` — max cosine distance from each posting's
     /// centroid to any of its live members. `0.0` for every posting when
     /// read from a pre-radius-aware sidecar (version 1 or 2), which
     /// degrades ranking exactly to raw centroid distance — see
@@ -6411,11 +6411,15 @@ impl LazyVectorIndex {
         parsed: Vec<VectorPostingIndex>,
         field: Option<String>,
     ) -> Self {
-        let mut centroids = Vec::with_capacity(parsed.len());
+        let dim = dim as usize;
+        let mut centroids = Vec::with_capacity(parsed.len() * dim);
         let mut ranges = Vec::with_capacity(parsed.len());
         let mut radii = Vec::with_capacity(parsed.len());
         for p in parsed {
-            centroids.push(p.centroid);
+            // `parse_vector_offsets` reads exactly `dim` floats per
+            // posting; anything else would shift every later row.
+            assert_eq!(p.centroid.len(), dim, "centroid of the wrong dimension");
+            centroids.extend_from_slice(&p.centroid);
             ranges.push((p.offset, p.length));
             radii.push(p.radius);
         }
@@ -6426,7 +6430,7 @@ impl LazyVectorIndex {
                 |n| n.to_string_lossy().into_owned(),
             ),
             slot,
-            dim: dim as usize,
+            dim,
             centroids,
             ranges,
             radii,
@@ -6436,6 +6440,16 @@ impl LazyVectorIndex {
             rabitq: is_rabitq_vector_index_version(version),
             field,
         }
+    }
+
+    /// Posting `i`'s centroid: row `i` of [`Self::centroids`].
+    fn centroid(&self, i: usize) -> &[f32] {
+        &self.centroids[i * self.dim..(i + 1) * self.dim]
+    }
+
+    /// Every centroid, in posting order.
+    fn centroid_rows(&self) -> impl Iterator<Item = &[f32]> {
+        (0..self.ranges.len()).map(|i| self.centroid(i))
     }
 }
 
@@ -6555,7 +6569,7 @@ pub enum KnnRefill {
 /// How much of a column a kNN probe reads (#381, see
 /// [`SegmentReader::knn_candidates_fetching`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum KnnProbeBudget {
+pub enum KnnProbeBudget<'a> {
     /// The global budget: postings whose centroid lower bound is within
     /// `max_distance`, at most `max_probes` of them (see
     /// [`SegmentReader::knn_search_within`]).
@@ -6564,8 +6578,121 @@ pub enum KnnProbeBudget {
         max_probes: usize,
         refill: KnnRefill,
     },
+    /// [`Self::Within`] with this segment's postings already chosen and
+    /// ranked by the query layer (#436): the segment neither scores its
+    /// centroids nor sorts them again.
+    Planned {
+        ranking: &'a KnnSegmentRanking,
+        refill: KnnRefill,
+    },
     /// The per-segment fallback: the `nprobe` nearest centroids.
     Nprobe(usize),
+}
+
+/// One segment's share of a global kNN probe budget (#436): which of its
+/// postings are inside the budget, nearest first.
+///
+/// The query layer already scores every centroid of every segment to pick
+/// the global cutoff ([`SegmentReader::knn_centroid_distances`]). Built
+/// from those same scores, this hands the segment its probe list, so the
+/// probe does not score and sort the segment's centroids a second time.
+/// The scores are kept: a restricted probe (a filter, deleted documents)
+/// that runs past the budget ranks the rest from them, and only then.
+///
+/// The postings chosen, and their order, are exactly the ones
+/// [`SegmentReader::knn_search_within_filtered_fetching`] picks from the
+/// same `max_distance` and `max_probes`: ascending score, equal scores in
+/// posting order, the first `max_probes` of those at or under
+/// `max_distance`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KnnSegmentRanking {
+    /// One rank score per posting, in posting order.
+    bounds: Vec<f32>,
+    /// The postings inside the budget, nearest first.
+    budgeted: Vec<u32>,
+    max_distance: f32,
+    max_probes: usize,
+}
+
+impl KnnSegmentRanking {
+    /// `bounds` is one segment's [`SegmentReader::knn_centroid_distances`]
+    /// for the query; `max_distance` and `max_probes` are the global
+    /// cutoff and cap, in the same units.
+    pub fn new(bounds: Vec<f32>, max_distance: f32, max_probes: usize) -> Self {
+        let budgeted = if bounds.iter().any(|d| d.is_nan()) {
+            // A NaN score has no place in an order. Keep whatever the full
+            // sort makes of it, as before #436, rather than define a
+            // second behaviour for an input no real query produces.
+            let ranked = Self::rank_all(&bounds);
+            let within = ranked
+                .iter()
+                .take_while(|(_, d)| *d <= max_distance)
+                .count()
+                .min(max_probes);
+            ranked[..within].iter().map(|&(i, _)| i).collect()
+        } else {
+            // Without NaN, "ascending score, ties in posting order" is a
+            // total order on `(score, posting)`, so the first `max_probes`
+            // under the cutoff can be selected without sorting the rest.
+            let by_rank = |a: &(f32, u32), b: &(f32, u32)| {
+                a.0.partial_cmp(&b.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.1.cmp(&b.1))
+            };
+            let mut within: Vec<(f32, u32)> = bounds
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| **d <= max_distance)
+                .map(|(i, &d)| (d, i as u32))
+                .collect();
+            if within.len() > max_probes {
+                if max_probes > 0 {
+                    within.select_nth_unstable_by(max_probes - 1, by_rank);
+                }
+                within.truncate(max_probes);
+            }
+            within.sort_unstable_by(by_rank);
+            within.into_iter().map(|(_, i)| i).collect()
+        };
+        Self {
+            bounds,
+            budgeted,
+            max_distance,
+            max_probes,
+        }
+    }
+
+    /// The postings inside the budget, nearest first.
+    pub fn budgeted(&self) -> &[u32] {
+        &self.budgeted
+    }
+
+    /// The rank score of every posting, in posting order.
+    pub fn bounds(&self) -> &[f32] {
+        &self.bounds
+    }
+
+    /// The cutoff the ranking was built for.
+    pub fn max_distance(&self) -> f32 {
+        self.max_distance
+    }
+
+    /// The cap the ranking was built for.
+    pub fn max_probes(&self) -> usize {
+        self.max_probes
+    }
+
+    /// Every posting, nearest first: [`Self::budgeted`] is its prefix.
+    /// Only a restricted probe that outruns its budget needs this.
+    fn rank_all(bounds: &[f32]) -> Vec<(u32, f32)> {
+        let mut ranked: Vec<(u32, f32)> = bounds
+            .iter()
+            .enumerate()
+            .map(|(i, &d)| (i as u32, d))
+            .collect();
+        ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranked
+    }
 }
 
 /// One kNN candidate with its score estimate and error bound (#381): the
@@ -6651,6 +6778,10 @@ pub struct KnnScanStats {
     pub decode_nanos: u64,
     /// Scoring entries against the query, candidate collection included.
     pub score_nanos: u64,
+    /// Scoring and ranking the segment's own centroids for a budgeted
+    /// probe (#436): zero when the query layer handed the probe its
+    /// ranking and the probe never ran past its budget.
+    pub rank_nanos: u64,
     /// Postings served from the segment's decoded-posting cache: no read,
     /// no decode.
     pub postings_cached: usize,
@@ -6667,6 +6798,7 @@ impl KnnScanStats {
         self.read_nanos += other.read_nanos;
         self.decode_nanos += other.decode_nanos;
         self.score_nanos += other.score_nanos;
+        self.rank_nanos += other.rank_nanos;
         self.postings_cached += other.postings_cached;
         self.postings_decoded += other.postings_decoded;
         self.postings_scanned += other.postings_scanned;
@@ -7673,7 +7805,7 @@ impl SegmentReader {
         let mut file = std::io::BufReader::new(fs::File::open(&vi.vector_idx_path)?);
         let mut buf = Vec::new();
         let mut postings = Vec::with_capacity(vi.ranges.len());
-        for (centroid, &(offset, length)) in vi.centroids.iter().zip(&vi.ranges) {
+        for (centroid, &(offset, length)) in vi.centroid_rows().zip(&vi.ranges) {
             if !(length as usize).is_multiple_of(entry_size) {
                 return Err(KoshaError::CorruptSegment(format!(
                     "{}: posting at {offset} is {length} bytes, not a multiple of {entry_size}",
@@ -7688,7 +7820,7 @@ impl SegmentReader {
                 .map(|entry| u32::from_le_bytes(entry[..4].try_into().unwrap()))
                 .collect();
             postings.push(VectorPostingMembers {
-                centroid: centroid.clone(),
+                centroid: centroid.to_vec(),
                 doc_seqs,
             });
         }
@@ -7733,7 +7865,7 @@ impl SegmentReader {
         emit: impl FnMut(u32, f32, f32),
     ) -> Result<(), KoshaError> {
         let vi = scan.vi;
-        let centroid = &vi.centroids[range_idx];
+        let centroid = vi.centroid(range_idx);
         let key = vector_cache_key(vi.slot, range_idx);
         let mut clock = scan.clock();
         if let Some(hit) = self.vector_cache.get(key) {
@@ -7935,8 +8067,7 @@ impl SegmentReader {
     fn centroid_lower_bounds(vi: &LazyVectorIndex, query: &[f32]) -> Vec<f32> {
         let alpha = knn_probe_radius_alpha();
         let unit = Self::unit_query(vi, query);
-        vi.centroids
-            .iter()
+        vi.centroid_rows()
             .zip(&vi.radii)
             .map(|(c, &r)| {
                 let distance = match &unit {
@@ -8112,6 +8243,54 @@ impl SegmentReader {
         ))
     }
 
+    /// [`Self::knn_search_within_filtered_fetching`] for a segment whose
+    /// postings the query layer has already chosen and ranked (#436):
+    /// `ranking` must have been built from this segment's
+    /// [`Self::knn_centroid_distances`] for the same `field` and `query`.
+    /// Same hits, same scores and same posting count as the unplanned
+    /// call with `ranking`'s cutoff and cap, without scoring or sorting
+    /// the segment's centroids again. A ranking that does not have one
+    /// score per posting of this column is ignored and the segment ranks
+    /// its own postings.
+    #[allow(clippy::too_many_arguments)]
+    pub fn knn_search_planned_fetching(
+        &self,
+        field: &str,
+        query: &[f32],
+        k: usize,
+        ranking: &KnnSegmentRanking,
+        accept: Option<&dyn Fn(u32) -> bool>,
+        refill: KnnRefill,
+        fetch: Option<VectorSpanFetch<'_>>,
+    ) -> BudgetedKnnResult {
+        let index = match self.vector_field(field) {
+            Ok(index) => index?,
+            Err(e) => return Some(Err(e)),
+        };
+        let vi = index.lazy.as_ref()?;
+        if let Err(e) = Self::check_query_dim(vi, field, query) {
+            return Some(Err(e));
+        }
+        let probed = match self.probe_within_lazy(
+            vi,
+            query,
+            k,
+            ranking.max_distance,
+            ranking.max_probes,
+            accept,
+            refill,
+            fetch,
+            Some(ranking),
+        ) {
+            Ok(probed) => probed,
+            Err(e) => return Some(Err(e)),
+        };
+        Some(Ok((
+            self.finish_probe(vi, query, probed.scored, &probed.errors, k),
+            probed.postings,
+        )))
+    }
+
     /// The candidates half of a kNN probe over `field`'s column, for
     /// global bound-driven rescoring (#381, `KOSHA_KNN_GLOBAL_RESCORE`).
     ///
@@ -8135,7 +8314,7 @@ impl SegmentReader {
         field: &str,
         query: &[f32],
         k: usize,
-        budget: KnnProbeBudget,
+        budget: KnnProbeBudget<'_>,
         accept: Option<&dyn Fn(u32) -> bool>,
         fetch: Option<VectorSpanFetch<'_>>,
     ) -> Option<Result<KnnCandidates, KoshaError>> {
@@ -8161,6 +8340,18 @@ impl SegmentReader {
                 accept,
                 refill,
                 fetch,
+                None,
+            ),
+            KnnProbeBudget::Planned { ranking, refill } => self.probe_within_lazy(
+                vi,
+                query,
+                k,
+                ranking.max_distance,
+                ranking.max_probes,
+                accept,
+                refill,
+                fetch,
+                Some(ranking),
             ),
             KnnProbeBudget::Nprobe(nprobe) => {
                 let mut unit = query.to_vec();
@@ -8493,6 +8684,7 @@ impl SegmentReader {
             accept,
             refill,
             fetch,
+            None,
         )?;
         Ok((
             self.finish_probe(vi, query, probed.scored, &probed.errors, k),
@@ -8502,6 +8694,12 @@ impl SegmentReader {
 
     /// The probe half of [`Self::knn_search_within_lazy`]: every candidate
     /// scored, with its error bound, before any cut or rescoring.
+    ///
+    /// `planned` is the query layer's ranking of this segment's postings
+    /// for the same cutoff and cap (#436). With it the budgeted postings
+    /// are read straight off the plan; without it (a direct caller, or a
+    /// plan that does not fit this column) they are ranked here, from the
+    /// same scores by the same rule.
     #[allow(clippy::too_many_arguments)]
     fn probe_within_lazy(
         &self,
@@ -8513,27 +8711,33 @@ impl SegmentReader {
         accept: Option<&dyn Fn(u32) -> bool>,
         refill: KnnRefill,
         fetch: Option<VectorSpanFetch<'_>>,
+        planned: Option<&KnnSegmentRanking>,
     ) -> Result<ProbedCandidates, KoshaError> {
-        // Rank this segment's qualifying postings nearest-first (by lower
-        // bound, not raw centroid distance — see `centroid_lower_bounds`),
-        // so the `max_probes` cap keeps the *best* candidates when it
-        // bites. `max_distance` is itself a lower-bound cutoff (computed
-        // from the same bound across all segments — see
-        // `Searcher::knn_plan`), so both sides of this
+        // This segment's postings inside the budget, nearest-first (by
+        // lower bound, not raw centroid distance — see
+        // `centroid_lower_bounds`), so the `max_probes` cap keeps the
+        // *best* candidates when it bites. `max_distance` is itself a
+        // lower-bound cutoff (computed from the same bound across all
+        // segments — see `Searcher::knn_plan`), so both sides of the
         // comparison are in the same units.
-        let mut ranked: Vec<(usize, f32)> = Self::centroid_lower_bounds(vi, query)
-            .into_iter()
-            .enumerate()
-            .collect();
-        ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        // Postings inside the budget: within the cutoff, capped at
-        // `max_probes`. `ranked` is nearest-first, so they are a prefix.
-        let budgeted = ranked
-            .iter()
-            .take_while(|(_, d)| *d <= max_distance)
-            .count()
-            .min(max_probes);
-        self.prefetch_vector_postings(vi, ranked[..budgeted].iter().map(|&(i, _)| i), fetch);
+        let mut rank_clock = KNN_SCAN_STATS
+            .with(|stats| stats.get().is_some())
+            .then(std::time::Instant::now);
+        let own;
+        let ranking = match planned.filter(|r| r.bounds.len() == vi.ranges.len()) {
+            Some(planned) => planned,
+            None => {
+                own = KnnSegmentRanking::new(
+                    Self::centroid_lower_bounds(vi, query),
+                    max_distance,
+                    max_probes,
+                );
+                &own
+            }
+        };
+        let rank_nanos = lap_nanos(&mut rank_clock);
+        let budgeted = ranking.budgeted.len();
+        self.prefetch_vector_postings(vi, ranking.budgeted.iter().map(|&i| i as usize), fetch);
 
         let mut probes = 0usize;
         let mut sink = CandidateSink::new(vi, k);
@@ -8541,32 +8745,51 @@ impl SegmentReader {
         let unit = Self::unit_query(vi, query);
         let mut scan =
             PostingScan::new(&self.segment_dir, vi, Self::probe_query(vi, query), accept);
-        for (position, (range_idx, _)) in ranked.iter().enumerate() {
-            if position >= budgeted {
-                // Past the budget. Without a restriction this is where the
-                // probe ends. With one, keep going only while the page is
-                // still short (see the doc comment on the public wrapper),
-                // and, when the restriction is deletes alone, only in a
-                // segment the budget reached at all (see `KnnRefill`).
-                if accept.is_none()
-                    || sink.len() >= k
-                    || (refill == KnnRefill::BudgetedSegments && budgeted == 0)
-                {
+        scan.stats.rank_nanos += rank_nanos;
+        for &range_idx in &ranking.budgeted {
+            probes += 1;
+            self.scan_posting(
+                &mut scan,
+                range_idx as usize,
+                |v| Self::f32_similarity(lanes, unit.as_deref(), query, v),
+                |id, sim, err| sink.push(id, sim, err),
+            )?;
+        }
+        // Past the budget. Without a restriction this is where the probe
+        // ends. With one, keep going only while the page is still short
+        // (see the doc comment on the public wrapper), and, when the
+        // restriction is deletes alone, only in a segment the budget
+        // reached at all (see `KnnRefill`). Only here is the rest of the
+        // segment ranked: most probes never get this far.
+        let refills = accept.is_some()
+            && sink.len() < k
+            && !(refill == KnnRefill::BudgetedSegments && budgeted == 0)
+            && budgeted < vi.ranges.len();
+        if refills {
+            let mut rank_clock = scan.clock();
+            let ranked = KnnSegmentRanking::rank_all(&ranking.bounds);
+            scan.stats.rank_nanos += lap_nanos(&mut rank_clock);
+            for position in budgeted..ranked.len() {
+                if sink.len() >= k {
                     break;
                 }
                 if (position - budgeted) % VECTOR_PREFETCH_CHUNK == 0 {
                     let chunk =
                         &ranked[position..(position + VECTOR_PREFETCH_CHUNK).min(ranked.len())];
-                    self.prefetch_vector_postings(vi, chunk.iter().map(|&(i, _)| i), fetch);
+                    self.prefetch_vector_postings(
+                        vi,
+                        chunk.iter().map(|&(i, _)| i as usize),
+                        fetch,
+                    );
                 }
+                probes += 1;
+                self.scan_posting(
+                    &mut scan,
+                    ranked[position].0 as usize,
+                    |v| Self::f32_similarity(lanes, unit.as_deref(), query, v),
+                    |id, sim, err| sink.push(id, sim, err),
+                )?;
             }
-            probes += 1;
-            self.scan_posting(
-                &mut scan,
-                *range_idx,
-                |v| Self::f32_similarity(lanes, unit.as_deref(), query, v),
-                |id, sim, err| sink.push(id, sim, err),
-            )?;
         }
         let (scored, errors) = sink.finish();
         Ok(ProbedCandidates {
@@ -8624,14 +8847,14 @@ impl SegmentReader {
         // past `nprobe` while the page is still short, as the budgeted
         // variant does.
         let rank = if accept.is_some() {
-            vi.centroids.len()
+            vi.ranges.len()
         } else {
             nprobe
         };
         let candidates = if vi.unit_norm {
-            kosha_vector_spfresh::nearest_centroids_dot(&vi.centroids, query, rank)
+            kosha_vector_spfresh::nearest_centroids_dot_rows(&vi.centroids, vi.dim, query, rank)
         } else {
-            kosha_vector_spfresh::nearest_centroids(&vi.centroids, query, rank)
+            kosha_vector_spfresh::nearest_centroids_rows(&vi.centroids, vi.dim, query, rank)
         };
         let budgeted = nprobe.min(candidates.len());
         self.prefetch_vector_postings(vi, candidates[..budgeted].iter().copied(), fetch);

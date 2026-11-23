@@ -85,6 +85,41 @@ pub fn nearest_centroids_dot(centroids: &[Vec<f32>], query: &[f32], nprobe: usiz
     )
 }
 
+/// The rows of a row-major centroid matrix: `rows.len() / dim` slices of
+/// `dim` floats each. `dim == 0` has no rows.
+fn matrix_rows(rows: &[f32], dim: usize) -> impl Iterator<Item = (usize, &[f32])> {
+    // `chunks_exact(0)` panics; a zero-dimension matrix holds nothing.
+    rows.chunks_exact(dim.max(1))
+        .take(if dim == 0 { 0 } else { usize::MAX })
+        .enumerate()
+}
+
+/// [`nearest_centroids`] over one flat row-major matrix (`dim` floats per
+/// centroid) instead of a `Vec` per centroid, so the scan reads memory
+/// sequentially and a caller that holds its centroids flat does not
+/// rebuild a `Vec<Vec<f32>>` per query. Same order, same ties.
+pub fn nearest_centroids_rows(
+    rows: &[f32],
+    dim: usize,
+    query: &[f32],
+    nprobe: usize,
+) -> Vec<usize> {
+    rank_by_distance(matrix_rows(rows, dim), query, nprobe)
+}
+
+/// [`nearest_centroids_dot`] over one flat row-major matrix; see
+/// [`nearest_centroids_rows`].
+pub fn nearest_centroids_dot_rows(
+    rows: &[f32],
+    dim: usize,
+    query: &[f32],
+    nprobe: usize,
+) -> Vec<usize> {
+    rank_by(matrix_rows(rows, dim), nprobe, |c| {
+        -crate::point::dot(query, c)
+    })
+}
+
 /// The single nearest active posting to `centroid`, or `None` if there are
 /// no active postings. Used by `ops::merge` to pick a merge target.
 pub(crate) fn nearest_active_posting(
@@ -159,6 +194,42 @@ mod tests {
         let centroids = vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![-1.0, 0.0]];
         let result = nearest_centroids(&centroids, &[0.0, 1.0], 2);
         assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn row_matrix_variants_rank_exactly_as_the_vec_of_vecs_ones() {
+        // Includes exact ties (duplicated rows), which must break the
+        // same way in both layouts.
+        let mut rng = crate::rng::DeterministicRng::new(7);
+        let dim = 12;
+        let mut centroids: Vec<Vec<f32>> = (0..97)
+            .map(|_| {
+                let mut v: Vec<f32> = (0..dim).map(|_| rng.next_f32_range(-0.5, 0.5)).collect();
+                crate::point::normalize_in_place(&mut v);
+                v
+            })
+            .collect();
+        centroids.push(centroids[3].clone());
+        centroids.push(centroids[40].clone());
+        let flat: Vec<f32> = centroids.iter().flatten().copied().collect();
+        for q in 0..20 {
+            let mut query: Vec<f32> = (0..dim).map(|_| rng.next_f32_range(-0.5, 0.5)).collect();
+            crate::point::normalize_in_place(&mut query);
+            for nprobe in [0, 1, 5, 50, centroids.len(), centroids.len() + 9] {
+                assert_eq!(
+                    nearest_centroids_rows(&flat, dim, &query, nprobe),
+                    nearest_centroids(&centroids, &query, nprobe),
+                    "cosine q{q} nprobe {nprobe}"
+                );
+                assert_eq!(
+                    nearest_centroids_dot_rows(&flat, dim, &query, nprobe),
+                    nearest_centroids_dot(&centroids, &query, nprobe),
+                    "dot q{q} nprobe {nprobe}"
+                );
+            }
+        }
+        assert!(nearest_centroids_rows(&[], 0, &[], 3).is_empty());
+        assert!(nearest_centroids_dot_rows(&[], 4, &[0.0; 4], 3).is_empty());
     }
 
     #[test]

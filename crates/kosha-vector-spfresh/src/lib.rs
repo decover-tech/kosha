@@ -29,7 +29,9 @@ mod search;
 
 use std::collections::{HashMap, HashSet};
 
-pub use centroid_probe::{nearest_centroids, nearest_centroids_dot};
+pub use centroid_probe::{
+    nearest_centroids, nearest_centroids_dot, nearest_centroids_dot_rows, nearest_centroids_rows,
+};
 pub use error::VectorIndexError;
 pub use point::{
     cosine_distance, cosine_similarity, dot, dot_lanes, maxsim, mean_vector, normalize_in_place,

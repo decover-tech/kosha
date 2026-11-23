@@ -31,6 +31,7 @@ DEFAULT_KEYS = [
     "knn_read_ms",
     "knn_decode_ms",
     "knn_dot_ms",
+    "knn_rank_ms",
     "knn_postings",
     "knn_postings_cached",
     "knn_segments",

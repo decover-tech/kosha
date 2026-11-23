@@ -569,7 +569,9 @@ For kNN cost counters per query (`knn_postings`, `knn_segments`,
 `knn_centroids`, `knn_plan_ms`, opens, hydration and S3 bytes) and the
 posting-scan split of `score_ms` (`knn_read_ms`, `knn_decode_ms`,
 `knn_dot_ms`, each summed across scoring threads, and
-`knn_postings_cached`, #435), summarize a phase's server log:
+`knn_postings_cached`, #435; `knn_rank_ms`, the time segments spent
+ranking their own centroids, which is zero when `knn_plan` handed them
+their ranking, #436), summarize a phase's server log:
 
 ```bash
 python3 knn_log_stats.py vector/server/knn_warm_nocache.log.gz

@@ -1022,3 +1022,241 @@ fn scan_stats_are_scoped_and_off_outside_a_scope() {
     assert!(matches!(result, Err(KoshaError::Io(_))));
     assert_eq!(stats.postings_scanned, 0);
 }
+
+// ── #436: the query layer's ranking of a segment's postings ──────────
+
+/// The budgeted postings as the probe picked them before #436: every
+/// score in a stable sort, the prefix under the cutoff, capped.
+fn legacy_budgeted(bounds: &[f32], max_distance: f32, max_probes: usize) -> Vec<u32> {
+    let mut ranked: Vec<(usize, f32)> = bounds.iter().copied().enumerate().collect();
+    ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    let budgeted = ranked
+        .iter()
+        .take_while(|(_, d)| *d <= max_distance)
+        .count()
+        .min(max_probes);
+    ranked[..budgeted].iter().map(|&(i, _)| i as u32).collect()
+}
+
+#[test]
+fn segment_ranking_selects_what_the_full_sort_did() {
+    // Many exact ties (also across the cutoff and across the cap), both
+    // zeros, and infinities.
+    let mut rng = Lcg(0x436);
+    let values = [-0.0f32, 0.0, 0.25, 0.25, 0.5, 0.75, 1.0, 2.0, f32::INFINITY];
+    for len in [0usize, 1, 2, 7, 64, 300] {
+        let bounds: Vec<f32> = (0..len)
+            .map(|_| {
+                if rng.next().is_multiple_of(3) {
+                    rng.coord().abs()
+                } else {
+                    values[(rng.next() >> 33) as usize % values.len()]
+                }
+            })
+            .collect();
+        for max_distance in [
+            f32::NEG_INFINITY,
+            0.0,
+            0.25,
+            0.6,
+            2.0,
+            f32::INFINITY,
+            f32::NAN,
+        ] {
+            for max_probes in [0usize, 1, 2, 5, len / 2, len, len + 3, usize::MAX] {
+                let ranking = KnnSegmentRanking::new(bounds.clone(), max_distance, max_probes);
+                assert_eq!(
+                    ranking.budgeted(),
+                    legacy_budgeted(&bounds, max_distance, max_probes),
+                    "len {len}, cutoff {max_distance}, cap {max_probes}"
+                );
+                // The full ranking a refill continues from starts with it.
+                let all = KnnSegmentRanking::rank_all(ranking.bounds());
+                let prefix: Vec<u32> = all[..ranking.budgeted().len()]
+                    .iter()
+                    .map(|&(i, _)| i)
+                    .collect();
+                assert_eq!(prefix, ranking.budgeted());
+                assert_eq!(all.len(), len);
+            }
+        }
+    }
+    // A NaN score keeps whatever the full sort makes of it.
+    let bounds = [0.5f32, f32::NAN, 0.1, 0.5, 0.9];
+    for max_probes in [0usize, 2, usize::MAX] {
+        assert_eq!(
+            KnnSegmentRanking::new(bounds.to_vec(), 0.6, max_probes).budgeted(),
+            legacy_budgeted(&bounds, 0.6, max_probes)
+        );
+    }
+}
+
+/// Cutoffs taken from the segment's own scores for `query`, so some fall
+/// exactly on a posting's score, plus the open ends.
+fn plan_cutoffs(bounds: &[f32]) -> Vec<f32> {
+    let mut sorted = bounds.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    vec![
+        f32::NEG_INFINITY,
+        sorted[0],
+        sorted[sorted.len() / 3],
+        (sorted[1] + sorted[2]) / 2.0,
+        sorted[sorted.len() - 1],
+        f32::INFINITY,
+    ]
+}
+
+#[test]
+fn planned_probe_matches_the_segment_ranking_its_own_postings() {
+    let mut fixture = Fixture::new("planned");
+    fixture.set_cache_budget(0);
+    let index = fixture.index();
+    let vi = index.lazy.as_ref().unwrap();
+    let postings = vi.ranges.len();
+    let even = |id: u32| id.is_multiple_of(2);
+    // So few pass that the probe runs past any budget, to the last posting.
+    let rare = |id: u32| id % 300 == 7;
+    let none = |_: u32| false;
+    type Accept<'a> = Option<&'a dyn Fn(u32) -> bool>;
+    let accepts: [(&str, Accept<'_>); 4] = [
+        ("unrestricted", None),
+        ("even", Some(&even)),
+        ("rare", Some(&rare)),
+        ("none", Some(&none)),
+    ];
+    let mut refilled = 0usize;
+    for (q, query) in queries().iter().enumerate() {
+        let bounds = fixture.reader.knn_centroid_distances(FIELD, query).unwrap();
+        assert_eq!(bounds.len(), postings);
+        for max_distance in plan_cutoffs(&bounds) {
+            for max_probes in [0usize, 1, 3, postings, usize::MAX] {
+                let ranking = KnnSegmentRanking::new(bounds.clone(), max_distance, max_probes);
+                for (name, accept) in accepts {
+                    for refill in [KnnRefill::Always, KnnRefill::BudgetedSegments] {
+                        for k in [0usize, 1, 10, DOCS * 2] {
+                            let context = format!(
+                                "query {q}, cutoff {max_distance}, cap {max_probes}, {name}, \
+                                 {refill:?}, k {k}"
+                            );
+                            // The probe as it was before #435 and #436.
+                            let expect = reference_within(
+                                vi,
+                                &fixture.idx,
+                                query,
+                                k,
+                                max_distance,
+                                max_probes,
+                                accept,
+                                refill,
+                            );
+                            let planned = fixture
+                                .reader
+                                .knn_search_planned_fetching(
+                                    FIELD, query, k, &ranking, accept, refill, None,
+                                )
+                                .unwrap()
+                                .unwrap();
+                            let unplanned = fixture
+                                .reader
+                                .knn_search_within_filtered_fetching(
+                                    FIELD,
+                                    query,
+                                    k,
+                                    max_distance,
+                                    max_probes,
+                                    accept,
+                                    refill,
+                                    None,
+                                )
+                                .unwrap()
+                                .unwrap();
+                            assert_eq!(
+                                (bits(&planned.0), planned.1),
+                                (bits(&unplanned.0), unplanned.1),
+                                "planned vs unplanned: {context}"
+                            );
+                            assert_eq!(planned.1, expect.1, "postings probed: {context}");
+                            // Above a tie at the cut the reference (a
+                            // stable sort of everything) and the running
+                            // top-k agree; compare scores, which are
+                            // exact, and ids where no tie decides.
+                            let scores = |hits: &[(u32, f64)]| -> Vec<u64> {
+                                hits.iter().map(|&(_, s)| s.to_bits()).collect()
+                            };
+                            assert_eq!(scores(&planned.0), scores(&expect.0), "{context}");
+                            if planned.1 > ranking.budgeted().len() {
+                                refilled += 1;
+                            }
+
+                            // The candidates path takes the same plan.
+                            let candidates = |budget| {
+                                fixture
+                                    .reader
+                                    .knn_candidates_fetching(FIELD, query, k, budget, accept, None)
+                                    .unwrap()
+                                    .unwrap()
+                            };
+                            let with_plan = candidates(KnnProbeBudget::Planned {
+                                ranking: &ranking,
+                                refill,
+                            });
+                            let without = candidates(KnnProbeBudget::Within {
+                                max_distance,
+                                max_probes,
+                                refill,
+                            });
+                            assert_eq!(with_plan.candidates, without.candidates, "{context}");
+                            assert_eq!(with_plan.postings, without.postings, "{context}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(refilled > 0, "some probe must have run past its budget");
+}
+
+#[test]
+fn a_ranking_of_another_shape_is_ignored() {
+    let fixture = Fixture::new("misfit");
+    let query = &queries()[1];
+    let mut bounds = fixture.reader.knn_centroid_distances(FIELD, query).unwrap();
+    // One score too many: not this column's ranking. Its first posting
+    // would otherwise be the only one probed.
+    bounds.push(0.0);
+    let misfit = KnnSegmentRanking::new(bounds, f32::INFINITY, 2);
+    let got = fixture
+        .reader
+        .knn_search_planned_fetching(FIELD, query, 10, &misfit, None, KnnRefill::Always, None)
+        .unwrap()
+        .unwrap();
+    let own = fixture
+        .reader
+        .knn_search_within_filtered(FIELD, query, 10, f32::INFINITY, 2, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!((bits(&got.0), got.1), (bits(&own.0), own.1));
+}
+
+#[test]
+fn centroids_are_one_row_major_matrix() {
+    let fixture = Fixture::new("flat-centroids");
+    let index = fixture.index();
+    let vi = index.lazy.as_ref().unwrap();
+    assert_eq!(vi.centroids.len(), vi.ranges.len() * vi.dim);
+    assert_eq!(vi.centroid_rows().count(), vi.ranges.len());
+    // Row `i` is what the offsets sidecar holds for posting `i`, and what
+    // compaction is handed.
+    let offsets = fs::read(fixture.dir.join("vector.offsets")).unwrap();
+    let parsed = parse_vector_offsets(&offsets, vi.dim as u32, vi.version).unwrap();
+    let layout = fixture
+        .reader
+        .vector_posting_layout(FIELD)
+        .unwrap()
+        .unwrap();
+    assert_eq!(parsed.len(), vi.ranges.len());
+    for (i, p) in parsed.iter().enumerate() {
+        assert_eq!(vi.centroid(i), p.centroid.as_slice(), "posting {i}");
+        assert_eq!(layout.postings[i].centroid, p.centroid, "posting {i}");
+    }
+}

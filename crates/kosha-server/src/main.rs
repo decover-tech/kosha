@@ -11135,8 +11135,8 @@ fn log_search_timing(
     // decode and dot, each summed across scoring threads.
     if phases.knn_mode.is_some() {
         knn_rescore.push_str(&format!(
-            " knn_read_ms={:.1} knn_decode_ms={:.1} knn_dot_ms={:.1} knn_postings_cached={}",
-            phases.knn_read_ms, phases.knn_decode_ms, phases.knn_dot_ms, phases.knn_postings_cached,
+            " knn_read_ms={:.1} knn_decode_ms={:.1} knn_dot_ms={:.1} knn_rank_ms={:.2} knn_postings_cached={}",
+            phases.knn_read_ms, phases.knn_decode_ms, phases.knn_dot_ms, phases.knn_rank_ms, phases.knn_postings_cached,
         ));
     }
     println!(
