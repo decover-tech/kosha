@@ -5,7 +5,7 @@ import type { Document, IndexDocumentsResponse } from "./types.js";
 export interface BulkOptions extends CallOptions {
   /** A batch closes at this many documents (default 500). */
   maxDocsPerBatch?: number;
-  /** ... or at this many bytes of serialized documents (default 8 MiB). */
+  /** ... or before its request body (the JSON sent, envelope included) would pass this many bytes (default 8 MiB). */
   maxBytesPerBatch?: number;
   /** Batches in flight at once (default 2). */
   concurrency?: number;
@@ -55,6 +55,10 @@ interface InFlight {
 }
 
 const encoder = new TextEncoder();
+// The request body is {"documents":[d1,d2,...]}: 16 bytes of envelope plus
+// each document and the commas between them. Sizing each document as its
+// bytes plus one counts one comma too many, so the envelope adds 15.
+const ENVELOPE_BYTES = '{"documents":[]}'.length - 1;
 
 export async function bulkIndex(
   ns: Upserter,
@@ -99,7 +103,7 @@ export async function bulkIndex(
     const bytes = encoder.encode(JSON.stringify(doc)).length + 1;
     const existing = current.get(doc.id);
     if (existing === undefined) {
-      if (current.size > 0 && (current.size >= maxDocsPerBatch || currentBytes + bytes > maxBytesPerBatch)) {
+      if (current.size > 0 && (current.size >= maxDocsPerBatch || ENVELOPE_BYTES + currentBytes + bytes > maxBytesPerBatch)) {
         await dispatch();
       }
       // A later write to an id that is still in flight waits for it, so the

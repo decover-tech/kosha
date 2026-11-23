@@ -114,7 +114,7 @@ describe("bulkIndex", () => {
     const big: Document = { id: "big", fields: [{ name: "title", field_type: "Text", value: "x".repeat(5000) }] };
     const docs = [doc(1), doc(2), big, doc(3)];
     const one = new TextEncoder().encode(JSON.stringify(doc(1))).length + 1;
-    const out = await ns.bulkIndex(docs, { maxBytesPerBatch: one * 2 + 1, concurrency: 1 });
+    const out = await ns.bulkIndex(docs, { maxBytesPerBatch: one * 2 + 15, concurrency: 1 });
     expect(out.batches).toBe(3);
     expect(server.requests.map((r) => r.body.documents.map((d: Document) => d.id))).toEqual([
       ["d0001", "d0002"],

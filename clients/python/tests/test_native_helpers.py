@@ -140,9 +140,49 @@ def test_bulk_index_splits_on_the_byte_cap():
     t = IndexTransport()
     big = {"id": "big", "fields": [{"name": "title", "field_type": "Text", "value": "x" * 5000}]}
     one = len(json.dumps(doc(1), separators=(",", ":")).encode()) + 1
-    out = client_with(t).bulk_index("n", [doc(1), doc(2), big, doc(3)], max_bytes_per_batch=2 * one + 1, concurrency=1)
+    # The body is {"documents":[...]}: the envelope adds 15 bytes.
+    out = client_with(t).bulk_index("n", [doc(1), doc(2), big, doc(3)], max_bytes_per_batch=2 * one + 15, concurrency=1)
     assert out["batches"] == 3
     assert [[i for i, _ in b] for b in t.batches] == [["d0001", "d0002"], ["big"], ["d0003"]]
+
+
+def test_bulk_index_caps_the_bytes_actually_sent():
+    """The cap bounds the HTTP body, non-ASCII text and envelope included."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    sizes = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            raw = self.rfile.read(int(self.headers["Content-Length"]))
+            sizes.append(len(raw))
+            body = json.dumps({"indexed_count": len(json.loads(raw)["documents"])}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        c = KoshaClient(f"http://127.0.0.1:{server.server_address[1]}", api_key="k", max_retries=1)
+        docs = [
+            {"id": f"j{i:02d}", "fields": [{"name": "title", "field_type": "Text", "value": "日本語のテキスト" * 8 + f" {i}"}]}
+            for i in range(40)
+        ]
+        out = c.bulk_index("n", docs, max_bytes_per_batch=4096, concurrency=1)
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert out["indexed"] == 40 and out["failures"] == []
+    assert len(sizes) == out["batches"] > 1
+    assert max(sizes) <= 4096
+    # Compact UTF-8, as the TypeScript and Go SDKs send: a full batch is
+    # close to the cap, not half of it as \uXXXX escapes would make it.
+    assert max(sizes) > 4096 - 300
 
 
 def test_bulk_index_reports_the_failed_batch():

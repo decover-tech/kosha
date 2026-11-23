@@ -9,13 +9,12 @@ bodies (``{"query_text": ..., "filter": ...}``, ``{"id": ..., "fields":
 
 from __future__ import annotations
 
-import json
 import threading
 import urllib.parse
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from typing import Any, Iterable, Iterator
 
-from .transport import KoshaRequestError, json_default
+from .transport import KoshaRequestError, encode_json
 
 DEFAULT_PAGE_SIZE = 500
 _ID_ASC = {"_id": {"order": "asc"}}
@@ -125,6 +124,12 @@ def search_all(transport: Any, namespace: str, body: dict, page_size: int | None
         cursor = nxt
 
 
+# The request body is {"documents":[d1,d2,...]}: 16 bytes of envelope plus
+# each document and the commas between them. Sizing each document as its
+# bytes plus one counts one comma too many, so the envelope adds 15.
+ENVELOPE_BYTES = len(b'{"documents":[]}') - 1
+
+
 def bulk_index(
     transport: Any,
     namespace: str,
@@ -181,12 +186,12 @@ def bulk_index(
                 if state["stopped"]:
                     break
             doc_id = doc["id"]
-            size = len(json.dumps(doc, default=json_default, separators=(",", ":"), ensure_ascii=False).encode()) + 1
+            size = len(encode_json(doc)) + 1  # the bytes sent, plus its comma
             if doc_id in current:
                 current_bytes += size - current[doc_id][1]
                 current[doc_id] = (doc, size)
                 continue
-            if current and (len(current) >= max_docs_per_batch or current_bytes + size > max_bytes_per_batch):
+            if current and (len(current) >= max_docs_per_batch or ENVELOPE_BYTES + current_bytes + size > max_bytes_per_batch):
                 dispatch()
             # A later write to an id still in flight waits for it, so the
             # later occurrence always wins.

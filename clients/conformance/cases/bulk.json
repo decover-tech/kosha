@@ -39,6 +39,27 @@
     ]
   },
   {
+    "id": "bulk.byte_cap_body",
+    "description": "max_bytes_per_batch bounds the request body actually sent, envelope and UTF-8 included: set to the tenant's max_body_bytes (4096), no batch is rejected. Each document is 255 bytes of compact UTF-8 JSON, so 15 fit (16 would be a 4111-byte body).",
+    "covers": ["KoshaService_IndexDocuments"],
+    "tenant": "small",
+    "setup": [
+      { "op": "create_namespace", "args": { "schema": { "fields": { "title": { "type": "text", "stored": true, "indexed": true } } } } }
+    ],
+    "steps": [
+      {
+        "op": "bulk_index",
+        "args": {
+          "documents": { "generate": { "count": 30, "id": "u{i:02}", "fields": { "title": { "type": "Text", "value": "検索エンジンのテスト検索エンジンのテスト検索エンジンのテスト検索エンジンのテスト検索エンジンのテスト検索エンジンのテスト {i:03}" } } } },
+          "max_bytes_per_batch": 4096,
+          "concurrency": 1,
+          "on_error": "continue"
+        },
+        "expect": { "indexed": 30, "batches": 2, "failed_ids": [] }
+      }
+    ]
+  },
+  {
     "id": "bulk.failed_batch",
     "description": "A batch over the tenant's body limit fails alone (413, never retried) and reports its ids; other batches land.",
     "covers": ["KoshaService_IndexDocuments"],

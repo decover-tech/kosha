@@ -18,7 +18,7 @@ the checked-in OpenAPI document (`api/openapi/v1/kosha.openapi.json`).
 
 | SDK | API | kosha-server | Go |
 |---|---|---|---|
-| 0.x (preview) | `/v1` | any server with `/v1`; error codes and `retryable` need API contract 1.0.0 or later (#350) | 1.25+ |
+| 0.x (preview) | `/v1` | any server with `/v1`; error codes and `retryable` need API contract 0.10.0 or later (#350) | 1.25+ |
 
 ## Use
 
@@ -70,7 +70,9 @@ if errors.As(err, &be) { /* be.Result.Failures[i].IDs, .Err */ }
 ```
 
 `BulkIndexSeq` takes an `iter.Seq[Document]` for streams. A batch closes at
-`MaxDocsPerBatch` (500) or `MaxBytesPerBatch` (8 MiB); one larger document
+`MaxDocsPerBatch` (500), or before the request body (the JSON sent, envelope
+included) would pass `MaxBytesPerBatch` (8 MiB), so the cap can be a
+tenant's `max_body_bytes`; one larger document
 is sent alone. A document whose id is in a batch still in flight waits for
 it; within a batch the last occurrence wins. By default the first failed
 batch stops dispatching and returns `*BulkError` with the partial result;

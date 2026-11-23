@@ -16,7 +16,7 @@ secrets, so do not ship them to a browser.
 
 | SDK | API | kosha-server |
 |---|---|---|
-| 0.x (preview) | `/v1` | any server with `/v1`; error codes and `retryable` need API contract 1.0.0 or later (#350) |
+| 0.x (preview) | `/v1` | any server with `/v1`; error codes and `retryable` need API contract 0.10.0 or later (#350) |
 
 Older servers still work: errors without a `code` surface as `code:
 "unknown"` (or the tenant-limit `reason`), and retries fall back to the
@@ -79,7 +79,9 @@ const result = await docs.bulkIndex(generateDocs(), { maxDocsPerBatch: 500, maxB
 ```
 
 `documents` may be any iterable or async iterable. A batch closes at
-`maxDocsPerBatch` documents or `maxBytesPerBatch` bytes of serialized JSON;
+`maxDocsPerBatch` documents, or before its request body (the JSON sent,
+envelope included) would pass `maxBytesPerBatch` bytes, so the cap can be a
+tenant's `max_body_bytes`;
 one larger document is sent alone and the server's verdict reported. Each
 batch goes through the retry policy. A document whose id is in a batch still
 in flight waits for it, and within a batch the last occurrence of an id

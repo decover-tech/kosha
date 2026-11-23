@@ -219,7 +219,7 @@ func TestBulkByteCap(t *testing.T) {
 	big := Document{Id: "big", Fields: []Field{{Name: "title", FieldType: FieldTypeText, Value: strings.Repeat("x", 5000)}}}
 	one := len(mustJSON(mkDoc(1, ""))) + 1
 	docs := []Document{mkDoc(1, ""), mkDoc(2, ""), big, mkDoc(3, "")}
-	res, err := testClient(t, f.URL).Namespace("n").BulkIndex(context.Background(), docs, BulkOptions{MaxBytesPerBatch: 2*one + 1, Concurrency: 1})
+	res, err := testClient(t, f.URL).Namespace("n").BulkIndex(context.Background(), docs, BulkOptions{MaxBytesPerBatch: 2*one + 15, Concurrency: 1})
 	if err != nil {
 		t.Fatal(err)
 	}

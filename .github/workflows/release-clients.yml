@@ -1,12 +1,14 @@
 name: release-clients
 
-# Publishes the TypeScript and Go SDKs (#351, ADR-351 §c). Only a tag
-# publishes:
+# Publishes the TypeScript, Go and Python SDKs (#351, ADR-351 §c). Only a
+# tag publishes:
 #
 #   tag clients/typescript/vX.Y.Z -> npm @decover/kosha@X.Y.Z (dist-tag
 #                                    "latest", or "next" for a prerelease)
 #   tag clients/go/vX.Y.Z         -> the Go module proxy picks up
 #                                    github.com/decover-tech/kosha/clients/go@vX.Y.Z
+#   tag clients/python/vX.Y.Z     -> PyPI kosha-client==X.Y.Z (replaces the
+#                                    manual `make client-python-publish`)
 #
 # Kept out of release.yml on purpose: that workflow's `v*` tag trigger,
 # AWS OIDC role and EKS deploys must stay one edit away from nothing an SDK
@@ -14,26 +16,30 @@ name: release-clients
 #
 # Credentials: none stored. npm uses trusted publishing (OIDC, `id-token:
 # write`; configure the trusted publisher for decover-tech/kosha +
-# release-clients.yml on npmjs.com first), and the Go module needs no
+# release-clients.yml on npmjs.com first), PyPI uses trusted publishing too
+# (configure the publisher for decover-tech/kosha + release-clients.yml +
+# environment `pypi` on pypi.org first), and the Go module needs no
 # credentials at all. The GitHub release uses the job's own GITHUB_TOKEN.
 # Nothing here echoes a secret; refs reach shell scripts only through env.
 #
 # workflow_dispatch rehearses a release without publishing: the same checks,
-# then `npm publish --dry-run` (TypeScript) or a local module check (Go).
-# Tags are never moved or deleted; retract a bad Go version in go.mod and
-# `npm deprecate` a bad npm version.
+# then `npm publish --dry-run` (TypeScript), a local module check (Go), or a
+# build plus `twine check` (Python). Tags are never moved or deleted; retract
+# a bad Go version in go.mod, `npm deprecate` a bad npm version and yank a
+# bad PyPI release.
 
 on:
   push:
     tags:
       - "clients/typescript/v*"
       - "clients/go/v*"
+      - "clients/python/v*"
   workflow_dispatch:
     inputs:
       sdk:
         description: SDK to rehearse (dry run; nothing is published)
         type: choice
-        options: [typescript, go]
+        options: [typescript, go, python]
 
 permissions:
   contents: read
@@ -162,3 +168,66 @@ jobs:
           awk -v v="$VERSION" '$0 ~ "^## \\[" v "\\]" {on=1; next} /^## \[/ {on=0} on' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
           flag=""; case "$VERSION" in *-*) flag="--prerelease" ;; esac
           gh release create "$TAG" --title "Go SDK $VERSION" --notes-file "$RUNNER_TEMP/notes.md" $flag
+
+  pypi:
+    name: PyPI kosha-client
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/clients/python/v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.sdk == 'python')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: write # the GitHub release
+      id-token: write # PyPI trusted publishing
+    defaults:
+      run:
+        working-directory: clients/python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: The version agrees with the tag
+        env:
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          grep -qx "### $version" README.md \
+            || { echo "::error::README.md has no '### $version' changelog entry"; exit 1; }
+          if [ "$EVENT" = push ] && [ "${TAG#clients/python/v}" != "$version" ]; then
+            echo "::error::tag $TAG does not match pyproject.toml version $version"; exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Unit tests
+        run: |
+          python -m pip install --upgrade pip
+          # pyyaml: tests/test_dsl_registry.py reads scripts/conformance/dsl/cases.yaml
+          python -m pip install -e . pytest pyyaml build twine
+          python -m pytest tests/ -q
+
+      - name: Build and check the distributions
+        run: |
+          rm -rf dist
+          python -m build
+          python -m twine check --strict dist/*
+
+      # Trusted publishing: the action trades the job's OIDC token for a
+      # short-lived upload token, so nothing is stored or printed.
+      - name: Publish
+        if: github.event_name == 'push'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: clients/python/dist
+
+      - name: GitHub release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          awk -v v="$VERSION" '$0 == "### " v {on=1; next} /^##/ {on=0} on' README.md > "$RUNNER_TEMP/notes.md"
+          flag=""; case "$VERSION" in *[a-z]*) flag="--prerelease" ;; esac
+          gh release create "$TAG" --title "Python client $VERSION" --notes-file "$RUNNER_TEMP/notes.md" $flag

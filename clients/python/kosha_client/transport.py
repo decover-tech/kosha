@@ -50,6 +50,19 @@ def json_default(data: Any) -> Any:
     raise TypeError(f"Unable to serialize {data!r} (type: {type(data)})")
 
 
+def encode_json(data: Any) -> bytes:
+    """The request-body encoding: compact JSON in UTF-8, as the TypeScript
+    (``JSON.stringify``) and Go (``json.Marshal``) SDKs send it.
+
+    ``bulk_index`` sizes batches with this same function, so the bytes it
+    counts are the bytes sent. A lone surrogate (not encodable in UTF-8)
+    becomes its ``\\uXXXX`` JSON escape, character by character, so the
+    encoding of a list is still the sum of its items' encodings.
+    """
+    text = json.dumps(data, default=json_default, separators=(",", ":"), ensure_ascii=False)
+    return text.encode("utf-8", "backslashreplace")
+
+
 # The retry policy (clients/conformance/RETRY.md), the same in the Python,
 # TypeScript and Go SDKs.
 DEFAULT_BASE_DELAY_MS = 250
@@ -68,11 +81,16 @@ def is_idempotent(method: str, path: str) -> bool:
     Idempotent: every GET, search, exists, upsert, merge, delete_by_query,
     flush and namespace delete. Not: namespace create, schema put, branch
     create and delete, shards, and any route this table does not know.
+
+    The deprecated ``POST /replace`` counts as merge: the client still sends
+    merges there against servers older than API 0.9.0 (``client._request``).
     """
     m = method.upper()
     if m in ("GET", "HEAD"):
         return True
     parts = [p for p in path.split("?", 1)[0].split("/") if p]
+    if m == "POST" and parts == ["replace"]:
+        return True
     if parts[:2] != ["v1", "namespaces"]:
         return False
     if m == "DELETE":
@@ -134,7 +152,9 @@ class Transport:
       every operation and 502/504 for idempotent ones;
     * a connection that could not be opened is retried for every operation;
       a timeout or reset after the request was sent only for idempotent ones
-      (or with ``retry_non_idempotent``), and only with ``retry_on_timeout``;
+      (or with ``retry_non_idempotent``). ``retry_on_timeout=False`` turns
+      off both, as in 0.2.x (no transport error is retried; HTTP responses
+      still follow the first rule);
     * the delay is the server's (``retry_after_ms``, then ``Retry-After``),
       else full-jitter backoff. A server delay over ``max_retry_after_ms``, a
       sleep past ``total_budget_ms``, or ``max_retries`` attempts ends it.
@@ -181,7 +201,7 @@ class Transport:
         """
         url = f"{self.base_url}/{path.lstrip('/')}"
         # Serialized once, so every attempt replays the same bytes.
-        data = json.dumps(body, default=json_default).encode() if body is not None else None
+        data = encode_json(body) if body is not None else None
         idempotent = is_idempotent(method, "/" + path.lstrip("/"))
         attempts = max(1, int(self.max_retries))
         started = time.monotonic()
@@ -219,10 +239,11 @@ class Transport:
                 cause = e
             except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
                 reason = e.reason if isinstance(e, urllib.error.URLError) else e
-                if _before_write(reason):
-                    retry = True
-                else:
-                    retry = self.retry_on_timeout and (idempotent or self.retry_non_idempotent)
+                # retry_on_timeout=False is 0.2.x's fail-fast on every
+                # transport error, before or after the write.
+                retry = self.retry_on_timeout and (
+                    _before_write(reason) or idempotent or self.retry_non_idempotent
+                )
                 error = KoshaRequestError(0, f"{method} {path} failed: {reason}")
                 cause = e
 

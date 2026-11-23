@@ -26,8 +26,9 @@ three SDKs and those cases together.
 ## Idempotent operations
 
 Every GET, search, exists, upsert (`POST .../documents`, keyed by the
-required id), merge (`POST .../replace`), delete_by_query, flush and
-namespace delete.
+required id), merge (`POST .../replace`, and in the Python client also the
+deprecated `POST /replace` it falls back to on servers older than API
+0.9.0), delete_by_query, flush and namespace delete.
 
 Not idempotent: namespace create, schema put, branch create and delete,
 shards, and any route the SDK does not know (`request()` / `Do`).

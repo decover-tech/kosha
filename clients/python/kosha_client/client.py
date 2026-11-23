@@ -88,7 +88,8 @@ class KoshaClient:
         # attempts (1 = fail fast). 429/503 and ``"retryable": true`` errors
         # are retried after the server's delay; a timeout after the request
         # was sent is retried only for idempotent operations, unless
-        # ``retry_non_idempotent`` (and never without ``retry_on_timeout``).
+        # ``retry_non_idempotent``. ``retry_on_timeout=False`` stops every
+        # transport-error retry (timeouts, resets, refused connections, DNS).
         # Normalise the Kosha base URL.  Resolution order:
         #   1. ``hosts`` arg (opensearchpy-compatible)
         #   2. ``KOSHA_HOST`` env var (customer-friendly)
@@ -2016,9 +2017,11 @@ class KoshaClient:
     ) -> dict:
         """Upsert native documents (``{"id", "fields": [...]}``) in batches.
 
-        A batch closes at ``max_docs_per_batch`` documents or
-        ``max_bytes_per_batch`` bytes of serialized JSON; a single larger
-        document is sent alone. Up to ``concurrency`` batches are in flight,
+        A batch closes at ``max_docs_per_batch`` documents, or before its
+        request body (the compact UTF-8 JSON actually sent, envelope
+        included) would pass ``max_bytes_per_batch`` bytes, so the cap can be
+        set to a tenant's ``max_body_bytes``; a single larger document is
+        sent alone. Up to ``concurrency`` batches are in flight,
         each through the retry policy. A document whose id is in a batch
         still in flight waits for it, and within a batch the last occurrence
         of an id wins. Never flushes.

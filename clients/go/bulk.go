@@ -13,8 +13,10 @@ import (
 type BulkOptions struct {
 	// MaxDocsPerBatch closes a batch at this many documents (default 500).
 	MaxDocsPerBatch int
-	// MaxBytesPerBatch closes a batch at this many bytes of serialized
-	// documents (default 8 MiB). A single larger document is sent alone.
+	// MaxBytesPerBatch closes a batch before its request body (the JSON
+	// sent, envelope included) would pass this many bytes (default 8 MiB),
+	// so it can be set to a tenant's max_body_bytes. A single larger
+	// document is sent alone.
 	MaxBytesPerBatch int
 	// Concurrency is the number of batches in flight (default 2).
 	Concurrency int
@@ -53,6 +55,12 @@ func (e *BulkError) Unwrap() error { return e.Result.Failures[0].Err }
 func (n *Namespace) BulkIndex(ctx context.Context, docs []Document, opts BulkOptions, callOpts ...CallOption) (*BulkResult, error) {
 	return n.BulkIndexSeq(ctx, slices.Values(docs), opts, callOpts...)
 }
+
+// envelopeBytes: the request body is {"documents":[d1,d2,...]}, 16 bytes of
+// envelope plus each document and the commas between them. Sizing each
+// document as its bytes plus one counts one comma too many, so the envelope
+// adds 15.
+const envelopeBytes = len(`{"documents":[]}`) - 1
 
 type flight struct {
 	ids  map[string]struct{}
@@ -185,7 +193,7 @@ func (n *Namespace) BulkIndexSeq(ctx context.Context, docs iter.Seq[Document], o
 			cur.bytes += size - old
 			continue
 		}
-		if len(cur.order) > 0 && (len(cur.order) >= maxDocs || cur.bytes+size > maxBytes) {
+		if len(cur.order) > 0 && (len(cur.order) >= maxDocs || envelopeBytes+cur.bytes+size > maxBytes) {
 			dispatch()
 		}
 		if waits := blockers(doc.Id); len(waits) > 0 {

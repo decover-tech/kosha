@@ -102,6 +102,9 @@ quickstart:
 client-python-build:
 	$(PYTHON) -m build clients/python
 
+# Releases go out from CI: push a clients/python/vX.Y.Z tag and
+# .github/workflows/release-clients.yml publishes to PyPI with trusted
+# publishing. This manual twine upload is the fallback only.
 client-python-publish:
 	$(PYTHON) -m twine upload clients/python/dist/*
 

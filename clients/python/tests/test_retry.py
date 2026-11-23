@@ -187,6 +187,17 @@ def test_a_refused_connection_is_retried_for_any_operation():
         transport(f"http://127.0.0.1:{port}").request("POST", "v1/namespaces", {"namespace": "a"})
     assert e.value.attempts == 3
     assert e.value.status_code == 0
+    # retry_on_timeout=False is 0.2.x's fail-fast on every transport error.
+    with pytest.raises(KoshaRequestError) as off:
+        transport(f"http://127.0.0.1:{port}", retry_on_timeout=False).request("GET", "v1/namespaces")
+    assert off.value.attempts == 1
+
+
+def test_a_legacy_merge_timeout_is_retried(serve):
+    s = serve((200, {}, {}, 0.5))
+    with pytest.raises(KoshaRequestError) as e:
+        transport(s.url, timeout=0.1, max_retries=2).request("POST", "replace", {"namespace": "a", "documents": []})
+    assert e.value.attempts == 2
 
 
 def test_error_fallbacks(serve):
@@ -216,7 +227,10 @@ def test_idempotency_table():
     assert not is_idempotent("POST", "/v1/namespaces/a/branch")
     assert not is_idempotent("DELETE", "/v1/namespaces/a/branch")
     assert not is_idempotent("POST", "/v1/namespaces/a/shards")
-    assert not is_idempotent("POST", "/replace")
+    # The deprecated merge route the client falls back to on pre-0.9 servers.
+    assert is_idempotent("POST", "/replace")
+    assert not is_idempotent("POST", "/index")
+    assert not is_idempotent("POST", "/v1/replace")
 
 
 def test_parse_retry_after():
