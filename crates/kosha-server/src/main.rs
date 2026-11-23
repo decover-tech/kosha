@@ -14462,6 +14462,122 @@ mod tests {
         assert!(rest.contains("\"a2\""), "{rest}");
     }
 
+    /// Finding 37: Elasticsearch-style callers send JSON booleans in `term`
+    /// / `terms` (the Decover backend's `{"term": {"isFiltered": false}}`);
+    /// that was a 400 on search, count and delete. A boolean now matches
+    /// what ingest stored for a `Boolean` field. A number is still the same
+    /// 400 and deletes nothing.
+    #[test]
+    fn bool_term_and_terms_match_stored_booleans_on_search_count_and_delete() {
+        let state = test_state();
+        let ns = NamespaceId("bool-terms".into());
+        for batch in [[("a", true), ("b", false)], [("c", true), ("d", false)]] {
+            state
+                .indexer
+                .index_documents(
+                    ns.clone(),
+                    batch
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (id, hot))| Document {
+                            id: DocumentId((*id).into()),
+                            fields: vec![
+                                Field::text("text", "hello"),
+                                Field::boolean("isHot", *hot),
+                                Field::integer("page", i as i64),
+                            ],
+                        })
+                        .collect(),
+                )
+                .unwrap();
+            state.indexer.flush_namespace(&ns).unwrap();
+        }
+        let search = |filter: &str| {
+            handle_search_post(
+                format!(
+                    r#"{{"namespace":"bool-terms","query_text":"hello","no_cache":true,
+                        "filter":{filter}}}"#
+                )
+                .as_bytes(),
+                &state,
+            )
+        };
+        let total = |filter: &str| -> u64 {
+            let response = search(filter);
+            assert!(response.starts_with("HTTP/1.1 200"), "{filter}: {response}");
+            json_body(&response)["total_hits"].as_u64().unwrap()
+        };
+        let count = |filter: &str| -> u64 {
+            // The client's count(): no hits, an exact total.
+            let response = handle_search_post(
+                format!(
+                    r#"{{"namespace":"bool-terms","query_text":"hello","no_cache":true,
+                        "max_results":0,"exact_total_hits":true,"filter":{filter}}}"#
+                )
+                .as_bytes(),
+                &state,
+            );
+            assert!(response.starts_with("HTTP/1.1 200"), "{filter}: {response}");
+            json_body(&response)["total_hits"].as_u64().unwrap()
+        };
+
+        assert_eq!(total(r#"{"term":{"isHot":true}}"#), 2);
+        assert_eq!(total(r#"{"term":{"isHot":false}}"#), 2);
+        assert_eq!(total(r#"{"term":{"isHot":"true"}}"#), 2);
+        assert_eq!(total(r#"{"terms":{"isHot":[true]}}"#), 2);
+        assert_eq!(total(r#"{"terms":{"isHot":[true,false]}}"#), 4);
+        assert_eq!(
+            total(r#"{"bool":{"must_not":[{"term":{"isHot":false}}]}}"#),
+            2
+        );
+        let hit_ids = |filter: &str| -> Vec<String> {
+            let mut ids: Vec<String> = json_body(&search(filter))["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|hit| hit["doc_id"].as_str().unwrap().to_owned())
+                .collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(hit_ids(r#"{"term":{"isHot":true}}"#), ["a", "c"]);
+        assert_eq!(
+            hit_ids(r#"{"term":{"isHot":true}}"#),
+            hit_ids(r#"{"term":{"isHot":"true"}}"#)
+        );
+        assert_eq!(count(r#"{"term":{"isHot":true}}"#), 2);
+        assert_eq!(count(r#"{"terms":{"isHot":[false]}}"#), 2);
+
+        // Numbers: unchanged 400, on search and on delete.
+        let numeric = search(r#"{"term":{"page":1}}"#);
+        assert!(numeric.starts_with("HTTP/1.1 400"), "{numeric}");
+        assert!(
+            numeric.contains("invalid search query: invalid type: integer `1`, expected a string"),
+            "{numeric}"
+        );
+        for filter in [r#"{"term":{"page":1}}"#, r#"{"terms":{"page":[0,1]}}"#] {
+            let body = format!(r#"{{"namespace":"bool-terms","filter":{filter}}}"#);
+            let response = handle_delete(body.as_bytes(), &state);
+            assert!(response.starts_with("HTTP/1.1 400"), "{filter}: {response}");
+            assert!(response.contains("invalid type: integer"), "{response}");
+        }
+        assert_eq!(total(r#"{"match_all":{}}"#), 4, "a 400 deleted something");
+
+        let response = handle_delete(
+            br#"{"namespace":"bool-terms","query":{"term":{"isHot":false}}}"#,
+            &state,
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("\"deleted\":2"), "{response}");
+        assert_eq!(hit_ids(r#"{"match_all":{}}"#), ["a", "c"]);
+        let response = handle_delete(
+            br#"{"namespace":"bool-terms","filter":{"terms":{"isHot":[true]}}}"#,
+            &state,
+        );
+        assert!(response.contains("\"deleted\":2"), "{response}");
+        assert_eq!(total(r#"{"match_all":{}}"#), 0);
+    }
+
     #[test]
     fn regression_query_replica_observes_published_deletes() {
         let ingest = test_state();
