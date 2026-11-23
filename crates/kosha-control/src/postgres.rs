@@ -102,7 +102,7 @@ fn is_migration_race(e: &sqlx::Error) -> bool {
         .is_some_and(|code| MIGRATION_RACE_SQLSTATES.contains(&code.as_ref()))
 }
 
-/// Apply the embedded migrations (001, both 003 files, 004, 005, 006, 007, then 009) in one transaction on one
+/// Apply the embedded migrations (001, both 003 files, 004, 005, 006, 007, 008, then 009) in one transaction on one
 /// connection, holding a transaction-scoped advisory lock for its duration.
 ///
 /// Concurrent constructors against a fresh database (several pods booting
@@ -132,7 +132,7 @@ async fn run_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
 /// "migration 003_scoped_api_keys failed" for 003_scoped_api_keys,
 /// "migration 004 failed" for 004, "migration 005 failed" for 005,
 /// "migration 006 failed" for 006, "migration 007 failed" for 007,
-/// "migration 009 failed" for 009.
+/// "migration 008 failed" for 008, "migration 009 failed" for 009.
 async fn migrate_once(pool: &sqlx::PgPool) -> Result<(), (sqlx::Error, &'static str)> {
     const FAILED: &str = "migration failed";
     let mut tx = pool.begin().await.map_err(|e| (e, FAILED))?;
@@ -182,6 +182,12 @@ async fn migrate_once(pool: &sqlx::PgPool) -> Result<(), (sqlx::Error, &'static 
         .execute(&mut *tx)
         .await
         .map_err(|e| (e, "migration 007 failed"))?;
+    // Sign-up, sessions, identities, SSO (#345 part 2): additive, idempotent.
+    let migration = include_str!("../migrations/008_identity_sessions.sql");
+    sqlx::raw_sql(migration)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (e, "migration 008 failed"))?;
     // Automatic plaintext scrub of API keys (#346): one additive table.
     let migration = include_str!("../migrations/009_api_key_scrub.sql");
     sqlx::raw_sql(migration)

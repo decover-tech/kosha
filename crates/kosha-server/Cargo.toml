@@ -65,6 +65,14 @@ crc32fast = "1"
 # itself, like this workspace.
 prometheus-client = "0.26"
 fail = "0.5"
+# The self-service console (#345): ID-token signatures (RS256/ES256), PKCE
+# and token randomness, and sealing organizations' OIDC client secrets
+# (AES-256-GCM). Already in the tree as rustls's crypto provider; no
+# default features, so nothing new is built.
+aws-lc-rs = { version = "=1.17.3", default-features = false, features = ["aws-lc-sys"] }
+# Certificate verification for the console's SMTP mailer (STARTTLS or
+# implicit TLS), the same OS-trust verifier reqwest already uses.
+rustls-platform-verifier = "=0.7.0"
 
 # Cache writeback control (writeback.rs): start writing a freshly filled
 # cache range to disk without waiting, and `syncfs` before the pod reports

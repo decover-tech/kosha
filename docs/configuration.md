@@ -581,6 +581,40 @@ connection stays open for the next request. `KOSHA_TLS_CERT_PATH` turns HTTPS on
 route on the port, client-facing and `/internal/*` alike. The clients that call other pods are
 configured separately, in the next section.
 
+### Self-service console
+
+Sign-up, sessions, OAuth/OIDC sign-in and the web console at `/console` (#345); see
+[organizations.md](organizations.md#self-service-console). All of it is off unless
+`KOSHA_CONSOLE` is on. Flags here accept `enabled`/`on`/`true`/`1`/`yes` and
+`disabled`/`off`/`false`/`0`/`no`; any other value, and any other configuration error while
+the console is on, stops the server at startup (`console.rs`, `Console::from_env`). Use
+Postgres in production: without it accounts live in one process's memory.
+
+| Variable | Purpose | Default | Units |
+| --- | --- | --- | --- |
+| `KOSHA_CONSOLE` | Serve the console API (`/v1/console/*`) and web UI (`/console`). Off: both are 404 | off | flag |
+| `KOSHA_CONSOLE_PUBLIC_URL` | The origin users reach the console at, e.g. `https://kosha.example.com` (no path). Required with `KOSHA_CONSOLE`. Email links and OAuth redirect URIs are built from it, and a state-changing request whose `Origin` differs is refused. `http://` only for `localhost`/`127.0.0.1` | unset | URL |
+| `KOSHA_SIGNUP` | Open self-serve sign-up (email + password, and account creation through Google/GitHub). Off: accounts come from invites, SSO or the operator | off | flag |
+| `KOSHA_SIGNUP_EMAIL_DOMAINS` | Comma-separated domains open sign-up is limited to (`example.com,example.org`). Empty: any domain | unset | list |
+| `KOSHA_SESSION_TTL_HOURS` | Absolute lifetime of a console session | `24` | hours |
+| `KOSHA_SESSION_IDLE_MINUTES` | A session unused for this long ends | `120` | minutes |
+| `KOSHA_CONSOLE_SECRET_KEY` | 32 bytes (64 hex characters or base64) that seal organizations' OIDC client secrets in Postgres (AES-256-GCM). Unset: organization SSO is off. Keep it in a secret; changing it makes stored client secrets unreadable (owners re-enter them) | unset | key |
+| `KOSHA_CONSOLE_CLIENT_IP_HEADER` | Header a trusted proxy puts the client address in (e.g. `x-forwarded-for`; the right-most entry is used), for the per-IP attempt limits. Unset: the TCP peer address. Set it only behind a proxy that overwrites the header | unset (peer address) | header name |
+| `KOSHA_MAILER` | `log` prints mails (with their links) to the server log, for development; `smtp` sends through `KOSHA_SMTP_*` (`mailer.rs`) | `log` | `log` \| `smtp` |
+| `KOSHA_SMTP_HOST` | SMTP relay host. Required with `KOSHA_MAILER=smtp` | unset | host |
+| `KOSHA_SMTP_PORT` | SMTP relay port | `587` (`465` with `KOSHA_SMTP_TLS=tls`) | port |
+| `KOSHA_SMTP_TLS` | `starttls` (required, never falls back to plain text), `tls` (implicit TLS) or `none` (plain text, no credentials allowed: a relay on the same host). Certificates are verified against the OS trust store | `starttls` | mode |
+| `KOSHA_SMTP_USERNAME` | SMTP `AUTH PLAIN` user; set with `KOSHA_SMTP_PASSWORD` or not at all | unset | string |
+| `KOSHA_SMTP_PASSWORD` | SMTP password | unset | string |
+| `KOSHA_MAIL_FROM` | Sender address of console mails. Required with `KOSHA_MAILER=smtp` | unset | address |
+| `KOSHA_OAUTH_GOOGLE_CLIENT_ID` | Google OAuth client (web application). With the secret, turns on "Continue with Google". Redirect URI to register: `<public URL>/v1/console/oauth/google/callback` | unset (off) | string |
+| `KOSHA_OAUTH_GOOGLE_CLIENT_SECRET` | Its client secret | unset | string |
+| `KOSHA_OAUTH_GITHUB_CLIENT_ID` | GitHub OAuth app. With the secret, turns on "Continue with GitHub". Callback URL: `<public URL>/v1/console/oauth/github/callback` | unset (off) | string |
+| `KOSHA_OAUTH_GITHUB_CLIENT_SECRET` | Its client secret | unset | string |
+
+Organization SSO (OIDC) is configured per organization in the console, not here; its
+redirect URI is `<public URL>/v1/console/sso/callback`. SAML is not supported yet.
+
 ### TLS between pods
 
 Pod-to-pod traffic is peer hydration (`GET /internal/segment/...`, query pod to query pod) and

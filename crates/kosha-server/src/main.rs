@@ -40,6 +40,10 @@ mod authz;
 mod branching;
 mod cache_reads;
 mod compaction_sched;
+// Self-service console (#345): sign-up, sessions, OAuth/SSO, `/console`.
+mod console;
+mod console_crypto;
+mod console_oauth;
 mod dashboard;
 mod deletion_purge;
 mod doc_spans;
@@ -53,6 +57,7 @@ mod http;
 #[cfg(feature = "s3")]
 mod hydration_budget;
 mod internal_tls;
+mod mailer;
 mod manifest_follow;
 mod metrics;
 #[cfg(feature = "migrate")]
@@ -527,6 +532,14 @@ struct AppState {
     unindexed: unindexed::UnindexedState,
     /// `KOSHA_DASHBOARD` and the per-namespace recent-query rings (#214).
     dashboard: dashboard::Dashboard,
+    /// `KOSHA_CONSOLE`: the self-service console (#345), `/v1/console/*`
+    /// and `/console`.
+    console: console::Console,
+    /// Tests only: the API-key table requests authenticate against instead
+    /// of the process-wide one (`auth::global()`, which unit tests leave
+    /// disabled), so a test can prove a key it created really works.
+    #[cfg(test)]
+    auth_override: Option<auth::Auth>,
 }
 
 /// One cached merged manifest over a sharded namespace (#207).
@@ -2302,7 +2315,19 @@ impl AppState {
             unindexed_cap: unindexed::UnindexedCap::from_env(),
             unindexed: unindexed::UnindexedState::new(query_role),
             dashboard: dashboard::Dashboard::from_env(),
+            console: console::Console::from_env(),
+            #[cfg(test)]
+            auth_override: None,
         }
+    }
+
+    /// The API-key table: `auth::global()`, or a test's own.
+    fn auth(&self) -> &auth::Auth {
+        #[cfg(test)]
+        if let Some(auth) = &self.auth_override {
+            return auth;
+        }
+        auth::global()
     }
 
     /// Construct inside an `Arc` with `self_ref` wired up — the constructor
@@ -6829,6 +6854,17 @@ fn dispatch(state: &AppState, request: http::Request) -> http::Response {
         return http::Response::from_raw(resp);
     }
 
+    // Self-service console (#345): `/console` and `/v1/console/*`, answered
+    // here, before API keys: these routes authenticate with a session
+    // cookie, and a session never reaches anything below. 404 unless
+    // KOSHA_CONSOLE is on.
+    if let Some(response) = console::handle(state, &request_line, &headers, &body) {
+        if response.status() >= 400 {
+            log_request(&request_line, "console", body.len(), &response, started);
+        }
+        return response;
+    }
+
     // ── API key authentication ──────────────────────────────────────────
     // Per proto/kosha/v1/kosha.proto: Authorization: Bearer <key> or X-Api-Key.
     let mut tenant_key = None;
@@ -6841,7 +6877,7 @@ fn dispatch(state: &AppState, request: http::Request) -> http::Response {
         // allow-list cover this request (#346). Checked here, ahead of
         // the role routing below, so a query pod refuses a request itself
         // instead of forwarding it to the ingest pod.
-        authenticate(&headers).and_then(|principal| {
+        authenticate(&headers, state.auth()).and_then(|principal| {
             let (method, path) = parse_method_and_path(&request_line).unwrap_or(("", ""));
             match authz::authorize(&principal, method, path, &body) {
                 Ok(()) => {
@@ -7513,8 +7549,11 @@ fn request_log_line(
 
 /// Extract and validate the API key from request headers.
 /// Returns who the key authenticates as, or a 401 response string on failure.
-fn authenticate(headers: &HashMap<String, String>) -> Result<auth::Principal, String> {
-    let store = match auth::global() {
+fn authenticate(
+    headers: &HashMap<String, String>,
+    auth: &auth::Auth,
+) -> Result<auth::Principal, String> {
+    let store = match auth {
         // Only reachable with an explicit `KOSHA_AUTH=disabled`; an empty
         // key set no longer means "auth off" (see `auth::init_global`).
         auth::Auth::Disabled => return Ok(auth::Principal::full("dev")),
@@ -7732,7 +7771,7 @@ fn admin_actor(
     headers: &HashMap<String, String>,
     state: &AppState,
 ) -> Option<kosha_control::orgs::Actor> {
-    admin_actor_in(headers, state.admin_auth_key.as_deref(), auth::global())
+    admin_actor_in(headers, state.admin_auth_key.as_deref(), state.auth())
 }
 
 /// A tenant id as presented on a request: non-empty, not `.` or `..`, and
@@ -7779,7 +7818,7 @@ fn route(
             return json_error(403, "admin credential required");
         };
         // Organizations, users, projects, audit log (#345).
-        let key_table = match auth::global() {
+        let key_table = match state.auth() {
             auth::Auth::Keys(keys) => Some(keys),
             auth::Auth::Disabled => None,
         };
@@ -8481,7 +8520,19 @@ fn branches_referencing(
 fn handle_delete_namespace(name: &str, tenant: &str, state: &AppState) -> String {
     let id = NamespaceId(tenant_namespace(tenant, name));
     match state.delete_namespace_recorded(&id, None) {
-        Ok(deleted) => namespace_deletion::namespace_deleted_response(name, &deleted),
+        Ok(deleted) => {
+            // #345: audited for a tenant an organization owns.
+            console::audit_tenant_event(
+                state,
+                tenant,
+                &format!("tenant:{tenant}"),
+                "namespace.deleted",
+                "namespace",
+                name,
+                serde_json::json!({ "deletion_id": deleted.record.id }),
+            );
+            namespace_deletion::namespace_deleted_response(name, &deleted)
+        }
         Err(response) => response,
     }
 }

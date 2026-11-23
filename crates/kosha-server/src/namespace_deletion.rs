@@ -733,6 +733,16 @@ pub(crate) fn handle_delete_tenant(
     };
     let done = state.delete_tenant(auth, &record);
     let completed = done.record.is_completed();
+    // #345: audited for a tenant an organization owns.
+    crate::console::audit_tenant_event(
+        state,
+        tenant,
+        "operator",
+        "tenant.deleted",
+        "tenant",
+        tenant,
+        serde_json::json!({ "deletion_id": done.record.id, "completed": completed }),
+    );
     let body = serde_json::json!({
         "tenant": tenant,
         "acknowledged": true,

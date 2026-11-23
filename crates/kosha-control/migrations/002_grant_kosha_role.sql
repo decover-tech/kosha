@@ -37,5 +37,13 @@ ALTER TABLE IF EXISTS kosha.audit_log OWNER TO kosha;
 -- 007_billing.sql (#349). IF EXISTS for the same reason.
 ALTER TABLE IF EXISTS kosha.billing_accounts OWNER TO kosha;
 ALTER TABLE IF EXISTS kosha.billing_invoices OWNER TO kosha;
+-- 008_identity_sessions.sql (#345 part 2). IF EXISTS for the same reason.
+ALTER TABLE IF EXISTS kosha.user_credentials OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.auth_tokens OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.sessions OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.user_identities OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.org_sso OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.login_flows OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.api_key_creators OWNER TO kosha;
 -- 009_api_key_scrub.sql (#346). IF EXISTS for the same reason.
 ALTER TABLE IF EXISTS kosha.api_key_scrub OWNER TO kosha;

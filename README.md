@@ -346,6 +346,7 @@ own document, or combine the two values into one leaf (`"name_org": "Ada|beta"`)
 - `GET /healthz` (liveness), `GET /readyz` (readiness), `GET /v1/stats` and per-namespace stats.
 - `GET /metrics` in Prometheus text format: search outcomes and latency histograms, queue depth, cache bytes, hydrations and lease outcomes, degraded kNN segments. Unauthenticated by default (`KOSHA_METRICS_AUTH=admin` to require the admin key, `KOSHA_METRICS=off` to disable). See [docs/metrics.md](docs/metrics.md).
 - A built-in read-only dashboard at `/dashboard` (#214), off by default (`KOSHA_DASHBOARD=on`): the tenant's namespaces, per-namespace detail with a recent-latency sparkline, and a query console that shows hits, scores and the timing breakdown and flags `knn_degraded_segments` in red. It calls the normal API with the key pasted into the page. See [docs/dashboard.md](docs/dashboard.md).
+- A self-service console (#345), off by default (`KOSHA_CONSOLE=enabled`): sign-up with email verification (`KOSHA_SIGNUP=enabled`), password login and reset, Google and GitHub sign-in, per-organization OIDC single sign-on, and a web UI at `/console` for organizations, members and invites, projects, tenants, API keys (shown once), namespaces with document counts and sizes, usage, plan, the audit log and SSO settings. Sessions are cookies that authenticate the console only; the data plane keeps using API keys. SAML is not supported yet. See [docs/organizations.md](docs/organizations.md#self-service-console).
 - Admin endpoints: create API key, rebuild filter blooms, backfill offset tables, compact a namespace (sync or async), compaction job and scheduler status, warmup status, import a namespace.
 - Schema migrations via `kosha-server migrate`.
 - Usage metering per tenant and namespace (#348), off by default (`KOSHA_USAGE_METERING=on`): searches, bytes returned and fetched, bytes and documents written, and an hourly stored-bytes snapshot, as idempotent raw events in `kosha.usage_events` (migration 005), read back with `GET /v1/usage`. See "Usage metering" in [docs/configuration.md](docs/configuration.md).
@@ -498,6 +499,7 @@ the routes marked *write* to the ingest pod.
 | `GET /v1/healthz`, `GET /healthz`, `GET /readyz` | | Unauthenticated probes. |
 | `GET /metrics` | → Prometheus text format | Unauthenticated unless `KOSHA_METRICS_AUTH=admin`; see [docs/metrics.md](docs/metrics.md). |
 | `GET /dashboard` | | Read-only web UI, `KOSHA_DASHBOARD=on` only (404 otherwise); see [docs/dashboard.md](docs/dashboard.md). |
+| `GET /console`, `/v1/console/*` | | Self-service console and its API, `KOSHA_CONSOLE=enabled` only (404 otherwise). Session cookie, never an API key; see [docs/organizations.md](docs/organizations.md#self-service-console). |
 | `GET /v1/usage` | → `{"tenant", "from", "to", "namespaces": [...], "total"}` | The caller's usage per namespace over `?from=&to=` (Unix seconds, default the last 30 days). 404 unless `KOSHA_USAGE_METERING=on`. `GET /v1/admin/usage[?tenant=]` is the admin view. |
 | `GET /v1/admin/usage/reconcile` | → `{"within_tolerance", "namespaces": [{"tenant", "namespace", "control_plane", "snapshot_bytes", "storage", "difference_bytes", "status"}], "totals", "unattributed", "skipped_prefixes", "warnings"}` | Admin key. Stored-bytes snapshots against object storage, per namespace; `?tenant=&tolerance=&tolerance_bytes=&max_snapshot_age=`. 404 unless `KOSHA_USAGE_METERING=on`. |
 | `GET /v1/billing` | → `{"tenant", "plan", "kind", "state", "free_tier_exceeded", "period", "usage", "accrued", "invoices"}` | The caller's plan, payment state, month-to-date usage with the charge accrued so far, and invoices. 404 unless `KOSHA_BILLING=on`. The admin routes are under `/v1/admin/billing/`. |
@@ -799,6 +801,12 @@ and the server logs a warning at startup for any in `KOSHA_API_KEYS`.
   under `/v1/admin/users` and `/v1/admin/orgs`; see
   [docs/organizations.md](docs/organizations.md). Existing tenants and keys need
   no migration.
+- `KOSHA_CONSOLE=enabled` lets users sign up (with `KOSHA_SIGNUP=enabled`),
+  sign in and manage their organizations and keys themselves at `/console`;
+  set `KOSHA_CONSOLE_PUBLIC_URL`, a real mailer (`KOSHA_MAILER=smtp`) and, for
+  organization SSO, `KOSHA_CONSOLE_SECRET_KEY`. See
+  [docs/organizations.md](docs/organizations.md#self-service-console) and
+  "Self-service console" in [docs/configuration.md](docs/configuration.md).
 - Set a separate `KOSHA_INTERNAL_API_KEY` on every peer participating in segment
   hydration. Tenant API keys do not authorize admin or peer-file access.
 - Both service capabilities are disabled when their respective secret is unset.
