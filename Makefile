@@ -8,6 +8,10 @@
 #   make rust-build       — build Rust binary
 #   make cli-assets       — kosha shell completions + man pages into target/cli-assets
 #   make client-python-test — run Python client unit tests (+ the copy script smoke test)
+#   make clients-gen      — regenerate the TypeScript and Go SDK types from api/openapi
+#   make clients-gen-check — clients-gen, then fail on drift (+ conformance coverage)
+#   make clients-test     — TypeScript and Go SDK unit tests
+#   make clients-conformance — compose stack + the shared SDK conformance suite
 #   make bench-hook-test   — run commit_bench_section.sh regression tests
 #   make migration-job-manifest MIGRATION_INDICES="a b" — regen the ES→Kosha backfill Job YAML
 #   make compat-matrix    — regen docs/compat/opensearch.{md,json} (KOSHA_BIN=... runs it live)
@@ -104,6 +108,46 @@ client-python-publish:
 client-python-test:
 	$(PYTHON) -m pip install -e clients/python pytest pyyaml
 	$(PYTHON) -m pytest clients/python/tests/ scripts/tests/ -q
+
+# ── TypeScript and Go SDKs (#351, ADR-351) ─────────────────────────────────
+#
+# Types are generated from the checked-in OpenAPI 3 document; the generated
+# files are committed and `clients-gen-check` (CI: clients.yml) fails on
+# drift. The Go generator is pinned in clients/go/tools/go.mod, the TS one in
+# clients/typescript/package-lock.json.
+
+.PHONY: clients-gen clients-gen-check clients-test clients-conformance clients-conformance-run
+
+CLIENTS_COMPOSE := docker compose -f docker-compose.yml \
+	-f scripts/integration/docker-compose.integration.yml \
+	-f clients/conformance/docker-compose.clients.yml
+
+clients-gen:
+	cd clients/typescript && npm ci --no-audit --no-fund && npm run gen
+	cd clients/go && $(GO) tool -modfile=tools/go.mod oapi-codegen -config oapi-codegen.yaml ../../$(API_SPEC_DIR)/kosha.openapi.json
+
+clients-gen-check: clients-gen
+	@git diff --exit-code --stat -- clients/typescript/src/generated clients/go/zz_generated_types.go || \
+		(echo "generated SDK types are stale: run 'make clients-gen' and commit the result" && exit 1)
+	$(PYTHON) clients/conformance/check_coverage.py
+	@test "$$(cd clients/go && $(GO) list -m all)" = "github.com/decover-tech/kosha/clients/go" || \
+		(echo "clients/go must have no dependencies outside the standard library" && exit 1)
+
+clients-test:
+	cd clients/typescript && npm ci --no-audit --no-fund && npm run typecheck && npm test
+	cd clients/go && $(GO) vet ./... && $(GO) test -race ./...
+
+# Brings up the read/write split stack with the conformance overlay, then
+# runs the Python, TypeScript and Go runners through faultproxy.py.
+clients-conformance:
+	$(CLIENTS_COMPOSE) up --build -d
+	scripts/integration/wait_ready.sh 8080 8081
+	$(MAKE) clients-conformance-run
+
+# Against an already-running stack (KOSHA_CONFORMANCE_UPSTREAM, default the
+# query pod on :8081).
+clients-conformance-run:
+	PYTHON=$(PYTHON) GO=$(GO) clients/conformance/run.sh
 
 # ── ES → Kosha migration ───────────────────────────────────────────────────
 

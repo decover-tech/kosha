@@ -1,0 +1,182 @@
+name: clients
+
+# The TypeScript and Go SDKs (#351, ADR-351 §d).
+#
+#   gen-check    generated types match api/openapi (make clients-gen-check),
+#                every public operation has a conformance case, and the Go
+#                module has no dependencies outside the standard library
+#   ts / go      unit tests on the supported runtimes (Node 22 and 24; Go
+#                1.25 and stable), plus the npm package checks
+#   conformance  the shared suite in clients/conformance run by the Python,
+#                TypeScript and Go runners against a live read/write split
+#                stack built from this commit, through faultproxy.py; only
+#                when the server, the API or a client changed
+#   clients-ok   the one check to mark required: fails if any job above
+#                failed, passes when path filtering skipped conformance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      live: ${{ steps.filter.outputs.live }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            live:
+              - 'proto/**'
+              - 'api/**'
+              - 'clients/**'
+              - 'crates/kosha-server/**'
+              - 'crates/kosha-core/**'
+              - 'Cargo.lock'
+              - 'Dockerfile'
+              - 'docker-compose*.yml'
+              - 'scripts/integration/**'
+              - '.github/workflows/clients.yml'
+
+  gen-check:
+    name: generated types + coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: clients/go/tools/go.mod
+          cache-dependency-path: clients/go/tools/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: clients/typescript/package-lock.json
+      - run: make clients-gen-check
+
+  ts:
+    name: typescript (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    defaults:
+      run:
+        working-directory: clients/typescript
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: clients/typescript/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: npm pack --dry-run
+      - run: npx --no-install publint
+
+  go:
+    name: go (${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.25", stable]
+    defaults:
+      run:
+        working-directory: clients/go
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+      - run: go vet ./... && go vet -tags conformance ./...
+      - run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go test -race ./...
+
+  conformance:
+    name: SDK conformance (python + ts + go, live)
+    needs: changes
+    if: needs.changes.outputs.live == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    env:
+      COMPOSE: >-
+        docker compose -f docker-compose.yml
+        -f scripts/integration/docker-compose.integration.yml
+        -f clients/conformance/docker-compose.clients.yml
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start stack
+        run: $COMPOSE up --build -d
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: clients/typescript/package-lock.json
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: clients/go/go.mod
+          cache: false
+
+      - name: Install the runners' dependencies
+        run: |
+          python -m pip install --quiet -e clients/python pytest
+          (cd clients/typescript && npm ci --no-audit --no-fund)
+
+      - name: Wait for both pods
+        run: scripts/integration/wait_ready.sh 8080 8081
+
+      - name: Run the suite (query pod through faultproxy)
+        env:
+          PYTHON: python
+          KOSHA_CONFORMANCE_UPSTREAM: http://localhost:8081
+        run: clients/conformance/run.sh
+
+      - name: Server logs
+        if: failure()
+        run: $COMPOSE logs --no-color --tail 300 kosha-ingest kosha-query
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: clients-conformance
+          path: build/conformance/
+          if-no-files-found: ignore
+
+  clients-ok:
+    name: clients-ok
+    if: always()
+    needs: [changes, gen-check, ts, go, conformance]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every needed job passed or was skipped by the path filter
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: $RESULTS"
+          for r in $RESULTS; do
+            case "$r" in
+              success|skipped) ;;
+              *) echo "::error::a clients job ended with '$r'"; exit 1 ;;
+            esac
+          done
