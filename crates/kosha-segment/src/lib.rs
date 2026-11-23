@@ -1696,6 +1696,76 @@ pub type VectorSpanFetch<'a> =
 /// budget (see `knn_search_within_filtered`).
 const VECTOR_PREFETCH_CHUNK: usize = 8;
 
+/// Most postings one prefetch's scan refetches, one at a time, when a
+/// posting it covered is no longer local by the time it is scanned (see
+/// [`PrefetchHolds::refetch`]). A backstop for a span file evicted from
+/// disk mid-probe, not a second fetch path: past it the scan fails as
+/// before rather than make one serial GET per posting of a segment.
+const VECTOR_REFETCH_MAX: usize = 8;
+
+/// What [`SegmentReader::prefetch_vector_postings`] keeps readable until
+/// the postings it was handed have been scanned: the spans it fetched that
+/// are only in memory, and the decoded postings it skipped fetching
+/// because the vector cache held them. Those are pinned here, so a cache
+/// eviction between the prefetch and the scan (another request's insert,
+/// or this probe's own second-touch admissions) cannot leave a skipped
+/// posting with no local copy (finding 31). Dropping it early makes those
+/// postings unreadable, hence `must_use`, as for [`span_cache::SpanHolds`].
+///
+/// It also carries the fetch, for the one bounded refetch of a posting
+/// that is still not local when scanned (see [`Self::refetch`]).
+#[must_use = "the prefetched postings are readable only while their holds live"]
+struct PrefetchHolds<'f> {
+    spans: span_cache::SpanHolds,
+    decoded: HashMap<usize, SharedVectorPosting>,
+    fetch: Option<VectorSpanFetch<'f>>,
+    refetches: std::sync::atomic::AtomicUsize,
+}
+
+impl<'f> PrefetchHolds<'f> {
+    fn new(fetch: Option<VectorSpanFetch<'f>>) -> Self {
+        Self {
+            spans: span_cache::SpanHolds::new(),
+            decoded: HashMap::new(),
+            fetch,
+            refetches: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// The decoded posting `range_idx` the prefetch pinned, if any.
+    fn pinned(&self, range_idx: usize) -> Option<&SharedVectorPosting> {
+        self.decoded.get(&range_idx)
+    }
+
+    /// Fetch `[start, end)` of `file` once more, for a posting that is not
+    /// local although the prefetch covered it: its span file was evicted
+    /// from disk, or its queued write failed, after the prefetch looked.
+    /// `None` without a fetch or once [`VECTOR_REFETCH_MAX`] refetches have
+    /// been spent; otherwise the holds of the refetched span, to keep until
+    /// it has been read.
+    fn refetch(
+        &self,
+        segment_dir: &Path,
+        file: &str,
+        start: u64,
+        end: u64,
+    ) -> Option<span_cache::SpanHolds> {
+        let fetch = self.fetch?;
+        let spent = self
+            .refetches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if spent >= VECTOR_REFETCH_MAX {
+            return None;
+        }
+        eprintln!(
+            "WARN: vector posting [{start}, +{}) of {}/{file} not local after its prefetch — refetching it once",
+            end - start,
+            segment_dir.display()
+        );
+        Some(fetch(segment_dir, file, &[(start, end)]))
+    }
+}
+
 /// Magic prefix of the `vector.offsets` sidecar ("KVOF", little-endian u32).
 pub const VECTOR_OFFSETS_MAGIC: u32 = u32::from_le_bytes(*b"KVOF");
 /// Version 1: vectors and centroids stored exactly as ingested (raw
@@ -5153,7 +5223,10 @@ impl<K: Copy + Eq + std::hash::Hash, V: Clone> PostingsCache<K, V> {
         Some(hit)
     }
 
-    /// Whether `key` is cached, without touching its recency.
+    /// Whether `key` is cached, without touching its recency. Keeps
+    /// nothing alive: a caller that skips reading `key` elsewhere because
+    /// it is cached must pin it with [`Self::get`] instead (finding 31).
+    #[cfg_attr(not(test), allow(dead_code))]
     fn contains(&self, key: K) -> bool {
         self.max_bytes != 0 && self.state.lock().unwrap().entries.contains_key(&key)
     }
@@ -8534,6 +8607,7 @@ impl SegmentReader {
     fn scan_posting(
         &self,
         scan: &mut PostingScan<'_>,
+        held: &PrefetchHolds<'_>,
         range_idx: usize,
         f32_similarity: impl Fn(&[f32]) -> f32,
         emit: impl FnMut(u32, f32, f32),
@@ -8542,27 +8616,46 @@ impl SegmentReader {
         let centroid = vi.centroid(range_idx);
         let key = self.vector_cache_key(vi.slot, range_idx);
         let mut clock = scan.clock();
-        if let Some(hit) = self.vector_cache.get(key) {
+        // The prefetch's pin first: the cache may have evicted it since.
+        let hit = match held.pinned(range_idx) {
+            Some(pinned) => Some(Arc::clone(pinned)),
+            None => self.vector_cache.get(key),
+        };
+        if let Some(hit) = hit {
             hit.for_each_similarity(scan.accept, f32_similarity, &scan.probe, centroid, emit);
             scan.stats.postings_cached += 1;
             scan.stats.score_nanos += lap_nanos(&mut clock);
             return Ok(());
         }
         let (offset, length) = vi.ranges[range_idx];
-        // Neither local file nor span: an IO error, which the query layer
-        // reports as a degraded segment, never as no matches.
-        let bytes = scan
-            .reader
-            .read(offset + length as u64, offset, length as u64)
-            .ok_or_else(|| {
-                KoshaError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!(
-                        "vector posting [{offset}, +{length}) of {} is not local",
-                        vi.vector_idx_path.display()
-                    ),
-                ))
-            })?;
+        let end = offset + length as u64;
+        // Not local although the prefetch covered it (a span evicted from
+        // disk, a failed queued write): one bounded refetch, held until
+        // the bytes below are decoded. Still nothing: an IO error, which
+        // the query layer reports as a degraded segment, never as no
+        // matches.
+        let refetched;
+        let bytes = match scan.reader.read(end, offset, length as u64) {
+            Some(bytes) => bytes,
+            None => {
+                refetched = held.refetch(&self.segment_dir, &vi.idx_file, offset, end);
+                let tried = refetched.is_some();
+                let read = match tried {
+                    true => scan.reader.read(end, offset, length as u64),
+                    false => None,
+                };
+                read.ok_or_else(|| {
+                    KoshaError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!(
+                            "vector posting [{offset}, +{length}) of {} is not local{}",
+                            vi.vector_idx_path.display(),
+                            if tried { " (refetched once)" } else { "" }
+                        ),
+                    ))
+                })?
+            }
+        };
         scan.stats.read_nanos += lap_nanos(&mut clock);
         // Second-touch admission, as for text postings, over a history as
         // long as the cache's reach (see `vector_miss_window`): one-shot
@@ -8667,16 +8760,23 @@ impl SegmentReader {
     /// Hand `fetch` the ranges of the column's idx file for the postings in
     /// `range_idxs` that are neither decoded in memory nor readable
     /// locally, in one call. The caller keeps the returned holds until it
-    /// has scanned those postings.
-    #[must_use = "the fetched postings are readable only while the holds live"]
-    fn prefetch_vector_postings(
+    /// has scanned those postings, and scans them with
+    /// [`Self::scan_posting`] through those holds.
+    ///
+    /// A posting skipped because the vector cache holds it is pinned in
+    /// the holds (`get`, not `contains`): the cache may evict it before the
+    /// scan, and since #481 a dropped span write can leave the decoded
+    /// entry as its only local copy (finding 31). Skipped always means
+    /// held until scanned.
+    fn prefetch_vector_postings<'f>(
         &self,
         vi: &LazyVectorIndex,
         range_idxs: impl IntoIterator<Item = usize>,
-        fetch: Option<VectorSpanFetch<'_>>,
-    ) -> span_cache::SpanHolds {
+        fetch: Option<VectorSpanFetch<'f>>,
+    ) -> PrefetchHolds<'f> {
+        let mut holds = PrefetchHolds::new(fetch);
         let Some(fetch) = fetch else {
-            return span_cache::SpanHolds::new();
+            return holds;
         };
         let whole_len = fs::metadata(&vi.vector_idx_path)
             .ok()
@@ -8689,12 +8789,11 @@ impl SegmentReader {
                 continue;
             };
             let end = offset + length as u64;
-            if length == 0
-                || whole_len >= end
-                || self
-                    .vector_cache
-                    .contains(self.vector_cache_key(vi.slot, i))
-            {
+            if length == 0 || whole_len >= end {
+                continue;
+            }
+            if let Some(hit) = self.vector_cache.get(self.vector_cache_key(vi.slot, i)) {
+                holds.decoded.insert(i, hit);
                 continue;
             }
             let spans = spans.get_or_insert_with(|| {
@@ -8704,10 +8803,10 @@ impl SegmentReader {
                 missing.push((offset, end));
             }
         }
-        if missing.is_empty() {
-            return span_cache::SpanHolds::new();
+        if !missing.is_empty() {
+            holds.spans = fetch(&self.segment_dir, &vi.idx_file, &missing);
         }
-        fetch(&self.segment_dir, &vi.idx_file, &missing)
+        holds
     }
 
     /// A query vector must have its column's dimension: scoring vectors of
@@ -9481,7 +9580,7 @@ impl SegmentReader {
             return Some(Ok(result));
         }
         // No usable sidecar: every posting, filtered while it is scored.
-        let _held = self.prefetch_vector_postings(vi, 0..vi.ranges.len(), fetch);
+        let held = self.prefetch_vector_postings(vi, 0..vi.ranges.len(), fetch);
         // A quantized column scores approximately here (it has no exact
         // vectors without the sidecar).
         let mut sink = CandidateSink::new(vi, k);
@@ -9497,6 +9596,7 @@ impl SegmentReader {
         for range_idx in 0..vi.ranges.len() {
             let scanned = self.scan_posting(
                 &mut scan,
+                &held,
                 range_idx,
                 |v| Self::f32_similarity(lanes, unit.as_deref(), query, v),
                 |id, sim, err| sink.push(id, sim, err),
@@ -9722,6 +9822,7 @@ impl SegmentReader {
             probes += 1;
             self.scan_posting(
                 &mut scan,
+                &held,
                 range_idx as usize,
                 |v| Self::f32_similarity(lanes, unit.as_deref(), query, v),
                 |id, sim, err| sink.push(id, sim, err),
@@ -9769,6 +9870,7 @@ impl SegmentReader {
                 probes += 1;
                 self.scan_posting(
                     &mut scan,
+                    &held,
                     ranked[position].0 as usize,
                     |v| Self::f32_similarity(lanes, unit.as_deref(), query, v),
                     |id, sim, err| sink.push(id, sim, err),
@@ -9874,6 +9976,7 @@ impl SegmentReader {
             postings += 1;
             self.scan_posting(
                 &mut scan,
+                &held,
                 range_idx,
                 |v| {
                     if vi.unit_norm {
