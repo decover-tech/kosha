@@ -267,6 +267,63 @@ service AdminService {
       }
     };
   }
+  rpc ReconcileUsage(ReconcileUsageRequest) returns (google.protobuf.Struct) {
+    option (google.api.http) = {
+      get: "/v1/admin/usage/reconcile"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "503"
+        value: {
+          description: "unavailable; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "namespace_not_found"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}, {string_value: "write_conflict"}]}}
+      }
+      extensions: {
+        key: "x-stability-level"
+        value: {string_value: "beta"}
+      }
+    };
+  }
   rpc GetWarmupStatus(GetWarmupStatusRequest) returns (google.protobuf.Struct) {
     option (google.api.http) = {
       get: "/v1/admin/warmup-status"
@@ -969,6 +1026,294 @@ service AdminService {
   rpc ScrubApiKeyPlaintext(ScrubApiKeyPlaintextRequest) returns (google.protobuf.Struct) {
     option (google.api.http) = {
       post: "/v1/admin/api-keys/scrub-plaintext"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "503"
+        value: {
+          description: "unavailable; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "namespace_not_found"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}, {string_value: "write_conflict"}]}}
+      }
+      extensions: {
+        key: "x-stability-level"
+        value: {string_value: "beta"}
+      }
+    };
+  }
+  rpc CountApiKeyPlaintext(CountApiKeyPlaintextRequest) returns (google.protobuf.Struct) {
+    option (google.api.http) = {
+      get: "/v1/admin/api-keys/plaintext-count"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "503"
+        value: {
+          description: "unavailable; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "namespace_not_found"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}, {string_value: "write_conflict"}]}}
+      }
+      extensions: {
+        key: "x-stability-level"
+        value: {string_value: "beta"}
+      }
+    };
+  }
+  rpc CreateOperatorCredential(CreateOperatorCredentialRequest) returns (google.protobuf.Struct) {
+    option (google.api.http) = {
+      post: "/v1/admin/operators"
+      body: "body"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "503"
+        value: {
+          description: "unavailable; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "namespace_not_found"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}, {string_value: "write_conflict"}]}}
+      }
+      extensions: {
+        key: "x-stability-level"
+        value: {string_value: "beta"}
+      }
+    };
+  }
+  rpc ListOperatorCredentials(ListOperatorCredentialsRequest) returns (google.protobuf.Struct) {
+    option (google.api.http) = {
+      get: "/v1/admin/operators"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "503"
+        value: {
+          description: "unavailable; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "namespace_not_found"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}, {string_value: "write_conflict"}]}}
+      }
+      extensions: {
+        key: "x-stability-level"
+        value: {string_value: "beta"}
+      }
+    };
+  }
+  rpc RevokeOperatorCredential(RevokeOperatorCredentialRequest) returns (google.protobuf.Struct) {
+    option (google.api.http) = {
+      post: "/v1/admin/operators/revoke"
+      body: "body"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "503"
+        value: {
+          description: "unavailable; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "already_exists"}, {string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "namespace_not_found"}, {string_value: "not_found"}, {string_value: "not_implemented"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}, {string_value: "write_conflict"}]}}
+      }
+      extensions: {
+        key: "x-stability-level"
+        value: {string_value: "beta"}
+      }
+    };
+  }
+  rpc RotateOperatorCredential(RotateOperatorCredentialRequest) returns (google.protobuf.Struct) {
+    option (google.api.http) = {
+      post: "/v1/admin/operators/rotate"
+      body: "body"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       responses: {
@@ -2528,6 +2873,17 @@ message GetTenantUsageRequest {
   }];
 }
 
+message ReconcileUsageRequest {
+  // Narrow to one tenant.
+  optional string tenant = 1;
+  // Relative difference allowed per namespace.
+  optional double tolerance = 2;
+  // Absolute difference allowed per namespace, in bytes.
+  optional uint64 tolerance_bytes = 3;
+  // Oldest stored-bytes snapshot accepted: seconds or a duration such as 3h (at least one hour).
+  optional string max_snapshot_age = 4;
+}
+
 message GetWarmupStatusRequest {
 }
 
@@ -2584,6 +2940,27 @@ message RotateApiKeyRequest {
 }
 
 message ScrubApiKeyPlaintextRequest {
+}
+
+message CountApiKeyPlaintextRequest {
+}
+
+message CreateOperatorCredentialRequest {
+  // The JSON request body.
+  google.protobuf.Struct body = 1;
+}
+
+message ListOperatorCredentialsRequest {
+}
+
+message RevokeOperatorCredentialRequest {
+  // The JSON request body.
+  google.protobuf.Struct body = 1;
+}
+
+message RotateOperatorCredentialRequest {
+  // The JSON request body.
+  google.protobuf.Struct body = 1;
 }
 
 message DeleteTenantRequest {

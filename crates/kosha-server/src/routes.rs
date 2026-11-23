@@ -194,6 +194,12 @@ pub(crate) static ROUTES: &[Route] = &[
     ),
     admin(
         "GET",
+        "/v1/admin/usage/reconcile",
+        "AdminService_ReconcileUsage",
+        Read,
+    ),
+    admin(
+        "GET",
         "/v1/admin/warmup-status",
         "AdminService_GetWarmupStatus",
         Read,
@@ -263,6 +269,36 @@ pub(crate) static ROUTES: &[Route] = &[
         "POST",
         "/v1/admin/api-keys/scrub-plaintext",
         "AdminService_ScrubApiKeyPlaintext",
+        Write,
+    ),
+    admin(
+        "GET",
+        "/v1/admin/api-keys/plaintext-count",
+        "AdminService_CountApiKeyPlaintext",
+        Read,
+    ),
+    admin(
+        "POST",
+        "/v1/admin/operators",
+        "AdminService_CreateOperatorCredential",
+        Write,
+    ),
+    admin(
+        "GET",
+        "/v1/admin/operators",
+        "AdminService_ListOperatorCredentials",
+        Read,
+    ),
+    admin(
+        "POST",
+        "/v1/admin/operators/revoke",
+        "AdminService_RevokeOperatorCredential",
+        Write,
+    ),
+    admin(
+        "POST",
+        "/v1/admin/operators/rotate",
+        "AdminService_RotateOperatorCredential",
         Write,
     ),
     admin(
@@ -549,6 +585,7 @@ mod tests {
         ("GET /v1/billing HTTP/1.1", false, false),
         ("GET /v1/stats HTTP/1.1", false, false),
         ("GET /v1/admin/usage HTTP/1.1", false, false),
+        ("GET /v1/admin/usage/reconcile HTTP/1.1", false, false),
         ("GET /v1/admin/warmup-status HTTP/1.1", false, false),
         ("POST /v1/admin/rebuild-filter-blooms HTTP/1.1", true, false),
         (
@@ -570,6 +607,15 @@ mod tests {
             true,
             false,
         ),
+        (
+            "GET /v1/admin/api-keys/plaintext-count HTTP/1.1",
+            false,
+            false,
+        ),
+        ("POST /v1/admin/operators HTTP/1.1", true, false),
+        ("GET /v1/admin/operators HTTP/1.1", false, false),
+        ("POST /v1/admin/operators/revoke HTTP/1.1", true, false),
+        ("POST /v1/admin/operators/rotate HTTP/1.1", true, false),
         ("DELETE /v1/admin/tenants/acme HTTP/1.1", true, false),
         ("GET /v1/admin/deletions HTTP/1.1", false, false),
         ("GET /v1/admin/deletions/d1 HTTP/1.1", false, false),

@@ -43,6 +43,7 @@ mod branching;
 mod cache_reads;
 mod compaction_sched;
 mod dashboard;
+mod deletion_purge;
 mod doc_spans;
 #[cfg(all(test, feature = "s3"))]
 mod doc_store_fallback_tests;
@@ -61,7 +62,10 @@ mod migrate;
 mod namespace_deletion;
 #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
 mod namespace_migrate;
+mod operator_admin;
 mod org_admin;
+#[cfg(all(test, feature = "s3"))]
+mod posting_presence_tests;
 mod posting_spans;
 mod rerank;
 mod role;
@@ -81,13 +85,20 @@ mod crash_points_tests;
 #[cfg_attr(not(feature = "s3"), allow(dead_code))]
 mod segment_commit;
 mod segment_gc;
+#[cfg(all(test, feature = "s3"))]
+mod segment_pin_tests;
+mod span_writes;
 mod tenant_limits;
 mod unindexed;
 mod usage;
+mod usage_reconcile;
+#[cfg(test)]
+mod usage_reconcile_tests;
 #[cfg(test)]
 mod usage_tests;
 mod warm;
 mod warm_run;
+mod writeback;
 mod writer_lease;
 #[cfg(test)]
 mod writer_lease_tests;
@@ -104,8 +115,18 @@ use kosha_query::DocStoreHydrator;
 #[cfg(feature = "s3")]
 use kosha_query::PageSegment;
 use kosha_query::Searcher;
+#[cfg(feature = "s3")]
+use kosha_segment::span_cache::SpanHolds;
 use kosha_segment::SegmentReader;
 use kosha_write::Indexer;
+
+/// Longest the boot warm-up waits for its writes to reach the cache disk
+/// before reporting ready anyway (see `AppState::finish_warmup`): above the
+/// ≈ 46 s that the kernel's dirty limit allows at 125 MiB/s, so it only
+/// fires on a disk (or an `emptyDir` node filesystem) slower or busier
+/// than that.
+#[cfg_attr(not(feature = "s3"), allow(dead_code))]
+const WARMUP_FLUSH_TIMEOUT: Duration = Duration::from_secs(120);
 
 // ─── Application state ──────────────────────────────────────────────────────
 
@@ -250,6 +271,10 @@ struct AppState {
     posting_promotions: doc_spans::PromotionQueue,
     /// Process totals of posting bytes fetched, for `GET /stats`.
     posting_reads: posting_spans::PostingReadCounters,
+    /// Writes of fetched spans into the span cache, drained by the
+    /// `kosha-span-writer` thread so no request (or rayon scoring task)
+    /// writes to disk. See [`span_writes`].
+    span_writes: span_writes::SpanWriteQueue,
     /// Ceiling on concurrent `/search` executions
     /// (`KOSHA_MAX_CONCURRENT_SEARCHES`, default 8). Complements the
     /// searcher's own live-bytes admission gate (`kosha_query::MemoryLedger`):
@@ -317,6 +342,8 @@ struct AppState {
     /// and counters (#239).
     gc_settings: segment_gc::GcSettings,
     gc_stats: segment_gc::GcStats,
+    /// Purge of deleted namespaces' cached copies on this pod (#347).
+    deletion_purge: deletion_purge::PurgeState,
     /// Serializes `POST /v1/admin/gc` runs.
     gc_lock: Mutex<()>,
     /// Namespace-level cached hydration verdict (Tier 1 O2). Keyed by
@@ -353,6 +380,12 @@ struct AppState {
     /// low-thousands entries; per-query cost is a single `HashMap` lookup,
     /// vs. 17 syscalls on the legacy path.
     completed_hydrations: Mutex<HashMap<(String, u64), HydrationVerdict>>,
+    /// When each `(namespace, segment)` last had its corrupt vector index
+    /// evicted for re-download ([`AppState::heal_corrupt_vector_indexes`]).
+    /// Entries older than [`KNN_SELF_HEAL_INTERVAL`] are dropped on every
+    /// heal attempt, so it holds only the segments healed in that window.
+    #[cfg(feature = "s3")]
+    knn_self_heals: Mutex<HashMap<(String, String), Instant>>,
     /// Whole-response cache for POST /search — see [`ResultCache`].
     result_cache: Mutex<ResultCache>,
     /// Rerank providers (`SearchQuery.rerank`) and their metrics; see
@@ -398,9 +431,10 @@ struct AppState {
     /// fetched). A positive verdict here that outlives a real eviction —
     /// `self.cache` LRU-evicts under `KOSHA_CACHE_MAX_BYTES` pressure — must
     /// therefore never be trusted past that eviction. Every stored entry is
-    /// stamped with `self.cache.eviction_generation()` as of the moment it
+    /// stamped with `self.presence_generation()` (the cache's eviction
+    /// generation plus failed span writes, see there) as of the moment it
     /// was verified, and a read compares that stamp against the *current*
-    /// generation: any eviction anywhere (not just of this exact file —
+    /// generation: any eviction (or failed span write) anywhere (not just of this exact file —
     /// tracking that precisely isn't worth the plumbing given how rare
     /// eviction is relative to query volume) invalidates the snapshot,
     /// falling back to a real stat. See `Cache::eviction_generation`'s doc
@@ -525,14 +559,37 @@ impl ShardView {
 /// `ensure_segments_local`'s in-flight registry. `done` flips to `true`
 /// exactly once, when the owning caller's fetch attempt finishes —
 /// successfully or not; waiters only learn the actual outcome by re-checking
-/// `AppState::segment_is_complete` themselves afterward, same as the owner
-/// does, so a failed fetch is never mistaken for a successful one.
+/// their own completeness predicate afterward, so a failed fetch is never
+/// mistaken for a successful one, and a segment still incomplete for them
+/// (the owner fetched a different file set) goes back through ownership
+/// (`hydrate_single_flight`).
 #[cfg(feature = "s3")]
-#[derive(Default)]
 struct SegmentFetch {
     done: Mutex<bool>,
     cv: Condvar,
+    /// The segment, and which hydration owns its fetch
+    /// ([`HYDRATE_OWNER_SEGMENTS`] or [`HYDRATE_OWNER_SCORING`]), for a
+    /// waiter's slow-wait log line.
+    seg_path: PathBuf,
+    owner: &'static str,
+    /// Bytes the owner's whole batch fetched, set by `complete_owned`.
+    owner_bytes: std::sync::atomic::AtomicU64,
 }
+
+/// `SegmentFetch::owner` of a full-segment hydration
+/// (`ensure_segments_local`: index, compaction, admin rewrites).
+#[cfg(feature = "s3")]
+const HYDRATE_OWNER_SEGMENTS: &str = "full_segment";
+/// `SegmentFetch::owner` of a search's scoring-set hydration
+/// (`ensure_scoring_files_local`).
+#[cfg(feature = "s3")]
+const HYDRATE_OWNER_SCORING: &str = "scoring_set";
+
+/// A wait for a hydration slot or for another request's fetch longer than
+/// this is logged: a healthy cold fetch is well under it, and past it the
+/// request's latency is mostly queueing.
+#[cfg_attr(not(feature = "s3"), allow(dead_code))]
+const SLOW_HYDRATION_WAIT: Duration = Duration::from_secs(5);
 
 /// Minimal counting semaphore built on `Mutex`/`Condvar`, for S3
 /// hydration: synchronous from the caller's point of view (it runs on the
@@ -558,13 +615,26 @@ impl Semaphore {
 
     /// Block until a permit is available, then hold it until the returned
     /// guard is dropped. Unbounded: for callers where waiting is always
-    /// preferable to failing.
-    fn acquire(&self) -> SemaphorePermit<'_> {
+    /// preferable to failing. A wait over [`SLOW_HYDRATION_WAIT`] is logged
+    /// naming `phase`, the hydration that waited.
+    fn acquire(&self, phase: &str) -> SemaphorePermit<'_> {
         let mut permits = self.permits.lock().unwrap();
+        let started = (*permits == 0).then(Instant::now);
         while *permits == 0 {
             permits = self.cv.wait(permits).unwrap();
         }
         *permits -= 1;
+        drop(permits);
+        if let Some(waited) = started.map(|t| t.elapsed()) {
+            if waited >= SLOW_HYDRATION_WAIT {
+                eprintln!(
+                    "WARN: hydration slot wait: phase={phase} waited_ms={} \
+                     (KOSHA_MAX_CONCURRENT_HYDRATIONS){}",
+                    waited.as_millis(),
+                    request_id()
+                );
+            }
+        }
         SemaphorePermit { sem: self }
     }
 }
@@ -620,6 +690,9 @@ struct HydrationOutcome {
     /// broken when the server merely declined to pull multiple GB inside
     /// one request.
     shed: bool,
+    /// Why `shed` is set, for the 429's log line.
+    #[cfg(feature = "s3")]
+    shed_reason: Option<String>,
     /// Bytes the page's documents pulled from S3 after scoring (#245):
     /// ranged spans or whole files. Filled in after the search runs.
     page: doc_spans::PageFetchStats,
@@ -634,6 +707,23 @@ struct HydrationOutcome {
     /// (#245). Segments fetch concurrently, so `rounds` is the most any one
     /// segment needed. Filled in after the search runs.
     vectors: posting_spans::PostingFetchStats,
+    /// Segments whose `doc_vectors.bin` header a filtered kNN wanted
+    /// (best-effort, see [`exact_knn_wants_doc_vectors_header`]) and did
+    /// not get. The query still answers; this pass's verdict is not cached,
+    /// so a later query retries the fetch.
+    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
+    exact_knn_headers_missing: usize,
+}
+
+#[cfg(feature = "s3")]
+impl HydrationOutcome {
+    /// Mark the outcome shed (never unmark) if `request` was, with why.
+    fn set_shed(&mut self, request: &RequestHydration) {
+        if request.is_shed() {
+            self.shed = true;
+            self.shed_reason = Some(request.shed_reason());
+        }
+    }
 }
 
 impl HydrationOutcome {
@@ -821,6 +911,37 @@ fn knn_files_complete(
     !knn_wants_doc_vectors_header(footer, field) || doc_spans::doc_vectors_header_local(seg_path)
 }
 
+/// [`doc_vectors_promotion`] for a segment whose `doc_vectors.bin` is
+/// promoted whole with its doc store.
+#[cfg(feature = "s3")]
+const DOC_VECTORS_PROMOTED: &str = "whole(quantized column)";
+
+/// What a doc-store promotion or warm-up does with `seg`'s
+/// `doc_vectors.bin`, for its log lines: fetched whole
+/// ([`DOC_VECTORS_PROMOTED`]), left to ranged reads (f32 columns, see
+/// [`kosha_segment::doc_vectors_kept_whole`]), or nothing to do.
+#[cfg(feature = "s3")]
+fn doc_vectors_promotion(seg: &Path) -> &'static str {
+    if kosha_segment::segment_keeps_doc_vectors_whole(seg) {
+        DOC_VECTORS_PROMOTED
+    } else if kosha_segment::segment_uses_doc_vectors(seg) {
+        "ranged(f32 columns)"
+    } else {
+        "none"
+    }
+}
+
+/// Whether a doc-store promotion or warm-up of `seg` has everything it
+/// fetches local: `doc_store.bin`, and `doc_vectors.bin` where it is kept
+/// whole. A segment whose sidecar stays remote counts as landed without
+/// it — otherwise it would read as a failed promotion forever.
+#[cfg(feature = "s3")]
+fn doc_store_promotion_landed(seg: &Path) -> bool {
+    file_present_nonempty(&seg.join(kosha_segment::DOC_STORE_FILE))
+        && (!kosha_segment::segment_keeps_doc_vectors_whole(seg)
+            || file_present_nonempty(&seg.join(kosha_segment::DOC_VECTORS_FILE)))
+}
+
 /// `KOSHA_KNN_GLOBAL_RESCORE` (#381), read once for the hydration
 /// predicates (the searcher reads the same variable).
 #[cfg(feature = "s3")]
@@ -860,15 +981,41 @@ fn knn_wants_doc_vectors_header_with(
             }))
 }
 
+/// Whether a filtered kNN on `field` would like `doc_vectors.bin`'s header
+/// local in a segment with this footer, best-effort: exact filtered kNN
+/// (#252) scores every candidate's vector from the sidecar, and with the
+/// file not whole (f32 sidecars are never promoted, see
+/// [`kosha_segment::doc_vectors_kept_whole`]) it reads just the
+/// candidates' ranges, which the header locates. Without it the exact path
+/// scans every vector posting of the column instead (logged), so the
+/// header is never REQUIRED: a segment the filter sends to the ANN probe
+/// does not need it, and a failed fetch must not fail the query. ~12 bytes
+/// per stored vector (0.2% of a 1536-dim f32 file).
+#[cfg(feature = "s3")]
+fn exact_knn_wants_doc_vectors_header(footer: Option<&kosha_core::Footer>, field: &str) -> bool {
+    footer.is_some_and(|f| {
+        f.doc_vectors
+            && f.vector_fields
+                .as_ref()
+                .is_some_and(|cols| cols.iter().any(|c| c.name == field))
+    })
+}
+
 /// The vector key a query's [`HydrationVerdict`] records and checks: its
 /// `knn.field` for a single-vector kNN (#204), and a key of its own for a
 /// late-interaction kNN (#205), whose pass hydrates the field's multivec
-/// files rather than its single-vector column. `None` without kNN.
+/// files rather than its single-vector column, and one for a kNN that
+/// reads filter columns, whose pass also hydrates the column's
+/// `doc_vectors.bin` header (see [`knn_wants_doc_vectors_header`]): an
+/// unfiltered pass's verdict must not let a filtered kNN skip that.
+/// `None` without kNN.
 #[cfg_attr(not(feature = "s3"), allow(dead_code))]
 fn knn_verdict_key(query: &SearchQuery) -> Option<String> {
     query.knn.as_ref().map(|knn| {
         if knn.is_late_interaction() {
             format!("late_interaction:{}", knn.field)
+        } else if query.needs_filter_columns() {
+            format!("filtered:{}", knn.field)
         } else {
             knn.field.clone()
         }
@@ -896,6 +1043,7 @@ type OwnedFetches = Vec<(PathBuf, Arc<SegmentFetch>)>;
 fn partition_for_hydration(
     in_flight: &Mutex<HashMap<PathBuf, Arc<SegmentFetch>>>,
     seg_paths: &[PathBuf],
+    owner: &'static str,
     is_complete: impl Fn(&Path) -> bool,
 ) -> (OwnedFetches, Vec<Arc<SegmentFetch>>) {
     let mut owned = Vec::new();
@@ -908,7 +1056,13 @@ fn partition_for_hydration(
         match guard.get(seg_path) {
             Some(existing) => waiting.push(Arc::clone(existing)),
             None => {
-                let entry = Arc::new(SegmentFetch::default());
+                let entry = Arc::new(SegmentFetch {
+                    done: Mutex::new(false),
+                    cv: Condvar::new(),
+                    seg_path: seg_path.clone(),
+                    owner,
+                    owner_bytes: std::sync::atomic::AtomicU64::new(0),
+                });
                 guard.insert(seg_path.clone(), Arc::clone(&entry));
                 owned.push((seg_path.clone(), entry));
             }
@@ -921,11 +1075,19 @@ fn partition_for_hydration(
 /// and remove each entry from `in_flight` so a future cache miss can retry
 /// it — must be called exactly once per batch returned by
 /// `partition_for_hydration`, whether the fetch succeeded or failed.
+/// `bytes` is what the batch fetched, for waiters' slow-wait log line.
 #[cfg(feature = "s3")]
-fn complete_owned(in_flight: &Mutex<HashMap<PathBuf, Arc<SegmentFetch>>>, owned: &OwnedFetches) {
+fn complete_owned(
+    in_flight: &Mutex<HashMap<PathBuf, Arc<SegmentFetch>>>,
+    owned: &OwnedFetches,
+    bytes: u64,
+) {
     let mut guard = in_flight.lock().unwrap();
     for (seg_path, entry) in owned {
         guard.remove(seg_path);
+        entry
+            .owner_bytes
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
         let mut done = entry.done.lock().unwrap();
         *done = true;
         entry.cv.notify_all();
@@ -933,15 +1095,163 @@ fn complete_owned(in_flight: &Mutex<HashMap<PathBuf, Arc<SegmentFetch>>>, owned:
 }
 
 /// Block until every entry in `waiting` has been signalled complete by its
-/// owner (see `complete_owned`).
+/// owner (see `complete_owned`). A wait over [`SLOW_HYDRATION_WAIT`] is
+/// logged once, naming the segment waited on longest and its owner.
 #[cfg(feature = "s3")]
 fn wait_for(waiting: &[Arc<SegmentFetch>]) {
+    if waiting.is_empty() {
+        return;
+    }
+    let started = Instant::now();
+    let mut slowest: Option<(Duration, &SegmentFetch)> = None;
     for entry in waiting {
+        let t = Instant::now();
         let mut done = entry.done.lock().unwrap();
         while !*done {
             done = entry.cv.wait(done).unwrap();
         }
+        drop(done);
+        let waited = t.elapsed();
+        if slowest.is_none_or(|(w, _)| waited > w) {
+            slowest = Some((waited, entry));
+        }
     }
+    let waited = started.elapsed();
+    if let Some((_, entry)) = slowest.filter(|_| waited >= SLOW_HYDRATION_WAIT) {
+        eprintln!(
+            "WARN: hydrate waited on other requests' fetches: waited_ms={} segments={} \
+             slowest={} owner={} owner_batch_mb={:.1}{}",
+            waited.as_millis(),
+            waiting.len(),
+            entry.seg_path.display(),
+            entry.owner,
+            entry.owner_bytes.load(std::sync::atomic::Ordering::Relaxed) as f64 / (1024.0 * 1024.0),
+            request_id()
+        );
+    }
+}
+
+/// Most partition rounds one hydration call runs. Single-flight is keyed by
+/// segment only, but an owner fetches only the files *its* request needs,
+/// so a waiter can find a segment still incomplete by its own predicate
+/// once the owner is done (an unfiltered search owning what a filtered kNN
+/// waits on leaves the filter and vector files unfetched). The waiter then
+/// takes those segments back through ownership and fetches its own gap. A
+/// round can make a request wait again behind another request that owned
+/// the retry first, possibly of a third shape, so three rounds cover three
+/// distinct shapes colliding on one segment. The bound keeps a pathological
+/// churn of shapes from looping: what is still incomplete after it is
+/// reported missing, as before.
+#[cfg(feature = "s3")]
+const HYDRATION_ROUNDS: usize = 3;
+
+/// How a request took part in a segment's single-flight hydration, named
+/// in the log line for a segment that is still missing afterwards.
+#[cfg(feature = "s3")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum HydrationRole {
+    /// This request fetched it.
+    Owned,
+    /// This request waited on another one's fetch (of hydration `owner`).
+    Waited { owner: &'static str },
+    /// It waited on another one's fetch, then fetched what was still missing.
+    OwnedAfterWaiting { owner: &'static str },
+}
+
+#[cfg(feature = "s3")]
+impl std::fmt::Display for HydrationRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Owned => f.write_str("owned"),
+            Self::Waited { owner } => write!(f, "waited on a {owner} fetch"),
+            Self::OwnedAfterWaiting { owner } => {
+                write!(f, "waited on a {owner} fetch, then owned the refetch")
+            }
+        }
+    }
+}
+
+/// The check a segment fails in `AppState::scoring_gap`, for the log line
+/// of a segment a search must fail on.
+#[cfg(feature = "s3")]
+#[derive(Debug, PartialEq)]
+enum ScoringGap<'a> {
+    Footer,
+    InvertedIdx,
+    FilterFile(&'a str),
+    /// Neither `doc_store.bin` nor a `doc_store.offsets` the reader accepts.
+    DocAccess,
+    /// The kNN field's vector files (`knn_files_complete`).
+    KnnFiles(&'a str),
+}
+
+#[cfg(feature = "s3")]
+impl std::fmt::Display for ScoringGap<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Footer => f.write_str("footer.json"),
+            Self::InvertedIdx => f.write_str("inverted.idx"),
+            Self::FilterFile(name) => write!(f, "filter file {name}"),
+            Self::DocAccess => {
+                f.write_str("doc_store (no doc_store.bin, no usable doc_store.offsets)")
+            }
+            Self::KnnFiles(field) => write!(f, "vector files of kNN field '{field}'"),
+        }
+    }
+}
+
+/// Single-flight hydration of `seg_paths`: own and `fetch` what nobody is
+/// fetching, wait for the rest, then take any waited segment that is still
+/// incomplete by `is_complete` back through ownership (up to
+/// [`HYDRATION_ROUNDS`] rounds) instead of leaving it to the other request's
+/// file set. `fetch` returns the bytes it moved (for waiters' slow-wait log
+/// line); `complete_owned` is called for every batch it was given, whatever
+/// it did. `is_complete`'s flag is true in the first round only, so a
+/// predicate that counts cache lookups counts each segment once. `give_up`
+/// stops the retries (a shed request must not fetch more).
+///
+/// Returns how this request took part in each segment that was incomplete
+/// when it got to it; empty, and allocation-free, when all were complete.
+#[cfg(feature = "s3")]
+fn hydrate_single_flight(
+    in_flight: &Mutex<HashMap<PathBuf, Arc<SegmentFetch>>>,
+    seg_paths: &[PathBuf],
+    owner: &'static str,
+    is_complete: impl Fn(&Path, bool) -> bool,
+    mut fetch: impl FnMut(&OwnedFetches) -> u64,
+    give_up: impl Fn() -> bool,
+) -> HashMap<PathBuf, HydrationRole> {
+    let mut roles: HashMap<PathBuf, HydrationRole> = HashMap::new();
+    let mut retry: Vec<PathBuf> = Vec::new();
+    for round in 0..HYDRATION_ROUNDS {
+        let pending = if round == 0 { seg_paths } else { &retry };
+        let (owned, waiting) =
+            partition_for_hydration(in_flight, pending, owner, |p| is_complete(p, round == 0));
+        if !owned.is_empty() {
+            let bytes = fetch(&owned);
+            complete_owned(in_flight, &owned, bytes);
+            for (p, _) in &owned {
+                let role = match roles.get(p) {
+                    Some(&HydrationRole::Waited { owner: by }) => {
+                        HydrationRole::OwnedAfterWaiting { owner: by }
+                    }
+                    _ => HydrationRole::Owned,
+                };
+                roles.insert(p.clone(), role);
+            }
+        }
+        wait_for(&waiting);
+        for w in &waiting {
+            roles.insert(w.seg_path.clone(), HydrationRole::Waited { owner: w.owner });
+        }
+        // Waited segments go round again; the next partition skips those the
+        // owner's fetch did complete for this request too.
+        retry = waiting.iter().map(|w| w.seg_path.clone()).collect();
+        if retry.is_empty() || give_up() {
+            break;
+        }
+    }
+    roles
 }
 
 /// Greedily group `(path, size)` pairs into batches whose total projected
@@ -1113,9 +1423,16 @@ fn with_header(response: String, name: &str, value: &str) -> String {
 /// on the footer anyway.
 #[cfg(feature = "s3")]
 fn filter_index_complete(seg_dir: &Path) -> bool {
-    match SegmentReader::read_footer(seg_dir) {
-        Ok(footer) => kosha_segment::filter_columns::filter_files_present(seg_dir, &footer),
-        Err(_) => seg_dir.join(kosha_core::FILTERS_BIN_FILE).is_file(),
+    filter_index_complete_for(seg_dir, SegmentReader::read_footer(seg_dir).ok().as_ref())
+}
+
+/// [`filter_index_complete`] with the local footer already parsed (`None`:
+/// unreadable).
+#[cfg(feature = "s3")]
+fn filter_index_complete_for(seg_dir: &Path, footer: Option<&kosha_core::Footer>) -> bool {
+    match footer {
+        Some(footer) => kosha_segment::filter_columns::filter_files_present(seg_dir, footer),
+        None => seg_dir.join(kosha_core::FILTERS_BIN_FILE).is_file(),
     }
 }
 
@@ -1256,7 +1573,9 @@ impl AppState {
                 .unwrap_or_else(|e| fatal(&e))
                 .role
         });
-        std::fs::create_dir_all(&data_dir).ok();
+        // Every segment, the WAL and the disk cache live here: a pod that
+        // cannot create it must not start and serve 503s.
+        kosha_core::create_dir_named(&data_dir).unwrap_or_else(|e| fatal(&e.to_string()));
         // Before the disk cache scans `data_dir`: transient tail segments of
         // an earlier process are never reused (#255).
         unindexed::remove_stale_tail_segments(&data_dir);
@@ -1835,9 +2154,8 @@ impl AppState {
             role,
             writer_leases,
             compaction_on_ingest,
-            admin_auth_key: std::env::var("KOSHA_ADMIN_API_KEY")
-                .ok()
-                .filter(|k| !k.is_empty()),
+            // `None` when `KOSHA_ADMIN_BOOTSTRAP_KEY` switches it off (#346).
+            admin_auth_key: auth::bootstrap_admin_key(),
             orgs: org_admin::OrgBackend::from_env(),
             internal_service_key: std::env::var("KOSHA_INTERNAL_API_KEY")
                 .ok()
@@ -1917,6 +2235,10 @@ impl AppState {
             #[cfg(feature = "s3")]
             posting_promotions: doc_spans::PromotionQueue::default(),
             posting_reads: posting_spans::PostingReadCounters::default(),
+            span_writes: span_writes::SpanWriteQueue::new(
+                span_writes::SPAN_WRITE_QUEUE_BYTES,
+                span_writes::SPAN_HELD_BYTES,
+            ),
             search_semaphore: {
                 let permits = std::env::var("KOSHA_MAX_CONCURRENT_SEARCHES")
                     .ok()
@@ -1967,8 +2289,11 @@ impl AppState {
             ),
             gc_settings: segment_gc::GcSettings::from_env(),
             gc_stats: segment_gc::GcStats::default(),
+            deletion_purge: deletion_purge::PurgeState::default(),
             gc_lock: Mutex::new(()),
             completed_hydrations: Mutex::new(HashMap::new()),
+            #[cfg(feature = "s3")]
+            knn_self_heals: Mutex::new(HashMap::new()),
             result_cache: Mutex::new(result_cache),
             rerankers: rerank::RerankRegistry::from_env(),
             embedders: embedding::EmbedderRegistry::from_env(),
@@ -2052,15 +2377,93 @@ impl AppState {
                 .spawn(move || {
                     let start = Instant::now();
                     state.run_boot_warmup(&*state);
-                    state
-                        .warmup_complete
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                    println!(
-                        "warmup: complete in {:.1}s — pod is ready",
-                        start.elapsed().as_secs_f64()
-                    );
+                    let data_dir = state.data_dir.clone();
+                    state.finish_warmup(start, WARMUP_FLUSH_TIMEOUT, move || {
+                        writeback::sync_filesystem(&data_dir)
+                    });
                 })
                 .expect("failed to spawn warmup thread");
+        }
+    }
+
+    /// The end of the boot warm-up: wait (at most `timeout`) for `flush`
+    /// to put what warm-up wrote on disk, then mark the pod ready.
+    ///
+    /// The warm-up's files are buffered writes. Flipping ready with them
+    /// still dirty (4.4–5.1 GB measured on staging, about the kernel's
+    /// dirty limit) handed the first user requests a disk that needed 41–52
+    /// s more to drain at 125 MiB/s, during which the kernel throttled every
+    /// thread that wrote. Each warm file's writeback starts as it lands
+    /// (`writeback`), so what is left to wait for here is the tail the disk
+    /// had not caught up with: never more than the kernel's dirty limit
+    /// (≈ 6 GB on a query pod, ≈ 46 s at 125 MiB/s), ≈ 1.1 GB (≈ 9 s) on
+    /// the measured warm-up. `syncfs` flushes the whole filesystem holding
+    /// the cache: on a dedicated cache volume (staging) only this pod's
+    /// writes, on an `emptyDir` (prod, finding 10) the node's root
+    /// filesystem, other pods' dirty data included, hence the timeout. A
+    /// flush that fails or overruns is logged and the pod goes ready
+    /// anyway (fail-open, as for the warm-up itself).
+    #[cfg_attr(not(any(test, feature = "s3")), allow(dead_code))]
+    fn finish_warmup(
+        &self,
+        start: Instant,
+        timeout: Duration,
+        flush: impl FnOnce() -> std::io::Result<()> + Send + 'static,
+    ) {
+        let mb = |b: u64| b / (1 << 20);
+        let before = writeback::dirty_bytes();
+        match before {
+            Some((dirty, wb)) => println!(
+                "warmup: flushing the cache disk before going ready (node dirty {} MB + \
+                 writeback {} MB; at most {}s)",
+                mb(dirty),
+                mb(wb),
+                timeout.as_secs()
+            ),
+            None => println!(
+                "warmup: flushing the cache disk before going ready (at most {}s)",
+                timeout.as_secs()
+            ),
+        }
+        let flushed = Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("kosha-warmup-flush".into())
+            .spawn(move || {
+                // The receiver is gone only after a timeout, already logged.
+                let _ = tx.send(flush());
+            });
+        let outcome = match spawned {
+            Ok(_) => rx.recv_timeout(timeout),
+            Err(e) => Ok(Err(e)),
+        };
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                eprintln!("WARN: warmup: flushing the cache disk failed: {e}; going ready anyway")
+            }
+            Err(_) => eprintln!(
+                "WARN: warmup: the cache disk flush did not finish within {}s; going ready \
+                 with writes still draining",
+                timeout.as_secs()
+            ),
+        }
+        let flush_s = flushed.elapsed().as_secs_f64();
+        let after = writeback::dirty_bytes();
+        self.warmup_complete
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        match after {
+            Some((dirty, wb)) => println!(
+                "warmup: complete in {:.1}s — pod is ready (cache flush {flush_s:.1}s; node \
+                 dirty {} MB + writeback {} MB now)",
+                start.elapsed().as_secs_f64(),
+                mb(dirty),
+                mb(wb)
+            ),
+            None => println!(
+                "warmup: complete in {:.1}s — pod is ready (cache flush {flush_s:.1}s)",
+                start.elapsed().as_secs_f64()
+            ),
         }
     }
 
@@ -2553,6 +2956,19 @@ impl AppState {
         reports
     }
 
+    /// The generation `posting_blob_presence` entries are stamped with and
+    /// checked against: the disk cache's eviction generation plus the span
+    /// writes that failed. A term is confirmed present as soon as its span
+    /// write is queued (see `posting_spans`), so a write that later fails
+    /// must invalidate, like an eviction, whatever was confirmed on its
+    /// strength. Both counters only grow, so their sum moves on either.
+    #[cfg(feature = "s3")]
+    fn presence_generation(&self) -> u64 {
+        self.cache
+            .eviction_generation()
+            .wrapping_add(self.span_writes.failures())
+    }
+
     /// Readiness-gate predicate used by the `/readyz` handler: true when no
     /// warmup is configured or it has finished (success or fail-open). Not a
     /// health signal — liveness stays on `/healthz`.
@@ -2723,8 +3139,12 @@ impl AppState {
                 manifest,
                 &query,
                 &RequestHydration::unlimited(),
+                None,
             );
-            if outcome.missing.is_empty() && !outcome.bloom_pruned {
+            if outcome.missing.is_empty()
+                && !outcome.bloom_pruned
+                && outcome.exact_knn_headers_missing == 0
+            {
                 self.completed_hydrations
                     .lock()
                     .unwrap()
@@ -2909,6 +3329,103 @@ impl AppState {
             .clone()
     }
 
+    /// Drop the cached hydration verdict for one manifest version, so the
+    /// next search re-checks its scoring set on disk instead of trusting a
+    /// verdict that a failed search just proved stale.
+    fn forget_hydration_verdict(&self, ns: &NamespaceId, manifest_version: u64) {
+        self.completed_hydrations
+            .lock()
+            .unwrap()
+            .remove(&(ns.0.clone(), manifest_version));
+    }
+
+    /// Self-heal for segments whose vector column loaded with a corrupt
+    /// body (`SearchPhaseStats::knn_corrupt_segments`). The searcher keeps
+    /// that verdict on its cached reader, and the local files are whole
+    /// (they land by rename), so re-checking presence finds nothing to
+    /// fetch: without this, every kNN touching the segment is a 503 until
+    /// the pod restarts. Evict the segment's fetched vector index files
+    /// unless a search holds the segment pinned (that search may be
+    /// between hydrating and opening it), and only then forget the
+    /// reader; the next search re-downloads them. A refused eviction
+    /// keeps the reader. Under sustained traffic on one segment the heal
+    /// can wait long for a moment without pins (follow-up: heal in the
+    /// next request's hydration, under single-flight, before it pins). At most once per segment per
+    /// [`KNN_SELF_HEAL_INTERVAL`]: when the object in S3 is itself corrupt
+    /// the 503 persists (its ERROR line names the segment) without a
+    /// download per request. Call with this request's own pins released.
+    #[cfg(feature = "s3")]
+    fn heal_corrupt_vector_indexes(
+        &self,
+        ns: &NamespaceId,
+        manifest: &kosha_core::Manifest,
+        segments: &[kosha_core::SegmentId],
+    ) {
+        if segments.is_empty() || self.s3_storage.is_none() {
+            return;
+        }
+        let rid = request_id();
+        for segment in segments {
+            let key = (ns.0.clone(), segment.0.clone());
+            {
+                let mut heals = self.knn_self_heals.lock().unwrap();
+                heals.retain(|_, at| at.elapsed() < KNN_SELF_HEAL_INTERVAL);
+                if heals.contains_key(&key) {
+                    eprintln!(
+                        "WARN: kNN self-heal: segment {} re-downloaded its vector index less \
+                         than {} s ago and is still corrupt (corrupt in S3?); not fetching \
+                         again yet{rid}",
+                        segment.0,
+                        KNN_SELF_HEAL_INTERVAL.as_secs()
+                    );
+                    continue;
+                }
+            }
+            let dir = manifest.segment_dir(&self.data_dir, ns, segment);
+            let Ok(dir_key) = dir.strip_prefix(&self.data_dir) else {
+                continue;
+            };
+            match self.cache.evict_files_unless_pinned(
+                &dir_key.to_string_lossy(),
+                kosha_core::is_vector_index_file,
+            ) {
+                // Only now: a reader forgotten before a refused eviction is
+                // reopened on the same corrupt files (losing its lexical
+                // state for nothing), and one forgotten before the eviction
+                // could be reopened corrupt in between and stay cached.
+                Ok(Some(0)) => {
+                    self.searcher.forget_segment(ns, segment);
+                    eprintln!(
+                        "WARN: kNN self-heal: segment {} has no fetched vector index file to \
+                         evict; reopening it, not rate-limited{rid}",
+                        segment.0
+                    );
+                }
+                Ok(Some(bytes)) => {
+                    self.searcher.forget_segment(ns, segment);
+                    self.knn_self_heals
+                        .lock()
+                        .unwrap()
+                        .insert(key, Instant::now());
+                    eprintln!(
+                        "WARN: kNN self-heal: evicted the corrupt vector index of segment {} \
+                         ({bytes} bytes); the next search re-downloads it{rid}",
+                        segment.0
+                    );
+                }
+                Ok(None) => eprintln!(
+                    "WARN: kNN self-heal: segment {} is in use by another search; \
+                     its corrupt vector index stays until a later 503 retries{rid}",
+                    segment.0
+                ),
+                Err(e) => eprintln!(
+                    "ERROR: kNN self-heal: evicting the vector index of segment {} failed: {e}{rid}",
+                    segment.0
+                ),
+            }
+        }
+    }
+
     /// Drop every per-namespace cache entry this node keeps for a deleted
     /// namespace. Versions never repeat across a delete and re-create, so
     /// this is hygiene (memory) rather than correctness, except for the
@@ -2979,7 +3496,6 @@ impl AppState {
     /// Cache footers parsed during a search's hydration on the manifest(s)
     /// that list their segments. A merged sharded view's segment ids are
     /// `_shard-XXXX/{id}`: those footers belong to the shard namespace.
-    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
     fn remember_search_footers(
         &self,
         ns: &NamespaceId,
@@ -3170,12 +3686,41 @@ impl AppState {
     #[cfg(feature = "s3")]
     const REQUIRED_SEGMENT_FILES: [&'static str; 3] = segment_commit::REQUIRED_SEGMENT_FILES;
 
+    /// What of a segment is on local disk, for a full-segment caller
+    /// (`ensure_segments_local`): `None` when a core file
+    /// (`REQUIRED_SEGMENT_FILES`, the filter index) is missing, otherwise
+    /// whether every vector file its footer lists is local too
+    /// ([`kosha_segment::vector_files_present`]). One footer parse serves
+    /// both answers.
     #[cfg(feature = "s3")]
-    fn segment_is_complete(seg_path: &Path) -> bool {
-        Self::REQUIRED_SEGMENT_FILES
+    fn segment_local_files(seg_path: &Path) -> Option<bool> {
+        if !Self::REQUIRED_SEGMENT_FILES
             .iter()
             .all(|f| seg_path.join(f).is_file())
-            && filter_index_complete(seg_path)
+        {
+            return None;
+        }
+        let footer = SegmentReader::read_footer(seg_path).ok();
+        if !filter_index_complete_for(seg_path, footer.as_ref()) {
+            return None;
+        }
+        Some(
+            footer
+                .as_ref()
+                .is_none_or(|f| kosha_segment::vector_files_present(seg_path, f)),
+        )
+    }
+
+    /// Whether a segment is local in full for a caller that does
+    /// (`needs_vectors`) or does not need its vectors. Without the
+    /// `needs_vectors` half, a segment a lexical caller hydrated (no vector
+    /// index) passed as complete for a caller that needs vectors, which then
+    /// never fetched them: every merge re-clustered those inputs' vectors
+    /// from scratch instead of reusing their postings, until the local copy
+    /// was evicted (finding 29).
+    #[cfg(feature = "s3")]
+    fn segment_is_complete(seg_path: &Path, needs_vectors: bool) -> bool {
+        Self::segment_local_files(seg_path).is_some_and(|vectors| vectors || !needs_vectors)
     }
 
     /// Ensure every listed segment directory is available locally, fanning
@@ -3203,9 +3748,10 @@ impl AppState {
     /// Concurrent callers racing on the same not-yet-cached segment(s) are
     /// coalesced via `in_flight_segments`: only the first ("owner") actually
     /// hits S3 for a given segment, and the rest ("waiters") block until the
-    /// owner finishes, then fall through to the same `segment_is_complete`
-    /// recheck the owner uses — so a failed fetch is visible to waiters too,
-    /// not silently treated as success. `hydration_semaphore` additionally
+    /// owner finishes, then recheck `segment_is_complete` and fetch what is
+    /// still missing themselves (`hydrate_single_flight`) — so a failed or
+    /// narrower fetch is visible to waiters too, not silently treated as
+    /// success. `hydration_semaphore` additionally
     /// bounds how many *owner* hydration batches run at once, server-wide.
     ///
     /// `needs_vectors` gates whether each segment's `vector.idx` is fetched
@@ -3219,6 +3765,9 @@ impl AppState {
     /// guaranteed never to open. Pass `true` from any caller that must
     /// preserve a segment's full fidelity (index/replace/compact/admin
     /// rewrite paths); the search path passes `query.knn.is_some()`.
+    /// It also decides which local copies count as already complete
+    /// ([`AppState::segment_is_complete`]): one hydrated without vectors is
+    /// re-fetched for a caller that needs them.
     #[cfg(feature = "s3")]
     fn ensure_segments_local(
         &self,
@@ -3236,110 +3785,139 @@ impl AppState {
         let request = RequestHydration::unlimited();
 
         let mut outcome = HydrationOutcome::default();
-        let (owned, waiting) = partition_for_hydration(
+        // A waiter behind a scoring-set owner (a search) finds the segment
+        // incomplete by this predicate afterwards and fetches the rest
+        // itself in the next round (see `hydrate_single_flight`).
+        hydrate_single_flight(
             &self.in_flight_segments,
             seg_paths,
-            Self::segment_is_complete,
-        );
+            HYDRATE_OWNER_SEGMENTS,
+            |p, _| Self::segment_is_complete(p, needs_vectors),
+            |owned| {
+                let bytes_before = outcome.bytes_fetched;
+                // Bound total concurrent hydration *operations* server-wide —
+                // released as soon as this operation's fetch is done, before
+                // waiters below get to run.
+                let _permit = self.hydration_semaphore.acquire("full_segment");
 
-        if !owned.is_empty() {
-            // Bound total concurrent hydration *operations* server-wide —
-            // released as soon as this operation's fetch is done, before
-            // waiters below get to run.
-            let _permit = self.hydration_semaphore.acquire();
-
-            let mut logical_paths: Vec<(String, u64)> = Vec::new();
-            for (seg_path, _) in &owned {
-                let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
-                    continue;
-                };
-                let s3_prefix = rel_path.to_string_lossy().into_owned();
-                match s3.list_with_sizes(&s3_prefix) {
-                    Ok(files) if !files.is_empty() => {
-                        logical_paths.extend(
-                            files
-                                .into_iter()
-                                .filter(|(name, _size)| hydration_wants_file(name, needs_vectors))
-                                .map(|(name, size)| (format!("{s3_prefix}/{name}"), size)),
-                        );
-                    }
-                    Ok(_) => {
-                        eprintln!("WARN: no S3 objects found for segment {s3_prefix}");
-                    }
-                    Err(e) => {
-                        eprintln!("WARN: S3 list failed for segment {s3_prefix}: {e}");
+                let mut logical_paths: Vec<(String, u64)> = Vec::new();
+                for (seg_path, _) in owned {
+                    let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
+                        continue;
+                    };
+                    let s3_prefix = rel_path.to_string_lossy().into_owned();
+                    match s3.list_with_sizes(&s3_prefix) {
+                        Ok(files) if !files.is_empty() => {
+                            logical_paths.extend(
+                                files
+                                    .into_iter()
+                                    .filter(|(name, _size)| {
+                                        hydration_wants_file(name, needs_vectors)
+                                    })
+                                    .map(|(name, size)| (format!("{s3_prefix}/{name}"), size)),
+                            );
+                        }
+                        Ok(_) => {
+                            eprintln!("WARN: no S3 objects found for segment {s3_prefix}");
+                        }
+                        Err(e) => {
+                            eprintln!("WARN: S3 list failed for segment {s3_prefix}: {e}");
+                        }
                     }
                 }
-            }
 
-            if !logical_paths.is_empty() {
-                println!(
+                if !logical_paths.is_empty() {
+                    println!(
                     "cache miss: hydrating {} file(s) across {} segment(s) from S3 (fan-out={}, byte-budget={})",
                     logical_paths.len(),
                     owned.len(),
                     self.hydrate_concurrency,
                     self.hydrate_byte_budget
                 );
-                outcome.files_fetched += logical_paths.len();
-                outcome.bytes_fetched += logical_paths.iter().map(|(_, size)| size).sum::<u64>();
-                // Routed through `hydrate_files`, which pins the batch
-                // against cache eviction for its whole duration (#62's
-                // convergence fix) and coordinates the fetch across
-                // replicas when the lease store is configured. Full-segment
-                // fetches keep the conservative fan-out — batches here can
-                // include multi-hundred-MB doc stores.
-                // Files already on disk before this call were verified (or
-                // trusted) when they first landed; only check what this call
-                // actually fetches, so a warm segment isn't re-read in full.
-                let fetched: Vec<(String, u64)> = logical_paths
-                    .iter()
-                    .filter(|(p, _)| !file_present_nonempty(&self.data_dir.join(p)))
-                    .cloned()
-                    .collect();
-                self.hydrate_files(s3, &logical_paths, self.hydrate_concurrency, &request);
-
-                // Check freshly fetched files against the segment's `_COMMIT`
-                // (#231). A mismatch is deleted and refetched once. If it
-                // still mismatches, it is deleted again, so the segment
-                // reports as incomplete (`outcome.missing`) and the caller
-                // fails the request instead of serving corrupt bytes.
-                let bad = verify_fetched_against_commit(&self.data_dir, &fetched);
-                if !bad.is_empty() {
-                    self.segment_checksum_failures
-                        .fetch_add(bad.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                    let retry: Vec<(String, u64)> = fetched
+                    outcome.files_fetched += logical_paths.len();
+                    outcome.bytes_fetched +=
+                        logical_paths.iter().map(|(_, size)| size).sum::<u64>();
+                    // Routed through `hydrate_files`, which pins the batch
+                    // against cache eviction for its whole duration (#62's
+                    // convergence fix) and coordinates the fetch across
+                    // replicas when the lease store is configured. Full-segment
+                    // fetches keep the conservative fan-out — batches here can
+                    // include multi-hundred-MB doc stores.
+                    // Files already on disk before this call were verified (or
+                    // trusted) when they first landed; only check what this call
+                    // actually fetches, so a warm segment isn't re-read in full.
+                    let fetched: Vec<(String, u64)> = logical_paths
                         .iter()
-                        .filter(|(p, _)| bad.contains(p))
+                        .filter(|(p, _)| !file_present_nonempty(&self.data_dir.join(p)))
                         .cloned()
                         .collect();
-                    self.hydrate_files(s3, &retry, self.hydrate_concurrency, &request);
-                    let still_bad = verify_fetched_against_commit(&self.data_dir, &retry);
-                    if !still_bad.is_empty() {
-                        self.segment_checksum_failures.fetch_add(
-                            still_bad.len() as u64,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                        eprintln!(
+                    self.hydrate_files(s3, &logical_paths, self.hydrate_concurrency, &request);
+
+                    // Check freshly fetched files against the segment's `_COMMIT`
+                    // (#231). A mismatch is deleted and refetched once. If it
+                    // still mismatches, it is deleted again, so the segment
+                    // reports as incomplete (`outcome.missing`) and the caller
+                    // fails the request instead of serving corrupt bytes.
+                    let bad = verify_fetched_against_commit(&self.data_dir, &fetched);
+                    if !bad.is_empty() {
+                        self.segment_checksum_failures
+                            .fetch_add(bad.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                        let retry: Vec<(String, u64)> = fetched
+                            .iter()
+                            .filter(|(p, _)| bad.contains(p))
+                            .cloned()
+                            .collect();
+                        self.hydrate_files(s3, &retry, self.hydrate_concurrency, &request);
+                        let still_bad = verify_fetched_against_commit(&self.data_dir, &retry);
+                        if !still_bad.is_empty() {
+                            self.segment_checksum_failures.fetch_add(
+                                still_bad.len() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            eprintln!(
                             "ERROR: segment file(s) fail their _COMMIT checksum after refetch, \
                              refusing to serve: {}",
                             still_bad.join(", ")
                         );
+                        }
                     }
                 }
+
+                outcome.bytes_fetched - bytes_before
+            },
+            || false,
+        );
+
+        // `missing` is what no caller can read past: a core file. A segment
+        // whose vector files still are not local after a fetch that asked
+        // for them (S3 lacks them, or this call waited behind a lexical
+        // owner) is logged rather than failed: none of these callers reads
+        // the vector index — writes and merges take vectors from the doc
+        // store / `doc_vectors.bin`, and a merge whose `doc_vectors.bin`
+        // is missing fails when it reads it — so failing them here would
+        // turn a slower merge into a write outage. A later call fetches it.
+        let rel = |p: &PathBuf| {
+            p.strip_prefix(&self.data_dir)
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        };
+        let mut without_vectors = Vec::new();
+        for path in seg_paths {
+            match Self::segment_local_files(path) {
+                None => outcome.missing.extend(rel(path)),
+                Some(false) if needs_vectors => without_vectors.extend(rel(path)),
+                Some(_) => {}
             }
-
-            drop(_permit);
-            complete_owned(&self.in_flight_segments, &owned);
         }
-
-        wait_for(&waiting);
-
-        outcome.missing = seg_paths
-            .iter()
-            .filter(|p| !Self::segment_is_complete(p))
-            .filter_map(|p| p.strip_prefix(&self.data_dir).ok())
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
+        if !without_vectors.is_empty() {
+            eprintln!(
+                "WARN: {} segment(s) hydrated for a caller that needs vectors still lack \
+                 vector files their footer lists: {}{}",
+                without_vectors.len(),
+                without_vectors.join(", "),
+                request_id()
+            );
+        }
         outcome
     }
 
@@ -3378,11 +3956,11 @@ impl AppState {
             // already decided not to serve.
             if request.is_shed() {
                 println!(
-                    "hydrate_files shed: stopped at chunk {}/{} after {:.1}MB \
-                     (KOSHA_HYDRATE_REQUEST_MAX_BYTES)",
+                    "hydrate_files shed: stopped at chunk {}/{}: {}{}",
                     chunk_idx + 1,
                     total_chunks,
-                    request.fetched_bytes() as f64 / (1024.0 * 1024.0),
+                    request.shed_reason(),
+                    request_id()
                 );
                 break;
             }
@@ -3474,21 +4052,25 @@ impl AppState {
     #[cfg(feature = "s3")]
     /// Returns `(files_fetched, bytes_fetched)` — already-local files cost
     /// nothing and aren't counted.
-    /// Fetch what materializing documents from these segments needs:
-    /// `doc_store.bin`, plus `doc_vectors.bin` for segments whose footer
-    /// says vectors were moved there (#243). Only those segments are asked
-    /// for the sidecar, so older segments never trigger a GET for a file
-    /// they don't have.
+    /// Fetch whole `doc_store.bin` for these segments, plus
+    /// `doc_vectors.bin` for those `with_vectors` picks: for a page
+    /// materialized from whole files, segments with a sidecar whose vectors
+    /// the page returns (`PageSegment::vectors`); for promotion and warm-up,
+    /// segments whose readers need it whole
+    /// ([`kosha_segment::segment_keeps_doc_vectors_whole`]). Only those
+    /// segments are asked for the sidecar, so others never trigger a GET
+    /// for it.
     #[cfg(feature = "s3")]
     fn ensure_doc_store_local(
         &self,
         seg_paths: &[PathBuf],
         request: &Arc<RequestHydration>,
+        with_vectors: impl Fn(&Path) -> bool,
     ) -> (usize, u64) {
         let (mut files, mut bytes) = self.ensure_files_local(seg_paths, "doc_store.bin", request);
         let with_sidecar: Vec<PathBuf> = seg_paths
             .iter()
-            .filter(|p| kosha_segment::segment_uses_doc_vectors(p))
+            .filter(|p| with_vectors(p))
             .cloned()
             .collect();
         if !with_sidecar.is_empty() {
@@ -3515,8 +4097,10 @@ impl AppState {
         &self,
         pages: &[PageSegment<'_>],
         request: &Arc<RequestHydration>,
+        rid: &str,
     ) -> doc_spans::PageFetchStats {
         let mut stats = doc_spans::PageFetchStats::default();
+        let mut fallback_error = None;
         let whole: Vec<PathBuf> = match (self.doc_read_mode, &self.s3_storage) {
             (_, None) => return stats,
             (doc_spans::ReadMode::Whole, Some(_)) => {
@@ -3530,9 +4114,11 @@ impl AppState {
                     request,
                 };
                 let outcome = {
-                    let _permit = self.hydration_semaphore.acquire();
-                    self.span_hydrator.hydrate(pages, &fetcher, &self.cache)
+                    let _permit = self.hydration_semaphore.acquire("page_docs");
+                    self.span_hydrator
+                        .hydrate(pages, &fetcher, &self.span_writes)
                 };
+                request.hold_spans(outcome.held);
                 stats.rounds = outcome.rounds;
                 stats.ranged_gets = outcome.gets;
                 stats.ranged_bytes = outcome.bytes;
@@ -3540,14 +4126,29 @@ impl AppState {
                     self.doc_store_reads.promotion_queued();
                     self.doc_store_promotions.push(seg);
                 }
+                fallback_error = outcome.fallback_error;
                 outcome.whole_fallback
             }
         };
         if !whole.is_empty() {
-            let (files, bytes) = self.ensure_doc_store_local(&whole, request);
+            // `doc_vectors.bin` only for a page that returns its vectors:
+            // one whose `_source` excludes them (the backend's searches)
+            // never downloads the sidecar — up to 2 GB — in-request.
+            let page_reads_vectors = |p: &Path| {
+                pages
+                    .iter()
+                    .any(|page| page.segment_dir == p && page.vectors)
+                    && kosha_segment::segment_uses_doc_vectors(p)
+            };
+            let (files, bytes) = self.ensure_doc_store_local(&whole, request, page_reads_vectors);
             stats.rounds += 1;
             stats.whole_files = files as u64;
             stats.whole_bytes = bytes;
+            // Legacy segments (no span index) go whole by design and carry
+            // no error; only a failed range is logged.
+            if let Some(error) = fallback_error {
+                log_ranged_fallback(&whole[0], "doc_store.bin", whole.len(), &error, bytes, rid);
+            }
         }
         self.doc_store_reads.record(&stats);
         stats
@@ -3555,9 +4156,9 @@ impl AppState {
 
     /// Start the thread that promotes hot segments from ranged reads to a
     /// whole local `doc_store.bin` (+ `doc_vectors.bin`), then drops their
-    /// now-redundant spans (#245). One segment at a time, each under a
-    /// hydration permit, so promotions queue behind live queries' fetches
-    /// instead of competing with them.
+    /// now-redundant spans (#245). One segment at a time, as background
+    /// work on the hydration budget, so promotions yield to live queries'
+    /// fetches instead of competing with them (see `promote_doc_store`).
     fn spawn_doc_store_promoter(self: &Arc<Self>) {
         #[cfg(feature = "s3")]
         {
@@ -3584,18 +4185,36 @@ impl AppState {
 
     /// Hydrate one segment's whole doc store for promotion and drop its
     /// spans once it is in place.
+    ///
+    /// Background work: its fetches yield to every request fetch on the
+    /// in-flight budget and hold at most its background share, in parts
+    /// (see `s3_storage::download_parts`), and it takes no
+    /// `hydration_semaphore` slot. It used to hold a slot (one of
+    /// `KOSHA_MAX_CONCURRENT_HYDRATIONS`, default 4) for its whole download
+    /// and fetch `doc_vectors.bin` (up to 2.6 GB on staging) as one GET
+    /// admitted past the budget's capacity, shutting every request fetch
+    /// on the pod out for 45-407 s. The slot bounds concurrent hydration
+    /// operations; this thread is one operation at a time by construction,
+    /// and its bytes are bounded by the background share.
+    ///
+    /// `doc_vectors.bin` comes along only for a segment with a quantized
+    /// vector column ([`kosha_segment::doc_vectors_kept_whole`]): the
+    /// default per-segment kNN path rescores that column's shortlist from
+    /// the whole file. Every other reader takes ranges (page vectors, exact
+    /// filtered kNN, global rescoring), so an f32 segment's sidecar — 2.0 of
+    /// a ~2.6 GB promotion on staging — stays remote.
     #[cfg(feature = "s3")]
     fn promote_doc_store(&self, seg: &Path) {
         let t = Instant::now();
-        let (files, bytes) = {
-            let _permit = self.hydration_semaphore.acquire();
-            self.ensure_doc_store_local(&[seg.to_path_buf()], &RequestHydration::unlimited())
-        };
-        let landed = file_present_nonempty(&seg.join(kosha_segment::DOC_STORE_FILE))
-            && (!kosha_segment::segment_uses_doc_vectors(seg)
-                || file_present_nonempty(&seg.join(kosha_segment::DOC_VECTORS_FILE)));
+        self.log_promotion_start(seg);
+        let (files, bytes) = self.ensure_doc_store_local(
+            &[seg.to_path_buf()],
+            &RequestHydration::background(),
+            kosha_segment::segment_keeps_doc_vectors_whole,
+        );
+        let landed = doc_store_promotion_landed(seg);
         self.span_hydrator
-            .finish_promotion(&self.cache, seg, landed);
+            .finish_promotion(&self.cache, &self.span_writes, seg, landed);
         if landed {
             self.doc_store_reads.promotion_done();
             self.doc_store_reads.record(&doc_spans::PageFetchStats {
@@ -3605,10 +4224,73 @@ impl AppState {
             });
         }
         println!(
-            "doc store promote: seg={} landed={landed} fetched {files} file(s) ({:.1} MB) in {:.0} ms",
+            "doc store promote: seg={} landed={landed} doc_vectors={} fetched {files} file(s) \
+             ({:.1} MB) in {:.0} ms",
             seg.display(),
+            doc_vectors_promotion(seg),
             bytes as f64 / (1024.0 * 1024.0),
             t.elapsed().as_secs_f64() * 1e3,
+        );
+    }
+
+    /// The `doc store promote start:` line: which segment, which files and
+    /// how large (one LIST of the segment, a promotion's only extra
+    /// request, skipped when every file is already local), what triggered it and how many more are queued. Rare (a
+    /// few per pod per hour), and the only place a multi-GB background
+    /// download shows up before it finishes.
+    #[cfg(feature = "s3")]
+    fn log_promotion_start(&self, seg: &Path) {
+        let Some(ref s3) = self.s3_storage else {
+            return;
+        };
+        let mut wanted = vec![kosha_segment::DOC_STORE_FILE];
+        let vectors = doc_vectors_promotion(seg);
+        if vectors == DOC_VECTORS_PROMOTED {
+            wanted.push(kosha_segment::DOC_VECTORS_FILE);
+        }
+        wanted.retain(|f| !file_present_nonempty(&seg.join(f)));
+        let rel = seg
+            .strip_prefix(&self.data_dir)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // Nothing left to fetch (already whole): no LIST.
+        let sizes = if wanted.is_empty() {
+            Vec::new()
+        } else {
+            s3.list_remote_with_sizes(&rel).unwrap_or_else(|e| {
+                eprintln!("WARN: doc store promote: listing {rel} for file sizes failed: {e}");
+                Vec::new()
+            })
+        };
+        let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+        let mut total = 0u64;
+        let files: Vec<String> = wanted
+            .iter()
+            .map(|f| match sizes.iter().find(|(name, _)| name == f) {
+                Some((_, size)) => {
+                    total += size;
+                    format!("{f}:{:.1}MB", mb(*size))
+                }
+                None => format!("{f}:?"),
+            })
+            .collect();
+        let (gets, ranged) = self.span_hydrator.heat(seg).unwrap_or((0, 0));
+        let cfg = self.span_hydrator.config();
+        println!(
+            "doc store promote start: seg={} files={} total_mb={:.1} doc_vectors={vectors} \
+             trigger: ranged_gets={gets} ranged_mb={:.1} (promote at gets>={} or mb>={:.1}) \
+             queued={}",
+            seg.display(),
+            if files.is_empty() {
+                "-".to_string()
+            } else {
+                files.join(",")
+            },
+            mb(total),
+            mb(ranged),
+            cfg.promote_after_gets,
+            mb(cfg.promote_after_bytes),
+            self.doc_store_promotions.len(),
         );
     }
 
@@ -3660,26 +4342,38 @@ impl AppState {
         (files, bytes)
     }
 
-    /// Pin every segment directory of `manifest` in the disk cache until
-    /// the returned guard drops.
-    fn pin_segments(&self, ns: &NamespaceId, manifest: &kosha_core::Manifest) -> SegmentPins<'_> {
-        let keys: Vec<String> = manifest
+    /// A search's disk-cache pins, until the returned guard drops: to start
+    /// with, the `footer.json` of every segment `manifest` holds no cached
+    /// footer for. The searcher prunes segments with those footers read
+    /// from disk (`Manifest::footer_or_read`), so it needs them for every
+    /// segment, including the ones it never hydrates: one evicted
+    /// mid-search leaves its segment unpruned, and the search fails on a
+    /// segment it was never meant to read. The directories of the segments
+    /// it does read are added once hydration has chosen them
+    /// ([`search_segment_sets`]), before anything is fetched for them.
+    #[cfg(feature = "s3")]
+    fn pin_search_footers(
+        &self,
+        ns: &NamespaceId,
+        manifest: &kosha_core::Manifest,
+    ) -> SegmentPins<'_> {
+        let mut pins = SegmentPins {
+            cache: &self.cache,
+            data_dir: &self.data_dir,
+            keys: Vec::new(),
+        };
+        let footers: Vec<PathBuf> = manifest
             .segments
             .iter()
-            .filter_map(|entry| {
-                let dir = manifest.segment_dir(&self.data_dir, ns, &entry.segment_id);
-                dir.strip_prefix(&self.data_dir)
-                    .ok()
-                    .map(|rel| rel.to_string_lossy().into_owned())
+            .filter(|entry| manifest.segment_footer(&entry.segment_id).is_none())
+            .map(|entry| {
+                manifest
+                    .segment_dir(&self.data_dir, ns, &entry.segment_id)
+                    .join("footer.json")
             })
             .collect();
-        for key in &keys {
-            self.cache.pin(key);
-        }
-        SegmentPins {
-            cache: &self.cache,
-            keys,
-        }
+        pins.hold_all(&footers);
+        pins
     }
 
     /// Fetch a batch of `(logical_path, projected_size_bytes)` pairs into
@@ -3896,7 +4590,7 @@ impl AppState {
 
         let written = (|| -> Result<u64, KoshaError> {
             use std::io::Write;
-            let mut file = std::fs::File::create(&tmp)?;
+            let file = std::fs::File::create(&tmp)?;
             let written = if legacy_base64 {
                 let encoded = resp
                     .text()
@@ -3905,12 +4599,19 @@ impl AppState {
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(encoded.trim())
                     .map_err(|e| KoshaError::NotFound(format!("base64 decode: {e}")))?;
-                file.write_all(&bytes)?;
+                let mut out = writeback::ChunkedWriteback::new(&file, 0);
+                out.write_all(&bytes)?;
+                out.finish();
                 bytes.len() as u64
             } else {
-                let mut out = std::io::BufWriter::with_capacity(256 * 1024, &mut file);
+                // Each 16 MiB written is handed to the writeback thread as
+                // it lands (see `writeback`), never advised from this thread.
+                let mut out = std::io::BufWriter::with_capacity(
+                    256 * 1024,
+                    writeback::ChunkedWriteback::new(&file, 0),
+                );
                 let n = std::io::copy(&mut resp, &mut out)?;
-                out.flush()?;
+                out.into_inner().map_err(|e| e.into_error())?.finish();
                 if let Some(expected) = declared.filter(|expected| *expected != n) {
                     return Err(KoshaError::NotFound(format!(
                         "short body: {n} of {expected} bytes"
@@ -3936,89 +4637,49 @@ impl AppState {
         }
     }
 
-    /// Hydrate only the **scoring set** for segments that might match the
-    /// query (footer filter + term bloom prune first), skipping the bulk
-    /// `doc_store.bin` for Lazy segments. Returns the relative paths of
-    /// segments still incomplete after hydration was attempted — see
-    /// [`AppState::segment_is_scoring_complete`]. An empty result means
-    /// every segment the search needs for *scoring* is present; a non-empty
-    /// one means the caller must not proceed (search would be incomplete).
-    ///
-    /// `doc_store.bin` is fetched later, on demand, for just the segments
-    /// holding the materialize page — see
-    /// [`kosha_query::Searcher::search_with_doc_store_hydrator`].
-    ///
-    /// Returns a [`HydrationOutcome`]: the missing list above plus how many
-    /// files/bytes this request actually pulled from S3.
+    /// The footer phase's fetch: `footer.json` for every `manifest`
+    /// segment the manifest carries no footer for. A local copy that does
+    /// not match the CRC the manifest records for a rewritten footer (bloom
+    /// rebuild) is the old one and is removed first, so it is fetched
+    /// again. Returns the files and bytes downloaded.
     #[cfg(feature = "s3")]
-    fn hydrate_segments_for_search(
+    fn fetch_missing_footers(
         &self,
         ns: &NamespaceId,
         manifest: &kosha_core::Manifest,
-        query: &SearchQuery,
         request: &Arc<RequestHydration>,
-    ) -> HydrationOutcome {
-        let term_prune = kosha_query::term_bloom_prune_mode(query);
-        // The query is analyzed per segment with the chains its footer
-        // records (#220), so which terms (and posting-blob shards) a
-        // segment needs depends on its footer.
-        let query_analysis = kosha_query::QueryAnalysis::new(query);
-        let needs_bloom_check = query.has_prunable_filter() || term_prune.is_some();
-        // Single-vector kNN reads its column's index; late interaction
-        // (#205) reads the field's multivec files instead (below).
-        let knn_field = query
-            .knn
-            .as_ref()
-            .filter(|knn| !knn.is_late_interaction())
-            .map(|knn| knn.field.as_str());
-        let filter_fields = query_filter_fields(query);
-        let all_seg_paths: Vec<PathBuf> = manifest
-            .segments
-            .iter()
-            .map(|entry| manifest.segment_dir(&self.data_dir, ns, &entry.segment_id))
-            .collect();
-
-        let missing_manifest_footer_paths: Vec<PathBuf> = manifest
-            .segments
-            .iter()
-            .filter(|entry| manifest.segment_footer(&entry.segment_id).is_none())
-            .map(|entry| manifest.segment_dir(&self.data_dir, ns, &entry.segment_id))
-            .collect();
-
-        // A footer rewritten after commit (bloom rebuild) is recorded by CRC
-        // in the manifest. A local copy that doesn't match is the old one:
-        // remove it so the hydration below fetches the current file.
+    ) -> (usize, u64) {
+        let mut missing = Vec::new();
         for entry in &manifest.segments {
-            let Some(&expected) = manifest.footer_crc32.get(&entry.segment_id) else {
-                continue;
-            };
             if manifest.segment_footer(&entry.segment_id).is_some() {
                 continue;
             }
-            let path = manifest
-                .segment_dir(&self.data_dir, ns, &entry.segment_id)
-                .join("footer.json");
-            if let Ok(bytes) = std::fs::read(&path) {
-                if crc32fast::hash(&bytes) != expected {
-                    let _ = std::fs::remove_file(&path);
+            let seg_path = manifest.segment_dir(&self.data_dir, ns, &entry.segment_id);
+            if let Some(&expected) = manifest.footer_crc32.get(&entry.segment_id) {
+                let path = seg_path.join("footer.json");
+                if let Ok(bytes) = std::fs::read(&path) {
+                    if crc32fast::hash(&bytes) != expected {
+                        let _ = std::fs::remove_file(&path);
+                    }
                 }
             }
+            missing.push(seg_path);
         }
+        self.ensure_files_local(&missing, "footer.json", request)
+    }
 
-        // New manifests carry the search footer metadata inline, so cold
-        // search can skip the footer-first S3 phase entirely. Legacy
-        // manifests fall back to hydrating footer.json for pruning and
-        // format detection.
-        let (footer_files, footer_bytes) =
-            self.ensure_files_local(&missing_manifest_footer_paths, "footer.json", request);
-
-        // Persisted manifests no longer carry footers (#241), so the
-        // fallback above is now the normal path for segments this pod has
-        // not seen yet. Parse each such footer once and cache it on the
-        // in-memory manifest: later queries (and later manifest versions,
-        // via `restore_manifest`'s carry-over) skip both the S3 fetch and
-        // the local parse for it.
-        let fetched_footers: HashMap<kosha_core::SegmentId, Arc<kosha_core::Footer>> = manifest
+    /// Parse the local `footer.json` of every `manifest` segment the
+    /// manifest carries no footer for, and cache each on the in-memory
+    /// manifest(s): later queries (and later manifest versions, via
+    /// `restore_manifest`'s carry-over) skip both the fetch and the parse.
+    /// Returns the footers parsed. A file that is missing, unparsable, not
+    /// the CRC-recorded rewrite or of another segment is left out.
+    fn remember_local_footers(
+        &self,
+        ns: &NamespaceId,
+        manifest: &kosha_core::Manifest,
+    ) -> HashMap<kosha_core::SegmentId, Arc<kosha_core::Footer>> {
+        let footers: HashMap<kosha_core::SegmentId, Arc<kosha_core::Footer>> = manifest
             .segments
             .iter()
             .filter(|entry| manifest.segment_footer(&entry.segment_id).is_none())
@@ -4046,9 +4707,63 @@ impl AppState {
                     .then(|| (entry.segment_id.clone(), Arc::new(footer)))
             })
             .collect();
-        if !fetched_footers.is_empty() {
-            self.remember_search_footers(ns, &fetched_footers);
+        if !footers.is_empty() {
+            self.remember_search_footers(ns, &footers);
         }
+        footers
+    }
+
+    /// Hydrate only the **scoring set** for segments that might match the
+    /// query (footer filter + term bloom prune first), skipping the bulk
+    /// `doc_store.bin` for Lazy segments. Returns the relative paths of
+    /// segments still incomplete after hydration was attempted — see
+    /// [`AppState::segment_is_scoring_complete`]. An empty result means
+    /// every segment the search needs for *scoring* is present; a non-empty
+    /// one means the caller must not proceed (search would be incomplete).
+    ///
+    /// `doc_store.bin` is fetched later, on demand, for just the segments
+    /// holding the materialize page — see
+    /// [`kosha_query::Searcher::search_with_doc_store_hydrator`].
+    ///
+    /// Returns a [`HydrationOutcome`]: the missing list above plus how many
+    /// files/bytes this request actually pulled from S3.
+    #[cfg(feature = "s3")]
+    fn hydrate_segments_for_search(
+        &self,
+        ns: &NamespaceId,
+        manifest: &kosha_core::Manifest,
+        query: &SearchQuery,
+        request: &Arc<RequestHydration>,
+        // A search's pins (see `AppState::pin_search_footers`): the
+        // segments chosen below are added before any of their files is
+        // fetched. `None` for warm-up, which reads nothing afterwards.
+        pins: Option<&mut SegmentPins<'_>>,
+    ) -> HydrationOutcome {
+        // The query is analyzed per segment with the chains its footer
+        // records (#220), so which terms (and posting-blob shards) a
+        // segment needs depends on its footer.
+        let query_analysis = kosha_query::QueryAnalysis::new(query);
+        let needs_bloom_check =
+            query.has_prunable_filter() || kosha_query::term_bloom_prune_mode(query).is_some();
+        // Single-vector kNN reads its column's index; late interaction
+        // (#205) reads the field's multivec files instead (below).
+        let knn_field = query
+            .knn
+            .as_ref()
+            .filter(|knn| !knn.is_late_interaction())
+            .map(|knn| knn.field.as_str());
+        let filter_fields = query_filter_fields(query);
+        let all_seg_paths: Vec<PathBuf> = manifest
+            .segments
+            .iter()
+            .map(|entry| manifest.segment_dir(&self.data_dir, ns, &entry.segment_id))
+            .collect();
+
+        // Persisted manifests no longer carry footers (#241): the footer
+        // phase fetches `footer.json` for segments this pod has not seen
+        // yet and caches each parsed footer on the in-memory manifest.
+        let (footer_files, footer_bytes) = self.fetch_missing_footers(ns, manifest, request);
+        let fetched_footers = self.remember_local_footers(ns, manifest);
 
         let segment_footer = |entry: &kosha_core::ManifestEntry| {
             manifest
@@ -4083,24 +4798,20 @@ impl AppState {
             posting_terms_for_query(query, &query_analysis, analyses.iter().copied());
         let stats_terms = kosha_query::namespace_stats_terms(query, analyses.iter().copied())
             .filter(|t| !t.is_empty());
-        let mut to_hydrate: Vec<PathBuf> = Vec::new();
-        let mut stats_only: Vec<PathBuf> = Vec::new();
-        for (entry, seg_path) in manifest.segments.iter().zip(all_seg_paths.iter().cloned()) {
-            // Borrowed, never cloned: footers hold every bloom. A segment
-            // with no cached footer was already read (once) into
-            // `fetched_footers` above.
-            let footer = segment_footer(entry);
-            match segment_search_hydration(
-                query,
-                needs_bloom_check,
-                term_prune.map(|mode| (&query_analysis, mode)),
-                stats_terms.as_deref(),
-                footer,
-            ) {
-                SegmentHydration::Scoring => to_hydrate.push(seg_path),
-                SegmentHydration::StatsOnly => stats_only.push(seg_path),
-                SegmentHydration::Skip => {}
-            }
+        // Footers borrowed, never cloned: they hold every bloom. A segment
+        // with no cached footer was already read (once) into
+        // `fetched_footers` above.
+        let (to_hydrate, stats_only) = search_segment_sets(
+            query,
+            &query_analysis,
+            stats_terms.as_deref(),
+            all_seg_paths
+                .iter()
+                .cloned()
+                .zip(manifest.segments.iter().map(segment_footer)),
+        );
+        if let Some(pins) = pins {
+            pins.hold_all(to_hydrate.iter().chain(&stats_only));
         }
         // The filter files each segment needs for this query (#244): its
         // whole `filters.bin`, or `filters.toc` plus only the columns the
@@ -4123,6 +4834,7 @@ impl AppState {
             &filter_files,
             &manifest_footers,
             request,
+            true,
         );
         let postings_outcome = self.ensure_query_postings(
             ns,
@@ -4132,6 +4844,15 @@ impl AppState {
             &posting_files,
             request,
         );
+        if let (Some(field), false) = (knn_field, filter_files.is_empty()) {
+            self.fetch_exact_knn_headers(
+                &to_hydrate,
+                field,
+                &manifest_footers,
+                request,
+                &mut outcome,
+            );
+        }
         outcome.files_fetched += postings_outcome.files_fetched;
         outcome.bytes_fetched += postings_outcome.bytes_fetched;
         outcome.missing.extend(postings_outcome.missing);
@@ -4188,6 +4909,7 @@ impl AppState {
                 &HashMap::new(),
                 &manifest_footers,
                 request,
+                false, // best effort: a miss does not fail the search
             );
             let stats_postings = self.ensure_query_postings(
                 ns,
@@ -4216,7 +4938,7 @@ impl AppState {
         // aren't local), but the caller must not report it as a hydration
         // *failure* — nothing failed, the request declined to pull that
         // much. See `HydrationOutcome::shed`.
-        outcome.shed = request.is_shed();
+        outcome.set_shed(request);
         outcome
     }
 
@@ -4274,23 +4996,43 @@ impl AppState {
         filter_files: &[String],
         manifest_footer: Option<&kosha_core::Footer>,
     ) -> bool {
+        Self::scoring_gap(
+            seg_path,
+            knn_field,
+            vectors_ranged,
+            filter_files,
+            manifest_footer,
+        )
+        .is_none()
+    }
+
+    /// The first check of [`Self::scoring_complete`] that `seg_path` fails,
+    /// or `None` when it is complete.
+    #[cfg(feature = "s3")]
+    fn scoring_gap<'a>(
+        seg_path: &Path,
+        knn_field: Option<&'a str>,
+        vectors_ranged: bool,
+        filter_files: &'a [String],
+        manifest_footer: Option<&kosha_core::Footer>,
+    ) -> Option<ScoringGap<'a>> {
         if manifest_footer.is_none() && !file_present_nonempty(&seg_path.join("footer.json")) {
-            return false;
+            return Some(ScoringGap::Footer);
         }
         if !file_present_nonempty(&seg_path.join("inverted.idx")) {
-            return false;
+            return Some(ScoringGap::InvertedIdx);
         }
-        if !filter_files
+        if let Some(f) = filter_files
             .iter()
-            .all(|f| file_present_nonempty(&seg_path.join(f)))
+            .find(|f| !file_present_nonempty(&seg_path.join(f)))
         {
-            return false;
+            return Some(ScoringGap::FilterFile(f));
         }
         let doc_access_ok = file_present_nonempty(&seg_path.join("doc_store.bin"))
             || (file_present_nonempty(&seg_path.join("doc_store.offsets"))
                 && kosha_segment::doc_store_offsets_plausible(seg_path, manifest_footer));
         if !doc_access_ok {
-            return false;
+            return Some(ScoringGap::DocAccess);
         }
         // `vector.offsets` is required only where it exists: legacy flat
         // segments never have one. A clustered segment without it is served
@@ -4306,10 +5048,94 @@ impl AppState {
                 }
             };
             if !knn_files_complete(seg_path, footer, field, vectors_ranged) {
-                return false;
+                return Some(ScoringGap::KnnFiles(field));
             }
         }
-        true
+        None
+    }
+
+    /// Best-effort: the `doc_vectors.bin` header of every scoring segment a
+    /// filtered kNN on `field` may score exactly from its sidecar (see
+    /// [`exact_knn_wants_doc_vectors_header`]), by range into the span
+    /// cache, one round sized from the footer. Unlike the scoring files a
+    /// header that does not arrive fails nothing — the exact path then
+    /// scans the column's vector postings (and says so) — it is only
+    /// counted, so the pass's verdict is not cached.
+    #[cfg(feature = "s3")]
+    fn fetch_exact_knn_headers(
+        &self,
+        seg_paths: &[PathBuf],
+        field: &str,
+        manifest_footers: &HashMap<PathBuf, &kosha_core::Footer>,
+        request: &Arc<RequestHydration>,
+        outcome: &mut HydrationOutcome,
+    ) {
+        let Some(ref s3) = self.s3_storage else {
+            return;
+        };
+        let mut targets: Vec<(&Path, String, u64)> = Vec::new();
+        for seg in seg_paths {
+            let local_footer;
+            let footer = match manifest_footers.get(seg) {
+                Some(footer) => Some(*footer),
+                None => {
+                    local_footer = SegmentReader::read_footer(seg).ok();
+                    local_footer.as_ref()
+                }
+            };
+            if !exact_knn_wants_doc_vectors_header(footer, field)
+                || doc_spans::doc_vectors_header_local(seg)
+            {
+                continue;
+            }
+            let (Some(footer), Ok(rel)) = (footer, seg.strip_prefix(&self.data_dir)) else {
+                continue;
+            };
+            targets.push((
+                seg.as_path(),
+                rel.to_string_lossy().into_owned(),
+                kosha_segment::doc_vectors_header_estimate(footer),
+            ));
+        }
+        if targets.is_empty() {
+            return;
+        }
+        if request.is_shed() {
+            outcome.exact_knn_headers_missing += targets.len();
+            return;
+        }
+        let fetcher = doc_spans::S3RangeFetcher {
+            s3,
+            concurrency: self.scoring_hydrate_concurrency,
+            budget: &self.hydration_budget,
+            request,
+        };
+        let refs: Vec<(&Path, &str)> = targets.iter().map(|(d, r, _)| (*d, r.as_str())).collect();
+        let fetched = {
+            let _permit = self.hydration_semaphore.acquire("exact_knn_headers");
+            doc_spans::fetch_doc_vectors_headers_probing(
+                &refs,
+                |i| targets[i].2,
+                &fetcher,
+                &self.span_writes,
+            )
+        };
+        outcome.rounds += fetched.rounds;
+        for (seg, (dir, _, _)) in fetched.segments.iter().zip(&targets) {
+            outcome.bytes_fetched += seg.bytes;
+            match seg.status {
+                doc_spans::HeaderStatus::Cached => outcome.files_fetched += 1,
+                doc_spans::HeaderStatus::Shed => outcome.exact_knn_headers_missing += 1,
+                doc_spans::HeaderStatus::Failed => {
+                    outcome.exact_knn_headers_missing += 1;
+                    eprintln!(
+                        "WARN: doc_vectors.bin header of {} could not be fetched for a filtered \
+                         kNN on '{field}': its exact path scans the column's vector postings",
+                        dir.display()
+                    );
+                }
+            }
+        }
     }
 
     /// Scoring-set-only counterpart of [`AppState::ensure_segments_local`]:
@@ -4320,12 +5146,14 @@ impl AppState {
     /// same namespace share one fetch, and the same `hydration_semaphore`
     /// bounds server-wide concurrent hydration operations.
     ///
-    /// A compaction/merge caller that is a *waiter* behind a search owner
-    /// here only sees scoring-set files fetched; it then reports those
-    /// segments as not-yet-complete via its own full-segment predicate and
-    /// the admin path surfaces per-segment errors (its existing tolerance
-    /// for partial S3 fetches) rather than reading a partial corpus — same
-    /// graceful-degradation contract those admin paths already have.
+    /// A waiter behind an owner that needed a different file set (an
+    /// unfiltered search ahead of a filtered kNN, or a search ahead of a
+    /// compaction) finds the segment still incomplete by its own predicate
+    /// afterwards and fetches the rest itself (`hydrate_single_flight`);
+    /// only what is incomplete after that is reported `missing`. With
+    /// `log_missing` (a set whose miss fails the request) one WARN then names
+    /// the count and the first few segments with the failed check and this
+    /// request's role.
     #[cfg(feature = "s3")]
     fn ensure_scoring_files_local(
         &self,
@@ -4334,6 +5162,7 @@ impl AppState {
         filter_files: &HashMap<PathBuf, Vec<String>>,
         manifest_footers: &HashMap<PathBuf, &kosha_core::Footer>,
         request: &Arc<RequestHydration>,
+        log_missing: bool,
     ) -> HydrationOutcome {
         let Some(ref s3) = self.s3_storage else {
             return HydrationOutcome::default();
@@ -4342,356 +5171,383 @@ impl AppState {
         let vectors_ranged = self.posting_read_mode == doc_spans::ReadMode::Ranged;
         let filters_of = |p: &Path| filter_files.get(p).map(Vec::as_slice).unwrap_or(&[]);
         let mut outcome = HydrationOutcome::default();
-        let (owned, waiting) = partition_for_hydration(&self.in_flight_segments, seg_paths, |p| {
-            let complete = Self::scoring_complete(
-                p,
-                knn_field,
-                vectors_ranged,
-                filters_of(p),
-                manifest_footers.get(p).copied(),
-            );
-            // A search's segment found with its scoring files already local
-            // is a disk-cache hit for its tenant; one that must hydrate is a
-            // miss (#342, `kosha_cache_{hits,misses}{cache="nvme"}`).
-            if let Ok(rel) = p.strip_prefix(&self.data_dir) {
-                let rel = rel.to_string_lossy();
-                self.cache
-                    .record_lookup(kosha_core::tenancy::tenant_of_segment_dir(&rel), complete);
-            }
-            complete
-        });
-
-        if !owned.is_empty() {
-            let _permit = self.hydration_semaphore.acquire();
-
-            // Which vector files a kNN needs is read from each segment's
-            // footer (#204), so a footer known neither from the manifest nor
-            // locally must be fetched before the list below is built.
-            if knn_field.is_some() {
-                let without_footer: Vec<PathBuf> = owned
-                    .iter()
-                    .map(|(p, _)| p.clone())
-                    .filter(|p| {
-                        !manifest_footers.contains_key(p)
-                            && !file_present_nonempty(&p.join("footer.json"))
-                    })
-                    .collect();
-                if !without_footer.is_empty() {
-                    let (files, bytes) =
-                        self.ensure_files_local(&without_footer, "footer.json", request);
-                    outcome.files_fetched += files;
-                    outcome.bytes_fetched += bytes;
-                }
-            }
-
-            // Sizes are unknown without a per-segment LIST round trip —
-            // avoiding that round trip is half the point of this path (file
-            // names are known a priori). 0 sizes mean `chunk_by_byte_budget`
-            // cannot chunk this batch at all: every file below lands in one
-            // chunk, fanned out `scoring_hydrate_concurrency` (64) wide.
-            //
-            // That used to be waved off as "the scoring set excludes the
-            // bulk doc stores, so per-file sizes are small." It isn't:
-            // `inverted.idx` grows with a segment's vocabulary, and one cold
-            // search on staging pulled 177 files / 4,974 MB through here
-            // (~28 MB average) in a single chunk. Volume on this path is
-            // instead bounded by `hydration_budget`, from each response's
-            // `Content-Length` — see the `hydrate_byte_budget` field docs.
-            let mut logical_paths: Vec<(String, u64)> = Vec::new();
-            // Segments sent to score with only their offsets sidecar. Each
-            // is checked after the fetch below: a sidecar that is missing
-            // from S3 or that the reader would reject falls back to
-            // `doc_store.bin` (#179, #184).
-            let mut lazy_segments: Vec<&PathBuf> = Vec::new();
-            // Legacy segments whose `doc_vectors.bin` header a kNN needs,
-            // with their object prefix: fetched by range after this round.
-            let mut doc_vector_headers: Vec<(&Path, String)> = Vec::new();
-            for (seg_path, _) in &owned {
-                let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
-                    continue;
-                };
-                let s3_prefix = rel_path.to_string_lossy().into_owned();
-
-                // `footer.json` is needed only for legacy manifests that do
-                // not carry a footer snapshot.
-                if !manifest_footers.contains_key(seg_path)
-                    && !file_present_nonempty(&seg_path.join("footer.json"))
-                {
-                    logical_paths.push((format!("{s3_prefix}/footer.json"), 0));
-                }
-                if !file_present_nonempty(&seg_path.join("inverted.idx")) {
-                    logical_paths.push((format!("{s3_prefix}/inverted.idx"), 0));
-                }
-                // Only the filter files this query reads: a columnar
-                // segment's TOC plus the columns the query names (#244),
-                // in the same round as the other scoring files.
-                for file in filters_of(seg_path) {
-                    if !file_present_nonempty(&seg_path.join(file)) {
-                        logical_paths.push((format!("{s3_prefix}/{file}"), 0));
-                    }
-                }
-
-                // doc_store: Lazy segments need only the offsets sidecar;
-                // legacy (format_version 0) segments need the full
-                // doc_store.bin because eager open parses it. See
-                // `segment_is_lazy_capable` for how that is decided and
-                // what it used to get wrong.
-                let has_offsets = file_present_nonempty(&seg_path.join("doc_store.offsets"));
-                let has_doc_store = file_present_nonempty(&seg_path.join("doc_store.bin"));
-                let lazy_capable = has_offsets
-                    || segment_is_lazy_capable(
-                        manifest_footers.get(seg_path).map(|f| f.format_version),
-                        || {
-                            SegmentReader::read_footer(seg_path)
-                                .ok()
-                                .map(|ft| ft.format_version)
-                        },
-                    );
-                if lazy_capable {
-                    if !has_offsets {
-                        logical_paths.push((format!("{s3_prefix}/doc_store.offsets"), 0));
-                    }
-                    if !has_doc_store {
-                        lazy_segments.push(seg_path);
-                    }
-                } else if !has_doc_store {
-                    logical_paths.push((format!("{s3_prefix}/doc_store.bin"), 0));
-                }
-
-                // Only the queried column's files (#204), as the segment's
-                // footer lists them. Ranged mode (#245) fetches a clustered
-                // column's offsets sidecar only: its probed postings are
-                // read by range during the search, and the idx file is
-                // fetched whole only for a column that turns out to have no
-                // sidecar (below). A legacy segment's `vector.offsets`
-                // exists only for the clustered format, and there is no
-                // footer signal to predict that (vector.idx is
-                // deliberately self-describing), so it is always attempted:
-                // a segment that doesn't have one just shows up as a
-                // per-file miss in `s3.read_many`'s accounting, not a
-                // hydration failure. Without the sidecar the lazy path
-                // never activates for S3-backed segments, and every kNN
-                // query silently takes the (still correct, just slower)
-                // eager fallback.
-                if let Some(field) = knn_field {
-                    let local_footer;
-                    let footer = match manifest_footers.get(seg_path) {
-                        Some(footer) => Some(*footer),
-                        None => {
-                            local_footer = SegmentReader::read_footer(seg_path).ok();
-                            local_footer.as_ref()
-                        }
-                    };
-                    for column in kosha_segment::knn_vector_columns(footer, field) {
-                        let mut files: Vec<&str> = Vec::new();
-                        if let Some(offsets) = &column.offsets_file {
-                            files.push(offsets);
-                        }
-                        if !vectors_ranged || column.offsets_file.is_none() {
-                            files.push(&column.idx_file);
-                        }
-                        for file in files {
-                            if !file_present_nonempty(&seg_path.join(file)) {
-                                logical_paths.push((format!("{s3_prefix}/{file}"), 0));
-                            }
-                        }
-                    }
-                    // Only the header of a legacy `doc_vectors.bin` (its
-                    // field table binds the unnamed index), by range below:
-                    // the whole file is as large as the index itself. With
-                    // global rescoring on (#381), a quantized column's
-                    // header too (see `knn_wants_doc_vectors_header`).
-                    if knn_wants_doc_vectors_header(footer, field)
-                        && !doc_spans::doc_vectors_header_local(seg_path)
-                    {
-                        doc_vector_headers.push((seg_path.as_path(), s3_prefix.clone()));
-                    }
-                }
-            }
-
-            if !logical_paths.is_empty() {
-                println!(
-                    "cache miss: hydrating {} scoring file(s) across {} segment(s) \
-                     (fan-out={}); doc stores deferred to page materialize for Lazy segments",
-                    logical_paths.len(),
-                    owned.len(),
-                    self.scoring_hydrate_concurrency
+        let roles = hydrate_single_flight(
+            &self.in_flight_segments,
+            seg_paths,
+            HYDRATE_OWNER_SCORING,
+            |p, first_round| {
+                let complete = Self::scoring_complete(
+                    p,
+                    knn_field,
+                    vectors_ranged,
+                    filters_of(p),
+                    manifest_footers.get(p).copied(),
                 );
-                self.hydrate_files(
-                    s3,
-                    &logical_paths,
-                    self.scoring_hydrate_concurrency,
-                    request,
-                );
-                outcome.rounds += 1;
-                // Bytes counted post-fetch (sizes weren't known up front);
-                // every path here was absent before the fetch, so this
-                // counts only what this call actually moved.
-                for (path, _) in &logical_paths {
-                    if let Ok(m) = std::fs::metadata(self.data_dir.join(path)) {
-                        outcome.files_fetched += 1;
-                        outcome.bytes_fetched += m.len();
+                // A search's segment found with its scoring files already local
+                // is a disk-cache hit for its tenant; one that must hydrate is a
+                // miss (#342, `kosha_cache_{hits,misses}{cache="nvme"}`).
+                if let (true, Ok(rel)) = (first_round, p.strip_prefix(&self.data_dir)) {
+                    let rel = rel.to_string_lossy();
+                    self.cache
+                        .record_lookup(kosha_core::tenancy::tenant_of_segment_dir(&rel), complete);
+                }
+                complete
+            },
+            |owned| {
+                let bytes_before = outcome.bytes_fetched;
+                let _permit = self.hydration_semaphore.acquire("scoring_set");
+
+                // Which vector files a kNN needs is read from each segment's
+                // footer (#204), so a footer known neither from the manifest nor
+                // locally must be fetched before the list below is built.
+                if knn_field.is_some() {
+                    let without_footer: Vec<PathBuf> = owned
+                        .iter()
+                        .map(|(p, _)| p.clone())
+                        .filter(|p| {
+                            !manifest_footers.contains_key(p)
+                                && !file_present_nonempty(&p.join("footer.json"))
+                        })
+                        .collect();
+                    if !without_footer.is_empty() {
+                        let (files, bytes) =
+                            self.ensure_files_local(&without_footer, "footer.json", request);
+                        outcome.files_fetched += files;
+                        outcome.bytes_fetched += bytes;
                     }
                 }
-            }
 
-            // Legacy `doc_vectors.bin` headers, by range into the span
-            // cache (the reader binds the unnamed index from that span).
-            if !doc_vector_headers.is_empty() && !request.is_shed() {
-                let fetcher = doc_spans::S3RangeFetcher {
-                    s3,
-                    concurrency: self.scoring_hydrate_concurrency,
-                    budget: &self.hydration_budget,
-                    request,
-                };
-                let targets: Vec<(&Path, &str)> = doc_vector_headers
-                    .iter()
-                    .map(|(dir, rel)| (*dir, rel.as_str()))
-                    .collect();
-                let fetched = doc_spans::fetch_doc_vectors_headers(&targets, &fetcher, &self.cache);
-                outcome.rounds += fetched.rounds;
-                outcome.shed |= fetched.shed;
-                for seg in &fetched.segments {
-                    outcome.bytes_fetched += seg.bytes;
-                    if seg.status == doc_spans::HeaderStatus::Cached {
-                        outcome.files_fetched += 1;
-                    }
-                }
-            }
-
-            // Ranged mode: a segment with no `vector.offsets` is a legacy
-            // flat (or unclustered) one, searched by exact scan of the whole
-            // `vector.idx`. One more round, for those segments only.
-            if let (Some(field), true) = (knn_field, vectors_ranged) {
-                let mut legacy: Vec<(String, u64)> = Vec::new();
-                for (p, _) in &owned {
-                    let Ok(rel) = p.strip_prefix(&self.data_dir) else {
+                // Sizes are unknown without a per-segment LIST round trip —
+                // avoiding that round trip is half the point of this path (file
+                // names are known a priori). 0 sizes mean `chunk_by_byte_budget`
+                // cannot chunk this batch at all: every file below lands in one
+                // chunk, fanned out `scoring_hydrate_concurrency` (64) wide.
+                //
+                // That used to be waved off as "the scoring set excludes the
+                // bulk doc stores, so per-file sizes are small." It isn't:
+                // `inverted.idx` grows with a segment's vocabulary, and one cold
+                // search on staging pulled 177 files / 4,974 MB through here
+                // (~28 MB average) in a single chunk. Volume on this path is
+                // instead bounded by `hydration_budget`, from each response's
+                // `Content-Length` — see the `hydrate_byte_budget` field docs.
+                let mut logical_paths: Vec<(String, u64)> = Vec::new();
+                // Segments sent to score with only their offsets sidecar. Each
+                // is checked after the fetch below: a sidecar that is missing
+                // from S3 or that the reader would reject falls back to
+                // `doc_store.bin` (#179, #184).
+                let mut lazy_segments: Vec<&PathBuf> = Vec::new();
+                // Legacy segments whose `doc_vectors.bin` header a kNN needs,
+                // with their object prefix: fetched by range after this round.
+                let mut doc_vector_headers: Vec<(&Path, String)> = Vec::new();
+                for (seg_path, _) in owned {
+                    let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
                         continue;
                     };
-                    let local_footer;
-                    let footer = match manifest_footers.get(p) {
-                        Some(footer) => Some(*footer),
-                        None => {
-                            local_footer = SegmentReader::read_footer(p).ok();
-                            local_footer.as_ref()
+                    let s3_prefix = rel_path.to_string_lossy().into_owned();
+
+                    // `footer.json` is needed only for legacy manifests that do
+                    // not carry a footer snapshot.
+                    if !manifest_footers.contains_key(seg_path)
+                        && !file_present_nonempty(&seg_path.join("footer.json"))
+                    {
+                        logical_paths.push((format!("{s3_prefix}/footer.json"), 0));
+                    }
+                    if !file_present_nonempty(&seg_path.join("inverted.idx")) {
+                        logical_paths.push((format!("{s3_prefix}/inverted.idx"), 0));
+                    }
+                    // Only the filter files this query reads: a columnar
+                    // segment's TOC plus the columns the query names (#244),
+                    // in the same round as the other scoring files.
+                    for file in filters_of(seg_path) {
+                        if !file_present_nonempty(&seg_path.join(file)) {
+                            logical_paths.push((format!("{s3_prefix}/{file}"), 0));
                         }
-                    };
-                    for column in kosha_segment::knn_vector_columns(footer, field) {
-                        let Some(offsets) = &column.offsets_file else {
-                            continue;
+                    }
+
+                    // doc_store: Lazy segments need only the offsets sidecar;
+                    // legacy (format_version 0) segments need the full
+                    // doc_store.bin because eager open parses it. See
+                    // `segment_is_lazy_capable` for how that is decided and
+                    // what it used to get wrong.
+                    let has_offsets = file_present_nonempty(&seg_path.join("doc_store.offsets"));
+                    let has_doc_store = file_present_nonempty(&seg_path.join("doc_store.bin"));
+                    let lazy_capable = has_offsets
+                        || segment_is_lazy_capable(
+                            manifest_footers.get(seg_path).map(|f| f.format_version),
+                            || {
+                                SegmentReader::read_footer(seg_path)
+                                    .ok()
+                                    .map(|ft| ft.format_version)
+                            },
+                        );
+                    if lazy_capable {
+                        if !has_offsets {
+                            logical_paths.push((format!("{s3_prefix}/doc_store.offsets"), 0));
+                        }
+                        if !has_doc_store {
+                            lazy_segments.push(seg_path);
+                        }
+                    } else if !has_doc_store {
+                        logical_paths.push((format!("{s3_prefix}/doc_store.bin"), 0));
+                    }
+
+                    // Only the queried column's files (#204), as the segment's
+                    // footer lists them. Ranged mode (#245) fetches a clustered
+                    // column's offsets sidecar only: its probed postings are
+                    // read by range during the search, and the idx file is
+                    // fetched whole only for a column that turns out to have no
+                    // sidecar (below). A legacy segment's `vector.offsets`
+                    // exists only for the clustered format, and there is no
+                    // footer signal to predict that (vector.idx is
+                    // deliberately self-describing), so it is always attempted:
+                    // a segment that doesn't have one just shows up as a
+                    // per-file miss in `s3.read_many`'s accounting, not a
+                    // hydration failure. Without the sidecar the lazy path
+                    // never activates for S3-backed segments, and every kNN
+                    // query silently takes the (still correct, just slower)
+                    // eager fallback.
+                    if let Some(field) = knn_field {
+                        let local_footer;
+                        let footer = match manifest_footers.get(seg_path) {
+                            Some(footer) => Some(*footer),
+                            None => {
+                                local_footer = SegmentReader::read_footer(seg_path).ok();
+                                local_footer.as_ref()
+                            }
                         };
-                        if !file_present_nonempty(&p.join(offsets))
-                            && !file_present_nonempty(&p.join(&column.idx_file))
+                        for column in kosha_segment::knn_vector_columns(footer, field) {
+                            let mut files: Vec<&str> = Vec::new();
+                            if let Some(offsets) = &column.offsets_file {
+                                files.push(offsets);
+                            }
+                            if !vectors_ranged || column.offsets_file.is_none() {
+                                files.push(&column.idx_file);
+                            }
+                            for file in files {
+                                if !file_present_nonempty(&seg_path.join(file)) {
+                                    logical_paths.push((format!("{s3_prefix}/{file}"), 0));
+                                }
+                            }
+                        }
+                        // Only the header of a legacy `doc_vectors.bin` (its
+                        // field table binds the unnamed index), by range below:
+                        // the whole file is as large as the index itself. With
+                        // global rescoring on (#381), a quantized column's
+                        // header too (see `knn_wants_doc_vectors_header`).
+                        if knn_wants_doc_vectors_header(footer, field)
+                            && !doc_spans::doc_vectors_header_local(seg_path)
                         {
-                            legacy.push((
-                                format!("{}/{}", rel.to_string_lossy(), column.idx_file),
-                                0,
-                            ));
+                            doc_vector_headers.push((seg_path.as_path(), s3_prefix.clone()));
                         }
                     }
                 }
-                if !legacy.is_empty() {
-                    self.hydrate_files(s3, &legacy, self.scoring_hydrate_concurrency, request);
+
+                if !logical_paths.is_empty() {
+                    println!(
+                        "cache miss: hydrating {} scoring file(s) across {} segment(s) \
+                     (fan-out={}); doc stores deferred to page materialize for Lazy segments",
+                        logical_paths.len(),
+                        owned.len(),
+                        self.scoring_hydrate_concurrency
+                    );
+                    self.hydrate_files(
+                        s3,
+                        &logical_paths,
+                        self.scoring_hydrate_concurrency,
+                        request,
+                    );
                     outcome.rounds += 1;
-                    for (path, _) in &legacy {
+                    // Bytes counted post-fetch (sizes weren't known up front);
+                    // every path here was absent before the fetch, so this
+                    // counts only what this call actually moved.
+                    for (path, _) in &logical_paths {
                         if let Ok(m) = std::fs::metadata(self.data_dir.join(path)) {
                             outcome.files_fetched += 1;
                             outcome.bytes_fetched += m.len();
                         }
                     }
                 }
-            }
 
-            // Doc-store fallback (#179, #184). A Lazy segment goes to
-            // scoring with only `doc_store.offsets`; `doc_store.bin` is
-            // deferred to page materialize. That is only safe if the reader
-            // will actually use the sidecar. Two ways it won't:
-            //
-            // * The sidecar is not in S3 (a partial upload, or a legacy
-            //   segment whose manifest footer claimed otherwise), or the GET
-            //   failed. The segment would reach scoring with neither
-            //   doc-store file, the one state the reader can't open, and the
-            //   whole search used to 503 with "segment hydration failed".
-            // * The sidecar is there but fails the reader's sanity check
-            //   (doc-count mismatch, truncation). The reader falls back to
-            //   parsing `doc_store.bin`, which was never fetched, and the
-            //   search used to 500 with "No such file or directory".
-            //
-            // Either way, fetch `doc_store.bin` for that segment and serve
-            // the search. It is the expensive path, and it self-heals: once
-            // the bulk file is local, later queries are served from disk.
-            // `footer.json` comes along for a rejected sidecar so the reader
-            // can check the manifest's cached footer against the segment's
-            // own (see `kosha_segment::doc_store_opens_lazily`).
-            let mut fallback_paths: Vec<(String, u64)> = Vec::new();
-            // A shed request skipped its fetches on purpose; its sidecars
-            // are absent because nothing asked for them, and it must not
-            // go on to pull bulk doc stores either.
-            let lazy_segments = if request.is_shed() {
-                Vec::new()
-            } else {
-                lazy_segments
-            };
-            for seg_path in lazy_segments {
-                let manifest_footer = manifest_footers.get(seg_path).copied();
-                let Some(reason) = doc_store_fallback_reason(seg_path, manifest_footer) else {
-                    continue;
+                // Legacy `doc_vectors.bin` headers, by range into the span
+                // cache (the reader binds the unnamed index from that span).
+                if !doc_vector_headers.is_empty() && !request.is_shed() {
+                    let fetcher = doc_spans::S3RangeFetcher {
+                        s3,
+                        concurrency: self.scoring_hydrate_concurrency,
+                        budget: &self.hydration_budget,
+                        request,
+                    };
+                    let targets: Vec<(&Path, &str)> = doc_vector_headers
+                        .iter()
+                        .map(|(dir, rel)| (*dir, rel.as_str()))
+                        .collect();
+                    let fetched =
+                        doc_spans::fetch_doc_vectors_headers(&targets, &fetcher, &self.span_writes);
+                    outcome.rounds += fetched.rounds;
+                    outcome.shed |= fetched.shed;
+                    for seg in &fetched.segments {
+                        outcome.bytes_fetched += seg.bytes;
+                        if seg.status == doc_spans::HeaderStatus::Cached {
+                            outcome.files_fetched += 1;
+                        }
+                    }
+                }
+
+                // Ranged mode: a segment with no `vector.offsets` is a legacy
+                // flat (or unclustered) one, searched by exact scan of the whole
+                // `vector.idx`. One more round, for those segments only.
+                if let (Some(field), true) = (knn_field, vectors_ranged) {
+                    let mut legacy: Vec<(String, u64)> = Vec::new();
+                    for (p, _) in owned {
+                        let Ok(rel) = p.strip_prefix(&self.data_dir) else {
+                            continue;
+                        };
+                        let local_footer;
+                        let footer = match manifest_footers.get(p) {
+                            Some(footer) => Some(*footer),
+                            None => {
+                                local_footer = SegmentReader::read_footer(p).ok();
+                                local_footer.as_ref()
+                            }
+                        };
+                        for column in kosha_segment::knn_vector_columns(footer, field) {
+                            let Some(offsets) = &column.offsets_file else {
+                                continue;
+                            };
+                            if !file_present_nonempty(&p.join(offsets))
+                                && !file_present_nonempty(&p.join(&column.idx_file))
+                            {
+                                legacy.push((
+                                    format!("{}/{}", rel.to_string_lossy(), column.idx_file),
+                                    0,
+                                ));
+                            }
+                        }
+                    }
+                    if !legacy.is_empty() {
+                        self.hydrate_files(s3, &legacy, self.scoring_hydrate_concurrency, request);
+                        outcome.rounds += 1;
+                        for (path, _) in &legacy {
+                            if let Ok(m) = std::fs::metadata(self.data_dir.join(path)) {
+                                outcome.files_fetched += 1;
+                                outcome.bytes_fetched += m.len();
+                            }
+                        }
+                    }
+                }
+
+                // Doc-store fallback (#179, #184). A Lazy segment goes to
+                // scoring with only `doc_store.offsets`; `doc_store.bin` is
+                // deferred to page materialize. That is only safe if the reader
+                // will actually use the sidecar. Two ways it won't:
+                //
+                // * The sidecar is not in S3 (a partial upload, or a legacy
+                //   segment whose manifest footer claimed otherwise), or the GET
+                //   failed. The segment would reach scoring with neither
+                //   doc-store file, the one state the reader can't open, and the
+                //   whole search used to 503 with "segment hydration failed".
+                // * The sidecar is there but fails the reader's sanity check
+                //   (doc-count mismatch, truncation). The reader falls back to
+                //   parsing `doc_store.bin`, which was never fetched, and the
+                //   search used to 500 with "No such file or directory".
+                //
+                // Either way, fetch `doc_store.bin` for that segment and serve
+                // the search. It is the expensive path, and it self-heals: once
+                // the bulk file is local, later queries are served from disk.
+                // `footer.json` comes along for a rejected sidecar so the reader
+                // can check the manifest's cached footer against the segment's
+                // own (see `kosha_segment::doc_store_opens_lazily`).
+                let mut fallback_paths: Vec<(String, u64)> = Vec::new();
+                // A shed request skipped its fetches on purpose; its sidecars
+                // are absent because nothing asked for them, and it must not
+                // go on to pull bulk doc stores either.
+                let lazy_segments = if request.is_shed() {
+                    Vec::new()
+                } else {
+                    lazy_segments
                 };
-                let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
-                    continue;
-                };
-                let s3_prefix = rel_path.to_string_lossy().into_owned();
-                eprintln!(
+                for seg_path in lazy_segments {
+                    let manifest_footer = manifest_footers.get(seg_path).copied();
+                    let Some(reason) = doc_store_fallback_reason(seg_path, manifest_footer) else {
+                        continue;
+                    };
+                    let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
+                        continue;
+                    };
+                    let s3_prefix = rel_path.to_string_lossy().into_owned();
+                    eprintln!(
                     "WARN: segment {s3_prefix}: {}; falling back to the eager doc_store.bin path \
                      for this search. Repair the sidecar with \
                      POST /v1/admin/backfill-offset-tables, otherwise every cold query on this \
                      segment pays for the full doc store.",
                     reason.describe()
                 );
-                self.doc_store_fallbacks
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                fallback_paths.push((format!("{s3_prefix}/doc_store.bin"), 0));
-                if reason == DocStoreFallbackReason::Rejected
-                    && !file_present_nonempty(&seg_path.join("footer.json"))
-                {
-                    fallback_paths.push((format!("{s3_prefix}/footer.json"), 0));
-                }
-            }
-            if !fallback_paths.is_empty() {
-                self.hydrate_files(
-                    s3,
-                    &fallback_paths,
-                    self.scoring_hydrate_concurrency,
-                    request,
-                );
-                for (path, _) in &fallback_paths {
-                    if let Ok(m) = std::fs::metadata(self.data_dir.join(path)) {
-                        outcome.files_fetched += 1;
-                        outcome.bytes_fetched += m.len();
+                    self.doc_store_fallbacks
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    fallback_paths.push((format!("{s3_prefix}/doc_store.bin"), 0));
+                    if reason == DocStoreFallbackReason::Rejected
+                        && !file_present_nonempty(&seg_path.join("footer.json"))
+                    {
+                        fallback_paths.push((format!("{s3_prefix}/footer.json"), 0));
                     }
                 }
+                if !fallback_paths.is_empty() {
+                    self.hydrate_files(
+                        s3,
+                        &fallback_paths,
+                        self.scoring_hydrate_concurrency,
+                        request,
+                    );
+                    for (path, _) in &fallback_paths {
+                        if let Ok(m) = std::fs::metadata(self.data_dir.join(path)) {
+                            outcome.files_fetched += 1;
+                            outcome.bytes_fetched += m.len();
+                        }
+                    }
+                }
+
+                outcome.bytes_fetched - bytes_before
+            },
+            || request.is_shed(),
+        );
+
+        // Rare path (a required set fails the request with it): say which
+        // check failed and how this request took part in the fetch, so a 503
+        // can be read from the log without a reproduction (finding 28). One
+        // line per request, naming the first few segments. Not for a shed
+        // request (its 429 says why) or a best-effort set.
+        const LOGGED_SEGMENTS: usize = 3;
+        let mut detail: Vec<String> = Vec::new();
+        for p in seg_paths {
+            let Some(gap) = Self::scoring_gap(
+                p,
+                knn_field,
+                vectors_ranged,
+                filters_of(p),
+                manifest_footers.get(p).copied(),
+            ) else {
+                continue;
+            };
+            let Ok(rel) = p.strip_prefix(&self.data_dir) else {
+                continue;
+            };
+            if log_missing && detail.len() < LOGGED_SEGMENTS {
+                let role = roles.get(p).map_or_else(
+                    || "found complete, then lost".to_string(),
+                    |r| r.to_string(),
+                );
+                detail.push(format!("{} (missing={gap}, role={role})", rel.display()));
             }
-
-            drop(_permit);
-            complete_owned(&self.in_flight_segments, &owned);
+            outcome.missing.push(rel.to_string_lossy().into_owned());
         }
-
-        wait_for(&waiting);
-
-        outcome.missing = seg_paths
-            .iter()
-            .filter(|p| {
-                !Self::scoring_complete(
-                    p,
-                    knn_field,
-                    vectors_ranged,
-                    filters_of(p),
-                    manifest_footers.get(*p).copied(),
-                )
-            })
-            .filter_map(|p| p.strip_prefix(&self.data_dir).ok())
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
+        if log_missing && !outcome.missing.is_empty() && !request.is_shed() {
+            eprintln!(
+                "WARN: scoring set incomplete after hydration: segments={} first: {}{}",
+                outcome.missing.len(),
+                detail.join("; "),
+                request_id()
+            );
+        }
         outcome
     }
 
@@ -4714,6 +5570,9 @@ impl AppState {
     /// [`kosha_segment::POSTING_BLOB_SHARDS`] shard files). Sub-ms when the
     /// shards are already local and the presence cache has already seen
     /// them this manifest version — see `posting_blob_presence`.
+    ///
+    /// Also adds to `pins` the segments the search reads, chosen as
+    /// `hydrate_segments_for_search` chooses them, before fetching anything.
     #[cfg(feature = "s3")]
     fn ensure_query_posting_blobs(
         &self,
@@ -4721,45 +5580,79 @@ impl AppState {
         manifest: &kosha_core::Manifest,
         query: &SearchQuery,
         request: &Arc<RequestHydration>,
+        pins: &mut SegmentPins<'_>,
     ) -> HydrationOutcome {
-        // Footers are local whenever the namespace verdict is cached (it
-        // means every segment's scoring set is present).
-        let analyses: Vec<Option<kosha_core::SegmentAnalysis>> = manifest
-            .segments
-            .iter()
-            .map(|entry| {
-                let dir = manifest.segment_dir(&self.data_dir, ns, &entry.segment_id);
-                manifest
-                    .footer_or_read(&entry.segment_id, || {
-                        kosha_segment::SegmentReader::read_footer(&dir).ok()
-                    })
-                    .and_then(|footer| footer.analysis.clone())
-            })
-            .collect();
-        let query_analysis = kosha_query::QueryAnalysis::new(query);
-        let posting_files = posting_blob_files_for_query(
-            query,
-            &query_analysis,
-            analyses.iter().map(Option::as_ref),
-        );
-        let posting_terms =
-            posting_terms_for_query(query, &query_analysis, analyses.iter().map(Option::as_ref));
-        if posting_files.is_empty() {
-            return HydrationOutcome::default();
-        }
         let seg_paths: Vec<PathBuf> = manifest
             .segments
             .iter()
             .map(|entry| manifest.segment_dir(&self.data_dir, ns, &entry.segment_id))
             .collect();
-        self.ensure_query_postings(
+        // Footers are local whenever the namespace verdict is cached (it
+        // means every segment's scoring set is present). Held together for
+        // this call, as `hydrate_segments_for_search` holds the ones it
+        // reads: usually borrowed from the manifest, which caches them.
+        let footers: Vec<Option<std::borrow::Cow<'_, kosha_core::Footer>>> = manifest
+            .segments
+            .iter()
+            .zip(&seg_paths)
+            .map(|(entry, dir)| {
+                manifest.footer_or_read(&entry.segment_id, || {
+                    kosha_segment::SegmentReader::read_footer(dir).ok()
+                })
+            })
+            .collect();
+        let analyses: Vec<Option<&kosha_core::SegmentAnalysis>> = footers
+            .iter()
+            .map(|footer| footer.as_deref().and_then(|f| f.analysis.as_ref()))
+            .collect();
+        let query_analysis = kosha_query::QueryAnalysis::new(query);
+        let stats_terms = kosha_query::namespace_stats_terms(query, analyses.iter().copied())
+            .filter(|t| !t.is_empty());
+        let (scoring, stats_only) = search_segment_sets(
+            query,
+            &query_analysis,
+            stats_terms.as_deref(),
+            seg_paths
+                .iter()
+                .cloned()
+                .zip(footers.iter().map(Option::as_deref)),
+        );
+        pins.hold_all(scoring.iter().chain(&stats_only));
+        let posting_files =
+            posting_blob_files_for_query(query, &query_analysis, analyses.iter().copied());
+        let posting_terms =
+            posting_terms_for_query(query, &query_analysis, analyses.iter().copied());
+        if posting_files.is_empty() {
+            return HydrationOutcome::default();
+        }
+        // As `hydrate_segments_for_search` does: the scored segments'
+        // postings must be local, the stats-only ones' are best effort, and
+        // a segment the search skips gets none (it is never read, and its
+        // files would be fetched unpinned).
+        let mut outcome = self.ensure_query_postings(
             ns,
             manifest,
-            &seg_paths,
+            &scoring,
             &posting_terms,
             &posting_files,
             request,
-        )
+        );
+        if !stats_only.is_empty() {
+            let stats = self.ensure_query_postings(
+                ns,
+                manifest,
+                &stats_only,
+                &posting_terms,
+                &posting_files,
+                request,
+            );
+            outcome.files_fetched += stats.files_fetched;
+            outcome.bytes_fetched += stats.bytes_fetched;
+        }
+        // A shed anywhere above, the best-effort stats fetch included, is a
+        // 429, as on the cold path.
+        outcome.set_shed(request);
+        outcome
     }
 
     /// Make the query terms' postings local in `seg_paths` (#245).
@@ -4806,7 +5699,7 @@ impl AppState {
 
         // Presence cache first: a warm repeat confirms every term of every
         // segment here without opening a footer or a TOC.
-        let eviction_gen = self.cache.eviction_generation();
+        let eviction_gen = self.presence_generation();
         let cached = {
             let cache = self.posting_blob_presence.lock().unwrap();
             posting_blob_cache_lookup(&cache, &ns.0, manifest.version, eviction_gen)
@@ -4822,6 +5715,7 @@ impl AppState {
             .collect();
         let mut ranged: Vec<PathBuf> = Vec::new();
         let mut whole: Vec<PathBuf> = Vec::new();
+        let mut shards_local: Vec<(String, String)> = Vec::new();
         for seg in seg_paths {
             let Ok(rel) = seg.strip_prefix(&self.data_dir) else {
                 continue;
@@ -4834,6 +5728,19 @@ impl AppState {
                 keys.iter().all(|k| set.contains(k))
                     || posting_files.iter().all(|f| set.contains(f))
             }) {
+                continue;
+            }
+            // Every shard the terms hash to is already a whole local file
+            // (warmed, promoted, or fetched whole): the postings are local,
+            // confirmed by name with one stat per shard. Without this, a
+            // presence miss sent the segment to `ranged`, which reads and
+            // decodes the whole `inverted.idx` (8 MB decoded for one staging
+            // segment) only to find the shards local.
+            if posting_files
+                .iter()
+                .all(|f| file_present_nonempty(&seg.join(f)))
+            {
+                shards_local.extend(posting_files.iter().map(|f| (rel.to_string(), f.clone())));
                 continue;
             }
             let raw = seg
@@ -4854,6 +5761,15 @@ impl AppState {
             }
         }
 
+        if !shards_local.is_empty() {
+            // The same generation every other presence stamp uses: a stamp
+            // that disagreed (after one failed span write) would make each
+            // insert wipe the other's and the namespace entry never hit.
+            let write_gen = self.presence_generation();
+            let mut cache = self.posting_blob_presence.lock().unwrap();
+            posting_blob_cache_insert(&mut cache, &ns.0, manifest.version, write_gen, shards_local);
+        }
+
         let mut outcome = HydrationOutcome::default();
         let mut stats = posting_spans::PostingFetchStats::default();
         if !ranged.is_empty() {
@@ -4864,10 +5780,11 @@ impl AppState {
                 request,
             };
             let o = {
-                let _permit = self.hydration_semaphore.acquire();
+                let _permit = self.hydration_semaphore.acquire("posting_spans");
                 self.posting_span_hydrator
-                    .hydrate(&ranged, terms, &fetcher, &self.cache)
+                    .hydrate(&ranged, terms, &fetcher, &self.span_writes)
             };
+            request.hold_spans(o.held);
             stats.rounds += o.rounds;
             stats.ranged_gets += o.gets;
             stats.ranged_bytes += o.bytes;
@@ -4879,7 +5796,10 @@ impl AppState {
                 self.posting_promotions.push(shard);
             }
             if !o.confirmed.is_empty() {
-                let write_gen = self.cache.eviction_generation();
+                // Stamped with the generation from before the fetch: a queued
+                // span write that fails after it moved the generation, so
+                // these confirmations must not outlive that failure.
+                let write_gen = eviction_gen;
                 let mut cache = self.posting_blob_presence.lock().unwrap();
                 posting_blob_cache_insert(
                     &mut cache,
@@ -4898,6 +5818,7 @@ impl AppState {
                 }
             }
             let mut fallback_round = false;
+            let fallback_error = o.fallback_error.unwrap_or_default();
             for (seg, files) in by_seg {
                 let w = self.ensure_posting_blobs_local(
                     ns,
@@ -4905,6 +5826,14 @@ impl AppState {
                     std::slice::from_ref(&seg),
                     &files,
                     request,
+                );
+                log_ranged_fallback(
+                    &seg,
+                    &files.join(","),
+                    1,
+                    &fallback_error,
+                    w.bytes_fetched,
+                    &request_id(),
                 );
                 fallback_round |= w.files_fetched > 0 || !w.missing.is_empty();
                 stats.whole_files += w.files_fetched as u64;
@@ -4934,7 +5863,7 @@ impl AppState {
         self.posting_reads.record(&stats);
         outcome.rounds = stats.rounds;
         outcome.postings = stats;
-        outcome.shed |= request.is_shed();
+        outcome.set_shed(request);
         outcome
     }
 
@@ -4942,7 +5871,9 @@ impl AppState {
     /// fetch the probed kNN postings' `vector.idx` ranges of one segment
     /// into the span cache (#245). A range that fails (not shed) falls back
     /// to the whole `vector.idx`, so the probe still reads every posting it
-    /// needs; anything still missing marks the segment degraded.
+    /// needs; anything still missing marks the segment degraded. Returns
+    /// the spans the probe must hold while it reads them (see
+    /// [`kosha_query::VectorSpanFetch`]).
     #[cfg(feature = "s3")]
     fn hydrate_vector_postings(
         &self,
@@ -4950,17 +5881,18 @@ impl AppState {
         file: &str,
         ranges: &[(u64, u64)],
         request: &Arc<RequestHydration>,
-    ) -> posting_spans::PostingFetchStats {
+        rid: &str,
+    ) -> (posting_spans::PostingFetchStats, SpanHolds) {
         let mut stats = posting_spans::PostingFetchStats::default();
         let Some(ref s3) = self.s3_storage else {
-            return stats;
+            return (stats, SpanHolds::new());
         };
         let Some(rel) = seg
             .strip_prefix(&self.data_dir)
             .ok()
             .map(|p| p.to_string_lossy().replace('\\', "/"))
         else {
-            return stats;
+            return (stats, SpanHolds::new());
         };
         let fetcher = doc_spans::S3RangeFetcher {
             s3,
@@ -4975,7 +5907,7 @@ impl AppState {
             ranges,
             self.posting_span_hydrator.coalesce_gap(),
             &fetcher,
-            &self.cache,
+            &self.span_writes,
         );
         stats.rounds = u64::from(o.gets > 0);
         stats.ranged_gets = o.gets;
@@ -4983,16 +5915,56 @@ impl AppState {
         // A failed range of `doc_vectors.bin` (only global rescoring, #381,
         // asks for those) is NOT retried as the whole file: that is the
         // full-precision sidecar the codes-only tier exists to keep remote,
-        // ~200 MB per segment. The pass reports the vectors it could not
+        // as large as the f32 vector index itself (1.9-2.7 GB per compacted
+        // segment on staging). The pass reports the vectors it could not
         // read as unavailable (and the segment degraded) instead.
+        let error = o.error.as_deref().unwrap_or_default();
         if o.failed && file != kosha_segment::DOC_VECTORS_FILE {
             let (files, bytes) = self.ensure_files_local(&[seg.to_path_buf()], file, request);
             stats.rounds += 1;
             stats.whole_files = files as u64;
             stats.whole_bytes = bytes;
+            log_ranged_fallback(seg, file, 1, error, bytes, rid);
+        } else if o.failed {
+            eprintln!(
+                "WARN: ranged read of {}/{file} failed ({error}); not fetching the whole \
+                 file, its vectors are reported unavailable{rid}",
+                seg.display()
+            );
         }
         self.posting_reads.record(&stats);
-        stats
+        (stats, o.held)
+    }
+
+    /// Start the thread that writes fetched spans into the span cache (see
+    /// [`span_writes`]). Only the S3 tier fetches spans.
+    fn spawn_span_writer(self: &Arc<Self>) {
+        #[cfg(feature = "s3")]
+        {
+            if self.s3_storage.is_none() {
+                return;
+            }
+            let weak = Arc::downgrade(self);
+            std::thread::Builder::new()
+                .name("kosha-span-writer".into())
+                .spawn(move || loop {
+                    let Some(state) = weak.upgrade() else { return };
+                    if let Some(job) = state.span_writes.pop_timeout(Duration::from_secs(1)) {
+                        // A panic in one write must not stop the thread
+                        // (every later span would stay queued, counted as
+                        // cached, forever): `write` counts it as a failed
+                        // write, which invalidates presence, and frees its
+                        // queue bytes while unwinding.
+                        let wrote = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            state.span_writes.write(&state.cache, job)
+                        }));
+                        if wrote.is_err() {
+                            eprintln!("ERROR: span writer: a span write panicked; continuing");
+                        }
+                    }
+                })
+                .expect("failed to spawn span writer thread");
+        }
     }
 
     /// Start the thread that promotes hot posting shards from ranged reads
@@ -5030,13 +6002,13 @@ impl AppState {
             return;
         };
         let t = Instant::now();
-        let (files, bytes) = {
-            let _permit = self.hydration_semaphore.acquire();
-            self.ensure_files_local(&[seg.to_path_buf()], &file, &RequestHydration::unlimited())
-        };
+        // Background work, like `promote_doc_store`: yields to request
+        // fetches on the budget and takes no hydration slot.
+        let (files, bytes) =
+            self.ensure_files_local(&[seg.to_path_buf()], &file, &RequestHydration::background());
         let landed = file_present_nonempty(shard);
         self.posting_span_hydrator
-            .finish_promotion(&self.cache, shard, landed);
+            .finish_promotion(&self.cache, &self.span_writes, shard, landed);
         if landed {
             self.posting_reads.promotion_done();
             self.posting_reads
@@ -5071,7 +6043,7 @@ impl AppState {
             return HydrationOutcome::default();
         }
 
-        let _permit = self.hydration_semaphore.acquire();
+        let _permit = self.hydration_semaphore.acquire("posting_blobs");
 
         // Presence-cache read (Tier 1 O3): an `Arc` snapshot (refcount
         // bump, no clone) of whichever (segment, shard) pairs are already
@@ -5081,7 +6053,7 @@ impl AppState {
         // yields an empty map, i.e. this degrades to the pre-cache full
         // stat sweep, never a false "present." See the field's doc comment
         // for why the eviction-generation check exists.
-        let eviction_gen = self.cache.eviction_generation();
+        let eviction_gen = self.presence_generation();
         let cached = {
             let cache = self.posting_blob_presence.lock().unwrap();
             posting_blob_cache_lookup(&cache, &ns.0, manifest_version, eviction_gen)
@@ -5199,7 +6171,7 @@ impl AppState {
         // which is still correct — every stamped pair was itself verified
         // by a real stat taken during this call, at or after that point.
         if !newly_confirmed.is_empty() {
-            let write_gen = self.cache.eviction_generation();
+            let write_gen = self.presence_generation();
             let mut cache = self.posting_blob_presence.lock().unwrap();
             posting_blob_cache_insert(
                 &mut cache,
@@ -5213,7 +6185,7 @@ impl AppState {
         // Set here as well as in `hydrate_segments_for_search`: on a warm
         // namespace the cached hydration verdict routes a query straight to
         // this function, and its outcome is the only one the handler sees.
-        outcome.shed = request.is_shed();
+        outcome.set_shed(request);
         outcome
     }
 
@@ -5660,6 +6632,9 @@ fn main() {
     if std::env::args().nth(1).as_deref() == Some("migrate-namespace") {
         std::process::exit(namespace_migrate::main(std::env::args().skip(2)));
     }
+    if std::env::args().nth(1).as_deref() == Some("reconcile-usage") {
+        std::process::exit(usage_reconcile::main(std::env::args().skip(2)));
+    }
     if std::env::args().nth(1).as_deref() == Some("migrate") {
         #[cfg(feature = "migrate")]
         {
@@ -5721,6 +6696,7 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(300);
+    slow_search_log_ms();
     let addr = format!("0.0.0.0:{port}");
     // #382 experiment flags: one line only when one is set or the image was
     // built above baseline x86-64, so a default server logs nothing new.
@@ -5728,6 +6704,10 @@ fn main() {
         println!("kosha-server {summary}");
     }
 
+    // Refuse to start on a mistyped interval rather than run with the
+    // purge silently off (#347).
+    let deletion_purge_settings =
+        deletion_purge::PurgeSettings::from_env().unwrap_or_else(|e| fatal(&e));
     let state = AppState::new_shared_as(PathBuf::from(data_dir.clone()), role);
     // Pre-#262 bare namespaces no tenant can reach (#344).
     namespace_migrate::warn_unreachable_bare_namespaces(
@@ -5736,6 +6716,7 @@ fn main() {
     // Bind the listener first so a slow warmup doesn't delay the port;
     // `/readyz` keeps HPA/kube endpoints from sending traffic while it
     // runs (Tier 1 O2). Liveness (`/healthz`) is unaffected.
+    state.spawn_span_writer();
     state.spawn_warmup();
     state.spawn_rewarmer();
     state.spawn_warm_set_persister();
@@ -5746,6 +6727,7 @@ fn main() {
     state.spawn_writer_lease_renewer();
     state.spawn_manifest_refresher();
     state.spawn_local_gc();
+    state.spawn_deletion_purge(deletion_purge_settings);
     state.spawn_usage_flusher();
     state.spawn_usage_snapshotter();
     state.spawn_billing_refresher();
@@ -5855,7 +6837,13 @@ fn dispatch_request(state: &AppState, request: http::Request) -> http::Response 
     // `is_write_path`) and answered ahead of the indexer's route gate
     // (#254): each pod, whatever its role, reports its own process.
     if request_line.starts_with("GET /metrics ") || request_line.starts_with("GET /metrics?") {
-        return http::Response::from_raw(handle_metrics(state, &headers));
+        let response = http::Response::from_raw(handle_metrics(state, &headers));
+        // A refused scrape is logged like any failed request; the
+        // per-scrape 200 is not.
+        if response.status() >= 400 {
+            log_request(&request_line, "-", body.len(), &response, started);
+        }
+        return response;
     }
 
     // Built-in dashboard (#214): its static assets hold no data and are
@@ -5867,7 +6855,7 @@ fn dispatch_request(state: &AppState, request: http::Request) -> http::Response 
 
     // ── API key authentication ──────────────────────────────────────────
     // Per proto/kosha/v1/kosha.proto: Authorization: Bearer <key> or X-Api-Key.
-    let authentication = if service_authorized(&headers, state.admin_auth_key.as_deref())
+    let authentication = if admin_actor(&headers, state).is_some()
         || service_authorized(&headers, state.internal_service_key.as_deref())
     {
         Ok("service".to_string())
@@ -6019,9 +7007,7 @@ fn cache_tenant_samples(state: &AppState) -> Vec<metrics::CacheTenantSample> {
 fn handle_metrics(state: &AppState, headers: &HashMap<String, String>) -> String {
     match state.metrics.config.exposure {
         metrics::Exposure::Off => return api_error(ErrorCode::NotFound, "not found"),
-        metrics::Exposure::Admin
-            if !service_authorized(headers, state.admin_auth_key.as_deref()) =>
-        {
+        metrics::Exposure::Admin if admin_actor(headers, state).is_none() => {
             return api_error(ErrorCode::PermissionDenied, "admin credential required");
         }
         _ => {}
@@ -6039,6 +7025,7 @@ fn handle_metrics(state: &AppState, headers: &HashMap<String, String>) -> String
         nvme_evictions: state.cache.eviction_generation(),
         segment_checksum_failures,
         cache_tenants: cache_tenant_samples(state),
+        span_writes: state.span_writes.stats(),
     });
     format!(
         "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: {}\r\n\r\n{body}",
@@ -6109,13 +7096,7 @@ fn tenant_rejection(
         .metrics
         .record_tenant_rejection(rejection.reason, tenant);
     let code = rejection.reason.code();
-    eprintln!(
-        "WARN: request refused: status={} tenant={tenant} reason={} limit={}{}",
-        code.status(),
-        rejection.reason.as_str(),
-        rejection.limit,
-        request_id()
-    );
+    // Logged once, by `log_request`, from the body's reason/limit aliases.
     let limit = rejection.limit_json();
     let mut error = ApiError::new(code, rejection.reason.message())
         .detail("limit", limit.clone())
@@ -6337,6 +7318,7 @@ impl SearchObservation {
             Err(why) => {
                 self.shed.set(Some(why));
                 state.metrics.record_queue_shed();
+                log_queue_shed(&state.search_semaphore, &tenant, why);
                 None
             }
         }
@@ -6373,12 +7355,63 @@ impl SearchObservation {
     }
 }
 
+/// A ranged read that failed and was replaced by a whole-file fetch (#245):
+/// the request paid for the whole file, which the ranged path exists to
+/// avoid. Failure path only. `segments` > 1 when one fetch covered several
+/// segments (`first` is the first of them).
+#[cfg(feature = "s3")]
+fn log_ranged_fallback(
+    first: &Path,
+    file: &str,
+    segments: usize,
+    error: &str,
+    bytes: u64,
+    rid: &str,
+) {
+    let more = if segments > 1 {
+        format!(" (+{} more segments)", segments - 1)
+    } else {
+        String::new()
+    };
+    eprintln!(
+        "WARN: ranged read of {}/{file}{more} failed ({error}); fetched the whole file \
+         ({:.1} MB){rid}",
+        first.display(),
+        bytes as f64 / (1024.0 * 1024.0)
+    );
+}
+
+/// The shed's cause and the queue it saw, one line per shed: the 429's
+/// text alone cannot tell a burst (queue full) from slow scoring (waits
+/// expiring with few waiters). Shed path only.
+fn log_queue_shed(sem: &fair_admission::FairSemaphore, tenant: &str, why: metrics::QueueShed) {
+    let cause = match why {
+        metrics::QueueShed::Full => "full".to_string(),
+        metrics::QueueShed::TenantFull => "tenant share full".to_string(),
+        metrics::QueueShed::Timeout => format!(
+            "wait expired after {}ms",
+            sem.wait_timeout().map_or(0, |t| t.as_millis())
+        ),
+    };
+    let q = sem.shed_snapshot(tenant);
+    eprintln!(
+        "WARN: search shed: scoring queue {cause} permits={} in_use={} waiters={} \
+         tenant={tenant} tenant_waiters={}{}",
+        q.permits,
+        q.in_use,
+        q.waiters,
+        q.tenant_waiters,
+        request_id()
+    );
+}
+
 /// The 429 for a search the pod shed for a reason that is not a tenant
 /// limit (scoring queue, hydration ceiling, memory admission): the same
 /// contract as [`tenant_rejection`] minus `limit`, so every search 429
 /// carries `Retry-After` and a JSON body `{error, reason, retry_after_ms}`
 /// (#341). Not counted in `kosha_tenant_rejections_total`.
 fn overload_shed_response(reason: &str, message: &str) -> String {
+    // Logged once, by `log_request`, from the body.
     ApiError::new(ErrorCode::Overloaded, message)
         .detail("reason", reason)
         .retry_after(Duration::from_millis(
@@ -6415,8 +7448,16 @@ fn observe_search(state: &AppState, run: impl FnOnce(&SearchObservation) -> Stri
 }
 
 /// One line per API request: who asked for what, the status returned and how
-/// long it took. A successful search is skipped because it already prints
-/// the more detailed `search timing:` line; probes never reach here.
+/// long it took. A failed request (status >= 400) is one `WARN: request
+/// failed:` line that also carries the error body's message and 429
+/// fields, so the handlers that build error responses (`json_error`,
+/// `tenant_rejection`, `overload_shed_response`) do not log them again.
+///
+/// Skipped: a successful search, by design: a slow one prints the
+/// `search timing:` line and a fast one leaves no per-request line at
+/// all; and the `404 not cached here` of `GET /internal/segment/`, the
+/// expected answer of the peer-poll protocol (the caller falls back to
+/// the lease owner or S3). Probes never reach here.
 fn log_request(
     request_line: &str,
     tenant: &str,
@@ -6424,19 +7465,54 @@ fn log_request(
     response: &http::Response,
     started: Instant,
 ) {
+    match request_log_line(request_line, tenant, body_bytes, response, started) {
+        Some(RequestLog::Failed(line)) => eprintln!("{line}"),
+        Some(RequestLog::Ok(line)) => println!("{line}"),
+        None => {}
+    }
+}
+
+/// [`log_request`]'s line, if the request gets one.
+#[derive(Debug)]
+enum RequestLog {
+    /// `WARN: request failed: …`, to stderr.
+    Failed(String),
+    /// `request: …`, to stdout.
+    Ok(String),
+}
+
+fn request_log_line(
+    request_line: &str,
+    tenant: &str,
+    body_bytes: usize,
+    response: &http::Response,
+    started: Instant,
+) -> Option<RequestLog> {
     let status = response.status();
     let mut parts = request_line.split_whitespace();
     let (method, target) = (parts.next().unwrap_or("-"), parts.next().unwrap_or("-"));
     let path = target.split('?').next().unwrap_or(target);
     if status == 200 && path.ends_with("/search") {
-        return;
+        return None;
     }
-    println!(
-        "request: {method} {path} status={status} tenant={tenant} ms={:.1} in_bytes={body_bytes} out_bytes={}{}",
-        started.elapsed().as_secs_f64() * 1e3,
-        response.body_len(),
-        request_id()
-    );
+    if status == 404 && path.starts_with("/internal/segment/") {
+        return None;
+    }
+    let ms = started.elapsed().as_secs_f64() * 1e3;
+    let out_bytes = response.body_len();
+    let rid = request_id();
+    Some(if status >= 400 {
+        RequestLog::Failed(format!(
+            "WARN: request failed: status={status}{} {method} {path} tenant={tenant} ms={ms:.1} \
+             in_bytes={body_bytes} out_bytes={out_bytes}{rid}",
+            response.error_fields(),
+        ))
+    } else {
+        RequestLog::Ok(format!(
+            "request: {method} {path} status={status} tenant={tenant} ms={ms:.1} \
+             in_bytes={body_bytes} out_bytes={out_bytes}{rid}"
+        ))
+    })
 }
 
 /// Extract and validate the API key from request headers.
@@ -6647,6 +7723,35 @@ fn service_authorized(headers: &HashMap<String, String>, expected: Option<&str>)
         .is_some_and(|expected| request_key(headers) == Some(expected))
 }
 
+/// Who holds the admin credential a request presents, if it presents one:
+/// the shared bootstrap key (`KOSHA_ADMIN_API_KEY`, the unnamed operator)
+/// or a named operator credential from the key registry (#346), which is
+/// refused once it expires or is revoked like any registry key. A tenant
+/// key is never an admin credential.
+fn admin_actor_in(
+    headers: &HashMap<String, String>,
+    bootstrap_key: Option<&str>,
+    auth: &auth::Auth,
+) -> Option<kosha_control::orgs::Actor> {
+    use kosha_control::orgs::Actor;
+    if service_authorized(headers, bootstrap_key) {
+        return Some(Actor::Operator);
+    }
+    let auth::Auth::Keys(keys) = auth else {
+        return None;
+    };
+    keys.lookup_operator(request_key(headers)?.trim())
+        .ok()
+        .map(Actor::NamedOperator)
+}
+
+fn admin_actor(
+    headers: &HashMap<String, String>,
+    state: &AppState,
+) -> Option<kosha_control::orgs::Actor> {
+    admin_actor_in(headers, state.admin_auth_key.as_deref(), auth::global())
+}
+
 /// A tenant id as presented on a request: non-empty, not `.` or `..`, and
 /// free of separators and control characters.
 fn valid_name_component(name: &str) -> bool {
@@ -6745,9 +7850,9 @@ fn route_checked(
         return api_error(ErrorCode::InvalidArgument, "invalid request line");
     };
     if path.starts_with("/v1/admin/") {
-        if !service_authorized(headers, state.admin_auth_key.as_deref()) {
+        let Some(operator) = admin_actor(headers, state) else {
             return api_error(ErrorCode::PermissionDenied, "admin credential required");
-        }
+        };
         if let Some(response) = unrouted_v1(method, path) {
             return response;
         }
@@ -6756,9 +7861,15 @@ fn route_checked(
             auth::Auth::Keys(keys) => Some(keys),
             auth::Auth::Disabled => None,
         };
-        if let Some(response) =
-            org_admin::handle(method, path, headers, body, &state.orgs, key_table)
-        {
+        if let Some(response) = org_admin::handle(
+            method,
+            path,
+            headers,
+            body,
+            &state.orgs,
+            key_table,
+            &operator,
+        ) {
             return response;
         }
         // Every other admin route is the operator's and knows nothing of
@@ -6769,6 +7880,10 @@ fn route_checked(
                 ErrorCode::PermissionDenied,
                 "this route is operator-only: it cannot be called with an 'x-kosha-actor' header",
             );
+        }
+        // Per-operator admin credentials (#346).
+        if let Some(response) = operator_admin::handle(method, path, body, &operator) {
+            return response;
         }
     } else if path.starts_with("/internal/") {
         if !service_authorized(headers, state.internal_service_key.as_deref()) {
@@ -6806,7 +7921,7 @@ fn route_checked(
             state.metrics.record_legacy_request(bare_path, tenant);
         }
         if method == "GET" && (bare_path == "/stats" || bare_path == "/v1/stats") {
-            return if service_authorized(headers, state.admin_auth_key.as_deref()) {
+            return if admin_actor(headers, state).is_some() {
                 handle_stats(state)
             } else {
                 api_error(ErrorCode::PermissionDenied, "use namespace-scoped stats")
@@ -7025,6 +8140,12 @@ fn route_inner(
         || request_line.starts_with("GET /v1/admin/usage?")
     {
         return usage::handle_admin_usage(request_line, state);
+    }
+
+    if request_line.starts_with("GET /v1/admin/usage/reconcile ")
+        || request_line.starts_with("GET /v1/admin/usage/reconcile?")
+    {
+        return usage_reconcile::handle_admin_reconcile(request_line, state);
     }
 
     // ── Billing (#349) ─────────────────────────────────────────────────────
@@ -8341,6 +9462,7 @@ fn handle_stats(state: &AppState) -> String {
         "s3_prefix": s3_prefix,
         "doc_store_reads": state.doc_store_reads.to_json(state.doc_read_mode),
         "posting_reads": state.posting_reads.to_json(state.posting_read_mode),
+        "span_writes": state.span_writes.to_json(),
         // Process-wide count of scoring blocks varint-decoded (#385); a
         // bench diffs it around a run for blocks decoded per query.
         "scoring_blocks_decoded": kosha_segment::scoring_blocks_decoded(),
@@ -8352,6 +9474,7 @@ fn handle_stats(state: &AppState) -> String {
             state.indexer.retired_segment_count(),
             state.indexer.local_retired_count(),
         ),
+        "deletion_purge": state.deletion_purge.to_json(),
         "rerank": state.rerankers.stats_json(),
         "embedding_providers": state.embedders.providers(),
     }))
@@ -8558,11 +9681,13 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     // See `hydration_budget`.
     #[cfg(feature = "s3")]
     let hydration_request = Arc::new(RequestHydration::new(state.hydrate_request_max_bytes));
-    // Hold this search's segments in the disk cache until it returns: once
+    // Hold what this search reads in the disk cache until it returns: once
     // the working set reaches KOSHA_CACHE_MAX_BYTES, files fetched for it
     // otherwise evicted files it had just checked, and it failed with
-    // "segment hydration failed".
-    let _segment_pins = state.pin_segments(&ns, manifest);
+    // "segment hydration failed". Only what it reads — see `SegmentPins`;
+    // hydration adds the segments it chooses.
+    #[cfg(feature = "s3")]
+    let mut segment_pins = state.pin_search_footers(&ns, manifest);
     // Read stamp for the disk-cache policy (#389): files this search
     // hydrates do not count its own read as a re-read. 0 when off.
     let cache_read_at = state.begin_cache_read();
@@ -8607,10 +9732,21 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
             // sub-ms when the shards are already local: one metadata stat
             // per term-shard per split segment.
             state.record_warm_nvme_hits(&ns, manifest);
-            state.ensure_query_posting_blobs(&ns, manifest, search_query, &hydration_request)
+            state.ensure_query_posting_blobs(
+                &ns,
+                manifest,
+                search_query,
+                &hydration_request,
+                &mut segment_pins,
+            )
         } else {
-            let outcome =
-                state.hydrate_segments_for_search(&ns, manifest, search_query, &hydration_request);
+            let outcome = state.hydrate_segments_for_search(
+                &ns,
+                manifest,
+                search_query,
+                &hydration_request,
+                Some(&mut segment_pins),
+            );
             // Cache what this pass verified: the static scoring set is
             // local for this manifest version, so future warm queries with
             // matching-or-lesser needs skip the per-segment static checks
@@ -8633,7 +9769,10 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
             // a query needing only `filters.bin` must not erase a
             // `vectors_verified` flag an earlier kNN pass already earned,
             // and vice versa.
-            if outcome.missing.is_empty() && !outcome.bloom_pruned {
+            if outcome.missing.is_empty()
+                && !outcome.bloom_pruned
+                && outcome.exact_knn_headers_missing == 0
+            {
                 state
                     .completed_hydrations
                     .lock()
@@ -8671,11 +9810,15 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     // disk with no S3 request (#245; the PR #84 property).
     #[cfg(feature = "s3")]
     let page_fetch = Mutex::new(doc_spans::PageFetchStats::default());
+    // The request id for the hydrators' failure lines: they can run on the
+    // query's worker threads, where the thread-local id is not set.
+    #[cfg(feature = "s3")]
+    let rid = request_id();
     #[cfg(feature = "s3")]
     let ensure_doc_store = |pages: &[PageSegment<'_>]| {
         // Same accountant as the scoring-set fetch above: the request pays
         // for its page's bytes, so the request's ceiling has to cover them.
-        let stats = state.hydrate_page_docs(pages, &hydration_request);
+        let stats = state.hydrate_page_docs(pages, &hydration_request, &rid);
         page_fetch.lock().unwrap().add(&stats);
     };
     #[cfg(feature = "s3")]
@@ -8688,8 +9831,10 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     let vector_fetch_stats = Mutex::new(posting_spans::PostingFetchStats::default());
     #[cfg(feature = "s3")]
     let fetch_vectors = |seg: &Path, file: &str, ranges: &[(u64, u64)]| {
-        let stats = state.hydrate_vector_postings(seg, file, ranges, &hydration_request);
+        let (stats, held) =
+            state.hydrate_vector_postings(seg, file, ranges, &hydration_request, &rid);
         vector_fetch_stats.lock().unwrap().add(&stats);
+        held
     };
     #[cfg(feature = "s3")]
     let vector_fetch: Option<kosha_query::VectorSpanFetch<'_>> = Some(&fetch_vectors);
@@ -8717,15 +9862,6 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
                 ..hydration
             };
             obs.s3_bytes.set(hydration.s3_bytes());
-            log_search_timing(
-                &ns,
-                &hydration,
-                hydrate_ms,
-                queue_ms,
-                &phases,
-                result.total_hits,
-                result.knn_degraded_segments,
-            );
             state.metrics.record_search_phases(
                 hydrate_ms,
                 queue_ms,
@@ -8734,8 +9870,46 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
             );
             state.record_search_access(&ns, manifest, search_query, &phases, &hydration);
             state.record_cache_reads(&ns, manifest, search_query, &phases, cache_read_at);
+            #[cfg(feature = "s3")]
+            let shed = hydration_request
+                .is_shed()
+                .then(|| hydration_request.shed_reason());
+            #[cfg(not(feature = "s3"))]
+            let shed = None;
+            // `wall_ms` is read when the line is logged: after the rerank
+            // and the response build, or at a kNN shed (429) or failure
+            // (503).
+            let log_timing = |total_hits, knn_degraded_segments| {
+                log_search_timing(
+                    &ns,
+                    &hydration,
+                    hydrate_ms,
+                    queue_ms,
+                    &phases,
+                    total_hits,
+                    knn_degraded_segments,
+                    t_request.elapsed().as_secs_f64() * 1e3,
+                )
+            };
             // Before a rerank replaces `result`.
             let knn_degraded = result.knn_degraded_segments.unwrap_or(0);
+            if let Some(response) = knn_shed_response(knn_degraded, shed).or_else(|| {
+                knn_failed_response(
+                    state,
+                    &ns,
+                    manifest.version,
+                    &phases.knn_failed_segments,
+                    knn_degraded,
+                )
+            }) {
+                log_timing(result.total_hits, result.knn_degraded_segments);
+                #[cfg(feature = "s3")]
+                {
+                    drop(segment_pins);
+                    state.heal_corrupt_vector_indexes(&ns, manifest, &phases.knn_corrupt_segments);
+                }
+                return response;
+            }
             if let Some(ref provider) = reranker {
                 let (reranked, call) = kosha_query::rerank::apply(&query, result, provider);
                 result = reranked;
@@ -8786,6 +9960,7 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
             if let Some(key) = cache_key.filter(|_| cacheable) {
                 state.result_cache.lock().unwrap().insert(key, &resp);
             }
+            log_timing(result.total_hits, result.knn_degraded_segments);
             if want_timings {
                 return with_search_timings(response_body_json(&resp), &timings);
             }
@@ -8806,18 +9981,14 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
             // itself failed for another reason.
             #[cfg(feature = "s3")]
             {
-                state
-                    .completed_hydrations
-                    .lock()
-                    .unwrap()
-                    .remove(&(ns.0.clone(), manifest.version));
+                state.forget_hydration_verdict(&ns, manifest.version);
                 state.posting_blob_presence.lock().unwrap().remove(&ns.0);
                 // A page-materialize fetch that crossed the request's byte
                 // ceiling leaves the doc store absent, which surfaces here
                 // as an IO error. It is a shed, not a fault — report it as
                 // one.
                 if hydration_request.is_shed() {
-                    return hydration_shed_response();
+                    return post_scoring_shed_response(&hydration_request, &e);
                 }
             }
             search_error_response(&e)
@@ -9051,6 +10222,7 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
 }
 
 fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> String {
+    let t_request = Instant::now();
     // Parse query string from the request line.
     // request_line looks like: "GET /search?ns=...&q=...&max_results=... HTTP/1.1"
     let query_string = request_line
@@ -9196,11 +10368,13 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
     // See `hydration_budget`.
     #[cfg(feature = "s3")]
     let hydration_request = Arc::new(RequestHydration::new(state.hydrate_request_max_bytes));
-    // Hold this search's segments in the disk cache until it returns: once
+    // Hold what this search reads in the disk cache until it returns: once
     // the working set reaches KOSHA_CACHE_MAX_BYTES, files fetched for it
     // otherwise evicted files it had just checked, and it failed with
-    // "segment hydration failed".
-    let _segment_pins = state.pin_segments(&ns, manifest);
+    // "segment hydration failed". Only what it reads — see `SegmentPins`;
+    // hydration adds the segments it chooses.
+    #[cfg(feature = "s3")]
+    let mut segment_pins = state.pin_search_footers(&ns, manifest);
 
     let cache_read_at = state.begin_cache_read();
     let t_hydrate = Instant::now();
@@ -9224,13 +10398,27 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
             // Posting blobs are per-query and outside the cached verdict —
             // see `handle_search_post` for the full rationale.
             state.record_warm_nvme_hits(&ns, manifest);
-            state.ensure_query_posting_blobs(&ns, manifest, &query, &hydration_request)
+            state.ensure_query_posting_blobs(
+                &ns,
+                manifest,
+                &query,
+                &hydration_request,
+                &mut segment_pins,
+            )
         } else {
-            let outcome =
-                state.hydrate_segments_for_search(&ns, manifest, &query, &hydration_request);
+            let outcome = state.hydrate_segments_for_search(
+                &ns,
+                manifest,
+                &query,
+                &hydration_request,
+                Some(&mut segment_pins),
+            );
             // Only merge when unfiltered — see `HydrationOutcome::bloom_pruned`
             // and `handle_search_post` for the full rationale.
-            if outcome.missing.is_empty() && !outcome.bloom_pruned {
+            if outcome.missing.is_empty()
+                && !outcome.bloom_pruned
+                && outcome.exact_knn_headers_missing == 0
+            {
                 state
                     .completed_hydrations
                     .lock()
@@ -9264,11 +10452,15 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
     // `hydrate_page_docs`.
     #[cfg(feature = "s3")]
     let page_fetch = Mutex::new(doc_spans::PageFetchStats::default());
+    // The request id for the hydrators' failure lines: they can run on the
+    // query's worker threads, where the thread-local id is not set.
+    #[cfg(feature = "s3")]
+    let rid = request_id();
     #[cfg(feature = "s3")]
     let ensure_doc_store = |pages: &[PageSegment<'_>]| {
         // Same accountant as the scoring-set fetch above: the request pays
         // for its page's bytes, so the request's ceiling has to cover them.
-        let stats = state.hydrate_page_docs(pages, &hydration_request);
+        let stats = state.hydrate_page_docs(pages, &hydration_request, &rid);
         page_fetch.lock().unwrap().add(&stats);
     };
     #[cfg(feature = "s3")]
@@ -9281,8 +10473,10 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
     let vector_fetch_stats = Mutex::new(posting_spans::PostingFetchStats::default());
     #[cfg(feature = "s3")]
     let fetch_vectors = |seg: &Path, file: &str, ranges: &[(u64, u64)]| {
-        let stats = state.hydrate_vector_postings(seg, file, ranges, &hydration_request);
+        let (stats, held) =
+            state.hydrate_vector_postings(seg, file, ranges, &hydration_request, &rid);
         vector_fetch_stats.lock().unwrap().add(&stats);
+        held
     };
     #[cfg(feature = "s3")]
     let vector_fetch: Option<kosha_query::VectorSpanFetch<'_>> = Some(&fetch_vectors);
@@ -9307,15 +10501,6 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
                 ..hydration
             };
             obs.s3_bytes.set(hydration.s3_bytes());
-            log_search_timing(
-                &ns,
-                &hydration,
-                hydrate_ms,
-                queue_ms,
-                &phases,
-                result.total_hits,
-                result.knn_degraded_segments,
-            );
             state.metrics.record_search_phases(
                 hydrate_ms,
                 queue_ms,
@@ -9324,7 +10509,42 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
             );
             state.record_search_access(&ns, manifest, &query, &phases, &hydration);
             state.record_cache_reads(&ns, manifest, &query, &phases, cache_read_at);
-            json_ok(&result)
+            #[cfg(feature = "s3")]
+            let shed = hydration_request
+                .is_shed()
+                .then(|| hydration_request.shed_reason());
+            #[cfg(not(feature = "s3"))]
+            let shed = None;
+            // A kNN shed (429) or failure (503) is logged too, like the
+            // search it answers.
+            let degraded = result.knn_degraded_segments.unwrap_or(0);
+            let resp = knn_shed_response(degraded, shed)
+                .or_else(|| {
+                    knn_failed_response(
+                        state,
+                        &ns,
+                        manifest.version,
+                        &phases.knn_failed_segments,
+                        degraded,
+                    )
+                })
+                .unwrap_or_else(|| json_ok(&result));
+            log_search_timing(
+                &ns,
+                &hydration,
+                hydrate_ms,
+                queue_ms,
+                &phases,
+                result.total_hits,
+                result.knn_degraded_segments,
+                t_request.elapsed().as_secs_f64() * 1e3,
+            );
+            #[cfg(feature = "s3")]
+            {
+                drop(segment_pins);
+                state.heal_corrupt_vector_indexes(&ns, manifest, &phases.knn_corrupt_segments);
+            }
+            resp
         }
         Err(e) => {
             // Same verdict invalidation as `handle_search_post` — see
@@ -9332,17 +10552,13 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
             // cause the retry to also skip hydration and fail again).
             #[cfg(feature = "s3")]
             {
-                state
-                    .completed_hydrations
-                    .lock()
-                    .unwrap()
-                    .remove(&(ns.0.clone(), manifest.version));
+                state.forget_hydration_verdict(&ns, manifest.version);
                 // A page-materialize fetch that crossed the request's byte
                 // ceiling leaves the doc store absent, which surfaces here
                 // as an IO error. It is a shed, not a fault — report it as
                 // one.
                 if hydration_request.is_shed() {
-                    return hydration_shed_response();
+                    return post_scoring_shed_response(&hydration_request, &e);
                 }
             }
             search_error_response(&e)
@@ -11055,6 +12271,38 @@ fn segment_search_hydration(
     }
 }
 
+/// The segments a search for `query` reads beyond their footers, as
+/// [`segment_search_hydration`] decides each from its footer: the ones it
+/// scores (whose files later phases also read: page doc stores, vector
+/// postings, kNN rescoring) and the ones it reads only for namespace BM25
+/// `df` (`stats_only`). The searcher prunes the rest with the same bloom
+/// checks and never opens them.
+#[cfg(feature = "s3")]
+fn search_segment_sets<'f>(
+    query: &SearchQuery,
+    analysis: &kosha_query::QueryAnalysis,
+    stats_terms: Option<&[String]>,
+    segments: impl IntoIterator<Item = (PathBuf, Option<&'f kosha_core::Footer>)>,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let term_prune = kosha_query::term_bloom_prune_mode(query);
+    let needs_bloom_check = query.has_prunable_filter() || term_prune.is_some();
+    let (mut scoring, mut stats_only) = (Vec::new(), Vec::new());
+    for (seg_path, footer) in segments {
+        match segment_search_hydration(
+            query,
+            needs_bloom_check,
+            term_prune.map(|mode| (analysis, mode)),
+            stats_terms,
+            footer,
+        ) {
+            SegmentHydration::Scoring => scoring.push(seg_path),
+            SegmentHydration::StatsOnly => stats_only.push(seg_path),
+            SegmentHydration::Skip => {}
+        }
+    }
+    (scoring, stats_only)
+}
+
 /// Whether scoring/materialization needs `filters.bin`. Broad lexical
 /// queries with default score/_id ranking do not: they use only postings,
 /// doc metadata, and page doc stores.
@@ -11158,6 +12406,11 @@ fn posting_blob_files_for_query<'a>(
 #[cfg(feature = "s3")]
 fn hydration_error_response(outcome: &HydrationOutcome) -> Option<String> {
     if outcome.shed {
+        eprintln!(
+            "WARN: search shed: {}{}",
+            outcome.shed_reason.as_deref().unwrap_or("-"),
+            request_id()
+        );
         return Some(hydration_shed_response());
     }
     if !outcome.missing.is_empty() {
@@ -11182,7 +12435,6 @@ fn hydration_error_response(outcome: &HydrationOutcome) -> Option<String> {
 /// its ceiling *after* scoring — at which point the missing doc store
 /// surfaces as an IO error. Reporting that as a 500 would call a deliberate
 /// admission decision a server bug.
-#[cfg(feature = "s3")]
 fn hydration_shed_response() -> String {
     overload_shed_response(
         "search_hydration_limit",
@@ -11191,28 +12443,117 @@ fn hydration_shed_response() -> String {
     )
 }
 
+/// The 429 for a search that failed after scoring because its request was
+/// shed meanwhile (a page-materialize fetch crossed the ceiling or waited
+/// out the budget, leaving a doc store absent). Logged like every other
+/// shed, with the cause and the error it surfaced as — before, these two
+/// sites returned the 429 with no line at all.
+#[cfg(feature = "s3")]
+fn post_scoring_shed_response(request: &RequestHydration, error: &KoshaError) -> String {
+    eprintln!(
+        "WARN: search shed after scoring: {}; surfaced as: {error}{}",
+        request.shed_reason(),
+        request_id()
+    );
+    hydration_shed_response()
+}
+
+/// A kNN answer that skipped segments because the request was shed (its
+/// vector postings were never fetched) is a 429, like any other shed: a 200
+/// would serve the partial page as complete, and neither the backend nor the
+/// Python client reads `knn_degraded_segments`. Other skips (a segment of
+/// another embedding model) stay a 200 that reports them.
+fn knn_shed_response(degraded: u32, shed: Option<String>) -> Option<String> {
+    let reason = shed.filter(|_| degraded > 0)?;
+    eprintln!(
+        "WARN: search shed: kNN skipped {degraded} segment(s): {reason}{}",
+        request_id()
+    );
+    Some(hydration_shed_response())
+}
+
+/// The least time between two re-downloads of one segment's corrupt vector
+/// index ([`AppState::heal_corrupt_vector_indexes`]). A local corruption
+/// heals on the first; a corrupt object in S3 costs one download of the
+/// column per segment per interval instead of one per request.
+#[cfg(feature = "s3")]
+const KNN_SELF_HEAL_INTERVAL: Duration = Duration::from_secs(600);
+
+/// A kNN answer that lost segments to an error is a 503 with `Retry-After`,
+/// never a 200: the page is missing those segments' nearest neighbours, and
+/// neither the backend nor the Python client reads `knn_degraded_segments`,
+/// so a 200 would serve the partial page as complete (run10: 68 of 540 1.8M
+/// eval queries). The cause is usually a vector posting that was not local
+/// when scored (evicted, or its span write dropped); the bytes are in S3, so
+/// a retry can succeed. `failed` is `SearchPhaseStats::knn_failed_segments`;
+/// a segment skipped by design (another embedding model, #209) is not in it
+/// and stays a degraded 200. Checked after [`knn_shed_response`]: a shed
+/// request is a 429 whatever else went wrong. Not cached: only a 200 enters
+/// the result cache. A corrupt vector index is not fixed by re-checking
+/// presence; the handler heals it after this, once its own pins are
+/// released ([`AppState::heal_corrupt_vector_indexes`]).
+fn knn_failed_response(
+    state: &AppState,
+    ns: &NamespaceId,
+    manifest_version: u64,
+    failed: &[kosha_core::SegmentId],
+    degraded: u32,
+) -> Option<String> {
+    if failed.is_empty() {
+        return None;
+    }
+    // As on a search error: a failed segment may be missing a scoring-set
+    // file (`vector.offsets`, `vector.idx`) that the cached verdict still
+    // calls local, and the retry `Retry-After` invites must re-check it.
+    state.forget_hydration_verdict(ns, manifest_version);
+    let rid = request_id();
+    let message = format!(
+        "kNN search lost {} segment(s) to errors, search would be incomplete",
+        failed.len()
+    );
+    eprintln!(
+        "ERROR: {message}: {}{rid}",
+        capped_segment_list(failed.iter().map(|segment| segment.0.as_str()))
+    );
+    Some(
+        ApiError::new(ErrorCode::Unavailable, message)
+            .detail("reason", "knn_segments_unavailable")
+            .detail("knn_failed_segments", failed.len())
+            .detail("knn_degraded_segments", degraded)
+            .retry_after(Duration::from_millis(
+                tenant_limits::QUEUE_SHED_RETRY_AFTER_MS,
+            ))
+            // Top-level fields as first shipped (#488), kept for clients.
+            .alias("reason", "knn_segments_unavailable")
+            .alias("knn_failed_segments", failed.len())
+            .alias("knn_degraded_segments", degraded)
+            .into_raw(),
+    )
+}
+
 /// Error message for a search that can't proceed because hydrating one or
 /// more required segments from S3 failed — returning results anyway would
 /// silently look like "0 hits" for a namespace that actually has data.
 #[cfg(feature = "s3")]
 fn hydration_failed_message(missing: &[String]) -> String {
-    const MAX_LISTED: usize = 10;
-    let listed: Vec<&str> = missing
-        .iter()
-        .take(MAX_LISTED)
-        .map(|s| s.as_str())
-        .collect();
-    let suffix = if missing.len() > MAX_LISTED {
-        format!(" (+{} more)", missing.len() - MAX_LISTED)
-    } else {
-        String::new()
-    };
     format!(
-        "segment hydration failed for {} segment(s), search would be incomplete: {}{}",
+        "segment hydration failed for {} segment(s), search would be incomplete: {}",
         missing.len(),
-        listed.join(", "),
-        suffix
+        capped_segment_list(missing.iter().map(String::as_str))
     )
+}
+
+/// Up to ten segment ids, comma-separated, then `(+N more)`: one log or
+/// error line stays bounded however many segments a namespace has.
+fn capped_segment_list<'a>(segments: impl ExactSizeIterator<Item = &'a str>) -> String {
+    const MAX_LISTED: usize = 10;
+    let total = segments.len();
+    let listed: Vec<&str> = segments.take(MAX_LISTED).collect();
+    if total > MAX_LISTED {
+        format!("{} (+{} more)", listed.join(", "), total - MAX_LISTED)
+    } else {
+        listed.join(", ")
+    }
 }
 
 // ─── Internal (pod-to-pod) routes ───────────────────────────────────────────
@@ -11273,27 +12614,80 @@ fn json_ok<T: serde::Serialize>(value: &T) -> String {
     )
 }
 
-/// Disk-cache pins on a search's segment directories, released on drop.
+/// Disk-cache pins on what a search reads, released on drop. Only what it
+/// reads: all Decover matters share one namespace, so pinning every
+/// segment of it for each in-flight search stopped all eviction under
+/// steady traffic and let the cache grow past `KOSHA_CACHE_MAX_BYTES`.
+#[cfg(feature = "s3")]
 struct SegmentPins<'a> {
     cache: &'a Cache,
+    data_dir: &'a Path,
     keys: Vec<String>,
 }
 
-impl Drop for SegmentPins<'_> {
-    fn drop(&mut self) {
-        for key in &self.keys {
-            self.cache.unpin(key);
-        }
+#[cfg(feature = "s3")]
+impl SegmentPins<'_> {
+    /// Pin `paths` (segment directories, each holding every file under
+    /// it, or single files) until the guard drops.
+    fn hold_all<'p>(&mut self, paths: impl IntoIterator<Item = &'p PathBuf>) {
+        let start = self.keys.len();
+        self.keys.extend(paths.into_iter().filter_map(|path| {
+            path.strip_prefix(self.data_dir)
+                .ok()
+                .map(|rel| rel.to_string_lossy().into_owned())
+        }));
+        self.cache.pin_all(&self.keys[start..]);
     }
 }
 
-/// One structured line per search request — the cold-read baseline
-/// instrument (Day 1 of the cold-read plan). Greppable as
+#[cfg(feature = "s3")]
+impl Drop for SegmentPins<'_> {
+    fn drop(&mut self) {
+        self.cache.unpin_all(&self.keys);
+    }
+}
+
+/// `KOSHA_SLOW_SEARCH_LOG_MS`: a search logs its `search timing:` line only
+/// when its phase sum or its wall time is at least this (default 1000; `0`
+/// logs every search). Read once, like the other knobs in this file;
+/// `main` reads it at startup so a bad value is reported there.
+fn slow_search_log_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        let raw = std::env::var("KOSHA_SLOW_SEARCH_LOG_MS").ok();
+        parse_slow_search_log_ms(raw.as_deref()).unwrap_or_else(|| {
+            eprintln!(
+                "WARN: KOSHA_SLOW_SEARCH_LOG_MS={:?} is not a whole number of ms; using 1000",
+                raw.unwrap_or_default()
+            );
+            1000
+        })
+    })
+}
+
+/// Unset: the 1000 ms default. `None` for a value that does not parse.
+fn parse_slow_search_log_ms(raw: Option<&str>) -> Option<u64> {
+    match raw {
+        None => Some(1000),
+        Some(v) => v.trim().parse().ok(),
+    }
+}
+
+/// Gated on the larger of the phase sum and the request's wall time, so
+/// a search slow outside the scored phases (manifest read, rerank,
+/// response build) is still logged.
+fn search_timing_logged(total_ms: f64, wall_ms: f64, threshold_ms: u64) -> bool {
+    total_ms.max(wall_ms) >= threshold_ms as f64
+}
+
+/// One structured line per slow search request (`KOSHA_SLOW_SEARCH_LOG_MS`,
+/// see [`slow_search_log_ms`]); the cold-read baseline instrument. Greppable as
 /// `search timing:`; every phase is wall-clock ms except `open_total_ms`
 /// (summed across rayon workers — read with `opens_cold` as average
 /// cold-open cost). `hydrate_files`/`hydrate_mb` count only this request's
 /// own S3 fetches; a fully-warm NVMe cache logs 0/0.0 with a small
 /// residual `hydrate_ms` (local existence checks).
+#[allow(clippy::too_many_arguments)]
 fn log_search_timing(
     ns: &NamespaceId,
     hydration: &HydrationOutcome,
@@ -11305,6 +12699,8 @@ fn log_search_timing(
     // non-kNN query) logs the same as `Some(0)` here; this line is a human/
     // grep-facing skim, not the API contract that needs the distinction.
     knn_degraded_segments: Option<u32>,
+    // The handler's wall time up to the built response.
+    wall_ms: f64,
 ) {
     let total_ms = hydrate_ms
         + queue_ms
@@ -11313,6 +12709,11 @@ fn log_search_timing(
         + phases.score_wall_ms
         + phases.materialize_wall_ms
         + phases.knn_rescore_ms;
+    // Decided before any of the line is formatted: a fast search allocates
+    // nothing here.
+    if !search_timing_logged(total_ms, wall_ms, slow_search_log_ms()) {
+        return;
+    }
     // Global bound-driven kNN rescoring (#381) logs its counters only when
     // it ran (`KOSHA_KNN_GLOBAL_RESCORE`), so the line is unchanged by
     // default.
@@ -11339,11 +12740,19 @@ fn log_search_timing(
             phases.knn_seg_quantized, phases.knn_seg_unrescored,
         ));
     }
+    // Posting-scan split of a kNN query's scoring time (#435): read,
+    // decode and dot, each summed across scoring threads.
+    if phases.knn_mode.is_some() {
+        knn_rescore.push_str(&format!(
+            " knn_read_ms={:.1} knn_decode_ms={:.1} knn_dot_ms={:.1} knn_rank_ms={:.2} knn_postings_cached={}",
+            phases.knn_read_ms, phases.knn_decode_ms, phases.knn_dot_ms, phases.knn_rank_ms, phases.knn_postings_cached,
+        ));
+    }
     println!(
-        "search timing: ns={} total_ms={:.1} hydrate_ms={:.1} hydrate_files={} \
+        "search timing: ns={} total_ms={:.1} wall_ms={:.1} hydrate_ms={:.1} hydrate_files={} \
          hydrate_mb={:.1} queue_ms={:.1} admit_ms={:.1} bm25_stats={} bm25_stats_ms={:.2} \
          score_ms={:.1} materialize_ms={:.1} opens_cold={} opens_cached={} \
-         open_total_ms={:.1} knn_postings={} knn_segments={} knn_centroids={} knn_plan_ms={:.1} knn_mode={} knn_exact_vectors={} \
+         open_total_ms={:.1} knn_postings={} knn_segments={} knn_centroids={} knn_plan_ms={:.1} knn_plan_exact_centroids={} knn_mode={} knn_exact_vectors={} \
          knn_filtered={} knn_degraded={} hits={} page_gets={} \
          page_ranged_kb={:.1} page_whole_files={} page_whole_mb={:.1} s3_rounds={} \
          s3_bytes={} postings_gets={} postings_ranged_kb={:.1} postings_whole_files={} \
@@ -11351,6 +12760,7 @@ fn log_search_timing(
          vector_whole_files={}{}{}{}",
         ns.0,
         total_ms,
+        wall_ms,
         hydrate_ms,
         hydration.files_fetched,
         hydration.bytes_fetched as f64 / (1024.0 * 1024.0),
@@ -11367,6 +12777,7 @@ fn log_search_timing(
         phases.knn_segments_probed,
         phases.knn_centroids_scanned,
         phases.knn_plan_ms,
+        phases.knn_plan_exact_centroids,
         phases.knn_mode.map_or("-", |mode| mode.as_str()),
         phases.knn_exact_vectors,
         phases
@@ -11841,6 +13252,13 @@ mod tests {
             filter: &kosha_core::deletion::DeletionFilter,
         ) -> Result<Vec<kosha_core::deletion::DeletionRecord>, KoshaError> {
             Ok(self.inner.lock().unwrap().deletions(filter))
+        }
+        fn deletions_after(
+            &self,
+            after: Option<&kosha_core::deletion::DeletionPosition>,
+            limit: u32,
+        ) -> Result<Vec<kosha_core::deletion::DeletionRecord>, KoshaError> {
+            Ok(self.inner.lock().unwrap().deletions_after(after, limit))
         }
     }
 
@@ -13793,6 +15211,122 @@ mod tests {
         assert!(rest.contains("\"a2\""), "{rest}");
     }
 
+    /// Finding 37: Elasticsearch-style callers send JSON booleans in `term`
+    /// / `terms` (the Decover backend's `{"term": {"isFiltered": false}}`);
+    /// that was a 400 on search, count and delete. A boolean now matches
+    /// what ingest stored for a `Boolean` field. A number is still the same
+    /// 400 and deletes nothing.
+    #[test]
+    fn bool_term_and_terms_match_stored_booleans_on_search_count_and_delete() {
+        let state = test_state();
+        let ns = NamespaceId("bool-terms".into());
+        for batch in [[("a", true), ("b", false)], [("c", true), ("d", false)]] {
+            state
+                .indexer
+                .index_documents(
+                    ns.clone(),
+                    batch
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (id, hot))| Document {
+                            id: DocumentId((*id).into()),
+                            fields: vec![
+                                Field::text("text", "hello"),
+                                Field::boolean("isHot", *hot),
+                                Field::integer("page", i as i64),
+                            ],
+                        })
+                        .collect(),
+                )
+                .unwrap();
+            state.indexer.flush_namespace(&ns).unwrap();
+        }
+        let search = |filter: &str| {
+            handle_search_post(
+                format!(
+                    r#"{{"namespace":"bool-terms","query_text":"hello","no_cache":true,
+                        "filter":{filter}}}"#
+                )
+                .as_bytes(),
+                &state,
+            )
+        };
+        let total = |filter: &str| -> u64 {
+            let response = search(filter);
+            assert!(response.starts_with("HTTP/1.1 200"), "{filter}: {response}");
+            json_body(&response)["total_hits"].as_u64().unwrap()
+        };
+        let count = |filter: &str| -> u64 {
+            // The client's count(): no hits, an exact total.
+            let response = handle_search_post(
+                format!(
+                    r#"{{"namespace":"bool-terms","query_text":"hello","no_cache":true,
+                        "max_results":0,"exact_total_hits":true,"filter":{filter}}}"#
+                )
+                .as_bytes(),
+                &state,
+            );
+            assert!(response.starts_with("HTTP/1.1 200"), "{filter}: {response}");
+            json_body(&response)["total_hits"].as_u64().unwrap()
+        };
+
+        assert_eq!(total(r#"{"term":{"isHot":true}}"#), 2);
+        assert_eq!(total(r#"{"term":{"isHot":false}}"#), 2);
+        assert_eq!(total(r#"{"term":{"isHot":"true"}}"#), 2);
+        assert_eq!(total(r#"{"terms":{"isHot":[true]}}"#), 2);
+        assert_eq!(total(r#"{"terms":{"isHot":[true,false]}}"#), 4);
+        assert_eq!(
+            total(r#"{"bool":{"must_not":[{"term":{"isHot":false}}]}}"#),
+            2
+        );
+        let hit_ids = |filter: &str| -> Vec<String> {
+            let mut ids: Vec<String> = json_body(&search(filter))["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|hit| hit["doc_id"].as_str().unwrap().to_owned())
+                .collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(hit_ids(r#"{"term":{"isHot":true}}"#), ["a", "c"]);
+        assert_eq!(
+            hit_ids(r#"{"term":{"isHot":true}}"#),
+            hit_ids(r#"{"term":{"isHot":"true"}}"#)
+        );
+        assert_eq!(count(r#"{"term":{"isHot":true}}"#), 2);
+        assert_eq!(count(r#"{"terms":{"isHot":[false]}}"#), 2);
+
+        // Numbers: unchanged 400, on search and on delete.
+        let numeric = search(r#"{"term":{"page":1}}"#);
+        assert!(numeric.starts_with("HTTP/1.1 400"), "{numeric}");
+        assert!(
+            numeric.contains("invalid search query: invalid type: integer `1`, expected a string"),
+            "{numeric}"
+        );
+        for filter in [r#"{"term":{"page":1}}"#, r#"{"terms":{"page":[0,1]}}"#] {
+            let body = format!(r#"{{"namespace":"bool-terms","filter":{filter}}}"#);
+            let response = handle_delete(body.as_bytes(), &state);
+            assert!(response.starts_with("HTTP/1.1 400"), "{filter}: {response}");
+            assert!(response.contains("invalid type: integer"), "{response}");
+        }
+        assert_eq!(total(r#"{"match_all":{}}"#), 4, "a 400 deleted something");
+
+        let response = handle_delete(
+            br#"{"namespace":"bool-terms","query":{"term":{"isHot":false}}}"#,
+            &state,
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("\"deleted\":2"), "{response}");
+        assert_eq!(hit_ids(r#"{"match_all":{}}"#), ["a", "c"]);
+        let response = handle_delete(
+            br#"{"namespace":"bool-terms","filter":{"terms":{"isHot":[true]}}}"#,
+            &state,
+        );
+        assert!(response.contains("\"deleted\":2"), "{response}");
+        assert_eq!(total(r#"{"match_all":{}}"#), 0);
+    }
+
     #[test]
     fn regression_query_replica_observes_published_deletes() {
         let ingest = test_state();
@@ -14089,6 +15623,93 @@ mod tests {
             let resp = post(bad);
             assert!(resp.starts_with("HTTP/1.1 400"), "{bad}: {resp}");
             assert!(resp.contains(needle), "{bad}: {resp}");
+        }
+    }
+
+    #[test]
+    fn percentiles_over_http_and_bad_percents_are_400() {
+        let state = test_state();
+        let ns = NamespaceId("pctns".into());
+        let doc = |id: &str, kind: &str, ms: i64| Document {
+            id: DocumentId(id.into()),
+            fields: vec![
+                Field::text("text", "request"),
+                Field::keyword("kind", kind),
+                Field::integer("ms", ms),
+            ],
+        };
+        // Two flushes, so the percentiles merge across two segments.
+        for batch in [
+            vec![
+                doc("1", "read", 10),
+                doc("2", "read", 20),
+                doc("3", "write", 100),
+            ],
+            vec![
+                doc("4", "read", 30),
+                doc("5", "read", 40),
+                doc("6", "write", 300),
+            ],
+        ] {
+            state.indexer.index_documents(ns.clone(), batch).unwrap();
+            state.indexer.flush_namespace(&ns).unwrap();
+        }
+        state.publish_namespace(&ns).unwrap();
+
+        let post = |aggs: &str| {
+            let body = format!(
+                r#"{{"namespace":"pctns","query_text":"request","max_results":0,"aggs":{aggs}}}"#
+            );
+            handle_search_post(body.as_bytes(), &state)
+        };
+        let resp = post(
+            r#"{"latency":{"percentiles":{"field":"ms","percents":[0,50,100]}},
+                "as_list":{"percentiles":{"field":"ms","percents":[50],"keyed":false}},
+                "by_kind":{"terms":{"field":"kind"},
+                           "aggs":{"p":{"percentiles":{"field":"ms","percents":[50]}}}}}"#,
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let v: serde_json::Value =
+            serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+        let aggs = &v["aggregations"];
+        // Sorted: 10, 20, 30, 40, 100, 300. The median interpolates
+        // between 30 and 40.
+        assert_eq!(
+            aggs["latency"],
+            serde_json::json!({"values": {"0.0": 10.0, "50.0": 35.0, "100.0": 300.0}}),
+            "{v}"
+        );
+        assert_eq!(
+            aggs["as_list"],
+            serde_json::json!({"values": [{"key": 50.0, "value": 35.0}]}),
+            "{v}"
+        );
+        assert_eq!(
+            aggs["by_kind"],
+            serde_json::json!({"buckets": [
+                {"key": "read", "doc_count": 4, "p": {"values": {"50.0": 25.0}}},
+                {"key": "write", "doc_count": 2, "p": {"values": {"50.0": 200.0}}},
+            ]}),
+            "{v}"
+        );
+
+        for (aggs, needle) in [
+            (
+                r#"{"x":{"percentiles":{"field":"ms","percents":[101]}}}"#,
+                "between 0 and 100",
+            ),
+            (
+                r#"{"x":{"percentiles":{"field":"ms","percents":[]}}}"#,
+                "must not be empty",
+            ),
+            (
+                r#"{"x":{"percentiles":{"field":"ms","tdigest":{"compression":200}}}}"#,
+                "`tdigest` is not supported yet",
+            ),
+        ] {
+            let resp = post(aggs);
+            assert!(resp.starts_with("HTTP/1.1 400"), "{aggs}: {resp}");
+            assert!(resp.contains(needle), "{aggs}: {resp}");
         }
     }
 
@@ -15089,6 +16710,116 @@ mod tests {
         .starts_with("HTTP/1.1 400"));
     }
 
+    /// #346: an admin request is the bootstrap key's (the unnamed operator)
+    /// or a named operator credential's, and nothing else's.
+    #[test]
+    fn admin_credential_is_the_bootstrap_key_or_a_named_operator_credential() {
+        use kosha_control::orgs::Actor;
+        let bearer = |key: &str| HashMap::from([("authorization".into(), format!("Bearer {key}"))]);
+        let registry_row = |key: &str, tenant_id: String, expires_at| kosha_control::ApiKeyRecord {
+            key_hash: kosha_control::hash_api_key(key),
+            tenant_id,
+            description: String::new(),
+            scopes: kosha_control::Scopes::ALL,
+            namespaces: None,
+            expires_at,
+            last_used_at: None,
+            created_at: 0,
+        };
+        let operator = kosha_control::api_keys::operator_tenant_id;
+        let keys = auth::KeyStore::with_keys(auth::parse_env_keys(Some("sk-env=acme"), None));
+        keys.replace_db_keys(vec![
+            registry_row("sk-alice", operator("alice"), None),
+            registry_row("sk-old", operator("bob"), Some(1)),
+            // A tenant key with every scope is still only a tenant key.
+            registry_row("sk-tenant", "acme".into(), None),
+        ]);
+        let auth = auth::Auth::Keys(keys);
+        let boot = Some("admin-secret");
+
+        assert_eq!(
+            admin_actor_in(&bearer("admin-secret"), boot, &auth),
+            Some(Actor::Operator)
+        );
+        let alice = Some(Actor::NamedOperator("alice".into()));
+        assert_eq!(admin_actor_in(&bearer("sk-alice"), boot, &auth), alice);
+        let x_api_key = HashMap::from([("x-api-key".to_string(), "sk-alice".to_string())]);
+        assert_eq!(admin_actor_in(&x_api_key, boot, &auth), alice);
+        for refused in ["sk-tenant", "sk-env", "sk-old", "sk-nobody", ""] {
+            assert_eq!(
+                admin_actor_in(&bearer(refused), boot, &auth),
+                None,
+                "{refused}"
+            );
+        }
+        assert_eq!(admin_actor_in(&HashMap::new(), boot, &auth), None);
+
+        // Bootstrap key switched off (or never set): it opens nothing, and
+        // operator credentials still work.
+        assert_eq!(admin_actor_in(&bearer("admin-secret"), None, &auth), None);
+        assert_eq!(admin_actor_in(&bearer("sk-alice"), None, &auth), alice);
+
+        // Without a key registry there are no operator credentials.
+        let disabled = auth::Auth::Disabled;
+        assert_eq!(admin_actor_in(&bearer("sk-alice"), boot, &disabled), None);
+        assert_eq!(
+            admin_actor_in(&bearer("admin-secret"), boot, &disabled),
+            Some(Actor::Operator)
+        );
+    }
+
+    #[test]
+    fn operator_credential_routes_need_the_admin_credential() {
+        let mut state = test_state();
+        state.admin_auth_key = Some("admin-secret".into());
+        state.internal_service_key = Some("peer-secret".into());
+        let admin = HashMap::from([("authorization".into(), "Bearer admin-secret".into())]);
+        let peer = HashMap::from([("authorization".into(), "Bearer peer-secret".into())]);
+        let tenant = HashMap::from([("authorization".into(), "Bearer tenant-key".into())]);
+        let mut vouching = admin.clone();
+        vouching.insert("x-kosha-actor".into(), "usr_1".into());
+        for line in [
+            "POST /v1/admin/operators HTTP/1.1",
+            "GET /v1/admin/operators HTTP/1.1",
+            "POST /v1/admin/operators/revoke HTTP/1.1",
+            "POST /v1/admin/operators/rotate HTTP/1.1",
+            "GET /v1/admin/api-keys/plaintext-count HTTP/1.1",
+        ] {
+            for headers in [&peer, &tenant, &vouching, &HashMap::new()] {
+                let response = route(line, headers, br#"{"name":"alice"}"#, "acme", &state);
+                assert!(response.starts_with("HTTP/1.1 403"), "{line}: {response}");
+            }
+        }
+        // With the credential the routes exist. Unit tests have no key
+        // registry, which is what they then report (501 not_implemented).
+        for line in [
+            "GET /v1/admin/operators HTTP/1.1",
+            "GET /v1/admin/api-keys/plaintext-count HTTP/1.1",
+        ] {
+            let response = route(line, &admin, b"", "service", &state);
+            assert!(response.starts_with("HTTP/1.1 501"), "{line}: {response}");
+        }
+        let response = route(
+            "POST /v1/admin/operators HTTP/1.1",
+            &admin,
+            br#"{"name":"not a name"}"#,
+            "service",
+            &state,
+        );
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert!(response.contains("invalid 'name'"), "{response}");
+        // A bootstrap key that is switched off opens none of them.
+        state.admin_auth_key = None;
+        let response = route(
+            "GET /v1/admin/operators HTTP/1.1",
+            &admin,
+            b"",
+            "service",
+            &state,
+        );
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    }
+
     #[test]
     fn regression_flush_does_not_acknowledge_failed_publication() {
         let state = test_state();
@@ -15375,10 +17106,10 @@ mod tests {
         // where waiting beats failing (hydration), so this change is scoped
         // to the search path.
         let sem = Arc::new(Semaphore::new(1));
-        let held = sem.acquire();
+        let held = sem.acquire("test");
         let s = Arc::clone(&sem);
         let t = std::thread::spawn(move || {
-            let _p = s.acquire();
+            let _p = s.acquire("test");
             true
         });
         std::thread::sleep(Duration::from_millis(30));
@@ -15408,6 +17139,26 @@ mod tests {
     }
 
     #[test]
+    fn slow_search_log_threshold() {
+        assert_eq!(parse_slow_search_log_ms(None), Some(1000));
+        assert_eq!(parse_slow_search_log_ms(Some("garbage")), None);
+        assert_eq!(parse_slow_search_log_ms(Some("-5")), None);
+        assert_eq!(parse_slow_search_log_ms(Some("250")), Some(250));
+        let default = parse_slow_search_log_ms(None).unwrap();
+        assert!(!search_timing_logged(12.5, 13.0, default));
+        assert!(!search_timing_logged(999.9, 999.9, default));
+        assert!(search_timing_logged(1000.0, 1000.0, default));
+        assert!(search_timing_logged(4321.0, 4330.0, default));
+        // Fast phases, slow request (manifest read, rerank, response
+        // build): the wall time alone crosses the threshold.
+        assert!(search_timing_logged(400.0, 3000.0, default));
+        // 0 logs every search, including a 0 ms one.
+        let all = parse_slow_search_log_ms(Some("0")).unwrap();
+        assert!(search_timing_logged(0.0, 0.0, all));
+        assert!(search_timing_logged(0.3, 0.4, all));
+    }
+
+    #[test]
     fn env_flag_default_on_semantics() {
         // Unset → on (the KOSHA_WARMUP_POSTING_BLOBS default).
         assert!(env_flag_default_on(None));
@@ -15430,7 +17181,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         assert!(
-            !AppState::segment_is_complete(&dir),
+            !AppState::segment_is_complete(&dir, false),
             "empty dir must not count as complete"
         );
 
@@ -15438,16 +17189,64 @@ mod tests {
             fs::write(dir.join(f), b"x").unwrap();
         }
         assert!(
-            !AppState::segment_is_complete(&dir),
+            !AppState::segment_is_complete(&dir, false),
             "missing filters.bin must still be incomplete"
         );
 
         fs::write(dir.join("filters.bin"), b"x").unwrap();
         assert!(
-            AppState::segment_is_complete(&dir),
+            AppState::segment_is_complete(&dir, false),
             "all four core files present (vector.idx not required) must be complete"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Finding 29: a caller that needs vectors does not count a segment as
+    /// complete until every vector file its footer lists is local — each
+    /// column's idx and offsets file and `doc_vectors.bin` — while a
+    /// lexical caller still does without them.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn segment_is_complete_requires_vector_files_only_when_vectors_are_needed() {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-segment-complete-vectors-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut w =
+            kosha_segment::SegmentWriter::new(kosha_core::SegmentId("v".into()), dir.clone());
+        for i in 0..4 {
+            w.add_document(
+                DocumentId(format!("d{i}")),
+                vec![
+                    Field::text("text", "x"),
+                    Field::vector("title_emb", vec![1.0, i as f32]),
+                    Field::vector("body_emb", vec![1.0, 0.0, i as f32]),
+                ],
+            );
+        }
+        let footer = w.finalize(Default::default()).unwrap();
+        assert!(footer.doc_vectors);
+        let mut vector_files = kosha_segment::vector_index_files(&dir);
+        assert_eq!(vector_files.len(), 4, "two columns, idx + offsets each");
+        vector_files.push(kosha_segment::DOC_VECTORS_FILE.to_string());
+        assert!(AppState::segment_is_complete(&dir, false));
+        assert!(AppState::segment_is_complete(&dir, true));
+
+        for name in &vector_files {
+            let stash = dir.join("stash");
+            fs::rename(dir.join(name), &stash).unwrap();
+            assert!(
+                AppState::segment_is_complete(&dir, false),
+                "{name}: a lexical caller does not need it"
+            );
+            assert!(
+                !AppState::segment_is_complete(&dir, true),
+                "{name}: a caller that needs vectors must fetch it"
+            );
+            fs::rename(&stash, dir.join(name)).unwrap();
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -15473,18 +17272,18 @@ mod tests {
         );
         let footer = w.finalize(kosha_core::Bm25Params::default()).unwrap();
         assert!(!dir.join("filters.bin").exists());
-        assert!(AppState::segment_is_complete(&dir));
+        assert!(AppState::segment_is_complete(&dir, false));
         let col = footer.filter_columns.as_ref().unwrap()[1].file_name();
         let stash = dir.join("col.stash");
         fs::rename(dir.join(&col), &stash).unwrap();
         assert!(
-            !AppState::segment_is_complete(&dir),
+            !AppState::segment_is_complete(&dir, false),
             "a missing column makes a columnar segment incomplete"
         );
         fs::rename(&stash, dir.join(&col)).unwrap();
         fs::remove_file(dir.join("filters.toc")).unwrap();
         assert!(
-            !AppState::segment_is_complete(&dir),
+            !AppState::segment_is_complete(&dir, false),
             "so does a missing TOC"
         );
         let _ = fs::remove_dir_all(&dir);
@@ -15847,6 +17646,79 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A landed promotion (posting shard or doc store) drops spans that the
+    /// whole file now supersedes: nothing became less local, so the
+    /// namespace's posting presence verdicts, other segments' included,
+    /// must survive it. Every one used to be wiped, and each following
+    /// distinct keyword query re-planned every segment from its
+    /// `inverted.idx` (~450 ms on staging, run8). A real eviction still
+    /// invalidates them.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn a_landed_promotion_keeps_posting_presence_and_an_eviction_does_not() {
+        let state = test_state();
+        let seg_a = state.data_dir.join("ns/seg-a");
+        state
+            .cache
+            .put_bytes("ns/seg-a/postings-00.bin.spans/0-10", &[1u8; 10])
+            .unwrap();
+        state
+            .cache
+            .put_bytes("ns/seg-a/postings-00.bin", &[1u8; 64])
+            .unwrap();
+        state
+            .cache
+            .put_bytes("ns/seg-a/doc_store.bin.spans/0-10", &[1u8; 10])
+            .unwrap();
+        state
+            .cache
+            .put_bytes("ns/seg-a/doc_store.bin", &[1u8; 64])
+            .unwrap();
+        state
+            .cache
+            .put_bytes("ns/seg-b/postings-01.bin", &[1u8; 64])
+            .unwrap();
+        let confirmed = |state: &AppState| {
+            let cache = state.posting_blob_presence.lock().unwrap();
+            posting_blob_cache_lookup(&cache, "ns", 1, state.presence_generation())
+                .get("ns/seg-b")
+                .is_some_and(|set| set.contains("postings-01.bin"))
+        };
+        posting_blob_cache_insert(
+            &mut state.posting_blob_presence.lock().unwrap(),
+            "ns",
+            1,
+            state.presence_generation(),
+            vec![("ns/seg-b".into(), "postings-01.bin".into())],
+        );
+        assert!(confirmed(&state));
+
+        state.posting_span_hydrator.finish_promotion(
+            &state.cache,
+            &state.span_writes,
+            &seg_a.join("postings-00.bin"),
+            true,
+        );
+        state
+            .span_hydrator
+            .finish_promotion(&state.cache, &state.span_writes, &seg_a, true);
+        assert!(
+            !seg_a.join("postings-00.bin.spans").exists(),
+            "spans dropped"
+        );
+        assert!(!seg_a.join("doc_store.bin.spans").exists(), "spans dropped");
+        assert!(
+            confirmed(&state),
+            "a landed promotion must not invalidate other segments' presence"
+        );
+
+        state.cache.evict("ns/seg-b/postings-01.bin").unwrap();
+        assert!(
+            !confirmed(&state),
+            "a real eviction must invalidate the presence verdicts"
+        );
+    }
+
     #[cfg(feature = "s3")]
     #[test]
     fn chunk_by_byte_budget_keeps_each_chunk_at_or_under_budget() {
@@ -16053,13 +17925,13 @@ mod tests {
 
     /// #204: a kNN's scoring set holds only the queried column's files, as
     /// the segment's footer lists them.
-    /// Global kNN rescoring (#381) reads a quantized column's exact
-    /// vectors by range, so with the flag on its `doc_vectors.bin` header
-    /// joins the kNN scoring set; with it off (the default) and for f32
-    /// columns, the predicate is the legacy one.
+    /// Readers that take sidecar vectors by range need its header: global
+    /// rescoring (#381) requires a quantized column's in the kNN scoring
+    /// set; exact filtered kNN asks best-effort for any column whose
+    /// vectors are in the sidecar (f32 sidecars are never fetched whole).
     #[cfg(feature = "s3")]
     #[test]
-    fn global_rescore_wants_the_doc_vectors_header_of_quantized_columns() {
+    fn knn_wants_the_doc_vectors_header_where_it_reads_ranges() {
         let footer = |quantization| {
             let dir = std::env::temp_dir().join(format!(
                 "kosha-test-dv-header-{quantization:?}-{}",
@@ -16085,11 +17957,66 @@ mod tests {
         };
         let i8 = footer(kosha_core::VectorQuantization::I8);
         let f32 = footer(kosha_core::VectorQuantization::F32);
+        // Required: a legacy segment's, and with global rescoring a
+        // quantized column's — never an f32 column's.
         assert!(!knn_wants_doc_vectors_header_with(Some(&i8), "emb", false));
         assert!(knn_wants_doc_vectors_header_with(Some(&i8), "emb", true));
         assert!(!knn_wants_doc_vectors_header_with(Some(&i8), "other", true));
         assert!(!knn_wants_doc_vectors_header_with(Some(&f32), "emb", true));
         assert!(!knn_wants_doc_vectors_header_with(None, "emb", false));
+        // Best-effort for a filtered kNN: any column whose vectors are in
+        // the sidecar (exact filtered kNN reads its candidates by range).
+        assert!(exact_knn_wants_doc_vectors_header(Some(&f32), "emb"));
+        assert!(exact_knn_wants_doc_vectors_header(Some(&i8), "emb"));
+        assert!(!exact_knn_wants_doc_vectors_header(Some(&f32), "other"));
+        assert!(!exact_knn_wants_doc_vectors_header(None, "emb"));
+        let inline = kosha_core::Footer {
+            doc_vectors: false,
+            ..f32.clone()
+        };
+        assert!(!exact_knn_wants_doc_vectors_header(Some(&inline), "emb"));
+    }
+
+    /// A doc-store promotion (or warm-up) of an f32 sidecar segment lands
+    /// with `doc_store.bin` alone; a quantized one also needs its whole
+    /// `doc_vectors.bin`, which the promotion therefore fetches.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn promotion_fetches_and_waits_for_doc_vectors_only_for_quantized_columns() {
+        for (quantization, kept) in [
+            (kosha_core::VectorQuantization::F32, false),
+            (kosha_core::VectorQuantization::I8, true),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "kosha-test-promote-landed-{quantization:?}-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            let mut w =
+                kosha_segment::SegmentWriter::new(kosha_core::SegmentId("s".into()), dir.clone())
+                    .with_vector_store_mode(kosha_segment::VectorStoreMode::Sidecar)
+                    .with_vector_quantization(kosha_segment::VectorQuantizationConfig::all(
+                        quantization,
+                    ));
+            for i in 0..8 {
+                w.add_document(
+                    DocumentId(format!("d{i}")),
+                    vec![Field::vector("emb", vec![1.0, i as f32, 0.5, 0.0])],
+                );
+            }
+            w.finalize(Default::default()).unwrap();
+            fs::remove_file(dir.join(kosha_segment::DOC_VECTORS_FILE)).unwrap();
+            assert_eq!(kosha_segment::segment_keeps_doc_vectors_whole(&dir), kept);
+            assert_eq!(
+                doc_vectors_promotion(&dir) == DOC_VECTORS_PROMOTED,
+                kept,
+                "{quantization:?}"
+            );
+            assert_eq!(doc_store_promotion_landed(&dir), !kept, "{quantization:?}");
+            fs::remove_file(dir.join(kosha_segment::DOC_STORE_FILE)).unwrap();
+            assert!(!doc_store_promotion_landed(&dir));
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 
     #[cfg(feature = "s3")]
@@ -16270,6 +18197,339 @@ mod tests {
             hydration_error_response(&HydrationOutcome::default()).is_none(),
             "a clean hydration proceeds"
         );
+    }
+
+    /// A kNN page that skipped a segment because the request was shed is a
+    /// 429; a skip without a shed stays a 200.
+    #[test]
+    fn knn_answer_skipping_a_segment_after_a_shed_is_a_429() {
+        assert!(knn_shed_response(0, Some("x".into())).is_none());
+        assert!(knn_shed_response(2, None).is_none());
+        let shed = knn_shed_response(1, Some("waited".into())).unwrap();
+        assert!(shed.starts_with("HTTP/1.1 429"), "{shed}");
+    }
+
+    /// Finding 31 / run10: a kNN search whose vector posting is gone when
+    /// it is scored loses that segment's neighbours. Both POST routes (the
+    /// legacy `/search` and the v1 route the Python client uses) must
+    /// answer 503 + `Retry-After`, never a 200 with fewer hits. (`GET
+    /// /search` builds no kNN query, so it cannot lose a kNN segment.)
+    #[test]
+    fn a_knn_search_that_loses_a_segment_to_an_error_is_a_503() {
+        let state = test_state();
+        let ns = NamespaceId("acme/knnlost".into());
+        let docs: Vec<Document> = [("d1", [1.0, 0.0, 0.0]), ("d2", [0.0, 1.0, 0.0])]
+            .into_iter()
+            .map(|(id, v)| Document {
+                id: DocumentId(id.into()),
+                fields: vec![Field::text("text", "x"), Field::vector("emb", v.to_vec())],
+            })
+            .collect();
+        let body = serde_json::to_vec(&kosha_core::IndexRequest {
+            namespace: ns.clone(),
+            documents: docs,
+        })
+        .unwrap();
+        let resp = handle_index(&body, &state);
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+
+        let knn = r#""query_text":"","no_cache":true,"knn":{"field":"emb","vector":[1.0,0.0,0.0],"k":2,"num_candidates":10}"#;
+        let legacy = || {
+            let body = format!(r#"{{"namespace":"acme/knnlost",{knn}}}"#);
+            handle_search_post(body.as_bytes(), &state)
+        };
+        let v1 = || {
+            route(
+                "POST /v1/namespaces/knnlost/search HTTP/1.1\r\n",
+                &HashMap::new(),
+                format!("{{{knn}}}").as_bytes(),
+                "acme",
+                &state,
+            )
+        };
+        let json = |resp: &str| -> serde_json::Value {
+            serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..]).unwrap()
+        };
+        // Warm: the segment is open in the searcher's cache, and its
+        // posting was read from disk. A first touch is never admitted to
+        // the decoded-posting cache, so the next probe reads disk again.
+        let resp = legacy();
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let body = json(&resp);
+        assert_eq!(body["knn_degraded_segments"], 0, "{body}");
+        assert_eq!(body["results"].as_array().unwrap().len(), 2, "{body}");
+        // The open reader's `vector.idx` vanishes (as an evicted or never
+        // written span does): the next probe of the posting fails.
+        let manifest = state.indexer.manifest(&ns).unwrap();
+        for entry in &manifest.segments {
+            let dir = manifest.segment_dir(&state.data_dir, &ns, &entry.segment_id);
+            fs::remove_file(dir.join("vector.idx")).unwrap();
+        }
+        for (route, resp) in [("legacy", legacy()), ("v1", v1())] {
+            assert!(resp.starts_with("HTTP/1.1 503"), "{route}: {resp}");
+            assert!(resp.contains("\r\nretry-after: 1\r\n"), "{route}: {resp}");
+            let body = json(&resp);
+            assert_eq!(
+                body["reason"], "knn_segments_unavailable",
+                "{route}: {body}"
+            );
+            assert_eq!(body["knn_failed_segments"], 1, "{route}: {body}");
+            assert_eq!(body["knn_degraded_segments"], 1, "{route}: {body}");
+            assert!(body["results"].is_null(), "no partial page: {body}");
+        }
+    }
+
+    /// The staging shape of the same failure (run10): the scoring set is
+    /// local, the kNN postings are read by range from S3, and the ranges
+    /// cannot be fetched (not a shed: the request has room). The postings
+    /// stay not local, the probe fails, and the answer is a 503, not a 200
+    /// with `knn_degraded_segments > 0`.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn knn_search_whose_vector_postings_cannot_be_fetched_is_a_503() {
+        const NS: &str = "vector-lost";
+        let (s3, mut state, manifest, _) = single_flight_node(
+            NS,
+            |w| w.with_vector_store_mode(kosha_segment::VectorStoreMode::Sidecar),
+            |i| {
+                vec![
+                    Field::text("text", format!("contract clause {i}")),
+                    Field::vector("emb", vec![1.0, i as f32, 0.5, 0.0]),
+                ]
+            },
+        );
+        state.posting_read_mode = doc_spans::ReadMode::Ranged;
+        let query = serde_json::json!({
+            "namespace": NS,
+            "query_text": "",
+            "max_results": 3,
+            "knn": {"field": "emb", "vector": [1.0, 0.0, 0.5, 0.0], "k": 3, "num_candidates": 100},
+        });
+        let scoring = state.hydrate_segments_for_search(
+            &NamespaceId(NS.into()),
+            &manifest,
+            &serde_json::from_value(query.clone()).unwrap(),
+            &Arc::new(RequestHydration::new(u64::MAX)),
+            None,
+        );
+        assert!(scoring.missing.is_empty() && !scoring.shed);
+        // Every `vector.idx` object goes from the bucket: a ranged read of
+        // a posting now fails.
+        for entry in &manifest.segments {
+            fs::remove_file(
+                s3.root
+                    .join(NS)
+                    .join(&entry.segment_id.0)
+                    .join("vector.idx"),
+            )
+            .unwrap();
+        }
+        let resp = handle_search_post(query.to_string().as_bytes(), &state);
+        assert_eq!(status_of(&resp), 503, "{resp}");
+        assert!(resp.contains("\r\nretry-after: 1\r\n"), "{resp}");
+        let body: serde_json::Value =
+            serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+        assert_eq!(body["reason"], "knn_segments_unavailable", "{body}");
+        assert_eq!(body["knn_failed_segments"], 2, "{body}");
+    }
+
+    /// A two-segment kNN node reading whole `vector.idx` files, with a
+    /// v2 index whose column can be corrupted.
+    #[cfg(feature = "s3")]
+    fn corrupt_vector_node(
+        ns: &str,
+    ) -> (
+        crate::doc_store_fallback_tests::FakeS3,
+        AppState,
+        kosha_core::Manifest,
+        Vec<PathBuf>,
+    ) {
+        let (s3, mut state, manifest, seg_paths) = single_flight_node(
+            ns,
+            |w| w.with_vector_store_mode(kosha_segment::VectorStoreMode::Sidecar),
+            |i| {
+                vec![
+                    Field::text("text", format!("contract clause {i}")),
+                    Field::vector("emb", vec![1.0, i as f32, 0.5, 0.0]),
+                ]
+            },
+        );
+        state.posting_read_mode = doc_spans::ReadMode::Whole;
+        (s3, state, manifest, seg_paths)
+    }
+
+    /// A kNN search of `ns` on `state`, not served from the result cache.
+    #[cfg(feature = "s3")]
+    fn corrupt_vector_search(state: &AppState, ns: &str) -> (u16, serde_json::Value) {
+        let body = serde_json::json!({
+            "namespace": ns,
+            "query_text": "",
+            "no_cache": true,
+            "max_results": 3,
+            "knn": {"field": "emb", "vector": [1.0, 0.0, 0.5, 0.0], "k": 3, "num_candidates": 100},
+        });
+        let resp = handle_search_post(body.to_string().as_bytes(), state);
+        let json: serde_json::Value =
+            serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..]).unwrap_or_default();
+        (status_of(&resp), json)
+    }
+
+    /// Give a segment's vector column a valid header over a corrupt body
+    /// and an unusable `vector.offsets`, the shape
+    /// `SegmentReader::vector_index_degraded` reports (no sidecar to fall
+    /// back on, and the whole file does not parse).
+    #[cfg(feature = "s3")]
+    fn corrupt_vector_column(dir: &Path) {
+        let idx = dir.join("vector.idx");
+        let mut bytes = fs::read(&idx).unwrap();
+        bytes.truncate(bytes.len() - 3);
+        fs::write(&idx, &bytes).unwrap();
+        fs::write(dir.join("vector.offsets"), b"not an offsets sidecar").unwrap();
+    }
+
+    /// A corrupt vector index on the pod's disk heals itself: the first
+    /// search is a 503 (its reader is cached corrupt), it evicts the
+    /// reader and the local vector index files, and the retry downloads
+    /// them again and answers in full.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn a_corrupt_local_vector_index_is_a_503_then_heals_on_the_retry() {
+        const NS: &str = "vector-heal";
+        let (_s3, state, manifest, seg_paths) = corrupt_vector_node(NS);
+        let search = |state: &AppState| corrupt_vector_search(state, NS);
+        let (status, full) = search(&state);
+        assert_eq!(status, 200, "{full}");
+        let want = full["results"].clone();
+        assert!(!want.as_array().unwrap().is_empty(), "{full}");
+        // Corrupt on disk, under a fresh reader.
+        for (dir, entry) in seg_paths.iter().zip(&manifest.segments) {
+            corrupt_vector_column(dir);
+            state
+                .searcher
+                .forget_segment(&NamespaceId(NS.into()), &entry.segment_id);
+        }
+        let (status, body) = search(&state);
+        assert_eq!(status, 503, "{body}");
+        assert_eq!(body["reason"], "knn_segments_unavailable", "{body}");
+        for dir in &seg_paths {
+            assert!(!dir.join("vector.idx").exists(), "evicted for re-download");
+            assert!(
+                dir.join("inverted.idx").exists(),
+                "only the vector index goes"
+            );
+        }
+        let (status, body) = search(&state);
+        assert_eq!(status, 200, "the retry re-downloads and heals: {body}");
+        assert_eq!(body["knn_degraded_segments"], 0, "{body}");
+        assert_eq!(body["results"], want, "{body}");
+    }
+
+    /// A heal refused because another search holds the segment keeps the
+    /// cached reader (and its lexical state) and the files: nothing is
+    /// thrown away for a re-download that did not happen.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn a_refused_self_heal_keeps_the_cached_reader() {
+        const NS: &str = "vector-heal-pinned";
+        let (_s3, state, manifest, seg_paths) = corrupt_vector_node(NS);
+        let search = |state: &AppState| corrupt_vector_search(state, NS);
+        assert_eq!(search(&state).0, 200);
+        for (dir, entry) in seg_paths.iter().zip(&manifest.segments) {
+            corrupt_vector_column(dir);
+            state
+                .searcher
+                .forget_segment(&NamespaceId(NS.into()), &entry.segment_id);
+        }
+        // Another search holds both segments.
+        let keys: Vec<String> = seg_paths
+            .iter()
+            .map(|dir| {
+                dir.strip_prefix(&state.data_dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        state.cache.pin_all(&keys);
+        let (status, body) = search(&state);
+        assert_eq!(status, 503, "{body}");
+        assert!(
+            state.searcher.segment_cache_bytes() > 0,
+            "the readers this search opened stay cached"
+        );
+        for dir in &seg_paths {
+            assert!(dir.join("vector.idx").exists(), "pinned: not evicted");
+        }
+        // Released: the next 503 heals, and the retry answers in full.
+        state.cache.unpin_all(&keys);
+        assert_eq!(search(&state).0, 503);
+        let (status, body) = search(&state);
+        assert_eq!(status, 200, "{body}");
+    }
+
+    /// When the object in S3 is itself corrupt, every search stays a 503,
+    /// but the column is re-downloaded at most once per
+    /// `KNN_SELF_HEAL_INTERVAL`, not once per request.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn a_corrupt_vector_index_in_s3_stays_a_503_without_a_download_per_request() {
+        const NS: &str = "vector-corrupt-s3";
+        let (s3, state, manifest, _) = corrupt_vector_node(NS);
+        let search = |state: &AppState| corrupt_vector_search(state, NS);
+        for entry in &manifest.segments {
+            corrupt_vector_column(&s3.root.join(NS).join(&entry.segment_id.0));
+        }
+        let vector_gets = || {
+            s3.gets
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|k| k.ends_with("vector.idx"))
+                .count()
+        };
+        let (status, body) = search(&state);
+        assert_eq!(status, 503, "{body}");
+        let first = vector_gets();
+        assert!(first > 0, "the cold search fetched the column");
+        // One re-download after the first heal...
+        let (status, body) = search(&state);
+        assert_eq!(status, 503, "still corrupt in S3: {body}");
+        let second = vector_gets();
+        assert!(second > first, "healed once: {first} -> {second}");
+        // ...and none after: the heal is rate-limited.
+        for _ in 0..3 {
+            let (status, body) = search(&state);
+            assert_eq!(status, 503, "{body}");
+        }
+        assert_eq!(vector_gets(), second, "no download per request");
+    }
+
+    /// The 503's contract: nothing for a search with no failed segment
+    /// (a degraded-by-design skip, another embedding model, stays a 200),
+    /// otherwise `Retry-After`, the reason, the counts and the request id.
+    #[test]
+    fn knn_failed_response_is_a_503_with_retry_after_and_request_id() {
+        let state = test_state();
+        let ns = NamespaceId("acme/x".into());
+        assert!(knn_failed_response(&state, &ns, 1, &[], 1).is_none());
+        api_error::begin_request(Some("ev-123"));
+        let failed = [
+            kosha_core::SegmentId("seg-a".into()),
+            kosha_core::SegmentId("seg-b".into()),
+        ];
+        let resp = knn_failed_response(&state, &ns, 1, &failed, 3).unwrap();
+        api_error::begin_request(None);
+        assert!(resp.starts_with("HTTP/1.1 503"), "{resp}");
+        assert!(resp.contains("\r\nretry-after: 1\r\n"), "{resp}");
+        let body: serde_json::Value =
+            serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+        assert_eq!(body["reason"], "knn_segments_unavailable");
+        assert_eq!(body["knn_failed_segments"], 2);
+        assert_eq!(body["knn_degraded_segments"], 3);
+        assert_eq!(body["request_id"], "ev-123");
+        assert_eq!(body["retry_after_ms"], 1000);
     }
 
     #[cfg(feature = "s3")]
@@ -16796,6 +19056,7 @@ mod tests {
                     let (owned, waiting) = partition_for_hydration(
                         &in_flight,
                         std::slice::from_ref(&seg_path),
+                        HYDRATE_OWNER_SCORING,
                         |_| hydrated.load(Ordering::SeqCst),
                     );
                     if !owned.is_empty() {
@@ -16805,7 +19066,7 @@ mod tests {
                         // waiters instead of also becoming owners.
                         std::thread::sleep(Duration::from_millis(50));
                         hydrated.store(true, Ordering::SeqCst);
-                        complete_owned(&in_flight, &owned);
+                        complete_owned(&in_flight, &owned, 0);
                     } else {
                         wait_for(&waiting);
                     }
@@ -16823,6 +19084,426 @@ mod tests {
             "in-flight entry must be removed after completion so a future cache miss can retry"
         );
         assert!(hydrated.load(Ordering::SeqCst));
+    }
+
+    /// Block until `entry` has `n` holders: the in-flight map, the owner's
+    /// batch, and one per waiter that has partitioned onto it.
+    #[cfg(feature = "s3")]
+    fn wait_for_holders(entry: &Arc<SegmentFetch>, n: usize) {
+        let t0 = Instant::now();
+        while Arc::strong_count(entry) < n {
+            assert!(t0.elapsed() < Duration::from_secs(10), "no waiter arrived");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Finding 28 (run9, two 503s "segment hydration failed for 12
+    /// segment(s)"): single-flight is keyed by segment, but the owner
+    /// fetches only what its own request needs. Owner A needs file X;
+    /// waiter B needs X and Y. Before the fix B woke up after A, found Y
+    /// absent and reported the segment missing without ever fetching it.
+    /// Now B takes the segment back through ownership and fetches Y.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn waiter_fetches_what_the_owner_did_not_need() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+
+        let in_flight: Mutex<HashMap<PathBuf, Arc<SegmentFetch>>> = Mutex::new(HashMap::new());
+        let (x, y) = (AtomicBool::new(false), AtomicBool::new(false));
+        let seg = PathBuf::from("ns/seg-1");
+        let (claimed_tx, claimed_rx) = mpsc::channel();
+
+        let b_roles = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                hydrate_single_flight(
+                    &in_flight,
+                    std::slice::from_ref(&seg),
+                    HYDRATE_OWNER_SCORING,
+                    |_, _| x.load(Ordering::SeqCst),
+                    |owned| {
+                        claimed_tx.send(()).unwrap();
+                        // Hold the fetch until B is waiting on it.
+                        wait_for_holders(&owned[0].1, 3);
+                        x.store(true, Ordering::SeqCst); // A fetches only X
+                        0
+                    },
+                    || false,
+                );
+            });
+            claimed_rx.recv().unwrap();
+            let b = scope.spawn(|| {
+                hydrate_single_flight(
+                    &in_flight,
+                    std::slice::from_ref(&seg),
+                    HYDRATE_OWNER_SCORING,
+                    |_, _| x.load(Ordering::SeqCst) && y.load(Ordering::SeqCst),
+                    |_| {
+                        y.store(true, Ordering::SeqCst); // B's own gap
+                        0
+                    },
+                    || false,
+                )
+            });
+            b.join().unwrap()
+        });
+
+        assert!(
+            y.load(Ordering::SeqCst),
+            "B must fetch Y itself, not report the segment missing"
+        );
+        assert_eq!(
+            b_roles.get(&seg),
+            Some(&HydrationRole::OwnedAfterWaiting {
+                owner: HYDRATE_OWNER_SCORING
+            })
+        );
+        assert!(in_flight.lock().unwrap().is_empty());
+    }
+
+    /// The warm path: every segment complete, nothing partitioned, fetched,
+    /// waited on or recorded.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn single_flight_on_complete_segments_does_nothing() {
+        let in_flight: Mutex<HashMap<PathBuf, Arc<SegmentFetch>>> = Mutex::new(HashMap::new());
+        let segs = [PathBuf::from("ns/a"), PathBuf::from("ns/b")];
+        let roles = hydrate_single_flight(
+            &in_flight,
+            &segs,
+            HYDRATE_OWNER_SCORING,
+            |_, _| true,
+            |_| panic!("nothing to fetch"),
+            || false,
+        );
+        assert!(roles.is_empty());
+        assert!(in_flight.lock().unwrap().is_empty());
+    }
+
+    /// A cold query node over a fake bucket of two segments written by
+    /// `writer` (configured by `configure`, documents from `fields(i)`),
+    /// with the writer's footers on the manifest. Returns the bucket, the
+    /// node, its segment dirs and their footers.
+    #[cfg(feature = "s3")]
+    fn single_flight_node(
+        ns: &str,
+        configure: impl Fn(kosha_segment::SegmentWriter) -> kosha_segment::SegmentWriter,
+        fields: impl Fn(u32) -> Vec<Field>,
+    ) -> (
+        crate::doc_store_fallback_tests::FakeS3,
+        AppState,
+        kosha_core::Manifest,
+        Vec<PathBuf>,
+    ) {
+        use crate::doc_store_fallback_tests::{cold_node, temp_dir, FakeS3};
+
+        // A manifest of two segments, from the indexer...
+        let writer = AppState::new(temp_dir("sf-writer"));
+        let id = NamespaceId(ns.into());
+        for batch in 0..2 {
+            let docs = (0..6)
+                .map(|i| Document {
+                    id: DocumentId(format!("d{batch}-{i}")),
+                    fields: vec![Field::text("text", format!("contract clause {i}"))],
+                })
+                .collect();
+            writer.indexer.index_documents(id.clone(), docs).unwrap();
+            writer.indexer.flush_namespace(&id).unwrap();
+        }
+        let mut manifest = writer.indexer.manifest_cloned(&id).unwrap();
+        // ...whose segments in the bucket are written in the shape under test.
+        let bucket = temp_dir("sf-bucket");
+        for (batch, entry) in manifest.segments.iter().enumerate() {
+            let mut w = configure(kosha_segment::SegmentWriter::new(
+                entry.segment_id.clone(),
+                bucket.join(ns).join(&entry.segment_id.0),
+            ));
+            for i in 0..entry.doc_count {
+                w.add_document(DocumentId(format!("d{batch}-{i}")), fields(i));
+            }
+            let footer = w.finalize(kosha_core::Bm25Params::default()).unwrap();
+            manifest
+                .segment_footers
+                .insert(entry.segment_id.clone(), Arc::new(footer));
+        }
+        let s3 = FakeS3::start(bucket);
+        let state = cold_node(&s3, ns, manifest.clone());
+        let seg_paths = manifest
+            .segments
+            .iter()
+            .map(|e| manifest.segment_dir(&state.data_dir, &id, &e.segment_id))
+            .collect();
+        (s3, state, manifest, seg_paths)
+    }
+
+    /// Each segment dir's manifest footer.
+    #[cfg(feature = "s3")]
+    fn footers_of<'a>(
+        manifest: &'a kosha_core::Manifest,
+        seg_paths: &[PathBuf],
+    ) -> HashMap<PathBuf, &'a kosha_core::Footer> {
+        manifest
+            .segments
+            .iter()
+            .zip(seg_paths)
+            .filter_map(|(e, p)| {
+                manifest
+                    .segment_footer(&e.segment_id)
+                    .map(|f| (p.clone(), f))
+            })
+            .collect()
+    }
+
+    /// Run `waiter` (an `ensure_scoring_files_local` call) while an
+    /// unfiltered keyword search owns every segment's scoring hydration:
+    /// the owner claims them all, waits until `waiter` is waiting on each,
+    /// lands only what its own round fetches (`footer.json`, `inverted.idx`,
+    /// `doc_store.offsets`), then completes. Returns the waiter's outcome.
+    #[cfg(feature = "s3")]
+    fn behind_unfiltered_owner(
+        s3: &crate::doc_store_fallback_tests::FakeS3,
+        state: &AppState,
+        seg_paths: &[PathBuf],
+        footers: &HashMap<PathBuf, &kosha_core::Footer>,
+        waiter: impl FnOnce() -> HydrationOutcome + Send,
+    ) -> HydrationOutcome {
+        let (owned, waiting) = partition_for_hydration(
+            &state.in_flight_segments,
+            seg_paths,
+            HYDRATE_OWNER_SCORING,
+            |_| false,
+        );
+        assert_eq!((owned.len(), waiting.len()), (seg_paths.len(), 0));
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(waiter);
+            for (_, entry) in &owned {
+                wait_for_holders(entry, 3);
+            }
+            for p in seg_paths {
+                let rel = p.strip_prefix(&state.data_dir).unwrap();
+                fs::create_dir_all(p).unwrap();
+                for f in ["footer.json", "inverted.idx", "doc_store.offsets"] {
+                    fs::copy(s3.root.join(rel).join(f), p.join(f)).unwrap();
+                }
+                assert!(AppState::scoring_complete(
+                    p,
+                    None,
+                    false,
+                    &[],
+                    footers.get(p).copied()
+                ));
+            }
+            complete_owned(&state.in_flight_segments, &owned, 0);
+            waiter.join().unwrap()
+        })
+    }
+
+    /// Finding 28, filter shape: a filtered search waiting behind an
+    /// unfiltered owner finds `filters.toc` and its column absent (the
+    /// owner never fetches filter files). Before the fix it reported every
+    /// segment missing; now it fetches the filter files itself.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn filtered_waiter_behind_unfiltered_owner_fetches_its_filter_files() {
+        // Columnar-filter segments (#244), as staging writes them.
+        let (s3, state, manifest, seg_paths) = single_flight_node(
+            "singleflight-filters",
+            |w| w.with_filters_write_version(2),
+            |i| {
+                vec![
+                    Field::text("text", format!("contract clause {i}")),
+                    Field::keyword("matterId", format!("m{}", i % 2)),
+                ]
+            },
+        );
+        let footers = footers_of(&manifest, &seg_paths);
+        let query: SearchQuery = serde_json::from_value(serde_json::json!({
+            "query_text": "contract",
+            "filter": {"term": {"matterId.keyword": "m1"}}
+        }))
+        .unwrap();
+        let fields = query_filter_fields(&query).expect("a filtered query reads filter files");
+        let filter_files: HashMap<PathBuf, Vec<String>> = seg_paths
+            .iter()
+            .map(|p| {
+                let files = segment_filter_files(footers.get(p).copied(), p, &fields);
+                assert_eq!(files.len(), 2, "filters.toc and the matterId column");
+                assert_eq!(files[0], kosha_core::FILTERS_TOC_FILE);
+                (p.clone(), files)
+            })
+            .collect();
+
+        let outcome = behind_unfiltered_owner(&s3, &state, &seg_paths, &footers, || {
+            state.ensure_scoring_files_local(
+                &seg_paths,
+                None,
+                &filter_files,
+                &footers,
+                &Arc::new(RequestHydration::new(u64::MAX)),
+                true,
+            )
+        });
+
+        assert!(
+            outcome.missing.is_empty(),
+            "the filtered search must fetch its filter files, not fail on: {:?}",
+            outcome.missing
+        );
+        for (p, files) in &filter_files {
+            for f in files {
+                assert!(file_present_nonempty(&p.join(f)), "{f} of {}", p.display());
+            }
+        }
+    }
+
+    /// Finding 28 as it happened on run9's ld9nd: an unfiltered keyword
+    /// search (rid ev95429290-14094) owned the 12 scoring segments and
+    /// fetched no vector files; two unfiltered kNN searches waiting on it
+    /// (-14099, -14105) then found the kNN column's files absent and 503'd
+    /// 0.3 s after the owner finished, without a fetch of their own. Now the
+    /// kNN waiter fetches its column files itself, in both posting read
+    /// modes (ranged: `vector.offsets`; whole: also `vector.idx`).
+    #[cfg(feature = "s3")]
+    #[test]
+    fn knn_waiter_behind_keyword_owner_fetches_its_vector_files() {
+        for mode in [doc_spans::ReadMode::Ranged, doc_spans::ReadMode::Whole] {
+            let (s3, mut state, manifest, seg_paths) = single_flight_node(
+                "singleflight-knn",
+                |w| w.with_vector_store_mode(kosha_segment::VectorStoreMode::Sidecar),
+                |i| {
+                    vec![
+                        Field::text("text", format!("contract clause {i}")),
+                        Field::vector("emb", vec![1.0, i as f32, 0.5, 0.0]),
+                    ]
+                },
+            );
+            state.posting_read_mode = mode;
+            let ranged = mode == doc_spans::ReadMode::Ranged;
+            let footers = footers_of(&manifest, &seg_paths);
+            for p in &seg_paths {
+                assert!(
+                    !kosha_segment::knn_vector_columns(footers.get(p).copied(), "emb").is_empty(),
+                    "segments carry an 'emb' column"
+                );
+            }
+
+            let outcome = behind_unfiltered_owner(&s3, &state, &seg_paths, &footers, || {
+                state.ensure_scoring_files_local(
+                    &seg_paths,
+                    Some("emb"),
+                    &HashMap::new(),
+                    &footers,
+                    &Arc::new(RequestHydration::new(u64::MAX)),
+                    true,
+                )
+            });
+
+            assert!(
+                outcome.missing.is_empty(),
+                "{mode:?}: the kNN search must fetch its vector files, not fail on: {:?}",
+                outcome.missing
+            );
+            for p in &seg_paths {
+                let footer = footers.get(p).copied();
+                for column in kosha_segment::knn_vector_columns(footer, "emb") {
+                    let local = |f: &str| file_present_nonempty(&p.join(f));
+                    assert!(
+                        column.offsets_file.as_deref().is_some_and(local)
+                            || local(&column.idx_file),
+                        "{mode:?}: a vector file of 'emb' in {}",
+                        p.display()
+                    );
+                }
+                assert!(AppState::scoring_complete(
+                    p,
+                    Some("emb"),
+                    ranged,
+                    &[],
+                    footer
+                ));
+            }
+        }
+    }
+
+    /// Finding 32: a kNN search whose `vector.idx` posting ranges are shed
+    /// (here: they would take the request over its byte ceiling) finds
+    /// those postings not local, and the segment reports degraded. The
+    /// answer must be the shed's 429, never a 200 with
+    /// `knn_degraded_segments > 0`. `hydrate_vector_postings` does not read
+    /// its `FileSpanOutcome::shed`: the ranged read marks the request
+    /// itself shed, and the handler turns "shed + degraded" into the 429
+    /// (`knn_shed_response`). This pins that chain end to end, including
+    /// that a shed range is not fetched by some other route.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn knn_search_whose_vector_posting_ranges_are_shed_is_a_429() {
+        const NS: &str = "vector-shed";
+        let node = || {
+            let (s3, mut state, manifest, _) = single_flight_node(
+                NS,
+                |w| w.with_vector_store_mode(kosha_segment::VectorStoreMode::Sidecar),
+                |i| {
+                    vec![
+                        Field::text("text", format!("contract clause {i}")),
+                        Field::vector("emb", vec![1.0, i as f32, 0.5, 0.0]),
+                    ]
+                },
+            );
+            state.posting_read_mode = doc_spans::ReadMode::Ranged;
+            (s3, state, manifest)
+        };
+        let query = serde_json::json!({
+            "query_text": "",
+            "max_results": 3,
+            "knn": {"field": "emb", "vector": [1.0, 0.0, 0.5, 0.0], "k": 3, "num_candidates": 100},
+        });
+        let search = |state: &AppState| {
+            let mut body = query.clone();
+            body["namespace"] = NS.into();
+            let resp = handle_search_post(body.to_string().as_bytes(), state);
+            let json: serde_json::Value =
+                serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..])
+                    .unwrap_or_default();
+            (status_of(&resp), json)
+        };
+        let vector_gets = |s3: &crate::doc_store_fallback_tests::FakeS3| {
+            s3.gets
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|k| k.ends_with("vector.idx"))
+                .count()
+        };
+
+        // Control: with room for everything, the cold kNN search reads its
+        // postings by range from `vector.idx` and answers in full.
+        let (s3, state, _) = node();
+        let (status, full) = search(&state);
+        assert_eq!(status, 200, "{full}");
+        assert_eq!(full["knn_degraded_segments"], 0, "{full}");
+        assert!(!full["results"].as_array().unwrap().is_empty(), "{full}");
+        assert!(vector_gets(&s3) > 0, "the postings are read by range");
+
+        // A pod whose scoring set is local but whose postings are not.
+        // Then a ceiling no posting range fits under.
+        let (s3, mut state, manifest) = node();
+        let scoring = state.hydrate_segments_for_search(
+            &NamespaceId(NS.into()),
+            &manifest,
+            &serde_json::from_value(query.clone()).unwrap(),
+            &Arc::new(RequestHydration::new(u64::MAX)),
+            None,
+        );
+        assert!(scoring.missing.is_empty() && !scoring.shed);
+        assert_eq!(vector_gets(&s3), 0, "scoring hydration reads no posting");
+        state.hydrate_request_max_bytes = 1;
+        let (status, body) = search(&state);
+        assert_eq!(
+            status, 429,
+            "a shed kNN must be a 429, not a partial answer: {body}"
+        );
+        assert_eq!(body["reason"], "search_hydration_limit", "{body}");
+        assert_eq!(vector_gets(&s3), 0, "a shed range is never fetched");
     }
 
     // ── bloom_pruned: a filtered query's hydration success must not be
@@ -16894,6 +19575,7 @@ mod tests {
             &manifest,
             &base_query,
             &RequestHydration::unlimited(),
+            None,
         );
         assert!(
             !unfiltered.bloom_pruned,
@@ -16910,6 +19592,7 @@ mod tests {
             &manifest,
             &filtered_query,
             &RequestHydration::unlimited(),
+            None,
         );
         assert!(
             filtered.bloom_pruned,
@@ -17243,6 +19926,7 @@ mod tests {
             &manifest,
             &warmup_like,
             &RequestHydration::unlimited(),
+            None,
         );
         assert!(outcome.missing.is_empty() && !outcome.bloom_pruned);
         state
@@ -17316,6 +20000,7 @@ mod tests {
             &manifest,
             &sorted_unfiltered,
             &RequestHydration::unlimited(),
+            None,
         );
         assert!(
             outcome3.missing.is_empty() && !outcome3.bloom_pruned,
@@ -17365,6 +20050,7 @@ mod tests {
                     let (owned, waiting) = partition_for_hydration(
                         &in_flight,
                         std::slice::from_ref(&seg_path),
+                        HYDRATE_OWNER_SCORING,
                         |_| false,
                     );
                     if !owned.is_empty() {
@@ -17372,7 +20058,7 @@ mod tests {
                         // The fetch "failed": nothing marks the segment
                         // complete, but completion must still be signalled
                         // so waiters don't hang forever.
-                        complete_owned(&in_flight, &owned);
+                        complete_owned(&in_flight, &owned, 0);
                     } else {
                         wait_for(&waiting);
                         // A waiter must be released promptly (this test
@@ -17406,7 +20092,7 @@ mod tests {
         std::thread::scope(|scope| {
             for _ in 0..6 {
                 scope.spawn(|| {
-                    let _permit = sem.acquire();
+                    let _permit = sem.acquire("test");
                     let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
                     max_seen.fetch_max(cur, Ordering::SeqCst);
                     std::thread::sleep(Duration::from_millis(20));
@@ -17499,6 +20185,62 @@ mod tests {
             ),
         );
         assert_eq!(response.status(), 400);
+    }
+
+    /// The peer-poll `404 not cached here` is expected protocol and leaves
+    /// no log line; any other failure is exactly one line carrying the
+    /// error message (the handler no longer logs it a second time).
+    #[test]
+    fn request_log_skips_peer_poll_404_and_logs_failures_once_with_message() {
+        let started = Instant::now();
+        let not_cached =
+            http::Response::from_raw(api_error::api_error_status(404, "not cached here"));
+        assert!(request_log_line(
+            "GET /internal/segment/ns/seg/missing.bin HTTP/1.1",
+            "service",
+            0,
+            &not_cached,
+            started
+        )
+        .is_none());
+
+        let missing = http::Response::from_raw(api_error::api_error_status(
+            404,
+            "namespace not found: acme/x",
+        ));
+        let Some(RequestLog::Failed(line)) = request_log_line(
+            "POST /v1/namespaces/acme%2Fx/query HTTP/1.1",
+            "acme",
+            12,
+            &missing,
+            started,
+        ) else {
+            panic!("a failed request is logged as a failure");
+        };
+        assert!(
+            line.starts_with("WARN: request failed: status=404"),
+            "{line}"
+        );
+        assert!(
+            line.contains(r#"error="namespace not found: acme/x""#),
+            "{line}"
+        );
+        assert!(line.contains("tenant=acme"), "{line}");
+
+        let shed = http::Response::from_raw(overload_shed_response(
+            "search_queue_full",
+            "search overloaded: scoring queue is saturated — retry with backoff",
+        ));
+        let Some(RequestLog::Failed(line)) =
+            request_log_line("POST /search HTTP/1.1", "acme", 0, &shed, started)
+        else {
+            panic!("a shed is logged as a failure");
+        };
+        assert!(line.contains("reason=search_queue_full"), "{line}");
+        assert!(line.contains("retry_after_ms="), "{line}");
+
+        let ok = http::Response::from_raw(json_ok(&serde_json::json!({"hits": []})));
+        assert!(request_log_line("POST /search HTTP/1.1", "acme", 0, &ok, started).is_none());
     }
 
     /// Parse a raw request (request line, headers, blank line, body) into
@@ -19337,6 +22079,84 @@ mod tests {
         dir
     }
 
+    /// A term is confirmed present as soon as its span write is queued; a
+    /// write that then fails moves the presence generation, so that
+    /// confirmation (stamped before the fetch) is no longer trusted and the
+    /// next query re-checks the disk instead of scoring a missing span.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn a_failed_span_write_invalidates_posting_presence() {
+        let state = test_state();
+        let seg = state.data_dir.join("ns/seg");
+        fs::create_dir_all(&seg).unwrap();
+        let generation = state.presence_generation();
+        assert!(state
+            .span_writes
+            .persist(&seg, "ns/seg", "postings-01.bin", 0, vec![1; 10])
+            .is_none());
+        let confirmed = vec![("ns/seg".to_string(), "w1".to_string())];
+        {
+            let mut cache = state.posting_blob_presence.lock().unwrap();
+            posting_blob_cache_insert(&mut cache, "ns", 1, generation, confirmed);
+            let current = state.presence_generation();
+            assert!(!posting_blob_cache_lookup(&cache, "ns", 1, current).is_empty());
+        }
+        // The segment goes away before the writer runs: the write fails.
+        fs::remove_dir_all(&seg).unwrap();
+        state.span_writes.drain(&state.cache);
+        assert_eq!(state.span_writes.failures(), 1);
+        let cache = state.posting_blob_presence.lock().unwrap();
+        let current = state.presence_generation();
+        assert_ne!(current, generation);
+        assert!(posting_blob_cache_lookup(&cache, "ns", 1, current).is_empty());
+    }
+
+    /// Readiness waits for the warm-up's writes to reach disk: the pod is
+    /// not ready while the flush runs, and is once it returns, also when
+    /// it fails (fail-open, like the warm-up).
+    #[test]
+    fn readiness_waits_for_the_warmup_flush() {
+        for fails in [false, true] {
+            let state = test_state();
+            state
+                .warmup_complete
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            let ready = Arc::clone(&state.warmup_complete);
+            let flushed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let saw = Arc::clone(&flushed);
+            state.finish_warmup(Instant::now(), Duration::from_secs(60), move || {
+                assert!(
+                    !ready.load(std::sync::atomic::Ordering::SeqCst),
+                    "ready before the warm-up flush ran"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+                saw.store(true, std::sync::atomic::Ordering::SeqCst);
+                if fails {
+                    Err(std::io::Error::other("injected"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(
+                flushed.load(std::sync::atomic::Ordering::SeqCst),
+                "waited for it"
+            );
+            assert!(state.is_ready());
+        }
+        // A flush that overruns its timeout: ready at the timeout.
+        let state = test_state();
+        state
+            .warmup_complete
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let t = Instant::now();
+        state.finish_warmup(Instant::now(), Duration::from_millis(100), || {
+            std::thread::sleep(Duration::from_secs(5));
+            Ok(())
+        });
+        assert!(state.is_ready());
+        assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
+    }
+
     // ─── Multi-field highlighting (#195) ─────────────────────────────────
 
     fn highlight_state(ns: &str) -> AppState {
@@ -20251,17 +23071,35 @@ mod tests {
     }
 
     impl warm_run::WarmStorage for MirrorStorage {
-        fn class_sizes(
-            &self,
-            ns: &NamespaceId,
-        ) -> Result<HashMap<(String, warm::FileClass), u64>, String> {
-            Ok(warm_run::local_class_sizes(&self.remote.join(&ns.0)))
+        fn list_objects(&self, ns: &NamespaceId) -> Result<Vec<(String, u64)>, String> {
+            Ok(warm_run::local_objects(&self.remote.join(&ns.0)))
+        }
+
+        fn fetch_footers(&self, ns: &NamespaceId, manifest: &kosha_core::Manifest) -> (u64, u64) {
+            let mut o = (0, 0);
+            for entry in &manifest.segments {
+                let seg = &entry.segment_id.0;
+                let to = self.local.join(&ns.0).join(seg);
+                if manifest.segment_footer(&entry.segment_id).is_some()
+                    || to.join("footer.json").exists()
+                {
+                    continue;
+                }
+                fs::create_dir_all(&to).unwrap();
+                o.1 += fs::copy(
+                    self.remote.join(&ns.0).join(seg).join("footer.json"),
+                    to.join("footer.json"),
+                )
+                .unwrap();
+                o.0 += 1;
+            }
+            o
         }
 
         fn warm_batch(
             &self,
             ns: &NamespaceId,
-            _manifest: &kosha_core::Manifest,
+            manifest: &kosha_core::Manifest,
             class: warm::FileClass,
             segments: &[String],
         ) -> warm_run::BatchOutcome {
@@ -20276,7 +23114,11 @@ mod tests {
                     // scaffolding so the segment opens.
                     let c = warm::FileClass::of_file(&name).unwrap_or(warm::FileClass::Scoring);
                     let dest = to.join(&name);
-                    if c != class || !f.path().is_file() || dest.exists() {
+                    if c != class
+                        || !f.path().is_file()
+                        || dest.exists()
+                        || !warm_run::warm_fetches(manifest, seg, &name)
+                    {
                         continue;
                     }
                     o.bytes += fs::copy(f.path(), &dest).unwrap();
@@ -20419,15 +23261,19 @@ mod tests {
                 .manifest(&ns)
                 .map(|m| m.version)
         );
-        // ...and every file of the merged segment is local.
+        // ...and every file of the merged segment that warm-up downloads
+        // is local; the filter files the unfiltered probe never fetches
+        // (`warm_run::warm_fetches`) are left to the first filtered search.
+        let installed = query.indexer.manifest_shared(&ns).unwrap();
         for f in fs::read_dir(ingest.data_dir.join(&ns.0).join(&merged[0]))
             .unwrap()
             .flatten()
         {
-            assert!(
-                merged_dir.join(f.file_name()).is_file(),
-                "{:?} not warmed",
-                f.file_name()
+            let name = f.file_name().to_string_lossy().into_owned();
+            assert_eq!(
+                merged_dir.join(&name).is_file(),
+                warm_run::warm_fetches(&installed, &merged[0], &name),
+                "{name}"
             );
         }
         // The idle namespace's new segment stays cold until queried.
@@ -20560,7 +23406,12 @@ mod tests {
         let shared = shared_store();
         let ingest = warm_ingest(&shared, &["big"]);
         let ns = seed_segments(&ingest, "big", 3);
-        let sizes = warm_run::local_class_sizes(&ingest.data_dir.join(&ns.0));
+        // The bytes warm-up downloads (`warm_run::warm_fetches`).
+        let stored = shared.inner.lock().unwrap().manifest(&ns).unwrap().clone();
+        let sizes = warm_run::warm_class_sizes(
+            warm_run::local_objects(&ingest.data_dir.join(&ns.0)),
+            &stored,
+        );
         let scoring: u64 = sizes
             .iter()
             .filter(|((_, c), _)| *c == warm::FileClass::Scoring)
@@ -20632,6 +23483,108 @@ mod tests {
         assert_eq!(rewarm.warmed_items, 0);
         assert!(rewarm.skipped_items > 0);
         assert_eq!(pod.warmup_status_json()["rewarms"][0]["warmed_items"], 0);
+    }
+
+    /// Finding 26: a boot pass plans its budget from the files it
+    /// downloads. A query pod's manifest arrives without footers (#241), so
+    /// the plan used to count every f32 `doc_vectors.bin` (never fetched,
+    /// #454) and every `filters.bin` (the unfiltered scaffolding probe never
+    /// fetches it) and skipped segments the budget had room for. Quantized
+    /// and legacy segments still need their sidecar whole: counted and
+    /// fetched.
+    #[test]
+    fn boot_plan_counts_only_the_files_warmup_fetches() {
+        use kosha_core::VectorQuantization::{F32, I8};
+        let shared = shared_store();
+        let ingest = warm_ingest(&shared, &["vec"]);
+        let ns = seed_segments(&ingest, "vec", 4);
+        let segments = stored_segments(&shared, &ns);
+        let remote = ingest.data_dir.join(&ns.0);
+        // Each published segment rewritten with a sidecar vector column:
+        // two f32, one i8 and one legacy (a footer listing no columns).
+        for (i, seg) in segments.iter().enumerate() {
+            let dir = remote.join(seg);
+            fs::remove_dir_all(&dir).unwrap();
+            let mut w =
+                kosha_segment::SegmentWriter::new(kosha_core::SegmentId(seg.clone()), dir.clone())
+                    .with_vector_store_mode(kosha_segment::VectorStoreMode::Sidecar)
+                    .with_vector_quantization(kosha_segment::VectorQuantizationConfig::all(
+                        if i == 2 { I8 } else { F32 },
+                    ));
+            for d in 0..64 {
+                w.add_document(
+                    DocumentId(format!("d{d}")),
+                    vec![
+                        Field::text("title", format!("segment {i} doc {d}")),
+                        Field::keyword("matter_id", format!("m{}", d % 4)),
+                        Field::vector("emb", (0..32).map(|k| (d * 32 + k) as f32).collect()),
+                    ],
+                );
+            }
+            w.finalize(Default::default()).unwrap();
+            if i == 3 {
+                let path = dir.join("footer.json");
+                let mut footer: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                footer["vector_fields"] = serde_json::Value::Null;
+                fs::write(&path, serde_json::to_vec(&footer).unwrap()).unwrap();
+            }
+        }
+        // A query pod reads the manifest from Postgres, which stores no
+        // footers (#241, `skip_serializing`): nor does this shared store.
+        shared
+            .inner
+            .lock()
+            .unwrap()
+            .manifest_mut(&ns)
+            .unwrap()
+            .segment_footers
+            .clear();
+        let objects = warm_run::local_objects(&remote);
+        let size = |seg: &str, file: &str| {
+            objects
+                .iter()
+                .find(|(rel, _)| *rel == format!("{seg}/{file}"))
+                .map(|(_, b)| *b)
+                .unwrap_or_else(|| panic!("{seg}/{file} not written"))
+        };
+        let listed: u64 = warm_run::group_class_sizes(objects.clone()).values().sum();
+        let not_fetched: u64 = size(&segments[0], kosha_segment::DOC_VECTORS_FILE)
+            + size(&segments[1], kosha_segment::DOC_VECTORS_FILE)
+            + segments
+                .iter()
+                .map(|s| size(s, kosha_core::FILTERS_BIN_FILE))
+                .sum::<u64>();
+        let fetched = listed - not_fetched;
+
+        // A budget that holds exactly the files warm-up downloads.
+        let mut pod = warm_query_replica(&shared);
+        pod.warmup_namespaces = vec![ns.0.clone()];
+        pod.warming = warm_run::Warming::new(
+            warm::WarmConfig {
+                budget_bytes: Some(fetched),
+                ..Default::default()
+            },
+            warm::AccessConfig::default(),
+        );
+        let storage = MirrorStorage::new(&ingest.data_dir, &pod.data_dir, &scratch_dir("wf"));
+        let report = pod.run_boot_warmup(&storage);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.skipped_items, 0, "{:?}", report.skipped);
+        assert_eq!(report.warmed_items, 4 * 4, "every class of every segment");
+        assert_eq!(report.warmed_bytes, fetched, "planned");
+        assert_eq!(report.fetched_bytes, fetched, "planned == fetched");
+        for (i, seg) in segments.iter().enumerate() {
+            let dir = pod.data_dir.join(&ns.0).join(seg);
+            assert!(dir.join(kosha_segment::DOC_STORE_FILE).is_file(), "{seg}");
+            assert_eq!(
+                dir.join(kosha_segment::DOC_VECTORS_FILE).is_file(),
+                i >= 2,
+                "{seg}: doc_vectors.bin only for the quantized and legacy segments"
+            );
+            assert!(!dir.join(kosha_core::FILTERS_BIN_FILE).exists(), "{seg}");
+        }
     }
 
     #[test]

@@ -104,7 +104,7 @@ impl LocalWalStore {
 
 impl WalStore for LocalWalStore {
     fn append_batch(&self, first_lsn: u64, bytes: &[u8]) -> Result<(), KoshaError> {
-        std::fs::create_dir_all(&self.dir).ok();
+        kosha_core::create_dir_named(&self.dir)?;
         durable_write(&self.path(first_lsn), bytes)
     }
 
@@ -294,8 +294,12 @@ fn live_discards(
         .collect()
 }
 
-/// Failed puts remembered for `next_key`; older ones are forgotten, which
-/// can only turn a later self-conflict into a (safe) fence.
+/// Failed puts remembered for `next_key`. Once this many are remembered
+/// the writer sends no further put to that key until a read of it answers
+/// (see `WalWriter::persist_conditional`), so an attempt that landed is
+/// never forgotten while the store is unreachable (#368). One is forgotten
+/// only after the store answered that the key is still absent, which can
+/// only turn a later self-conflict into a (safe) fence.
 const MAX_AMBIGUOUS_PUTS: usize = 8;
 
 /// Write-Ahead Log for durability of buffered documents. Thread-safe:
@@ -803,6 +807,7 @@ impl WalWriter {
                 state.fenced.get_or_insert(reason.clone());
                 Some(fenced_error(&reason))
             }
+            Err(GroupFailure::Unsent(error)) => Some(error),
             Err(GroupFailure::Failed(error)) => {
                 if conditional && outcome.key == state.next_key {
                     if state.ambiguous.len() == MAX_AMBIGUOUS_PUTS {
@@ -839,6 +844,14 @@ impl WalWriter {
     /// - nothing, or unreadable: the outcome is unknown (an earlier put may
     ///   still be in flight). The group fails and the key is retried.
     /// - anything else: another writer owns the key; fence this one.
+    ///
+    /// With [`MAX_AMBIGUOUS_PUTS`] failed attempts remembered for `key`,
+    /// the key is read before anything is sent (#368). Remembering one more
+    /// attempt would forget the oldest, and if that one had landed, the
+    /// conflict it causes later would look like another writer and fence
+    /// this one for good. So an existing object is resolved as above
+    /// without a put, and a failed read fails the group without a put:
+    /// nothing new can land, so nothing has to be remembered or forgotten.
     fn persist_conditional(
         &self,
         key: u64,
@@ -850,18 +863,55 @@ impl WalWriter {
             adopted,
             result,
         };
-        let error = match self.store.append_batch(key, bytes) {
-            Ok(()) => return outcome(key, None, Ok(())),
-            Err(error) if is_conflict(&error) => error,
-            Err(error) => return outcome(key, None, Err(GroupFailure::Failed(error))),
+        let found = if ambiguous.len() >= MAX_AMBIGUOUS_PUTS {
+            match self.read_conflicting(key) {
+                Ok(found) => found,
+                Err(error) => {
+                    let kind = match &error {
+                        KoshaError::Io(io) => io.kind(),
+                        _ => std::io::ErrorKind::Other,
+                    };
+                    let error = std::io::Error::new(
+                        kind,
+                        format!(
+                            "WAL key {key} has {} earlier puts with an unknown outcome and \
+                             cannot be read back yet; not sending another ({error})",
+                            ambiguous.len()
+                        ),
+                    );
+                    return outcome(key, None, Err(GroupFailure::Unsent(error.into())));
+                }
+            }
+        } else {
+            None
         };
-        let stored = match self.read_conflicting(key) {
-            Ok(Some(stored)) => stored,
-            Ok(None) | Err(_) => return outcome(key, None, Err(GroupFailure::Failed(error))),
+        let (stored, error) = match found {
+            // Not sent: the key is taken, by this writer or by another.
+            Some(stored) => {
+                let error = std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("WAL key {key} already holds an object; this group was not sent"),
+                );
+                (stored, KoshaError::from(error))
+            }
+            None => {
+                let error = match self.store.append_batch(key, bytes) {
+                    Ok(()) => return outcome(key, None, Ok(())),
+                    Err(error) if is_conflict(&error) => error,
+                    Err(error) => return outcome(key, None, Err(GroupFailure::Failed(error))),
+                };
+                let stored = match self.read_conflicting(key) {
+                    Ok(Some(stored)) => stored,
+                    Ok(None) | Err(_) => {
+                        return outcome(key, None, Err(GroupFailure::Failed(error)))
+                    }
+                };
+                if stored == bytes {
+                    return outcome(key, None, Ok(()));
+                }
+                (stored, error)
+            }
         };
-        if stored == bytes {
-            return outcome(key, None, Ok(()));
-        }
         let decoded = Some(stored)
             .filter(|stored| ambiguous.iter().any(|attempt| **attempt == *stored))
             .and_then(|stored| decode_frames(&stored, key).ok())
@@ -954,6 +1004,9 @@ enum GroupFailure {
     Lost(KoshaError),
     /// The put failed (or its outcome is unknown); the key is retried.
     Failed(KoshaError),
+    /// Nothing was sent, so there is no attempt to remember; the key is
+    /// retried.
+    Unsent(KoshaError),
 }
 
 fn is_conflict(error: &KoshaError) -> bool {
@@ -1726,6 +1779,25 @@ mod tests {
         fn write_meta(&self, name: &str, bytes: &[u8]) -> Result<(), KoshaError> {
             self.inner.write_meta(name, bytes)
         }
+    }
+
+    /// A WAL dir that cannot be created fails the append with the dir's
+    /// path, not with NotFound on a temp file inside it.
+    #[test]
+    fn append_names_a_wal_dir_it_cannot_create() {
+        let dir = temp_dir("not-a-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("file");
+        std::fs::write(&file, b"").unwrap();
+        let wal_dir = file.join("_wal");
+        let err = LocalWalStore::new(wal_dir.clone())
+            .append_batch(1, b"x")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!("cannot create {}", wal_dir.display())),
+            "{err}"
+        );
     }
 
     #[test]

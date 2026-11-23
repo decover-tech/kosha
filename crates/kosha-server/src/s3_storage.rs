@@ -19,8 +19,52 @@ use std::sync::Arc;
 
 use kosha_core::{KoshaError, LocalStorage, ObjectMeta, StorageBackend};
 
-use crate::hydration_budget::{HydrationBudget, RequestHydration};
+use crate::hydration_budget::{BudgetPermit, HydrationBudget, RequestHydration};
 use crate::segment_commit;
+
+/// Log an S3 SDK error's whole cause chain server-side, and return the
+/// short form for the error message.
+///
+/// The SDK's `Display` is only the outer layer ("dispatch failure",
+/// "service error"), which says nothing about the cause.
+/// [`aws_sdk_s3::error::DisplayErrorContext`] prints the chain, but that
+/// chain can carry the role ARN (account id), the bucket and S3 request
+/// ids. Error messages built here can reach a tenant's response body, so
+/// the chain goes only to the pod log, with the request id; the message
+/// keeps the short form. Error path only.
+pub(crate) fn log_s3_error<E: std::error::Error>(op: &str, target: &str, e: &E) -> String {
+    #[cfg(test)]
+    S3_ERRORS_LOGGED.with(|n| n.set(n.get() + 1));
+    eprintln!(
+        "WARN: S3 {op} {target} failed: {}{}",
+        aws_sdk_s3::error::DisplayErrorContext(e),
+        crate::request_id()
+    );
+    e.to_string()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Lines [`log_s3_error`] wrote on this thread, so a test can assert an
+    /// expected S3 answer is not logged.
+    pub(crate) static S3_ERRORS_LOGGED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`log_s3_error`] for `GetObject`, without the log line for a missing
+/// key: callers ask for objects that may legitimately be absent (a
+/// segment's commit marker, GC probes) and report that themselves.
+fn log_get_object_error<R>(
+    key: &str,
+    e: &aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::get_object::GetObjectError, R>,
+) -> String
+where
+    R: std::fmt::Debug,
+{
+    if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
+        return e.to_string();
+    }
+    log_s3_error("get_object", key, e)
+}
 
 /// Join a configured key prefix with a logical (unprefixed) path, the same
 /// way for every call site — `S3Storage::s3_key` and the concurrent fetch
@@ -1100,21 +1144,39 @@ impl S3Storage {
                 .key(&key)
                 .send()
                 .await
-                .map_err(|e| KoshaError::NotFound(format!("S3 get_object: {e}")))?;
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 get_object: {}",
+                        log_get_object_error(&key, &e)
+                    ))
+                })?;
 
             let bytes = resp
                 .body
                 .collect()
                 .await
-                .map_err(|e| KoshaError::NotFound(format!("S3 read body: {e}")))?
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 read body: {}",
+                        log_s3_error("read body", &key, &e)
+                    ))
+                })?
                 .into_bytes();
             Ok::<Vec<u8>, KoshaError>(bytes.to_vec())
         })?;
 
         if let Some(parent) = local_path.parent() {
-            std::fs::create_dir_all(parent).ok();
+            kosha_core::create_dir_named(parent)?;
         }
-        std::fs::write(local_path, &data).map_err(KoshaError::Io)?;
+        // Through a temp file and a rename: `read` serves whatever exists
+        // at `local_path`, so a write that failed part-way (`ENOSPC`) must
+        // never leave a truncated file there.
+        kosha_core::atomic_write(local_path, &data).inspect_err(|e| {
+            eprintln!(
+                "WARN: disk cache write {} failed: {e} (partial removed)",
+                local_path.display()
+            )
+        })?;
 
         Ok(data)
     }
@@ -1142,7 +1204,12 @@ impl S3Storage {
                 .prefix(&prefix)
                 .send()
                 .await
-                .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))?;
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 list_objects_v2: {}",
+                        log_s3_error("list_objects_v2", &prefix, &e)
+                    ))
+                })?;
 
             let mut out = Vec::new();
             for obj in resp.contents() {
@@ -1189,10 +1256,12 @@ impl S3Storage {
                 if let Some(token) = continuation.take() {
                     req = req.continuation_token(token);
                 }
-                let resp = req
-                    .send()
-                    .await
-                    .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))?;
+                let resp = req.send().await.map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 list_objects_v2: {}",
+                        log_s3_error("list_objects_v2", &prefix, &e)
+                    ))
+                })?;
                 for cp in resp.common_prefixes() {
                     if let Some(p) = cp.prefix() {
                         let child = p
@@ -1252,10 +1321,12 @@ impl S3Storage {
                 if let Some(token) = continuation.take() {
                     req = req.continuation_token(token);
                 }
-                let resp = req
-                    .send()
-                    .await
-                    .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))?;
+                let resp = req.send().await.map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 list_objects_v2: {}",
+                        log_s3_error("list_objects_v2", &prefix, &e)
+                    ))
+                })?;
                 for obj in resp.contents() {
                     if let Some(key) = obj.key() {
                         let relative = key.strip_prefix(&prefix).unwrap_or(key);
@@ -1290,10 +1361,12 @@ impl S3Storage {
                 if let Some(token) = continuation.take() {
                     req = req.continuation_token(token);
                 }
-                let resp = req
-                    .send()
-                    .await
-                    .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))?;
+                let resp = req.send().await.map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 list_objects_v2: {}",
+                        log_s3_error("list_objects_v2", &key_prefix, &e)
+                    ))
+                })?;
                 for obj in resp.contents() {
                     let Some(path) = obj.key().and_then(|k| logical_path_of_key(&root, k)) else {
                         continue;
@@ -1320,6 +1393,50 @@ impl S3Storage {
         })
     }
 
+    /// Visit what is under the logical directory `dir` one LIST page at a
+    /// time, so the caller never holds more than a page (about 1,000 keys)
+    /// however large the prefix is. Usage reconciliation (#348) sums a whole
+    /// bucket this way. `recursive` visits every object below `dir`;
+    /// otherwise only its immediate children: objects directly in it and one
+    /// [`Listed::Dir`] per child "directory". Metadata only: no object body
+    /// is read.
+    pub fn visit_listing(
+        &self,
+        dir: &str,
+        recursive: bool,
+        visit: &mut dyn FnMut(Listed<'_>),
+    ) -> Result<(), KoshaError> {
+        let mut key_prefix = self.s3_key(dir.trim_matches('/'));
+        // The trailing slash keeps a sibling (`acme/docs2`) out of a listing
+        // of `acme/docs`.
+        if !key_prefix.is_empty() && !key_prefix.ends_with('/') {
+            key_prefix.push('/');
+        }
+        visit_listing_pages(
+            &self.prefix,
+            |continuation| {
+                let mut req = self
+                    .client
+                    .list_objects_v2()
+                    .bucket(&self.bucket)
+                    .prefix(&key_prefix);
+                if !recursive {
+                    req = req.delimiter("/");
+                }
+                if let Some(token) = continuation {
+                    req = req.continuation_token(token);
+                }
+                self.rt.block_on(req.send()).map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 list_objects_v2: {}",
+                        log_s3_error("list_objects_v2", &key_prefix, &e)
+                    ))
+                })
+            },
+            visit,
+        )
+    }
+
     /// Delete one object from S3, surfacing failures (unlike the trait's
     /// `delete`, which predates GC and is best-effort remotely).
     pub fn delete_remote(&self, path: &str) -> Result<(), KoshaError> {
@@ -1334,7 +1451,12 @@ impl S3Storage {
                 .send()
                 .await
                 .map(|_| ())
-                .map_err(|e| KoshaError::NotFound(format!("S3 delete_object {key}: {e}")))
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 delete_object {key}: {}",
+                        log_s3_error("delete_object", &key, &e)
+                    ))
+                })
         })
     }
 
@@ -1363,10 +1485,12 @@ impl S3Storage {
                 if let Some(token) = continuation.take() {
                     req = req.continuation_token(token);
                 }
-                let resp = req
-                    .send()
-                    .await
-                    .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))?;
+                let resp = req.send().await.map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 list_objects_v2: {}",
+                        log_s3_error("list_objects_v2", &prefix, &e)
+                    ))
+                })?;
                 let objects = resp
                     .contents()
                     .iter()
@@ -1387,7 +1511,12 @@ impl S3Storage {
                         .delete(delete)
                         .send()
                         .await
-                        .map_err(|e| KoshaError::NotFound(format!("S3 delete_objects: {e}")))?;
+                        .map_err(|e| {
+                            KoshaError::NotFound(format!(
+                                "S3 delete_objects: {}",
+                                log_s3_error("delete_objects", &prefix, &e)
+                            ))
+                        })?;
                     if let Some(err) = out.errors().first() {
                         return Err(KoshaError::NotFound(format!(
                             "S3 delete_objects: {} of {count} objects failed, first {}: {}",
@@ -1478,12 +1607,22 @@ impl S3Storage {
                 .key(&key)
                 .send()
                 .await
-                .map_err(|e| KoshaError::NotFound(format!("S3 get_object {key}: {e}")))?;
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 get_object: {}",
+                        log_get_object_error(&key, &e)
+                    ))
+                })?;
             let bytes = resp
                 .body
                 .collect()
                 .await
-                .map_err(|e| KoshaError::NotFound(format!("S3 read body {key}: {e}")))?
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 read body: {}",
+                        log_s3_error("read body", &key, &e)
+                    ))
+                })?
                 .into_bytes();
             Ok(bytes.to_vec())
         })
@@ -1620,8 +1759,9 @@ pub struct FetchStats {
 }
 
 /// Fetch one logical path for [`S3Storage::read_many`]: serve from local
-/// disk if already present, otherwise GET from S3 (with bounded retry —
-/// see [`get_object_streamed_with_retry`]) and persist it there.
+/// disk if already present, otherwise download it from S3 (in ranged parts
+/// when it is large, each with bounded retry — see [`download_to`]) and
+/// persist it there.
 ///
 /// Returns [`FetchStats`], not the bytes — every caller of `read_many` only
 /// ever wants "is this file on disk now" plus rank-ordering timing, so a
@@ -1630,10 +1770,10 @@ pub struct FetchStats {
 /// going to read either.
 ///
 /// `budget`/`request` are the byte-level admission gate (see
-/// [`crate::hydration_budget`]): the object's size is learned from the GET
-/// response's `Content-Length` — no LIST round trip — then charged to the
-/// request and reserved against the process-wide in-flight cap before its
-/// body is streamed.
+/// [`crate::hydration_budget`]): the object's size is learned from the
+/// first GET response — no LIST round trip — then charged to the request,
+/// and each part reserves its own bytes against the process-wide in-flight
+/// cap while it streams.
 async fn fetch_one(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -1667,18 +1807,45 @@ async fn fetch_one(
         )));
     }
 
-    let s3_key = join_s3_key(prefix, path);
+    let source: Arc<dyn PartSource> = Arc::new(S3PartSource {
+        client: client.clone(),
+        bucket: bucket.to_string(),
+        key: join_s3_key(prefix, path),
+    });
+    download_to(
+        source,
+        path,
+        &local_path,
+        DOWNLOAD_PART_BYTES,
+        budget,
+        &request,
+    )
+    .await
+}
 
+/// Download one whole object from `source` to `local_path` (see
+/// [`download_parts`]) through a uniquely-named temp file that is renamed
+/// into place only once every byte landed.
+///
+/// Readers must never observe a created-but-unwritten or partially written
+/// file (concurrent searches read these paths the moment they exist), and a
+/// fetch cancelled or failed mid-write must leave nothing behind at the
+/// final path. Unique suffix so two racing fetches of the same file can't
+/// interleave writes into one temp file — both write complete files,
+/// renames are atomic, either winner is valid.
+async fn download_to(
+    source: Arc<dyn PartSource>,
+    path: &str,
+    local_path: &Path,
+    part_bytes: u64,
+    budget: Option<Arc<HydrationBudget>>,
+    request: &Arc<RequestHydration>,
+) -> Result<FetchStats, KoshaError> {
     if let Some(parent) = local_path.parent() {
-        tokio::fs::create_dir_all(parent).await.ok();
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| kosha_core::dir_error(parent, e))?;
     }
-    // Write to a uniquely-named temp file and atomically rename into place:
-    // readers must never observe a created-but-unwritten or partially
-    // written file (concurrent searches read these paths the moment they
-    // exist), and a fetch cancelled mid-write must leave nothing behind at
-    // the final path. Unique suffix so two racing fetches of the same file
-    // can't interleave writes into one temp file — both write complete
-    // files, renames are atomic, either winner is valid.
     static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tmp_path = local_path.with_extension(format!(
         "tmp.{}.{}",
@@ -1686,16 +1853,7 @@ async fn fetch_one(
         TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let t_transfer = std::time::Instant::now();
-    let streamed = get_object_streamed_with_retry(
-        client,
-        bucket,
-        &s3_key,
-        kosha_core::tenancy::tenant_of_file_key(path),
-        &tmp_path,
-        budget,
-        &request,
-    )
-    .await;
+    let streamed = download_parts(source, path, &tmp_path, part_bytes, budget, request).await;
     let transfer_ms = t_transfer.elapsed().as_secs_f64() * 1e3;
     let streamed = match streamed {
         Ok(s) => s,
@@ -1704,7 +1862,7 @@ async fn fetch_one(
             return Err(e);
         }
     };
-    if let Err(e) = tokio::fs::rename(&tmp_path, &local_path).await {
+    if let Err(e) = tokio::fs::rename(&tmp_path, local_path).await {
         let _ = tokio::fs::remove_file(&tmp_path).await;
         request.refund(streamed.bytes);
         return Err(KoshaError::Io(e));
@@ -1729,110 +1887,384 @@ struct StreamedFetch {
     write_ms: f64,
 }
 
-/// Stream a whole object to `tmp_path` with the same bounded retry as
-/// [`get_object_with_retry_ranged`], charging its size against the hydration
-/// budget once the response headers reveal it.
+/// Size of one ranged GET when a whole object is downloaded in parts. An
+/// object no larger than this is one GET, as before parts existed; a larger
+/// one costs `ceil(size / DOWNLOAD_PART_BYTES)` GETs — 64 per GiB, i.e.
+/// ~$0.000026 per GiB downloaded at S3 Standard's $0.0004 per 1,000 GETs
+/// (one 2.6 GB `doc_vectors.bin`: 156 GETs, ~$0.00006). 16 MiB keeps a part's first-byte
+/// latency (tens of ms) small next to its transfer (~0.4 s at the 41-50
+/// MB/s a single S3 stream measured on staging), and a part's hold on the
+/// in-flight budget well under a second.
+pub(crate) const DOWNLOAD_PART_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Parts of one object in flight at once. A single S3 stream measured
+/// 41-50 MB/s p50 on staging (4.8-97 range) while parallel ranged GETs
+/// reached 127-251 MB/s aggregate, so a multi-GB object fetched as one GET
+/// took 45-407 s. Eight parts at once is ~8x one stream's rate per object,
+/// at a heap cost of two write buffers per part (~16 MiB per object; see
+/// [`STREAM_WRITE_BUFFER`]). Bytes in flight stay bounded by the budget,
+/// which each part reserves separately.
+const DOWNLOAD_PART_PARALLELISM: usize = 8;
+
+/// One GET response, as [`download_parts`] needs it.
+struct PartResponse {
+    body: aws_sdk_s3::primitives::ByteStream,
+    /// Bytes this response carries (`Content-Length`).
+    len: u64,
+    /// The whole object's size: from `Content-Range`, or `len` when the
+    /// store answered with the whole object.
+    total: u64,
+    etag: Option<String>,
+}
+
+type PartFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<PartResponse, KoshaError>> + Send>>;
+
+/// Where [`download_parts`] GETs an object from: S3 in production, memory
+/// in tests.
+trait PartSource: Send + Sync {
+    /// GET bytes `start..end` (end exclusive) of the object, only if its
+    /// ETag is still `if_match` when one is given. A store may answer with
+    /// the whole object instead (no `Content-Range`); the caller checks.
+    fn get(&self, start: u64, end: u64, if_match: Option<String>) -> PartFuture;
+}
+
+/// [`PartSource`] over one S3 object.
+struct S3PartSource {
+    client: aws_sdk_s3::Client,
+    bucket: String,
+    key: String,
+}
+
+impl PartSource for S3PartSource {
+    fn get(&self, start: u64, end: u64, if_match: Option<String>) -> PartFuture {
+        let (client, bucket, key) = (self.client.clone(), self.bucket.clone(), self.key.clone());
+        Box::pin(async move {
+            let ranged = client
+                .get_object()
+                .bucket(&bucket)
+                .key(&key)
+                .range(format!("bytes={start}-{}", end.saturating_sub(1)))
+                .set_if_match(if_match)
+                .send()
+                .await;
+            let resp = match ranged {
+                Ok(resp) => resp,
+                // An empty object has no byte 0 to range over (416); ask
+                // for it whole, as every fetch did before parts.
+                Err(e)
+                    if start == 0 && e.raw_response().map(|r| r.status().as_u16()) == Some(416) =>
+                {
+                    client
+                        .get_object()
+                        .bucket(&bucket)
+                        .key(&key)
+                        .send()
+                        .await
+                        .map_err(|e| KoshaError::NotFound(format!("S3 get_object: {e}")))?
+                }
+                // The object no longer has the first part's ETag: it was
+                // replaced mid-download. Retrying cannot fix that.
+                Err(e) if e.raw_response().map(|r| r.status().as_u16()) == Some(412) => {
+                    return Err(KoshaError::CorruptSegment(format!(
+                        "S3 object {key} changed during a download in parts \
+                         (If-Match failed): {e}"
+                    )))
+                }
+                Err(e) => return Err(KoshaError::NotFound(format!("S3 get_object: {e}"))),
+            };
+            let len = resp.content_length().unwrap_or(0).max(0) as u64;
+            let total = resp
+                .content_range()
+                .and_then(content_range_total)
+                .unwrap_or(len);
+            Ok(PartResponse {
+                etag: resp.e_tag().map(str::to_string),
+                body: resp.body,
+                len,
+                total,
+            })
+        })
+    }
+}
+
+/// The object size of a `Content-Range: bytes <first>-<last>/<size>`
+/// header; `None` when absent or `*`.
+fn content_range_total(header: &str) -> Option<u64> {
+    header.rsplit_once('/')?.1.trim().parse().ok()
+}
+
+/// Download one whole object from `source` into `tmp_path` in ranged parts
+/// of `part_bytes`, [`DOWNLOAD_PART_PARALLELISM`] at a time, each holding
+/// only its own bytes of the in-flight `budget` while it streams.
 ///
-/// Retries cover the *whole* attempt (request + body). A body that fails
-/// mid-stream leaves a partial temp file, which the next attempt truncates
-/// via `File::create` — a half-written file must never be renamed into
-/// place, where every existence check in the hydration path would read it as
-/// complete.
-async fn get_object_streamed_with_retry(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-    key: &str,
-    tenant: &str,
+/// Why parts: as one GET, an object larger than the whole budget could only
+/// be admitted with nothing else in flight, then held the budget past
+/// capacity for its whole transfer — a 2 GB `doc_vectors.bin` at the
+/// staging single-stream rate shut every other fetch on the pod out for
+/// 45-407 s, and each one of them waited out its 30 s and shed its request.
+/// In parts, no reservation exceeds `part_bytes`, a waiting fetch is
+/// admitted as soon as any part finishes, and parallel parts download the
+/// object several times faster.
+///
+/// The first GET asks for the first part and learns the object's size from
+/// `Content-Range`; an object no larger than one part is therefore still
+/// exactly one GET. The whole size is charged to `request` up front, so a
+/// request ceiling still sheds before a byte is streamed. Later parts are
+/// conditional on the first part's ETag, so an object replaced mid-download
+/// fails the fetch at once (no retry) instead of splicing two versions.
+///
+/// A request fetch reserves its first part once the response reveals its
+/// size (as whole fetches always did); every later part, and every part of
+/// a background fetch, reserves *before* its GET is sent, so no S3 response
+/// sits open while it waits. Each part retries on its own (bounded, see
+/// [`retry_backoff_schedule`]); a part that fails for good fails the fetch
+/// and stops the others. A shed (`Overloaded`) is never retried.
+///
+/// Every part writes at its own offset of the temp file; the caller renames
+/// it into place only on success (see [`download_to`]).
+async fn download_parts(
+    source: Arc<dyn PartSource>,
+    path: &str,
     tmp_path: &Path,
+    part_bytes: u64,
     budget: Option<Arc<HydrationBudget>>,
     request: &Arc<RequestHydration>,
 ) -> Result<StreamedFetch, KoshaError> {
-    let mut backoffs = retry_backoff_schedule().into_iter();
-    let mut last_err = None;
-    for attempt in 1..=FETCH_MAX_ATTEMPTS {
-        let result: Result<StreamedFetch, KoshaError> = async {
-            let resp = client
-                .get_object()
-                .bucket(bucket)
-                .key(key)
-                .send()
-                .await
-                .map_err(|e| KoshaError::NotFound(format!("S3 get_object: {e}")))?;
-
-            // `Content-Length` is the size the scoring hydration path never
-            // knew up front (it skips the per-segment LIST on purpose), and
-            // it arrives with the response headers — before a single body
-            // byte is buffered. This is the hook the byte budget hangs off.
-            let projected = resp.content_length().unwrap_or(0).max(0) as u64;
-            if !request.charge(projected) {
-                return Err(KoshaError::Overloaded(format!(
-                    "hydration of {key} would put this request over its byte ceiling"
-                )));
+    let part_bytes = part_bytes.max(1);
+    let background = request.is_background();
+    // A background fetch reserves before even the first GET: its size is
+    // at most one part, and a yielding fetch must not hold a response open.
+    let mut first_permit = if background {
+        wait_for_budget(budget.as_ref(), request, "hydration of", path, part_bytes).await?
+    } else {
+        None
+    };
+    let first = get_part_with_retry(&*source, path, 0, part_bytes).await?;
+    let total = first.total;
+    if first.len > total || (first.len < total && first.len != part_bytes) {
+        return Err(KoshaError::NotFound(format!(
+            "GET of {path} returned {} of {total} bytes for its first {part_bytes}-byte part",
+            first.len
+        )));
+    }
+    if !request.charge(total) {
+        return Err(KoshaError::Overloaded(format!(
+            "hydration of {path} would put this request over its byte ceiling"
+        )));
+    }
+    let result = async {
+        if !background {
+            first_permit =
+                wait_for_budget(budget.as_ref(), request, "hydration of", path, first.len).await?;
+        }
+        let etag = first.etag.clone();
+        let part = |start: u64, end: u64, response: Option<PartResponse>, permit| Part {
+            source: Arc::clone(&source),
+            path: path.to_string(),
+            tmp_path: tmp_path.to_path_buf(),
+            start,
+            end,
+            etag: etag.clone(),
+            response,
+            permit,
+            budget: budget.clone(),
+            request: Arc::clone(request),
+        };
+        let first_len = first.len;
+        if first_len == total {
+            // One part: the whole object, streamed into a new file.
+            return part(0, total, Some(first), first_permit).fetch(true).await;
+        }
+        // Parts write at their own offsets of a file created up front.
+        tokio::fs::File::create(tmp_path)
+            .await
+            .map_err(KoshaError::Io)?;
+        let mut parts = tokio::task::JoinSet::new();
+        parts.spawn(part(0, first_len, Some(first), first_permit).fetch(false));
+        let mut next = first_len;
+        let (mut bytes, mut write_ms, mut count) = (0u64, 0.0f64, 0usize);
+        loop {
+            while parts.len() < DOWNLOAD_PART_PARALLELISM && next < total {
+                let end = next.saturating_add(part_bytes).min(total);
+                parts.spawn(part(next, end, None, None).fetch(false));
+                next = end;
             }
-            let _permit = match budget.as_ref() {
-                Some(budget) => {
-                    let t_wait = std::time::Instant::now();
-                    let permit = budget.acquire(tenant, projected);
-                    request.record_wait(t_wait.elapsed());
-                    match permit {
-                        Some(permit) => Some(permit),
-                        None => {
-                            request.refund(projected);
-                            request.mark_shed();
-                            return Err(KoshaError::Overloaded(format!(
-                                "hydration of {key} waited out the in-flight byte budget"
-                            )));
-                        }
-                    }
-                }
-                None => None,
+            let outcome = match parts.join_next().await {
+                None => break,
+                Some(Ok(outcome)) => outcome,
+                Some(Err(e)) => Err(KoshaError::NotFound(format!(
+                    "download part of {path} did not finish: {e}"
+                ))),
             };
-
-            let streamed = stream_body_to_file(resp.body, tmp_path).await;
-            match streamed {
-                Ok(streamed) => {
-                    // Charged from `Content-Length`; reconcile against what
-                    // actually landed so the request's running total stays
-                    // truthful even if a store under-reports.
-                    if streamed.bytes < projected {
-                        request.refund(projected - streamed.bytes);
-                    } else if streamed.bytes > projected {
-                        request.charge(streamed.bytes - projected);
-                    }
-                    Ok(streamed)
+            match outcome {
+                Ok(done) => {
+                    bytes += done.bytes;
+                    write_ms += done.write_ms;
+                    count += 1;
                 }
                 Err(e) => {
-                    request.refund(projected);
-                    Err(e)
+                    parts.shutdown().await;
+                    return Err(e);
                 }
             }
         }
-        .await;
+        if bytes != total {
+            return Err(KoshaError::NotFound(format!(
+                "download of {path} wrote {bytes} of {total} bytes"
+            )));
+        }
+        Ok(StreamedFetch {
+            bytes,
+            // Parts write concurrently: their summed write time over the
+            // parts in flight approximates its share of the wall clock.
+            write_ms: write_ms / count.clamp(1, DOWNLOAD_PART_PARALLELISM) as f64,
+        })
+    }
+    .await;
+    if result.is_err() {
+        request.refund(total);
+    }
+    result
+}
 
-        match result {
-            Ok(streamed) => return Ok(streamed),
-            Err(e) => {
-                // A shed is a deliberate decision, not a transient failure —
-                // retrying it would just burn the backoff schedule against a
-                // ceiling that has not moved.
-                if matches!(e, KoshaError::Overloaded(_)) {
-                    return Err(e);
-                }
-                if let Some(delay) = backoffs.next() {
+/// The first GET of [`download_parts`], with the same bounded retry as
+/// every fetch (see [`retry_backoff_schedule`]).
+async fn get_part_with_retry(
+    source: &dyn PartSource,
+    path: &str,
+    start: u64,
+    end: u64,
+) -> Result<PartResponse, KoshaError> {
+    let mut backoffs = retry_backoff_schedule().into_iter();
+    let mut attempt = 1;
+    loop {
+        match source.get(start, end, None).await {
+            Ok(resp) => return Ok(resp),
+            Err(e) => match backoffs.next() {
+                Some(delay) => {
                     eprintln!(
-                        "WARN: S3 get_object for {key} failed (attempt {attempt}/{FETCH_MAX_ATTEMPTS}): \
+                        "WARN: S3 get_object for {path} failed (attempt {attempt}/{FETCH_MAX_ATTEMPTS}): \
                          {e}; retrying in {delay:?}"
                     );
                     tokio::time::sleep(delay).await;
+                    attempt += 1;
                 }
-                last_err = Some(e);
+                None => return Err(e),
+            },
+        }
+    }
+}
+
+/// One part of a [`download_parts`] download: bytes `start..end` of the
+/// object into the same offsets of `tmp_path`.
+struct Part {
+    source: Arc<dyn PartSource>,
+    path: String,
+    tmp_path: PathBuf,
+    start: u64,
+    end: u64,
+    etag: Option<String>,
+    /// The first part's response, already received.
+    response: Option<PartResponse>,
+    /// Its budget reservation, when already held.
+    permit: Option<BudgetPermit>,
+    budget: Option<Arc<HydrationBudget>>,
+    request: Arc<RequestHydration>,
+}
+
+impl Part {
+    /// Stream this part into the temp file, which `create` makes (the
+    /// whole object is this one part) or which already exists. Retries a
+    /// failed GET or body (bounded); never a shed.
+    async fn fetch(mut self, create: bool) -> Result<StreamedFetch, KoshaError> {
+        let want = self.end - self.start;
+        let _permit = match self.permit.take() {
+            Some(permit) => Some(permit),
+            None => {
+                if self.request.is_shed() {
+                    return Err(KoshaError::Overloaded(format!(
+                        "hydration of {} skipped: request already shed",
+                        self.path
+                    )));
+                }
+                wait_for_budget(
+                    self.budget.as_ref(),
+                    &self.request,
+                    "hydration of",
+                    &self.path,
+                    want,
+                )
+                .await?
+            }
+        };
+        let mut backoffs = retry_backoff_schedule().into_iter();
+        let mut attempt = 1;
+        loop {
+            let result = async {
+                let resp = match self.response.take() {
+                    Some(resp) => resp,
+                    None => {
+                        self.source
+                            .get(self.start, self.end, self.etag.clone())
+                            .await?
+                    }
+                };
+                if resp.len != want {
+                    return Err(KoshaError::NotFound(format!(
+                        "GET of {} [{}, {}) returned {} bytes",
+                        self.path, self.start, self.end, resp.len
+                    )));
+                }
+                let file = if create {
+                    tokio::fs::File::create(&self.tmp_path).await
+                } else {
+                    open_at(&self.tmp_path, self.start).await
+                }
+                .map_err(KoshaError::Io)?;
+                let streamed = stream_body_into(resp.body, file, self.start).await?;
+                if streamed.bytes != want {
+                    return Err(KoshaError::NotFound(format!(
+                        "S3 read body: {} [{}, {}) ended after {} bytes",
+                        self.path, self.start, self.end, streamed.bytes
+                    )));
+                }
+                Ok(streamed)
+            }
+            .await;
+            match result {
+                Ok(streamed) => return Ok(streamed),
+                // A shed, or an object replaced mid-download: retrying
+                // cannot help.
+                Err(e @ (KoshaError::Overloaded(_) | KoshaError::CorruptSegment(_))) => {
+                    return Err(e)
+                }
+                Err(e) => match backoffs.next() {
+                    Some(delay) => {
+                        eprintln!(
+                            "WARN: S3 get_object for {} [{}, {}) failed (attempt \
+                             {attempt}/{FETCH_MAX_ATTEMPTS}): {e}; retrying in {delay:?}",
+                            self.path, self.start, self.end
+                        );
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                    }
+                    None => return Err(e),
+                },
             }
         }
     }
-    Err(last_err.expect("at least one attempt runs, so an exhausted loop always has an error"))
 }
 
-/// Write buffer for [`stream_body_to_file`]: large writes instead of one
+/// An existing file opened for writing at `offset`, without truncating it.
+async fn open_at(path: &Path, offset: u64) -> std::io::Result<tokio::fs::File> {
+    use tokio::io::AsyncSeekExt;
+    let mut file = tokio::fs::OpenOptions::new().write(true).open(path).await?;
+    file.seek(std::io::SeekFrom::Start(offset)).await?;
+    Ok(file)
+}
+
+/// Write buffer for [`stream_body_into`]: large writes instead of one
 /// blocking-pool round trip per network chunk, while keeping per-fetch
 /// memory bounded at hydration fan-out. Each fetch holds this buffer plus,
 /// at most, `tokio::fs::File`'s copy of the write in flight (also at most
@@ -1840,8 +2272,21 @@ async fn get_object_streamed_with_retry(
 /// for a single oversized chunk), so 64 fetches in flight cost ~128 MiB.
 const STREAM_WRITE_BUFFER: usize = 1 << 20;
 
-/// Write a GET response body to `tmp_path` chunk by chunk, returning what it
-/// cost.
+/// Write a GET response body to a new file at `tmp_path` chunk by chunk,
+/// returning what it cost. See [`stream_body_into`].
+#[cfg(test)]
+async fn stream_body_to_file(
+    body: aws_sdk_s3::primitives::ByteStream,
+    tmp_path: &Path,
+) -> Result<StreamedFetch, KoshaError> {
+    let file = tokio::fs::File::create(tmp_path)
+        .await
+        .map_err(KoshaError::Io)?;
+    stream_body_into(body, file, 0).await
+}
+
+/// Write a GET response body into `file` (at its current position) chunk
+/// by chunk, returning what it cost.
 ///
 /// The whole point is that the object is never resident in the process at
 /// once. The previous `body.collect()` → `tokio::fs::write(tmp, raw)` held
@@ -1859,18 +2304,16 @@ const STREAM_WRITE_BUFFER: usize = 1 << 20;
 /// bench VM wrote 1 GB vector-namespace files at 30-45 MB/s while the GET
 /// itself took ~1 s (`hydrate_files timing:` write_ms 23-35 s), which made
 /// a 249 GB warmup take ~2 h.
-async fn stream_body_to_file(
+async fn stream_body_into(
     mut body: aws_sdk_s3::primitives::ByteStream,
-    tmp_path: &Path,
+    file: tokio::fs::File,
+    offset: u64,
 ) -> Result<StreamedFetch, KoshaError> {
     use tokio::io::AsyncWriteExt;
 
-    let t_create = std::time::Instant::now();
-    let file = tokio::fs::File::create(tmp_path)
-        .await
-        .map_err(KoshaError::Io)?;
+    let t_start = std::time::Instant::now();
     let mut file = tokio::io::BufWriter::with_capacity(STREAM_WRITE_BUFFER, file);
-    let mut write_ms = t_create.elapsed().as_secs_f64() * 1e3;
+    let mut write_ms = t_start.elapsed().as_secs_f64() * 1e3;
     let mut bytes = 0u64;
 
     loop {
@@ -1896,7 +2339,83 @@ async fn stream_body_to_file(
     file.flush().await.map_err(KoshaError::Io)?;
     write_ms += t_flush.elapsed().as_secs_f64() * 1e3;
 
+    // Start writing the part to disk now rather than leaving it dirty
+    // until the kernel's background threshold (see `writeback`): a warm-up
+    // or a large hydration otherwise piles up gigabytes of dirty pages and
+    // the kernel then throttles every thread in the pod that writes.
+    // Handed to the writeback thread: the advice can sleep in the kernel,
+    // and this part's request must not wait on it.
+    if bytes > 0 {
+        let file = file.into_inner().into_std().await;
+        crate::writeback::start_in_background(file, offset, bytes);
+    }
+
     Ok(StreamedFetch { bytes, write_ms })
+}
+
+/// Reserve `bytes` of the process-wide in-flight budget for logical
+/// `path`, already charged to `request`: [`wait_for_budget`], refunding
+/// the charge when the reservation fails.
+async fn reserve_budget(
+    budget: Option<&Arc<HydrationBudget>>,
+    request: &RequestHydration,
+    what: &str,
+    path: &str,
+    bytes: u64,
+) -> Result<Option<BudgetPermit>, KoshaError> {
+    wait_for_budget(budget, request, what, path, bytes)
+        .await
+        .inspect_err(|_| request.refund(bytes))
+}
+
+/// Reserve `bytes` of the process-wide in-flight budget for logical
+/// `path` — as background work when `request` is
+/// [`RequestHydration::background`]. On an expired wait the request is
+/// shed and the first expiry per request logged with the budget's state
+/// and its oldest and largest holders. A request shed while this fetch
+/// waited gets its permit back and the fetch skipped. `None` budget:
+/// nothing to reserve. Charges are the caller's: nothing is refunded here.
+/// The error reads "`what` `path` waited out the in-flight byte budget".
+async fn wait_for_budget(
+    budget: Option<&Arc<HydrationBudget>>,
+    request: &RequestHydration,
+    what: &str,
+    path: &str,
+    bytes: u64,
+) -> Result<Option<BudgetPermit>, KoshaError> {
+    let Some(budget) = budget else {
+        return Ok(None);
+    };
+    let t_wait = std::time::Instant::now();
+    let permit = budget
+        .acquire_for(
+            kosha_core::tenancy::tenant_of_file_key(path),
+            path,
+            bytes,
+            request.is_background(),
+        )
+        .await;
+    let waited = t_wait.elapsed();
+    request.record_wait(waited);
+    match permit {
+        // Shed while it waited (another of its fetches expired or crossed
+        // the ceiling): the response will be a 429, so streaming this
+        // object would only take budget other requests are waiting on.
+        Ok(permit) if request.is_shed() => {
+            drop(permit);
+            Err(KoshaError::Overloaded(format!(
+                "{what} {path} skipped: request shed while waiting for in-flight budget"
+            )))
+        }
+        Ok(permit) => Ok(Some(permit)),
+        Err(expired) => {
+            request.mark_shed();
+            request.note_budget_expired(path, bytes, waited, &expired);
+            Err(KoshaError::Overloaded(format!(
+                "{what} {path} waited out the in-flight byte budget"
+            )))
+        }
+    }
 }
 
 /// Fetch one byte range for [`S3Storage::read_ranges`]: from the local file
@@ -1939,24 +2458,7 @@ async fn fetch_range_one(
             "ranged read of {path} would put this request over its byte ceiling"
         )));
     }
-    let _permit = match budget {
-        Some(budget) => {
-            let t_wait = std::time::Instant::now();
-            let permit = budget.acquire(kosha_core::tenancy::tenant_of_file_key(path), length);
-            request.record_wait(t_wait.elapsed());
-            match permit {
-                Some(permit) => Some(permit),
-                None => {
-                    request.refund(length);
-                    request.mark_shed();
-                    return Err(KoshaError::Overloaded(format!(
-                        "ranged read of {path} waited out the in-flight byte budget"
-                    )));
-                }
-            }
-        }
-        None => None,
-    };
+    let _permit = reserve_budget(budget.as_ref(), request, "ranged read of", path, length).await?;
 
     let s3_key = join_s3_key(prefix, path);
     let range = format!("bytes={}-{}", offset, offset + length - 1);
@@ -2008,7 +2510,12 @@ async fn put_bytes(
             .apply_sse(sse.as_ref())
             .send()
             .await
-            .map_err(|e| KoshaError::NotFound(format!("S3 create_multipart_upload: {e}")))?;
+            .map_err(|e| {
+                KoshaError::NotFound(format!(
+                    "S3 create_multipart_upload: {}",
+                    log_s3_error("create_multipart_upload", &key, &e)
+                ))
+            })?;
 
         let upload_id = mpu.upload_id().unwrap_or_default();
         let mut parts: Vec<aws_sdk_s3::types::CompletedPart> = Vec::new();
@@ -2031,7 +2538,12 @@ async fn put_bytes(
                 )))
                 .send()
                 .await
-                .map_err(|e| KoshaError::NotFound(format!("S3 upload_part: {e}")))?;
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 upload_part: {}",
+                        log_s3_error("upload_part", &key, &e)
+                    ))
+                })?;
 
             let etag = upload_part_res.e_tag().unwrap_or_default().to_string();
             parts.push(
@@ -2057,7 +2569,12 @@ async fn put_bytes(
             )
             .send()
             .await
-            .map_err(|e| KoshaError::NotFound(format!("S3 complete_multipart_upload: {e}")))?;
+            .map_err(|e| {
+                KoshaError::NotFound(format!(
+                    "S3 complete_multipart_upload: {}",
+                    log_s3_error("complete_multipart_upload", &key, &e)
+                ))
+            })?;
     } else {
         client
             .put_object()
@@ -2067,7 +2584,12 @@ async fn put_bytes(
             .body(aws_sdk_s3::primitives::ByteStream::from(data))
             .send()
             .await
-            .map_err(|e| KoshaError::NotFound(format!("S3 put_object: {e}")))?;
+            .map_err(|e| {
+                KoshaError::NotFound(format!(
+                    "S3 put_object: {}",
+                    log_s3_error("put_object", &key, &e)
+                ))
+            })?;
     }
     Ok::<_, KoshaError>(())
 }
@@ -2098,14 +2620,19 @@ impl StorageBackend for S3Storage {
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         let key = s3_key.clone();
+        // Best effort, as before: the local copy is gone and the caller
+        // proceeds; a remote leftover is segment GC's to collect. Logged so
+        // the leftover is explainable.
         self.rt.block_on(async move {
-            client
+            if let Err(e) = client
                 .delete_object()
                 .bucket(&bucket)
                 .key(&key)
                 .send()
                 .await
-                .ok();
+            {
+                log_s3_error("delete_object", &key, &e);
+            }
         });
         Ok(())
     }
@@ -2164,6 +2691,67 @@ impl StorageBackend for S3GcStore<'_> {
     }
 }
 
+/// One entry of [`S3Storage::visit_listing`]. Paths are logical (without
+/// the configured key prefix).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Listed<'a> {
+    Object {
+        path: &'a str,
+        size: u64,
+    },
+    /// A child "directory" of a non-recursive listing, without the
+    /// trailing slash.
+    Dir {
+        path: &'a str,
+    },
+}
+
+/// The page loop of [`S3Storage::visit_listing`]: call `fetch` with the
+/// previous page's continuation token until a page is not truncated,
+/// handing each page's entries to `visit` before fetching the next.
+fn visit_listing_pages(
+    root_prefix: &str,
+    mut fetch: impl FnMut(
+        Option<String>,
+    ) -> Result<
+        aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output,
+        KoshaError,
+    >,
+    visit: &mut dyn FnMut(Listed<'_>),
+) -> Result<(), KoshaError> {
+    let mut continuation: Option<String> = None;
+    loop {
+        let page = fetch(continuation.take())?;
+        for object in page.contents() {
+            if let Some(path) = object
+                .key()
+                .and_then(|key| logical_path_of_key(root_prefix, key))
+            {
+                visit(Listed::Object {
+                    path: &path,
+                    size: object.size().unwrap_or(0).max(0) as u64,
+                });
+            }
+        }
+        for common in page.common_prefixes() {
+            if let Some(path) = common
+                .prefix()
+                .and_then(|key| logical_path_of_key(root_prefix, key))
+            {
+                visit(Listed::Dir {
+                    path: path.trim_end_matches('/'),
+                });
+            }
+        }
+        match page.next_continuation_token() {
+            Some(token) if page.is_truncated().unwrap_or(false) => {
+                continuation = Some(token.to_string())
+            }
+            _ => return Ok(()),
+        }
+    }
+}
+
 fn local_list_with_zero_sizes(
     local: &LocalStorage,
     path: &str,
@@ -2203,6 +2791,369 @@ pub(crate) fn sum_segment_sizes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fetch admitted to the in-flight budget after its request was shed
+    /// (by another of its fetches) is skipped: its permit is handed back at
+    /// once for requests still being served, and its charge refunded.
+    #[test]
+    fn a_fetch_admitted_after_its_request_was_shed_is_skipped() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let budget = Arc::new(HydrationBudget::with_tenant_cap(
+            100,
+            100,
+            std::time::Duration::from_secs(5),
+        ));
+        let request = Arc::new(RequestHydration::new(1_000));
+        rt.block_on(async {
+            let holder = budget.acquire("acme", 100).await.unwrap();
+            assert!(request.charge(60));
+            let waiting = tokio::spawn({
+                let (budget, request) = (Arc::clone(&budget), Arc::clone(&request));
+                async move {
+                    reserve_budget(Some(&budget), &request, "hydration of", "acme/seg/x", 60)
+                        .await
+                        .map(|p| p.is_some())
+                }
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            // Another fetch of the same request sheds it, then budget frees.
+            request.mark_shed();
+            drop(holder);
+            let result = waiting.await.unwrap();
+            assert!(
+                matches!(result, Err(KoshaError::Overloaded(_))),
+                "a shed request's fetch must not stream: {result:?}"
+            );
+        });
+        assert_eq!(budget.in_flight(), 0, "the permit is handed back");
+        assert_eq!(request.fetched_bytes(), 0, "the charge is refunded");
+    }
+
+    /// In-memory [`PartSource`]: serves ranges of `data` at `delay` per 10
+    /// bytes (a transfer's time grows with its size, as an S3 stream's
+    /// does), counts GETs, and fails parts starting at chosen offsets.
+    struct MemSource {
+        data: Vec<u8>,
+        /// Answer every GET with the whole object, as a store that ignores
+        /// `Range` would.
+        ignore_range: bool,
+        delay: std::time::Duration,
+        gets: std::sync::atomic::AtomicUsize,
+        /// Parts starting here fail once, then succeed.
+        fail_once: std::sync::Mutex<Vec<u64>>,
+        /// Parts starting here always fail.
+        fail_always: Option<u64>,
+        /// Later parts find the object replaced (If-Match fails).
+        replaced: bool,
+    }
+
+    impl MemSource {
+        fn with(len: usize, tweak: impl FnOnce(&mut Self)) -> Arc<Self> {
+            let mut source = Self {
+                data: (0..len).map(|i| (i * 7 % 251) as u8).collect(),
+                ignore_range: false,
+                delay: std::time::Duration::ZERO,
+                gets: Default::default(),
+                fail_once: Default::default(),
+                fail_always: None,
+                replaced: false,
+            };
+            tweak(&mut source);
+            Arc::new(source)
+        }
+
+        fn gets(&self) -> usize {
+            self.gets.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl PartSource for Arc<MemSource> {
+        fn get(&self, start: u64, end: u64, if_match: Option<String>) -> PartFuture {
+            let this = Arc::clone(self);
+            Box::pin(async move {
+                this.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                assert!(
+                    start == 0 || if_match.as_deref() == Some("v1"),
+                    "later parts are conditional"
+                );
+                let fail = this.fail_always == Some(start) || {
+                    let mut once = this.fail_once.lock().unwrap();
+                    let hit = once.iter().position(|s| *s == start);
+                    hit.map(|i| once.swap_remove(i)).is_some()
+                };
+                if fail {
+                    return Err(KoshaError::NotFound(format!("injected failure at {start}")));
+                }
+                if this.replaced && start > 0 {
+                    return Err(KoshaError::CorruptSegment("If-Match failed".into()));
+                }
+                let total = this.data.len() as u64;
+                let (s, e) = if this.ignore_range {
+                    (0, total)
+                } else {
+                    (start.min(total), end.min(total))
+                };
+                tokio::time::sleep(this.delay * (e - s).div_ceil(10) as u32).await;
+                let bytes = this.data[s as usize..e as usize].to_vec();
+                Ok(PartResponse {
+                    len: bytes.len() as u64,
+                    body: aws_sdk_s3::primitives::ByteStream::from(bytes),
+                    total,
+                    etag: Some("v1".into()),
+                })
+            })
+        }
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kosha-parts-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Files left in `dir` (temp files must not be).
+    fn files_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn download(
+        rt: &tokio::runtime::Runtime,
+        source: &Arc<MemSource>,
+        dest: &Path,
+        part_bytes: u64,
+        request: &Arc<RequestHydration>,
+    ) -> Result<FetchStats, KoshaError> {
+        let source: Arc<dyn PartSource> = Arc::new(Arc::clone(source));
+        rt.block_on(download_to(
+            source,
+            "acme/seg/f.bin",
+            dest,
+            part_bytes,
+            None,
+            request,
+        ))
+    }
+
+    /// Objects of every shape relative to the part size land byte-identical
+    /// at their final path, with one GET per part (an object no larger than
+    /// a part is still a single GET), and no temp file left behind.
+    #[test]
+    fn a_download_in_parts_lands_identical_bytes() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = scratch_dir("identical");
+        for len in [1usize, 9, 10, 11, 105, 1000] {
+            for ignore_range in [false, true] {
+                let source = MemSource::with(len, |s| s.ignore_range = ignore_range);
+                let dest = dir.join("f.bin");
+                let _ = std::fs::remove_file(&dest);
+                let request = Arc::new(RequestHydration::new(u64::MAX));
+                let stats = download(&rt, &source, &dest, 10, &request).expect("downloads");
+                assert_eq!(std::fs::read(&dest).unwrap(), source.data, "len={len}");
+                assert_eq!(stats.bytes, len as u64);
+                assert_eq!(request.fetched_bytes(), len as u64, "charged once, in full");
+                let parts = if ignore_range { 1 } else { len.div_ceil(10) };
+                assert_eq!(
+                    source.gets(),
+                    parts,
+                    "len={len} ignore_range={ignore_range}"
+                );
+                assert_eq!(files_in(&dir), vec!["f.bin"], "no temp file left");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A part that fails once is retried on its own; one that keeps failing
+    /// fails the whole download: nothing at the final path, no temp file,
+    /// the request's charge refunded.
+    #[test]
+    fn a_failed_part_is_retried_and_a_lost_one_leaves_nothing_behind() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = scratch_dir("failure");
+        let dest = dir.join("f.bin");
+
+        let flaky = MemSource::with(105, |s| *s.fail_once.get_mut().unwrap() = vec![0, 50]);
+        let request = Arc::new(RequestHydration::new(u64::MAX));
+        download(&rt, &flaky, &dest, 10, &request).expect("retried");
+        assert_eq!(std::fs::read(&dest).unwrap(), flaky.data);
+        assert_eq!(
+            flaky.gets(),
+            11 + 2,
+            "only the two failed parts were fetched again"
+        );
+        std::fs::remove_file(&dest).unwrap();
+
+        let broken = MemSource::with(105, |s| s.fail_always = Some(50));
+        let request = Arc::new(RequestHydration::new(u64::MAX));
+        let result = download(&rt, &broken, &dest, 10, &request);
+        assert!(
+            matches!(result, Err(KoshaError::NotFound(_))),
+            "{:?}",
+            result.err()
+        );
+        assert!(
+            !dest.exists(),
+            "a partial object must never reach its final path"
+        );
+        assert!(
+            files_in(&dir).is_empty(),
+            "temp file removed: {:?}",
+            files_in(&dir)
+        );
+        assert_eq!(request.fetched_bytes(), 0, "charge refunded");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An object replaced mid-download (If-Match fails on a later part)
+    /// fails the fetch on that part's first attempt — no retries — and
+    /// leaves nothing behind.
+    #[test]
+    fn an_object_replaced_mid_download_fails_without_retrying() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = scratch_dir("replaced");
+        let dest = dir.join("f.bin");
+        let source = MemSource::with(25, |s| s.replaced = true);
+        let request = Arc::new(RequestHydration::new(u64::MAX));
+        let result = download(&rt, &source, &dest, 10, &request);
+        assert!(
+            matches!(result, Err(KoshaError::CorruptSegment(_))),
+            "{:?}",
+            result.err()
+        );
+        assert_eq!(source.gets(), 3, "one GET per part, none retried");
+        assert!(!dest.exists());
+        assert!(files_in(&dir).is_empty(), "{:?}", files_in(&dir));
+        assert_eq!(request.fetched_bytes(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Staging run 7: a promotion fetched a ~2 GB `doc_vectors.bin` as one
+    /// GET, admitted past the 1 GiB budget because nothing else held any;
+    /// every request fetch then waited out its 30 s behind it and shed its
+    /// search (27 of 29 budget 429s on the 1.8M matter). Scaled down: a
+    /// 1000-byte background download under a 100-byte budget, and a request
+    /// fetch arriving while it streams.
+    #[test]
+    fn a_large_promotion_does_not_block_a_request_fetch() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = scratch_dir("promotion");
+        let wait = std::time::Duration::from_millis(300);
+        // 10 ms per 10 bytes: as one GET the object streams for 1 s; in
+        // 10-byte parts, at most two in flight (the 25-byte background
+        // share), for ~0.5 s, each part holding budget for 10 ms.
+        let source = MemSource::with(1000, |s| s.delay = std::time::Duration::from_millis(10));
+        let request_fetch = |budget: &Arc<HydrationBudget>| {
+            let budget = Arc::clone(budget);
+            rt.block_on(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                let started = std::time::Instant::now();
+                budget.acquire("acme", 30).await.map(|_| started.elapsed())
+            })
+        };
+        for (part_bytes, as_one_get) in [(u64::MAX, true), (10, false)] {
+            let budget = Arc::new(HydrationBudget::with_tenant_cap(100, 100, wait));
+            let dest = dir.join(format!("p{as_one_get}.bin"));
+            let promotion = std::thread::spawn({
+                let (source, budget, dest) =
+                    (Arc::clone(&source), Arc::clone(&budget), dest.clone());
+                move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    let source: Arc<dyn PartSource> = Arc::new(source);
+                    rt.block_on(download_to(
+                        source,
+                        "acme/seg/doc_vectors.bin",
+                        &dest,
+                        part_bytes,
+                        Some(budget),
+                        &RequestHydration::background(),
+                    ))
+                }
+            });
+            let waited = request_fetch(&budget);
+            if as_one_get {
+                // The pre-fix shape, for contrast: one reservation for the
+                // whole object shuts the request fetch out until it expires.
+                assert!(waited.is_err(), "one whole-object GET holds the budget");
+            } else {
+                let waited = waited.expect("admitted beside the promotion");
+                assert!(
+                    waited < std::time::Duration::from_millis(100),
+                    "waited {waited:?}"
+                );
+                assert!(budget.background_in_flight() <= 25);
+            }
+            promotion.join().unwrap().expect("the promotion completes");
+            assert_eq!(std::fs::read(&dest).unwrap(), source.data);
+            assert_eq!(budget.in_flight(), 0);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A request fetch downloading a large object in parts holds at most its
+    /// tenant's share while another tenant waits, so that tenant's small
+    /// fetch is admitted within a part's time — not after the whole object.
+    #[test]
+    fn a_large_request_fetch_in_parts_lets_another_tenant_in() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = scratch_dir("request");
+        let source = MemSource::with(1000, |s| s.delay = std::time::Duration::from_millis(30));
+        let budget = Arc::new(HydrationBudget::with_tenant_cap(
+            100,
+            50,
+            std::time::Duration::from_millis(300),
+        ));
+        let dest = dir.join("big.bin");
+        let big = std::thread::spawn({
+            let (source, budget, dest) = (Arc::clone(&source), Arc::clone(&budget), dest.clone());
+            move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let source: Arc<dyn PartSource> = Arc::new(source);
+                rt.block_on(download_to(
+                    source,
+                    "acme/seg/doc_store.bin",
+                    &dest,
+                    10,
+                    Some(budget),
+                    &Arc::new(RequestHydration::new(u64::MAX)),
+                ))
+            }
+        });
+        let waited = rt.block_on({
+            let budget = Arc::clone(&budget);
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                let started = std::time::Instant::now();
+                budget.acquire("beta", 40).await.map(|_| started.elapsed())
+            }
+        });
+        let waited = waited.expect("beta admitted while acme's object streams");
+        assert!(
+            waited < std::time::Duration::from_millis(150),
+            "waited {waited:?}"
+        );
+        big.join().unwrap().expect("acme's object completes");
+        assert_eq!(std::fs::read(&dest).unwrap(), source.data);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn content_range_total_parses_the_object_size() {
+        assert_eq!(
+            content_range_total("bytes 0-16777215/2727274244"),
+            Some(2727274244)
+        );
+        assert_eq!(content_range_total("bytes 0-9/*"), None);
+        assert_eq!(content_range_total("garbage"), None);
+    }
 
     #[test]
     fn sum_segment_sizes_groups_by_segment_and_filters_files() {
@@ -2365,6 +3316,104 @@ mod tests {
         assert_eq!(streamed.bytes, payload.len() as u64);
         assert_eq!(std::fs::read(&tmp_path).unwrap(), payload);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #348: a listing is consumed page by page, each page's continuation
+    /// token goes into the next request, and nothing is accumulated.
+    #[test]
+    fn a_listing_is_visited_page_by_page_until_it_is_not_truncated() {
+        use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
+        use aws_sdk_s3::types::{CommonPrefix, Object};
+
+        let object = |key: &str, size: i64| Object::builder().key(key).size(size).build();
+        let mut pages = vec![
+            ListObjectsV2Output::builder()
+                .contents(object("kosha/acme/docs/seg-1/a.bin", 10))
+                .contents(object("kosha/acme/docs/seg-1/b.bin", 20))
+                .is_truncated(true)
+                .next_continuation_token("t1")
+                .build(),
+            // A page may be empty and still truncated.
+            ListObjectsV2Output::builder()
+                .is_truncated(true)
+                .next_continuation_token("t2")
+                .build(),
+            ListObjectsV2Output::builder()
+                .contents(object("kosha/acme/docs/seg-2/c.bin", 30))
+                // Outside the configured prefix: never reported.
+                .contents(object("other/x", 99))
+                .common_prefixes(CommonPrefix::builder().prefix("kosha/acme/logs/").build())
+                .is_truncated(false)
+                // S3-compatible stores may echo a token on the last page.
+                .next_continuation_token("ignored")
+                .build(),
+        ]
+        .into_iter();
+        let mut tokens = Vec::new();
+        let mut seen = Vec::new();
+        visit_listing_pages(
+            "kosha",
+            |token| {
+                tokens.push(token);
+                Ok(pages.next().expect("no request after the last page"))
+            },
+            &mut |entry| {
+                seen.push(match entry {
+                    Listed::Object { path, size } => format!("{path}={size}"),
+                    Listed::Dir { path } => format!("{path}/"),
+                });
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            tokens,
+            vec![None, Some("t1".to_string()), Some("t2".to_string())]
+        );
+        assert_eq!(
+            seen,
+            vec![
+                "acme/docs/seg-1/a.bin=10",
+                "acme/docs/seg-1/b.bin=20",
+                "acme/docs/seg-2/c.bin=30",
+                "acme/logs/",
+            ]
+        );
+
+        let failed = visit_listing_pages(
+            "",
+            |_| Err(KoshaError::NotFound("injected".into())),
+            &mut |_| panic!("nothing to visit"),
+        );
+        assert!(failed.is_err());
+    }
+
+    /// #348: the listing asks S3 for keys under `<dir>/` only, with a
+    /// delimiter when it wants immediate children, and never for a body.
+    #[test]
+    fn visit_listing_sends_a_list_request_scoped_to_the_directory() {
+        let dir = std::env::temp_dir().join(format!("kosha-list-req-{}", std::process::id()));
+        let (storage, capture) = capture::storage(dir, "kosha", sse::SseConfig::default());
+        for (recursive, delimited) in [(true, false), (false, true)] {
+            assert!(storage
+                .visit_listing("acme/docs", recursive, &mut |_| {})
+                .is_err());
+            let requests = capture.take();
+            assert_eq!(requests.len(), 1);
+            let request = &requests[0];
+            assert_eq!(request.method, "GET");
+            assert!(request.uri.contains("list-type=2"), "{}", request.uri);
+            assert!(
+                request.uri.contains("prefix=kosha%2Facme%2Fdocs%2F"),
+                "{}",
+                request.uri
+            );
+            assert_eq!(
+                request.uri.contains("delimiter=%2F"),
+                delimited,
+                "{}",
+                request.uri
+            );
+        }
     }
 
     #[test]
@@ -2791,6 +3840,196 @@ mod sse_request_tests {
         let (storage, capture) = start_pod(Some(&format!("acme={NEW_KEY}")));
         assert!(storage.write(&format!("{seg}/_COMMIT"), b"c").is_err());
         assert_kms(&capture.take()[0], NEW_KEY);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// S3 failures against a local HTTP endpoint that answers like S3: what
+/// reaches an error message (and so possibly a tenant's response body),
+/// and what the download path leaves on disk.
+#[cfg(test)]
+mod error_path_tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    use aws_sdk_s3::config::retry::RetryConfig;
+    use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
+
+    use super::*;
+
+    /// Serve every request with `status` and `body`, one response per
+    /// connection, until the test process exits.
+    fn serve(status: &'static str, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                let text = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                let len = text
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut sink = vec![0u8; len];
+                let _ = stream.read_exact(&mut sink);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\ncontent-type: application/xml\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn storage(endpoint: &str, tag: &str) -> (S3Storage, PathBuf) {
+        let root = std::env::temp_dir().join(format!("kosha-s3-err-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            .retry_config(RetryConfig::disabled())
+            .build();
+        let storage = S3Storage {
+            local: LocalStorage::new(root.clone()),
+            bucket: "bucket".into(),
+            prefix: "secret-prefix".into(),
+            rt: tokio::runtime::Runtime::new().unwrap(),
+            client: aws_sdk_s3::Client::from_conf(config),
+            sse: SseConfig::default(),
+        };
+        (storage, root)
+    }
+
+    fn assert_short(message: &str) {
+        for leak in [
+            "arn:",
+            "123456789012",
+            "assumed-role",
+            "secret-prefix",
+            "REQ123",
+        ] {
+            assert!(!message.contains(leak), "{leak} leaked into: {message}");
+        }
+    }
+
+    /// An AccessDenied names the role ARN (account id) and carries request
+    /// ids; none of that may reach an error message, which can end up in a
+    /// tenant's response body. The pod log gets the chain instead.
+    #[test]
+    fn access_denied_detail_stays_out_of_error_messages() {
+        let endpoint = serve(
+            "403 Forbidden",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <Error><Code>AccessDenied</Code>\
+             <Message>User: arn:aws:sts::123456789012:assumed-role/kosha-query/i-0abc \
+             is not authorized to perform: s3:GetObject on resource: \
+             arn:aws:s3:::bucket/secret-prefix/acme/ns/seg/doc_store.bin</Message>\
+             <RequestId>REQ123</RequestId><HostId>HOST</HostId></Error>",
+        );
+        let (storage, root) = storage(&endpoint, "denied");
+
+        let read = storage
+            .read_remote("acme/ns/seg/doc_store.bin")
+            .unwrap_err();
+        assert_short(&read.to_string());
+        let read = storage.read("acme/ns/seg/doc_store.bin").unwrap_err();
+        assert_short(&read.to_string());
+        let list = storage.list_remote_with_sizes("acme/ns").unwrap_err();
+        assert_short(&list.to_string());
+        let delete = storage.delete_prefix("acme/ns").unwrap_err();
+        assert_short(&delete.to_string());
+        let write = storage.write("acme/ns/seg/new.bin", b"x").unwrap_err();
+        assert_short(&write.to_string());
+
+        // The WAL backend: an index request's error message carries these
+        // (`indexing error: …`).
+        use kosha_write::object_wal::WalObjectBackend;
+        let wal =
+            crate::s3_wal::S3WalBackend::new(&storage, std::time::Duration::from_secs(5)).unwrap();
+        let put = wal
+            .put_if_absent("_wal/w1/acme/ns/000001", b"x")
+            .unwrap_err();
+        assert_short(&put.to_string());
+        let put = wal.put("_wal/w1/acme/ns/000001", b"x").unwrap_err();
+        assert_short(&put.to_string());
+        let get = wal.get("_wal/w1/acme/ns/000001").unwrap_err();
+        assert_short(&get.to_string());
+        let list = wal.list("_wal/w1/").unwrap_err();
+        assert_short(&list.to_string());
+        let delete = wal
+            .delete(&["_wal/w1/acme/ns/000001".to_string()])
+            .unwrap_err();
+        assert_short(&delete.to_string());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A conditional WAL put that loses to an existing object (412) is the
+    /// expected answer: `AlreadyExists`, and no log line, since callers
+    /// treat it as success on every startup probe and `create_meta`.
+    #[test]
+    fn conditional_put_conflict_is_already_exists_and_not_logged() {
+        use kosha_write::object_wal::WalObjectBackend;
+        let endpoint = serve(
+            "412 Precondition Failed",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <Error><Code>PreconditionFailed</Code>\
+             <Message>At least one of the pre-conditions you specified did not hold</Message>\
+             <RequestId>REQ412</RequestId></Error>",
+        );
+        let (storage, root) = storage(&endpoint, "precondition");
+        let wal =
+            crate::s3_wal::S3WalBackend::new(&storage, std::time::Duration::from_secs(5)).unwrap();
+        let before = S3_ERRORS_LOGGED.with(|n| n.get());
+        let err = wal.put_if_absent("_wal/w1/meta", b"x").unwrap_err();
+        assert!(
+            matches!(&err, KoshaError::Io(e) if e.kind() == std::io::ErrorKind::AlreadyExists),
+            "{err:?}"
+        );
+        assert_eq!(
+            S3_ERRORS_LOGGED.with(|n| n.get()),
+            before,
+            "a 412 is not logged"
+        );
+
+        // The same answer to an unconditional put is a failure, logged.
+        assert!(wal.put("_wal/w1/meta", b"x").is_err());
+        assert_eq!(S3_ERRORS_LOGGED.with(|n| n.get()), before + 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The download path writes through a temp file and a rename: the
+    /// object lands whole and no temp file is left behind.
+    #[test]
+    fn download_lands_whole_with_no_temp_file() {
+        let endpoint = serve("200 OK", "whole object body");
+        let (storage, root) = storage(&endpoint, "download");
+        let data = storage.read("acme/ns/seg/doc_store.bin").unwrap();
+        assert_eq!(data, b"whole object body");
+        let dir = root.join("acme/ns/seg");
+        assert_eq!(
+            std::fs::read(dir.join("doc_store.bin")).unwrap(),
+            b"whole object body"
+        );
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["doc_store.bin".to_string()]);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

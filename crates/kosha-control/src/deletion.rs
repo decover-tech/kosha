@@ -7,7 +7,9 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use kosha_core::deletion::{DeletionFilter, DeletionRecord, DeletionState, NewDeletion};
+use kosha_core::deletion::{
+    DeletionFilter, DeletionPosition, DeletionRecord, DeletionState, NewDeletion,
+};
 use kosha_core::KoshaError;
 
 fn unix_millis() -> u64 {
@@ -77,6 +79,22 @@ impl DeletionLog {
         self.records.iter().find(|record| record.id == id).cloned()
     }
 
+    pub(crate) fn list_after(
+        &self,
+        after: Option<&DeletionPosition>,
+        limit: u32,
+    ) -> Vec<DeletionRecord> {
+        let mut records: Vec<DeletionRecord> = self
+            .records
+            .iter()
+            .filter(|record| after.is_none_or(|after| record.position() > *after))
+            .cloned()
+            .collect();
+        records.sort_by_key(DeletionRecord::position);
+        records.truncate(limit.max(1) as usize);
+        records
+    }
+
     pub(crate) fn list(&self, filter: &DeletionFilter) -> Vec<DeletionRecord> {
         self.records
             .iter()
@@ -88,11 +106,14 @@ impl DeletionLog {
 }
 
 #[cfg(feature = "postgres")]
-pub(crate) use pg::{get, insert, list, record_attempt};
+pub(crate) use pg::{get, insert, list, list_after, record_attempt};
 
 #[cfg(feature = "postgres")]
 mod pg {
-    use super::{no_such_record, DeletionFilter, DeletionRecord, DeletionState, NewDeletion};
+    use super::{
+        no_such_record, DeletionFilter, DeletionPosition, DeletionRecord, DeletionState,
+        NewDeletion,
+    };
     use kosha_core::deletion::DeletionScope;
     use kosha_core::KoshaError;
 
@@ -239,6 +260,29 @@ mod pg {
         .bind(filter.state.map(DeletionState::as_str))
         .bind(&filter.tenant_id)
         .bind(i64::from(filter.effective_limit()))
+        .fetch_all(pool)
+        .await
+        .map_err(io_error)?;
+        rows.into_iter().map(decode).collect()
+    }
+
+    /// `kosha.deletion_records` in `(requested_at in ms, id)` order, strictly
+    /// after `after`. The millisecond value is the one [`COLUMNS`] reads,
+    /// so a position taken from a record compares the way the rows sort.
+    pub(crate) async fn list_after(
+        pool: &sqlx::PgPool,
+        after: Option<&DeletionPosition>,
+        limit: u32,
+    ) -> Result<Vec<DeletionRecord>, KoshaError> {
+        const MS: &str = "(EXTRACT(EPOCH FROM requested_at) * 1000)::BIGINT";
+        let rows: Vec<Row> = sqlx::query_as(&format!(
+            "SELECT {COLUMNS} FROM kosha.deletion_records \
+             WHERE $1::BIGINT IS NULL OR ({MS}, id) > ($1::BIGINT, $2::TEXT) \
+             ORDER BY {MS}, id LIMIT $3"
+        ))
+        .bind(after.map(|after| after.requested_at_ms as i64))
+        .bind(after.map_or("", |after| after.id.as_str()))
+        .bind(i64::from(limit.max(1)))
         .fetch_all(pool)
         .await
         .map_err(io_error)?;

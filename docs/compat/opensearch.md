@@ -35,7 +35,7 @@ Migrating from Elasticsearch or OpenSearch: see [the migration guide](../migrati
 | --- | ---: | ---: | ---: |
 | [Query DSL](#query-dsl) | 10 | 6 | 13 |
 | [Filters (bool filter context)](#filters-bool-filter-context) | 10 | 1 | 3 |
-| [Aggregations](#aggregations) | 6 | 1 | 3 |
+| [Aggregations](#aggregations) | 7 | 1 | 3 |
 | [Sort](#sort) | 2 | 2 | 0 |
 | [Paging and totals](#paging-and-totals) | 3 | 0 | 0 |
 | [Top-level search body keys](#top-level-search-body-keys) | 7 | 4 | 0 |
@@ -107,7 +107,8 @@ Migrating from Elasticsearch or OpenSearch: see [the migration guide](../migrati
 | date_histogram (calendar_interval, fixed_interval, time_zone, bounds) | supported | Options are passed through to the server. | live | `aggregation.date_histogram` |
 | cardinality | supported | Top level only; it takes no sub-aggregations. | live | `aggregation.cardinality` |
 | min, max, sum, avg, value_count | supported | Single-value metrics. | live | `aggregation.metrics` |
-| stats, percentiles, top_hits, filter(s), range, significant_terms, nested, ... | rejected (client) | Any other aggregation type is refused by name. | client | `aggregation.unsupported` |
+| percentiles (percents, keyed) | supported | Top level or under a bucket aggregation. Exact up to 4,096 values per aggregation or bucket, then a DDSketch within 1% relative error. | live | `aggregation.percentiles` |
+| stats, top_hits, filter(s), range, significant_terms, nested, ... | rejected (client) | Any other aggregation type is refused by name. | client | `aggregation.unsupported` |
 
 ## Sort
 

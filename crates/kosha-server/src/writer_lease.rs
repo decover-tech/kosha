@@ -189,6 +189,42 @@ impl WriterLeases {
         self.held.lock().unwrap().contains_key(ns)
     }
 
+    /// Expire the lease row this process has on `ns` under `token`.
+    fn release_row(
+        &self,
+        ns: &NamespaceId,
+        token: u64,
+        controller: &Controller,
+    ) -> Result<(), KoshaError> {
+        match &self.backend {
+            LeaseBackend::ControlStore => {
+                controller
+                    .lock()
+                    .unwrap()
+                    .release_writer_lease(ns, &self.holder, token)
+            }
+            #[cfg(feature = "postgres")]
+            LeaseBackend::Postgres(store) => store.release(ns, &self.holder, token),
+        }
+    }
+
+    /// Release the lease on one namespace, if this process holds it: for a
+    /// lease taken only to fence other writers during a short operation
+    /// (the automatic deletion retry, #347), so the renewer does not keep
+    /// it and lock the namespace's real writer out. A failed release only
+    /// means the lease lapses on its own.
+    pub(crate) fn release(&self, ns: &NamespaceId, controller: &Controller) {
+        let Some(held) = self.held.lock().unwrap().remove(ns) else {
+            return;
+        };
+        if let Err(error) = self.release_row(ns, held.token, controller) {
+            eprintln!(
+                "WARN: writer lease release for {} failed: {error}; it lapses on its own",
+                ns.0
+            );
+        }
+    }
+
     /// Release every held lease, on graceful shutdown, so the next writer
     /// takes them at once instead of waiting out the TTL. Returns how many
     /// were released; a failed release only means that lease lapses on its
@@ -197,17 +233,7 @@ impl WriterLeases {
         let held: Vec<(NamespaceId, Held)> = self.held.lock().unwrap().drain().collect();
         let mut released = 0;
         for (ns, held) in held {
-            let result = match &self.backend {
-                LeaseBackend::ControlStore => {
-                    controller
-                        .lock()
-                        .unwrap()
-                        .release_writer_lease(&ns, &self.holder, held.token)
-                }
-                #[cfg(feature = "postgres")]
-                LeaseBackend::Postgres(store) => store.release(&ns, &self.holder, held.token),
-            };
-            match result {
+            match self.release_row(&ns, held.token, controller) {
                 Ok(()) => released += 1,
                 Err(error) => eprintln!(
                     "WARN: writer lease release for {} failed: {error}; it lapses on its own",

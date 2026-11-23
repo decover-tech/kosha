@@ -378,6 +378,18 @@ fn vector_value_dim(value: &str) -> Option<VectorValueDim> {
     })
 }
 
+/// What this node holds for a namespace, as [`Indexer::while_quiesced`]
+/// reads it.
+#[derive(Debug, Clone)]
+pub struct LocalNamespace {
+    /// The local manifest, including segments not yet published.
+    pub manifest: Manifest,
+    /// Whether anything here is not in the control store yet: a manifest
+    /// version that was never published, buffered or WAL-recovered writes,
+    /// or pending deletes.
+    pub unpublished: bool,
+}
+
 struct NamespaceHandle {
     mutation: Mutex<()>,
     writes: Mutex<()>,
@@ -531,7 +543,9 @@ pub struct Indexer {
 impl Indexer {
     pub fn new(data_dir: PathBuf) -> Self {
         let wal_dir = data_dir.join("_wal");
-        std::fs::create_dir_all(&wal_dir).ok();
+        // No WAL dir = every acknowledged write would fail; stop here, like
+        // the failed recovery below, instead of at the first append.
+        kosha_core::create_dir_named(&wal_dir).unwrap_or_else(|e| panic!("WAL: {e}"));
         let (wal, records) = crate::wal::WalWriter::open(
             Arc::new(crate::wal::LocalWalStore::new(wal_dir)),
             crate::wal::GroupCommitConfig::from_env(),
@@ -2664,6 +2678,42 @@ impl Indexer {
         Ok(Some(shared))
     }
 
+    /// Run `sweep` while no write, flush, upsert, compaction or drop of
+    /// `namespace` is in flight on this node (the locks
+    /// [`Self::drop_namespace`] takes), handing it what this node holds for
+    /// the namespace at that moment; `None` when it is unknown here.
+    ///
+    /// For removing local files of a deleted incarnation (#347) without
+    /// touching the current one: under these locks every segment directory
+    /// this writer has produced for the namespace is listed by the manifest
+    /// in [`LocalNamespace`], published or not. A manifest a follower
+    /// installs ([`Self::restore_manifest`]) is not held back by them.
+    pub fn while_quiesced<R>(
+        &self,
+        namespace: &NamespaceId,
+        sweep: impl FnOnce(Option<LocalNamespace>) -> R,
+    ) -> R {
+        let handle = self.ns_handle(namespace);
+        let _writes = handle.writes.lock().unwrap();
+        let _compact = handle.compact.lock().unwrap();
+        let _mutation = handle.mutation.lock().unwrap();
+        let local = {
+            let state = handle.state.lock().unwrap();
+            state.known.then(|| LocalNamespace {
+                unpublished: state.published_version != state.manifest.version
+                    || state
+                        .buffer
+                        .as_ref()
+                        .is_some_and(|b| !b.documents.is_empty())
+                    || !state.tombstones.is_empty()
+                    || !state.recovered.is_empty()
+                    || !state.recovered_deletes.is_empty(),
+                manifest: state.manifest.clone(),
+            })
+        };
+        sweep(local)
+    }
+
     /// Forget a namespace this node only follows (a query replica's copy
     /// of a namespace deleted elsewhere): it reads as unknown until a
     /// manifest is restored for it again. Leaves the WAL alone, unlike
@@ -4037,6 +4087,40 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// #347: the purge reads a namespace under the writer's locks.
+    #[test]
+    fn while_quiesced_reports_unknown_published_and_unpublished_namespaces() {
+        let dir = std::env::temp_dir().join(format!("kosha-quiesced-{}", uuid::Uuid::new_v4()));
+        let idx = Indexer::new(dir.clone());
+        let ns = NamespaceId("t/quiesced".into());
+        assert!(idx.while_quiesced(&ns, |local| local.is_none()));
+        // Asking does not make the namespace known.
+        assert!(idx.manifest_version(&ns).is_none());
+        assert!(!idx.namespaces().contains(&ns));
+
+        idx.restore_manifest(ns.clone(), Manifest::empty(4));
+        let local = idx.while_quiesced(&ns, |local| local).unwrap();
+        assert_eq!(local.manifest.version, 4);
+        assert!(!local.unpublished, "a followed manifest is published");
+
+        let doc = Document {
+            id: DocumentId("a".into()),
+            fields: vec![Field::text("text", "hello")],
+        };
+        idx.index_documents(ns.clone(), vec![doc]).unwrap();
+        assert!(
+            idx.while_quiesced(&ns, |local| local).unwrap().unpublished,
+            "a buffered write"
+        );
+        idx.flush_namespace(&ns).unwrap();
+        let local = idx.while_quiesced(&ns, |local| local).unwrap();
+        assert!(local.unpublished, "a flushed, unpublished segment");
+        assert_eq!(local.manifest.segments.len(), 1);
+        publish(&idx, &ns);
+        assert!(!idx.while_quiesced(&ns, |local| local).unwrap().unpublished);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn drop_namespace_refuses_unpublished_writes_and_forgets_published_ones() {
         let dir = std::env::temp_dir().join(format!("kosha-drop-{}", uuid::Uuid::new_v4()));
@@ -4895,6 +4979,155 @@ mod tests {
             assert_eq!(ids[0], "d3", "{field}: exact match first");
             assert!(!ids.iter().any(|id| id == missing), "{field}: {ids:?}");
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Finding 29: a query-path hydration leaves a segment on disk without
+    /// its vector index files (`vector*.idx` / `vector*.offsets` are only
+    /// fetched when a caller needs vectors). If compaction then merges that
+    /// segment, the vectors must survive: they are read from the doc store
+    /// / `doc_vectors.bin`, never from the index, and the merged index is
+    /// rebuilt from them. Both vector-index modes are checked.
+    ///
+    /// The second half pins the loud failure: an input whose
+    /// `doc_vectors.bin` is missing aborts the compaction with an error and
+    /// leaves the manifest untouched, rather than writing a merged segment
+    /// without the vectors.
+    #[test]
+    fn compaction_of_inputs_without_local_vector_index_keeps_every_vector() {
+        use kosha_segment::VectorCompactionMode;
+        fn vector(i: u64) -> Vec<f32> {
+            let mut s = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut next = || {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+            };
+            let c = (i % 16) as f32;
+            (0..16)
+                .map(|d| if d as f32 == c { 3.0 } else { 0.0 } + next() * 0.5)
+                .collect()
+        }
+        let doc = |id: u64| Document {
+            id: DocumentId(format!("d{id}")),
+            fields: vec![
+                Field::text("text", format!("doc {id}")),
+                Field::vector("emb", vector(id)),
+            ],
+        };
+        // Two inputs; the first is big enough (>= LIRE_ADOPT_MIN_VECTORS)
+        // that `lire` would try to seed from its (missing) postings.
+        let build = |dir: &std::path::Path| {
+            let idx = Indexer::new(dir.to_path_buf())
+                .with_flush_threshold(10_000)
+                .with_max_concurrent_flush_writers(1);
+            let ns = NamespaceId("vecidx".into());
+            idx.index_documents(ns.clone(), (0..1_200).map(doc).collect())
+                .unwrap();
+            idx.flush_namespace(&ns).unwrap();
+            idx.index_documents(ns.clone(), (1_200..1_250).map(doc).collect())
+                .unwrap();
+            idx.flush_namespace(&ns).unwrap();
+            let manifest = idx.manifest(&ns).unwrap();
+            assert_eq!(manifest.segments.len(), 2);
+            let seg_dirs: Vec<std::path::PathBuf> = manifest
+                .segments
+                .iter()
+                .map(|e| dir.join(&ns.0).join(&e.segment_id.0))
+                .collect();
+            (idx, ns, seg_dirs)
+        };
+        let remove_matching = |seg_dir: &std::path::Path, pred: &dyn Fn(&str) -> bool| {
+            let mut removed = 0;
+            for entry in std::fs::read_dir(seg_dir).unwrap().flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if pred(&name) {
+                    std::fs::remove_file(entry.path()).unwrap();
+                    removed += 1;
+                }
+            }
+            removed
+        };
+
+        for mode in [VectorCompactionMode::Lire, VectorCompactionMode::Rebuild] {
+            let dir = std::env::temp_dir().join(format!(
+                "kosha-compact-no-vecidx-{mode:?}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let (idx, ns, seg_dirs) = build(&dir);
+            for seg_dir in &seg_dirs {
+                assert!(
+                    remove_matching(seg_dir, &kosha_core::is_vector_index_file) > 0,
+                    "{mode:?}: input had vector index files to drop"
+                );
+            }
+
+            let result = idx
+                .compact_namespace_with_options(&ns, CompactOptions::full().with_vector_index(mode))
+                .unwrap();
+            assert!(result.merged, "{mode:?}");
+            let manifest = idx.manifest(&ns).unwrap();
+            assert_eq!(manifest.segments.len(), 1);
+            let reader = kosha_segment::SegmentReader::open(
+                dir.join(&ns.0).join(&manifest.segments[0].segment_id.0),
+            )
+            .unwrap();
+            let columns: Vec<(String, u32)> = reader
+                .footer()
+                .vector_fields
+                .clone()
+                .unwrap()
+                .into_iter()
+                .map(|m| (m.name, m.count))
+                .collect();
+            assert_eq!(columns, vec![("emb".into(), 1_250)], "{mode:?}");
+            for i in (0..1_250u64).step_by(37) {
+                let hits = reader.knn_search(&vector(i), 1, 1_000).unwrap().unwrap();
+                let rec = reader.doc_record_full(hits[0].0).unwrap().unwrap();
+                assert_eq!(rec.doc_id.0, format!("d{i}"), "{mode:?}");
+                let emb = rec.fields.iter().find(|f| f.name == "emb").unwrap();
+                let got: Vec<f32> = serde_json::from_str(&emb.value).unwrap();
+                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&got), bits(&vector(i)), "{mode:?} doc {i}");
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        // Vectors stored in a sidecar that is not local: refuse to merge.
+        let dir =
+            std::env::temp_dir().join(format!("kosha-compact-no-docvec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (idx, ns, seg_dirs) = build(&dir);
+        let before = idx.manifest(&ns).unwrap();
+        assert!(before
+            .segments
+            .iter()
+            .all(|e| before.segment_footer(&e.segment_id).unwrap().doc_vectors));
+        assert_eq!(
+            remove_matching(&seg_dirs[1], &|n| n == kosha_segment::DOC_VECTORS_FILE),
+            1
+        );
+        let err = idx
+            .compact_namespace_with_options(&ns, CompactOptions::full())
+            .expect_err("a merge without the input's vectors must fail");
+        assert!(
+            err.to_string().contains(kosha_segment::DOC_VECTORS_FILE),
+            "{err}"
+        );
+        let after = idx.manifest(&ns).unwrap();
+        assert_eq!(after.version, before.version, "manifest unchanged");
+        let ids = |m: &Manifest| -> Vec<SegmentId> {
+            m.segments.iter().map(|e| e.segment_id.clone()).collect()
+        };
+        assert_eq!(ids(&after), ids(&before));
+        let dirs = std::fs::read_dir(dir.join(&ns.0))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .count();
+        assert_eq!(dirs, 2, "no merged output left on disk");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -5950,7 +6183,7 @@ mod tests {
         );
         let seg_id = idx.manifest(&ns).unwrap().segments[0].segment_id.clone();
         let reader = kosha_segment::SegmentReader::open(dir.join("test").join(&seg_id.0)).unwrap();
-        let store = reader.filter_store();
+        let store = reader.try_filter_store().unwrap();
         // Merge order is not index order: key everything by document id.
         let records: Vec<_> = reader.iter_doc_records().map(|r| r.unwrap()).collect();
         let id_of = |seq: u32| records[seq as usize].doc_id.0.clone();

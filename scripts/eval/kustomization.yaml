@@ -1,0 +1,13 @@
+# In-cluster eval log collector, applied by hand: `kubectl apply -k scripts/eval`.
+# Not part of the k8s/ overlays. See k8s/collector.yaml.
+namespace: kosha
+resources:
+  - k8s/collector.yaml
+configMapGenerator:
+  # bundle.py itself; the name hash rolls the pod when the script changes.
+  - name: kosha-eval-collector
+    files:
+      - bundle.py
+    options:
+      labels:
+        app: kosha-eval-collector

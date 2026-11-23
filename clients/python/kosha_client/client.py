@@ -87,6 +87,7 @@ class KoshaClient:
         timeout: int = 60,
         max_retries: int = 3,
         retry_on_timeout: bool = True,
+        retry_budget: float | None = None,
         pool_maxsize: int = 20,
         consistency: str | None = None,
         retry_non_idempotent: bool = False,
@@ -105,7 +106,8 @@ class KoshaClient:
         # ``base_delay_ms``/``max_delay_ms`` shape the full-jitter backoff;
         # a server delay over ``max_retry_after_ms`` is reported, not slept
         # through; no sleep may end past ``total_budget_ms`` after the first
-        # attempt.
+        # attempt. ``retry_budget`` (seconds, 0.2.17) sets ``total_budget_ms``
+        # when given.
         # Normalise the Kosha base URL.  Resolution order:
         #   1. ``hosts`` arg (opensearchpy-compatible)
         #   2. ``KOSHA_HOST`` env var (customer-friendly)
@@ -152,6 +154,7 @@ class KoshaClient:
             max_delay_ms=max_delay_ms,
             max_retry_after_ms=max_retry_after_ms,
             total_budget_ms=total_budget_ms,
+            retry_budget=retry_budget,
         )
 
         # Read-your-writes (#255): ``"strong"`` searches also scan writes the
@@ -1049,7 +1052,7 @@ class KoshaClient:
     # under a bucket aggregation; any other sub-aggregation is refused
     # rather than ignored: the caller would read buckets that are not there.
     _BUCKET_AGG_TYPES = ("terms", "composite", "histogram", "date_histogram")
-    _METRIC_AGG_TYPES = ("min", "max", "sum", "avg", "value_count")
+    _METRIC_AGG_TYPES = ("min", "max", "sum", "avg", "value_count", "percentiles")
     _AGG_TYPES = ("cardinality", *_BUCKET_AGG_TYPES, *_METRIC_AGG_TYPES)
 
     @classmethod

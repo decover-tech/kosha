@@ -288,6 +288,22 @@ pub trait ControlStore: Send + Sync {
             "this control store holds no deletion records".into(),
         ))
     }
+
+    /// Up to `limit` deletion records of any state, in
+    /// `(requested_at_ms, id)` order, strictly after `after` (from the
+    /// first record when `None`). For readers that work through every
+    /// record, such as each pod's cache purge (#347); see
+    /// [`deletion::DeletionPosition`] for what the order does not promise.
+    fn deletions_after(
+        &self,
+        after: Option<&deletion::DeletionPosition>,
+        limit: u32,
+    ) -> Result<Vec<deletion::DeletionRecord>, KoshaError> {
+        let _ = (after, limit);
+        Err(KoshaError::ControlPlane(
+            "this control store holds no deletion records".into(),
+        ))
+    }
 }
 
 /// The manifest version a new incarnation of a namespace starts at, given
@@ -776,6 +792,41 @@ impl<'de> Deserialize<'de> for PrefixFilter {
     }
 }
 
+/// One `term` / `terms` value on the wire: a string, or a JSON boolean.
+///
+/// A boolean becomes `"true"` / `"false"`, the text every ingest path stores
+/// for a `Boolean` field (`Field::boolean`, the CLI shorthand, `migrate`,
+/// the Python client), so `{"term": {"isHot": true}}` matches the same
+/// documents as `{"term": {"isHot": "true"}}`. Elasticsearch accepts both
+/// spellings; before this, the boolean one was a 400.
+///
+/// Numbers stay an error: a stored number's text depends on how it was
+/// written (`3` vs `3.0`), so matching one needs a typed comparison, not a
+/// string spelling chosen here.
+struct FilterValue(String);
+
+impl<'de> Deserialize<'de> for FilterValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = FilterValue;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a string or a boolean")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<FilterValue, E> {
+                Ok(FilterValue(v.to_owned()))
+            }
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<FilterValue, E> {
+                Ok(FilterValue(v))
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<FilterValue, E> {
+                Ok(FilterValue(v.to_string()))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 /// Clause keys `FilterClause` accepts, as reported in parse errors.
 const FILTER_CLAUSE_KEYS: [&str; 8] = [
     "term",
@@ -842,10 +893,21 @@ impl<'de> Deserialize<'de> for FilterClause {
         }
 
         match key.as_str() {
-            "term" => Ok(FilterClause::Term { term: body(inner)? }),
-            "terms" => Ok(FilterClause::Terms {
-                terms: body(inner)?,
-            }),
+            "term" => {
+                let term: std::collections::HashMap<String, FilterValue> = body(inner)?;
+                Ok(FilterClause::Term {
+                    term: term.into_iter().map(|(k, v)| (k, v.0)).collect(),
+                })
+            }
+            "terms" => {
+                let terms: std::collections::HashMap<String, Vec<FilterValue>> = body(inner)?;
+                Ok(FilterClause::Terms {
+                    terms: terms
+                        .into_iter()
+                        .map(|(k, vs)| (k, vs.into_iter().map(|v| v.0).collect()))
+                        .collect(),
+                })
+            }
             "range" => Ok(FilterClause::Range {
                 range: body(inner)?,
             }),
@@ -1332,6 +1394,10 @@ pub enum Aggregation {
     ValueCount {
         value_count: AggMetric,
     },
+    /// Percentiles of the field's values over the matched documents.
+    Percentiles {
+        percentiles: AggPercentiles,
+    },
     /// Fixed-width numeric buckets (issue #219).
     Histogram {
         histogram: AggHistogram,
@@ -1356,6 +1422,7 @@ pub enum MetricKind {
     Sum,
     Avg,
     ValueCount,
+    Percentiles,
 }
 
 impl MetricKind {
@@ -1367,6 +1434,7 @@ impl MetricKind {
             MetricKind::Sum => "sum",
             MetricKind::Avg => "avg",
             MetricKind::ValueCount => "value_count",
+            MetricKind::Percentiles => "percentiles",
         }
     }
 }
@@ -1379,8 +1447,85 @@ pub struct AggMetric {
     pub field: String,
 }
 
+/// Body of a `percentiles` aggregation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AggPercentiles {
+    pub field: String,
+    /// Percentiles to return, each in `[0, 100]`. Defaults to
+    /// Elasticsearch's `[1, 5, 25, 50, 75, 95, 99]`.
+    #[serde(default = "default_percents")]
+    pub percents: Vec<f64>,
+    /// `true` (the default) returns `values` as an object keyed by
+    /// percentile; `false` returns a list of `{key, value}`.
+    #[serde(default = "default_keyed", skip_serializing_if = "is_true")]
+    pub keyed: bool,
+}
+
+fn default_percents() -> Vec<f64> {
+    vec![1.0, 5.0, 25.0, 50.0, 75.0, 95.0, 99.0]
+}
+
+fn default_keyed() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+/// Most percentiles one `percentiles` aggregation may ask for.
+pub const MAX_PERCENTS: usize = 100;
+
+impl AggPercentiles {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.percents.is_empty() {
+            return Err("`percents` must not be empty".into());
+        }
+        if self.percents.len() > MAX_PERCENTS {
+            return Err(format!(
+                "`percents` has {} entries; at most {MAX_PERCENTS} are allowed",
+                self.percents.len()
+            ));
+        }
+        for p in &self.percents {
+            if !p.is_finite() || !(0.0..=100.0).contains(p) {
+                return Err(format!("`percents` must be between 0 and 100, got {p}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The key Elasticsearch writes a percentile under: `"50.0"`, `"99.9"`.
+    pub fn key(percent: f64) -> String {
+        if percent.fract() == 0.0 {
+            format!("{percent:.1}")
+        } else {
+            format!("{percent}")
+        }
+    }
+}
+
+/// Elasticsearch `percentiles` options Kosha does not implement. They get a
+/// specific message instead of serde's generic unknown-field one.
+fn reject_unsupported_percentiles_options(body: &serde_json::Value) -> Result<(), String> {
+    let Some(obj) = body.as_object() else {
+        return Ok(());
+    };
+    for option in ["tdigest", "hdr", "missing", "script", "format"] {
+        if obj.contains_key(option) {
+            return Err(format!(
+                "in `percentiles` aggregation: `{option}` is not supported yet (values are \
+                 exact up to a few thousand values and estimated to within 1% beyond that; \
+                 documents without the field are skipped)"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Aggregation type keys `Aggregation` accepts, as reported in parse errors.
-const AGGREGATION_KEYS: [&str; 10] = [
+const AGGREGATION_KEYS: [&str; 11] = [
     "terms",
     "cardinality",
     "composite",
@@ -1391,17 +1536,23 @@ const AGGREGATION_KEYS: [&str; 10] = [
     "sum",
     "avg",
     "value_count",
+    "percentiles",
 ];
 
 impl Aggregation {
-    /// The metric kind and body when this is a metric aggregation.
-    pub fn metric(&self) -> Option<(MetricKind, &AggMetric)> {
+    /// The metric kind and field when this is a metric aggregation.
+    pub fn metric(&self) -> Option<(MetricKind, &str)> {
         match self {
-            Aggregation::Min { min } => Some((MetricKind::Min, min)),
-            Aggregation::Max { max } => Some((MetricKind::Max, max)),
-            Aggregation::Sum { sum } => Some((MetricKind::Sum, sum)),
-            Aggregation::Avg { avg } => Some((MetricKind::Avg, avg)),
-            Aggregation::ValueCount { value_count } => Some((MetricKind::ValueCount, value_count)),
+            Aggregation::Min { min } => Some((MetricKind::Min, &min.field)),
+            Aggregation::Max { max } => Some((MetricKind::Max, &max.field)),
+            Aggregation::Sum { sum } => Some((MetricKind::Sum, &sum.field)),
+            Aggregation::Avg { avg } => Some((MetricKind::Avg, &avg.field)),
+            Aggregation::ValueCount { value_count } => {
+                Some((MetricKind::ValueCount, &value_count.field))
+            }
+            Aggregation::Percentiles { percentiles } => {
+                Some((MetricKind::Percentiles, &percentiles.field))
+            }
             _ => None,
         }
     }
@@ -1439,6 +1590,7 @@ impl Aggregation {
             Aggregation::DateHistogram { date_histogram, .. } => {
                 date_histogram.validate().map_err(in_agg)?
             }
+            Aggregation::Percentiles { percentiles } => percentiles.validate().map_err(in_agg)?,
             _ => {}
         }
         if let Some(subs) = self.sub_aggregations() {
@@ -1446,6 +1598,7 @@ impl Aggregation {
                 if sub.metric().is_none() {
                     return Err(nested_bucket_error(name, sub_name, sub.type_name()));
                 }
+                sub.validate(sub_name)?;
             }
         }
         Ok(())
@@ -1493,8 +1646,8 @@ fn reject_unsupported_histogram_options(
 fn nested_bucket_error(parent: &str, name: &str, kind: &str) -> String {
     format!(
         "sub-aggregation `{name}` of `{parent}` is a `{kind}` aggregation; only metric \
-         aggregations (min, max, sum, avg, value_count) can be nested under a bucket \
-         aggregation"
+         aggregations (min, max, sum, avg, value_count, percentiles) can be nested under a \
+         bucket aggregation"
     )
 }
 
@@ -1612,6 +1765,14 @@ impl<'de> Deserialize<'de> for Aggregation {
             "value_count" => Ok(Aggregation::ValueCount {
                 value_count: body(&key, inner)?,
             }),
+            "percentiles" => {
+                reject_unsupported_percentiles_options(&inner).map_err(D::Error::custom)?;
+                let percentiles: AggPercentiles = body(&key, inner)?;
+                percentiles
+                    .validate()
+                    .map_err(|e| D::Error::custom(format!("in `percentiles` aggregation: {e}")))?;
+                Ok(Aggregation::Percentiles { percentiles })
+            }
             "histogram" => {
                 reject_unsupported_histogram_options(&key, &inner).map_err(D::Error::custom)?;
                 let histogram: AggHistogram = body(&key, inner)?;
@@ -1638,7 +1799,7 @@ impl<'de> Deserialize<'de> for Aggregation {
                 let hint = match other {
                     "stats"
                     | "extended_stats"
-                    | "percentiles"
+                    | "percentile_ranks"
                     | "auto_date_histogram"
                     | "variable_width_histogram"
                     | "range"
@@ -1833,7 +1994,18 @@ impl LocalStorage {
 ///
 /// The temp filename includes the PID and a per-process atomic counter so
 /// concurrent writes to the *same* path never collide on the same temp file.
-fn atomic_write(path: &std::path::Path, data: &[u8]) -> Result<(), KoshaError> {
+pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> Result<(), KoshaError> {
+    atomic_write_with(path, |tmp| std::fs::write(tmp, data))
+}
+
+/// [`atomic_write`] with the temp file filled by `fill` (a copy, a
+/// stream): `path` only ever appears complete. When `fill` or the rename
+/// fails, the temp file is removed, so a failed write (`ENOSPC` part-way)
+/// leaves neither a truncated `path` nor a stray temp file.
+pub fn atomic_write_with(
+    path: &std::path::Path,
+    fill: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> Result<(), KoshaError> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1852,9 +2024,31 @@ fn atomic_write(path: &std::path::Path, data: &[u8]) -> Result<(), KoshaError> {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp_path = dir.join(format!(".{file_name}.tmp.{}.{n}", std::process::id()));
 
-    std::fs::write(&tmp_path, data)?;
-    std::fs::rename(&tmp_path, path)?;
+    let written = fill(&tmp_path).and_then(|()| std::fs::rename(&tmp_path, path));
+    if let Err(e) = written {
+        if let Err(rm) = std::fs::remove_file(&tmp_path) {
+            if rm.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "WARN: removing temp file {} after a failed write also failed: {rm}",
+                    tmp_path.display()
+                );
+            }
+        }
+        return Err(e.into());
+    }
     Ok(())
+}
+
+/// [`std::fs::create_dir_all`] whose error names the directory. A bare
+/// `io::Error` says only "Permission denied", and a write after an ignored
+/// failure reports NotFound on a file instead of the real cause.
+pub fn create_dir_named(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir).map_err(|e| dir_error(dir, e))
+}
+
+/// `e`, a failure to create `dir`, with `dir` in its message.
+pub fn dir_error(dir: &std::path::Path, e: std::io::Error) -> std::io::Error {
+    std::io::Error::new(e.kind(), format!("cannot create {}: {e}", dir.display()))
 }
 
 impl StorageBackend for LocalStorage {
@@ -1862,7 +2056,11 @@ impl StorageBackend for LocalStorage {
         Ok(std::fs::read(self.root.join(path))?)
     }
     fn write(&self, path: &str, data: &[u8]) -> Result<(), KoshaError> {
-        atomic_write(&self.root.join(path), data)
+        let full = self.root.join(path);
+        if let Some(dir) = full.parent() {
+            create_dir_named(dir)?;
+        }
+        atomic_write(&full, data)
     }
     fn exists(&self, path: &str) -> bool {
         self.root.join(path).exists()
@@ -3931,8 +4129,8 @@ impl SearchQuery {
                 Aggregation::Histogram { histogram, .. } => add(&histogram.field),
                 Aggregation::DateHistogram { date_histogram, .. } => add(&date_histogram.field),
                 _ => {
-                    if let Some((_, metric)) = agg.metric() {
-                        add(&metric.field);
+                    if let Some((_, field)) = agg.metric() {
+                        add(field);
                     }
                 }
             }
@@ -4291,6 +4489,47 @@ mod filter_clause_parsing {
     fn bool_only_keys_at_clause_level_get_a_hint() {
         let err = parse(r#"{"must": [{"term": {"a": "b"}}]}"#).expect_err("must is not a clause");
         assert!(err.to_string().contains("inside a `bool` clause"), "{err}");
+    }
+
+    /// Finding 37: Elasticsearch takes a JSON boolean in `term` / `terms`;
+    /// it becomes the `"true"` / `"false"` text ingest stores. Numbers and
+    /// null are still rejected, nested inside `bool` too.
+    #[test]
+    fn term_and_terms_accept_booleans_as_stored_text() {
+        match parse(r#"{"term": {"isHot": true}}"#).unwrap() {
+            FilterClause::Term { term } => assert_eq!(term["isHot"], "true"),
+            other => panic!("{other:?}"),
+        }
+        match parse(r#"{"terms": {"isHot": [false, "true", true]}}"#).unwrap() {
+            FilterClause::Terms { terms } => {
+                assert_eq!(terms["isHot"], ["false", "true", "true"])
+            }
+            other => panic!("{other:?}"),
+        }
+        let nested = parse(r#"{"bool": {"must_not": [{"term": {"isFiltered": false}}]}}"#);
+        match nested.unwrap() {
+            FilterClause::Bool { bool } => match &bool.must_not[0] {
+                FilterClause::Term { term } => assert_eq!(term["isFiltered"], "false"),
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+        // One canonical form: the result-cache key is the same either way.
+        assert_eq!(
+            serde_json::to_string(&parse(r#"{"term": {"a": true}}"#).unwrap()).unwrap(),
+            serde_json::to_string(&parse(r#"{"term": {"a": "true"}}"#).unwrap()).unwrap(),
+        );
+        for bad in [
+            r#"{"term": {"page": 3}}"#,
+            r#"{"term": {"score": 0.5}}"#,
+            r#"{"term": {"a": null}}"#,
+            r#"{"term": {"a": ["x"]}}"#,
+            r#"{"terms": {"page": [1, 2]}}"#,
+            r#"{"terms": {"a": [null]}}"#,
+        ] {
+            let err = parse(bad).expect_err(bad);
+            assert!(err.to_string().contains("invalid type"), "{bad}: {err}");
+        }
     }
 
     #[test]
@@ -4923,6 +5162,18 @@ mod tests {
         assert!(!segment_may_match(&must, Some(&blooms)));
     }
 
+    /// A key under a directory that does not exist yet (`_warmset/query.json`
+    /// on a fresh query pod) is written, not refused with NotFound.
+    #[test]
+    fn local_storage_write_creates_missing_parent_directories() {
+        let dir = std::env::temp_dir().join("kosha-core-test-write-creates-parent");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = LocalStorage::new(dir.clone());
+        storage.write("_warmset/query.json", b"{}").unwrap();
+        assert_eq!(storage.read("_warmset/query.json").unwrap(), b"{}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Regression test for the staging incident this generalizes PR #45's
     /// fix for: `SegmentWriter::finalize()` (and every other caller of
     /// `StorageBackend::write`, e.g. WAL, the S3-hydration local cache
@@ -4980,6 +5231,37 @@ mod tests {
             "leftover temp files after atomic_write: {leftover:?}"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fill that fails part-way (`ENOSPC`, a broken download stream)
+    /// leaves the published file as it was and no temp file behind.
+    #[test]
+    fn failed_atomic_write_keeps_the_old_file_and_removes_its_temp() {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-core-test-atomic-write-fail-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("doc_store.bin");
+        std::fs::write(&path, b"complete").unwrap();
+
+        let result = atomic_write_with(&path, |tmp| {
+            std::fs::write(tmp, b"par")?;
+            Err(std::io::Error::other("no space left on device"))
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"complete");
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["doc_store.bin".to_string()],
+            "no temp file left"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -5210,12 +5492,142 @@ mod aggregation_parsing {
             ),
         ] {
             let agg = parse(json).unwrap();
-            let (parsed_kind, metric) = agg.metric().unwrap();
+            let (parsed_kind, field) = agg.metric().unwrap();
             assert_eq!(parsed_kind, kind);
-            assert_eq!(metric.field, "price");
+            assert_eq!(field, "price");
             assert_eq!(agg.type_name(), kind.name());
             assert_eq!(serde_json::to_string(&agg).unwrap(), json);
         }
+    }
+
+    #[test]
+    fn percentiles_parse_with_defaults_and_round_trip() {
+        let agg = parse(r#"{"percentiles":{"field":"latency"}}"#).unwrap();
+        let (kind, field) = agg.metric().unwrap();
+        assert_eq!(kind, MetricKind::Percentiles);
+        assert_eq!(field, "latency");
+        assert_eq!(agg.type_name(), "percentiles");
+        let Aggregation::Percentiles { percentiles } = &agg else {
+            panic!("expected percentiles");
+        };
+        assert_eq!(
+            percentiles.percents,
+            [1.0, 5.0, 25.0, 50.0, 75.0, 95.0, 99.0]
+        );
+        assert!(percentiles.keyed);
+        // Round trip: defaults are written out, `keyed: true` is not.
+        let json = serde_json::to_string(&agg).unwrap();
+        assert!(!json.contains("keyed"), "{json}");
+        let again = parse(&json).unwrap();
+        assert_eq!(serde_json::to_string(&again).unwrap(), json);
+
+        let agg =
+            parse(r#"{"percentiles":{"field":"latency","percents":[50,99.9],"keyed":false}}"#)
+                .unwrap();
+        let Aggregation::Percentiles { percentiles } = &agg else {
+            panic!("expected percentiles");
+        };
+        assert_eq!(percentiles.percents, [50.0, 99.9]);
+        assert!(!percentiles.keyed);
+        assert!(serde_json::to_string(&agg)
+            .unwrap()
+            .contains(r#""keyed":false"#));
+    }
+
+    #[test]
+    fn percentile_keys_match_elasticsearch() {
+        for (percent, key) in [
+            (1.0, "1.0"),
+            (50.0, "50.0"),
+            (99.9, "99.9"),
+            (99.99, "99.99"),
+            (0.0, "0.0"),
+            (100.0, "100.0"),
+        ] {
+            assert_eq!(AggPercentiles::key(percent), key);
+        }
+    }
+
+    #[test]
+    fn invalid_percentiles_are_rejected() {
+        for (json, needle) in [
+            (
+                r#"{"percentiles":{"field":"a","percents":[]}}"#,
+                "must not be empty",
+            ),
+            (
+                r#"{"percentiles":{"field":"a","percents":[50,101]}}"#,
+                "between 0 and 100",
+            ),
+            (
+                r#"{"percentiles":{"field":"a","percents":[-1]}}"#,
+                "between 0 and 100",
+            ),
+            (
+                r#"{"percentiles":{"field":"a","tdigest":{"compression":200}}}"#,
+                "`tdigest` is not supported yet",
+            ),
+            (
+                r#"{"percentiles":{"field":"a","hdr":{"number_of_significant_value_digits":3}}}"#,
+                "`hdr` is not supported yet",
+            ),
+            (
+                r#"{"percentiles":{"field":"a","missing":0}}"#,
+                "`missing` is not supported yet",
+            ),
+            (
+                r#"{"percentiles":{"field":"a","percent":[50]}}"#,
+                "in `percentiles` aggregation",
+            ),
+            (r#"{"percentiles":{}}"#, "in `percentiles` aggregation"),
+            (
+                r#"{"percentiles":{"field":"a"},"aggs":{"m":{"min":{"field":"a"}}}}"#,
+                "cannot have sub-aggregations",
+            ),
+        ] {
+            let err = parse(json).unwrap_err().to_string();
+            assert!(err.contains(needle), "{json}: {err}");
+        }
+        let too_many: Vec<u32> = (0..=MAX_PERCENTS as u32).map(|i| i % 100).collect();
+        let err = parse(
+            &serde_json::json!({"percentiles": {"field": "a", "percents": too_many}}).to_string(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("at most 100"), "{err}");
+
+        // A value built in code is checked by `validate`, also when nested.
+        let nested = Aggregation::Terms {
+            terms: AggTerms {
+                field: "c".into(),
+                size: 10,
+            },
+            aggs: Some(
+                [(
+                    "p".to_string(),
+                    Aggregation::Percentiles {
+                        percentiles: AggPercentiles {
+                            field: "a".into(),
+                            percents: vec![150.0],
+                            keyed: true,
+                        },
+                    },
+                )]
+                .into(),
+            ),
+        };
+        let err = nested.validate("by_c").unwrap_err();
+        assert!(err.contains("between 0 and 100"), "{err}");
+    }
+
+    #[test]
+    fn percentiles_nest_under_bucket_aggregations() {
+        let agg = parse(
+            r#"{"terms":{"field":"c"},"aggs":{"p":{"percentiles":{"field":"a","percents":[50]}}}}"#,
+        )
+        .unwrap();
+        let subs = agg.sub_aggregations().unwrap();
+        assert_eq!(subs["p"].metric().unwrap().0, MetricKind::Percentiles);
     }
 
     #[test]

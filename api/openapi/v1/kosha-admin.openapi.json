@@ -469,6 +469,177 @@
         "x-stability-level": "beta"
       }
     },
+    "/v1/admin/api-keys/plaintext-count": {
+      "get": {
+        "operationId": "AdminService_CountApiKeyPlaintext",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "A successful response."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "invalid_argument"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "permission_denied"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_found, namespace_not_found"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "method_not_allowed"
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "payload_too_large"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "internal"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unavailable; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "AdminService"
+        ],
+        "x-kosha-error-codes": [
+          "already_exists",
+          "conflict",
+          "internal",
+          "invalid_argument",
+          "method_not_allowed",
+          "namespace_not_found",
+          "not_found",
+          "not_implemented",
+          "payload_too_large",
+          "permission_denied",
+          "request_timeout",
+          "unauthenticated",
+          "unavailable",
+          "write_conflict"
+        ],
+        "x-stability-level": "beta"
+      }
+    },
     "/v1/admin/api-keys/revoke": {
       "post": {
         "operationId": "AdminService_RevokeApiKey",
@@ -3732,6 +3903,724 @@
         "x-stability-level": "beta"
       }
     },
+    "/v1/admin/operators": {
+      "get": {
+        "operationId": "AdminService_ListOperatorCredentials",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "A successful response."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "invalid_argument"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "permission_denied"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_found, namespace_not_found"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "method_not_allowed"
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "payload_too_large"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "internal"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unavailable; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "AdminService"
+        ],
+        "x-kosha-error-codes": [
+          "already_exists",
+          "conflict",
+          "internal",
+          "invalid_argument",
+          "method_not_allowed",
+          "namespace_not_found",
+          "not_found",
+          "not_implemented",
+          "payload_too_large",
+          "permission_denied",
+          "request_timeout",
+          "unauthenticated",
+          "unavailable",
+          "write_conflict"
+        ],
+        "x-stability-level": "beta"
+      },
+      "post": {
+        "operationId": "AdminService_CreateOperatorCredential",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "description": "The JSON request body.",
+          "required": true,
+          "x-originalParamName": "body"
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "A successful response."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "invalid_argument"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "permission_denied"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_found, namespace_not_found"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "method_not_allowed"
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "payload_too_large"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "internal"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unavailable; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "AdminService"
+        ],
+        "x-kosha-error-codes": [
+          "already_exists",
+          "conflict",
+          "internal",
+          "invalid_argument",
+          "method_not_allowed",
+          "namespace_not_found",
+          "not_found",
+          "not_implemented",
+          "payload_too_large",
+          "permission_denied",
+          "request_timeout",
+          "unauthenticated",
+          "unavailable",
+          "write_conflict"
+        ],
+        "x-stability-level": "beta"
+      }
+    },
+    "/v1/admin/operators/revoke": {
+      "post": {
+        "operationId": "AdminService_RevokeOperatorCredential",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "description": "The JSON request body.",
+          "required": true,
+          "x-originalParamName": "body"
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "A successful response."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "invalid_argument"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "permission_denied"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_found, namespace_not_found"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "method_not_allowed"
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "payload_too_large"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "internal"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unavailable; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "AdminService"
+        ],
+        "x-kosha-error-codes": [
+          "already_exists",
+          "conflict",
+          "internal",
+          "invalid_argument",
+          "method_not_allowed",
+          "namespace_not_found",
+          "not_found",
+          "not_implemented",
+          "payload_too_large",
+          "permission_denied",
+          "request_timeout",
+          "unauthenticated",
+          "unavailable",
+          "write_conflict"
+        ],
+        "x-stability-level": "beta"
+      }
+    },
+    "/v1/admin/operators/rotate": {
+      "post": {
+        "operationId": "AdminService_RotateOperatorCredential",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "description": "The JSON request body.",
+          "required": true,
+          "x-originalParamName": "body"
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "A successful response."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "invalid_argument"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "permission_denied"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_found, namespace_not_found"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "method_not_allowed"
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "payload_too_large"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "internal"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unavailable; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "AdminService"
+        ],
+        "x-kosha-error-codes": [
+          "already_exists",
+          "conflict",
+          "internal",
+          "invalid_argument",
+          "method_not_allowed",
+          "namespace_not_found",
+          "not_found",
+          "not_implemented",
+          "payload_too_large",
+          "permission_denied",
+          "request_timeout",
+          "unauthenticated",
+          "unavailable",
+          "write_conflict"
+        ],
+        "x-stability-level": "beta"
+      }
+    },
     "/v1/admin/orgs": {
       "post": {
         "operationId": "AdminService_CreateOrg",
@@ -6514,6 +7403,213 @@
             "schema": {
               "format": "int64",
               "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "A successful response."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "invalid_argument"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "permission_denied"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_found, namespace_not_found"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "method_not_allowed"
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying; sent with write_conflict only.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "payload_too_large"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "internal"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unavailable; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "AdminService"
+        ],
+        "x-kosha-error-codes": [
+          "already_exists",
+          "conflict",
+          "internal",
+          "invalid_argument",
+          "method_not_allowed",
+          "namespace_not_found",
+          "not_found",
+          "not_implemented",
+          "payload_too_large",
+          "permission_denied",
+          "request_timeout",
+          "unauthenticated",
+          "unavailable",
+          "write_conflict"
+        ],
+        "x-stability-level": "beta"
+      }
+    },
+    "/v1/admin/usage/reconcile": {
+      "get": {
+        "operationId": "AdminService_ReconcileUsage",
+        "parameters": [
+          {
+            "description": "Narrow to one tenant.",
+            "in": "query",
+            "name": "tenant",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Relative difference allowed per namespace.",
+            "in": "query",
+            "name": "tolerance",
+            "schema": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          {
+            "description": "Absolute difference allowed per namespace, in bytes.",
+            "in": "query",
+            "name": "tolerance_bytes",
+            "schema": {
+              "format": "uint64",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Oldest stored-bytes snapshot accepted: seconds or a duration such as 3h (at least one hour).",
+            "in": "query",
+            "name": "max_snapshot_age",
+            "schema": {
+              "type": "string"
             }
           }
         ],

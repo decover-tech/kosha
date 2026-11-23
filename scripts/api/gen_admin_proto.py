@@ -26,6 +26,12 @@ QUERY_PARAMS = {
         ("to", "int64", "Window end, Unix seconds (default: now)."),
     ],
     "AdminService_ListApiKeys": [("tenant_id", "string", "Narrow to one tenant.")],
+    "AdminService_ReconcileUsage": [
+        ("tenant", "string", "Narrow to one tenant."),
+        ("tolerance", "double", "Relative difference allowed per namespace."),
+        ("tolerance_bytes", "uint64", "Absolute difference allowed per namespace, in bytes."),
+        ("max_snapshot_age", "string", "Oldest stored-bytes snapshot accepted: seconds or a duration such as 3h (at least one hour)."),
+    ],
     "AdminService_ListInvoices": [("tenant", "string", "Narrow to one tenant.")],
     "AdminService_ListDeletions": [
         ("state", "string", "\"pending\" or \"completed\"."),

@@ -492,16 +492,19 @@ impl ApiError {
     }
 
     /// The complete raw HTTP/1.1 response the `String`-returning handlers
-    /// in `main.rs` produce. Logs the failure like every error response.
+    /// in `main.rs` produce. The failure is logged once, by `log_request`,
+    /// from the body; only log-only detail (never in the body) is logged
+    /// here.
     pub(crate) fn into_raw(self) -> String {
         let request_id = current_request_id();
         let status = self.code.status();
-        eprintln!(
-            "WARN: request failed: status={status} code={} {}{}",
-            self.code.as_str(),
-            self.log_detail.as_deref().unwrap_or(&self.message),
-            log_rid()
-        );
+        if let Some(detail) = &self.log_detail {
+            eprintln!(
+                "WARN: request failed: status={status} code={} {detail}{}",
+                self.code.as_str(),
+                log_rid()
+            );
+        }
         let body = self.body(&request_id).to_string();
         let mut out = format!("HTTP/1.1 {status} {}\r\n", reason_phrase(status));
         for (name, value) in self.response_headers(&request_id) {

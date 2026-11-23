@@ -66,6 +66,17 @@ crc32fast = "1"
 prometheus-client = "0.26"
 fail = "0.5"
 
+# Cache writeback control (writeback.rs): start writing a freshly filled
+# cache range to disk without waiting, and `syncfs` before the pod reports
+# ready. Safe syscall wrappers (this workspace forbids unsafe code); already
+# in the dependency tree through `tempfile`.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", default-features = false, features = ["std", "fs"] }
+
 [dev-dependencies]
+# A one-thread pool for the scoring-never-writes test (posting_spans).
+rayon = { workspace = true }
+# Paused clock for budget-wait tests (`hydration_budget`).
+tokio = { version = "1", features = ["test-util"] }
 # Self-signed certificates for the TLS smoke test (http.rs).
 rcgen = "=0.14.5"

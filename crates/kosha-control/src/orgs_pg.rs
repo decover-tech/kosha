@@ -37,6 +37,14 @@ fn seconds(ms: i64) -> f64 {
     ms as f64 / 1000.0
 }
 
+/// Appends one `kosha.audit_log` row. Binds, in order: `org_id`, `actor`,
+/// `action`, `target_type`, `target_id`, `detail` (JSON text). Shared with
+/// the operator-credential changes in `api_key_store`, which audit inside
+/// their own transaction.
+pub(crate) const INSERT_AUDIT: &str = "INSERT INTO kosha.audit_log \
+         (org_id, actor, action, target_type, target_id, detail) \
+     VALUES ($1, $2, $3, $4, $5, $6)";
+
 struct PgTx<'a> {
     tx: sqlx::Transaction<'static, sqlx::Postgres>,
     rt: &'a tokio::runtime::Runtime,
@@ -395,18 +403,14 @@ impl OrgTx for PgTx<'_> {
     fn insert_audit(&mut self, event: &NewAuditEvent) -> Result<(), OrgError> {
         self.rt
             .block_on(
-                sqlx::query(
-                    "INSERT INTO kosha.audit_log \
-                         (org_id, actor, action, target_type, target_id, detail) \
-                     VALUES ($1, $2, $3, $4, $5, $6)",
-                )
-                .bind(&event.org_id)
-                .bind(&event.actor)
-                .bind(event.action)
-                .bind(event.target_type)
-                .bind(&event.target_id)
-                .bind(event.detail.to_string())
-                .execute(&mut *self.tx),
+                sqlx::query(INSERT_AUDIT)
+                    .bind(&event.org_id)
+                    .bind(&event.actor)
+                    .bind(event.action)
+                    .bind(event.target_type)
+                    .bind(&event.target_id)
+                    .bind(event.detail.to_string())
+                    .execute(&mut *self.tx),
             )
             .map(|_| ())
             .map_err(store_error)

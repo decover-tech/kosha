@@ -419,6 +419,229 @@ fn concurrent_first_boot_migrations_all_succeed() {
     admin_exec(&url, &format!("DROP DATABASE {db} WITH (FORCE)"));
 }
 
+/// Every table the embedded migrations create, by the migration that
+/// creates it. A new migration adds its tables here.
+const MIGRATED_TABLES: &[&str] = &[
+    // 001_create_kosha_tables
+    "namespaces",
+    "manifests",
+    "retired_namespaces",
+    "api_keys",
+    "hydration_leases",
+    // 003_writer_leases
+    "writer_leases",
+    // 004_deletion_records
+    "deletion_records",
+    // 005_usage_events
+    "usage_events",
+    // 006_orgs_users_projects
+    "users",
+    "organizations",
+    "org_members",
+    "projects",
+    "tenants",
+    "audit_log",
+    // 007_billing
+    "billing_accounts",
+    "billing_invoices",
+];
+
+/// The migrations came from separate branches (#426): booting twice on
+/// one database must apply all of them the first time and change nothing
+/// the second. Uses its own freshly created database, like
+/// `concurrent_first_boot_migrations_all_succeed`.
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn booting_twice_on_one_database_creates_every_table_once() {
+    use sqlx::Connection;
+    let url = std::env::var("KOSHA_TEST_DATABASE_URL").expect("set a dedicated test database URL");
+    let db = format!("kosha_migrate_{}", uuid::Uuid::new_v4().simple());
+    admin_exec(&url, &format!("CREATE DATABASE {db}"));
+    let fresh = with_database(&url, &db);
+
+    // Tables with their columns, and indexes, of the `kosha` schema.
+    let schema = || -> (Vec<(String, String)>, Vec<String>) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut conn = sqlx::PgConnection::connect(&fresh).await.unwrap();
+            let columns = sqlx::query_as(
+                "SELECT table_name::TEXT, column_name::TEXT FROM information_schema.columns \
+                 WHERE table_schema = 'kosha' ORDER BY 1, 2",
+            )
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+            let indexes: Vec<(String,)> = sqlx::query_as(
+                "SELECT indexname::TEXT FROM pg_indexes WHERE schemaname = 'kosha' ORDER BY 1",
+            )
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+            conn.close().await.unwrap();
+            (columns, indexes.into_iter().map(|(name,)| name).collect())
+        })
+    };
+
+    let first = PgStore::new(&fresh).unwrap();
+    let after_first = schema();
+    for table in MIGRATED_TABLES {
+        assert!(
+            after_first.0.iter().any(|(name, _)| name == table),
+            "kosha.{table} is missing after the first boot"
+        );
+    }
+    // 003_scoped_api_keys alters a table instead of creating one.
+    for column in [
+        "key_hash",
+        "scopes",
+        "namespaces",
+        "expires_at",
+        "last_used_at",
+    ] {
+        assert!(
+            after_first
+                .0
+                .contains(&("api_keys".to_string(), column.to_string())),
+            "kosha.api_keys.{column} is missing after the first boot"
+        );
+    }
+    assert!(after_first.1.contains(&"idx_api_keys_key_hash".to_string()));
+
+    // Rows written between the boots survive the second one.
+    let tenant = format!("boot-{}", uuid::Uuid::new_v4());
+    let key = first
+        .create_api_key(&kosha_control::NewApiKey {
+            tenant_id: tenant.clone(),
+            description: "kept".to_string(),
+            scopes: kosha_control::Scopes::ALL,
+            namespaces: None,
+            expires_at: None,
+        })
+        .unwrap();
+    drop(first);
+    let second = PgStore::new(&fresh).unwrap();
+    assert_eq!(schema(), after_first, "the second boot changed the schema");
+    assert_eq!(second.validate_api_key(&key.api_key), Some(tenant));
+
+    drop(second);
+    admin_exec(&url, &format!("DROP DATABASE {db} WITH (FORCE)"));
+}
+
+/// Run `setup` as the connected (admin) role, then, as `role`: what
+/// `UNUSABLE_RELATIONS_SQL` reports, and the result of a statement the
+/// server runs on `kosha.hydration_leases`.
+async fn as_server_role(
+    conn: &mut sqlx::PgConnection,
+    role: &str,
+    setup: &str,
+) -> (
+    Vec<String>,
+    Result<sqlx::postgres::PgQueryResult, sqlx::Error>,
+) {
+    sqlx::raw_sql(&format!("RESET ROLE;\n{setup};\nSET ROLE {role}"))
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    let unusable: Vec<String> = sqlx::query_scalar(kosha_control::UNUSABLE_RELATIONS_SQL)
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+    let delete = sqlx::query("DELETE FROM kosha.hydration_leases")
+        .execute(&mut *conn)
+        .await;
+    (unusable, delete)
+}
+
+/// #426: an instance migrated by an admin (`make db-migrate`) with a 002
+/// that did not hand over `kosha.hydration_leases` boots, and then fails
+/// every statement on that table. The embedded migrations cannot repair
+/// ownership, so the store reports what its role cannot use; re-running the
+/// current 002 clears it. Runs the real 002 for a stand-in role (`SET ROLE`,
+/// so no second login is needed) in its own database.
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn a_table_002_did_not_hand_over_is_reported_until_002_is_rerun() {
+    use sqlx::Connection;
+    let url = std::env::var("KOSHA_TEST_DATABASE_URL").expect("set a dedicated test database URL");
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let db = format!("kosha_owner_{id}");
+    let role = format!("kosha_role_{id}");
+    admin_exec(&url, &format!("CREATE DATABASE {db}"));
+    let fresh = with_database(&url, &db);
+
+    // The connecting role created every table: nothing to report.
+    let store = PgStore::new(&fresh).unwrap();
+    assert_eq!(store.unusable_relations().unwrap(), Vec::<String>::new());
+    drop(store);
+
+    // 002 as it is, and as it was before #426 (no hydration_leases line),
+    // for the stand-in role.
+    let grants = include_str!("../migrations/002_grant_kosha_role.sql")
+        .replace("TO kosha;", &format!("TO {role};"));
+    assert!(grants.contains(&format!("kosha.hydration_leases OWNER TO {role};")));
+    let old_grants: String = grants
+        .lines()
+        .filter(|line| !line.contains("hydration_leases"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut conn = sqlx::PgConnection::connect(&fresh).await.unwrap();
+        // Before 002: the role can use nothing the admin created.
+        let (unusable, delete) =
+            as_server_role(&mut conn, &role, &format!("CREATE ROLE {role} NOLOGIN")).await;
+        for table in MIGRATED_TABLES {
+            assert!(unusable.iter().any(|name| name == table), "{table}");
+        }
+        assert!(unusable.contains(&"audit_log_id_seq".to_string()));
+        assert!(delete.is_err());
+
+        // The old 002: the server boots, hydration_leases stays out of reach.
+        let (unusable, delete) = as_server_role(&mut conn, &role, &old_grants).await;
+        assert_eq!(unusable, vec!["hydration_leases".to_string()]);
+        let denied = delete.unwrap_err();
+        assert_eq!(
+            denied.as_database_error().and_then(|e| e.code()).as_deref(),
+            Some("42501"),
+            "{denied}"
+        );
+        let warning = kosha_control::unusable_relations_warning(&unusable).unwrap();
+        assert!(warning.contains("kosha.hydration_leases"), "{warning}");
+
+        // Re-running 002 as the admin repairs it; a second run changes nothing.
+        for _ in 0..2 {
+            let (unusable, delete) = as_server_role(&mut conn, &role, &grants).await;
+            assert_eq!(unusable, Vec::<String>::new());
+            delete.unwrap();
+        }
+        conn.close().await.unwrap();
+    });
+
+    admin_exec(&url, &format!("DROP DATABASE {db} WITH (FORCE)"));
+    admin_exec(&url, &format!("DROP ROLE {role}"));
+}
+
+#[test]
+fn the_unusable_relations_warning_names_the_tables_and_the_fix() {
+    assert_eq!(kosha_control::unusable_relations_warning(&[]), None);
+    let one = kosha_control::unusable_relations_warning(&["hydration_leases".to_string()]).unwrap();
+    assert!(one.contains("cannot read and write kosha.hydration_leases."));
+    assert!(one.contains("002_grant_kosha_role.sql"));
+    let two = kosha_control::unusable_relations_warning(&[
+        "audit_log".to_string(),
+        "audit_log_id_seq".to_string(),
+    ])
+    .unwrap();
+    assert!(two.contains("kosha.audit_log, kosha.audit_log_id_seq"));
+}
+
 #[test]
 fn with_database_replaces_only_the_database_name() {
     assert_eq!(
@@ -433,6 +656,65 @@ fn with_database_replaces_only_the_database_name() {
         with_database("postgres://h:5432", "x"),
         "postgres://h:5432/x"
     );
+}
+
+/// #347: each pod's cache purge pages through every deletion record, of
+/// any state, in `(requested_at_ms, id)` order, and re-reads a window
+/// behind the newest it has seen.
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn postgres_pages_through_deletion_records_in_position_order() {
+    use kosha_core::deletion::{DeletionPosition, DeletionRecord, NewDeletion};
+    let url = std::env::var("KOSHA_TEST_DATABASE_URL").expect("set a dedicated test database URL");
+    let mut store = PgStore::new(&url).unwrap();
+    let tenant = format!("page-test-{}", uuid::Uuid::new_v4());
+    let mut issued: Vec<DeletionRecord> = Vec::new();
+    for i in 0..5u64 {
+        let subject = format!("{tenant}/ns{i}");
+        let request = NewDeletion::namespace(&subject, Some(&tenant), None);
+        issued.push(store.begin_deletion(&request, i).unwrap());
+    }
+    store
+        .record_deletion_attempt(&issued[1].id, 0, None)
+        .unwrap();
+    let ours = |records: Vec<DeletionRecord>| -> Vec<DeletionRecord> {
+        records
+            .into_iter()
+            .filter(|r| r.tenant_id.as_deref() == Some(tenant.as_str()))
+            .collect()
+    };
+
+    // From the start, two at a time: the whole table in order, each record
+    // once (other tests' rows are in it too).
+    let mut all: Vec<DeletionRecord> = Vec::new();
+    let mut after: Option<DeletionPosition> = None;
+    loop {
+        let page = store.deletions_after(after.as_ref(), 2).unwrap();
+        assert!(page.len() <= 2);
+        let Some(last) = page.last() else { break };
+        after = Some(last.position());
+        all.extend(page);
+    }
+    let positions: Vec<DeletionPosition> = all.iter().map(DeletionRecord::position).collect();
+    let mut sorted = positions.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(positions, sorted, "ordered, no record twice");
+    let mine = ours(all);
+    assert_eq!(mine.len(), 5);
+    assert_eq!(mine.iter().filter(|r| r.is_completed()).count(), 1);
+
+    // A window: everything requested at or after a record's millisecond.
+    let oldest = issued.iter().map(|r| r.requested_at_ms).min().unwrap();
+    let window = ours(
+        store
+            .deletions_after(Some(&DeletionPosition::at_ms(oldest)), 1000)
+            .unwrap(),
+    );
+    assert_eq!(window.len(), 5);
+    // Strictly after the newest of ours: none of ours.
+    let newest = issued.iter().map(DeletionRecord::position).max().unwrap();
+    assert!(ours(store.deletions_after(Some(&newest), 1000).unwrap()).is_empty());
 }
 
 /// #347: the namespace's rows and its pending deletion record go in one
