@@ -225,6 +225,9 @@ pub struct SpanOutcome {
     /// Segments the ranged path could not serve; the caller fetches their
     /// whole files instead.
     pub whole_fallback: Vec<PathBuf>,
+    /// Why the first `whole_fallback` segment could not be served by range,
+    /// for the fallback's log line. Set on the failure path only.
+    pub fallback_error: Option<String>,
     /// Segments that just crossed a promotion threshold; the caller queues
     /// a background whole-file hydration and then calls
     /// [`SpanHydrator::finish_promotion`].
@@ -360,7 +363,9 @@ impl SpanHydrator {
                             }
                         }
                         Ok(None) => {}
-                        Err(_) => {
+                        Err(e) => {
+                            out.fallback_error
+                                .get_or_insert_with(|| format!("doc_vectors span: {e}"));
                             fallback[i] = true;
                             break;
                         }
@@ -413,10 +418,17 @@ impl SpanHydrator {
                             bytes.len(),
                             p.exact
                         );
+                        out.fallback_error.get_or_insert_with(|| {
+                            format!("{} returned {} bytes", p.file, bytes.len())
+                        });
                         fallback[p.seg] = true;
                     }
                     Err(KoshaError::Overloaded(_)) => out.shed = true,
-                    Err(_) => fallback[p.seg] = true,
+                    Err(e) => {
+                        out.fallback_error
+                            .get_or_insert_with(|| format!("{}: {e}", p.file));
+                        fallback[p.seg] = true;
+                    }
                 }
             }
         }

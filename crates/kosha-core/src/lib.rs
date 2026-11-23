@@ -1849,7 +1849,18 @@ impl LocalStorage {
 ///
 /// The temp filename includes the PID and a per-process atomic counter so
 /// concurrent writes to the *same* path never collide on the same temp file.
-fn atomic_write(path: &std::path::Path, data: &[u8]) -> Result<(), KoshaError> {
+pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> Result<(), KoshaError> {
+    atomic_write_with(path, |tmp| std::fs::write(tmp, data))
+}
+
+/// [`atomic_write`] with the temp file filled by `fill` (a copy, a
+/// stream): `path` only ever appears complete. When `fill` or the rename
+/// fails, the temp file is removed, so a failed write (`ENOSPC` part-way)
+/// leaves neither a truncated `path` nor a stray temp file.
+pub fn atomic_write_with(
+    path: &std::path::Path,
+    fill: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> Result<(), KoshaError> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1868,8 +1879,18 @@ fn atomic_write(path: &std::path::Path, data: &[u8]) -> Result<(), KoshaError> {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp_path = dir.join(format!(".{file_name}.tmp.{}.{n}", std::process::id()));
 
-    std::fs::write(&tmp_path, data)?;
-    std::fs::rename(&tmp_path, path)?;
+    let written = fill(&tmp_path).and_then(|()| std::fs::rename(&tmp_path, path));
+    if let Err(e) = written {
+        if let Err(rm) = std::fs::remove_file(&tmp_path) {
+            if rm.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "WARN: removing temp file {} after a failed write also failed: {rm}",
+                    tmp_path.display()
+                );
+            }
+        }
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -5024,6 +5045,37 @@ mod tests {
             "leftover temp files after atomic_write: {leftover:?}"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fill that fails part-way (`ENOSPC`, a broken download stream)
+    /// leaves the published file as it was and no temp file behind.
+    #[test]
+    fn failed_atomic_write_keeps_the_old_file_and_removes_its_temp() {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-core-test-atomic-write-fail-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("doc_store.bin");
+        std::fs::write(&path, b"complete").unwrap();
+
+        let result = atomic_write_with(&path, |tmp| {
+            std::fs::write(tmp, b"par")?;
+            Err(std::io::Error::other("no space left on device"))
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"complete");
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["doc_store.bin".to_string()],
+            "no temp file left"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

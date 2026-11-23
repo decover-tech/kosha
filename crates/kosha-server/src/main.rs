@@ -3596,8 +3596,10 @@ impl AppState {
         &self,
         pages: &[PageSegment<'_>],
         request: &Arc<RequestHydration>,
+        rid: &str,
     ) -> doc_spans::PageFetchStats {
         let mut stats = doc_spans::PageFetchStats::default();
+        let mut fallback_error = None;
         let whole: Vec<PathBuf> = match (self.doc_read_mode, &self.s3_storage) {
             (_, None) => return stats,
             (doc_spans::ReadMode::Whole, Some(_)) => {
@@ -3621,6 +3623,7 @@ impl AppState {
                     self.doc_store_reads.promotion_queued();
                     self.doc_store_promotions.push(seg);
                 }
+                fallback_error = outcome.fallback_error;
                 outcome.whole_fallback
             }
         };
@@ -3629,6 +3632,11 @@ impl AppState {
             stats.rounds += 1;
             stats.whole_files = files as u64;
             stats.whole_bytes = bytes;
+            // Legacy segments (no span index) go whole by design and carry
+            // no error; only a failed range is logged.
+            if let Some(error) = fallback_error {
+                log_ranged_fallback(&whole[0], "doc_store.bin", whole.len(), &error, bytes, rid);
+            }
         }
         self.doc_store_reads.record(&stats);
         stats
@@ -4984,6 +4992,7 @@ impl AppState {
                 }
             }
             let mut fallback_round = false;
+            let fallback_error = o.fallback_error.unwrap_or_default();
             for (seg, files) in by_seg {
                 let w = self.ensure_posting_blobs_local(
                     ns,
@@ -4991,6 +5000,14 @@ impl AppState {
                     std::slice::from_ref(&seg),
                     &files,
                     request,
+                );
+                log_ranged_fallback(
+                    &seg,
+                    &files.join(","),
+                    1,
+                    &fallback_error,
+                    w.bytes_fetched,
+                    &request_id(),
                 );
                 fallback_round |= w.files_fetched > 0 || !w.missing.is_empty();
                 stats.whole_files += w.files_fetched as u64;
@@ -5036,6 +5053,7 @@ impl AppState {
         file: &str,
         ranges: &[(u64, u64)],
         request: &Arc<RequestHydration>,
+        rid: &str,
     ) -> posting_spans::PostingFetchStats {
         let mut stats = posting_spans::PostingFetchStats::default();
         let Some(ref s3) = self.s3_storage else {
@@ -5071,11 +5089,19 @@ impl AppState {
         // full-precision sidecar the codes-only tier exists to keep remote,
         // ~200 MB per segment. The pass reports the vectors it could not
         // read as unavailable (and the segment degraded) instead.
+        let error = o.error.as_deref().unwrap_or_default();
         if o.failed && file != kosha_segment::DOC_VECTORS_FILE {
             let (files, bytes) = self.ensure_files_local(&[seg.to_path_buf()], file, request);
             stats.rounds += 1;
             stats.whole_files = files as u64;
             stats.whole_bytes = bytes;
+            log_ranged_fallback(seg, file, 1, error, bytes, rid);
+        } else if o.failed {
+            eprintln!(
+                "WARN: ranged read of {}/{file} failed ({error}); not fetching the whole \
+                 file, its vectors are reported unavailable{rid}",
+                seg.display()
+            );
         }
         self.posting_reads.record(&stats);
         stats
@@ -5941,7 +5967,13 @@ fn dispatch(state: &AppState, request: http::Request) -> http::Response {
     // `is_write_path`) and answered ahead of the indexer's route gate
     // (#254): each pod, whatever its role, reports its own process.
     if request_line.starts_with("GET /metrics ") || request_line.starts_with("GET /metrics?") {
-        return http::Response::from_raw(handle_metrics(state, &headers));
+        let response = http::Response::from_raw(handle_metrics(state, &headers));
+        // A refused scrape is logged like any failed request; the
+        // per-scrape 200 is not.
+        if response.status() >= 400 {
+            log_request(&request_line, "-", body.len(), &response, started);
+        }
+        return response;
     }
 
     // Built-in dashboard (#214): its static assets hold no data and are
@@ -6201,13 +6233,7 @@ fn tenant_rejection(
     state
         .metrics
         .record_tenant_rejection(rejection.reason, tenant);
-    eprintln!(
-        "WARN: request refused: status=429 tenant={tenant} reason={} limit={} retry_after_ms={}{}",
-        rejection.reason.as_str(),
-        rejection.limit,
-        rejection.retry_after_ms,
-        request_id()
-    );
+    // Logged once, by `log_request`, from the body's reason/limit fields.
     let body = rejection.body().to_string();
     retry_after(
         format!(
@@ -6426,6 +6452,7 @@ impl SearchObservation {
             Err(why) => {
                 self.shed.set(Some(why));
                 state.metrics.record_queue_shed();
+                log_queue_shed(&state.search_semaphore, &tenant, why);
                 None
             }
         }
@@ -6462,17 +6489,64 @@ impl SearchObservation {
     }
 }
 
+/// A ranged read that failed and was replaced by a whole-file fetch (#245):
+/// the request paid for the whole file, which the ranged path exists to
+/// avoid. Failure path only. `segments` > 1 when one fetch covered several
+/// segments (`first` is the first of them).
+#[cfg(feature = "s3")]
+fn log_ranged_fallback(
+    first: &Path,
+    file: &str,
+    segments: usize,
+    error: &str,
+    bytes: u64,
+    rid: &str,
+) {
+    let more = if segments > 1 {
+        format!(" (+{} more segments)", segments - 1)
+    } else {
+        String::new()
+    };
+    eprintln!(
+        "WARN: ranged read of {}/{file}{more} failed ({error}); fetched the whole file \
+         ({:.1} MB){rid}",
+        first.display(),
+        bytes as f64 / (1024.0 * 1024.0)
+    );
+}
+
+/// The shed's cause and the queue it saw, one line per shed: the 429's
+/// text alone cannot tell a burst (queue full) from slow scoring (waits
+/// expiring with few waiters). Shed path only.
+fn log_queue_shed(sem: &fair_admission::FairSemaphore, tenant: &str, why: metrics::QueueShed) {
+    let cause = match why {
+        metrics::QueueShed::Full => "full".to_string(),
+        metrics::QueueShed::TenantFull => "tenant share full".to_string(),
+        metrics::QueueShed::Timeout => format!(
+            "wait expired after {}ms",
+            sem.wait_timeout().map_or(0, |t| t.as_millis())
+        ),
+    };
+    let q = sem.shed_snapshot(tenant);
+    eprintln!(
+        "WARN: search shed: scoring queue {cause} permits={} in_use={} waiters={} \
+         tenant={tenant} tenant_waiters={}{}",
+        q.permits,
+        q.in_use,
+        q.waiters,
+        q.tenant_waiters,
+        request_id()
+    );
+}
+
 /// The 429 for a search the pod shed for a reason that is not a tenant
 /// limit (scoring queue, hydration ceiling, memory admission): the same
 /// contract as [`tenant_rejection`] minus `limit`, so every search 429
 /// carries `Retry-After` and a JSON body `{error, reason, retry_after_ms}`
 /// (#341). Not counted in `kosha_tenant_rejections_total`.
 fn overload_shed_response(reason: &str, message: &str) -> String {
+    // Logged once, by `log_request`, from the body.
     let retry_after_ms = tenant_limits::QUEUE_SHED_RETRY_AFTER_MS;
-    eprintln!(
-        "WARN: request failed: status=429 reason={reason} {message}{}",
-        request_id()
-    );
     let body = serde_json::json!({
         "error": message,
         "reason": reason,
@@ -6514,8 +6588,16 @@ fn observe_search(state: &AppState, run: impl FnOnce(&SearchObservation) -> Stri
 }
 
 /// One line per API request: who asked for what, the status returned and how
-/// long it took. A successful search is skipped because it already prints
-/// the more detailed `search timing:` line; probes never reach here.
+/// long it took. A failed request (status >= 400) is one `WARN: request
+/// failed:` line that also carries the error body's message and 429
+/// fields, so the handlers that build error responses (`json_error`,
+/// `tenant_rejection`, `overload_shed_response`) do not log them again.
+///
+/// Skipped: a successful search, by design: a slow one prints the
+/// `search timing:` line and a fast one leaves no per-request line at
+/// all; and the `404 not cached here` of `GET /internal/segment/`, the
+/// expected answer of the peer-poll protocol (the caller falls back to
+/// the lease owner or S3). Probes never reach here.
 fn log_request(
     request_line: &str,
     tenant: &str,
@@ -6523,19 +6605,54 @@ fn log_request(
     response: &http::Response,
     started: Instant,
 ) {
+    match request_log_line(request_line, tenant, body_bytes, response, started) {
+        Some(RequestLog::Failed(line)) => eprintln!("{line}"),
+        Some(RequestLog::Ok(line)) => println!("{line}"),
+        None => {}
+    }
+}
+
+/// [`log_request`]'s line, if the request gets one.
+#[derive(Debug)]
+enum RequestLog {
+    /// `WARN: request failed: …`, to stderr.
+    Failed(String),
+    /// `request: …`, to stdout.
+    Ok(String),
+}
+
+fn request_log_line(
+    request_line: &str,
+    tenant: &str,
+    body_bytes: usize,
+    response: &http::Response,
+    started: Instant,
+) -> Option<RequestLog> {
     let status = response.status();
     let mut parts = request_line.split_whitespace();
     let (method, target) = (parts.next().unwrap_or("-"), parts.next().unwrap_or("-"));
     let path = target.split('?').next().unwrap_or(target);
     if status == 200 && path.ends_with("/search") {
-        return;
+        return None;
     }
-    println!(
-        "request: {method} {path} status={status} tenant={tenant} ms={:.1} in_bytes={body_bytes} out_bytes={}{}",
-        started.elapsed().as_secs_f64() * 1e3,
-        response.body_len(),
-        request_id()
-    );
+    if status == 404 && path.starts_with("/internal/segment/") {
+        return None;
+    }
+    let ms = started.elapsed().as_secs_f64() * 1e3;
+    let out_bytes = response.body_len();
+    let rid = request_id();
+    Some(if status >= 400 {
+        RequestLog::Failed(format!(
+            "WARN: request failed: status={status}{} {method} {path} tenant={tenant} ms={ms:.1} \
+             in_bytes={body_bytes} out_bytes={out_bytes}{rid}",
+            response.error_fields(),
+        ))
+    } else {
+        RequestLog::Ok(format!(
+            "request: {method} {path} status={status} tenant={tenant} ms={ms:.1} \
+             in_bytes={body_bytes} out_bytes={out_bytes}{rid}"
+        ))
+    })
 }
 
 /// Extract and validate the API key from request headers.
@@ -8634,11 +8751,15 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     // disk with no S3 request (#245; the PR #84 property).
     #[cfg(feature = "s3")]
     let page_fetch = Mutex::new(doc_spans::PageFetchStats::default());
+    // The request id for the hydrators' failure lines: they can run on the
+    // query's worker threads, where the thread-local id is not set.
+    #[cfg(feature = "s3")]
+    let rid = request_id();
     #[cfg(feature = "s3")]
     let ensure_doc_store = |pages: &[PageSegment<'_>]| {
         // Same accountant as the scoring-set fetch above: the request pays
         // for its page's bytes, so the request's ceiling has to cover them.
-        let stats = state.hydrate_page_docs(pages, &hydration_request);
+        let stats = state.hydrate_page_docs(pages, &hydration_request, &rid);
         page_fetch.lock().unwrap().add(&stats);
     };
     #[cfg(feature = "s3")]
@@ -8651,7 +8772,7 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     let vector_fetch_stats = Mutex::new(posting_spans::PostingFetchStats::default());
     #[cfg(feature = "s3")]
     let fetch_vectors = |seg: &Path, file: &str, ranges: &[(u64, u64)]| {
-        let stats = state.hydrate_vector_postings(seg, file, ranges, &hydration_request);
+        let stats = state.hydrate_vector_postings(seg, file, ranges, &hydration_request, &rid);
         vector_fetch_stats.lock().unwrap().add(&stats);
     };
     #[cfg(feature = "s3")]
@@ -9246,11 +9367,15 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
     // `hydrate_page_docs`.
     #[cfg(feature = "s3")]
     let page_fetch = Mutex::new(doc_spans::PageFetchStats::default());
+    // The request id for the hydrators' failure lines: they can run on the
+    // query's worker threads, where the thread-local id is not set.
+    #[cfg(feature = "s3")]
+    let rid = request_id();
     #[cfg(feature = "s3")]
     let ensure_doc_store = |pages: &[PageSegment<'_>]| {
         // Same accountant as the scoring-set fetch above: the request pays
         // for its page's bytes, so the request's ceiling has to cover them.
-        let stats = state.hydrate_page_docs(pages, &hydration_request);
+        let stats = state.hydrate_page_docs(pages, &hydration_request, &rid);
         page_fetch.lock().unwrap().add(&stats);
     };
     #[cfg(feature = "s3")]
@@ -9263,7 +9388,7 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
     let vector_fetch_stats = Mutex::new(posting_spans::PostingFetchStats::default());
     #[cfg(feature = "s3")]
     let fetch_vectors = |seg: &Path, file: &str, ranges: &[(u64, u64)]| {
-        let stats = state.hydrate_vector_postings(seg, file, ranges, &hydration_request);
+        let stats = state.hydrate_vector_postings(seg, file, ranges, &hydration_request, &rid);
         vector_fetch_stats.lock().unwrap().add(&stats);
     };
     #[cfg(feature = "s3")]
@@ -11433,11 +11558,8 @@ fn json_accepted<T: serde::Serialize>(value: &T) -> String {
 }
 
 fn json_error(status_code: u16, message: &str) -> String {
-    // The reason for an error response; `request:` carries the rest.
-    eprintln!(
-        "WARN: request failed: status={status_code} {message}{}",
-        request_id()
-    );
+    // Logged once, by `log_request`, which reads `message` back from the
+    // body: every response reaches the client through `dispatch`.
     let body = serde_json::json!({"error": message}).to_string();
     let status_line = match status_code {
         400 => "400 Bad Request",
@@ -17344,6 +17466,58 @@ mod tests {
             ),
         );
         assert_eq!(response.status(), 400);
+    }
+
+    /// The peer-poll `404 not cached here` is expected protocol and leaves
+    /// no log line; any other failure is exactly one line carrying the
+    /// error message (the handler no longer logs it a second time).
+    #[test]
+    fn request_log_skips_peer_poll_404_and_logs_failures_once_with_message() {
+        let started = Instant::now();
+        let not_cached = http::Response::from_raw(json_error(404, "not cached here"));
+        assert!(request_log_line(
+            "GET /internal/segment/ns/seg/missing.bin HTTP/1.1",
+            "service",
+            0,
+            &not_cached,
+            started
+        )
+        .is_none());
+
+        let missing = http::Response::from_raw(json_error(404, "namespace not found: acme/x"));
+        let Some(RequestLog::Failed(line)) = request_log_line(
+            "POST /v1/namespaces/acme%2Fx/query HTTP/1.1",
+            "acme",
+            12,
+            &missing,
+            started,
+        ) else {
+            panic!("a failed request is logged as a failure");
+        };
+        assert!(
+            line.starts_with("WARN: request failed: status=404"),
+            "{line}"
+        );
+        assert!(
+            line.contains(r#"error="namespace not found: acme/x""#),
+            "{line}"
+        );
+        assert!(line.contains("tenant=acme"), "{line}");
+
+        let shed = http::Response::from_raw(overload_shed_response(
+            "search_queue_full",
+            "search overloaded: scoring queue is saturated — retry with backoff",
+        ));
+        let Some(RequestLog::Failed(line)) =
+            request_log_line("POST /search HTTP/1.1", "acme", 0, &shed, started)
+        else {
+            panic!("a shed is logged as a failure");
+        };
+        assert!(line.contains("reason=search_queue_full"), "{line}");
+        assert!(line.contains("retry_after_ms="), "{line}");
+
+        let ok = http::Response::from_raw(json_ok(&serde_json::json!({"hits": []})));
+        assert!(request_log_line("POST /search HTTP/1.1", "acme", 0, &ok, started).is_none());
     }
 
     /// Parse a raw request (request line, headers, blank line, body) into

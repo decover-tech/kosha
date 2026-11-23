@@ -22,6 +22,50 @@ use kosha_core::{KoshaError, LocalStorage, ObjectMeta, StorageBackend};
 use crate::hydration_budget::{BudgetPermit, HydrationBudget, RequestHydration};
 use crate::segment_commit;
 
+/// Log an S3 SDK error's whole cause chain server-side, and return the
+/// short form for the error message.
+///
+/// The SDK's `Display` is only the outer layer ("dispatch failure",
+/// "service error"), which says nothing about the cause.
+/// [`aws_sdk_s3::error::DisplayErrorContext`] prints the chain, but that
+/// chain can carry the role ARN (account id), the bucket and S3 request
+/// ids. Error messages built here can reach a tenant's response body, so
+/// the chain goes only to the pod log, with the request id; the message
+/// keeps the short form. Error path only.
+pub(crate) fn log_s3_error<E: std::error::Error>(op: &str, target: &str, e: &E) -> String {
+    #[cfg(test)]
+    S3_ERRORS_LOGGED.with(|n| n.set(n.get() + 1));
+    eprintln!(
+        "WARN: S3 {op} {target} failed: {}{}",
+        aws_sdk_s3::error::DisplayErrorContext(e),
+        crate::request_id()
+    );
+    e.to_string()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Lines [`log_s3_error`] wrote on this thread, so a test can assert an
+    /// expected S3 answer is not logged.
+    pub(crate) static S3_ERRORS_LOGGED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`log_s3_error`] for `GetObject`, without the log line for a missing
+/// key: callers ask for objects that may legitimately be absent (a
+/// segment's commit marker, GC probes) and report that themselves.
+fn log_get_object_error<R>(
+    key: &str,
+    e: &aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::get_object::GetObjectError, R>,
+) -> String
+where
+    R: std::fmt::Debug,
+{
+    if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
+        return e.to_string();
+    }
+    log_s3_error("get_object", key, e)
+}
+
 /// Join a configured key prefix with a logical (unprefixed) path, the same
 /// way for every call site — `S3Storage::s3_key` and the concurrent fetch
 /// path in `read_many` both delegate here so they can't drift apart.
@@ -1100,13 +1144,23 @@ impl S3Storage {
                 .key(&key)
                 .send()
                 .await
-                .map_err(|e| KoshaError::NotFound(format!("S3 get_object: {e}")))?;
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 get_object: {}",
+                        log_get_object_error(&key, &e)
+                    ))
+                })?;
 
             let bytes = resp
                 .body
                 .collect()
                 .await
-                .map_err(|e| KoshaError::NotFound(format!("S3 read body: {e}")))?
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 read body: {}",
+                        log_s3_error("read body", &key, &e)
+                    ))
+                })?
                 .into_bytes();
             Ok::<Vec<u8>, KoshaError>(bytes.to_vec())
         })?;
@@ -1114,7 +1168,15 @@ impl S3Storage {
         if let Some(parent) = local_path.parent() {
             kosha_core::create_dir_named(parent)?;
         }
-        std::fs::write(local_path, &data).map_err(KoshaError::Io)?;
+        // Through a temp file and a rename: `read` serves whatever exists
+        // at `local_path`, so a write that failed part-way (`ENOSPC`) must
+        // never leave a truncated file there.
+        kosha_core::atomic_write(local_path, &data).inspect_err(|e| {
+            eprintln!(
+                "WARN: disk cache write {} failed: {e} (partial removed)",
+                local_path.display()
+            )
+        })?;
 
         Ok(data)
     }
@@ -1142,7 +1204,12 @@ impl S3Storage {
                 .prefix(&prefix)
                 .send()
                 .await
-                .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))?;
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 list_objects_v2: {}",
+                        log_s3_error("list_objects_v2", &prefix, &e)
+                    ))
+                })?;
 
             let mut out = Vec::new();
             for obj in resp.contents() {
@@ -1189,10 +1256,12 @@ impl S3Storage {
                 if let Some(token) = continuation.take() {
                     req = req.continuation_token(token);
                 }
-                let resp = req
-                    .send()
-                    .await
-                    .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))?;
+                let resp = req.send().await.map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 list_objects_v2: {}",
+                        log_s3_error("list_objects_v2", &prefix, &e)
+                    ))
+                })?;
                 for cp in resp.common_prefixes() {
                     if let Some(p) = cp.prefix() {
                         let child = p
@@ -1252,10 +1321,12 @@ impl S3Storage {
                 if let Some(token) = continuation.take() {
                     req = req.continuation_token(token);
                 }
-                let resp = req
-                    .send()
-                    .await
-                    .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))?;
+                let resp = req.send().await.map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 list_objects_v2: {}",
+                        log_s3_error("list_objects_v2", &prefix, &e)
+                    ))
+                })?;
                 for obj in resp.contents() {
                     if let Some(key) = obj.key() {
                         let relative = key.strip_prefix(&prefix).unwrap_or(key);
@@ -1290,10 +1361,12 @@ impl S3Storage {
                 if let Some(token) = continuation.take() {
                     req = req.continuation_token(token);
                 }
-                let resp = req
-                    .send()
-                    .await
-                    .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))?;
+                let resp = req.send().await.map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 list_objects_v2: {}",
+                        log_s3_error("list_objects_v2", &key_prefix, &e)
+                    ))
+                })?;
                 for obj in resp.contents() {
                     let Some(path) = obj.key().and_then(|k| logical_path_of_key(&root, k)) else {
                         continue;
@@ -1353,9 +1426,12 @@ impl S3Storage {
                 if let Some(token) = continuation {
                     req = req.continuation_token(token);
                 }
-                self.rt
-                    .block_on(req.send())
-                    .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))
+                self.rt.block_on(req.send()).map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 list_objects_v2: {}",
+                        log_s3_error("list_objects_v2", &key_prefix, &e)
+                    ))
+                })
             },
             visit,
         )
@@ -1375,7 +1451,12 @@ impl S3Storage {
                 .send()
                 .await
                 .map(|_| ())
-                .map_err(|e| KoshaError::NotFound(format!("S3 delete_object {key}: {e}")))
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 delete_object {key}: {}",
+                        log_s3_error("delete_object", &key, &e)
+                    ))
+                })
         })
     }
 
@@ -1404,10 +1485,12 @@ impl S3Storage {
                 if let Some(token) = continuation.take() {
                     req = req.continuation_token(token);
                 }
-                let resp = req
-                    .send()
-                    .await
-                    .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))?;
+                let resp = req.send().await.map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 list_objects_v2: {}",
+                        log_s3_error("list_objects_v2", &prefix, &e)
+                    ))
+                })?;
                 let objects = resp
                     .contents()
                     .iter()
@@ -1428,7 +1511,12 @@ impl S3Storage {
                         .delete(delete)
                         .send()
                         .await
-                        .map_err(|e| KoshaError::NotFound(format!("S3 delete_objects: {e}")))?;
+                        .map_err(|e| {
+                            KoshaError::NotFound(format!(
+                                "S3 delete_objects: {}",
+                                log_s3_error("delete_objects", &prefix, &e)
+                            ))
+                        })?;
                     if let Some(err) = out.errors().first() {
                         return Err(KoshaError::NotFound(format!(
                             "S3 delete_objects: {} of {count} objects failed, first {}: {}",
@@ -1519,12 +1607,22 @@ impl S3Storage {
                 .key(&key)
                 .send()
                 .await
-                .map_err(|e| KoshaError::NotFound(format!("S3 get_object {key}: {e}")))?;
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 get_object: {}",
+                        log_get_object_error(&key, &e)
+                    ))
+                })?;
             let bytes = resp
                 .body
                 .collect()
                 .await
-                .map_err(|e| KoshaError::NotFound(format!("S3 read body {key}: {e}")))?
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 read body: {}",
+                        log_s3_error("read body", &key, &e)
+                    ))
+                })?
                 .into_bytes();
             Ok(bytes.to_vec())
         })
@@ -2057,7 +2155,12 @@ async fn put_bytes(
             .apply_sse(sse.as_ref())
             .send()
             .await
-            .map_err(|e| KoshaError::NotFound(format!("S3 create_multipart_upload: {e}")))?;
+            .map_err(|e| {
+                KoshaError::NotFound(format!(
+                    "S3 create_multipart_upload: {}",
+                    log_s3_error("create_multipart_upload", &key, &e)
+                ))
+            })?;
 
         let upload_id = mpu.upload_id().unwrap_or_default();
         let mut parts: Vec<aws_sdk_s3::types::CompletedPart> = Vec::new();
@@ -2080,7 +2183,12 @@ async fn put_bytes(
                 )))
                 .send()
                 .await
-                .map_err(|e| KoshaError::NotFound(format!("S3 upload_part: {e}")))?;
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 upload_part: {}",
+                        log_s3_error("upload_part", &key, &e)
+                    ))
+                })?;
 
             let etag = upload_part_res.e_tag().unwrap_or_default().to_string();
             parts.push(
@@ -2106,7 +2214,12 @@ async fn put_bytes(
             )
             .send()
             .await
-            .map_err(|e| KoshaError::NotFound(format!("S3 complete_multipart_upload: {e}")))?;
+            .map_err(|e| {
+                KoshaError::NotFound(format!(
+                    "S3 complete_multipart_upload: {}",
+                    log_s3_error("complete_multipart_upload", &key, &e)
+                ))
+            })?;
     } else {
         client
             .put_object()
@@ -2116,7 +2229,12 @@ async fn put_bytes(
             .body(aws_sdk_s3::primitives::ByteStream::from(data))
             .send()
             .await
-            .map_err(|e| KoshaError::NotFound(format!("S3 put_object: {e}")))?;
+            .map_err(|e| {
+                KoshaError::NotFound(format!(
+                    "S3 put_object: {}",
+                    log_s3_error("put_object", &key, &e)
+                ))
+            })?;
     }
     Ok::<_, KoshaError>(())
 }
@@ -2147,14 +2265,19 @@ impl StorageBackend for S3Storage {
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         let key = s3_key.clone();
+        // Best effort, as before: the local copy is gone and the caller
+        // proceeds; a remote leftover is segment GC's to collect. Logged so
+        // the leftover is explainable.
         self.rt.block_on(async move {
-            client
+            if let Err(e) = client
                 .delete_object()
                 .bucket(&bucket)
                 .key(&key)
                 .send()
                 .await
-                .ok();
+            {
+                log_s3_error("delete_object", &key, &e);
+            }
         });
         Ok(())
     }
@@ -3039,6 +3162,196 @@ mod sse_request_tests {
         let (storage, capture) = start_pod(Some(&format!("acme={NEW_KEY}")));
         assert!(storage.write(&format!("{seg}/_COMMIT"), b"c").is_err());
         assert_kms(&capture.take()[0], NEW_KEY);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// S3 failures against a local HTTP endpoint that answers like S3: what
+/// reaches an error message (and so possibly a tenant's response body),
+/// and what the download path leaves on disk.
+#[cfg(test)]
+mod error_path_tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    use aws_sdk_s3::config::retry::RetryConfig;
+    use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
+
+    use super::*;
+
+    /// Serve every request with `status` and `body`, one response per
+    /// connection, until the test process exits.
+    fn serve(status: &'static str, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                let text = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                let len = text
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut sink = vec![0u8; len];
+                let _ = stream.read_exact(&mut sink);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\ncontent-type: application/xml\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn storage(endpoint: &str, tag: &str) -> (S3Storage, PathBuf) {
+        let root = std::env::temp_dir().join(format!("kosha-s3-err-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            .retry_config(RetryConfig::disabled())
+            .build();
+        let storage = S3Storage {
+            local: LocalStorage::new(root.clone()),
+            bucket: "bucket".into(),
+            prefix: "secret-prefix".into(),
+            rt: tokio::runtime::Runtime::new().unwrap(),
+            client: aws_sdk_s3::Client::from_conf(config),
+            sse: SseConfig::default(),
+        };
+        (storage, root)
+    }
+
+    fn assert_short(message: &str) {
+        for leak in [
+            "arn:",
+            "123456789012",
+            "assumed-role",
+            "secret-prefix",
+            "REQ123",
+        ] {
+            assert!(!message.contains(leak), "{leak} leaked into: {message}");
+        }
+    }
+
+    /// An AccessDenied names the role ARN (account id) and carries request
+    /// ids; none of that may reach an error message, which can end up in a
+    /// tenant's response body. The pod log gets the chain instead.
+    #[test]
+    fn access_denied_detail_stays_out_of_error_messages() {
+        let endpoint = serve(
+            "403 Forbidden",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <Error><Code>AccessDenied</Code>\
+             <Message>User: arn:aws:sts::123456789012:assumed-role/kosha-query/i-0abc \
+             is not authorized to perform: s3:GetObject on resource: \
+             arn:aws:s3:::bucket/secret-prefix/acme/ns/seg/doc_store.bin</Message>\
+             <RequestId>REQ123</RequestId><HostId>HOST</HostId></Error>",
+        );
+        let (storage, root) = storage(&endpoint, "denied");
+
+        let read = storage
+            .read_remote("acme/ns/seg/doc_store.bin")
+            .unwrap_err();
+        assert_short(&read.to_string());
+        let read = storage.read("acme/ns/seg/doc_store.bin").unwrap_err();
+        assert_short(&read.to_string());
+        let list = storage.list_remote_with_sizes("acme/ns").unwrap_err();
+        assert_short(&list.to_string());
+        let delete = storage.delete_prefix("acme/ns").unwrap_err();
+        assert_short(&delete.to_string());
+        let write = storage.write("acme/ns/seg/new.bin", b"x").unwrap_err();
+        assert_short(&write.to_string());
+
+        // The WAL backend: an index request's error message carries these
+        // (`indexing error: …`).
+        use kosha_write::object_wal::WalObjectBackend;
+        let wal =
+            crate::s3_wal::S3WalBackend::new(&storage, std::time::Duration::from_secs(5)).unwrap();
+        let put = wal
+            .put_if_absent("_wal/w1/acme/ns/000001", b"x")
+            .unwrap_err();
+        assert_short(&put.to_string());
+        let put = wal.put("_wal/w1/acme/ns/000001", b"x").unwrap_err();
+        assert_short(&put.to_string());
+        let get = wal.get("_wal/w1/acme/ns/000001").unwrap_err();
+        assert_short(&get.to_string());
+        let list = wal.list("_wal/w1/").unwrap_err();
+        assert_short(&list.to_string());
+        let delete = wal
+            .delete(&["_wal/w1/acme/ns/000001".to_string()])
+            .unwrap_err();
+        assert_short(&delete.to_string());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A conditional WAL put that loses to an existing object (412) is the
+    /// expected answer: `AlreadyExists`, and no log line, since callers
+    /// treat it as success on every startup probe and `create_meta`.
+    #[test]
+    fn conditional_put_conflict_is_already_exists_and_not_logged() {
+        use kosha_write::object_wal::WalObjectBackend;
+        let endpoint = serve(
+            "412 Precondition Failed",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <Error><Code>PreconditionFailed</Code>\
+             <Message>At least one of the pre-conditions you specified did not hold</Message>\
+             <RequestId>REQ412</RequestId></Error>",
+        );
+        let (storage, root) = storage(&endpoint, "precondition");
+        let wal =
+            crate::s3_wal::S3WalBackend::new(&storage, std::time::Duration::from_secs(5)).unwrap();
+        let before = S3_ERRORS_LOGGED.with(|n| n.get());
+        let err = wal.put_if_absent("_wal/w1/meta", b"x").unwrap_err();
+        assert!(
+            matches!(&err, KoshaError::Io(e) if e.kind() == std::io::ErrorKind::AlreadyExists),
+            "{err:?}"
+        );
+        assert_eq!(
+            S3_ERRORS_LOGGED.with(|n| n.get()),
+            before,
+            "a 412 is not logged"
+        );
+
+        // The same answer to an unconditional put is a failure, logged.
+        assert!(wal.put("_wal/w1/meta", b"x").is_err());
+        assert_eq!(S3_ERRORS_LOGGED.with(|n| n.get()), before + 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The download path writes through a temp file and a rename: the
+    /// object lands whole and no temp file is left behind.
+    #[test]
+    fn download_lands_whole_with_no_temp_file() {
+        let endpoint = serve("200 OK", "whole object body");
+        let (storage, root) = storage(&endpoint, "download");
+        let data = storage.read("acme/ns/seg/doc_store.bin").unwrap();
+        assert_eq!(data, b"whole object body");
+        let dir = root.join("acme/ns/seg");
+        assert_eq!(
+            std::fs::read(dir.join("doc_store.bin")).unwrap(),
+            b"whole object body"
+        );
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["doc_store.bin".to_string()]);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

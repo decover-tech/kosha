@@ -213,6 +213,8 @@ impl Scheduler {
 /// See the module doc.
 pub(crate) struct FairSemaphore {
     state: Mutex<Scheduler>,
+    /// Permits in all (free + held), for the shed log line.
+    permits: usize,
     cv: Condvar,
     /// Max requests waiting in all. `0` = unbounded.
     max_waiters: usize,
@@ -231,6 +233,7 @@ impl FairSemaphore {
     ) -> Self {
         Self {
             state: Mutex::new(Scheduler::new(permits)),
+            permits,
             cv: Condvar::new(),
             max_waiters,
             max_waiters_per_tenant,
@@ -303,10 +306,37 @@ impl FairSemaphore {
         self.max_waiters_per_tenant
     }
 
+    /// The queue as a shed sees it, for its log line (shed path only):
+    /// permits in all, permits held, requests waiting in all and in
+    /// `tenant`'s queue.
+    pub(crate) fn shed_snapshot(&self, tenant: &str) -> ShedSnapshot {
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        ShedSnapshot {
+            permits: self.permits,
+            in_use: self.permits.saturating_sub(st.permits),
+            waiters: st.waiters,
+            tenant_waiters: st.tenant_waiters(tenant),
+        }
+    }
+
+    /// How long a request may wait before it is shed (`None` = forever).
+    pub(crate) fn wait_timeout(&self) -> Option<Duration> {
+        self.wait_timeout
+    }
+
     /// Requests waiting for a permit right now (`kosha_search_queue_depth`).
     pub(crate) fn waiters(&self) -> usize {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).waiters
     }
+}
+
+/// See [`FairSemaphore::shed_snapshot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShedSnapshot {
+    pub(crate) permits: usize,
+    pub(crate) in_use: usize,
+    pub(crate) waiters: usize,
+    pub(crate) tenant_waiters: usize,
 }
 
 /// A held search permit; dropping it hands the permit to the next tenant.
@@ -599,5 +629,26 @@ mod tests {
         drop(held);
         assert!(first.join().unwrap());
         assert!(other.join().unwrap());
+    }
+
+    /// The shed log line's queue figures: permits held and waiting, in all
+    /// and for the shed tenant.
+    #[test]
+    fn shed_snapshot_reports_the_queue_a_shed_saw() {
+        let sem = FairSemaphore::new(1, 1, 0, Some(Duration::from_millis(1)));
+        let held = sem.try_acquire("a", 1).expect("a free permit");
+        assert_eq!(
+            sem.shed_snapshot("b"),
+            ShedSnapshot {
+                permits: 1,
+                in_use: 1,
+                waiters: 0,
+                tenant_waiters: 0
+            }
+        );
+        assert!(matches!(sem.try_acquire("b", 1), Err(QueueShed::Timeout)));
+        assert_eq!(sem.wait_timeout(), Some(Duration::from_millis(1)));
+        drop(held);
+        assert_eq!(sem.shed_snapshot("b").in_use, 0);
     }
 }

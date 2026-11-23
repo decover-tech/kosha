@@ -637,6 +637,7 @@ impl Cache {
         };
         let before = self.total_bytes.load(Ordering::Relaxed);
         let mut files = 0u32;
+        let mut failed = 0u32;
         loop {
             if self.total_bytes.load(Ordering::Relaxed) <= max {
                 break;
@@ -644,8 +645,23 @@ impl Cache {
             let Some(key) = self.next_victim(max, protect) else {
                 break;
             };
-            let _ = self.evict(&key);
-            files += 1;
+            match self.evict(&key) {
+                Ok(_) => files += 1,
+                // `evict` returned before dropping the key, so it is still
+                // the next victim: re-picking it would spin this writer
+                // thread forever. Take it out of the candidates instead;
+                // its bytes are still on disk, so they stay counted and
+                // the loop evicts other files to make room for them.
+                Err(e) => {
+                    failed += 1;
+                    self.recency.lock().unwrap().remove(&key);
+                    self.policy_forget(|k| k == key);
+                    eprintln!(
+                        "WARN: disk cache eviction of {key} failed: {e}; \
+                         left on disk and counted, no longer an eviction candidate"
+                    );
+                }
+            }
         }
         if files > 0 {
             let now = self.total_bytes.load(Ordering::Relaxed);
@@ -661,7 +677,9 @@ impl Cache {
         if self.over_budget.swap(over, Ordering::Relaxed) != over {
             println!(
                 "disk cache {}: size_mb={:.1} max_mb={:.1} pinned_keys={}",
-                if over {
+                if over && failed > 0 {
+                    "over budget, nothing evictable (some files could not be removed)"
+                } else if over {
                     "over budget, nothing evictable"
                 } else {
                     "back within budget"
@@ -732,7 +750,9 @@ impl Cache {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::copy(source_path, &dest)?;
+        self.write_atomically(key, &dest, |tmp| {
+            std::fs::copy(source_path, tmp).map(|_| ())
+        })?;
         let new_len = dest.metadata().map(|m| m.len()).unwrap_or(0);
         self.account(key, new_len);
         Ok(CachedFile { local_path: dest })
@@ -744,9 +764,24 @@ impl Cache {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&dest, data)?;
+        self.write_atomically(key, &dest, |tmp| std::fs::write(tmp, data))?;
         self.account(key, data.len() as u64);
         Ok(CachedFile { local_path: dest })
+    }
+
+    /// Write `key`'s file through a temp file and a rename
+    /// ([`kosha_core::atomic_write_with`]), so a write that fails part-way
+    /// (`ENOSPC`, say) never leaves a truncated file that [`Self::get`]
+    /// would serve as a hit; an existing file stays as it was.
+    fn write_atomically(
+        &self,
+        key: &str,
+        dest: &Path,
+        fill: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) -> Result<(), KoshaError> {
+        kosha_core::atomic_write_with(dest, fill).inspect_err(|e| {
+            eprintln!("WARN: disk cache write {key} failed: {e} (partial removed)");
+        })
     }
 
     /// Record `key`'s new size in the running and per-tenant totals and the
@@ -808,11 +843,11 @@ impl Cache {
         let mut tenant = None;
         if path.is_file() {
             removed = path.metadata().map(|m| m.len()).unwrap_or(0);
-            std::fs::remove_file(&path)?;
+            ignore_not_found(std::fs::remove_file(&path))?;
             tenant = Some(tenant_of_file_key(key));
         } else if path.is_dir() {
             removed = dir_size(&path);
-            std::fs::remove_dir_all(&path)?;
+            ignore_not_found(std::fs::remove_dir_all(&path))?;
             tenant = Some(tenant_of_dir_key(key));
         }
         // Only bytes the cache counted leave the totals: a directory can
@@ -1021,6 +1056,15 @@ fn dir_size(path: &Path) -> u64 {
         }
     }
     total
+}
+
+/// `Ok` for a removal whose target was already gone (removed by someone
+/// else in between): the outcome the caller wanted.
+fn ignore_not_found(result: std::io::Result<()>) -> std::io::Result<()> {
+    match result {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
 }
 
 #[cfg(test)]
@@ -2194,5 +2238,82 @@ mod tests {
             );
             let _ = fs::remove_dir_all(&dir);
         }
+    }
+
+    /// A victim whose file cannot be removed used to stay first in the LRU
+    /// list, so `enforce_limit` re-picked it forever on the writer thread.
+    /// It must be skipped (left on disk, still counted) and the next
+    /// victim evicted instead.
+    #[cfg(unix)]
+    #[test]
+    fn failed_eviction_is_skipped_not_retried_forever() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-cache-evict-fail-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let cache = std::sync::Arc::new(Cache::with_max_bytes(dir.clone(), Some(100)));
+        cache.put_bytes("t/ns/locked/x.bin", &[0; 40]).unwrap();
+        cache.put_bytes("t/ns/seg-z/z.bin", &[0; 40]).unwrap();
+        let locked = dir.join("t/ns/locked");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        if fs::write(locked.join("probe"), b"").is_ok() {
+            // Running as root: permissions do not stop the removal.
+            println!("skipped: running as root, a read-only directory cannot block removal");
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let (done, finished) = std::sync::mpsc::channel();
+        let writer = std::sync::Arc::clone(&cache);
+        std::thread::spawn(move || {
+            let result = writer.put_bytes("t/ns/seg-y/y.bin", &[0; 40]).map(|_| ());
+            let _ = done.send(result);
+        });
+        let result = finished.recv_timeout(std::time::Duration::from_secs(10));
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        let result = result.expect("put_bytes must not spin on an eviction that keeps failing");
+        assert!(result.is_ok());
+        assert!(locked.join("x.bin").exists(), "the locked file stays");
+        assert!(
+            !cache.contains("t/ns/seg-z/z.bin"),
+            "the next victim is evicted instead"
+        );
+        assert!(cache.contains("t/ns/seg-y/y.bin"));
+        assert_eq!(cache.total_size(), 80, "the undeletable file stays counted");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A write that fails part-way leaves the cached file as it was (no
+    /// truncated file for `get` to serve as a hit), its size unchanged,
+    /// and no temp file behind.
+    #[test]
+    fn failed_write_leaves_no_partial_file() {
+        let dir =
+            std::env::temp_dir().join(format!("kosha-test-cache-partial-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let cache = Cache::with_max_bytes(dir.clone(), Some(1000));
+        cache.put_bytes("t/ns/seg/a.bin", &[0; 100]).unwrap();
+
+        let dest = cache.path_for("t/ns/seg/a.bin").unwrap();
+        let result = cache.write_atomically("t/ns/seg/a.bin", &dest, |tmp| {
+            fs::write(tmp, [1u8; 10])?;
+            Err(std::io::Error::other("no space left on device"))
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(&dest).unwrap(),
+            vec![0u8; 100],
+            "the old file is intact"
+        );
+        assert_eq!(cache.total_size(), 100);
+        assert_eq!(
+            fs::read_dir(dest.parent().unwrap()).unwrap().count(),
+            1,
+            "no temp file left"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }
