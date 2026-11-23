@@ -6878,8 +6878,6 @@ pub struct RawDocRecord {
     pub vectors: Vec<(usize, Vec<f32>)>,
 }
 
-/// The `k` highest-scoring of `scored`, best first (ties keep no
-/// particular order, as on the probe path).
 /// Cap on a RaBitQ probe's bound-driven rescoring shortlist, as a multiple
 /// of the `k * vector_rescore_factor` list every quantized column rescores.
 /// Bounds widen on a posting with loose residuals; this keeps one such
@@ -6910,6 +6908,15 @@ fn rabitq_bound_shortlist_len(scored: &[(u32, f64)], errors: &[f32], k: usize) -
         .count()
 }
 
+/// The `k` highest-scoring of `scored`, best first. Which of several
+/// candidates that tie at the `k`-th score are kept, and the order of equal
+/// scores, is whatever the unstable select leaves.
+///
+/// Given an f32 column's [`CandidateSink`] output (at most `k` candidates,
+/// already best first) it changes nothing, so on those paths ties are the
+/// sink's: first scored wins. Before #435 those paths passed every score
+/// through the select, so among exactly equal scores at the cut they could
+/// return other ids — same scores, different duplicates.
 fn top_k_by_score(mut scored: Vec<(u32, f64)>, k: usize) -> Vec<(u32, f64)> {
     let by_score_desc =
         |a: &(u32, f64), b: &(u32, f64)| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal);

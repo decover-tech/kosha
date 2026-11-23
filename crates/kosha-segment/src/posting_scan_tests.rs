@@ -9,6 +9,7 @@
 
 use super::*;
 use kosha_core::{Bm25Params, DocumentId, Field, SegmentId};
+use std::collections::HashSet;
 
 const DIM: usize = 24;
 const DOCS: usize = 900;
@@ -887,6 +888,98 @@ fn running_top_k_equals_a_stable_sort_and_cut() {
             assert!(errors.is_empty());
         }
     }
+}
+
+/// The two paths that cut with `top_k_by_score` (global-rescore candidates
+/// and the postings fallback of exact filtered kNN) used to hand it every
+/// score; they now hand it the sink's running top-`k`. Against the old cut
+/// over every score: the scores are the same, position by position, and so
+/// is every hit above the `k`-th score. Only which of several documents
+/// that tie exactly at the cut are returned may differ (the old select
+/// kept ties in no particular order; the sink keeps the first scored).
+#[test]
+fn top_k_cut_paths_differ_from_the_old_select_only_among_ties_at_the_cut() {
+    let fixture = Fixture::new("ties");
+    let index = fixture.index();
+    let vi = index.lazy.as_ref().unwrap();
+    let all_docs: Vec<u32> = (0..DOCS as u32).collect();
+    let mut cuts_through_a_tie = 0;
+    for (q, query) in queries().iter().enumerate() {
+        // Every score, as the pre-#435 probe collected them.
+        let (full, _) = reference_within(
+            vi,
+            &fixture.idx,
+            query,
+            DOCS * 2,
+            f32::INFINITY,
+            usize::MAX,
+            None,
+            KnnRefill::Always,
+        );
+        assert_eq!(full.len(), DOCS);
+        let score_of: HashMap<u32, u64> = bits(&full).into_iter().collect();
+        for k in 1..=80usize {
+            let old = top_k_by_score(full.clone(), k);
+            let kth = old[k - 1].1;
+            if full[k].1 == kth {
+                cuts_through_a_tie += 1;
+            }
+            let candidates: Vec<(u32, f64)> = fixture
+                .reader
+                .knn_candidates_fetching(
+                    FIELD,
+                    query,
+                    k,
+                    KnnProbeBudget::Within {
+                        max_distance: f32::INFINITY,
+                        max_probes: usize::MAX,
+                        refill: KnnRefill::Always,
+                    },
+                    None,
+                    None,
+                )
+                .unwrap()
+                .unwrap()
+                .candidates
+                .iter()
+                .map(|c| (c.doc_seq, c.estimate))
+                .collect();
+            let exact = fixture
+                .reader
+                .knn_exact_filtered(FIELD, query, k, &all_docs)
+                .unwrap()
+                .unwrap();
+            assert_eq!(exact.source, ExactKnnSource::Postings);
+            for (path, got) in [("candidates", &candidates), ("exact", &exact.hits)] {
+                let context = format!("{path}, query {q} k {k}");
+                let scores = |hits: &[(u32, f64)]| -> Vec<u64> {
+                    hits.iter().map(|&(_, s)| s.to_bits()).collect()
+                };
+                assert_eq!(scores(got), scores(&old), "{context}: scores");
+                // Each hit is a distinct document carrying its own score.
+                let ids: HashSet<u32> = got.iter().map(|&(id, _)| id).collect();
+                assert_eq!(ids.len(), k, "{context}: distinct ids");
+                for &(id, score) in got.iter() {
+                    assert_eq!(score_of[&id], score.to_bits(), "{context}: doc {id}");
+                }
+                // Above the k-th score there is no choice to make.
+                let above = |hits: &[(u32, f64)]| -> HashSet<u32> {
+                    hits.iter()
+                        .filter(|&&(_, s)| s > kth)
+                        .map(|&(id, _)| id)
+                        .collect()
+                };
+                assert_eq!(above(got), above(&old), "{context}: ids above the cut");
+            }
+            // The candidates path scores in probe order, so its ties are
+            // the reference's: first scored first.
+            assert_eq!(bits(&candidates), bits(&full[..k]), "query {q} k {k}");
+        }
+    }
+    assert!(
+        cuts_through_a_tie > 0,
+        "the fixture should put equal scores on both sides of some cut"
+    );
 }
 
 #[test]

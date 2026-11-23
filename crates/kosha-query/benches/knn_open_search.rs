@@ -324,7 +324,6 @@ fn main() {
     // as it is under real traffic. The default repeats one vector.
     let distinct = env_usize("KOSHA_BENCH_QUERIES", 1).max(1);
     let mut warm = Vec::new();
-    let mut knn_postings = 0usize;
     // Posting-scan split of the warm kNN shape (#435), summed over its
     // samples: read / decode / dot ms (across scoring threads), postings
     // served from the decoded cache, postings scanned.
@@ -349,7 +348,6 @@ fn main() {
             assert!(r.total_hits > 0, "{label} returned 0 hits");
             black_box(r.total_hits);
             if key == "knn" {
-                knn_postings = stats.knn_postings_probed;
                 scan.0 += stats.knn_read_ms;
                 scan.1 += stats.knn_decode_ms;
                 scan.2 += stats.knn_dot_ms;
@@ -385,8 +383,13 @@ fn main() {
     for (label, _, d) in &warm {
         row(label, d);
     }
-    println!("warm kNN: {distinct} distinct quer(ies), {knn_postings} postings probed per query");
     let per_query = |total: f64| total / warm_iters.max(1) as f64;
+    // The mean over every warm kNN sample: distinct query vectors probe
+    // different numbers of postings, so one sample's count is not it.
+    let knn_postings = per_query(scan.4 as f64);
+    println!(
+        "warm kNN: {distinct} distinct quer(ies), {knn_postings:.1} postings probed per query (mean)"
+    );
     println!(
         "warm kNN posting scan per query (summed over threads): read {:.2}ms, decode {:.2}ms, \
          dot {:.2}ms; {:.0}% of postings from the decoded cache",
