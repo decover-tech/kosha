@@ -175,6 +175,14 @@ alongside. If the provider times out or fails, hits come back in search order an
   (an extra flush) can each wait up to `retry_budget` once per call.
 - An error body that is not a JSON object (a proxy's HTML page, a JSON list) now raises
   `KoshaRequestError` with the raw body as `error`, instead of an `AttributeError`.
+- Connections are kept alive and reused, instead of one connection (one DNS lookup, one TCP
+  handshake) per request. A process keeps at most 10 idle connections per host, for 15 s
+  idle (the server closes at 30 s) and 60 s in total, so new server pods get traffic; all
+  clients for the same host share them, and the pool is thread-safe and reset in a forked
+  child. A read whose reused connection turns out closed is resent once on a new
+  connection; a write takes the connection-error retry. Timeouts and errors are those of
+  `urlopen` as before. A host that the `*_proxy` environment sends through a proxy still
+  uses `urlopen` per request.
 
 ### 0.2.16
 
