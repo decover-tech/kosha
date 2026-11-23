@@ -958,6 +958,82 @@ impl Cache {
         self.remove_dir_unless_pinned(key, false)
     }
 
+    /// [`Self::evict_dir_unless_pinned`] for some of a directory's files:
+    /// those directly in directory `key` whose file name `select` picks
+    /// (a segment's corrupt vector index, re-downloaded by the next search
+    /// that needs it). Only files this cache tracks, i.e. fetched into it:
+    /// a file written straight to disk (an indexer's flush, which may not
+    /// be in S3 yet) is never removed. Refused, with `Ok(None)`, while any key at or under
+    /// `key` is pinned, under the same locks and in the same order, so no
+    /// search can pin the segment between the check and the removal.
+    /// `Ok(Some(bytes))` is what left the disk (`0` when nothing matched).
+    /// Counts as an eviction: bumps [`Self::eviction_generation`].
+    pub fn evict_files_unless_pinned(
+        &self,
+        key: &str,
+        select: impl Fn(&str) -> bool,
+    ) -> Result<Option<u64>, KoshaError> {
+        let dir = self.path_for(key)?;
+        let key = key
+            .trim_start_matches('/')
+            .trim_end_matches('/')
+            .to_string();
+        let prefix = format!("{key}/");
+        let mut recency = self.recency.lock().unwrap();
+        let pinned = self.pinned.lock().unwrap();
+        if pinned.keys().any(|k| {
+            k.trim_start_matches('/') == key || k.trim_start_matches('/').starts_with(&prefix)
+        }) {
+            return Ok(None);
+        }
+        let mut tracked = self.tracked.lock().unwrap();
+        let doomed: Vec<(PathBuf, String, u64)> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
+            .filter(|entry| entry.file_name().to_str().is_some_and(&select))
+            .filter_map(|entry| {
+                let rel = self.key_of(&entry.path())?;
+                tracked.sizes.contains_key(&rel).then(|| {
+                    let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    (entry.path(), rel, len)
+                })
+            })
+            .collect();
+        let mut result = Ok(());
+        let mut removed_bytes = 0u64;
+        let mut gone = HashSet::new();
+        for (path, rel, len) in doomed {
+            match ignore_not_found(std::fs::remove_file(&path)) {
+                Ok(()) => {
+                    removed_bytes += len;
+                    gone.insert(rel);
+                }
+                Err(e) => result = Err(e),
+            }
+        }
+        let mut freed = 0u64;
+        for rel in &gone {
+            if recency.remove(rel) {
+                freed += tracked.forget(rel);
+            }
+        }
+        if !gone.is_empty() {
+            tracked.tenants.evicted(tenant_of_dir_key(&key));
+        }
+        drop(tracked);
+        drop(pinned);
+        drop(recency);
+        self.policy_forget(|k| gone.contains(k));
+        self.sub_total(freed);
+        if !gone.is_empty() {
+            self.eviction_generation.fetch_add(1, Ordering::Relaxed);
+        }
+        result?;
+        Ok(Some(removed_bytes))
+    }
+
     fn remove_dir_unless_pinned(
         &self,
         key: &str,
@@ -1462,6 +1538,54 @@ mod tests {
         // already-gone directory is a no-op.
         assert!(cache.get("ns/seg-a2/doc_store.bin").is_some());
         assert_eq!(cache.evict_dir_unless_pinned("ns/seg-a").unwrap(), Some(0));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Only the selected files of the directory go, never while anything
+    /// in it is pinned (a search's segment pin), and the accounting stays
+    /// exact.
+    #[test]
+    fn evict_files_unless_pinned_removes_only_selected_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-cache-evict-files-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let cache = Cache::new(dir.clone());
+        cache.put_bytes("ns/seg/vector.idx", &[0u8; 40]).unwrap();
+        cache.put_bytes("ns/seg/vector.offsets", &[0u8; 8]).unwrap();
+        cache.put_bytes("ns/seg/inverted.idx", &[0u8; 10]).unwrap();
+        // Written straight to disk, never accounted (an indexer flush).
+        fs::write(dir.join("ns/seg/vector.1.idx"), [0u8; 5]).unwrap();
+        assert_eq!(cache.total_size(), 58);
+        let vector = |name: &str| name.starts_with("vector.");
+
+        cache.pin("ns/seg");
+        assert_eq!(
+            cache.evict_files_unless_pinned("ns/seg", vector).unwrap(),
+            None
+        );
+        assert!(dir.join("ns/seg/vector.idx").exists(), "pinned: kept");
+        cache.unpin("ns/seg");
+
+        let gen = cache.eviction_generation();
+        assert_eq!(
+            cache.evict_files_unless_pinned("ns/seg", vector).unwrap(),
+            Some(48)
+        );
+        assert!(!dir.join("ns/seg/vector.idx").exists());
+        assert!(!dir.join("ns/seg/vector.offsets").exists());
+        assert!(cache.get("ns/seg/inverted.idx").is_some(), "not selected");
+        assert!(dir.join("ns/seg/vector.1.idx").exists(), "untracked: kept");
+        assert_eq!(cache.total_size(), 10);
+        assert!(cache.eviction_generation() > gen);
+        // Nothing left to select: a no-op that is not an eviction.
+        let gen = cache.eviction_generation();
+        assert_eq!(
+            cache.evict_files_unless_pinned("ns/seg", vector).unwrap(),
+            Some(0)
+        );
+        assert_eq!(cache.eviction_generation(), gen);
         let _ = fs::remove_dir_all(&dir);
     }
 

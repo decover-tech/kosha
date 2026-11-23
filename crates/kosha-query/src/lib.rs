@@ -3732,6 +3732,18 @@ pub struct SearchPhaseStats {
     /// `score_wall_ms`. Microseconds once the query's terms are cached for
     /// the manifest version; zero when the floor was not used.
     pub wand_bounds_ms: f64,
+    /// Segments whose kNN search failed and contributed no vector hits:
+    /// the subset of `SearchResult::knn_degraded_segments` lost to an
+    /// error rather than skipped by design (another embedding model). The
+    /// page is missing their nearest neighbours, so the server answers 503
+    /// instead of a partial 200. Empty for a non-kNN query.
+    pub knn_failed_segments: Vec<kosha_core::SegmentId>,
+    /// Of `knn_failed_segments`, those whose loaded vector column has a
+    /// valid header but a corrupt body (no usable `vector.offsets`, and the
+    /// whole `vector.idx` does not parse). The flag is fixed when the
+    /// segment is opened, so the cached reader stays corrupt until the
+    /// server evicts it and its local vector index files (self-heal).
+    pub knn_corrupt_segments: Vec<kosha_core::SegmentId>,
 }
 
 /// Which BM25 collection statistics a search actually scored with.
@@ -5854,6 +5866,7 @@ impl Searcher {
                             total_hits: 0,
                             hits_capped: false,
                             knn_segment_degraded: false,
+                            knn_failed_segment: None,
                         });
                     }
 
@@ -5906,6 +5919,7 @@ impl Searcher {
                                 total_hits,
                                 hits_capped: false,
                                 knn_segment_degraded: false,
+                                knn_failed_segment: None,
                             });
                         }
 
@@ -5924,6 +5938,7 @@ impl Searcher {
                                 total_hits,
                                 hits_capped: false,
                                 knn_segment_degraded: false,
+                                knn_failed_segment: None,
                             });
                         }
 
@@ -6010,6 +6025,7 @@ impl Searcher {
                             total_hits,
                             hits_capped: false,
                             knn_segment_degraded: false,
+                            knn_failed_segment: None,
                         });
                     }
 
@@ -6256,6 +6272,7 @@ impl Searcher {
                             total_hits,
                             hits_capped,
                             knn_segment_degraded: false,
+                            knn_failed_segment: None,
                         });
                     }
 
@@ -6433,6 +6450,7 @@ impl Searcher {
                         total_hits,
                         hits_capped,
                         knn_segment_degraded: false,
+                        knn_failed_segment: None,
                     })
                 };
                 let attempt = wand_attempt();
@@ -6788,6 +6806,10 @@ impl Searcher {
         // one, else HNSW, else flat fallback — unchanged for anything that
         // isn't a v2 segment) ──
         let mut knn_segment_degraded = false;
+        // Degraded by an error, not by design: see `knn_failed_segment`.
+        let mut knn_segment_failed = false;
+        // The failure is a corrupt vector index body, fixed at open.
+        let mut knn_segment_corrupt = false;
         // Hybrid only: this segment's vector hits, nearest first, kept out
         // of `seg_hits` so the two retrievers can be ranked separately.
         let mut knn_hits: Vec<(u32, f64)> = Vec::new();
@@ -6882,6 +6904,7 @@ impl Searcher {
                             reader.segment_dir().display()
                         );
                         knn_segment_degraded = true;
+                        knn_segment_failed = true;
                         late_results = Some(Vec::new());
                     }
                 }
@@ -6907,6 +6930,7 @@ impl Searcher {
                         reader.segment_dir().display()
                     );
                     knn_segment_degraded = true;
+                    knn_segment_failed = true;
                     Vec::new()
                 }
                 // No vectors for this field in this segment.
@@ -6960,12 +6984,16 @@ impl Searcher {
                                 .fetch_add(exact.vectors_scored, Ordering::Relaxed);
                             exact.hits
                         }
+                        // A client error, not a lost segment: a 400, never
+                        // a retried 503.
+                        Some(Err(e @ KoshaError::InvalidQuery(_))) => return Err(e),
                         Some(Err(e)) => {
                             eprintln!(
                                 "WARN: exact knn failed for a v2 vector index in {}: {e} — treating as no vector hits for this segment",
                                 reader.segment_dir().display()
                             );
                             knn_segment_degraded = true;
+                            knn_segment_failed = true;
                             Vec::new()
                         }
                         None => Vec::new(),
@@ -7041,18 +7069,22 @@ impl Searcher {
                     open_stats.add_knn_scan(&scan);
                     match probe {
                         Some(Ok(results)) => results,
+                        // As above: a client error is a 400.
+                        Some(Err(e @ KoshaError::InvalidQuery(_))) => return Err(e),
                         Some(Err(e)) => {
                             eprintln!(
                                 "WARN: knn_search failed for a v2 vector index in {}: {e} — treating as no vector hits for this segment",
                                 reader.segment_dir().display()
                             );
-                            // Client-visible counterpart to the log line
-                            // above — see
-                            // `SearchResult::knn_degraded_segments`. This
-                            // segment's true nearest neighbors are silently
-                            // missing from the page below; a caller checking
-                            // only HTTP status has no other way to know.
+                            // This segment's true nearest neighbors are
+                            // missing from the page below. Counted in
+                            // `SearchResult::knn_degraded_segments` and,
+                            // as a failure, in
+                            // `SearchPhaseStats::knn_failed_segments`, which
+                            // the server turns into a 503: a caller checking
+                            // only HTTP status must not take it as complete.
                             knn_segment_degraded = true;
+                            knn_segment_failed = true;
                             Vec::new()
                         }
                         None => Vec::new(),
@@ -7087,6 +7119,8 @@ impl Searcher {
                             reader.segment_dir().display()
                         );
                         knn_segment_degraded = true;
+                        knn_segment_failed = true;
+                        knn_segment_corrupt = true;
                     }
                     Vec::new()
                 }
@@ -7353,6 +7387,10 @@ impl Searcher {
             total_hits,
             hits_capped: false,
             knn_segment_degraded,
+            knn_failed_segment: knn_segment_failed.then(|| KnnSegmentFailure {
+                segment: entry.segment_id.clone(),
+                corrupt_index: knn_segment_corrupt,
+            }),
         }))
     }
 
@@ -7878,6 +7916,14 @@ impl Searcher {
             any_capped |= output.hits_capped;
             if output.knn_segment_degraded {
                 knn_degraded_segments += 1;
+            }
+            if let Some(failure) = output.knn_failed_segment {
+                if failure.corrupt_index {
+                    phase_stats
+                        .knn_corrupt_segments
+                        .push(failure.segment.clone());
+                }
+                phase_stats.knn_failed_segments.push(failure.segment);
             }
             for (agg_name, result) in output.aggs {
                 all_aggs.entry(agg_name).or_default().merge(result);
@@ -8850,6 +8896,20 @@ struct SegmentOutput {
     /// Always `false` on every fast path below except the general path,
     /// which is the only one that runs kNN at all.
     knn_segment_degraded: bool,
+    /// This segment, when it is degraded because its kNN search failed (an
+    /// unreadable or unfetched vector posting, vector field or exact vector,
+    /// a corrupt `vector.idx` body). `None` for a segment skipped by design
+    /// (another embedding model, #209), which stays a degraded 200. See
+    /// `SearchPhaseStats::knn_failed_segments`.
+    knn_failed_segment: Option<KnnSegmentFailure>,
+}
+
+/// A segment whose kNN search failed (see `SegmentOutput::knn_failed_segment`).
+struct KnnSegmentFailure {
+    segment: kosha_core::SegmentId,
+    /// The failure is a corrupt `vector.idx` body (see
+    /// `SearchPhaseStats::knn_corrupt_segments`).
+    corrupt_index: bool,
 }
 
 /// What [`rrf_fuse`] hands back to `search_inner`.
@@ -14905,6 +14965,9 @@ mod tests {
             "both i8 segments surface their unreadable exact vectors"
         );
         assert_eq!(r.results.len(), 10, "estimates still answer the query");
+        // No candidate was lost (each kept its estimate), so this stays a
+        // degraded 200, not a failure.
+        assert!(stats.knn_failed_segments.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -15380,7 +15443,9 @@ mod tests {
             vectors: None,
             scoring: None,
         });
-        let r = searcher.search(&ns, &manifest, &q, None).unwrap();
+        let (r, stats) = searcher
+            .search_with_stats(&ns, &manifest, &q, None)
+            .unwrap();
         assert_eq!(
             r.results.len(),
             0,
@@ -15392,6 +15457,10 @@ mod tests {
             "a segment with a corrupt vector.idx body must be counted as \
              degraded, not silently reported as a clean zero-hit result"
         );
+        // Lost to an error, so reported as failed: the server answers 503.
+        assert_eq!(stats.knn_failed_segments, vec![SegmentId("s1".into())]);
+        // A corrupt body: the server may self-heal it by re-downloading.
+        assert_eq!(stats.knn_corrupt_segments, vec![SegmentId("s1".into())]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -15459,8 +15528,11 @@ mod tests {
         // warming this segment into the searcher's own SegmentCache (keyed
         // by namespace/segment/load_vectors — reused as-is by the next
         // call, not reopened from disk).
-        let warm = searcher.search(&ns, &manifest, &q, None).unwrap();
+        let (warm, warm_stats) = searcher
+            .search_with_stats(&ns, &manifest, &q, None)
+            .unwrap();
         assert_eq!(warm.knn_degraded_segments, Some(0));
+        assert!(warm_stats.knn_failed_segments.is_empty());
 
         // Now the file disappears. The already-open reader still has it
         // resident in `vector_idx_path`, so the segment stays "present" as
@@ -15468,7 +15540,9 @@ mod tests {
         // hydration attempt discovers it's gone.
         std::fs::remove_file(seg_dir.join("vector.idx")).unwrap();
 
-        let r = searcher.search(&ns, &manifest, &q, None).unwrap();
+        let (r, stats) = searcher
+            .search_with_stats(&ns, &manifest, &q, None)
+            .unwrap();
         assert_eq!(
             r.results.len(),
             0,
@@ -15479,6 +15553,10 @@ mod tests {
             Some(1),
             "a segment whose knn_search errors must be counted as degraded"
         );
+        // Lost to an error, so reported as failed: the server answers 503.
+        assert_eq!(stats.knn_failed_segments, vec![SegmentId("s1".into())]);
+        // Not a corrupt index: nothing to re-download.
+        assert!(stats.knn_corrupt_segments.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
