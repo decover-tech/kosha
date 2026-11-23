@@ -1,0 +1,7 @@
+# Generated from proto/ by `make openapi` (#350); reviewed as a diff, not by hand.
+api/openapi/** linguist-generated=true
+proto/kosha/v1/admin.proto linguist-generated=true
+# SDK types generated from api/openapi by `make clients-gen` (#351).
+clients/typescript/src/generated/** linguist-generated=true
+clients/go/zz_generated_types.go linguist-generated=true
+clients/typescript/package-lock.json linguist-generated=true

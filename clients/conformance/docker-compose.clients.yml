@@ -1,0 +1,28 @@
+# Overlay for the SDK conformance suite (#351), on top of the read/write
+# split stack:
+#
+#   docker compose -f docker-compose.yml \
+#     -f scripts/integration/docker-compose.integration.yml \
+#     -f clients/conformance/docker-compose.clients.yml up --build -d
+#
+# Adds two tenants with limits the live cases play against (limits.json):
+# conformance-small (max_body_bytes 4096: a deterministic 413) and
+# conformance-limited (qps 1: real 429s with Retry-After). Both pods get the
+# same keys and limits; the SDKs talk to the query pod (:8081) through
+# faultproxy.py, so writes also exercise forwarding to the ingest pod.
+# Dev-only keys.
+
+x-conformance-env: &conformance-env
+  KOSHA_API_KEYS: sk-tenant-a=tenant-a,sk-tenant-b=tenant-b,sk-conformance-small=conformance-small,sk-conformance-limited=conformance-limited
+  KOSHA_TENANT_LIMITS_FILE: /etc/kosha/limits.json
+
+services:
+  kosha-ingest:
+    environment: *conformance-env
+    volumes:
+      - ./clients/conformance/limits.json:/etc/kosha/limits.json:ro
+
+  kosha-query:
+    environment: *conformance-env
+    volumes:
+      - ./clients/conformance/limits.json:/etc/kosha/limits.json:ro

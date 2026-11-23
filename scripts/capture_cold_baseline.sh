@@ -14,7 +14,8 @@
 # Usage:
 #   KOSHA_API_KEY=... ./scripts/capture_cold_baseline.sh [ns1 ns2 ...]
 #
-# With no args: prints /stats (all namespaces, doc/segment counts) and picks
+# With no args: prints GET /v1/namespaces (the key's namespaces, doc/segment
+# counts) and picks
 # paragraph_index_hnsw plus the largest-by-docs namespace automatically.
 set -euo pipefail
 
@@ -72,8 +73,8 @@ search_once() {
     code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 600 \
       -H "Authorization: Bearer $KOSHA_API_KEY" \
       -H 'Content-Type: application/json' \
-      -X POST "http://127.0.0.1:$LOCAL_PORT/search" \
-      -d "{\"namespace\": \"$ns\", \"query_text\": \"$QUERY_TEXT\", \"max_results\": 10}") || code=000
+      -X POST "http://127.0.0.1:$LOCAL_PORT/v1/namespaces/$ns/search" \
+      -d "{\"query_text\": \"$QUERY_TEXT\", \"max_results\": 10}") || code=000
     [ "$code" = 200 ] && break
     if [ "$code" = 000 ]; then
       # Connection-level failure: the port-forward may be dead — rebuild it
@@ -96,14 +97,14 @@ search_once() {
 
 say "resolving target namespaces"
 port_forward
-STATS_JSON=$(kcurl "http://127.0.0.1:$LOCAL_PORT/stats")
+STATS_JSON=$(kcurl "http://127.0.0.1:$LOCAL_PORT/v1/namespaces")
 echo "$STATS_JSON" | python3 -c '
 import json, sys
 stats = json.load(sys.stdin)
-rows = sorted(stats.get("namespaces", []), key=lambda r: -r.get("documents", 0))
+rows = sorted(stats.get("namespaces", []), key=lambda r: -(r.get("documents") or 0))
 print("%-50s %12s %9s" % ("namespace", "documents", "segments"))
 for r in rows[:15]:
-    print("%-50s %12d %9d" % (r["namespace"], r["documents"], r["segments"]))
+    print("%-50s %12d %9d" % (r["name"], r.get("documents") or 0, r.get("segments") or 0))
 '
 
 if [ "$#" -gt 0 ]; then
@@ -113,8 +114,8 @@ else
   BIGGEST=$(echo "$STATS_JSON" | python3 -c '
 import json, sys
 rows = json.load(sys.stdin).get("namespaces", [])
-rows = [r for r in rows if r.get("documents", 0) > 0]
-print(max(rows, key=lambda r: r["documents"])["namespace"] if rows else "")
+rows = [r for r in rows if (r.get("documents") or 0) > 0]
+print(max(rows, key=lambda r: r["documents"])["name"] if rows else "")
 ')
   TARGETS=(paragraph_index_hnsw)
   [ -n "$BIGGEST" ] && [ "$BIGGEST" != "paragraph_index_hnsw" ] && TARGETS+=("$BIGGEST")

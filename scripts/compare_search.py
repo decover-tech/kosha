@@ -57,16 +57,15 @@ def setup_opensearch(host: str, index: str, docs: list[tuple[str, str]]) -> None
 
 def setup_kosha(host: str, namespace: str, docs: list[tuple[str, str]]) -> None:
     body = {
-        "namespace": namespace,
         "documents": [
             {"id": doc_id, "fields": [{"name": "title", "text": text}]}
             for doc_id, text in docs
         ],
     }
-    resp = requests.post(f"{host}/index", json=body)
+    resp = requests.post(f"{host}/v1/namespaces/{namespace}/documents", json=body)
     resp.raise_for_status()
 
-    resp = requests.post(f"{host}/flush", json={"namespace": namespace})
+    resp = requests.post(f"{host}/v1/namespaces/{namespace}/flush", json={})
     resp.raise_for_status()
 
 
@@ -79,9 +78,9 @@ def search_opensearch(host: str, index: str, query: str, size: int) -> list[tupl
 
 
 def search_kosha(host: str, namespace: str, query: str, size: int) -> list[tuple[str, float]]:
-    resp = requests.get(
-        f"{host}/search",
-        params={"ns": namespace, "q": query, "max_results": size},
+    resp = requests.post(
+        f"{host}/v1/namespaces/{namespace}/search",
+        json={"query_text": query, "max_results": size},
     )
     resp.raise_for_status()
     results = resp.json()["results"]

@@ -10,6 +10,7 @@
 use super::*;
 use kosha_core::{Bm25Params, DocumentId, Field, SegmentId};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 const DIM: usize = 24;
 const DOCS: usize = 900;
@@ -38,9 +39,14 @@ impl Lcg {
 /// `DOCS` vectors; every seventh repeats an earlier one, so equal scores
 /// (and their order) are exercised.
 fn corpus() -> Vec<Vec<f32>> {
+    corpus_of(DOCS)
+}
+
+/// [`corpus`] of `docs` vectors (its first `DOCS` are [`corpus`]).
+fn corpus_of(docs: usize) -> Vec<Vec<f32>> {
     let mut rng = Lcg(0x435);
-    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(DOCS);
-    for i in 0..DOCS {
+    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(docs);
+    for i in 0..docs {
         if i % 7 == 6 {
             vectors.push(vectors[i / 2].clone());
         } else {
@@ -67,6 +73,11 @@ struct Fixture {
 
 impl Fixture {
     fn new(name: &str) -> Self {
+        Self::with_docs(name, DOCS)
+    }
+
+    /// A fixture over [`corpus_of`]`(docs)`.
+    fn with_docs(name: &str, docs: usize) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "kosha-posting-scan-{name}-{}-{}",
@@ -75,7 +86,7 @@ impl Fixture {
         ));
         let _ = fs::remove_dir_all(&dir);
         let mut writer = SegmentWriter::new(SegmentId("scan".into()), dir.clone());
-        for (i, v) in corpus().into_iter().enumerate() {
+        for (i, v) in corpus_of(docs).into_iter().enumerate() {
             writer.add_document(DocumentId(format!("d{i}")), vec![Field::vector(FIELD, v)]);
         }
         writer.finalize(Bm25Params::default()).unwrap();
@@ -2208,8 +2219,9 @@ fn one_large_segment_probe_by_pool_size() {
         let vi = index.lazy.as_ref().unwrap();
         let all: Vec<u32> = (0..postings as u32).collect();
         let t = std::time::Instant::now();
+        let held = PrefetchHolds::new(None);
         for _ in 0..RUNS {
-            std::hint::black_box(reader.second_touch_admissions(vi, &all));
+            std::hint::black_box(reader.second_touch_admissions(vi, &held, &all));
         }
         println!(
             "{mode:>10}, admission pre-pass: {:.3} ms per probe",
@@ -2218,4 +2230,344 @@ fn one_large_segment_probe_by_pool_size() {
     }
     drop(reader);
     let _ = fs::remove_dir_all(&dir);
+}
+
+// ---- Finding 31: what the prefetch skips must stay readable until scanned ----
+
+type SpanFetch<'a> = dyn Fn(&Path, &str, &[(u64, u64)]) -> span_cache::SpanHolds + Sync + 'a;
+
+/// A fetch as the server makes it when its span write queue is full
+/// (#481): the fetched bytes are held in memory by the fetching request
+/// only and never reach disk. Counts its calls; runs `hook(call)` before
+/// it returns.
+fn held_fetch<'a>(
+    idx: &'a [u8],
+    held: &'a Arc<AtomicU64>,
+    calls: &'a AtomicUsize,
+    hook: &'a (dyn Fn(usize) + Sync),
+) -> impl Fn(&Path, &str, &[(u64, u64)]) -> span_cache::SpanHolds + Sync + 'a {
+    move |dir: &Path, file: &str, ranges: &[(u64, u64)]| {
+        let call = calls.fetch_add(1, Ordering::Relaxed);
+        let holds = ranges
+            .iter()
+            .map(|&(s, e)| {
+                span_cache::PendingSpan::register_held(
+                    dir,
+                    file,
+                    s,
+                    idx[s as usize..e as usize].to_vec(),
+                    held.clone(),
+                )
+            })
+            .collect::<span_cache::SpanHolds>();
+        hook(call);
+        holds
+    }
+}
+
+/// A budgeted probe of every posting of `fixture` for `query`, through
+/// `fetch`.
+fn probe_all(
+    fixture: &Fixture,
+    query: &[f32],
+    fetch: &SpanFetch<'_>,
+) -> Result<Vec<(u32, u64)>, KoshaError> {
+    fixture
+        .reader
+        .knn_search_within_filtered_fetching(
+            FIELD,
+            query,
+            10,
+            f32::INFINITY,
+            usize::MAX,
+            None,
+            KnnRefill::Always,
+            Some(fetch),
+        )
+        .unwrap()
+        .map(|(hits, _)| bits(&hits))
+}
+
+/// Finding 31, deterministic: postings the prefetch skips because the
+/// decoded cache holds them, evicted before the scan reaches them, whose
+/// span writes were dropped (so the decoded entry was their only local
+/// copy). The eviction inside the fetch stands in for another request's
+/// inserts into the shared cache. Failed with "vector posting … is not
+/// local" while the prefetch only checked `contains()`.
+#[test]
+fn a_cached_posting_the_prefetch_skips_stays_readable_when_evicted() {
+    let mut fixture = Fixture::new("pin-evicted");
+    fixture.set_cache_budget(usize::MAX / 2);
+    let cache = Arc::clone(&fixture.reader.vector_cache);
+    fs::remove_file(fixture.dir.join(VECTOR_IDX_FILE)).unwrap();
+    let query = &queries()[1];
+    let held = Arc::new(AtomicU64::new(0));
+    let calls = AtomicUsize::new(0);
+    let fetch = held_fetch(&fixture.idx, &held, &calls, &|_| {});
+    // First touch, then second touch admits every posting into the
+    // decoded cache; no span ever reaches disk.
+    let want = probe_all(&fixture, query, &fetch).unwrap();
+    probe_all(&fixture, query, &fetch).unwrap();
+    assert_eq!(held.load(Ordering::Relaxed), 0, "holds released");
+    assert!(!span_cache::spans_dir(&fixture.dir, VECTOR_IDX_FILE).exists());
+    let postings = fixture.index().lazy.as_ref().unwrap().ranges.len();
+    // One posting not cached, so the prefetch calls the fetch; it skips
+    // every other one, and the fetch then evicts them all.
+    cache.remove_where(|&(_, k)| k == 0);
+    let calls = AtomicUsize::new(0);
+    let evict_all = |_| cache.remove_where(|_| true);
+    let fetch = held_fetch(&fixture.idx, &held, &calls, &evict_all);
+    let got = probe_all(&fixture, query, &fetch);
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "one prefetch, no refetch: the {} skipped postings were pinned",
+        postings - 1
+    );
+    assert_eq!(got.expect("every skipped posting is read"), want);
+}
+
+/// Finding 31 with no hook and one thread: a cache that holds half of one
+/// probe's postings. The probe's own second-touch admissions evict
+/// postings its prefetch skipped as cached, whose bytes were held-only
+/// (dropped writes). Failed on the fourth run while the prefetch only
+/// checked `contains()`.
+#[test]
+fn a_probe_evicting_its_own_skipped_postings_still_reads_them() {
+    let query = &queries()[1];
+    let held = Arc::new(AtomicU64::new(0));
+    let calls = AtomicUsize::new(0);
+    // Calibrate: the decoded bytes of every posting this probe reads.
+    let mut cal = Fixture::new("pin-cal");
+    cal.set_cache_budget(usize::MAX / 2);
+    fs::remove_file(cal.dir.join(VECTOR_IDX_FILE)).unwrap();
+    let fetch = held_fetch(&cal.idx, &held, &calls, &|_| {});
+    let want = probe_all(&cal, query, &fetch).unwrap();
+    probe_all(&cal, query, &fetch).unwrap();
+    let total = cal.reader.vector_cache.resident_bytes_where(|_| true);
+    assert!(total > 0);
+
+    let mut fixture = Fixture::new("pin-self");
+    fixture.set_cache_budget(total / 2);
+    fs::remove_file(fixture.dir.join(VECTOR_IDX_FILE)).unwrap();
+    let fetch = held_fetch(&fixture.idx, &held, &calls, &|_| {});
+    for run in 0..4 {
+        let before = calls.load(Ordering::Relaxed);
+        let got = probe_all(&fixture, query, &fetch);
+        assert_eq!(got.unwrap_or_else(|e| panic!("run {run}: {e}")), want);
+        assert!(
+            calls.load(Ordering::Relaxed) - before <= 1,
+            "run {run}: one prefetch, no refetch: the skipped postings were pinned"
+        );
+    }
+    assert_eq!(held.load(Ordering::Relaxed), 0, "holds released");
+}
+
+/// Control: the same sequence as the eviction test, but every fetch's
+/// write lands on disk (as before #481): evicted postings are read from
+/// their span files. Passes with or without the pins.
+#[test]
+fn evicted_cached_postings_with_spans_on_disk_are_read_from_disk() {
+    let mut fixture = Fixture::new("pin-control");
+    fixture.set_cache_budget(usize::MAX / 2);
+    let cache = Arc::clone(&fixture.reader.vector_cache);
+    fs::remove_file(fixture.dir.join(VECTOR_IDX_FILE)).unwrap();
+    let query = &queries()[1];
+    let idx = fixture.idx.clone();
+    let write_fetch = |dir: &Path, file: &str, ranges: &[(u64, u64)]| {
+        let spans = span_cache::spans_dir(dir, file);
+        fs::create_dir_all(&spans).unwrap();
+        for &(s, e) in ranges {
+            fs::write(
+                spans.join(span_cache::span_file_name(s, e)),
+                &idx[s as usize..e as usize],
+            )
+            .unwrap();
+        }
+        span_cache::SpanHolds::new()
+    };
+    let want = probe_all(&fixture, query, &write_fetch).unwrap();
+    probe_all(&fixture, query, &write_fetch).unwrap();
+    cache.remove_where(|&(_, k)| k == 0);
+    let evicting = |dir: &Path, file: &str, ranges: &[(u64, u64)]| {
+        let holds = write_fetch(dir, file, ranges);
+        cache.remove_where(|_| true);
+        holds
+    };
+    assert_eq!(probe_all(&fixture, query, &evicting).unwrap(), want);
+}
+
+/// `fixture` with every posting in its own span file and `vector.idx`
+/// gone, except posting 0's span (so a probe's prefetch calls the fetch).
+/// Returns the postings' ranges.
+fn spans_but_the_first(fixture: &mut Fixture) -> Vec<(u64, u64)> {
+    fixture.set_cache_budget(0);
+    fixture.move_idx_to_spans(1);
+    let index = fixture.index();
+    let ranges: Vec<(u64, u64)> = index
+        .lazy
+        .as_ref()
+        .unwrap()
+        .ranges
+        .iter()
+        .map(|&(o, l)| (o, o + l as u64))
+        .collect();
+    let spans = span_cache::spans_dir(&fixture.dir, VECTOR_IDX_FILE);
+    fs::remove_file(spans.join(span_cache::span_file_name(ranges[0].0, ranges[0].1))).unwrap();
+    ranges
+}
+
+/// Backstop (b): span files the prefetch saw on disk, evicted from disk
+/// before the scan reads them. Each such posting is refetched once and
+/// read, so the answer is exact rather than a "not local" degraded
+/// segment.
+#[test]
+fn a_posting_evicted_from_disk_after_the_prefetch_is_refetched_once() {
+    let mut fixture = Fixture::new("refetch");
+    let query = &queries()[1];
+    let want = {
+        let calls = AtomicUsize::new(0);
+        let held = Arc::new(AtomicU64::new(0));
+        let mut whole = Fixture::new("refetch-want");
+        whole.set_cache_budget(0);
+        let fetch = held_fetch(&whole.idx, &held, &calls, &|_| {});
+        probe_all(&whole, query, &fetch).unwrap()
+    };
+    let ranges = spans_but_the_first(&mut fixture);
+    let evicted = 3;
+    assert!(evicted <= VECTOR_REFETCH_MAX && ranges.len() > evicted + 1);
+    let spans = span_cache::spans_dir(&fixture.dir, VECTOR_IDX_FILE);
+    let held = Arc::new(AtomicU64::new(0));
+    let calls = AtomicUsize::new(0);
+    let evict = |call: usize| {
+        if call == 0 {
+            for &(s, e) in &ranges[1..=evicted] {
+                fs::remove_file(spans.join(span_cache::span_file_name(s, e))).unwrap();
+            }
+        }
+    };
+    let fetch = held_fetch(&fixture.idx, &held, &calls, &evict);
+    assert_eq!(probe_all(&fixture, query, &fetch).unwrap(), want);
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1 + evicted,
+        "the prefetch, then one refetch per evicted posting"
+    );
+    assert_eq!(held.load(Ordering::Relaxed), 0, "refetched spans released");
+}
+
+/// The backstop is bounded: past [`VECTOR_REFETCH_MAX`] refetches in one
+/// prefetch's scan, a posting that is not local fails the probe as an IO
+/// error, as before, instead of one serial fetch per posting.
+#[test]
+fn refetches_past_the_bound_fail_as_not_local() {
+    let mut fixture = Fixture::new("refetch-bound");
+    let query = &queries()[1];
+    let ranges = spans_but_the_first(&mut fixture);
+    assert!(ranges.len() > VECTOR_REFETCH_MAX + 1);
+    let spans = span_cache::spans_dir(&fixture.dir, VECTOR_IDX_FILE);
+    let held = Arc::new(AtomicU64::new(0));
+    let calls = AtomicUsize::new(0);
+    let evict_all = |call: usize| {
+        if call == 0 {
+            fs::remove_dir_all(&spans).unwrap();
+        }
+    };
+    let fetch = held_fetch(&fixture.idx, &held, &calls, &evict_all);
+    let err = probe_all(&fixture, query, &fetch).unwrap_err();
+    assert!(
+        matches!(&err, KoshaError::Io(e) if e.to_string().contains("is not local")),
+        "{err}"
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 1 + VECTOR_REFETCH_MAX);
+}
+
+/// Decoded bytes of every posting a probe of `query` reads in a fixture of
+/// `docs` vectors, and that probe's answer.
+fn probe_footprint(docs: usize, query: &[f32]) -> (usize, Vec<(u32, u64)>) {
+    let held = Arc::new(AtomicU64::new(0));
+    let calls = AtomicUsize::new(0);
+    let mut cal = Fixture::with_docs("pin-footprint", docs);
+    cal.set_cache_budget(usize::MAX / 2);
+    fs::remove_file(cal.dir.join(VECTOR_IDX_FILE)).unwrap();
+    let fetch = held_fetch(&cal.idx, &held, &calls, &|_| {});
+    let want = probe_all(&cal, query, &fetch).unwrap();
+    probe_all(&cal, query, &fetch).unwrap();
+    (cal.reader.vector_cache.resident_bytes_where(|_| true), want)
+}
+
+/// Finding 31 on a multi-thread pool: a probe of one segment large enough
+/// to be split across threads (#484 scores a budgeted probe's postings in
+/// runs of 16 on the current rayon pool), over a cache that holds half of
+/// it, with held-only fetches. The probe's own admissions, inserted by
+/// whichever run scans them, evict postings that the serial prefetch
+/// skipped and that other runs have yet to scan; the pins must keep every
+/// one of them readable for the whole probe, across all runs. On a branch
+/// without the split this is the serial case on a pool thread.
+#[test]
+fn a_probe_on_a_thread_pool_reads_every_posting_its_prefetch_skipped() {
+    const POOL_DOCS: usize = 8_000;
+    let query = &queries()[1];
+    let (total, want) = probe_footprint(POOL_DOCS, query);
+    let mut fixture = Fixture::with_docs("pin-pool", POOL_DOCS);
+    let postings = fixture.index().lazy.as_ref().unwrap().ranges.len();
+    assert!(postings >= 64, "{postings} postings: too few to split");
+    fixture.set_cache_budget(total / 2);
+    fs::remove_file(fixture.dir.join(VECTOR_IDX_FILE)).unwrap();
+    let held = Arc::new(AtomicU64::new(0));
+    let calls = AtomicUsize::new(0);
+    let fetch = held_fetch(&fixture.idx, &held, &calls, &|_| {});
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    for run in 0..4 {
+        let before = calls.load(Ordering::Relaxed);
+        let got = pool.install(|| probe_all(&fixture, query, &fetch));
+        assert_eq!(got.unwrap_or_else(|e| panic!("run {run}: {e}")), want);
+        assert!(
+            calls.load(Ordering::Relaxed) - before <= 1,
+            "run {run}: one prefetch, no refetch: the skipped postings were pinned"
+        );
+    }
+    assert_eq!(held.load(Ordering::Relaxed), 0, "holds released");
+}
+
+/// Finding 31 across requests: several probes of one segment at once,
+/// on their own threads, over a cache that holds a quarter of what one
+/// reads,
+/// with held-only fetches. Each one's admissions evict what the others'
+/// prefetches skipped. Every probe must return its serial answer with one
+/// prefetch and no refetch. A stress test: without the pins it fails on
+/// about a third of runs here (the deterministic cases are the tests
+/// above).
+#[test]
+fn concurrent_probes_evicting_each_others_skipped_postings_stay_exact() {
+    let queries = queries();
+    let wants: Vec<(usize, Vec<(u32, u64)>)> =
+        queries.iter().map(|q| probe_footprint(DOCS, q)).collect();
+    let total = wants.iter().map(|(bytes, _)| *bytes).max().unwrap();
+    let mut fixture = Fixture::new("pin-concurrent");
+    fixture.set_cache_budget(total / 4);
+    fs::remove_file(fixture.dir.join(VECTOR_IDX_FILE)).unwrap();
+    let held = Arc::new(AtomicU64::new(0));
+    let calls = AtomicUsize::new(0);
+    let fetch = held_fetch(&fixture.idx, &held, &calls, &|_| {});
+    const ROUNDS: usize = 20;
+    std::thread::scope(|scope| {
+        for (query, (_, want)) in queries.iter().zip(&wants) {
+            let (fixture, fetch) = (&fixture, &fetch);
+            scope.spawn(move || {
+                for round in 0..ROUNDS {
+                    let got = probe_all(fixture, query, fetch);
+                    assert_eq!(&got.unwrap_or_else(|e| panic!("round {round}: {e}")), want);
+                }
+            });
+        }
+    });
+    assert!(
+        calls.load(Ordering::Relaxed) <= queries.len() * ROUNDS,
+        "one prefetch per probe, no refetch: the skipped postings were pinned"
+    );
+    assert_eq!(held.load(Ordering::Relaxed), 0, "holds released");
 }

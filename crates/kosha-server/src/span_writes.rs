@@ -47,10 +47,11 @@
 
 use std::collections::VecDeque;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
 use kosha_cache::Cache;
@@ -109,7 +110,22 @@ pub struct SpanWriteQueue {
     inline: AtomicU64,
     failed: AtomicU64,
     drop_log: Mutex<DropLog>,
+    /// Exclusion between span writes and the drop of a superseded span
+    /// directory ([`Self::drop_superseded`]), striped by the directory's
+    /// cache key. A write holds its stripe shared across its whole-file
+    /// check, its rename into the span directory and its cache accounting;
+    /// a drop holds it exclusive, so a drop never walks a directory a write
+    /// is adding to (finding 33). Writes never wait for each other.
+    /// Lock order: a stripe, then the cache's locks.
+    dir_gates: [RwLock<()>; DIR_GATE_STRIPES],
 }
+
+/// Stripes of [`SpanWriteQueue::dir_gates`]. A drop waits only for the
+/// writes in flight in its stripe: 1 background writer plus the inline
+/// writers (0 at target load, 44 in a whole run10), so with 64 stripes a
+/// drop waits for an unrelated directory's write with probability about
+/// (1 + inline) / 64.
+const DIR_GATE_STRIPES: usize = 64;
 
 /// Point-in-time totals for `/stats` and `/metrics`.
 #[derive(Clone, Copy, Debug, Default)]
@@ -140,7 +156,46 @@ impl SpanWriteQueue {
             inline: AtomicU64::new(0),
             failed: AtomicU64::new(0),
             drop_log: Mutex::new(DropLog::default()),
+            dir_gates: std::array::from_fn(|_| RwLock::new(())),
         }
+    }
+
+    /// The gate of the span directory `dir_key` (`{rel}/{file}.spans`).
+    fn dir_gate(&self, dir_key: &str) -> &RwLock<()> {
+        let mut h = std::hash::DefaultHasher::new();
+        dir_key.trim_matches('/').hash(&mut h);
+        &self.dir_gates[h.finish() as usize % DIR_GATE_STRIPES]
+    }
+
+    /// Shared hold on the gate of the span directory holding the span file
+    /// `key` (`{rel}/{file}.spans/{name}`).
+    fn write_gate(&self, key: &str) -> RwLockReadGuard<'_, ()> {
+        let dir_key = key.rsplit_once('/').map_or(key, |(dir, _)| dir);
+        self.dir_gate(dir_key)
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Drop the span directory `dir_key` (`{rel}/{file}.spans`) of a file a
+    /// promotion just landed whole
+    /// ([`Cache::drop_superseded_dir_unless_pinned`]), never interleaved
+    /// with a span write into it. Without the gate a write that checked for
+    /// the whole file before it landed renamed its span in after the drop's
+    /// walk: the drop failed with ENOTEMPTY and left the directory behind,
+    /// and the cache kept counting the spans it had already unlinked, or a
+    /// write accounted mid-drop stayed counted with its file gone. With it
+    /// the write either runs first (and its span is dropped) or sees the
+    /// whole file and writes nothing.
+    pub fn drop_superseded(
+        &self,
+        cache: &Cache,
+        dir_key: &str,
+    ) -> Result<Option<u64>, kosha_core::KoshaError> {
+        let _gate = self
+            .dir_gate(dir_key)
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        cache.drop_superseded_dir_unless_pinned(dir_key)
     }
 
     /// Make the fetched range `[start, start + bytes.len())` of
@@ -225,7 +280,12 @@ impl SpanWriteQueue {
         // thread accounts it (it holds the cache).
         self.note_drop(len, true);
         let span = PendingSpan::register(segment_dir, file, start, bytes, true);
-        if !self.write_file(&span) {
+        // Its accounting job takes the gate again: a drop in between
+        // removes the untracked file, and the job then accounts 0 bytes.
+        let gate = self.write_gate(&key);
+        let ok = self.write_file(&span);
+        drop(gate);
+        if !ok {
             // It counted as cached while registered (a query may have
             // confirmed its term): invalidate that, as for a queued write.
             self.failed.fetch_add(1, Ordering::AcqRel);
@@ -277,6 +337,9 @@ impl SpanWriteQueue {
             bytes: job.queued,
             ok: false,
         };
+        // The whole-file check, the rename and the accounting are one step
+        // relative to a drop of this span directory.
+        let gate = self.write_gate(&job.key);
         done.ok = match &job.span {
             Some(span) => self.write_file(span),
             None => true,
@@ -284,6 +347,7 @@ impl SpanWriteQueue {
         if done.ok {
             cache.note_external_write(&job.key);
         }
+        drop(gate);
         drop(job);
     }
 
@@ -632,6 +696,197 @@ mod tests {
         assert_eq!(writes.stats().inline, 1);
         assert_eq!(writes.failures(), 1);
         assert!(!gone.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Bytes under `dir`, as the disk has them.
+    fn bytes_on_disk(dir: &Path) -> u64 {
+        fs::read_dir(dir)
+            .map(|d| {
+                d.flatten()
+                    .filter_map(|e| e.metadata().ok())
+                    .map(|m| m.len())
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Finding 33's failure shape, made deterministic: the drop unlinks
+    /// every span, then the final rmdir of the span directory fails (here
+    /// EACCES from a read-only segment directory; on staging ENOTEMPTY,
+    /// because a write renamed a span in after the walk). The cache kept
+    /// counting every span the drop had already unlinked.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_superseded_drop_stops_counting_the_spans_it_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, cache) = fixture("failed-drop");
+        let seg = root.join("ns/seg");
+        let writes = SpanWriteQueue::new(1 << 20, 1 << 20);
+        for i in 0..8u64 {
+            assert!(writes
+                .persist(&seg, "ns/seg", "doc_store.bin", i * 1000, vec![7; 1000])
+                .is_none());
+        }
+        writes.drain(&cache);
+        assert_eq!(cache.total_size(), 8000);
+        // The promotion landed the whole file (written behind the cache).
+        fs::write(seg.join("doc_store.bin"), vec![0u8; 8000]).unwrap();
+        fs::set_permissions(&seg, fs::Permissions::from_mode(0o555)).unwrap();
+        if fs::write(seg.join("probe"), b"").is_ok() {
+            println!("skipped: running as root, a read-only directory cannot block removal");
+            fs::set_permissions(&seg, fs::Permissions::from_mode(0o755)).unwrap();
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        let res = writes.drop_superseded(&cache, "ns/seg/doc_store.bin.spans");
+        fs::set_permissions(&seg, fs::Permissions::from_mode(0o755)).unwrap();
+        let spans = span_cache::spans_dir(&seg, "doc_store.bin");
+        assert!(res.is_err(), "the rmdir after the walk failed");
+        assert!(spans.exists());
+        assert_eq!(bytes_on_disk(&spans), 0, "every span was unlinked");
+        assert_eq!(
+            cache.total_size(),
+            0,
+            "spans the failed drop removed are no longer counted"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The race itself, on the real writer, the real inline path and the
+    /// real promotion drop (`SpanHydrator::finish_promotion`): span writes
+    /// into `doc_store.bin.spans` are in flight when the promotion lands
+    /// the whole file and drops the span directory. Even iterations write
+    /// from the background writer thread, odd ones inline from two request
+    /// threads (both caps full). Afterwards the span directory must be gone
+    /// (a failed drop leaves it, and is logged), no write may have failed,
+    /// and the cache must count exactly the span bytes on disk. On main 13–
+    /// 20% of iterations broke one of these (finding 33).
+    /// `SPAN_RACE_ITERS` sets the iteration count (default 200).
+    #[test]
+    fn span_writes_never_interleave_with_a_superseded_drop() {
+        use crate::doc_spans::{SpanConfig, SpanHydrator};
+        let iters: usize = std::env::var("SPAN_RACE_ITERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200);
+        const SPAN: usize = 1 << 20;
+        const SPANS: u64 = 24;
+        let (mut orphans, mut failed, mut miscounted) = (0, 0, 0);
+        let mut drop_ms = Vec::with_capacity(iters);
+        for it in 0..iters {
+            let (root, cache) = fixture(&format!("race-{it}"));
+            let cache = Arc::new(cache);
+            let seg = root.join("ns/seg");
+            let inline = it % 2 == 1;
+            let (cap, held) = if inline { (0, 0) } else { (1 << 30, 1 << 30) };
+            let writes = Arc::new(SpanWriteQueue::new(cap, held));
+            fn persist(writes: &SpanWriteQueue, seg: &Path, i: u64) {
+                let bytes = vec![i as u8; SPAN];
+                assert!(writes
+                    .persist(seg, "ns/seg", "doc_store.bin", i * SPAN as u64, bytes)
+                    .is_none());
+            }
+            let workers: Vec<_> = if inline {
+                (0..2u64)
+                    .map(|t| {
+                        let (writes, seg) = (writes.clone(), seg.clone());
+                        std::thread::spawn(move || {
+                            for i in (t..SPANS).step_by(2) {
+                                persist(&writes, &seg, i);
+                            }
+                        })
+                    })
+                    .collect()
+            } else {
+                for i in 0..SPANS {
+                    persist(&writes, &seg, i);
+                }
+                let (writes, cache) = (writes.clone(), cache.clone());
+                vec![std::thread::spawn(move || writes.drain(&cache))]
+            };
+            // Land the whole file part-way through the writes, as
+            // `promote_doc_store` does, then drop as it does.
+            let spans = span_cache::spans_dir(&seg, "doc_store.bin");
+            let want = (it as u64 / 2 % SPANS).max(1);
+            while fs::read_dir(&spans).map_or(0, |d| d.count() as u64) < want {
+                std::hint::spin_loop();
+            }
+            let tmp = seg.join(".doc_store.tmp");
+            fs::write(&tmp, vec![0u8; SPAN * SPANS as usize]).unwrap();
+            fs::rename(&tmp, seg.join("doc_store.bin")).unwrap();
+            let t = Instant::now();
+            SpanHydrator::new(root.clone(), SpanConfig::default())
+                .finish_promotion(&cache, &writes, &seg, true);
+            drop_ms.push(t.elapsed().as_secs_f64() * 1e3);
+            for w in workers {
+                w.join().unwrap();
+            }
+            writes.drain(&cache); // inline writes' accounting jobs
+            orphans += usize::from(spans.exists());
+            failed += writes.stats().failed;
+            if cache.total_size() != bytes_on_disk(&spans) {
+                miscounted += 1;
+                eprintln!(
+                    "it={it} inline={inline} counted={} on_disk={}",
+                    cache.total_size(),
+                    bytes_on_disk(&spans)
+                );
+            }
+            let _ = fs::remove_dir_all(&root);
+        }
+        drop_ms.sort_by(f64::total_cmp);
+        eprintln!(
+            "span drop race: iters={iters} orphan_dirs={orphans} failed_writes={failed} \
+             miscounted={miscounted} drop_ms p50={:.2} max={:.2}",
+            drop_ms[iters / 2],
+            drop_ms[iters - 1]
+        );
+        assert_eq!(
+            (orphans, failed, miscounted),
+            (0, 0, 0),
+            "a span write interleaved with the promotion drop"
+        );
+    }
+
+    /// The gate is per span directory: while a drop holds one directory's
+    /// stripe, a write into a directory on another stripe goes ahead, and a
+    /// write into the dropped directory waits for the drop.
+    #[test]
+    fn a_drop_blocks_only_writes_into_its_own_span_directory() {
+        let (root, cache) = fixture("stripes");
+        let writes = Arc::new(SpanWriteQueue::new(0, 0));
+        let dropped = "ns/seg/doc_store.bin.spans";
+        let other = (0..)
+            .map(|i| format!("ns/seg{i}"))
+            .find(|rel| {
+                let key = format!("{rel}/doc_store.bin.spans");
+                !std::ptr::eq(writes.dir_gate(&key), writes.dir_gate(dropped))
+            })
+            .unwrap();
+        fs::create_dir_all(root.join(&other)).unwrap();
+        let gate = writes.dir_gate(dropped).write().unwrap();
+        let inline_write = |rel: String| {
+            let (writes, seg) = (writes.clone(), root.join(&rel));
+            std::thread::spawn(move || {
+                assert!(writes
+                    .persist(&seg, &rel, "doc_store.bin", 0, vec![1; 10])
+                    .is_none());
+            })
+        };
+        let free = inline_write(other.clone());
+        let blocked = inline_write("ns/seg".into());
+        free.join().unwrap();
+        assert!(span_cache::spans_dir(&root.join(&other), "doc_store.bin").exists());
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !blocked.is_finished(),
+            "a write into the directory being dropped waits for the drop"
+        );
+        drop(gate);
+        blocked.join().unwrap();
+        writes.drain(&cache);
+        assert_eq!(cache.total_size(), 20);
         let _ = fs::remove_dir_all(&root);
     }
 }

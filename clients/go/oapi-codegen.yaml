@@ -1,0 +1,10 @@
+# Models only (ADR-351 §a): the transport is hand-written, so the published
+# module has no third-party dependencies. Run through `make clients-gen`.
+package: kosha
+generate:
+  models: true
+output: zz_generated_types.go
+output-options:
+  skip-prune: true
+compatibility:
+  always-prefix-enum-values: true

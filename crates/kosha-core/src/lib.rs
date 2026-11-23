@@ -792,6 +792,41 @@ impl<'de> Deserialize<'de> for PrefixFilter {
     }
 }
 
+/// One `term` / `terms` value on the wire: a string, or a JSON boolean.
+///
+/// A boolean becomes `"true"` / `"false"`, the text every ingest path stores
+/// for a `Boolean` field (`Field::boolean`, the CLI shorthand, `migrate`,
+/// the Python client), so `{"term": {"isHot": true}}` matches the same
+/// documents as `{"term": {"isHot": "true"}}`. Elasticsearch accepts both
+/// spellings; before this, the boolean one was a 400.
+///
+/// Numbers stay an error: a stored number's text depends on how it was
+/// written (`3` vs `3.0`), so matching one needs a typed comparison, not a
+/// string spelling chosen here.
+struct FilterValue(String);
+
+impl<'de> Deserialize<'de> for FilterValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = FilterValue;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a string or a boolean")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<FilterValue, E> {
+                Ok(FilterValue(v.to_owned()))
+            }
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<FilterValue, E> {
+                Ok(FilterValue(v))
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<FilterValue, E> {
+                Ok(FilterValue(v.to_string()))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 /// Clause keys `FilterClause` accepts, as reported in parse errors.
 const FILTER_CLAUSE_KEYS: [&str; 8] = [
     "term",
@@ -858,10 +893,21 @@ impl<'de> Deserialize<'de> for FilterClause {
         }
 
         match key.as_str() {
-            "term" => Ok(FilterClause::Term { term: body(inner)? }),
-            "terms" => Ok(FilterClause::Terms {
-                terms: body(inner)?,
-            }),
+            "term" => {
+                let term: std::collections::HashMap<String, FilterValue> = body(inner)?;
+                Ok(FilterClause::Term {
+                    term: term.into_iter().map(|(k, v)| (k, v.0)).collect(),
+                })
+            }
+            "terms" => {
+                let terms: std::collections::HashMap<String, Vec<FilterValue>> = body(inner)?;
+                Ok(FilterClause::Terms {
+                    terms: terms
+                        .into_iter()
+                        .map(|(k, vs)| (k, vs.into_iter().map(|v| v.0).collect()))
+                        .collect(),
+                })
+            }
             "range" => Ok(FilterClause::Range {
                 range: body(inner)?,
             }),
@@ -4272,8 +4318,8 @@ pub enum KoshaError {
     /// The server is shedding load: admitting this request would push live
     /// segment memory past the configured watermark and it did not free up
     /// within the admission timeout (see `kosha_query::MemoryLedger`).
-    /// Transient by construction — callers should retry with backoff, which
-    /// the Python `kosha_client` already does. Maps to HTTP 429.
+    /// Transient by construction: maps to HTTP 429 `overloaded` with
+    /// `retryable: true` and `Retry-After`, and clients should retry then.
     Overloaded(String),
     /// The control store (Postgres) could not be reached or returned an
     /// error. Says nothing about whether a namespace or manifest exists —
@@ -4443,6 +4489,47 @@ mod filter_clause_parsing {
     fn bool_only_keys_at_clause_level_get_a_hint() {
         let err = parse(r#"{"must": [{"term": {"a": "b"}}]}"#).expect_err("must is not a clause");
         assert!(err.to_string().contains("inside a `bool` clause"), "{err}");
+    }
+
+    /// Finding 37: Elasticsearch takes a JSON boolean in `term` / `terms`;
+    /// it becomes the `"true"` / `"false"` text ingest stores. Numbers and
+    /// null are still rejected, nested inside `bool` too.
+    #[test]
+    fn term_and_terms_accept_booleans_as_stored_text() {
+        match parse(r#"{"term": {"isHot": true}}"#).unwrap() {
+            FilterClause::Term { term } => assert_eq!(term["isHot"], "true"),
+            other => panic!("{other:?}"),
+        }
+        match parse(r#"{"terms": {"isHot": [false, "true", true]}}"#).unwrap() {
+            FilterClause::Terms { terms } => {
+                assert_eq!(terms["isHot"], ["false", "true", "true"])
+            }
+            other => panic!("{other:?}"),
+        }
+        let nested = parse(r#"{"bool": {"must_not": [{"term": {"isFiltered": false}}]}}"#);
+        match nested.unwrap() {
+            FilterClause::Bool { bool } => match &bool.must_not[0] {
+                FilterClause::Term { term } => assert_eq!(term["isFiltered"], "false"),
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+        // One canonical form: the result-cache key is the same either way.
+        assert_eq!(
+            serde_json::to_string(&parse(r#"{"term": {"a": true}}"#).unwrap()).unwrap(),
+            serde_json::to_string(&parse(r#"{"term": {"a": "true"}}"#).unwrap()).unwrap(),
+        );
+        for bad in [
+            r#"{"term": {"page": 3}}"#,
+            r#"{"term": {"score": 0.5}}"#,
+            r#"{"term": {"a": null}}"#,
+            r#"{"term": {"a": ["x"]}}"#,
+            r#"{"terms": {"page": [1, 2]}}"#,
+            r#"{"terms": {"a": [null]}}"#,
+        ] {
+            let err = parse(bad).expect_err(bad);
+            assert!(err.to_string().contains("invalid type"), "{bad}: {err}");
+        }
     }
 
     #[test]

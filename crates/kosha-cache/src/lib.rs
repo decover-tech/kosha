@@ -17,7 +17,7 @@
 //! cold namespace larger than the cache cannot flush another tenant's warm
 //! working set below its floor.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
@@ -853,24 +853,59 @@ impl Cache {
         let nested = format!("{}/", key.trim_end_matches('/'));
         let mut removed = 0;
         let mut tenant = None;
+        let mut result = Ok(());
         if path.is_file() {
             removed = path.metadata().map(|m| m.len()).unwrap_or(0);
             ignore_not_found(std::fs::remove_file(&path))?;
             tenant = Some(tenant_of_file_key(key));
         } else if path.is_dir() {
             removed = dir_size(&path);
-            ignore_not_found(std::fs::remove_dir_all(&path))?;
+            // A walk that fails part-way has still unlinked files: those
+            // are forgotten below and the survivors stay counted.
+            result = ignore_not_found(std::fs::remove_dir_all(&path));
             tenant = Some(tenant_of_dir_key(key));
         }
         // Only bytes the cache counted leave the totals: a directory can
         // hold files written by something that never reported them (an
         // ingest pod's own flushes), and subtracting those would drive the
         // total below real usage, so `KOSHA_CACHE_MAX_BYTES` stops binding.
+        let left = self.keys_on_disk_under(&path);
+        self.forget_removed(
+            |k| (k == key || k.starts_with(&nested)) && !left.contains(k),
+            tenant,
+        );
+        result?;
+        Ok(removed)
+    }
+
+    /// Cache keys of the files still on disk under `dir` (none once it is
+    /// gone): what a removal that failed part-way left behind, or what was
+    /// written there since.
+    fn keys_on_disk_under(&self, dir: &Path) -> HashSet<String> {
+        let mut files = Vec::new();
+        collect_files(dir, &mut files);
+        files
+            .iter()
+            .filter_map(|(file, _)| self.key_of(file))
+            .collect()
+    }
+
+    /// The cache key of a file under the cache root.
+    fn key_of(&self, file: &Path) -> Option<String> {
+        let rel = file.strip_prefix(&self.cache_dir).ok()?;
+        Some(rel.to_string_lossy().replace('\\', "/"))
+    }
+
+    /// Drop every key `gone` selects from the LRU order, the size
+    /// accounting and the policy state, subtracting only the bytes the
+    /// cache tracked. A `tenant` counts one eviction for it and bumps
+    /// [`Self::eviction_generation`].
+    fn forget_removed(&self, gone: impl Fn(&str) -> bool, tenant: Option<&str>) {
         let mut recency = self.recency.lock().unwrap();
         let mut tracked = self.tracked.lock().unwrap();
         let mut freed = 0u64;
         recency.retain(|k| {
-            if k == key || k.starts_with(&nested) {
+            if gone(k) {
                 freed += tracked.forget(k);
                 false
             } else {
@@ -883,9 +918,8 @@ impl Cache {
         }
         drop(tracked);
         drop(recency);
-        self.policy_forget(|k| k == key || k.starts_with(&nested));
+        self.policy_forget(&gone);
         self.sub_total(freed);
-        Ok(removed)
     }
 
     /// Remove a whole directory (a superseded segment) and every file under
@@ -924,6 +958,82 @@ impl Cache {
         self.remove_dir_unless_pinned(key, false)
     }
 
+    /// [`Self::evict_dir_unless_pinned`] for some of a directory's files:
+    /// those directly in directory `key` whose file name `select` picks
+    /// (a segment's corrupt vector index, re-downloaded by the next search
+    /// that needs it). Only files this cache tracks, i.e. fetched into it:
+    /// a file written straight to disk (an indexer's flush, which may not
+    /// be in S3 yet) is never removed. Refused, with `Ok(None)`, while any key at or under
+    /// `key` is pinned, under the same locks and in the same order, so no
+    /// search can pin the segment between the check and the removal.
+    /// `Ok(Some(bytes))` is what left the disk (`0` when nothing matched).
+    /// Counts as an eviction: bumps [`Self::eviction_generation`].
+    pub fn evict_files_unless_pinned(
+        &self,
+        key: &str,
+        select: impl Fn(&str) -> bool,
+    ) -> Result<Option<u64>, KoshaError> {
+        let dir = self.path_for(key)?;
+        let key = key
+            .trim_start_matches('/')
+            .trim_end_matches('/')
+            .to_string();
+        let prefix = format!("{key}/");
+        let mut recency = self.recency.lock().unwrap();
+        let pinned = self.pinned.lock().unwrap();
+        if pinned.keys().any(|k| {
+            k.trim_start_matches('/') == key || k.trim_start_matches('/').starts_with(&prefix)
+        }) {
+            return Ok(None);
+        }
+        let mut tracked = self.tracked.lock().unwrap();
+        let doomed: Vec<(PathBuf, String, u64)> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
+            .filter(|entry| entry.file_name().to_str().is_some_and(&select))
+            .filter_map(|entry| {
+                let rel = self.key_of(&entry.path())?;
+                tracked.sizes.contains_key(&rel).then(|| {
+                    let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    (entry.path(), rel, len)
+                })
+            })
+            .collect();
+        let mut result = Ok(());
+        let mut removed_bytes = 0u64;
+        let mut gone = HashSet::new();
+        for (path, rel, len) in doomed {
+            match ignore_not_found(std::fs::remove_file(&path)) {
+                Ok(()) => {
+                    removed_bytes += len;
+                    gone.insert(rel);
+                }
+                Err(e) => result = Err(e),
+            }
+        }
+        let mut freed = 0u64;
+        for rel in &gone {
+            if recency.remove(rel) {
+                freed += tracked.forget(rel);
+            }
+        }
+        if !gone.is_empty() {
+            tracked.tenants.evicted(tenant_of_dir_key(&key));
+        }
+        drop(tracked);
+        drop(pinned);
+        drop(recency);
+        self.policy_forget(|k| gone.contains(k));
+        self.sub_total(freed);
+        if !gone.is_empty() {
+            self.eviction_generation.fetch_add(1, Ordering::Relaxed);
+        }
+        result?;
+        Ok(Some(removed_bytes))
+    }
+
     fn remove_dir_unless_pinned(
         &self,
         key: &str,
@@ -948,15 +1058,19 @@ impl Cache {
         let mut files = Vec::new();
         collect_files(&path, &mut files);
         let on_disk: u64 = files.iter().map(|(_, len)| len).sum();
-        std::fs::remove_dir_all(&path)?;
+        // A walk that fails part-way (a file created in the directory
+        // after the walk passed it: ENOTEMPTY; or EIO, EACCES) has still
+        // unlinked files. Those leave the accounting; the survivors stay
+        // counted, and the error is returned after.
+        let result = std::fs::remove_dir_all(&path);
+        let left = self.keys_on_disk_under(&path);
         let mut tracked = self.tracked.lock().unwrap();
         let mut freed = 0u64;
         for (file, _len) in &files {
-            let Ok(rel) = file.strip_prefix(&self.cache_dir) else {
+            let Some(rel) = self.key_of(file) else {
                 continue;
             };
-            let rel = rel.to_string_lossy().replace('\\', "/");
-            if recency.remove(&rel) {
+            if !left.contains(&rel) && recency.remove(&rel) {
                 freed += tracked.forget(&rel);
             }
         }
@@ -966,11 +1080,12 @@ impl Cache {
         drop(tracked);
         drop(pinned);
         drop(recency);
-        self.policy_forget(|k| k == key || k.starts_with(&prefix));
+        self.policy_forget(|k| (k == key || k.starts_with(&prefix)) && !left.contains(k));
         self.sub_total(freed);
         if is_eviction {
             self.eviction_generation.fetch_add(1, Ordering::Relaxed);
         }
+        result?;
         Ok(Some(on_disk))
     }
 
@@ -988,25 +1103,21 @@ impl Cache {
         }
         let dir = self.path_for(prefix)?;
         let below = format!("{prefix}/");
-        let mut freed = 0u64;
-        {
-            let mut recency = self.recency.lock().unwrap();
-            let mut tracked = self.tracked.lock().unwrap();
-            recency.retain(|key| {
-                if !key.starts_with(&below) {
-                    return true;
-                }
-                freed += tracked.forget(key);
-                false
-            });
-            tracked.tenants.evicted(tenant_of_namespace(prefix));
-        }
-        self.policy_forget(|k| k.starts_with(&below));
-        if dir.is_dir() {
-            std::fs::remove_dir_all(&dir)?;
-        }
-        self.sub_total(freed);
-        self.eviction_generation.fetch_add(1, Ordering::Relaxed);
+        // Remove first, then forget only what is gone: a walk that fails
+        // part-way leaves files on disk (the rest of the namespace when it
+        // aborts early), and forgetting those would leave them on disk
+        // and untracked until a restart rescans the cache.
+        let result = if dir.is_dir() {
+            std::fs::remove_dir_all(&dir)
+        } else {
+            Ok(())
+        };
+        let left = self.keys_on_disk_under(&dir);
+        self.forget_removed(
+            |k| k.starts_with(&below) && !left.contains(k),
+            Some(tenant_of_namespace(prefix)),
+        );
+        result?;
         Ok(())
     }
 
@@ -1427,6 +1538,54 @@ mod tests {
         // already-gone directory is a no-op.
         assert!(cache.get("ns/seg-a2/doc_store.bin").is_some());
         assert_eq!(cache.evict_dir_unless_pinned("ns/seg-a").unwrap(), Some(0));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Only the selected files of the directory go, never while anything
+    /// in it is pinned (a search's segment pin), and the accounting stays
+    /// exact.
+    #[test]
+    fn evict_files_unless_pinned_removes_only_selected_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-cache-evict-files-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let cache = Cache::new(dir.clone());
+        cache.put_bytes("ns/seg/vector.idx", &[0u8; 40]).unwrap();
+        cache.put_bytes("ns/seg/vector.offsets", &[0u8; 8]).unwrap();
+        cache.put_bytes("ns/seg/inverted.idx", &[0u8; 10]).unwrap();
+        // Written straight to disk, never accounted (an indexer flush).
+        fs::write(dir.join("ns/seg/vector.1.idx"), [0u8; 5]).unwrap();
+        assert_eq!(cache.total_size(), 58);
+        let vector = |name: &str| name.starts_with("vector.");
+
+        cache.pin("ns/seg");
+        assert_eq!(
+            cache.evict_files_unless_pinned("ns/seg", vector).unwrap(),
+            None
+        );
+        assert!(dir.join("ns/seg/vector.idx").exists(), "pinned: kept");
+        cache.unpin("ns/seg");
+
+        let gen = cache.eviction_generation();
+        assert_eq!(
+            cache.evict_files_unless_pinned("ns/seg", vector).unwrap(),
+            Some(48)
+        );
+        assert!(!dir.join("ns/seg/vector.idx").exists());
+        assert!(!dir.join("ns/seg/vector.offsets").exists());
+        assert!(cache.get("ns/seg/inverted.idx").is_some(), "not selected");
+        assert!(dir.join("ns/seg/vector.1.idx").exists(), "untracked: kept");
+        assert_eq!(cache.total_size(), 10);
+        assert!(cache.eviction_generation() > gen);
+        // Nothing left to select: a no-op that is not an eviction.
+        let gen = cache.eviction_generation();
+        assert_eq!(
+            cache.evict_files_unless_pinned("ns/seg", vector).unwrap(),
+            Some(0)
+        );
+        assert_eq!(cache.eviction_generation(), gen);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2385,6 +2544,98 @@ mod tests {
         );
         assert!(cache.contains("t/ns/seg-y/y.bin"));
         assert_eq!(cache.total_size(), 80, "the undeletable file stays counted");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A cache with a tracked 100-byte file in each of `t/ns/seg-a`,
+    /// `t/ns/seg-b/{in_b}` and `t/ns/seg-c`, and `seg-b` read-only: a
+    /// removal walk cannot unlink `seg-b/x.bin` (it survives), and unlinks
+    /// `seg-b/inner/x.bin` but then cannot rmdir `inner` (it is gone, and
+    /// the walk still fails). `None` when running as root (permissions do
+    /// not block removal).
+    #[cfg(unix)]
+    fn cache_with_a_locked_segment(name: &str, in_b: &str) -> Option<(PathBuf, Cache)> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kosha-test-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let cache = Cache::new(dir.clone());
+        for file in ["seg-a/x.bin", &format!("seg-b/{in_b}"), "seg-c/x.bin"] {
+            cache.put_bytes(&format!("t/ns/{file}"), &[0; 100]).unwrap();
+        }
+        let locked = dir.join("t/ns/seg-b");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        if fs::write(locked.join("probe"), b"").is_ok() {
+            println!("skipped: running as root, a read-only directory cannot block removal");
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            let _ = fs::remove_dir_all(&dir);
+            return None;
+        }
+        Some((dir, cache))
+    }
+
+    /// After a removal that failed part-way, the cache counts exactly the
+    /// tracked files still on disk: each one tracked, nothing removed
+    /// tracked.
+    #[cfg(unix)]
+    fn assert_counts_exactly_what_is_left(dir: &Path, cache: &Cache) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir.join("t/ns/seg-b"), fs::Permissions::from_mode(0o755)).unwrap();
+        let mut left = Vec::new();
+        collect_files(dir, &mut left);
+        let left: Vec<String> = left
+            .iter()
+            .map(|(f, _)| f.strip_prefix(dir).unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            cache.total_size(),
+            100 * left.len() as u64,
+            "left: {left:?}"
+        );
+        let recency = cache.recency.lock().unwrap();
+        let mut tracked: Vec<&String> = recency.iter().collect();
+        tracked.sort();
+        let mut left: Vec<&String> = left.iter().collect();
+        left.sort();
+        assert_eq!(tracked, left, "tracked keys are the files on disk");
+    }
+
+    /// Namespace deletion forgot every key under the prefix before removing
+    /// it, so a walk that failed part-way left the files it had not
+    /// removed (with an early abort, the rest of the namespace) on disk and
+    /// untracked until a restart (finding 33).
+    #[cfg(unix)]
+    #[test]
+    fn evict_prefix_that_fails_part_way_keeps_the_survivors_counted() {
+        let Some((dir, cache)) = cache_with_a_locked_segment("evict-prefix-partial", "x.bin")
+        else {
+            return;
+        };
+        let generation = cache.eviction_generation();
+        assert!(cache.evict_prefix("t/ns").is_err());
+        assert!(cache.eviction_generation() > generation);
+        assert!(
+            dir.join("t/ns/seg-b/x.bin").exists(),
+            "it cannot be unlinked"
+        );
+        assert_counts_exactly_what_is_left(&dir, &cache);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `evict` of a directory returned before forgetting anything, so the
+    /// files its walk had already unlinked stayed counted (finding 33).
+    #[cfg(unix)]
+    #[test]
+    fn evict_dir_that_fails_part_way_forgets_only_what_it_removed() {
+        let Some((dir, cache)) = cache_with_a_locked_segment("evict-dir-partial", "inner/x.bin")
+        else {
+            return;
+        };
+        assert!(cache.evict("t/ns").is_err());
+        assert!(
+            !dir.join("t/ns/seg-b/inner/x.bin").exists(),
+            "unlinked before the failure"
+        );
+        assert_counts_exactly_what_is_left(&dir, &cache);
         let _ = fs::remove_dir_all(&dir);
     }
 
