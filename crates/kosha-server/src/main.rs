@@ -47,6 +47,7 @@ mod doc_store_fallback_tests;
 mod embedding;
 #[cfg(test)]
 mod embedding_server_tests;
+mod exports;
 mod fair_admission;
 mod http;
 #[cfg(feature = "s3")]
@@ -70,6 +71,7 @@ mod role;
 mod s3_storage;
 #[cfg(feature = "s3")]
 mod s3_wal;
+mod schema_rules;
 // The crash-point harness uploads to an in-memory bucket through the same
 // commit-marker sequence as S3, so it needs this module without `s3`.
 mod billing;
@@ -339,6 +341,8 @@ struct AppState {
     gc_stats: segment_gc::GcStats,
     /// Purge of deleted namespaces' cached copies on this pod (#347).
     deletion_purge: deletion_purge::PurgeState,
+    /// Namespace exports (#347).
+    exports: exports::ExportRuntime,
     /// Serializes `POST /v1/admin/gc` runs.
     gc_lock: Mutex<()>,
     /// Namespace-level cached hydration verdict (Tier 1 O2). Keyed by
@@ -2274,6 +2278,7 @@ impl AppState {
             gc_settings: segment_gc::GcSettings::from_env(),
             gc_stats: segment_gc::GcStats::default(),
             deletion_purge: deletion_purge::PurgeState::default(),
+            exports: exports::ExportRuntime::default(),
             gc_lock: Mutex::new(()),
             completed_hydrations: Mutex::new(HashMap::new()),
             #[cfg(feature = "s3")]
@@ -2808,13 +2813,16 @@ impl AppState {
     fn branch_references(&self) -> Result<kosha_core::branch::References, String> {
         let _lineage = self.branch_lock.lock().unwrap();
         let (_, manifests) = self.every_manifest()?;
-        kosha_core::branch::References::collect(
+        let mut refs = kosha_core::branch::References::collect(
             manifests
                 .iter()
                 .filter(|(_, manifest)| manifest.branch.is_some())
                 .map(|(ns, manifest)| (ns, manifest)),
         )
-        .map_err(|e| format!("cannot resolve branch references: {e}"))
+        .map_err(|e| format!("cannot resolve branch references: {e}"))?;
+        // What a running export reads stays too (#347).
+        self.pin_export_references(&mut refs)?;
+        Ok(refs)
     }
 
     /// The object store segment GC sweeps: S3 when configured, otherwise
@@ -2862,7 +2870,12 @@ impl AppState {
                     .iter()
                     .filter(|(other, manifest)| other != ns && manifest.branch.is_some())
                     .map(|(other, manifest)| (other, manifest)),
-            );
+            )
+            .map_err(|e| e.to_string())
+            // A running export's pinned manifests (#347), this namespace's
+            // own included: a compaction mid-export must not cost it a
+            // segment.
+            .and_then(|mut refs| self.pin_export_references(&mut refs).map(|()| refs));
             let config = match referenced {
                 Ok(refs) => kosha_core::gc::GcConfig {
                     referenced_elsewhere: Some(Arc::new(refs)),
@@ -6691,6 +6704,7 @@ fn main() {
     // purge silently off (#347).
     let deletion_purge_settings =
         deletion_purge::PurgeSettings::from_env().unwrap_or_else(|e| fatal(&e));
+    let export_settings = exports::ExportSettings::from_env().unwrap_or_else(|e| fatal(&e));
     let state = AppState::new_shared_as(PathBuf::from(data_dir.clone()), role);
     // Pre-#262 bare namespaces no tenant can reach (#344).
     namespace_migrate::warn_unreachable_bare_namespaces(
@@ -6711,6 +6725,7 @@ fn main() {
     state.spawn_manifest_refresher();
     state.spawn_local_gc();
     state.spawn_deletion_purge(deletion_purge_settings);
+    state.spawn_exports(export_settings);
     state.spawn_usage_flusher();
     state.spawn_usage_snapshotter();
     state.spawn_billing_refresher();
@@ -6915,6 +6930,10 @@ fn dispatch_authenticated(
                 && service_authorized(headers, state.internal_service_key.as_deref()) =>
         {
             internal_segment_response(request_line, state)
+        }
+        // An export part streams from a file too (#347).
+        (Ok(tenant), _, _) if exports::is_download_route(request_line) => {
+            exports::download_response(request_line, tenant, state)
         }
         (Ok(tenant), _, _) => http::Response::from_raw(serve_tenant_request(
             request_line,
@@ -7590,6 +7609,10 @@ fn is_write_path(request_line: &str) -> bool {
     if namespace_deletion::is_write_route(request_line) {
         return true;
     }
+    // Starting and deleting a namespace export (#347).
+    if exports::is_write_route(request_line) {
+        return true;
+    }
     // Compaction jobs and scheduler state live on the write pod that runs
     // them; a query pod has none, so these reads are forwarded too.
     if request_line.starts_with("GET /v1/admin/compaction-") {
@@ -7808,6 +7831,10 @@ fn route(
             // `/v1/namespaces/{ns}/{action}`, or the bare
             // `/v1/namespaces/{ns}` that `DELETE` addresses.
             let ns = match rest.rsplit_once('/') {
+                // `/v1/namespaces/{ns}/exports/{id}[/download]` (#347).
+                _ if exports::parse_route(method, path).is_some() => {
+                    rest.split('/').next().unwrap_or(rest)
+                }
                 Some((ns, _action)) => ns,
                 None => rest.split('?').next().unwrap_or(rest),
             };
@@ -7927,6 +7954,11 @@ fn route_inner(
     }
 
     if let Some(ns) = bare_namespace(request_line, "DELETE") {
+        if let Err(response) =
+            namespace_deletion::check_delete_confirmation(request_line, &ns, state)
+        {
+            return response;
+        }
         return handle_delete_namespace(&ns, tenant, state);
     }
 
@@ -8051,6 +8083,11 @@ fn route_inner(
 
     // Tenant deletion and deletion records (#347).
     if let Some(response) = namespace_deletion::route_admin(request_line, body, state) {
+        return response;
+    }
+
+    // Namespace exports (#347); the download streams from `dispatch`.
+    if let Some(response) = exports::route(request_line, body, tenant, state) {
         return response;
     }
 
@@ -9288,6 +9325,7 @@ fn handle_stats(state: &AppState) -> String {
             state.indexer.local_retired_count(),
         ),
         "deletion_purge": state.deletion_purge.to_json(),
+        "exports": state.exports.to_json(),
         "rerank": state.rerankers.stats_json(),
         "embedding_providers": state.embedders.providers(),
     }))
@@ -10422,6 +10460,12 @@ fn handle_put_schema_with_ns(
     if let Some(shards) = state.indexer.shard_count(&ns) {
         pinned.extend(kosha_core::sharding::shard_namespaces(&ns, shards));
     }
+    // Schema evolution rules (#347): a change existing documents cannot
+    // follow is a 409 naming the field and the rule.
+    let changes = match schema_rules::check(state, &pinned, &schema) {
+        Ok(changes) => changes,
+        Err(response) => return response,
+    };
     for target in &pinned {
         if let Some(conflict) = state.indexer.embedding_conflict(target, &schema) {
             return json_error(409, &conflict);
@@ -10429,6 +10473,9 @@ fn handle_put_schema_with_ns(
     }
     let changed = match state.indexer.set_schema(&ns, schema.clone()) {
         Ok(changed) => changed,
+        Err(KoshaError::InvalidQuery(message)) if schema_rules::is_reindex_refusal(&message) => {
+            return json_error(409, &message)
+        }
         Err(KoshaError::InvalidQuery(message)) => return json_error(400, &message),
         Err(e) => return json_error(500, &format!("schema update failed: {e}")),
     };
@@ -10449,6 +10496,7 @@ fn handle_put_schema_with_ns(
         "namespace": namespace,
         "schema": schema,
         "changed": changed,
+        "changes": changes,
     }))
 }
 
@@ -12835,6 +12883,66 @@ mod tests {
             limit: u32,
         ) -> Result<Vec<kosha_core::deletion::DeletionRecord>, KoshaError> {
             Ok(self.inner.lock().unwrap().deletions_after(after, limit))
+        }
+        // #347 part 2: the pod registry, acknowledgements and exports.
+        fn note_deletion_exports(&mut self, id: &str, count: u64) -> Result<(), KoshaError> {
+            ControlStore::note_deletion_exports(&mut *self.inner.lock().unwrap(), id, count)
+        }
+        fn heartbeat_pod(
+            &mut self,
+            pod: &kosha_core::deletion::PodHeartbeat,
+        ) -> Result<(), KoshaError> {
+            ControlStore::heartbeat_pod(&mut *self.inner.lock().unwrap(), pod)
+        }
+        fn acknowledge_deletion(&mut self, id: &str, pod: &str) -> Result<(), KoshaError> {
+            ControlStore::acknowledge_deletion(&mut *self.inner.lock().unwrap(), id, pod)
+        }
+        fn deletion_ack_status(
+            &self,
+            id: &str,
+            live_within_ms: u64,
+        ) -> Result<kosha_core::deletion::AckStatus, KoshaError> {
+            ControlStore::deletion_ack_status(&*self.inner.lock().unwrap(), id, live_within_ms)
+        }
+        fn finalize_deletion(
+            &mut self,
+            id: &str,
+            live_within_ms: u64,
+        ) -> Result<kosha_core::deletion::DeletionRecord, KoshaError> {
+            ControlStore::finalize_deletion(&mut *self.inner.lock().unwrap(), id, live_within_ms)
+        }
+        fn create_export(
+            &mut self,
+            export: &kosha_core::export::NewExport,
+        ) -> Result<kosha_core::export::ExportRecord, KoshaError> {
+            ControlStore::create_export(&mut *self.inner.lock().unwrap(), export)
+        }
+        fn export(&self, id: &str) -> Result<Option<kosha_core::export::ExportRecord>, KoshaError> {
+            ControlStore::export(&*self.inner.lock().unwrap(), id)
+        }
+        fn exports(
+            &self,
+            filter: &kosha_core::export::ExportFilter,
+        ) -> Result<Vec<kosha_core::export::ExportRecord>, KoshaError> {
+            ControlStore::exports(&*self.inner.lock().unwrap(), filter)
+        }
+        fn update_export(
+            &mut self,
+            id: &str,
+            update: &kosha_core::export::ExportUpdate,
+        ) -> Result<Option<kosha_core::export::ExportRecord>, KoshaError> {
+            ControlStore::update_export(&mut *self.inner.lock().unwrap(), id, update)
+        }
+        fn claim_export(
+            &mut self,
+            id: &str,
+            holder: &str,
+            stale_after_ms: u64,
+        ) -> Result<Option<kosha_core::export::ExportRecord>, KoshaError> {
+            ControlStore::claim_export(&mut *self.inner.lock().unwrap(), id, holder, stale_after_ms)
+        }
+        fn delete_exports(&mut self, ids: &[String]) -> Result<u64, KoshaError> {
+            ControlStore::delete_exports(&mut *self.inner.lock().unwrap(), ids)
         }
     }
 

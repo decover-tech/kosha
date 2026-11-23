@@ -10,8 +10,10 @@
 //!
 //! Scopes by route:
 //!   - `read`: search, exists, namespace stats, reading a schema, listing
-//!     namespaces and branches, and the tenant's own usage (`GET /v1/usage`)
-//!     and billing state (`GET /v1/billing`).
+//!     namespaces and branches, the tenant's own usage (`GET /v1/usage`)
+//!     and billing state (`GET /v1/billing`), and namespace exports
+//!     (`/v1/namespaces/{ns}/exports...`, #347: an export returns what
+//!     a search could read).
 //!   - `write`: index, replace, delete documents, flush.
 //!   - `admin`: create and delete namespaces and branches, change a
 //!     namespace's schema or shards.
@@ -77,6 +79,18 @@ pub fn requirement(method: &str, path: &str) -> Requirement {
     let (bare, query) = path.split_once('?').unwrap_or((path, ""));
     if bare.starts_with("/v1/admin/") || bare.starts_with("/internal/") {
         return Requirement::Service;
+    }
+    // Namespace exports (#347): starting, reading, downloading and
+    // deleting one hands back the namespace's documents, so `read`.
+    if let Some(route) = crate::exports::parse_route(method, path) {
+        use crate::exports::ExportRoute;
+        let ns = match route {
+            ExportRoute::Create(ns) | ExportRoute::List(ns) => ns,
+            ExportRoute::Get(ns, _) | ExportRoute::Download(ns, _) | ExportRoute::Delete(ns, _) => {
+                ns
+            }
+        };
+        return scoped(Read, Target::Path(ns));
     }
     if let Some(rest) = bare.strip_prefix("/v1/namespaces/") {
         let Some((ns, action)) = rest.rsplit_once('/') else {
@@ -235,6 +249,15 @@ mod tests {
         ("POST", "/v1/namespaces/docs/shards", Scope::Admin),
         ("POST", "/v1/namespaces/docs/branch", Scope::Admin),
         ("DELETE", "/v1/namespaces/docs/branch", Scope::Admin),
+        ("POST", "/v1/namespaces/docs/exports", Scope::Read),
+        ("GET", "/v1/namespaces/docs/exports", Scope::Read),
+        ("GET", "/v1/namespaces/docs/exports/exp-1", Scope::Read),
+        (
+            "GET",
+            "/v1/namespaces/docs/exports/exp-1/download",
+            Scope::Read,
+        ),
+        ("DELETE", "/v1/namespaces/docs/exports/exp-1", Scope::Read),
     ];
 
     /// The routes of `ROUTES` that answer for the whole tenant.
@@ -334,6 +357,16 @@ mod tests {
                 ("POST", "/v1/admin/api-keys/scrub-plaintext"),
             ],
             source: Some((include_str!("api_key_admin.rs"), "\npub(crate) fn handle(")),
+        },
+        Delegate {
+            call: "exports::route(request_line, body, tenant, state)",
+            routes: &[
+                ("POST", "/v1/namespaces/docs/exports"),
+                ("GET", "/v1/namespaces/docs/exports"),
+                ("GET", "/v1/namespaces/docs/exports/exp-1"),
+                ("DELETE", "/v1/namespaces/docs/exports/exp-1"),
+            ],
+            source: Some((include_str!("exports.rs"), "\npub(crate) fn route(")),
         },
         Delegate {
             call: "namespace_deletion::route_admin(request_line, body, state)",

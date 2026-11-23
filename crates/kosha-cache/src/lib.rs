@@ -464,11 +464,15 @@ impl Cache {
                     continue;
                 };
                 // The WAL, a local WAL kept after moving it to S3
-                // (`_wal.migrated-*`) and the usage-metering spool (#348,
-                // `_usage`) are not cache content.
+                // (`_wal.migrated-*`), the usage-metering spool (#348,
+                // `_usage`) and namespace exports (#347, `_exports`) are not
+                // cache content.
                 if dir == root
                     && entry.file_name().to_str().is_some_and(|name| {
-                        name == "_wal" || name == "_usage" || name.starts_with("_wal.migrated-")
+                        name == "_wal"
+                            || name == "_usage"
+                            || name == "_exports"
+                            || name.starts_with("_wal.migrated-")
                     })
                 {
                     continue;
