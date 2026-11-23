@@ -105,25 +105,31 @@ impl Fixture {
     /// postings (in file order) to a span file.
     fn move_idx_to_spans(&self, per_span: usize) {
         let index = self.index();
-        let vi = index.lazy.as_ref().unwrap();
-        let mut ranges: Vec<(u64, u64)> = vi
-            .ranges
-            .iter()
-            .map(|&(offset, length)| (offset, offset + length as u64))
-            .collect();
-        ranges.sort_unstable();
-        let spans = span_cache::spans_dir(&self.dir, VECTOR_IDX_FILE);
-        fs::create_dir_all(&spans).unwrap();
-        for group in ranges.chunks(per_span) {
-            let (start, end) = (group[0].0, group[group.len() - 1].1);
-            fs::write(
-                spans.join(span_cache::span_file_name(start, end)),
-                &self.idx[start as usize..end as usize],
-            )
-            .unwrap();
-        }
-        fs::remove_file(self.dir.join(VECTOR_IDX_FILE)).unwrap();
+        move_idx_to_spans(&self.dir, index.lazy.as_ref().unwrap(), &self.idx, per_span);
     }
+}
+
+/// Move the `vector.idx` of the segment in `dir` (whose bytes are `idx`)
+/// into the span cache: `per_span` consecutive postings (in file order) to
+/// a span file.
+fn move_idx_to_spans(dir: &Path, vi: &LazyVectorIndex, idx: &[u8], per_span: usize) {
+    let mut ranges: Vec<(u64, u64)> = vi
+        .ranges
+        .iter()
+        .map(|&(offset, length)| (offset, offset + length as u64))
+        .collect();
+    ranges.sort_unstable();
+    let spans = span_cache::spans_dir(dir, VECTOR_IDX_FILE);
+    fs::create_dir_all(&spans).unwrap();
+    for group in ranges.chunks(per_span) {
+        let (start, end) = (group[0].0, group[group.len() - 1].1);
+        fs::write(
+            spans.join(span_cache::span_file_name(start, end)),
+            &idx[start as usize..end as usize],
+        )
+        .unwrap();
+    }
+    fs::remove_file(dir.join(VECTOR_IDX_FILE)).unwrap();
 }
 
 impl Drop for Fixture {
@@ -2026,6 +2032,116 @@ fn one_segment_probe_is_scored_on_more_than_one_thread() {
     assert!(seen > 1, "every posting was scored on one thread");
 }
 
+/// Two postings of one probe, far apart in probe order (so in different
+/// runs of a split), cannot be read: the split probe fails with the
+/// serial probe's error, the one naming the earlier posting.
+#[test]
+fn a_split_probe_fails_on_its_earliest_unreadable_posting() {
+    let (dir, _) = write_split_segment("fail", 8_000, 16, VectorQuantization::F32, 0xFA11);
+    let mut reader = SegmentReader::open_with_options(dir.clone(), true).unwrap();
+    reader.vector_cache = Arc::new(PostingsCache::new(0, None));
+    let index = reader.vector_field(FIELD).unwrap().unwrap();
+    let vi = index.lazy.as_ref().unwrap();
+    let idx = fs::read(dir.join(VECTOR_IDX_FILE)).unwrap();
+    move_idx_to_spans(&dir, vi, &idx, 1);
+    let query: Vec<f32> = (0..16).map(|i| (i as f32 * 0.29).sin()).collect();
+    let bounds = reader.knn_centroid_distances(FIELD, &query).unwrap();
+    let ranking = KnnSegmentRanking::new(bounds, f32::INFINITY, usize::MAX);
+    let order = &ranking.budgeted;
+    assert!(order.len() >= 4 * KNN_PARALLEL_MIN_POSTINGS);
+    let (earlier, later) = (order[2] as usize, order[order.len() - 3] as usize);
+    let name = |range_idx: usize| {
+        let (offset, length) = vi.ranges[range_idx];
+        format!("[{offset}, +{length})")
+    };
+    for range_idx in [earlier, later] {
+        let (offset, length) = vi.ranges[range_idx];
+        let span = span_cache::span_file_name(offset, offset + length as u64);
+        fs::remove_file(span_cache::spans_dir(&dir, VECTOR_IDX_FILE).join(span)).unwrap();
+    }
+    let budgets = [
+        KnnProbeBudget::Planned {
+            ranking: &ranking,
+            refill: KnnRefill::Always,
+        },
+        KnnProbeBudget::Within {
+            max_distance: f32::INFINITY,
+            max_probes: usize::MAX,
+            refill: KnnRefill::Always,
+        },
+    ];
+    let error = |threads: usize, budget| {
+        pool(threads).install(|| {
+            match reader.knn_candidates_fetching(FIELD, &query, 10, budget, None, None) {
+                Some(Err(e)) => e.to_string(),
+                _ => panic!("{threads} threads: the probe did not fail"),
+            }
+        })
+    };
+    for budget in budgets {
+        let serial = error(1, budget);
+        assert!(serial.contains(&name(earlier)), "{serial}");
+        assert_eq!(error(4, budget), serial);
+    }
+    drop(index);
+    drop(reader);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// With part of the probe already cached (hits, second touches and first
+/// touches in one probe), a split probe still returns and counts exactly
+/// what a serial one does, run after run, restricted or not, for f32, i8
+/// and RaBitQ.
+#[test]
+fn a_split_probe_over_a_partly_warm_cache_returns_what_one_thread_returns() {
+    for (name, quantization) in [
+        ("warm-f32", VectorQuantization::F32),
+        ("warm-i8", VectorQuantization::I8),
+        ("warm-rabitq", VectorQuantization::RaBitQ),
+    ] {
+        let (dir, _) = write_split_segment(name, 8_000, 16, quantization, 0x3A3A);
+        let query: Vec<f32> = (0..16).map(|i| (i as f32 * 0.43).cos()).collect();
+        let dead: HashSet<u32> = (0..8_000).filter(|i| i % 13 == 1).collect();
+        let filtered = |id: u32| !id.is_multiple_of(3) && !dead.contains(&id);
+        let runs =
+            |threads: usize| {
+                let mut reader = SegmentReader::open_with_options(dir.clone(), true).unwrap();
+                reader.vector_cache = Arc::new(PostingsCache::new(usize::MAX / 2, None));
+                let within = |max_probes| KnnProbeBudget::Within {
+                    max_distance: f32::INFINITY,
+                    max_probes,
+                    refill: KnnRefill::Always,
+                };
+                // Warm the nearest 40 postings, serially: seen twice, so
+                // cached; the next 20 seen once, so admitted on their next miss.
+                let one = pool(1);
+                for max_probes in [40, 40, 60] {
+                    one.install(|| probe_outcome(&reader, &query, 10, within(max_probes), None));
+                }
+                let pool = pool(threads);
+                let mut outcomes = Vec::new();
+                for accept in [None, Some(&filtered as KnnAccept<'_>)] {
+                    for k in [1, 10, 500] {
+                        outcomes.push(pool.install(|| {
+                            probe_outcome(&reader, &query, k, within(usize::MAX), accept)
+                        }));
+                    }
+                }
+                outcomes
+            };
+        let serial = runs(1);
+        // The first probe meets every kind of posting.
+        let (_, postings, _, (scanned, decoded, cached)) = serial[0];
+        assert!(postings >= 4 * KNN_PARALLEL_MIN_POSTINGS, "{name}");
+        assert!(cached > 0 && decoded > 0, "{name}: {:?}", serial[0].3);
+        if quantization == VectorQuantization::F32 {
+            assert!(scanned > 0, "{name}: {:?}", serial[0].3);
+        }
+        assert_eq!(runs(4), serial, "{name}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
 /// One large segment probed by one query, by pool size: staging's shape,
 /// ~1,600 postings of ~90 1536-d f32 vectors per segment.
 ///
@@ -2086,6 +2202,19 @@ fn one_large_segment_probe_by_pool_size() {
                 serial_ms / median
             );
         }
+        // The split's serial part: one second-touch decision per posting
+        // on the caller's thread, under the cache mutex.
+        let index = reader.vector_field(FIELD).unwrap().unwrap();
+        let vi = index.lazy.as_ref().unwrap();
+        let all: Vec<u32> = (0..postings as u32).collect();
+        let t = std::time::Instant::now();
+        for _ in 0..RUNS {
+            std::hint::black_box(reader.second_touch_admissions(vi, &all));
+        }
+        println!(
+            "{mode:>10}, admission pre-pass: {:.3} ms per probe",
+            t.elapsed().as_secs_f64() * 1e3 / RUNS as f64
+        );
     }
     drop(reader);
     let _ = fs::remove_dir_all(&dir);
