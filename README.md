@@ -21,6 +21,8 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 | --- | --- | --- |
 | Server image | [Docker Hub — `ravidecoverai/kosha`](https://hub.docker.com/r/ravidecoverai/kosha) | `docker pull ravidecoverai/kosha:latest` |
 | Python client | [PyPI — `kosha-client`](https://pypi.org/project/kosha-client/) | `pip install kosha-client` |
+| TypeScript SDK (preview) | npm — `@decover/kosha` ([clients/typescript](clients/typescript)) | `npm install @decover/kosha` |
+| Go SDK (preview) | `github.com/decover-tech/kosha/clients/go` ([clients/go](clients/go)) | `go get github.com/decover-tech/kosha/clients/go` |
 | CLI | not published to crates.io yet | `cargo install --path crates/kosha-cli` |
 
 ## Supported features
@@ -314,6 +316,7 @@ own document, or combine the two values into one leaf (`"name_org": "Ada|beta"`)
 - `proto/kosha/v1/*.proto` describes the wire format and generates the OpenAPI documents (`make openapi`).
 - `kosha` CLI (built from `crates/kosha-cli`, not yet on crates.io): health, index, search, flush, delete, stats, admin commands, named profiles, `--json` output, and a `kosha curl` escape hatch.
 - OpenSearch-compatible Python client, [`kosha-client` on PyPI](https://pypi.org/project/kosha-client/): `search`, `index`, `bulk`, `count`, `update`, `delete_by_query`, `update_by_query`, `scroll`, plus `indices` and `tasks` namespaces, translating the ES query DSL to Kosha's native shape. What it supports, partially supports and rejects: [docs/compat/opensearch.md](docs/compat/opensearch.md). Moving an index over: [docs/migration/from-elasticsearch.md](docs/migration/from-elasticsearch.md).
+- TypeScript ([clients/typescript](clients/typescript)) and Go ([clients/go](clients/go)) SDKs for the native `/v1` API, typed from the OpenAPI document: namespaces, schema, upsert/merge, search, a `search_after` iterator, batched bulk indexing, and retries on `429`/`503` that honour `Retry-After`. All three SDKs share one retry policy ([clients/conformance/RETRY.md](clients/conformance/RETRY.md)) and one conformance suite run against a live stack in CI ([clients/conformance](clients/conformance)). The TS and Go SDKs take native bodies only (no OpenSearch DSL translation).
 
 ### Not supported yet
 
@@ -916,6 +919,9 @@ back requires converting both formats. The SQL column needs no schema change.
       python/kosha_client   OpenSearch-compatible Python client
                             (spec → codegen → thin client)
       python/README.md      how the client is structured
+      typescript/           TypeScript SDK (@decover/kosha)
+      go/                   Go SDK (github.com/decover-tech/kosha/clients/go)
+      conformance/          shared SDK conformance cases, fault proxy, retry policy
     proto/
       buf.yaml              Buf module config
       kosha/v1/kosha.proto  canonical API contract (source of truth)
