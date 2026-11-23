@@ -145,6 +145,7 @@ See `k8s/README.md` ("Encryption at rest") for an IAM policy and a StorageClass 
 | `KOSHA_RESULT_CACHE_MAX_BYTES` | Whole-response cache for `POST /search`; `0` disables (`result_cache_budget`) | `67108864` (64 MiB) | bytes |
 | `KOSHA_POSTINGS_CACHE_MAX_BYTES` | Decoded text-postings LRU, **per open segment**; `0` disables (`kosha-segment`) | `4194304` (4 MiB) | bytes |
 | `KOSHA_VECTOR_POSTINGS_CACHE_MAX_BYTES` | Decoded vector-postings LRU, **one budget for the whole process** (every open segment's postings in one LRU); also counted in `KOSHA_SEGMENT_LIVE_MAX_BYTES`. Keep it a stated share of that watermark; `0` disables | `536870912` (512 MiB) | bytes |
+| `KOSHA_SPAN_LISTING_CACHE` | Cache each `*.spans` directory's listing in memory, valid while the directory's modification time is unchanged (a span is added by a rename and removed by an unlink, and both change it). Saves a `read_dir` and a stat per span on every ranged local read of a segment warmed by ranged fetches. `0`, `off` or `false` lists the directory every time | `1` | bool |
 
 ## Hydration (fetching segments from S3)
 
