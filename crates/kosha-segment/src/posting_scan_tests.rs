@@ -1658,3 +1658,45 @@ fn per_hit_cost_at_five_thousand_entries() {
     let old_ns = t.elapsed().as_nanos() as f64 / HITS as f64;
     println!("per hit at {N} entries: new {new_ns:.1} ns, old {old_ns:.1} ns");
 }
+
+/// Freeing a decoded posting can mean thousands of deallocations; the
+/// shared vector cache's lock (which every kNN worker takes) must not be
+/// held while evicted or removed entries are freed.
+#[test]
+fn evicted_and_removed_entries_are_freed_outside_the_cache_lock() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static CACHE: OnceLock<PostingsCache<(u64, usize), Probe>> = OnceLock::new();
+    static FREED: AtomicUsize = AtomicUsize::new(0);
+    static FREED_LOCKED: AtomicUsize = AtomicUsize::new(0);
+    #[derive(Clone)]
+    struct Probe(#[allow(dead_code)] Arc<u8>);
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            // Last reference (the cache's): is the cache lock free?
+            if Arc::strong_count(&self.0) == 1 {
+                FREED.fetch_add(1, Ordering::SeqCst);
+                if CACHE.get().unwrap().state.try_lock().is_err() {
+                    FREED_LOCKED.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+    let cache = CACHE.get_or_init(|| PostingsCache::new(4, None));
+    let account: Arc<CountingAccount> = Arc::default();
+    let shared: SharedAccount = Arc::clone(&account) as SharedAccount;
+    // Evictions: each insert past four entries evicts the oldest.
+    for k in 0..10 {
+        cache.insert_for((0, k), Probe(Arc::new(0)), 1, Some(&shared));
+    }
+    // Replacement of an existing key frees the old value.
+    cache.insert_for((0, 9), Probe(Arc::new(0)), 1, Some(&shared));
+    // A dropped segment's entries.
+    cache.remove_where(|(owner, _)| *owner == 0);
+    assert_eq!(
+        FREED.load(Ordering::SeqCst),
+        11,
+        "6 evicted, 1 replaced, 4 removed"
+    );
+    assert_eq!(FREED_LOCKED.load(Ordering::SeqCst), 0);
+    assert_eq!(account.live(), 0);
+}

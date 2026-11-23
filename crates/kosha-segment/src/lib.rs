@@ -5086,8 +5086,10 @@ impl<K: Copy + Eq + std::hash::Hash, V: Clone> PostingsCache<K, V> {
         // "cache locks may be held while taking the ledger lock, never the
         // reverse." Reporting outside the cache lock keeps that direction
         // clean and avoids any reentrancy if `add_postings` ever touches
-        // the same cache.
-        let mut released: Vec<(Option<SharedAccount>, usize)> = Vec::new();
+        // the same cache. Evicted entries are freed out there too: one
+        // insert can evict many postings, and every kNN worker of every
+        // segment waits on this lock.
+        let mut gone: Vec<CacheEntry<V>> = Vec::new();
         {
             let mut guard = self.state.lock().unwrap();
             let st = &mut *guard;
@@ -5101,7 +5103,7 @@ impl<K: Copy + Eq + std::hash::Hash, V: Clone> PostingsCache<K, V> {
             if let Some(old) = st.entries.insert(key, entry) {
                 // Replacing an entry: release its bytes, add the new ones.
                 st.total_bytes -= old.bytes;
-                released.push((old.account, old.bytes));
+                gone.push(old);
             }
             st.total_bytes += bytes;
             while st.total_bytes > self.max_bytes {
@@ -5110,48 +5112,44 @@ impl<K: Copy + Eq + std::hash::Hash, V: Clone> PostingsCache<K, V> {
                 else {
                     break;
                 };
-                if let Some(gone) = st.entries.remove(&oldest) {
-                    st.total_bytes -= gone.bytes;
-                    released.push((gone.account, gone.bytes));
+                if let Some(evicted) = st.entries.remove(&oldest) {
+                    st.total_bytes -= evicted.bytes;
+                    gone.push(evicted);
                 }
             }
             let entries = &st.entries;
             st.recency
                 .compact(entries.len(), |k| entries.get(k).map(|e| e.stamp));
         }
-        for (account, bytes) in released {
-            if let Some(account) = account {
-                account.release_postings(bytes as u64);
-            }
-        }
+        release_and_free(gone);
         if let Some(account) = account {
             account.add_postings(bytes as u64);
         }
     }
 
     /// Remove every entry whose key `doomed` selects, releasing its bytes
-    /// to its account. O(entries). Remembered misses are left to age out
+    /// to its account. O(entries) under the lock; the entries are freed
+    /// after it is released (a segment's postings can be thousands of
+    /// allocations, and this runs from `SegmentReader::drop`). Remembered misses are left to age out
     /// of their bounded window: purging them would cost a pass over up to
     /// [`VECTOR_MISS_WINDOW_MAX`] keys under the lock every kNN shares.
     fn remove_where(&self, doomed: impl Fn(&K) -> bool) {
         let removed = {
-            let mut guard = self.state.lock().unwrap();
+            // Reachable from `Drop`: a poisoned lock must not panic there.
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let st = &mut *guard;
-            let mut removed = Vec::new();
-            st.entries.retain(|key, entry| {
-                if !doomed(key) {
-                    return true;
-                }
-                removed.push((entry.account.take(), entry.bytes));
-                false
-            });
-            st.total_bytes -= removed.iter().map(|(_, bytes)| bytes).sum::<usize>();
+            let removed: Vec<CacheEntry<V>> = st
+                .entries
+                .extract_if(|key, _| doomed(key))
+                .map(|(_, entry)| entry)
+                .collect();
+            st.total_bytes -= removed.iter().map(|entry| entry.bytes).sum::<usize>();
             let entries = &st.entries;
             st.recency
                 .compact(entries.len(), |k| entries.get(k).map(|e| e.stamp));
             removed
         };
-        release_grouped(removed);
+        release_and_free(removed);
     }
 
     /// Bytes held by the entries `selected` picks. O(entries).
@@ -5165,17 +5163,18 @@ impl<K: Copy + Eq + std::hash::Hash, V: Clone> PostingsCache<K, V> {
     }
 }
 
-/// Release `(account, bytes)` pairs with one call per distinct account, so
-/// dropping a cache of thousands of entries notifies the ledger once.
-fn release_grouped(released: Vec<(Option<SharedAccount>, usize)>) {
+/// Free entries taken out of a cache, then release their bytes with one
+/// call per distinct account (dropping thousands of entries notifies the
+/// ledger once). Call with the cache lock released.
+fn release_and_free<V>(gone: Vec<CacheEntry<V>>) {
     let mut totals: Vec<(SharedAccount, u64)> = Vec::new();
-    for (account, bytes) in released {
-        let Some(account) = account else {
+    for entry in gone {
+        let Some(account) = entry.account else {
             continue;
         };
         match totals.iter_mut().find(|(a, _)| Arc::ptr_eq(a, &account)) {
-            Some((_, total)) => *total += bytes as u64,
-            None => totals.push((account, bytes as u64)),
+            Some((_, total)) => *total += entry.bytes as u64,
+            None => totals.push((account, entry.bytes as u64)),
         }
     }
     for (account, total) in totals {
@@ -5192,14 +5191,11 @@ impl<K, V> Drop for PostingsCache<K, V> {
         // `SegmentReader` (and its caches) go away — see the trait doc.
         // Taken under the lock, reported outside it (same lock-order
         // discipline as `insert_for`).
-        let released = {
+        let gone: Vec<CacheEntry<V>> = {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            st.entries
-                .drain()
-                .map(|(_, entry)| (entry.account, entry.bytes))
-                .collect()
+            st.entries.drain().map(|(_, entry)| entry).collect()
         };
-        release_grouped(released);
+        release_and_free(gone);
     }
 }
 
