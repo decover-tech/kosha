@@ -5,10 +5,17 @@ Handles API key injection, HTTP requests, retry, and JSON serialization.
 
 from __future__ import annotations
 
+import collections
+import http.client
 import json
 import logging
 import math
+import os
 import random
+import select
+import socket
+import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -16,6 +23,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from email.utils import parsedate_to_datetime
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import UUID
 
 try:
@@ -89,6 +97,126 @@ def _retry_after_secs(value: str | None) -> float | None:
     return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
 
 
+# Kept-alive connections, shared by every Transport in the process (the
+# backend builds a new client per call) and reused per (scheme, host, port),
+# so a request pays DNS and the TCP/TLS handshake only when it opens a new
+# connection, not every time. At most _POOL_MAXSIZE idle connections are
+# kept per host; a request that finds none opens one, so concurrency is not
+# capped. An idle connection is dropped after _POOL_IDLE_SECS, below the
+# server's 30 s keep-alive idle timeout (KOSHA_HTTP_IDLE_TIMEOUT_SECS). A
+# connection is retired after _POOL_MAX_AGE_SECS: a Service balances per
+# connection, so this is how load reaches pods added since (autoscaling) and
+# leaves pods being replaced.
+_POOL_MAXSIZE = 10
+_POOL_IDLE_SECS = 15.0
+_POOL_MAX_AGE_SECS = 60.0
+_USER_AGENT = f"Python-urllib/{sys.version_info[0]}.{sys.version_info[1]}"
+
+
+def _alive(sock: socket.socket | None) -> bool:
+    """Whether an idle connection's socket is still open with nothing unread.
+
+    A peer that closed it (idle timeout, restart) makes it readable: EOF, a
+    reset, or stray bytes. None of those can carry another request. Polled
+    rather than peeked so it works on TLS sockets too.
+    """
+    if sock is None:
+        return False
+    try:
+        if hasattr(select, "poll"):  # select() fails on fds above FD_SETSIZE
+            poller = select.poll()
+            poller.register(sock, select.POLLIN)
+            return not poller.poll(0)
+        return not select.select([sock], [], [], 0)[0]
+    except (OSError, ValueError):
+        return False
+
+
+class _Pool:
+    """Idle kept-alive connections to one host, newest last."""
+
+    def __init__(self, scheme: str, host: str, port: int | None):
+        self.scheme = scheme
+        self.host = host
+        self.port = port
+        self._lock = threading.Lock()
+        self._idle: collections.deque[tuple[http.client.HTTPConnection, float]] = (
+            collections.deque()
+        )
+
+    def get(self, timeout: float) -> tuple[http.client.HTTPConnection, bool]:
+        """A connection and whether it was reused; a new one is not connected yet."""
+        while True:
+            with self._lock:
+                conn, since = self._idle.pop() if self._idle else (None, 0.0)
+            if conn is None:
+                break
+            if time.monotonic() - since <= _POOL_IDLE_SECS and _alive(conn.sock):
+                conn.timeout = timeout
+                conn.sock.settimeout(timeout)
+                return conn, True
+            conn.close()
+        cls = (
+            http.client.HTTPSConnection
+            if self.scheme == "https"
+            else http.client.HTTPConnection
+        )
+        conn = cls(self.host, self.port, timeout=timeout)
+        conn._kosha_opened = time.monotonic()  # type: ignore[attr-defined]
+        return conn, False
+
+    def put(self, conn: http.client.HTTPConnection) -> None:
+        opened = getattr(conn, "_kosha_opened", 0.0)
+        if time.monotonic() - opened > _POOL_MAX_AGE_SECS:
+            conn.close()
+            return
+        with self._lock:
+            self._idle.append((conn, time.monotonic()))
+            extra = self._idle.popleft()[0] if len(self._idle) > _POOL_MAXSIZE else None
+        if extra is not None:
+            extra.close()
+
+    def clear(self) -> None:
+        """Close every idle connection (their peer has likely closed them all)."""
+        with self._lock:
+            idle, self._idle = self._idle, collections.deque()
+        for conn, _ in idle:
+            conn.close()
+
+
+_POOLS: dict[tuple[str, str, int | None], _Pool] = {}
+_POOLS_LOCK = threading.Lock()
+
+
+def _pool_for(scheme: str, host: str, port: int | None) -> _Pool:
+    key = (scheme, host, port)
+    pool = _POOLS.get(key)
+    if pool is None:
+        with _POOLS_LOCK:
+            pool = _POOLS.setdefault(key, _Pool(scheme, host, port))
+    return pool
+
+
+def _reset_pools_after_fork() -> None:
+    # A forked child must not share its parent's sockets, nor inherit a lock
+    # another thread held at fork time.
+    global _POOLS, _POOLS_LOCK
+    _POOLS = {}
+    _POOLS_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_pools_after_fork)
+
+
+def _uses_proxy(url: str) -> bool:
+    """Whether urllib would send this URL through a proxy (``*_proxy`` env)."""
+    parts = urlsplit(url)
+    return parts.scheme in urllib.request.getproxies() and not (
+        urllib.request.proxy_bypass(parts.hostname or "")
+    )
+
+
 class Transport:
     """Low-level HTTP transport for Kosha API requests.
 
@@ -103,6 +231,13 @@ class Transport:
     ``Retry-After`` that does not fit the budget (a 60 s quota refusal) is
     not waited for: the error is raised at once. ``retry_budget=0`` turns
     status retries off.
+
+    Connections are kept alive and reused (see ``_Pool``). A read that fails
+    on a reused connection before any response (its peer closed it while it
+    sat idle) is resent once on a new connection without counting as an
+    attempt; a write takes the connection-error retry above. A base URL that
+    the ``*_proxy`` environment routes through a proxy uses ``urlopen`` per
+    request, as before.
     """
 
     # Full-jitter backoff without a Retry-After: uniform(0, min(cap, base * 2**n)).
@@ -124,6 +259,7 @@ class Transport:
         self.max_retries = max_retries
         self.retry_on_timeout = retry_on_timeout
         self.retry_budget = retry_budget
+        self._proxied = _uses_proxy(self.base_url)
 
     def _status_retry_delay(
         self, method: str, path: str, status: int, retry_after: str | None,
@@ -157,43 +293,18 @@ class Transport:
         url = f"{self.base_url}/{path.lstrip('/')}"
         data = json.dumps(body, default=json_default).encode() if body is not None else None
 
-        req = urllib.request.Request(url, data=data, method=method)
-        req.add_header("Content-Type", "application/json")
+        # Header names are capitalized as urllib's Request.add_header does.
+        req_headers = {"Content-type": "application/json"}
         if self.api_key:
-            req.add_header("Authorization", f"Bearer {self.api_key}")
+            req_headers["Authorization"] = f"Bearer {self.api_key}"
 
         last_error: Exception | None = None
         started = time.monotonic()
         for attempt in range(1, self.max_retries + 1):
             try:
-                resp = urllib.request.urlopen(req, timeout=self.timeout)
-                return json.loads(resp.read().decode())
-            except urllib.error.HTTPError as e:
-                body_bytes = e.read()
-                try:
-                    err = json.loads(body_bytes.decode())
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    err = None
-                if not isinstance(err, dict):
-                    # A non-JSON or non-object body (a proxy's HTML page).
-                    err = {"error": body_bytes.decode(errors="replace")}
-                retry_after = e.headers.get("Retry-After") if e.headers else None
-                delay = self._status_retry_delay(
-                    method, path, e.code, retry_after, attempt, started
+                status, reason, resp_headers, body_bytes = self._send(
+                    method, path, url, data, req_headers
                 )
-                if delay is not None:
-                    logger.info(
-                        "Kosha request retrying: %s %s → %s (attempt %d/%d, in %.2fs) %s",
-                        method, path, e.code, attempt, self.max_retries, delay,
-                        err.get("reason", ""),
-                    )
-                    time.sleep(delay)
-                    continue
-                logger.warning(
-                    "Kosha request failed: %s %s → %s %s",
-                    method, path, e.code, err,
-                )
-                raise KoshaRequestError(e.code, err.get("error", str(e)), err) from e
             except urllib.error.URLError as e:
                 last_error = e
                 if isinstance(e, urllib.error.URLError) and not self.retry_on_timeout:
@@ -201,8 +312,96 @@ class Transport:
                 if attempt < self.max_retries:
                     time.sleep(0.1 * (2 ** attempt))
                 continue
+            if 200 <= status < 300:
+                return json.loads(body_bytes.decode())
+            try:
+                err = json.loads(body_bytes.decode())
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                err = None
+            if not isinstance(err, dict):
+                # A non-JSON or non-object body (a proxy's HTML page).
+                err = {"error": body_bytes.decode(errors="replace")}
+            retry_after = resp_headers.get("Retry-After") if resp_headers else None
+            delay = self._status_retry_delay(
+                method, path, status, retry_after, attempt, started
+            )
+            if delay is not None:
+                logger.info(
+                    "Kosha request retrying: %s %s → %s (attempt %d/%d, in %.2fs) %s",
+                    method, path, status, attempt, self.max_retries, delay,
+                    err.get("reason", ""),
+                )
+                time.sleep(delay)
+                continue
+            logger.warning(
+                "Kosha request failed: %s %s → %s %s",
+                method, path, status, err,
+            )
+            raise KoshaRequestError(
+                status, err.get("error", f"HTTP Error {status}: {reason}"), err
+            )
 
         raise KoshaRequestError(0, f"request failed after {self.max_retries} retries: {last_error}") from last_error
+
+    def _send(
+        self, method: str, path: str, url: str, data: bytes | None, headers: dict
+    ) -> tuple[int, str, Any, bytes]:
+        """One HTTP exchange: ``(status, reason, headers, body)`` for any status.
+
+        Errors are those of ``urlopen``: a failure to connect or send raises
+        ``urllib.error.URLError``; a failure while waiting for or reading the
+        response (a timeout included) propagates unchanged. New here: a
+        reused connection that turns out closed (any error but a timeout)
+        raises ``URLError``, so it takes the connection-error retry.
+        """
+        if self._proxied:
+            req = urllib.request.Request(url, data=data, method=method)
+            for name, value in headers.items():
+                req.add_header(name, value)
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    return resp.status, resp.reason, resp.headers, resp.read()
+            except urllib.error.HTTPError as e:
+                return e.code, e.reason, e.headers, e.read()
+
+        parts = urlsplit(url)
+        target = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+        headers = {"User-agent": _USER_AGENT, **headers}
+        pool = _pool_for(parts.scheme, parts.hostname or "", parts.port)
+        resend_stale = _is_read(method, path)
+        while True:
+            conn, reused = pool.get(self.timeout)
+            sent = False
+            try:
+                conn.request(method, target, body=data, headers=headers)
+                sent = True
+                resp = conn.getresponse()
+            except OSError as e:
+                conn.close()
+                # A timeout is a slow server, not a closed connection: it is
+                # neither resent here nor a reason to drop the idle ones.
+                stale = reused and not isinstance(e, TimeoutError)
+                if stale:
+                    pool.clear()
+                    if resend_stale:
+                        resend_stale = False
+                        continue
+                if stale or not sent:
+                    raise urllib.error.URLError(e) from e
+                raise
+            except BaseException:
+                conn.close()
+                raise
+            try:
+                body = resp.read()
+            except BaseException:
+                conn.close()
+                raise
+            if resp.will_close:
+                conn.close()
+            else:
+                pool.put(conn)
+            return resp.status, resp.reason, resp.headers, body
 
     def request_with_ns(
         self,
