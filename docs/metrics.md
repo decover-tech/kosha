@@ -71,6 +71,10 @@ plus `+Inf`.
 | `kosha_hydrations_total` | counter | `source` | Segment files a hydration needed, by where they came from. `s3`: fetched from the object store. `peer`: streamed from the replica holding the hydration lease. `local`: already in the local cache when the fetch ran. Ranged span reads of doc stores and postings are not counted. Stays at zero without S3 |
 | `kosha_hydration_lease_outcome_total` | counter | `outcome` | Cross-replica hydration lease claims (S3 and Postgres builds with `POD_IP` set). `won`: this replica fetches the file. `streamed_from_peer`: another replica held the lease and served the bytes. `timeout`: the holder did not serve the bytes within the peer-fetch budget (or the fetch failed), and the file was fetched from S3 instead |
 | `kosha_segment_checksum_failures_total` | counter | none | Hydrated segment files that failed their `_COMMIT` size or CRC check, refetch failures included. The same number as `segment_checksum_failures` in `GET /v1/stats` |
+| `kosha_span_writes_total` | counter | `outcome` | Fetched byte ranges (kNN postings, term postings, page documents, sidecar headers) by what became of their write into the span cache. `written`: written by the background span writer. `dropped`: the writer's queue (256 MiB) was full; the span was held in memory by the request that fetched it and not cached. `inline`: queue and held cap (1 GiB) both full; written on the fetching thread. `failed`: a write that did not complete (it invalidates the posting presence cache). The same numbers as `span_writes` in `GET /v1/stats` |
+| `kosha_span_writes_dropped_bytes_total` | counter | none | Bytes of the `dropped` span writes above |
+| `kosha_span_write_queue_bytes` | gauge | none | Span bytes queued for the background writer (at most 256 MiB, plus never-dropped header spans) |
+| `kosha_span_held_bytes` | gauge | none | Bytes of dropped span writes held in memory by in-flight requests (at most 1 GiB) |
 
 Values that already exist elsewhere in the server (cache bytes, NVMe evictions, checksum
 failures, queue depth) are read when Prometheus scrapes, not counted twice.

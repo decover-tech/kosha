@@ -2343,13 +2343,11 @@ async fn stream_body_into(
     // until the kernel's background threshold (see `writeback`): a warm-up
     // or a large hydration otherwise piles up gigabytes of dirty pages and
     // the kernel then throttles every thread in the pod that writes.
+    // Handed to the writeback thread: the advice can sleep in the kernel,
+    // and this part's request must not wait on it.
     if bytes > 0 {
         let file = file.into_inner().into_std().await;
-        if let Err(e) =
-            tokio::task::spawn_blocking(move || crate::writeback::start(&file, offset, bytes)).await
-        {
-            eprintln!("WARN: writeback start task failed: {e}");
-        }
+        crate::writeback::start_in_background(file, offset, bytes);
     }
 
     Ok(StreamedFetch { bytes, write_ms })

@@ -33,8 +33,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::{Duration, SystemTime};
 
 /// Suffix of the sparse cache directory next to a segment file.
@@ -71,13 +71,64 @@ pub struct PendingSpan {
     start: u64,
     bytes: Vec<u8>,
     queued: bool,
+    /// Where the bytes are counted while held only (a dropped write), so
+    /// the owner can bound and report them; decremented on the last drop.
+    held: Option<Arc<AtomicU64>>,
 }
 
 /// Pending spans a reader must keep alive until it has read them: the
 /// spans a fetch could not queue for writing (see [`PendingSpan`]).
-pub type SpanHolds = Vec<Arc<PendingSpan>>;
+/// Dropping it early makes those ranges unreadable, hence `must_use`.
+#[must_use = "the fetched spans are readable only while their holds live"]
+#[derive(Debug, Default, Clone)]
+pub struct SpanHolds(Vec<Arc<PendingSpan>>);
 
-type PendingRegistry = Mutex<HashMap<PathBuf, Vec<Weak<PendingSpan>>>>;
+impl SpanHolds {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Bytes held.
+    pub fn bytes(&self) -> u64 {
+        self.0.iter().map(|p| p.bytes.len() as u64).sum()
+    }
+
+    pub fn append(&mut self, other: &mut SpanHolds) {
+        self.0.append(&mut other.0);
+    }
+}
+
+impl Extend<Arc<PendingSpan>> for SpanHolds {
+    fn extend<I: IntoIterator<Item = Arc<PendingSpan>>>(&mut self, iter: I) {
+        self.0.extend(iter);
+    }
+}
+
+impl Extend<SpanHolds> for SpanHolds {
+    fn extend<I: IntoIterator<Item = SpanHolds>>(&mut self, iter: I) {
+        for mut holds in iter {
+            self.append(&mut holds);
+        }
+    }
+}
+
+impl FromIterator<Arc<PendingSpan>> for SpanHolds {
+    fn from_iter<I: IntoIterator<Item = Arc<PendingSpan>>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+/// Read-mostly: every [`SpanIndex::load`] with pending spans alive reads
+/// it; only registering and the last drop of a pending span write it.
+type PendingRegistry = RwLock<HashMap<PathBuf, Vec<Weak<PendingSpan>>>>;
 
 fn pending_registry() -> &'static PendingRegistry {
     static REGISTRY: OnceLock<PendingRegistry> = OnceLock::new();
@@ -101,13 +152,46 @@ impl PendingSpan {
         bytes: Vec<u8>,
         queued: bool,
     ) -> Arc<Self> {
+        Self::registered(spans_dir(segment_dir, file), start, bytes, queued, None)
+    }
+
+    /// [`Self::register`] for a span whose write was dropped: readable only
+    /// (never counted as cached), its bytes added to `held` until the last
+    /// clone drops.
+    pub fn register_held(
+        segment_dir: &Path,
+        file: &str,
+        start: u64,
+        bytes: Vec<u8>,
+        held: Arc<AtomicU64>,
+    ) -> Arc<Self> {
+        held.fetch_add(bytes.len() as u64, Ordering::AcqRel);
+        Self::registered(
+            spans_dir(segment_dir, file),
+            start,
+            bytes,
+            false,
+            Some(held),
+        )
+    }
+
+    fn registered(
+        dir: PathBuf,
+        start: u64,
+        bytes: Vec<u8>,
+        queued: bool,
+        held: Option<Arc<AtomicU64>>,
+    ) -> Arc<Self> {
         let span = Arc::new(Self {
-            dir: spans_dir(segment_dir, file),
+            dir,
             start,
             bytes,
             queued,
+            held,
         });
-        let mut registry = pending_registry().lock().unwrap();
+        let mut registry = pending_registry()
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         registry
             .entry(span.dir.clone())
             .or_default()
@@ -138,13 +222,24 @@ impl PendingSpan {
         &self.dir
     }
 
+    /// The whole file the span is a range of: `{segment_dir}/{file}`.
+    pub fn whole_path(&self) -> PathBuf {
+        let name = self
+            .dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let file = name.strip_suffix(SPANS_SUFFIX).unwrap_or(&name);
+        self.dir.with_file_name(file)
+    }
+
     /// The live pending spans of one span directory, sorted by start.
     fn of_dir(dir: &Path) -> Vec<Arc<Self>> {
         if PENDING_LIVE.load(Ordering::Acquire) == 0 {
             return Vec::new();
         }
         let mut live: Vec<Arc<Self>> = {
-            let registry = pending_registry().lock().unwrap();
+            let registry = pending_registry().read().unwrap_or_else(|e| e.into_inner());
             registry
                 .get(dir)
                 .map(|spans| spans.iter().filter_map(Weak::upgrade).collect())
@@ -157,7 +252,12 @@ impl PendingSpan {
 
 impl Drop for PendingSpan {
     fn drop(&mut self) {
-        let mut registry = pending_registry().lock().unwrap();
+        if let Some(held) = &self.held {
+            held.fetch_sub(self.bytes.len() as u64, Ordering::AcqRel);
+        }
+        let mut registry = pending_registry()
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(spans) = registry.get_mut(&self.dir) {
             // This span's own weak entry is dead by now (its strong count
             // reached zero), as is any other that has not been pruned yet.
@@ -341,13 +441,6 @@ impl SpanIndex {
 
     pub fn covers(&self, start: u64, end: u64) -> bool {
         start == end || self.covering(start, end).is_some()
-    }
-
-    /// [`Self::covers`] by a span file alone: what a caller that records
-    /// "this range is local" beyond this index's lifetime must ask, since a
-    /// pending span is in memory only until its write lands (or never).
-    pub fn covers_on_disk(&self, start: u64, end: u64) -> bool {
-        start == end || covering_in(&self.on_disk, start, end).is_some()
     }
 
     /// The pending span holding all of `[start, end)`, if any.
@@ -801,10 +894,13 @@ mod tests {
         put(&seg, file, 0, b"DISK");
         let bytes: Vec<u8> = (0..32u8).collect();
         let queued = PendingSpan::register(&seg, file, 100, bytes.clone(), true);
-        let dropped = PendingSpan::register(&seg, file, 200, vec![9u8; 8], false);
+        let held = Arc::new(AtomicU64::new(0));
+        let dropped = PendingSpan::register_held(&seg, file, 200, vec![9u8; 8], held.clone());
+        assert_eq!(held.load(Ordering::Relaxed), 8);
+        assert_eq!(queued.whole_path(), seg.join(file));
         let idx = SpanIndex::load(&seg, file);
         assert_eq!(idx.spans(), &[(0, 4), (100, 132)]);
-        assert!(idx.covers(104, 108) && !idx.covers_on_disk(104, 108));
+        assert!(idx.covers(104, 108) && !queued.dest().exists());
         assert!(!idx.covers(200, 208), "a dropped span is not cached");
         assert_eq!(idx.read(104, 108).as_deref(), Some(&bytes[4..8]));
         assert_eq!(idx.read(202, 204).as_deref(), Some(&[9u8, 9][..]));
@@ -830,6 +926,11 @@ mod tests {
         assert_eq!(idx.read(104, 108).as_deref(), Some(&bytes[4..8]));
         assert_eq!(reader.read(u64::MAX, 200, 2), Some(&[9u8, 9][..]));
         drop((idx, reader));
+        assert_eq!(
+            held.load(Ordering::Relaxed),
+            0,
+            "the last drop releases the count"
+        );
         let idx = SpanIndex::load(&seg, file);
         assert_eq!(idx.spans(), &[(0, 4)]);
         assert_eq!(idx.read(104, 108), None);

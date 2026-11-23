@@ -674,15 +674,15 @@ impl RequestHydration {
             budget_expiries: AtomicU64::new(0),
             rid: crate::request_id(),
             background: false,
-            held_spans: Mutex::new(Vec::new()),
+            held_spans: Mutex::new(SpanHolds::new()),
         }
     }
 
     /// Keep `spans` readable until this request's accountant drops (see
     /// `held_spans`).
-    pub fn hold_spans(&self, spans: SpanHolds) {
+    pub fn hold_spans(&self, mut spans: SpanHolds) {
         if !spans.is_empty() {
-            self.held_spans.lock().unwrap().extend(spans);
+            self.held_spans.lock().unwrap().append(&mut spans);
         }
     }
 

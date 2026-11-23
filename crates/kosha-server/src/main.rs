@@ -113,6 +113,14 @@ use kosha_segment::span_cache::SpanHolds;
 use kosha_segment::SegmentReader;
 use kosha_write::Indexer;
 
+/// Longest the boot warm-up waits for its writes to reach the cache disk
+/// before reporting ready anyway (see `AppState::finish_warmup`): above the
+/// ≈ 46 s that the kernel's dirty limit allows at 125 MiB/s, so it only
+/// fires on a disk (or an `emptyDir` node filesystem) slower or busier
+/// than that.
+#[cfg_attr(not(feature = "s3"), allow(dead_code))]
+const WARMUP_FLUSH_TIMEOUT: Duration = Duration::from_secs(120);
+
 // ─── Application state ──────────────────────────────────────────────────────
 
 struct AppState {
@@ -2070,7 +2078,10 @@ impl AppState {
             #[cfg(feature = "s3")]
             posting_promotions: doc_spans::PromotionQueue::default(),
             posting_reads: posting_spans::PostingReadCounters::default(),
-            span_writes: span_writes::SpanWriteQueue::new(span_writes::SPAN_WRITE_QUEUE_BYTES),
+            span_writes: span_writes::SpanWriteQueue::new(
+                span_writes::SPAN_WRITE_QUEUE_BYTES,
+                span_writes::SPAN_HELD_BYTES,
+            ),
             search_semaphore: {
                 let permits = std::env::var("KOSHA_MAX_CONCURRENT_SEARCHES")
                     .ok()
@@ -2208,49 +2219,89 @@ impl AppState {
                     let start = Instant::now();
                     state.run_boot_warmup(&*state);
                     let data_dir = state.data_dir.clone();
-                    state.finish_warmup(start, || writeback::sync_filesystem(&data_dir));
+                    state.finish_warmup(start, WARMUP_FLUSH_TIMEOUT, move || {
+                        writeback::sync_filesystem(&data_dir)
+                    });
                 })
                 .expect("failed to spawn warmup thread");
         }
     }
 
-    /// The end of the boot warm-up: wait for `flush` to put what warm-up
-    /// wrote on disk, then mark the pod ready.
+    /// The end of the boot warm-up: wait (at most `timeout`) for `flush`
+    /// to put what warm-up wrote on disk, then mark the pod ready.
     ///
     /// The warm-up's files are buffered writes. Flipping ready with them
     /// still dirty (4.4–5.1 GB measured on staging, about the kernel's
     /// dirty limit) handed the first user requests a disk that needed 41–52
     /// s more to drain at 125 MiB/s, during which the kernel throttled every
     /// thread that wrote. Each warm file's writeback starts as it lands
-    /// (`writeback::start`), so what is left to wait for here is the tail
-    /// that the disk had not caught up with yet. It can never exceed the
-    /// kernel's dirty limit (≈ 6 GB on a query pod), so the wait is at most
-    /// ≈ 6 GB / 125 MiB/s ≈ 46 s, and on the measured warm-up the dirty
-    /// tail is ≈ 1.1 GB (≈ 9 s). A failed flush is logged and the pod goes
-    /// ready anyway (fail-open, as for the warm-up itself).
+    /// (`writeback`), so what is left to wait for here is the tail the disk
+    /// had not caught up with: never more than the kernel's dirty limit
+    /// (≈ 6 GB on a query pod, ≈ 46 s at 125 MiB/s), ≈ 1.1 GB (≈ 9 s) on
+    /// the measured warm-up. `syncfs` flushes the whole filesystem holding
+    /// the cache: on a dedicated cache volume (staging) only this pod's
+    /// writes, on an `emptyDir` (prod, finding 10) the node's root
+    /// filesystem, other pods' dirty data included, hence the timeout. A
+    /// flush that fails or overruns is logged and the pod goes ready
+    /// anyway (fail-open, as for the warm-up itself).
     #[cfg_attr(not(any(test, feature = "s3")), allow(dead_code))]
-    fn finish_warmup(&self, start: Instant, flush: impl FnOnce() -> std::io::Result<()>) {
+    fn finish_warmup(
+        &self,
+        start: Instant,
+        timeout: Duration,
+        flush: impl FnOnce() -> std::io::Result<()> + Send + 'static,
+    ) {
         let mb = |b: u64| b / (1 << 20);
         let before = writeback::dirty_bytes();
+        match before {
+            Some((dirty, wb)) => println!(
+                "warmup: flushing the cache disk before going ready (node dirty {} MB + \
+                 writeback {} MB; at most {}s)",
+                mb(dirty),
+                mb(wb),
+                timeout.as_secs()
+            ),
+            None => println!(
+                "warmup: flushing the cache disk before going ready (at most {}s)",
+                timeout.as_secs()
+            ),
+        }
         let flushed = Instant::now();
-        if let Err(e) = flush() {
-            eprintln!("WARN: warmup: flushing the cache disk failed: {e}; going ready anyway");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("kosha-warmup-flush".into())
+            .spawn(move || {
+                // The receiver is gone only after a timeout, already logged.
+                let _ = tx.send(flush());
+            });
+        let outcome = match spawned {
+            Ok(_) => rx.recv_timeout(timeout),
+            Err(e) => Ok(Err(e)),
+        };
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                eprintln!("WARN: warmup: flushing the cache disk failed: {e}; going ready anyway")
+            }
+            Err(_) => eprintln!(
+                "WARN: warmup: the cache disk flush did not finish within {}s; going ready \
+                 with writes still draining",
+                timeout.as_secs()
+            ),
         }
         let flush_s = flushed.elapsed().as_secs_f64();
         let after = writeback::dirty_bytes();
         self.warmup_complete
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        match (before, after) {
-            (Some((dirty, wb)), Some((dirty_after, wb_after))) => println!(
-                "warmup: complete in {:.1}s — pod is ready (cache flush {flush_s:.1}s: node \
-                 dirty {} MB + writeback {} MB before, {} MB + {} MB after)",
+        match after {
+            Some((dirty, wb)) => println!(
+                "warmup: complete in {:.1}s — pod is ready (cache flush {flush_s:.1}s; node \
+                 dirty {} MB + writeback {} MB now)",
                 start.elapsed().as_secs_f64(),
                 mb(dirty),
-                mb(wb),
-                mb(dirty_after),
-                mb(wb_after)
+                mb(wb)
             ),
-            _ => println!(
+            None => println!(
                 "warmup: complete in {:.1}s — pod is ready (cache flush {flush_s:.1}s)",
                 start.elapsed().as_secs_f64()
             ),
@@ -2743,6 +2794,19 @@ impl AppState {
             .last_run_ms
             .store(unix_millis(), std::sync::atomic::Ordering::Relaxed);
         reports
+    }
+
+    /// The generation `posting_blob_presence` entries are stamped with and
+    /// checked against: the disk cache's eviction generation plus the span
+    /// writes that failed. A term is confirmed present as soon as its span
+    /// write is queued (see `posting_spans`), so a write that later fails
+    /// must invalidate, like an eviction, whatever was confirmed on its
+    /// strength. Both counters only grow, so their sum moves on either.
+    #[cfg(feature = "s3")]
+    fn presence_generation(&self) -> u64 {
+        self.cache
+            .eviction_generation()
+            .wrapping_add(self.span_writes.failures())
     }
 
     /// Readiness-gate predicate used by the `/readyz` handler: true when no
@@ -4209,7 +4273,7 @@ impl AppState {
 
         let written = (|| -> Result<u64, KoshaError> {
             use std::io::Write;
-            let mut file = std::fs::File::create(&tmp)?;
+            let file = std::fs::File::create(&tmp)?;
             let written = if legacy_base64 {
                 let encoded = resp
                     .text()
@@ -4218,12 +4282,19 @@ impl AppState {
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(encoded.trim())
                     .map_err(|e| KoshaError::NotFound(format!("base64 decode: {e}")))?;
-                file.write_all(&bytes)?;
+                let mut out = writeback::ChunkedWriteback::new(&file, 0);
+                out.write_all(&bytes)?;
+                out.finish();
                 bytes.len() as u64
             } else {
-                let mut out = std::io::BufWriter::with_capacity(256 * 1024, &mut file);
+                // Each 16 MiB written is handed to the writeback thread as
+                // it lands (see `writeback`), never advised from this thread.
+                let mut out = std::io::BufWriter::with_capacity(
+                    256 * 1024,
+                    writeback::ChunkedWriteback::new(&file, 0),
+                );
                 let n = std::io::copy(&mut resp, &mut out)?;
-                out.flush()?;
+                out.into_inner().map_err(|e| e.into_error())?.finish();
                 if let Some(expected) = declared.filter(|expected| *expected != n) {
                     return Err(KoshaError::NotFound(format!(
                         "short body: {n} of {expected} bytes"
@@ -4231,9 +4302,6 @@ impl AppState {
                 }
                 n
             };
-            // As for an S3 download (`writeback`): drain at disk speed now,
-            // not once dirty memory reaches the kernel's throttle point.
-            writeback::start(&file, 0, 0);
             Ok(written)
         })();
         match written {
@@ -4703,7 +4771,6 @@ impl AppState {
                 &self.span_writes,
             )
         };
-        request.hold_spans(fetched.held);
         outcome.rounds += fetched.rounds;
         for (seg, (dir, _, _)) in fetched.segments.iter().zip(&targets) {
             outcome.bytes_fetched += seg.bytes;
@@ -4965,7 +5032,6 @@ impl AppState {
                     .collect();
                 let fetched =
                     doc_spans::fetch_doc_vectors_headers(&targets, &fetcher, &self.span_writes);
-                request.hold_spans(fetched.held);
                 outcome.rounds += fetched.rounds;
                 outcome.shed |= fetched.shed;
                 for seg in &fetched.segments {
@@ -5260,7 +5326,7 @@ impl AppState {
 
         // Presence cache first: a warm repeat confirms every term of every
         // segment here without opening a footer or a TOC.
-        let eviction_gen = self.cache.eviction_generation();
+        let eviction_gen = self.presence_generation();
         let cached = {
             let cache = self.posting_blob_presence.lock().unwrap();
             posting_blob_cache_lookup(&cache, &ns.0, manifest.version, eviction_gen)
@@ -5334,7 +5400,10 @@ impl AppState {
                 self.posting_promotions.push(shard);
             }
             if !o.confirmed.is_empty() {
-                let write_gen = self.cache.eviction_generation();
+                // Stamped with the generation from before the fetch: a queued
+                // span write that fails after it moved the generation, so
+                // these confirmations must not outlive that failure.
+                let write_gen = eviction_gen;
                 let mut cache = self.posting_blob_presence.lock().unwrap();
                 posting_blob_cache_insert(
                     &mut cache,
@@ -5420,14 +5489,14 @@ impl AppState {
     ) -> (posting_spans::PostingFetchStats, SpanHolds) {
         let mut stats = posting_spans::PostingFetchStats::default();
         let Some(ref s3) = self.s3_storage else {
-            return (stats, Vec::new());
+            return (stats, SpanHolds::new());
         };
         let Some(rel) = seg
             .strip_prefix(&self.data_dir)
             .ok()
             .map(|p| p.to_string_lossy().replace('\\', "/"))
         else {
-            return (stats, Vec::new());
+            return (stats, SpanHolds::new());
         };
         let fetcher = doc_spans::S3RangeFetcher {
             s3,
@@ -5485,7 +5554,17 @@ impl AppState {
                 .spawn(move || loop {
                     let Some(state) = weak.upgrade() else { return };
                     if let Some(job) = state.span_writes.pop_timeout(Duration::from_secs(1)) {
-                        state.span_writes.write(&state.cache, job);
+                        // A panic in one write must not stop the thread
+                        // (every later span would stay queued, counted as
+                        // cached, forever): `write` counts it as a failed
+                        // write, which invalidates presence, and frees its
+                        // queue bytes while unwinding.
+                        let wrote = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            state.span_writes.write(&state.cache, job)
+                        }));
+                        if wrote.is_err() {
+                            eprintln!("ERROR: span writer: a span write panicked; continuing");
+                        }
                     }
                 })
                 .expect("failed to spawn span writer thread");
@@ -5578,7 +5657,7 @@ impl AppState {
         // yields an empty map, i.e. this degrades to the pre-cache full
         // stat sweep, never a false "present." See the field's doc comment
         // for why the eviction-generation check exists.
-        let eviction_gen = self.cache.eviction_generation();
+        let eviction_gen = self.presence_generation();
         let cached = {
             let cache = self.posting_blob_presence.lock().unwrap();
             posting_blob_cache_lookup(&cache, &ns.0, manifest_version, eviction_gen)
@@ -5696,7 +5775,7 @@ impl AppState {
         // which is still correct — every stamped pair was itself verified
         // by a real stat taken during this call, at or after that point.
         if !newly_confirmed.is_empty() {
-            let write_gen = self.cache.eviction_generation();
+            let write_gen = self.presence_generation();
             let mut cache = self.posting_blob_presence.lock().unwrap();
             posting_blob_cache_insert(
                 &mut cache,
@@ -6550,6 +6629,7 @@ fn handle_metrics(state: &AppState, headers: &HashMap<String, String>) -> String
         nvme_evictions: state.cache.eviction_generation(),
         segment_checksum_failures,
         cache_tenants: cache_tenant_samples(state),
+        span_writes: state.span_writes.stats(),
     });
     format!(
         "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: {}\r\n\r\n{body}",
@@ -19827,6 +19907,38 @@ mod tests {
         dir
     }
 
+    /// A term is confirmed present as soon as its span write is queued; a
+    /// write that then fails moves the presence generation, so that
+    /// confirmation (stamped before the fetch) is no longer trusted and the
+    /// next query re-checks the disk instead of scoring a missing span.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn a_failed_span_write_invalidates_posting_presence() {
+        let state = test_state();
+        let seg = state.data_dir.join("ns/seg");
+        fs::create_dir_all(&seg).unwrap();
+        let generation = state.presence_generation();
+        assert!(state
+            .span_writes
+            .persist(&seg, "ns/seg", "postings-01.bin", 0, vec![1; 10])
+            .is_none());
+        let confirmed = vec![("ns/seg".to_string(), "w1".to_string())];
+        {
+            let mut cache = state.posting_blob_presence.lock().unwrap();
+            posting_blob_cache_insert(&mut cache, "ns", 1, generation, confirmed);
+            let current = state.presence_generation();
+            assert!(!posting_blob_cache_lookup(&cache, "ns", 1, current).is_empty());
+        }
+        // The segment goes away before the writer runs: the write fails.
+        fs::remove_dir_all(&seg).unwrap();
+        state.span_writes.drain(&state.cache);
+        assert_eq!(state.span_writes.failures(), 1);
+        let cache = state.posting_blob_presence.lock().unwrap();
+        let current = state.presence_generation();
+        assert_ne!(current, generation);
+        assert!(posting_blob_cache_lookup(&cache, "ns", 1, current).is_empty());
+    }
+
     /// Readiness waits for the warm-up's writes to reach disk: the pod is
     /// not ready while the flush runs, and is once it returns, also when
     /// it fails (fail-open, like the warm-up).
@@ -19837,19 +19949,40 @@ mod tests {
             state
                 .warmup_complete
                 .store(false, std::sync::atomic::Ordering::SeqCst);
-            let mut flushed = false;
-            state.finish_warmup(Instant::now(), || {
-                assert!(!state.is_ready(), "ready before the warm-up flush ran");
-                flushed = true;
+            let ready = Arc::clone(&state.warmup_complete);
+            let flushed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let saw = Arc::clone(&flushed);
+            state.finish_warmup(Instant::now(), Duration::from_secs(60), move || {
+                assert!(
+                    !ready.load(std::sync::atomic::Ordering::SeqCst),
+                    "ready before the warm-up flush ran"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+                saw.store(true, std::sync::atomic::Ordering::SeqCst);
                 if fails {
                     Err(std::io::Error::other("injected"))
                 } else {
                     Ok(())
                 }
             });
-            assert!(flushed);
+            assert!(
+                flushed.load(std::sync::atomic::Ordering::SeqCst),
+                "waited for it"
+            );
             assert!(state.is_ready());
         }
+        // A flush that overruns its timeout: ready at the timeout.
+        let state = test_state();
+        state
+            .warmup_complete
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let t = Instant::now();
+        state.finish_warmup(Instant::now(), Duration::from_millis(100), || {
+            std::thread::sleep(Duration::from_secs(5));
+            Ok(())
+        });
+        assert!(state.is_ready());
+        assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
     }
 
     // ─── Multi-field highlighting (#195) ─────────────────────────────────

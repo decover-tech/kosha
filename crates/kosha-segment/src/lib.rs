@@ -8656,7 +8656,7 @@ impl SegmentReader {
         fetch: Option<VectorSpanFetch<'_>>,
     ) -> span_cache::SpanHolds {
         let Some(fetch) = fetch else {
-            return Vec::new();
+            return span_cache::SpanHolds::new();
         };
         let whole_len = fs::metadata(&vi.vector_idx_path)
             .ok()
@@ -8685,7 +8685,7 @@ impl SegmentReader {
             }
         }
         if missing.is_empty() {
-            return Vec::new();
+            return span_cache::SpanHolds::new();
         }
         fetch(&self.segment_dir, &vi.idx_file, &missing)
     }
@@ -9582,7 +9582,9 @@ impl SegmentReader {
                     .filter(|&(start, end)| !spans.covers(start, end))
                     .collect();
                 if !missing.is_empty() {
-                    fetch(&self.segment_dir, DOC_VECTORS_FILE, &missing);
+                    // Held until the vectors below are read: the reloaded
+                    // index sees what the fetch left only in memory.
+                    let _held = fetch(&self.segment_dir, DOC_VECTORS_FILE, &missing);
                     spans = span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE);
                 }
             }
@@ -15810,7 +15812,7 @@ mod global_rescore_tests {
             for &(s, e) in ranges {
                 put(s, e);
             }
-            Vec::new()
+            span_cache::SpanHolds::new()
         };
         let fetched = reader.knn_exact_scores_fetching("emb", &query, &seqs, Some(&fetch));
         assert!(fetched.ranged);

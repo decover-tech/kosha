@@ -334,7 +334,6 @@ impl SpanHydrator {
             let fetched = fetch_doc_vectors_headers(&targets, fetcher, writes);
             out.rounds += fetched.rounds;
             out.shed |= fetched.shed;
-            out.held.extend(fetched.held);
             for (&i, seg) in header_segs.iter().zip(fetched.segments) {
                 out.gets += seg.gets;
                 out.bytes += seg.bytes;
@@ -551,8 +550,6 @@ pub struct HeadersFetched {
     pub segments: Vec<HeaderFetch>,
     pub rounds: u64,
     pub shed: bool,
-    /// Headers the write queue could not take: readable only while held.
-    pub held: SpanHolds,
 }
 
 /// Whether `doc_vectors.bin`'s header is readable locally: the whole file,
@@ -628,8 +625,9 @@ pub fn fetch_doc_vectors_headers_probing(
         match doc_vectors_header_len(&prefix) {
             Ok(Ok(_)) => {
                 let (dir, rel) = targets[i];
-                out.held
-                    .extend(writes.persist(dir, rel, DOC_VECTORS_FILE, 0, prefix));
+                // Never dropped: completeness checks and single-flight
+                // waiters read it after this request is done with it.
+                writes.persist_required(dir, rel, DOC_VECTORS_FILE, 0, prefix);
                 seg.status = HeaderStatus::Cached;
             }
             // A full probe that ended inside the header: fetch the rest. A
@@ -667,8 +665,7 @@ pub fn fetch_doc_vectors_headers_probing(
                     && matches!(doc_vectors_header_len(&prefix), Ok(Ok(_)))
                 {
                     let (dir, rel) = targets[i];
-                    out.held
-                        .extend(writes.persist(dir, rel, DOC_VECTORS_FILE, 0, prefix));
+                    writes.persist_required(dir, rel, DOC_VECTORS_FILE, 0, prefix);
                     seg.status = HeaderStatus::Cached;
                 }
             }
@@ -909,7 +906,10 @@ mod tests {
         store: &dyn RangeFetcher,
         cache: &Cache,
     ) -> SpanOutcome {
-        let writes = SpanWriteQueue::new(crate::span_writes::SPAN_WRITE_QUEUE_BYTES);
+        let writes = SpanWriteQueue::new(
+            crate::span_writes::SPAN_WRITE_QUEUE_BYTES,
+            crate::span_writes::SPAN_HELD_BYTES,
+        );
         let o = hydrator.hydrate(pages, store, &writes);
         writes.drain(cache);
         o
@@ -922,7 +922,10 @@ mod tests {
         store: &dyn RangeFetcher,
         cache: &Cache,
     ) -> HeadersFetched {
-        let writes = SpanWriteQueue::new(crate::span_writes::SPAN_WRITE_QUEUE_BYTES);
+        let writes = SpanWriteQueue::new(
+            crate::span_writes::SPAN_WRITE_QUEUE_BYTES,
+            crate::span_writes::SPAN_HELD_BYTES,
+        );
         let o = fetch_doc_vectors_headers_probing(targets, probe, store, &writes);
         writes.drain(cache);
         o
@@ -1134,6 +1137,27 @@ mod tests {
         assert_eq!(r2.results.len(), 4);
         assert_eq!(calls, 0);
         assert_eq!(store.gets(), before);
+    }
+
+    /// A `doc_vectors.bin` header is never dropped, even with a span write
+    /// queue that can take nothing: completeness checks
+    /// (`doc_vectors_header_local`) and single-flight waiters read it after
+    /// the fetching request is done, so it must count as local until it
+    /// lands on disk.
+    #[test]
+    fn a_full_write_queue_never_drops_a_header() {
+        let f = fixture("dv-required", 1, 40, true, |_| false);
+        let seg = f.data.join(&f.ns.0).join("s0");
+        let store = CountingStore::new(f.remote.clone());
+        let full = SpanWriteQueue::new(0, 0);
+        let fetched = fetch_doc_vectors_headers(&[(&seg, "ns/s0")], &store, &full);
+        assert_eq!(fetched.segments[0].status, HeaderStatus::Cached);
+        assert!(doc_vectors_header_local(&seg), "local while queued");
+        assert!(full.queued_bytes() > 0);
+        assert_eq!(full.stats().dropped, 0);
+        let cache = Cache::new(f.data.clone());
+        full.drain(&cache);
+        assert!(doc_vectors_header_local(&seg), "and on disk after");
     }
 
     /// A header longer than the fixed probe takes two rounds; sized from

@@ -131,7 +131,7 @@ fn exact_is_identical_without_the_whole_file(n: usize, dim: usize, every: u32) {
             max_range.fetch_max(e - s, Ordering::Relaxed);
             put_span(dir, s, &remote[s as usize..e as usize]);
         }
-        Vec::new()
+        kosha_segment::span_cache::SpanHolds::new()
     };
     let reader = SegmentReader::open(node.clone()).unwrap();
     let got = reader
@@ -162,6 +162,61 @@ fn exact_is_identical_without_the_whole_file(n: usize, dim: usize, every: u32) {
         .unwrap();
     assert_eq!(bits(&warm.hits), bits(&want.hits));
 
+    for dir in [seg, node] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// A fetch whose spans are only held in memory (the server's span write
+/// queue was full, so nothing reaches disk): the exact path reads them
+/// while it holds them and answers from the sidecar, bit-identical. If the
+/// reader let the holds go before reading, the ranges would vanish and it
+/// would fall back to scoring postings.
+#[test]
+fn exact_filtered_knn_reads_spans_that_are_only_held_in_memory() {
+    let (n, dim) = (1_200, 32);
+    let seg = temp_dir("seg");
+    write(&seg, n, dim, VectorQuantizationConfig::default());
+    let candidates: Vec<u32> = (0..n as u32).filter(|i| i % 5 == 0).collect();
+    let query = vector(777, dim);
+    let want = SegmentReader::open(seg.clone())
+        .unwrap()
+        .knn_exact_filtered("emb", &query, 10, &candidates)
+        .unwrap()
+        .unwrap();
+
+    let node = node_copy(&seg, "held", true);
+    let remote = std::fs::read(seg.join(DOC_VECTORS_FILE)).unwrap();
+    let held = std::sync::Arc::new(AtomicU64::new(0));
+    let fetch = |dir: &Path, file: &str, ranges: &[(u64, u64)]| {
+        ranges
+            .iter()
+            .map(|&(s, e)| {
+                span_cache::PendingSpan::register_held(
+                    dir,
+                    file,
+                    s,
+                    remote[s as usize..e as usize].to_vec(),
+                    held.clone(),
+                )
+            })
+            .collect::<span_cache::SpanHolds>()
+    };
+    let got = SegmentReader::open(node.clone())
+        .unwrap()
+        .knn_exact_filtered_fetching("emb", &query, 10, &candidates, Some(&fetch))
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.source, ExactKnnSource::Sidecar, "not the posting scan");
+    assert_eq!(bits(&got.hits), bits(&want.hits));
+    assert_eq!(held.load(Ordering::Relaxed), 0, "released once read");
+    assert!(
+        span_cache::SpanIndex::load(&node, DOC_VECTORS_FILE)
+            .spans()
+            .len()
+            == 1,
+        "nothing but the header on disk"
+    );
     for dir in [seg, node] {
         let _ = std::fs::remove_dir_all(dir);
     }

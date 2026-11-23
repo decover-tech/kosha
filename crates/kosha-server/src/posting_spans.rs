@@ -85,9 +85,10 @@ pub struct PostingSpanOutcome {
     pub gets: u64,
     pub bytes: u64,
     /// `(segment rel path, presence key)` for every term now known readable
-    /// locally or absent from that segment. Only span files on disk confirm
-    /// a term: a span still in memory (its write queued or dropped) is
-    /// confirmed by a later query's local check once it has landed.
+    /// locally or absent from that segment. A span whose write is queued
+    /// confirms its term (a write that then fails invalidates the presence
+    /// cache through `SpanWriteQueue::failures`); a dropped one, held only
+    /// by this request, does not.
     pub confirmed: Vec<(String, String)>,
     /// `(segment dir, shard file)` whose ranges failed; the caller fetches
     /// the whole shard instead.
@@ -197,13 +198,9 @@ impl PostingSpanHydrator {
                 let index = indexes
                     .entry(span.file.clone())
                     .or_insert_with(|| SpanIndex::load(seg, &span.file));
-                if whole_local || index.covers_on_disk(span.start, end) {
+                if whole_local || index.covers(span.start, end) {
                     out.confirmed
                         .push((rel.to_string(), presence_key(&span.term)));
-                } else if index.covers(span.start, end) {
-                    // Fetched by another query, its write still queued:
-                    // readable now, on disk soon. Nothing to fetch, but not
-                    // confirmed until it is on disk.
                 } else {
                     by_file
                         .entry(span.file.as_str())
@@ -277,10 +274,9 @@ impl PostingSpanHydrator {
             }
         }
 
-        // Confirm terms whose span is now on disk (a write that landed
-        // already; the rest are confirmed by a later query's local check).
-        // A failed shard goes whole; its terms are confirmed by the next
-        // query's local check.
+        // Confirm terms whose span is now cached (on disk or queued; not a
+        // dropped write). A failed shard goes whole; its terms are
+        // confirmed by the next query's local check.
         for (i, spans) in waiting.iter().enumerate() {
             let Some(rel) = rels[i].as_deref() else {
                 continue;
@@ -293,7 +289,7 @@ impl PostingSpanHydrator {
                 let index = indexes
                     .entry(span.file.as_str())
                     .or_insert_with(|| SpanIndex::load(&segments[i], &span.file));
-                if index.covers_on_disk(span.start, span.start + span.len) {
+                if index.covers(span.start, span.start + span.len) {
                     out.confirmed
                         .push((rel.to_string(), presence_key(&span.term)));
                 }
@@ -719,7 +715,10 @@ mod tests {
     }
 
     fn writes() -> SpanWriteQueue {
-        SpanWriteQueue::new(crate::span_writes::SPAN_WRITE_QUEUE_BYTES)
+        SpanWriteQueue::new(
+            crate::span_writes::SPAN_WRITE_QUEUE_BYTES,
+            crate::span_writes::SPAN_HELD_BYTES,
+        )
     }
 
     /// [`PostingSpanHydrator::hydrate`] with its span writes done before it
@@ -771,7 +770,7 @@ mod tests {
                 writes.drain(cache);
             }
         };
-        let held: Mutex<SpanHolds> = Mutex::new(Vec::new());
+        let held: Mutex<SpanHolds> = Mutex::new(SpanHolds::new());
         // The terms the server's hydration asks for: every reading of the
         // query (#220) plus per-field keys and norms (#249). The fixture's
         // segments use the default analysis.
@@ -787,7 +786,7 @@ mod tests {
         let ensure = |pages: &[PageSegment<'_>]| {
             let o = docs.hydrate(pages, store, writes);
             drain();
-            held.lock().unwrap().extend(o.held);
+            held.lock().unwrap().extend([o.held]);
         };
         let fetch_vectors = |seg: &Path, file: &str, ranges: &[(u64, u64)]| {
             let o = fetch_file_spans(&f.rel(seg), seg, file, ranges, 64 * 1024, store, writes);
@@ -827,24 +826,9 @@ mod tests {
         assert_eq!(got, want, "ranged reads return the fully local answer");
         let (rounds, gets, bytes) = store.snapshot();
         let total = f.remote_bytes();
-        // A fetched term is confirmed local only once its span is on disk,
-        // which the background writer does after the fetch returns: the
-        // next local check confirms every query term in every segment,
-        // without a GET.
-        assert!(o.confirmed.is_empty(), "{:?}", o.confirmed);
-        let gets_before = store.snapshot().1;
-        let terms = kosha_query::QueryAnalysis::new(&q).union_terms([None]);
-        let recheck = hydrate_now(&postings, &f.segs, &terms, &store, &cache);
-        let confirmed: HashSet<_> = recheck.confirmed.iter().collect();
-        for seg in &f.segs {
-            for term in ["w0", "w977", "w1954"] {
-                assert!(
-                    confirmed.contains(&(f.rel(seg), presence_key(term))),
-                    "{term}"
-                );
-            }
-        }
-        assert_eq!(store.snapshot().1, gets_before);
+        // Every query term is now confirmed in every segment: the cold query
+        // fills the presence cache, so a warm repeat never re-plans spans.
+        assert_eq!(o.confirmed.len(), 3 * f.segs.len());
         println!(
             "cold BM25: {rounds} round trips, {gets} GETs, {bytes} bytes of {total} \
              ({:.2}%); postings {} GETs / {} bytes",
@@ -1116,6 +1100,13 @@ mod tests {
             [&want[0], &want[1], &want[0], &want[1]].map(|w| w.clone())
         );
         assert!(writes.queued_bytes() > 0, "the spans wait for the writer");
+        // Queued spans count as cached: every query term is confirmed
+        // (presence cache filled) without a GET, though none is on disk yet.
+        let gets = store.snapshot().1;
+        let terms = kosha_query::QueryAnalysis::new(&bm25).union_terms([None]);
+        let o = postings.hydrate(&f.segs, &terms, &store, &writes);
+        assert_eq!(o.confirmed.len(), 3 * f.segs.len());
+        assert_eq!((o.gets, store.snapshot().1), (0, gets));
         for seg in &f.segs {
             for file in [
                 kosha_segment::VECTOR_IDX_FILE,
@@ -1166,7 +1157,7 @@ mod tests {
         }));
         let bm25 = query(serde_json::json!({"query_text": "w0 w977 w1954", "max_results": 10}));
         f.scaffold(&store, true);
-        let full = SpanWriteQueue::new(0);
+        let full = SpanWriteQueue::new(0, crate::span_writes::SPAN_HELD_BYTES);
         for q in [&knn, &bm25] {
             let want = reference(&f, q);
             let searcher = Searcher::new(f.data.clone());
@@ -1188,7 +1179,12 @@ mod tests {
             );
             assert_eq!(o2.confirmed.len(), absent);
         }
-        assert_eq!(full.queued_bytes(), 0);
+        // Only `doc_vectors.bin` headers are queued: they are never dropped.
+        assert!(
+            full.queued_bytes()
+                <= f.segs.len() as u64 * 2 * kosha_segment::DOC_VECTORS_HEADER_PROBE
+        );
+        assert_eq!(full.stats().held_bytes, 0, "released with the requests");
         let stats = full.to_json();
         assert!(stats["dropped"].as_u64().unwrap() > 0, "{stats}");
         assert_eq!(stats["written"], 0);
