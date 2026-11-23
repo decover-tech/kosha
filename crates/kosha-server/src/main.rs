@@ -3772,12 +3772,17 @@ impl AppState {
             data_dir: &self.data_dir,
             keys: Vec::new(),
         };
-        for entry in &manifest.segments {
-            if manifest.segment_footer(&entry.segment_id).is_none() {
-                let dir = manifest.segment_dir(&self.data_dir, ns, &entry.segment_id);
-                pins.hold(&dir.join("footer.json"));
-            }
-        }
+        let footers: Vec<PathBuf> = manifest
+            .segments
+            .iter()
+            .filter(|entry| manifest.segment_footer(&entry.segment_id).is_none())
+            .map(|entry| {
+                manifest
+                    .segment_dir(&self.data_dir, ns, &entry.segment_id)
+                    .join("footer.json")
+            })
+            .collect();
+        pins.hold_all(&footers);
         pins
     }
 
@@ -4199,9 +4204,7 @@ impl AppState {
                 .zip(manifest.segments.iter().map(segment_footer)),
         );
         if let Some(pins) = pins {
-            for seg_path in to_hydrate.iter().chain(&stats_only) {
-                pins.hold(seg_path);
-            }
+            pins.hold_all(to_hydrate.iter().chain(&stats_only));
         }
         // The filter files each segment needs for this query (#244): its
         // whole `filters.bin`, or `filters.toc` plus only the columns the
@@ -4867,9 +4870,7 @@ impl AppState {
                 .cloned()
                 .zip(footers.iter().map(Option::as_deref)),
         );
-        for seg_path in scoring.iter().chain(&stats_only) {
-            pins.hold(seg_path);
-        }
+        pins.hold_all(scoring.iter().chain(&stats_only));
         let posting_files =
             posting_blob_files_for_query(query, &query_analysis, analyses.iter().copied());
         let posting_terms =
@@ -4877,14 +4878,31 @@ impl AppState {
         if posting_files.is_empty() {
             return HydrationOutcome::default();
         }
-        self.ensure_query_postings(
+        // As `hydrate_segments_for_search` does: the scored segments'
+        // postings must be local, the stats-only ones' are best effort, and
+        // a segment the search skips gets none (it is never read, and its
+        // files would be fetched unpinned).
+        let mut outcome = self.ensure_query_postings(
             ns,
             manifest,
-            &seg_paths,
+            &scoring,
             &posting_terms,
             &posting_files,
             request,
-        )
+        );
+        if !stats_only.is_empty() {
+            let stats = self.ensure_query_postings(
+                ns,
+                manifest,
+                &stats_only,
+                &posting_terms,
+                &posting_files,
+                request,
+            );
+            outcome.files_fetched += stats.files_fetched;
+            outcome.bytes_fetched += stats.bytes_fetched;
+        }
+        outcome
     }
 
     /// Make the query terms' postings local in `seg_paths` (#245).
@@ -11436,23 +11454,23 @@ struct SegmentPins<'a> {
 
 #[cfg(feature = "s3")]
 impl SegmentPins<'_> {
-    /// Pin `path` (a segment directory, which holds every file under it,
-    /// or one file) until the guard drops.
-    fn hold(&mut self, path: &Path) {
-        if let Ok(rel) = path.strip_prefix(self.data_dir) {
-            let key = rel.to_string_lossy().into_owned();
-            self.cache.pin(&key);
-            self.keys.push(key);
-        }
+    /// Pin `paths` (segment directories, each holding every file under
+    /// it, or single files) until the guard drops.
+    fn hold_all<'p>(&mut self, paths: impl IntoIterator<Item = &'p PathBuf>) {
+        let start = self.keys.len();
+        self.keys.extend(paths.into_iter().filter_map(|path| {
+            path.strip_prefix(self.data_dir)
+                .ok()
+                .map(|rel| rel.to_string_lossy().into_owned())
+        }));
+        self.cache.pin_all(&self.keys[start..]);
     }
 }
 
 #[cfg(feature = "s3")]
 impl Drop for SegmentPins<'_> {
     fn drop(&mut self) {
-        for key in &self.keys {
-            self.cache.unpin(key);
-        }
+        self.cache.unpin_all(&self.keys);
     }
 }
 

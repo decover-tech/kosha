@@ -25,7 +25,8 @@ pub(super) struct FakeS3 {
     endpoint: String,
     /// `{root}/{key}` is the object `key`.
     root: PathBuf,
-    gets: Arc<Mutex<Vec<String>>>,
+    /// Every key fetched with GET, in order.
+    pub(super) gets: Arc<Mutex<Vec<String>>>,
 }
 
 impl FakeS3 {

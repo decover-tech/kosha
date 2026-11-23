@@ -75,16 +75,31 @@ fn node(s3: &FakeS3, manifest: &kosha_core::Manifest, cap: Option<u64>) -> AppSt
 
 /// Search `word`, filtered to `matter` when given; the status and hit ids.
 fn search(state: &AppState, word: &str, matter: Option<&str>) -> (u16, Vec<String>) {
-    let mut body = serde_json::json!({
-        "namespace": NS,
-        "query_text": word,
-        "max_results": 500,
-        "no_cache": true,
-    });
+    let mut body = serde_json::json!({"query_text": word});
     if let Some(matter) = matter {
         body["filter"] = serde_json::json!({"term": {"matter_id": matter}});
     }
+    post(state, body)
+}
+
+/// POST `body` (plus the namespace, a page size and `no_cache`) as a
+/// search; the status and sorted hit ids. Every pin the search took is
+/// released by the time it returns.
+fn post(state: &AppState, mut body: serde_json::Value) -> (u16, Vec<String>) {
+    body["namespace"] = NS.into();
+    body["max_results"] = 500.into();
+    body["no_cache"] = true.into();
     let response = handle_search_post(body.to_string().as_bytes(), state);
+    let manifest = state
+        .indexer
+        .manifest_cloned(&NamespaceId(NS.into()))
+        .unwrap();
+    for entry in &manifest.segments {
+        let dir = format!("{NS}/{}", entry.segment_id.0);
+        for key in [dir.clone(), format!("{dir}/footer.json")] {
+            assert!(!state.cache.is_pinned(&key), "{key} still pinned");
+        }
+    }
     let (head, body) = response.split_once("\r\n\r\n").unwrap();
     let status: u16 = head
         .split_whitespace()
@@ -221,4 +236,47 @@ fn searches_succeed_when_the_cache_is_smaller_than_the_namespace() {
     assert_eq!(ids.len(), MATTERS.len() * DOCS_PER_MATTER);
     let (matter, word) = MATTERS[2];
     assert_eq!(search(&state, word, Some(matter)), (200, expected(word)));
+}
+
+/// The warm path (a cached hydration verdict) fetches postings only for the
+/// segments the search reads. A fuzzy query reads whole posting shards and
+/// is pruned by term bloom: in its matter's segment only, here. Fetching
+/// the shards of the segments it skips cost GETs and disk for nothing, and,
+/// unpinned, they could be evicted before the presence check and fail the
+/// search with "segment hydration failed" for a segment it never reads.
+#[test]
+fn the_warm_path_fetches_no_postings_of_skipped_segments() {
+    let (s3, manifest) = uploaded_matters();
+    let state = node(&s3, &manifest, None);
+    // Unfiltered and without terms (nothing to prune on): hydrates every
+    // segment's scoring set and caches the verdict that sends later
+    // searches down the warm path.
+    let (status, _) = post(&state, serde_json::json!({"query_text": ""}));
+    assert_eq!(status, 200);
+    assert!(
+        !state.completed_hydrations.lock().unwrap().is_empty(),
+        "the verdict is cached"
+    );
+    let fetched_before = s3.gets.lock().unwrap().len();
+
+    let (_, word) = MATTERS[0];
+    let fuzzy = serde_json::json!({
+        "query_text": "",
+        "fuzzy": {"value": "alpah", "fuzziness": 1},
+    });
+    assert_eq!(post(&state, fuzzy), (200, expected(word)));
+
+    let skipped: Vec<String> = manifest.segments[1..]
+        .iter()
+        .map(|entry| format!("{NS}/{}/", entry.segment_id.0))
+        .collect();
+    let fetched: Vec<String> = s3.gets.lock().unwrap()[fetched_before..]
+        .iter()
+        .filter(|key| skipped.iter().any(|prefix| key.starts_with(prefix)))
+        .cloned()
+        .collect();
+    assert!(
+        fetched.is_empty(),
+        "fetched for segments the search skips: {fetched:?}"
+    );
 }

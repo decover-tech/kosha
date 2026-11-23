@@ -535,25 +535,36 @@ impl Cache {
     /// finishes converging (observed in production as an incomplete-
     /// segment count climbing — 37→128→193 — instead of shrinking).
     pub fn pin(&self, key: &str) {
-        *self
-            .pinned
-            .lock()
-            .unwrap()
-            .entry(key.to_string())
-            .or_insert(0) += 1;
+        self.pin_all([key]);
+    }
+
+    /// `pin` each of `keys`, under one lock.
+    pub fn pin_all(&self, keys: impl IntoIterator<Item = impl AsRef<str>>) {
+        let mut pinned = self.pinned.lock().unwrap();
+        for key in keys {
+            *pinned.entry(key.as_ref().to_string()).or_insert(0) += 1;
+        }
+    }
+
+    /// `unpin` each of `keys`, under one lock.
+    pub fn unpin_all(&self, keys: impl IntoIterator<Item = impl AsRef<str>>) {
+        let mut pinned = self.pinned.lock().unwrap();
+        for key in keys {
+            let key = key.as_ref();
+            if let Some(count) = pinned.get_mut(key) {
+                *count -= 1;
+                if *count == 0 {
+                    pinned.remove(key);
+                }
+            }
+        }
     }
 
     /// Release one pin taken by `pin`. A mismatched call (unpinning a key
     /// that isn't pinned) is a silent no-op rather than a panic — cleanup/
     /// error paths must be able to call this unconditionally.
     pub fn unpin(&self, key: &str) {
-        let mut pinned = self.pinned.lock().unwrap();
-        if let Some(count) = pinned.get_mut(key) {
-            *count -= 1;
-            if *count == 0 {
-                pinned.remove(key);
-            }
-        }
+        self.unpin_all([key]);
     }
 
     /// True if `key` currently has at least one outstanding pin. A pin on a
