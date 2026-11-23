@@ -48,6 +48,9 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"  # keep-alive, unlike the HTTP/1.0 default
 
     def _answer(self):
+        # Read before answering: the test may flip it as soon as the client
+        # has this response, which must not change what this request does.
+        close_after = self.server.close_after_response
         length = int(self.headers.get("content-length") or 0)
         sent = self.rfile.read(length)
         status, headers, body = self.server.next_answer()
@@ -63,7 +66,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("content-length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
-        if self.server.close_after_response:
+        if close_after:
             # Close without a "connection: close" header: the client learns
             # only when it next uses the connection, like an idle timeout.
             self.close_connection = True
