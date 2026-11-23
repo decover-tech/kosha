@@ -8720,22 +8720,25 @@ impl SegmentReader {
         // lower-bound cutoff (computed from the same bound across all
         // segments — see `Searcher::knn_plan`), so both sides of the
         // comparison are in the same units.
-        let mut rank_clock = KNN_SCAN_STATS
-            .with(|stats| stats.get().is_some())
-            .then(std::time::Instant::now);
         let own;
+        // Timed only when the segment ranks for itself, so a probe handed
+        // its ranking reports exactly zero rather than a timer's overhead.
+        let mut rank_nanos = 0;
         let ranking = match planned.filter(|r| r.bounds.len() == vi.ranges.len()) {
             Some(planned) => planned,
             None => {
+                let mut rank_clock = KNN_SCAN_STATS
+                    .with(|stats| stats.get().is_some())
+                    .then(std::time::Instant::now);
                 own = KnnSegmentRanking::new(
                     Self::centroid_lower_bounds(vi, query),
                     max_distance,
                     max_probes,
                 );
+                rank_nanos = lap_nanos(&mut rank_clock);
                 &own
             }
         };
-        let rank_nanos = lap_nanos(&mut rank_clock);
         let budgeted = ranking.budgeted.len();
         self.prefetch_vector_postings(vi, ranking.budgeted.iter().map(|&i| i as usize), fetch);
 
@@ -8851,7 +8854,17 @@ impl SegmentReader {
         } else {
             nprobe
         };
-        let candidates = if vi.unit_norm {
+        let candidates = if vi.dim == 0 {
+            // A zero-dimension column (no writer produces one, but the
+            // parsers accept it) has a centroid per posting and nothing in
+            // the matrix to tell them apart by: rank the empty rows.
+            let rows = vec![Vec::new(); vi.ranges.len()];
+            if vi.unit_norm {
+                kosha_vector_spfresh::nearest_centroids_dot(&rows, query, rank)
+            } else {
+                kosha_vector_spfresh::nearest_centroids(&rows, query, rank)
+            }
+        } else if vi.unit_norm {
             kosha_vector_spfresh::nearest_centroids_dot_rows(&vi.centroids, vi.dim, query, rank)
         } else {
             kosha_vector_spfresh::nearest_centroids_rows(&vi.centroids, vi.dim, query, rank)

@@ -97,7 +97,10 @@ fn matrix_rows(rows: &[f32], dim: usize) -> impl Iterator<Item = (usize, &[f32])
 /// [`nearest_centroids`] over one flat row-major matrix (`dim` floats per
 /// centroid) instead of a `Vec` per centroid, so the scan reads memory
 /// sequentially and a caller that holds its centroids flat does not
-/// rebuild a `Vec<Vec<f32>>` per query. Same order, same ties.
+/// rebuild a `Vec<Vec<f32>>` per query. Same order, same ties. A
+/// zero-dimension matrix cannot say how many rows it holds and ranks
+/// nothing: a caller with zero-dimension centroids to rank passes them to
+/// [`nearest_centroids`].
 pub fn nearest_centroids_rows(
     rows: &[f32],
     dim: usize,

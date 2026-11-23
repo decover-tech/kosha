@@ -1260,3 +1260,102 @@ fn centroids_are_one_row_major_matrix() {
         assert_eq!(layout.postings[i].centroid, p.centroid, "posting {i}");
     }
 }
+
+#[test]
+fn a_planned_probe_inside_its_budget_reports_no_ranking_time() {
+    let mut fixture = Fixture::new("planned-rank-time");
+    fixture.set_cache_budget(0);
+    let query = &queries()[0];
+    let bounds = fixture.reader.knn_centroid_distances(FIELD, query).unwrap();
+    let ranking = KnnSegmentRanking::new(bounds, f32::INFINITY, 3);
+    // Exactly zero, not "small": the stat tells a segment that ranked for
+    // itself from one the plan ranked for.
+    for _ in 0..20 {
+        let (hits, stats) = with_knn_scan_stats(|| {
+            fixture
+                .reader
+                .knn_search_planned_fetching(
+                    FIELD,
+                    query,
+                    5,
+                    &ranking,
+                    None,
+                    KnnRefill::Always,
+                    None,
+                )
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(hits.1, 3);
+        assert_eq!(stats.rank_nanos, 0);
+    }
+    // A segment left to rank for itself does report it.
+    let ranked_here = (0..20).any(|_| {
+        let (_, stats) = with_knn_scan_stats(|| {
+            fixture
+                .reader
+                .knn_search_within(query, 5, f32::INFINITY, 3)
+                .unwrap()
+                .unwrap()
+        });
+        stats.rank_nanos > 0
+    });
+    assert!(ranked_here);
+}
+
+/// A column whose header says dimension zero (no writer produces one, but
+/// neither parser rejects it) still has one, empty, centroid per posting:
+/// the per-segment `nprobe` probe ranks and scans those postings, as it
+/// did when centroids were a `Vec` each.
+#[test]
+fn nprobe_probe_of_a_zero_dimension_column_still_scans_its_postings() {
+    let fixture = Fixture::new("dim-zero");
+    let version = fixture.index().lazy.as_ref().unwrap().version;
+    assert!(!is_quantized_vector_index_version(version));
+    // Three postings of ids only (an f32 entry of dimension 0 is its id).
+    let postings: [&[u32]; 3] = [&[0, 1], &[2], &[3, 4, 5]];
+    let header = |magic: u32, count: u32| {
+        let mut bytes = magic.to_le_bytes().to_vec();
+        bytes.extend(version.to_le_bytes());
+        bytes.extend(0u32.to_le_bytes());
+        bytes.extend(count.to_le_bytes());
+        bytes
+    };
+    let mut idx = header(VECTOR_MAGIC, 6);
+    let mut offsets = header(VECTOR_OFFSETS_MAGIC, postings.len() as u32);
+    for ids in postings {
+        offsets.extend((idx.len() as u64).to_le_bytes());
+        offsets.extend((ids.len() as u32 * 4).to_le_bytes());
+        if version >= RADIUS_AWARE_VECTOR_INDEX_VERSION {
+            offsets.extend(0f32.to_le_bytes());
+        }
+        for id in ids {
+            idx.extend(id.to_le_bytes());
+        }
+    }
+    fs::write(fixture.dir.join(VECTOR_IDX_FILE), idx).unwrap();
+    fs::write(fixture.dir.join("vector.offsets"), offsets).unwrap();
+    let reader = SegmentReader::open_with_options(fixture.dir.clone(), true).unwrap();
+    let index = reader.vector_field(FIELD).unwrap().unwrap();
+    let vi = index.lazy.as_ref().unwrap();
+    assert_eq!((vi.dim, vi.ranges.len()), (0, 3));
+
+    let ids = |hits: Vec<(u32, f64)>| {
+        let mut ids: Vec<u32> = hits.into_iter().map(|(id, _)| id).collect();
+        ids.sort_unstable();
+        ids
+    };
+    let all = reader
+        .knn_search_filtered(FIELD, &[], 10, 3, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(ids(all), vec![0, 1, 2, 3, 4, 5]);
+    // Restricted: every posting is ranked, so the probe runs past `nprobe`
+    // until the page fills.
+    let odd = |id: u32| id % 2 == 1;
+    let filtered = reader
+        .knn_search_filtered(FIELD, &[], 10, 1, Some(&odd))
+        .unwrap()
+        .unwrap();
+    assert_eq!(ids(filtered), vec![1, 3, 5]);
+}
