@@ -420,9 +420,10 @@ struct AppState {
     /// fetched). A positive verdict here that outlives a real eviction —
     /// `self.cache` LRU-evicts under `KOSHA_CACHE_MAX_BYTES` pressure — must
     /// therefore never be trusted past that eviction. Every stored entry is
-    /// stamped with `self.cache.eviction_generation()` as of the moment it
+    /// stamped with `self.presence_generation()` (the cache's eviction
+    /// generation plus failed span writes, see there) as of the moment it
     /// was verified, and a read compares that stamp against the *current*
-    /// generation: any eviction anywhere (not just of this exact file —
+    /// generation: any eviction (or failed span write) anywhere (not just of this exact file —
     /// tracking that precisely isn't worth the plumbing given how rare
     /// eviction is relative to query volume) invalidates the snapshot,
     /// falling back to a real stat. See `Cache::eviction_generation`'s doc
@@ -5400,7 +5401,10 @@ impl AppState {
         }
 
         if !shards_local.is_empty() {
-            let write_gen = self.cache.eviction_generation();
+            // The same generation every other presence stamp uses: a stamp
+            // that disagreed (after one failed span write) would make each
+            // insert wipe the other's and the namespace entry never hit.
+            let write_gen = self.presence_generation();
             let mut cache = self.posting_blob_presence.lock().unwrap();
             posting_blob_cache_insert(&mut cache, &ns.0, manifest.version, write_gen, shards_local);
         }
@@ -16529,7 +16533,7 @@ mod tests {
             .unwrap();
         let confirmed = |state: &AppState| {
             let cache = state.posting_blob_presence.lock().unwrap();
-            posting_blob_cache_lookup(&cache, "ns", 1, state.cache.eviction_generation())
+            posting_blob_cache_lookup(&cache, "ns", 1, state.presence_generation())
                 .get("ns/seg-b")
                 .is_some_and(|set| set.contains("postings-01.bin"))
         };
@@ -16537,7 +16541,7 @@ mod tests {
             &mut state.posting_blob_presence.lock().unwrap(),
             "ns",
             1,
-            state.cache.eviction_generation(),
+            state.presence_generation(),
             vec![("ns/seg-b".into(), "postings-01.bin".into())],
         );
         assert!(confirmed(&state));

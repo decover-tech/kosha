@@ -73,12 +73,8 @@ fn a_presence_miss_with_local_shards_does_not_read_the_term_table() {
         .to_string_lossy()
         .into_owned();
     let cache = state.posting_blob_presence.lock().unwrap();
-    let confirmed = posting_blob_cache_lookup(
-        &cache,
-        NS,
-        manifest.version,
-        state.cache.eviction_generation(),
-    );
+    let confirmed =
+        posting_blob_cache_lookup(&cache, NS, manifest.version, state.presence_generation());
     assert!(confirmed.get(&rel).is_some_and(|set| set.contains(&shard)));
 }
 
@@ -94,5 +90,62 @@ fn a_missing_shard_still_plans_from_the_term_table() {
         outcome.missing.iter().any(|m| m.ends_with("/inverted.idx")),
         "{:?}",
         outcome.missing
+    );
+}
+
+/// After a failed span write the presence generation is no longer the
+/// cache's eviction generation. Every presence insert must stamp the same
+/// one: a shards-local confirmation and a ranged one in the same namespace
+/// then keep each other (both hit), instead of each insert wiping the other
+/// and every following query re-planning from `inverted.idx` (~450 ms).
+#[test]
+fn shards_local_and_ranged_presence_agree_after_a_failed_span_write() {
+    let (_s3, manifest, state, seg) = node_with_local_shards();
+    let gone = state.data_dir.join(NS).join("gone-segment");
+    assert!(state
+        .span_writes
+        .persist(
+            &gone,
+            &format!("{NS}/gone-segment"),
+            "postings-00.bin",
+            0,
+            vec![1; 8]
+        )
+        .is_none());
+    state.span_writes.drain(&state.cache);
+    assert_eq!(state.span_writes.failures(), 1, "the injected write failed");
+    assert_ne!(
+        state.presence_generation(),
+        state.cache.eviction_generation()
+    );
+
+    // A ranged confirmation of another segment, as `ensure_query_postings`
+    // stamps it, then a shards-local one of this segment.
+    let other = (format!("{NS}/other"), "postings-07.bin".to_string());
+    posting_blob_cache_insert(
+        &mut state.posting_blob_presence.lock().unwrap(),
+        NS,
+        manifest.version,
+        state.presence_generation(),
+        vec![other.clone()],
+    );
+    let outcome = ensure(&state, &manifest, &seg);
+    assert!(outcome.missing.is_empty(), "{:?}", outcome.missing);
+
+    let rel = seg
+        .strip_prefix(&state.data_dir)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let shard = kosha_segment::posting_blob_file_for_term("alpha");
+    let cache = state.posting_blob_presence.lock().unwrap();
+    let hits = posting_blob_cache_lookup(&cache, NS, manifest.version, state.presence_generation());
+    assert!(
+        hits.get(&rel).is_some_and(|set| set.contains(&shard)),
+        "shards-local kept"
+    );
+    assert!(
+        hits.get(&other.0).is_some_and(|set| set.contains(&other.1)),
+        "the ranged confirmation was not wiped"
     );
 }

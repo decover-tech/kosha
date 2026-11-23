@@ -34,7 +34,9 @@
 //!    later request fetches it again.
 //! 3. **Inline**: with both full the span is written on the calling thread,
 //!    as before this module. That is backpressure at a point where the disk
-//!    is far behind; it keeps memory bounded by the two caps.
+//!    is far behind; it keeps memory bounded by the two caps, and avoids a
+//!    429 the client would not retry. Expected 0 at target load:
+//!    `kosha_span_writes_total{outcome="inline"}` is alert-worthy.
 //!
 //! A span another request's correctness depends on beyond the fetcher's
 //! own lifetime ([`SpanWriteQueue::persist_required`]: `doc_vectors.bin`
@@ -223,7 +225,11 @@ impl SpanWriteQueue {
         // thread accounts it (it holds the cache).
         self.note_drop(len, true);
         let span = PendingSpan::register(segment_dir, file, start, bytes, true);
-        if self.write_file(&span) {
+        if !self.write_file(&span) {
+            // It counted as cached while registered (a query may have
+            // confirmed its term): invalidate that, as for a queued write.
+            self.failed.fetch_add(1, Ordering::AcqRel);
+        } else {
             let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
             queue.writes.push_back(SpanWrite {
                 span: None,
@@ -610,6 +616,22 @@ mod tests {
         writes.drain(&cache);
         assert!(!span_cache::spans_dir(&seg, "doc_store.bin").exists());
         assert_eq!(writes.stats().failed, 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An inline write that fails counts as a failed write, so a term a
+    /// query confirmed on the strength of it is invalidated.
+    #[test]
+    fn a_failed_inline_write_counts_as_failed() {
+        let (root, _cache) = fixture("inline-fail");
+        let writes = SpanWriteQueue::new(0, 0);
+        let gone = root.join("ns/gone");
+        assert!(writes
+            .persist(&gone, "ns/gone", "f.bin", 0, vec![1; 10])
+            .is_none());
+        assert_eq!(writes.stats().inline, 1);
+        assert_eq!(writes.failures(), 1);
+        assert!(!gone.exists());
         let _ = fs::remove_dir_all(&root);
     }
 }
