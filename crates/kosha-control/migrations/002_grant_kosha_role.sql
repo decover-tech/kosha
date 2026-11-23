@@ -37,3 +37,12 @@ ALTER TABLE IF EXISTS kosha.audit_log OWNER TO kosha;
 -- 007_billing.sql (#349). IF EXISTS for the same reason.
 ALTER TABLE IF EXISTS kosha.billing_accounts OWNER TO kosha;
 ALTER TABLE IF EXISTS kosha.billing_invoices OWNER TO kosha;
+-- 011_billing_ledger.sql (#349). IF EXISTS for the same reason. Moving
+-- billing_plan_changes also moves the sequence its BIGSERIAL id owns.
+ALTER TABLE IF EXISTS kosha.billing_plan_changes OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.billing_webhook_events OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.billing_payment_failures OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.billing_notices OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.billing_payment_methods OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.billing_jobs OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.billing_leases OWNER TO kosha;

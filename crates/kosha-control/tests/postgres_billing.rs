@@ -40,6 +40,7 @@ fn invoice(tenant: &str, period: &str, total: u64) -> Invoice {
             unit: 1,
             unit_price_cents: total / 5,
             amount_cents: total,
+            plan: None,
         }],
         total_cents: total,
         issued_at_ms: 30,
@@ -205,6 +206,7 @@ fn a_month_of_usage_in_postgres_is_invoiced_once() {
         store: &billing,
         usage: &usage,
         provider: Some(&provider),
+        plan_changes: None,
     };
     let now = period.end_ms() + 1;
     let id = format!("{tenant}/2026-10");
@@ -236,4 +238,121 @@ fn a_month_of_usage_in_postgres_is_invoiced_once() {
         (paid.status, paid.paid_at_ms),
         (InvoiceStatus::Paid, Some(now + 2))
     );
+}
+
+/// The ledger of migration 011 against the memory ledger: plan changes,
+/// webhook ids, payment failures (only those of open invoices), notices,
+/// payment methods, jobs and the scheduler lease.
+#[test]
+#[ignore = "requires KOSHA_TEST_DATABASE_URL"]
+fn postgres_ledger_behaves_like_the_memory_ledger() {
+    use kosha_control::billing::PlanChange;
+    use kosha_control::billing_ledger::{
+        BillingLedger, MemoryBillingLedger, NoticeRecord, PgBillingLedger,
+    };
+    let billing = store();
+    let pg = PgBillingLedger::new(&url()).unwrap();
+    let memory = MemoryBillingLedger::new();
+    let tenant = fresh_tenant();
+    let open = invoice(&tenant, "2026-10", 500);
+    let mut paid = invoice(&tenant, "2026-09", 500);
+    paid.status = InvoiceStatus::Paid;
+    billing.insert_invoice(&open).unwrap();
+    billing.insert_invoice(&paid).unwrap();
+    let ledgers: [&dyn BillingLedger; 2] = [&pg, &memory];
+    for ledger in ledgers {
+        for (at, from, to) in [(30, Some("free"), "payg"), (10, None, "free")] {
+            ledger
+                .record_plan_change(&PlanChange {
+                    tenant: tenant.clone(),
+                    at_ms: at,
+                    from_plan: from.map(str::to_string),
+                    to_plan: to.into(),
+                    source: "admin".into(),
+                })
+                .unwrap();
+        }
+        let changes = ledger.plan_changes(&tenant, 0, 100).unwrap();
+        assert_eq!(
+            changes.iter().map(|c| c.at_ms).collect::<Vec<_>>(),
+            vec![10, 30]
+        );
+        assert_eq!(ledger.plan_changes(&tenant, 11, 30).unwrap(), vec![]);
+
+        let event = format!("evt_{tenant}");
+        assert!(!ledger.webhook_event_seen(&event).unwrap());
+        assert!(ledger
+            .record_webhook_event(&event, "invoice.paid", "paid", 5)
+            .unwrap());
+        assert!(!ledger
+            .record_webhook_event(&event, "invoice.paid", "paid", 6)
+            .unwrap());
+        assert!(ledger.webhook_event_seen(&event).unwrap());
+
+        for (invoice, at) in [(&open.id, 100), (&open.id, 200), (&paid.id, 50)] {
+            ledger
+                .record_payment_failure(invoice, &tenant, at, Some("declined"))
+                .unwrap();
+        }
+        ledger.record_payment_retry(&open.id, 300).unwrap();
+        let failure = ledger
+            .payment_failures()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.invoice_id == open.id)
+            .unwrap();
+        assert_eq!(
+            (
+                failure.failures,
+                failure.first_failed_at_ms,
+                failure.last_failed_at_ms,
+                failure.retries,
+                failure.last_retry_at_ms,
+                failure.last_reason.as_deref()
+            ),
+            (2, 100, 200, 1, Some(300), Some("declined"))
+        );
+
+        let notice = NoticeRecord {
+            id: format!("{}/overdue", open.id),
+            tenant: tenant.clone(),
+            invoice_id: Some(open.id.clone()),
+            kind: "overdue".into(),
+            sent_at_ms: 1_000,
+        };
+        assert!(ledger.claim_notice(&notice).unwrap());
+        assert!(!ledger.claim_notice(&notice).unwrap());
+        assert!(ledger
+            .notices(1_000)
+            .unwrap()
+            .iter()
+            .any(|n| n.id == notice.id));
+        ledger.release_notice(&notice.id).unwrap();
+        assert!(ledger.claim_notice(&notice).unwrap());
+
+        assert_eq!(ledger.payment_method(&tenant).unwrap(), None);
+        ledger.set_payment_method(&tenant, Some("pm_1"), 7).unwrap();
+        ledger.set_payment_method(&tenant, None, 8).unwrap();
+        let method = ledger.payment_method(&tenant).unwrap().unwrap();
+        assert_eq!((method.payment_method, method.updated_at_ms), (None, 8));
+
+        let job = format!("close-period/{tenant}");
+        assert!(!ledger.job_done(&job).unwrap());
+        ledger.mark_job_done(&job, 1, "{}").unwrap();
+        ledger.mark_job_done(&job, 2, "{}").unwrap();
+        assert!(ledger.job_done(&job).unwrap());
+
+        let lease = format!("lease-{tenant}");
+        assert!(ledger.try_lease(&lease, "a", 0, 100).unwrap());
+        assert!(!ledger.try_lease(&lease, "b", 50, 100).unwrap());
+        assert!(ledger.try_lease(&lease, "a", 60, 100).unwrap());
+        assert!(ledger.try_lease(&lease, "b", 160, 100).unwrap());
+    }
+    // The memory ledger keeps the paid invoice's failure; Postgres only
+    // returns open invoices'.
+    assert!(pg
+        .payment_failures()
+        .unwrap()
+        .iter()
+        .all(|f| f.invoice_id != paid.id));
 }

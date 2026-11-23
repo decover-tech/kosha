@@ -108,6 +108,42 @@ per cache, summed over tenants; with `KOSHA_METRICS_TENANT_LABELS=on` it has one
 cache and tenant instead (see [Tenant labels](#tenant-labels)). The labelled NVMe evictions add
 up to the unlabelled count.
 
+### Usage metering
+
+Present only on a pod with `KOSHA_USAGE_METERING=on` (#348). Each pod reports its own pipeline:
+the events it produced, its spool, and its deliveries to the usage store. The same counters (since
+process start) are in `pipeline` of `GET /v1/admin/usage`.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `kosha_usage_events_emitted_total` | counter | none | Usage events this pod produced: searches, writes, deletes and snapshots. Spooled plus dropped |
+| `kosha_usage_events_spooled_total` | counter | none | Events appended to the local spool |
+| `kosha_usage_events_delivered_total` | counter | none | Events the usage store accepted (flushed). A file resent after a crash counts again here, not in the store |
+| `kosha_usage_events_dropped_total` | counter | none | Events dropped because the spool was at `KOSHA_USAGE_SPOOL_MAX_BYTES` or unwritable. **Alert on any increase**: those events are lost for billing |
+| `kosha_usage_spool_malformed_lines_total` | counter | none | Spool lines that did not parse when delivered (a write cut short by a crash) |
+| `kosha_usage_sink_errors_total` | counter | none | Flushes that failed (usage store unreachable, spool file error). Events stay spooled and are retried every `KOSHA_USAGE_FLUSH_MS` |
+| `kosha_usage_spool_bytes` | gauge | none | Bytes of events waiting in the spool. Growing steadily means delivery is failing |
+| `kosha_usage_last_delivery_timestamp_seconds` | gauge | none | Unix time of the last flush that delivered the whole spool; 0 before the first |
+| `kosha_usage_snapshot_runs_total` | counter | none | Runs of the snapshot tick (`KOSHA_USAGE_SNAPSHOT_TICK_MS`, writer pods only) |
+| `kosha_usage_snapshots_total` | counter | `meter` | Hourly namespace snapshots emitted, `stored_bytes` or `vector_dimensions` |
+| `kosha_usage_snapshot_failures_total` | counter | none | Namespace snapshots a tick could not take (object listing or segment footer read failed); retried next tick |
+| `kosha_usage_footer_reads_total` | counter | none | Segment footers read for the `vector_dimensions` meter. Each segment's footer is read once; a rate that keeps up with the snapshot rate means the cache is not working |
+
+### Billing
+
+Present only on a pod with `KOSHA_BILLING=on` (#349).
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `kosha_billing_webhook_events_total` | counter | `outcome` | Stripe webhook deliveries. `processed`: applied (including events billing ignores). `duplicate`: an event id processed before. `bad_signature`: refused with 400 (missing, stale or wrong `Stripe-Signature`; a steady rate means a wrong `KOSHA_STRIPE_WEBHOOK_SECRET`). `invalid`: signed but not an event. `failed`: a store or provider error, answered 503 so Stripe delivers it again |
+| `kosha_billing_scheduler_runs_total` | counter | `result` | Scheduler ticks (`KOSHA_BILLING_SCHEDULER=on`). `ok`, `failed` (a step reported an error; see the log), `not_leader` (another pod holds the lease) |
+| `kosha_billing_scheduler_last_run_timestamp_seconds` | gauge | none | Unix time of the last tick this pod ran as the leader; 0 if none. Across pods, alert when the maximum is older than a few intervals |
+| `kosha_billing_notices_total` | counter | `outcome` | Dunning notices: `sent`, or `failed` (offered again on the next pass) |
+| `kosha_billing_payment_retries_total` | counter | none | Payments retried by dunning |
+| `kosha_billing_payments_collected_total` | counter | none | Invoices a dunning retry collected |
+| `kosha_billing_catalog_reloads_total` | counter | `outcome` | Plan catalog reloads: `applied`, or `rejected` (invalid, or drops a plan an account is on; the old catalog stays) |
+| `kosha_billing_refresh_failures_total` | counter | none | Standings refreshes that failed; the pod enforces its previous standings |
+
 ## Namespace labels
 
 `KOSHA_METRICS_NAMESPACE_LABELS=on` adds a `namespace` label to

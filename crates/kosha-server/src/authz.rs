@@ -14,7 +14,9 @@
 //!     and billing state (`GET /v1/billing`).
 //!   - `write`: index, replace, delete documents, flush.
 //!   - `admin`: create and delete namespaces and branches, change a
-//!     namespace's schema or shards.
+//!     namespace's schema or shards, and start a self-service checkout or
+//!     open the billing portal (`POST /v1/billing/checkout`,
+//!     `POST /v1/billing/portal`).
 //!
 //! Usage and billing answer for the whole tenant (every namespace's usage,
 //! the plan, the invoices), so, like listing namespaces, a key restricted
@@ -103,6 +105,12 @@ pub fn requirement(method: &str, path: &str) -> Requirement {
         ("GET", "/v1/namespaces") => scoped(Read, Target::Tenant),
         // A tenant reading its own usage (#348) and billing state (#349).
         ("GET", "/v1/usage" | "/v1/billing") => scoped(Read, Target::Tenant),
+        // Self-service billing (#349): putting a payment method on file
+        // moves the tenant to a paid plan, so it takes the admin scope.
+        ("POST", "/v1/billing/checkout" | "/v1/billing/portal") => scoped(Admin, Target::Tenant),
+        // Stripe's deliveries carry a signature, not a key; `dispatch`
+        // answers them before authentication.
+        ("POST", "/v1/billing/webhooks/stripe") => Requirement::Open,
         ("POST", "/v1/namespaces") => scoped(Admin, Target::Body("namespace")),
         // Legacy unversioned routes.
         ("POST", "/search" | "/exists") => scoped(Read, Target::Body("namespace")),
@@ -235,6 +243,8 @@ mod tests {
         ("POST", "/v1/namespaces/docs/shards", Scope::Admin),
         ("POST", "/v1/namespaces/docs/branch", Scope::Admin),
         ("DELETE", "/v1/namespaces/docs/branch", Scope::Admin),
+        ("POST", "/v1/billing/checkout", Scope::Admin),
+        ("POST", "/v1/billing/portal", Scope::Admin),
     ];
 
     /// The routes of `ROUTES` that answer for the whole tenant.
@@ -242,6 +252,8 @@ mod tests {
         ("GET", "/v1/namespaces"),
         ("GET", "/v1/usage"),
         ("GET", "/v1/billing"),
+        ("POST", "/v1/billing/checkout"),
+        ("POST", "/v1/billing/portal"),
     ];
 
     /// The body of `route_inner` in main.rs, after its signature.
@@ -645,7 +657,7 @@ mod tests {
             let denied = authorize(&docs, method, path, b"").unwrap_err();
             assert!(denied.contains("whole tenant"), "{method} {path}: {denied}");
             // The same key without the namespace restriction may.
-            assert!(authorize(&key(&[Scope::Read], None), method, path, b"").is_ok());
+            assert!(authorize(&key(&all, None), method, path, b"").is_ok());
         }
         assert!(authorize(&docs, "GET", "/v1/usage?from=1&to=2", b"").is_err());
         // A branch must be allowed by name as well as its parent.

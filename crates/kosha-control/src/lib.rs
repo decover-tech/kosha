@@ -42,6 +42,9 @@ mod hydration_lease;
 pub use hydration_lease::{HydrationLease, HydrationLeaseStore};
 
 pub mod billing;
+pub mod billing_ledger;
+pub mod dunning;
+pub mod stripe_webhook;
 pub mod usage;
 
 #[cfg(feature = "postgres")]
