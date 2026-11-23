@@ -61,6 +61,8 @@ mod namespace_deletion;
 mod namespace_migrate;
 mod operator_admin;
 mod org_admin;
+#[cfg(all(test, feature = "s3"))]
+mod posting_presence_tests;
 mod posting_spans;
 mod rerank;
 mod role;
@@ -5221,6 +5223,7 @@ impl AppState {
             .collect();
         let mut ranged: Vec<PathBuf> = Vec::new();
         let mut whole: Vec<PathBuf> = Vec::new();
+        let mut shards_local: Vec<(String, String)> = Vec::new();
         for seg in seg_paths {
             let Ok(rel) = seg.strip_prefix(&self.data_dir) else {
                 continue;
@@ -5233,6 +5236,19 @@ impl AppState {
                 keys.iter().all(|k| set.contains(k))
                     || posting_files.iter().all(|f| set.contains(f))
             }) {
+                continue;
+            }
+            // Every shard the terms hash to is already a whole local file
+            // (warmed, promoted, or fetched whole): the postings are local,
+            // confirmed by name with one stat per shard. Without this, a
+            // presence miss sent the segment to `ranged`, which reads and
+            // decodes the whole `inverted.idx` (8 MB decoded for one staging
+            // segment) only to find the shards local.
+            if posting_files
+                .iter()
+                .all(|f| file_present_nonempty(&seg.join(f)))
+            {
+                shards_local.extend(posting_files.iter().map(|f| (rel.to_string(), f.clone())));
                 continue;
             }
             let raw = seg
@@ -5251,6 +5267,12 @@ impl AppState {
             } else {
                 whole.push(seg.clone());
             }
+        }
+
+        if !shards_local.is_empty() {
+            let write_gen = self.cache.eviction_generation();
+            let mut cache = self.posting_blob_presence.lock().unwrap();
+            posting_blob_cache_insert(&mut cache, &ns.0, manifest.version, write_gen, shards_local);
         }
 
         let mut outcome = HydrationOutcome::default();
@@ -16297,6 +16319,78 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A landed promotion (posting shard or doc store) drops spans that the
+    /// whole file now supersedes: nothing became less local, so the
+    /// namespace's posting presence verdicts, other segments' included,
+    /// must survive it. Every one used to be wiped, and each following
+    /// distinct keyword query re-planned every segment from its
+    /// `inverted.idx` (~450 ms on staging, run8). A real eviction still
+    /// invalidates them.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn a_landed_promotion_keeps_posting_presence_and_an_eviction_does_not() {
+        let state = test_state();
+        let seg_a = state.data_dir.join("ns/seg-a");
+        state
+            .cache
+            .put_bytes("ns/seg-a/postings-00.bin.spans/0-10", &[1u8; 10])
+            .unwrap();
+        state
+            .cache
+            .put_bytes("ns/seg-a/postings-00.bin", &[1u8; 64])
+            .unwrap();
+        state
+            .cache
+            .put_bytes("ns/seg-a/doc_store.bin.spans/0-10", &[1u8; 10])
+            .unwrap();
+        state
+            .cache
+            .put_bytes("ns/seg-a/doc_store.bin", &[1u8; 64])
+            .unwrap();
+        state
+            .cache
+            .put_bytes("ns/seg-b/postings-01.bin", &[1u8; 64])
+            .unwrap();
+        let confirmed = |state: &AppState| {
+            let cache = state.posting_blob_presence.lock().unwrap();
+            posting_blob_cache_lookup(&cache, "ns", 1, state.cache.eviction_generation())
+                .get("ns/seg-b")
+                .is_some_and(|set| set.contains("postings-01.bin"))
+        };
+        posting_blob_cache_insert(
+            &mut state.posting_blob_presence.lock().unwrap(),
+            "ns",
+            1,
+            state.cache.eviction_generation(),
+            vec![("ns/seg-b".into(), "postings-01.bin".into())],
+        );
+        assert!(confirmed(&state));
+
+        state.posting_span_hydrator.finish_promotion(
+            &state.cache,
+            &seg_a.join("postings-00.bin"),
+            true,
+        );
+        state
+            .span_hydrator
+            .finish_promotion(&state.cache, &seg_a, true);
+        assert!(
+            !seg_a.join("postings-00.bin.spans").exists(),
+            "spans dropped"
+        );
+        assert!(!seg_a.join("doc_store.bin.spans").exists(), "spans dropped");
+        assert!(
+            confirmed(&state),
+            "a landed promotion must not invalidate other segments' presence"
+        );
+
+        state.cache.evict("ns/seg-b/postings-01.bin").unwrap();
+        assert!(
+            !confirmed(&state),
+            "a real eviction must invalidate the presence verdicts"
+        );
     }
 
     #[cfg(feature = "s3")]

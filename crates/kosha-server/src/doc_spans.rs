@@ -502,9 +502,12 @@ impl SpanHydrator {
     /// A background whole-file hydration for `segment_dir` finished. When
     /// the whole files `landed`, the spans of each file now whole are
     /// redundant (the whole file wins every read) and are dropped from disk
-    /// and from the cache's accounting. A `doc_vectors.bin` kept remote
-    /// (f32 columns, see [`kosha_segment::doc_vectors_kept_whole`]) keeps
-    /// its spans: they are still how its vectors are read. Either way the
+    /// and from the cache's accounting — not as an eviction, so posting
+    /// presence verdicts survive
+    /// ([`Cache::drop_superseded_dir_unless_pinned`]). A `doc_vectors.bin`
+    /// kept remote (f32 columns, see
+    /// [`kosha_segment::doc_vectors_kept_whole`]) keeps its spans: they are
+    /// still how its vectors are read. Either way the
     /// segment's heat resets, so a failed promotion may be retried after
     /// another threshold's worth of reads.
     pub fn finish_promotion(&self, cache: &Cache, segment_dir: &Path, landed: bool) {
@@ -521,7 +524,7 @@ impl SpanHydrator {
                 continue;
             }
             let key = format!("{rel}/{file}{}", span_cache::SPANS_SUFFIX);
-            if let Err(e) = cache.evict_dir_unless_pinned(&key) {
+            if let Err(e) = cache.drop_superseded_dir_unless_pinned(&key) {
                 eprintln!("WARN: failed to drop span cache {key}: {e}");
             }
         }

@@ -15,7 +15,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 
 const BUCKET: &str = "kosha-test";
-const NS: &str = "offsets-fallback";
+pub(super) const NS: &str = "offsets-fallback";
 
 /// Path-style S3 that serves GetObject / HeadObject from a directory, 404s
 /// (`NoSuchKey`) anything absent, and records every key it was asked for.
@@ -24,7 +24,7 @@ const NS: &str = "offsets-fallback";
 pub(super) struct FakeS3 {
     endpoint: String,
     /// `{root}/{key}` is the object `key`.
-    root: PathBuf,
+    pub(super) root: PathBuf,
     /// Every key fetched with GET, in order.
     pub(super) gets: Arc<Mutex<Vec<String>>>,
 }
@@ -202,7 +202,7 @@ pub(super) fn temp_dir(tag: &str) -> PathBuf {
 /// uploaded to a fresh fake bucket. Returns the bucket and the manifest the
 /// writer produced, with the writer's own cached footers (format_version 2)
 /// in it: the "modern manifest" shape.
-fn uploaded_namespace() -> (FakeS3, kosha_core::Manifest) {
+pub(super) fn uploaded_namespace() -> (FakeS3, kosha_core::Manifest) {
     let writer_dir = temp_dir("writer");
     let state = AppState::new(writer_dir.clone());
     let ns = NamespaceId(NS.into());

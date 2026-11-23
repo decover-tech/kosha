@@ -316,7 +316,9 @@ impl PostingSpanHydrator {
 
     /// A background whole-shard hydration of `shard` finished. When it
     /// `landed`, the shard's spans are dropped (the whole file wins every
-    /// read). Either way its heat resets.
+    /// read) without counting as an eviction, so posting presence verdicts
+    /// survive ([`Cache::drop_superseded_dir_unless_pinned`]). Either way
+    /// its heat resets.
     pub fn finish_promotion(&self, cache: &Cache, shard: &Path, landed: bool) {
         self.promoting.lock().unwrap().remove(shard);
         self.heat.lock().unwrap().remove(shard);
@@ -327,7 +329,7 @@ impl PostingSpanHydrator {
             return;
         };
         let key = format!("{rel}{}", span_cache::SPANS_SUFFIX);
-        if let Err(e) = cache.evict_dir_unless_pinned(&key) {
+        if let Err(e) = cache.drop_superseded_dir_unless_pinned(&key) {
             eprintln!("WARN: failed to drop span cache {key}: {e}");
         }
     }
