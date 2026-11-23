@@ -95,8 +95,10 @@ impl Fixture {
         self.reader.vector_field(FIELD).unwrap().unwrap()
     }
 
+    /// Give the reader a cache of its own with this budget (the shared
+    /// one is process-wide and other tests use it concurrently).
     fn set_cache_budget(&mut self, max_bytes: usize) {
-        self.reader.vector_cache.max_bytes = max_bytes;
+        self.reader.vector_cache = Arc::new(PostingsCache::new(max_bytes, None));
     }
 
     /// Move `vector.idx` into the span cache: `per_span` consecutive
@@ -1358,4 +1360,301 @@ fn nprobe_probe_of_a_zero_dimension_column_still_scans_its_postings() {
         .unwrap()
         .unwrap();
     assert_eq!(ids(filtered), vec![1, 3, 5]);
+}
+
+// ── Vector postings cache: admission, recency, memory bound ──────────
+
+/// A segment of `docs` random `dim`-wide vectors in its own directory.
+fn write_vector_segment(name: &str, docs: usize, dim: usize) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("kosha-vcache-{name}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let mut writer = SegmentWriter::new(SegmentId(name.into()), dir.clone());
+    let mut rng = Lcg(docs as u64 ^ 0x5EED);
+    for i in 0..docs {
+        let v = (0..dim).map(|_| rng.coord()).collect();
+        writer.add_document(DocumentId(format!("d{i}")), vec![Field::vector(FIELD, v)]);
+    }
+    writer.finalize(Bm25Params::default()).unwrap();
+    let _ = fs::remove_file(dir.join(DOC_VECTORS_FILE));
+    dir
+}
+
+/// Live bytes reported by the caches, as the query layer's ledger sees
+/// them.
+#[derive(Default)]
+struct CountingAccount(std::sync::atomic::AtomicI64);
+
+impl PostingsMemoryAccount for CountingAccount {
+    fn add_postings(&self, bytes: u64) {
+        self.0
+            .fetch_add(bytes as i64, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn release_postings(&self, bytes: u64) {
+        self.0
+            .fetch_sub(bytes as i64, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl CountingAccount {
+    fn live(&self) -> i64 {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Staging probed 1,610 postings per segment per query; the 256-key
+/// second-touch ring forgot each one before the next query asked for it
+/// again, so a repeated query never got a cache hit. Through the real
+/// probe path: a query probing far more than 256 postings is admitted on
+/// its second run and served from the cache on its third.
+#[test]
+fn a_probe_of_more_postings_than_the_text_ring_is_admitted_on_its_second_run() {
+    let dir = write_vector_segment("wide", 60_000, 4);
+    let mut reader = SegmentReader::open_with_options(dir.clone(), true).unwrap();
+    reader.vector_cache = Arc::new(PostingsCache::new(usize::MAX / 2, None));
+    let postings = {
+        let index = reader.vector_field(FIELD).unwrap().unwrap();
+        index.lazy.as_ref().unwrap().ranges.len()
+    };
+    assert!(
+        postings > 2 * POSTINGS_CACHE_MISS_RING,
+        "the probe must outnumber the text ring: {postings} postings"
+    );
+    let query = [0.25f32, -0.5, 0.75, 0.1];
+    let run = || {
+        with_knn_scan_stats(|| {
+            reader
+                .knn_search_within(&query, 10, f32::INFINITY, usize::MAX)
+                .unwrap()
+                .unwrap()
+        })
+        .1
+    };
+    let counts = |s: KnnScanStats| (s.postings_scanned, s.postings_decoded, s.postings_cached);
+    assert_eq!(counts(run()), (postings, 0, 0), "first run: one-shot");
+    assert_eq!(counts(run()), (0, postings, 0), "second run: admitted");
+    assert_eq!(counts(run()), (0, 0, postings), "third run: all cached");
+    drop(reader);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// One query that probes more postings than the cache can hold, repeated,
+/// would only churn an LRU (each posting evicted before its reuse): the
+/// second-touch window is the cache's reach, so it is not admitted and
+/// nothing is decoded for nothing.
+#[test]
+fn a_probe_larger_than_the_cache_reach_passes_through() {
+    let dir = write_vector_segment("reach", 60_000, 4);
+    let mut reader = SegmentReader::open_with_options(dir.clone(), true).unwrap();
+    let (postings, largest) = {
+        let index = reader.vector_field(FIELD).unwrap().unwrap();
+        let vi = index.lazy.as_ref().unwrap();
+        let largest = vi.ranges.iter().map(|&(_, l)| l as usize).max().unwrap();
+        (
+            vi.ranges.len(),
+            f32_posting_resident_bytes(largest / (4 + 16), 4),
+        )
+    };
+    // Room for at most 128 postings, far fewer than one probe touches.
+    reader.vector_cache = Arc::new(PostingsCache::new(largest * 128, None));
+    assert!(postings > 4 * 128, "{postings} postings");
+    let query = [0.25f32, -0.5, 0.75, 0.1];
+    for _ in 0..3 {
+        let (_, stats) = with_knn_scan_stats(|| {
+            reader
+                .knn_search_within(&query, 10, f32::INFINITY, usize::MAX)
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(stats.postings_scanned, postings, "{stats:?}");
+    }
+    drop(reader);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Every segment's vector postings share one budget: however many
+/// segments are open, resident decoded postings stay under it, the
+/// ledger's view (each segment's account) matches what is resident, and a
+/// dropped segment takes its entries and their live bytes with it.
+#[test]
+fn vector_postings_of_all_segments_stay_under_one_budget() {
+    let dirs: Vec<PathBuf> = (0..4)
+        .map(|i| write_vector_segment(&format!("bound{i}"), 3_000, 8))
+        .collect();
+    let largest = dirs
+        .iter()
+        .map(|dir| {
+            let reader = SegmentReader::open_with_options(dir.clone(), true).unwrap();
+            let index = reader.vector_field(FIELD).unwrap().unwrap();
+            let vi = index.lazy.as_ref().unwrap();
+            let l = vi.ranges.iter().map(|&(_, l)| l as usize).max().unwrap();
+            f32_posting_resident_bytes(l / (4 + 32), 8)
+        })
+        .max()
+        .unwrap();
+    // Readers opened the normal way share the one process-wide cache…
+    {
+        let a = SegmentReader::open_with_options(dirs[0].clone(), true).unwrap();
+        let b = SegmentReader::open_with_options(dirs[1].clone(), true).unwrap();
+        assert!(Arc::ptr_eq(&a.vector_cache, &b.vector_cache));
+        assert_ne!(a.vector_cache_owner, b.vector_cache_owner);
+    }
+    // …here a private one, about one segment's worth: four segments'
+    // working sets cannot all fit.
+    let budget = largest * 60;
+    let cache = Arc::new(PostingsCache::new(budget, None));
+    let accounts: Vec<Arc<CountingAccount>> = (0..dirs.len()).map(|_| Arc::default()).collect();
+    let mut readers: Vec<SegmentReader> = dirs
+        .iter()
+        .zip(&accounts)
+        .map(|(dir, account)| {
+            let account: SharedAccount = Arc::clone(account) as SharedAccount;
+            let mut r =
+                SegmentReader::open_with_footer_options(dir.clone(), true, None, Some(account))
+                    .unwrap();
+            r.vector_cache = Arc::clone(&cache);
+            r
+        })
+        .collect();
+    let total = |readers: &[SegmentReader]| -> usize {
+        readers
+            .iter()
+            .map(|r| r.vector_cache_resident_bytes())
+            .sum()
+    };
+    let mut peak = 0;
+    for round in 0..4 {
+        for (i, reader) in readers.iter().enumerate() {
+            let query: Vec<f32> = (0..8).map(|d| ((round + i + d) % 5) as f32 - 2.0).collect();
+            reader
+                .knn_search_within(&query, 10, f32::INFINITY, usize::MAX)
+                .unwrap()
+                .unwrap();
+            let resident = total(&readers);
+            assert!(resident <= budget, "{resident} > {budget}");
+            peak = peak.max(resident);
+        }
+    }
+    assert!(peak > budget / 2, "the cache was used: peak {peak}");
+    for (reader, account) in readers.iter().zip(&accounts) {
+        assert_eq!(account.live(), reader.vector_cache_resident_bytes() as i64);
+    }
+    let gone = readers.remove(0);
+    drop(gone);
+    assert_eq!(
+        accounts[0].live(),
+        0,
+        "a dropped segment releases its bytes"
+    );
+    assert_eq!(total(&readers), cache.state.lock().unwrap().total_bytes);
+    drop(readers);
+    assert_eq!(cache.state.lock().unwrap().total_bytes, 0);
+    for dir in dirs {
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// Hits re-stamp instead of moving entries; eviction must still follow
+/// exact LRU order. Checked against a plain ordered-list model over a
+/// long random mix of hits, inserts and membership checks (which must not
+/// count as use), and the recency queue must stay compacted.
+#[test]
+fn postings_cache_evicts_in_exact_lru_order() {
+    const CAP: usize = 40;
+    let cache = PostingsCache::<usize, usize>::new(CAP, None);
+    let mut model: VecDeque<usize> = VecDeque::new();
+    let mut rng = Lcg(42);
+    for step in 0..200_000 {
+        let key = (rng.next() % 64) as usize;
+        match rng.next() % 3 {
+            0 => {
+                let hit = cache.get(key);
+                let pos = model.iter().position(|k| *k == key);
+                assert_eq!(hit.is_some(), pos.is_some(), "step {step} key {key}");
+                if let Some(pos) = pos {
+                    model.remove(pos);
+                    model.push_back(key);
+                }
+            }
+            1 => assert_eq!(cache.contains(key), model.contains(&key)),
+            _ => {
+                cache.insert(key, key, 1);
+                if let Some(pos) = model.iter().position(|k| *k == key) {
+                    model.remove(pos);
+                }
+                model.push_back(key);
+                if model.len() > CAP {
+                    model.pop_front();
+                }
+            }
+        }
+        let st = cache.state.lock().unwrap();
+        assert!(st.recency.queue.len() <= 2 * st.entries.len() + 64);
+    }
+    let st = cache.state.lock().unwrap();
+    let mut order: Vec<(u64, usize)> = st.entries.iter().map(|(k, e)| (e.stamp, *k)).collect();
+    order.sort_unstable();
+    let order: Vec<usize> = order.into_iter().map(|(_, k)| k).collect();
+    assert_eq!(order, model.into_iter().collect::<Vec<_>>());
+}
+
+/// The text caches keep their 256-key second-touch ring: a key missed
+/// again within 256 other misses is admitted, one missed after more is
+/// not.
+#[test]
+fn text_second_touch_ring_is_unchanged() {
+    let cache = PostingsCache::<usize, u8>::new(usize::MAX, None);
+    for k in 0..POSTINGS_CACHE_MISS_RING {
+        assert!(!cache.admit_on_miss(k));
+    }
+    assert!(cache.admit_on_miss(0), "within the ring");
+    for k in 1_000..1_000 + POSTINGS_CACHE_MISS_RING {
+        assert!(!cache.admit_on_miss(k));
+    }
+    assert!(!cache.admit_on_miss(1), "pushed out of the ring");
+    let st = cache.state.lock().unwrap();
+    assert!(st.misses.len() <= POSTINGS_CACHE_MISS_RING);
+    assert!(st.miss_order.queue.len() <= 2 * st.misses.len() + 64);
+}
+
+/// Per-hit cost at 5,000 entries (staging's posting count per segment):
+/// the O(1) re-stamp against the old recency scan (`position` + `remove`
+/// + `push_back` on a `VecDeque`). Run with:
+///
+/// `cargo test --release -p kosha-segment per_hit_cost -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn per_hit_cost_at_five_thousand_entries() {
+    const N: usize = 5_000;
+    const HITS: usize = 2_000_000;
+    let cache = PostingsCache::<usize, Arc<u8>>::new(usize::MAX / 2, None);
+    let value = Arc::new(0u8);
+    for k in 0..N {
+        cache.insert(k, Arc::clone(&value), 1);
+    }
+    let mut rng = Lcg(7);
+    let keys: Vec<usize> = (0..HITS)
+        .map(|_| (rng.next() % N as u64) as usize)
+        .collect();
+    let t = std::time::Instant::now();
+    for k in &keys {
+        std::hint::black_box(cache.get(*k));
+    }
+    let new_ns = t.elapsed().as_nanos() as f64 / HITS as f64;
+    type OldLru = (HashMap<usize, Arc<u8>>, VecDeque<usize>);
+    let old: Mutex<OldLru> = Mutex::new((
+        (0..N).map(|k| (k, Arc::clone(&value))).collect(),
+        (0..N).collect(),
+    ));
+    let t = std::time::Instant::now();
+    for k in &keys {
+        let mut st = old.lock().unwrap();
+        let hit = st.0.get(k).cloned();
+        if let Some(pos) = st.1.iter().position(|x| x == k) {
+            st.1.remove(pos);
+        }
+        st.1.push_back(*k);
+        std::hint::black_box(hit);
+    }
+    let old_ns = t.elapsed().as_nanos() as f64 / HITS as f64;
+    println!("per hit at {N} entries: new {new_ns:.1} ns, old {old_ns:.1} ns");
 }
