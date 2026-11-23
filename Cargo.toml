@@ -25,3 +25,11 @@ rayon = "1"
 # index) dominate `cargo test` time. Debug assertions stay on.
 [profile.dev.package.kosha-vector-spfresh]
 opt-level = 3
+
+# Console password hashing (argon2id, #345) does ~19 MiB of memory-hard work
+# per hash; unoptimized that is seconds per sign-up or login in tests.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

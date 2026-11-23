@@ -8,13 +8,13 @@ use crate::orgs::{
 };
 use crate::PgStore;
 
-fn store_error(e: sqlx::Error) -> OrgError {
+pub(crate) fn store_error(e: sqlx::Error) -> OrgError {
     OrgError::Store(e.to_string())
 }
 
 /// A unique violation (SQLSTATE 23505) on an insert is the collision
 /// `OrgTx` documents; anything else is a store failure.
-fn insert_error(e: sqlx::Error, conflict: &str) -> OrgError {
+pub(crate) fn insert_error(e: sqlx::Error, conflict: &str) -> OrgError {
     let unique_violation = e
         .as_database_error()
         .and_then(|db| db.code())
@@ -26,14 +26,14 @@ fn insert_error(e: sqlx::Error, conflict: &str) -> OrgError {
     }
 }
 
-fn parse_role(role: &str) -> Result<Role, OrgError> {
+pub(crate) fn parse_role(role: &str) -> Result<Role, OrgError> {
     Role::parse(role)
         .ok_or_else(|| OrgError::Store(format!("unknown role '{role}' in org_members")))
 }
 
 /// Timestamps cross the boundary as Unix milliseconds: bound as seconds for
 /// `to_timestamp`, read back with `CREATED_MS`-style expressions.
-fn seconds(ms: i64) -> f64 {
+pub(crate) fn seconds(ms: i64) -> f64 {
     ms as f64 / 1000.0
 }
 
@@ -45,9 +45,9 @@ pub(crate) const INSERT_AUDIT: &str = "INSERT INTO kosha.audit_log \
          (org_id, actor, action, target_type, target_id, detail) \
      VALUES ($1, $2, $3, $4, $5, $6)";
 
-struct PgTx<'a> {
-    tx: sqlx::Transaction<'static, sqlx::Postgres>,
-    rt: &'a tokio::runtime::Runtime,
+pub(crate) struct PgTx<'a> {
+    pub(crate) tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    pub(crate) rt: &'a tokio::runtime::Runtime,
 }
 
 impl OrgStore for PgStore {

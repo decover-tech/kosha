@@ -61,6 +61,11 @@ pub enum Permission {
     ManageMembers,
     /// Read the audit log.
     ViewAuditLog,
+    /// Revoke any of the organization's API keys (a member may always
+    /// revoke the keys they created themselves).
+    ManageApiKeys,
+    /// Configure the organization's single sign-on.
+    ManageSso,
 }
 
 impl Role {
@@ -87,7 +92,9 @@ impl Role {
             Permission::ManageProjects
             | Permission::ManageTenants
             | Permission::ManageMembers
-            | Permission::ViewAuditLog => matches!(self, Role::Owner | Role::Admin),
+            | Permission::ViewAuditLog
+            | Permission::ManageApiKeys
+            | Permission::ManageSso => matches!(self, Role::Owner | Role::Admin),
         }
     }
 }
@@ -299,7 +306,7 @@ pub trait OrgStore: Send + Sync {
     ) -> Result<(), OrgError>;
 }
 
-fn run<R>(
+pub(crate) fn run<R>(
     store: &dyn OrgStore,
     mut f: impl FnMut(&mut dyn OrgTx) -> Result<R, OrgError>,
 ) -> Result<R, OrgError> {
@@ -311,23 +318,23 @@ fn run<R>(
     out.ok_or_else(|| OrgError::Store("transaction committed without a result".into()))
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
 
-fn new_id(prefix: &str) -> String {
+pub(crate) fn new_id(prefix: &str) -> String {
     format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
 }
 
 // ── Validation ──────────────────────────────────────────────────────────────
 
 const MAX_SLUG_LEN: usize = 63;
-const MAX_NAME_LEN: usize = 200;
+pub(crate) const MAX_NAME_LEN: usize = 200;
 const MAX_EMAIL_LEN: usize = 254;
-const MAX_DESCRIPTION_LEN: usize = 500;
+pub(crate) const MAX_DESCRIPTION_LEN: usize = 500;
 /// The most rows a list call returns (and the audit log's largest page).
 pub const MAX_LIST: u32 = 1000;
 pub const DEFAULT_AUDIT_PAGE: u32 = 100;
@@ -353,7 +360,7 @@ fn check_slug(what: &str, slug: &str) -> Result<(), OrgError> {
     }
 }
 
-fn check_text(what: &str, value: &str, max: usize, required: bool) -> Result<(), OrgError> {
+pub(crate) fn check_text(what: &str, value: &str, max: usize, required: bool) -> Result<(), OrgError> {
     if required && value.trim().is_empty() {
         return Err(OrgError::Invalid(format!("'{what}' must not be empty")));
     }
@@ -367,7 +374,7 @@ fn check_text(what: &str, value: &str, max: usize, required: bool) -> Result<(),
 
 /// Trimmed and lowercased, so uniqueness is case-insensitive. A shape
 /// check only: whether the address is real is email verification's job.
-fn normalize_email(email: &str) -> Result<String, OrgError> {
+pub(crate) fn normalize_email(email: &str) -> Result<String, OrgError> {
     let email = email.trim().to_lowercase();
     let shape_ok = match email.split_once('@') {
         Some((local, domain)) => !local.is_empty() && !domain.is_empty() && !domain.contains('@'),
@@ -413,14 +420,14 @@ fn require_operator(actor: &Actor, what: &str) -> Result<(), OrgError> {
     }
 }
 
-fn require_org(tx: &mut dyn OrgTx, org_id: &str, lock: bool) -> Result<Organization, OrgError> {
+pub(crate) fn require_org(tx: &mut dyn OrgTx, org_id: &str, lock: bool) -> Result<Organization, OrgError> {
     tx.org(org_id, lock)?
         .ok_or_else(|| OrgError::NotFound(format!("organization '{org_id}' not found")))
 }
 
 /// The actor's role in the organization: `None` for the operator, who is
 /// not bound by roles. A user who is not a member is refused.
-fn actor_role(tx: &mut dyn OrgTx, actor: &Actor, org_id: &str) -> Result<Option<Role>, OrgError> {
+pub(crate) fn actor_role(tx: &mut dyn OrgTx, actor: &Actor, org_id: &str) -> Result<Option<Role>, OrgError> {
     match actor.user_id() {
         None => Ok(None),
         Some(user_id) => tx
@@ -430,7 +437,7 @@ fn actor_role(tx: &mut dyn OrgTx, actor: &Actor, org_id: &str) -> Result<Option<
     }
 }
 
-fn authorize(
+pub(crate) fn authorize(
     tx: &mut dyn OrgTx,
     actor: &Actor,
     org_id: &str,
@@ -450,7 +457,7 @@ fn authorize(
 /// is "not a member"), by an actor with `actor_role` (`None` = operator):
 /// only an owner (or the operator) grants, changes or revokes the owner
 /// role, and an organization never loses its last owner.
-fn check_member_change(
+pub(crate) fn check_member_change(
     actor_role: Option<Role>,
     current: Option<Role>,
     new: Option<Role>,
@@ -470,7 +477,7 @@ fn check_member_change(
     Ok(())
 }
 
-fn audit(
+pub(crate) fn audit(
     tx: &mut dyn OrgTx,
     actor: &Actor,
     org_id: Option<&str>,
@@ -834,7 +841,7 @@ pub fn list_tenants(
 
 /// The audit detail for a created key: enough to tell keys apart, never
 /// the key.
-fn key_detail(key: &ApiKey) -> serde_json::Value {
+pub(crate) fn key_detail(key: &ApiKey) -> serde_json::Value {
     let tail = key.api_key.len().saturating_sub(4);
     serde_json::json!({
         "key_suffix": key.api_key.get(tail..).unwrap_or(""),
@@ -842,7 +849,7 @@ fn key_detail(key: &ApiKey) -> serde_json::Value {
     })
 }
 
-fn new_api_key(tenant_id: &str, description: &str) -> ApiKey {
+pub(crate) fn new_api_key(tenant_id: &str, description: &str) -> ApiKey {
     ApiKey {
         api_key: format!("sk-{}", uuid::Uuid::new_v4()),
         tenant_id: tenant_id.to_string(),
@@ -915,21 +922,23 @@ struct MemberRow {
 }
 
 #[derive(Debug, Clone, Default)]
-struct MemoryState {
-    users: Vec<User>,
-    orgs: Vec<Organization>,
+pub(crate) struct MemoryState {
+    pub(crate) users: Vec<User>,
+    pub(crate) orgs: Vec<Organization>,
     members: Vec<MemberRow>,
     projects: Vec<Project>,
-    tenants: Vec<TenantLink>,
+    pub(crate) tenants: Vec<TenantLink>,
     api_keys: Vec<ApiKey>,
-    audit: Vec<AuditEvent>,
+    pub(crate) audit: Vec<AuditEvent>,
+    /// Sign-up, sessions, identities, SSO (#345 part 2): see `identity`.
+    pub(crate) identity: crate::identity::MemoryIdentity,
 }
 
 /// The store for a server without Postgres, like the in-memory
 /// `Controller`: state lives in this process and is gone on restart.
 #[derive(Debug, Default)]
 pub struct MemoryOrgStore {
-    state: Mutex<MemoryState>,
+    pub(crate) state: Mutex<MemoryState>,
 }
 
 impl MemoryOrgStore {
@@ -972,6 +981,24 @@ pub(crate) const ORG_EXISTS: &str = "an organization with this slug already exis
 pub(crate) const PROJECT_EXISTS: &str =
     "a project with this slug already exists in this organization";
 pub(crate) const TENANT_LINKED: &str = "this tenant id already belongs to an organization";
+
+impl MemoryState {
+    /// Every organization `user_id` belongs to, with their role, by slug.
+    pub(crate) fn user_memberships(&self, user_id: &str) -> Vec<(Organization, Role)> {
+        let mut out: Vec<(Organization, Role)> = self
+            .members
+            .iter()
+            .filter(|m| m.user_id == user_id)
+            .filter_map(|m| {
+                let org = self.orgs.iter().find(|o| o.id == m.org_id)?;
+                Some((org.clone(), m.role))
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.slug.cmp(&b.0.slug));
+        out.truncate(MAX_LIST as usize);
+        out
+    }
+}
 
 impl OrgTx for MemoryState {
     fn user(&mut self, id: &str) -> Result<Option<User>, OrgError> {
@@ -1173,18 +1200,20 @@ mod tests {
                 ManageTenants,
                 ManageMembers,
                 ViewAuditLog,
+                ManageApiKeys,
+                ManageSso,
             ]
             .map(|p| role.allows(p))
         };
-        assert_eq!(allowed(Role::Owner), [true; 6]);
-        assert_eq!(allowed(Role::Admin), [true; 6]);
+        assert_eq!(allowed(Role::Owner), [true; 8]);
+        assert_eq!(allowed(Role::Admin), [true; 8]);
         assert_eq!(
             allowed(Role::Member),
-            [true, true, false, false, false, false]
+            [true, true, false, false, false, false, false, false]
         );
         assert_eq!(
             allowed(Role::ReadOnly),
-            [true, false, false, false, false, false]
+            [true, false, false, false, false, false, false, false]
         );
     }
 
