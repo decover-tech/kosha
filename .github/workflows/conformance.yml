@@ -56,7 +56,7 @@ jobs:
       - name: Python client tests
         run: |
           python3 -m venv .venv-legacy-off
-          .venv-legacy-off/bin/pip install --quiet -e clients/python pytest numpy requests
+          .venv-legacy-off/bin/pip install --quiet -e clients/python pytest pyyaml numpy requests  # pyyaml: tests/test_dsl_registry.py
           .venv-legacy-off/bin/python -m pytest clients/python/tests -q
 
       - name: Bench scripts smoke (legacy routes off)
