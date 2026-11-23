@@ -63,6 +63,46 @@ pub fn dot_i8(q: &[f32], codes: &[i8], scale: f32) -> f32 {
     s * scale
 }
 
+/// Quantizes a query to i16 codes in `-max_code..=max_code`, one symmetric
+/// scale for the vector (`scale = max|x_i| / max_code`), for
+/// [`dot_i16_i8`]. A zero or non-finite query gets scale `0.0` and
+/// all-zero codes. `max_code` is clamped to `1..=i16::MAX`.
+pub fn quantize_i16(v: &[f32], max_code: i16) -> (Vec<i16>, f32) {
+    let max_code = f32::from(max_code.max(1));
+    let max_abs = v.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    if max_abs == 0.0 || !max_abs.is_finite() || v.iter().any(|x| !x.is_finite()) {
+        return (vec![0; v.len()], 0.0);
+    }
+    let scale = max_abs / max_code;
+    let inv = 1.0 / scale;
+    let codes = v
+        .iter()
+        .map(|&x| (x * inv).round().clamp(-max_code, max_code) as i16)
+        .collect();
+    (codes, scale)
+}
+
+/// Largest `max_code` for [`quantize_i16`] at which [`dot_i16_i8`] over
+/// `dim` components cannot overflow its `i32` sum:
+/// `max_code * 127 * dim <= i32::MAX`.
+pub fn max_i16_query_code(dim: usize) -> i16 {
+    let limit = i32::MAX as usize / (I8_MAX_CODE as usize * dim.max(1));
+    limit.min(i16::MAX as usize) as i16
+}
+
+/// `sum(q_i * codes_i)` in integers: the dot product of a quantized query
+/// with a quantized vector, exactly (multiply by both scales for the
+/// estimate). Integer addition is associative, so unlike [`dot_i8`] the
+/// compiler is free to widen and unroll this as far as the target allows.
+/// The caller keeps `|q_i| <= max_i16_query_code(dim)` so the sum fits.
+pub fn dot_i16_i8(q: &[i16], codes: &[i8]) -> i32 {
+    debug_assert_eq!(q.len(), codes.len(), "dot_i16_i8: dimension mismatch");
+    q.iter()
+        .zip(codes)
+        .map(|(&x, &c)| i32::from(x) * i32::from(c))
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,6 +146,47 @@ mod tests {
             // ... and is close to the exact similarity.
             assert!((dot(&q, &v) - got).abs() < 0.02, "dim {dim}");
         }
+    }
+
+    #[test]
+    fn dot_i16_i8_is_the_integer_dot_product_and_cannot_overflow() {
+        for dim in [1usize, 7, 16, 17, 384, 1024, 4096, 70_000] {
+            let max_code = max_i16_query_code(dim);
+            assert!(max_code >= 1);
+            assert!(i64::from(max_code) * 127 * dim as i64 <= i64::from(i32::MAX));
+            // The extreme: every product at its largest.
+            let q = vec![max_code; dim];
+            let c = vec![127i8; dim];
+            assert_eq!(
+                i64::from(dot_i16_i8(&q, &c)),
+                i64::from(max_code) * 127 * dim as i64
+            );
+            let c = vec![-127i8; dim];
+            assert_eq!(
+                i64::from(dot_i16_i8(&q, &c)),
+                -i64::from(max_code) * 127 * dim as i64
+            );
+            // And against the plain f32 route.
+            let v = unit(3, dim);
+            let x = unit(4, dim);
+            let (qc, qs) = quantize_i16(&v, max_code);
+            let mut codes = Vec::new();
+            let scale = quantize_i8(&x, &mut codes);
+            let wide: i64 = qc
+                .iter()
+                .zip(&codes)
+                .map(|(&a, &b)| i64::from(a) * i64::from(b))
+                .sum();
+            assert_eq!(i64::from(dot_i16_i8(&qc, &codes)), wide);
+            assert!(qc.iter().all(|c| c.abs() <= max_code));
+            if dim <= 4096 {
+                let estimate = dot_i16_i8(&qc, &codes) as f32 * qs * scale;
+                assert!((estimate - dot(&v, &x)).abs() < 0.03, "dim {dim}");
+            }
+        }
+        assert_eq!(quantize_i16(&[0.0; 3], 100), (vec![0; 3], 0.0));
+        assert_eq!(quantize_i16(&[1.0, f32::NAN], 100), (vec![0; 2], 0.0));
+        assert_eq!(quantize_i16(&[0.5, -1.0], 100), (vec![50, -100], 0.01));
     }
 
     #[test]
