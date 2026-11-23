@@ -1276,9 +1276,16 @@ fn retry_after(response: String, secs: u64) -> String {
 /// on the footer anyway.
 #[cfg(feature = "s3")]
 fn filter_index_complete(seg_dir: &Path) -> bool {
-    match SegmentReader::read_footer(seg_dir) {
-        Ok(footer) => kosha_segment::filter_columns::filter_files_present(seg_dir, &footer),
-        Err(_) => seg_dir.join(kosha_core::FILTERS_BIN_FILE).is_file(),
+    filter_index_complete_for(seg_dir, SegmentReader::read_footer(seg_dir).ok().as_ref())
+}
+
+/// [`filter_index_complete`] with the local footer already parsed (`None`:
+/// unreadable).
+#[cfg(feature = "s3")]
+fn filter_index_complete_for(seg_dir: &Path, footer: Option<&kosha_core::Footer>) -> bool {
+    match footer {
+        Some(footer) => kosha_segment::filter_columns::filter_files_present(seg_dir, footer),
+        None => seg_dir.join(kosha_core::FILTERS_BIN_FILE).is_file(),
     }
 }
 
@@ -3432,12 +3439,41 @@ impl AppState {
     #[cfg(feature = "s3")]
     const REQUIRED_SEGMENT_FILES: [&'static str; 3] = segment_commit::REQUIRED_SEGMENT_FILES;
 
+    /// What of a segment is on local disk, for a full-segment caller
+    /// (`ensure_segments_local`): `None` when a core file
+    /// (`REQUIRED_SEGMENT_FILES`, the filter index) is missing, otherwise
+    /// whether every vector file its footer lists is local too
+    /// ([`kosha_segment::vector_files_present`]). One footer parse serves
+    /// both answers.
     #[cfg(feature = "s3")]
-    fn segment_is_complete(seg_path: &Path) -> bool {
-        Self::REQUIRED_SEGMENT_FILES
+    fn segment_local_files(seg_path: &Path) -> Option<bool> {
+        if !Self::REQUIRED_SEGMENT_FILES
             .iter()
             .all(|f| seg_path.join(f).is_file())
-            && filter_index_complete(seg_path)
+        {
+            return None;
+        }
+        let footer = SegmentReader::read_footer(seg_path).ok();
+        if !filter_index_complete_for(seg_path, footer.as_ref()) {
+            return None;
+        }
+        Some(
+            footer
+                .as_ref()
+                .is_none_or(|f| kosha_segment::vector_files_present(seg_path, f)),
+        )
+    }
+
+    /// Whether a segment is local in full for a caller that does
+    /// (`needs_vectors`) or does not need its vectors. Without the
+    /// `needs_vectors` half, a segment a lexical caller hydrated (no vector
+    /// index) passed as complete for a caller that needs vectors, which then
+    /// never fetched them: every merge re-clustered those inputs' vectors
+    /// from scratch instead of reusing their postings, until the local copy
+    /// was evicted (finding 29).
+    #[cfg(feature = "s3")]
+    fn segment_is_complete(seg_path: &Path, needs_vectors: bool) -> bool {
+        Self::segment_local_files(seg_path).is_some_and(|vectors| vectors || !needs_vectors)
     }
 
     /// Ensure every listed segment directory is available locally, fanning
@@ -3481,6 +3517,9 @@ impl AppState {
     /// guaranteed never to open. Pass `true` from any caller that must
     /// preserve a segment's full fidelity (index/replace/compact/admin
     /// rewrite paths); the search path passes `query.knn.is_some()`.
+    /// It also decides which local copies count as already complete
+    /// ([`AppState::segment_is_complete`]): one hydrated without vectors is
+    /// re-fetched for a caller that needs them.
     #[cfg(feature = "s3")]
     fn ensure_segments_local(
         &self,
@@ -3502,7 +3541,7 @@ impl AppState {
             &self.in_flight_segments,
             seg_paths,
             HYDRATE_OWNER_SEGMENTS,
-            Self::segment_is_complete,
+            |p| Self::segment_is_complete(p, needs_vectors),
         );
 
         if !owned.is_empty() {
@@ -3597,12 +3636,36 @@ impl AppState {
 
         wait_for(&waiting);
 
-        outcome.missing = seg_paths
-            .iter()
-            .filter(|p| !Self::segment_is_complete(p))
-            .filter_map(|p| p.strip_prefix(&self.data_dir).ok())
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
+        // `missing` is what no caller can read past: a core file. A segment
+        // whose vector files still are not local after a fetch that asked
+        // for them (S3 lacks them, or this call waited behind a lexical
+        // owner) is logged rather than failed: none of these callers reads
+        // the vector index — writes and merges take vectors from the doc
+        // store / `doc_vectors.bin`, and a merge whose `doc_vectors.bin`
+        // is missing fails when it reads it — so failing them here would
+        // turn a slower merge into a write outage. A later call fetches it.
+        let rel = |p: &PathBuf| {
+            p.strip_prefix(&self.data_dir)
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        };
+        let mut without_vectors = Vec::new();
+        for path in seg_paths {
+            match Self::segment_local_files(path) {
+                None => outcome.missing.extend(rel(path)),
+                Some(false) if needs_vectors => without_vectors.extend(rel(path)),
+                Some(_) => {}
+            }
+        }
+        if !without_vectors.is_empty() {
+            eprintln!(
+                "WARN: {} segment(s) hydrated for a caller that needs vectors still lack \
+                 vector files their footer lists: {}{}",
+                without_vectors.len(),
+                without_vectors.join(", "),
+                request_id()
+            );
+        }
         outcome
     }
 
@@ -16077,7 +16140,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         assert!(
-            !AppState::segment_is_complete(&dir),
+            !AppState::segment_is_complete(&dir, false),
             "empty dir must not count as complete"
         );
 
@@ -16085,16 +16148,64 @@ mod tests {
             fs::write(dir.join(f), b"x").unwrap();
         }
         assert!(
-            !AppState::segment_is_complete(&dir),
+            !AppState::segment_is_complete(&dir, false),
             "missing filters.bin must still be incomplete"
         );
 
         fs::write(dir.join("filters.bin"), b"x").unwrap();
         assert!(
-            AppState::segment_is_complete(&dir),
+            AppState::segment_is_complete(&dir, false),
             "all four core files present (vector.idx not required) must be complete"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Finding 29: a caller that needs vectors does not count a segment as
+    /// complete until every vector file its footer lists is local — each
+    /// column's idx and offsets file and `doc_vectors.bin` — while a
+    /// lexical caller still does without them.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn segment_is_complete_requires_vector_files_only_when_vectors_are_needed() {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-segment-complete-vectors-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut w =
+            kosha_segment::SegmentWriter::new(kosha_core::SegmentId("v".into()), dir.clone());
+        for i in 0..4 {
+            w.add_document(
+                DocumentId(format!("d{i}")),
+                vec![
+                    Field::text("text", "x"),
+                    Field::vector("title_emb", vec![1.0, i as f32]),
+                    Field::vector("body_emb", vec![1.0, 0.0, i as f32]),
+                ],
+            );
+        }
+        let footer = w.finalize(Default::default()).unwrap();
+        assert!(footer.doc_vectors);
+        let mut vector_files = kosha_segment::vector_index_files(&dir);
+        assert_eq!(vector_files.len(), 4, "two columns, idx + offsets each");
+        vector_files.push(kosha_segment::DOC_VECTORS_FILE.to_string());
+        assert!(AppState::segment_is_complete(&dir, false));
+        assert!(AppState::segment_is_complete(&dir, true));
+
+        for name in &vector_files {
+            let stash = dir.join("stash");
+            fs::rename(dir.join(name), &stash).unwrap();
+            assert!(
+                AppState::segment_is_complete(&dir, false),
+                "{name}: a lexical caller does not need it"
+            );
+            assert!(
+                !AppState::segment_is_complete(&dir, true),
+                "{name}: a caller that needs vectors must fetch it"
+            );
+            fs::rename(&stash, dir.join(name)).unwrap();
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -16120,18 +16231,18 @@ mod tests {
         );
         let footer = w.finalize(kosha_core::Bm25Params::default()).unwrap();
         assert!(!dir.join("filters.bin").exists());
-        assert!(AppState::segment_is_complete(&dir));
+        assert!(AppState::segment_is_complete(&dir, false));
         let col = footer.filter_columns.as_ref().unwrap()[1].file_name();
         let stash = dir.join("col.stash");
         fs::rename(dir.join(&col), &stash).unwrap();
         assert!(
-            !AppState::segment_is_complete(&dir),
+            !AppState::segment_is_complete(&dir, false),
             "a missing column makes a columnar segment incomplete"
         );
         fs::rename(&stash, dir.join(&col)).unwrap();
         fs::remove_file(dir.join("filters.toc")).unwrap();
         assert!(
-            !AppState::segment_is_complete(&dir),
+            !AppState::segment_is_complete(&dir, false),
             "so does a missing TOC"
         );
         let _ = fs::remove_dir_all(&dir);

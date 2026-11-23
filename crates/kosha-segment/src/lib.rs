@@ -2053,6 +2053,26 @@ pub fn vector_index_files(segment_dir: &Path) -> Vec<String> {
     }
 }
 
+/// Whether every vector file `footer` says the segment has is local: each
+/// column's idx file, its offsets sidecar where the writer emitted one,
+/// and `doc_vectors.bin` when vectors are stored there (#243). For callers
+/// that need a segment's vectors in full (merges, rewrites), as
+/// [`filter_columns::filter_files_present`] is for its filter index.
+///
+/// A legacy footer (no `vector_fields`) cannot say whether the segment has
+/// a vector index, so only its `doc_vectors.bin` is checked: requiring
+/// `vector.idx` there would make every vectorless legacy segment
+/// permanently incomplete.
+pub fn vector_files_present(segment_dir: &Path, footer: &Footer) -> bool {
+    let present = |name: &str| segment_dir.join(name).is_file();
+    footer
+        .vector_fields
+        .iter()
+        .flatten()
+        .all(|meta| present(&meta.idx_file()) && (!meta.offsets || present(&meta.offsets_file())))
+        && (!footer.doc_vectors || present(DOC_VECTORS_FILE))
+}
+
 /// Parses a v2 `vector.idx`'s header only — `(dim, total_count, version)`.
 /// `None` for anything that isn't a valid, recognized-version v2 header
 /// (legacy file, truncated, corrupt, unknown version) — callers fall back
