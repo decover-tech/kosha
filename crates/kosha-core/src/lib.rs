@@ -1873,12 +1873,28 @@ fn atomic_write(path: &std::path::Path, data: &[u8]) -> Result<(), KoshaError> {
     Ok(())
 }
 
+/// [`std::fs::create_dir_all`] whose error names the directory. A bare
+/// `io::Error` says only "Permission denied", and a write after an ignored
+/// failure reports NotFound on a file instead of the real cause.
+pub fn create_dir_named(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir).map_err(|e| dir_error(dir, e))
+}
+
+/// `e`, a failure to create `dir`, with `dir` in its message.
+pub fn dir_error(dir: &std::path::Path, e: std::io::Error) -> std::io::Error {
+    std::io::Error::new(e.kind(), format!("cannot create {}: {e}", dir.display()))
+}
+
 impl StorageBackend for LocalStorage {
     fn read(&self, path: &str) -> Result<Vec<u8>, KoshaError> {
         Ok(std::fs::read(self.root.join(path))?)
     }
     fn write(&self, path: &str, data: &[u8]) -> Result<(), KoshaError> {
-        atomic_write(&self.root.join(path), data)
+        let full = self.root.join(path);
+        if let Some(dir) = full.parent() {
+            create_dir_named(dir)?;
+        }
+        atomic_write(&full, data)
     }
     fn exists(&self, path: &str) -> bool {
         self.root.join(path).exists()
@@ -4937,6 +4953,18 @@ mod tests {
             },
         };
         assert!(!segment_may_match(&must, Some(&blooms)));
+    }
+
+    /// A key under a directory that does not exist yet (`_warmset/query.json`
+    /// on a fresh query pod) is written, not refused with NotFound.
+    #[test]
+    fn local_storage_write_creates_missing_parent_directories() {
+        let dir = std::env::temp_dir().join("kosha-core-test-write-creates-parent");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = LocalStorage::new(dir.clone());
+        storage.write("_warmset/query.json", b"{}").unwrap();
+        assert_eq!(storage.read("_warmset/query.json").unwrap(), b"{}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Regression test for the staging incident this generalizes PR #45's

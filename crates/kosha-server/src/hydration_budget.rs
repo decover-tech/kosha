@@ -329,6 +329,9 @@ pub struct RequestHydration {
     /// Ceiling in bytes; `u64::MAX` disables shedding.
     ceiling: u64,
     shed: AtomicBool,
+    /// Shed because a fetch waited out the pod's in-flight budget, rather
+    /// than because the request went over its own ceiling.
+    shed_waiting: AtomicBool,
     wait_micros: AtomicU64,
 }
 
@@ -338,6 +341,7 @@ impl RequestHydration {
             fetched_bytes: AtomicU64::new(0),
             ceiling,
             shed: AtomicBool::new(false),
+            shed_waiting: AtomicBool::new(false),
             wait_micros: AtomicU64::new(0),
         }
     }
@@ -391,7 +395,30 @@ impl RequestHydration {
         if self.ceiling == u64::MAX {
             return;
         }
-        self.shed.store(true, Ordering::Relaxed);
+        // A request already shed keeps its first cause for the log line.
+        if !self.shed.swap(true, Ordering::Relaxed) {
+            self.shed_waiting.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Why the request was shed, for its log line.
+    pub fn shed_reason(&self) -> String {
+        let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+        if self.shed_waiting.load(Ordering::Relaxed) {
+            format!(
+                "a fetch timed out waiting for in-flight budget: the pod's \
+                 (KOSHA_HYDRATE_BYTE_BUDGET) or its tenant's \
+                 (KOSHA_HYDRATE_TENANT_MAX_INFLIGHT_BYTES), waited_ms={:.0} fetched_mb={:.1}",
+                self.wait_ms(),
+                mb(self.fetched_bytes())
+            )
+        } else {
+            format!(
+                "over the request ceiling (KOSHA_HYDRATE_REQUEST_MAX_BYTES) fetched_mb={:.1} ceiling_mb={:.1}",
+                mb(self.fetched_bytes()),
+                mb(self.ceiling)
+            )
+        }
     }
 
     pub fn is_shed(&self) -> bool {
@@ -699,5 +726,27 @@ mod tests {
         req.mark_shed();
         assert!(!req.is_shed());
         assert!(req.charge(1));
+    }
+
+    /// The log line names the cause that shed the request first: a budget
+    /// wait timing out after the ceiling already shed it is still a ceiling
+    /// shed, and a wait names both limits it can time out on.
+    #[test]
+    fn shed_reason_keeps_the_first_cause() {
+        let over = RequestHydration::new(1_000);
+        assert!(!over.charge(2_000));
+        over.mark_shed();
+        assert!(over
+            .shed_reason()
+            .contains("KOSHA_HYDRATE_REQUEST_MAX_BYTES"));
+
+        let waited = RequestHydration::new(1_000);
+        waited.mark_shed();
+        let reason = waited.shed_reason();
+        assert!(reason.contains("KOSHA_HYDRATE_BYTE_BUDGET"), "{reason}");
+        assert!(
+            reason.contains("KOSHA_HYDRATE_TENANT_MAX_INFLIGHT_BYTES"),
+            "{reason}"
+        );
     }
 }

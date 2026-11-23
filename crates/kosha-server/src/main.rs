@@ -622,6 +622,9 @@ struct HydrationOutcome {
     /// broken when the server merely declined to pull multiple GB inside
     /// one request.
     shed: bool,
+    /// Why `shed` is set, for the 429's log line.
+    #[cfg(feature = "s3")]
+    shed_reason: Option<String>,
     /// Bytes the page's documents pulled from S3 after scoring (#245):
     /// ranged spans or whole files. Filled in after the search runs.
     page: doc_spans::PageFetchStats,
@@ -636,6 +639,17 @@ struct HydrationOutcome {
     /// (#245). Segments fetch concurrently, so `rounds` is the most any one
     /// segment needed. Filled in after the search runs.
     vectors: posting_spans::PostingFetchStats,
+}
+
+#[cfg(feature = "s3")]
+impl HydrationOutcome {
+    /// Mark the outcome shed (never unmark) if `request` was, with why.
+    fn set_shed(&mut self, request: &RequestHydration) {
+        if request.is_shed() {
+            self.shed = true;
+            self.shed_reason = Some(request.shed_reason());
+        }
+    }
 }
 
 impl HydrationOutcome {
@@ -1247,7 +1261,9 @@ impl AppState {
                 .unwrap_or_else(|e| fatal(&e))
                 .role
         });
-        std::fs::create_dir_all(&data_dir).ok();
+        // Every segment, the WAL and the disk cache live here: a pod that
+        // cannot create it must not start and serve 503s.
+        kosha_core::create_dir_named(&data_dir).unwrap_or_else(|e| fatal(&e.to_string()));
         // Before the disk cache scans `data_dir`: transient tail segments of
         // an earlier process are never reused (#255).
         unindexed::remove_stale_tail_segments(&data_dir);
@@ -3368,11 +3384,11 @@ impl AppState {
             // already decided not to serve.
             if request.is_shed() {
                 println!(
-                    "hydrate_files shed: stopped at chunk {}/{} after {:.1}MB \
-                     (KOSHA_HYDRATE_REQUEST_MAX_BYTES)",
+                    "hydrate_files shed: stopped at chunk {}/{}: {}{}",
                     chunk_idx + 1,
                     total_chunks,
-                    request.fetched_bytes() as f64 / (1024.0 * 1024.0),
+                    request.shed_reason(),
+                    request_id()
                 );
                 break;
             }
@@ -4206,7 +4222,7 @@ impl AppState {
         // aren't local), but the caller must not report it as a hydration
         // *failure* — nothing failed, the request declined to pull that
         // much. See `HydrationOutcome::shed`.
-        outcome.shed = request.is_shed();
+        outcome.set_shed(request);
         outcome
     }
 
@@ -4924,7 +4940,7 @@ impl AppState {
         self.posting_reads.record(&stats);
         outcome.rounds = stats.rounds;
         outcome.postings = stats;
-        outcome.shed |= request.is_shed();
+        outcome.set_shed(request);
         outcome
     }
 
@@ -5203,7 +5219,7 @@ impl AppState {
         // Set here as well as in `hydrate_segments_for_search`: on a warm
         // namespace the cached hydration verdict routes a query straight to
         // this function, and its outcome is the only one the handler sees.
-        outcome.shed = request.is_shed();
+        outcome.set_shed(request);
         outcome
     }
 
@@ -8600,6 +8616,17 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
             );
             state.record_search_access(&ns, manifest, search_query, &phases, &hydration);
             state.record_cache_reads(&ns, manifest, search_query, &phases, cache_read_at);
+            #[cfg(feature = "s3")]
+            let shed = hydration_request
+                .is_shed()
+                .then(|| hydration_request.shed_reason());
+            #[cfg(not(feature = "s3"))]
+            let shed = None;
+            if let Some(response) =
+                knn_shed_response(result.knn_degraded_segments.unwrap_or(0), shed)
+            {
+                return response;
+            }
             // Before a rerank replaces `result`.
             let knn_degraded = result.knn_degraded_segments.unwrap_or(0);
             if let Some(ref provider) = reranker {
@@ -9190,6 +9217,17 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
             );
             state.record_search_access(&ns, manifest, &query, &phases, &hydration);
             state.record_cache_reads(&ns, manifest, &query, &phases, cache_read_at);
+            #[cfg(feature = "s3")]
+            let shed = hydration_request
+                .is_shed()
+                .then(|| hydration_request.shed_reason());
+            #[cfg(not(feature = "s3"))]
+            let shed = None;
+            if let Some(response) =
+                knn_shed_response(result.knn_degraded_segments.unwrap_or(0), shed)
+            {
+                return response;
+            }
             json_ok(&result)
         }
         Err(e) => {
@@ -10963,6 +11001,11 @@ fn posting_blob_files_for_query<'a>(
 #[cfg(feature = "s3")]
 fn hydration_error_response(outcome: &HydrationOutcome) -> Option<String> {
     if outcome.shed {
+        eprintln!(
+            "WARN: search shed: {}{}",
+            outcome.shed_reason.as_deref().unwrap_or("-"),
+            request_id()
+        );
         return Some(hydration_shed_response());
     }
     if !outcome.missing.is_empty() {
@@ -10979,13 +11022,26 @@ fn hydration_error_response(outcome: &HydrationOutcome) -> Option<String> {
 /// its ceiling *after* scoring — at which point the missing doc store
 /// surfaces as an IO error. Reporting that as a 500 would call a deliberate
 /// admission decision a server bug.
-#[cfg(feature = "s3")]
 fn hydration_shed_response() -> String {
     overload_shed_response(
         "search_hydration_limit",
         "search overloaded: this query needs more segment data than one request \
          may hydrate — the namespace is still warming, retry with backoff",
     )
+}
+
+/// A kNN answer that skipped segments because the request was shed (its
+/// vector postings were never fetched) is a 429, like any other shed: a 200
+/// would serve the partial page as complete, and neither the backend nor the
+/// Python client reads `knn_degraded_segments`. Other skips (a segment of
+/// another embedding model) stay a 200 that reports them.
+fn knn_shed_response(degraded: u32, shed: Option<String>) -> Option<String> {
+    let reason = shed.filter(|_| degraded > 0)?;
+    eprintln!(
+        "WARN: search shed: kNN skipped {degraded} segment(s): {reason}{}",
+        request_id()
+    );
+    Some(hydration_shed_response())
 }
 
 /// Error message for a search that can't proceed because hydrating one or
@@ -15897,6 +15953,16 @@ mod tests {
             hydration_error_response(&HydrationOutcome::default()).is_none(),
             "a clean hydration proceeds"
         );
+    }
+
+    /// A kNN page that skipped a segment because the request was shed is a
+    /// 429; a skip without a shed stays a 200.
+    #[test]
+    fn knn_answer_skipping_a_segment_after_a_shed_is_a_429() {
+        assert!(knn_shed_response(0, Some("x".into())).is_none());
+        assert!(knn_shed_response(2, None).is_none());
+        let shed = knn_shed_response(1, Some("waited".into())).unwrap();
+        assert!(shed.starts_with("HTTP/1.1 429"), "{shed}");
     }
 
     #[cfg(feature = "s3")]

@@ -543,7 +543,9 @@ pub struct Indexer {
 impl Indexer {
     pub fn new(data_dir: PathBuf) -> Self {
         let wal_dir = data_dir.join("_wal");
-        std::fs::create_dir_all(&wal_dir).ok();
+        // No WAL dir = every acknowledged write would fail; stop here, like
+        // the failed recovery below, instead of at the first append.
+        kosha_core::create_dir_named(&wal_dir).unwrap_or_else(|e| panic!("WAL: {e}"));
         let (wal, records) = crate::wal::WalWriter::open(
             Arc::new(crate::wal::LocalWalStore::new(wal_dir)),
             crate::wal::GroupCommitConfig::from_env(),
