@@ -287,13 +287,17 @@ Everything is JSON; errors are `{"error": "..."}`. Every request that is not a
 | `GET /v1/console/orgs/{org}/namespaces` | | any member: every tenant's namespaces with `documents`, `segments`, `stored_bytes` |
 | `GET /v1/console/orgs/{org}/usage?tenant=&from=&to=` | | any member (the `GET /v1/usage` answer for that tenant) |
 | `GET /v1/console/orgs/{org}/billing?tenant=` | | any member (the `GET /v1/billing` answer, plus `actions`, see below) |
+| `POST /v1/console/orgs/{org}/billing/checkout`, `.../billing/portal` | `{tenant}` → `{id, url}` | admin, owner: a Stripe Checkout page (card on file, move to the catalog's `upgrade_plan`) or the customer portal for one of the organization's tenants; the browser is sent to `url` |
 | `GET /v1/console/orgs/{org}/audit-log?limit=&before=` | | admin, owner |
 | `GET`, `POST`, `DELETE /v1/console/orgs/{org}/sso` | `{issuer, client_id, client_secret?, allowed_domains?, sso_required?}` | admin, owner (requiring SSO, or removing a required one: owner) |
 
-Billing: `actions` is `null` until online payment exists; the plan page shows a
-placeholder. The hook for Stripe Checkout and the customer portal (#349) is
-`console::billing_actions` / `billing_actions_available` in
-`crates/kosha-server/src/console.rs`.
+Billing: `actions` is `{"checkout": true, "portal": true}` when self-service
+billing is on (a payment provider and `KOSHA_BILLING_RETURN_URL`; point that
+at `https://<console>/console` so users land back in the console), else
+`null` and the plan page says to contact support. No provider session is
+created by the `GET`; only the `POST`s above create one, after the role
+check. Dunning notices (#349) are also emailed, through the console's
+mailer, to the owners and admins of the tenant's organization.
 
 ### Security model
 

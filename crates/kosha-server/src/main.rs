@@ -6745,6 +6745,7 @@ fn main() {
     state.spawn_deletion_purge(deletion_purge_settings);
     state.spawn_usage_flusher();
     state.spawn_usage_snapshotter();
+    state.attach_billing_email();
     state.spawn_billing_refresher();
     state.spawn_billing_scheduler();
     let listener = TcpListener::bind(&addr).expect("failed to bind HTTP listener");

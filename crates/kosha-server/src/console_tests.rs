@@ -1244,3 +1244,231 @@ fn organization_sso_is_scoped_to_its_organization() {
     assert!(actions.contains(&"sso.configured"), "{actions:?}");
     assert!(!log.to_string().contains("acme-secret"));
 }
+
+// ── Billing (#349 wired into the console) ───────────────────────────────────
+
+/// A catalog with a self-service upgrade plan.
+const BILLING_CATALOG: &str = r#"{
+  "default_plan": "free",
+  "upgrade_plan": "payg",
+  "plans": {
+    "free": {"kind": "free", "meters": {"queries": {"included": 1000}}},
+    "payg": {"kind": "usage", "base_fee_cents": 2500,
+             "meters": {"queries": {"unit": 1000000, "unit_price_cents": 400}}}
+  }
+}"#;
+
+/// Collects the notices the inner notifier took.
+#[derive(Default)]
+struct Notices(std::sync::Mutex<Vec<kosha_control::dunning::Notice>>);
+
+impl kosha_control::dunning::Notifier for Notices {
+    fn name(&self) -> &str {
+        "notices"
+    }
+    fn notify(
+        &self,
+        notice: &kosha_control::dunning::Notice,
+    ) -> Result<(), kosha_core::KoshaError> {
+        self.0.lock().unwrap().push(notice.clone());
+        Ok(())
+    }
+}
+
+fn billing_server() -> Server {
+    let mut server = Server::new();
+    let billing = crate::billing::Billing::new(
+        kosha_control::billing::Catalog::parse(BILLING_CATALOG).unwrap(),
+        Arc::new(kosha_control::billing::MemoryBillingStore::new()),
+        Arc::new(kosha_control::usage::MemoryUsageStore::new()),
+        Some(Arc::new(kosha_control::billing::FakeBillingProvider::new())),
+        Arc::new(|| 1_900_000_000_000),
+    )
+    .with_return_url(&format!("{PUBLIC}/console"));
+    server.state.billing = Some(Arc::new(billing));
+    server
+}
+
+/// Owners and admins can open Checkout and the portal for their own
+/// organization's tenants from the console; read-only members cannot, and
+/// no one can for a tenant of another organization.
+#[test]
+fn the_console_starts_checkout_and_portal_for_managers_only() {
+    let server = billing_server();
+    let mut ada = server.browser();
+    ada.join("ada@example.com");
+    let config = ada.ok("GET", "/v1/console/config", Value::Null);
+    assert_eq!(config["billing_actions"], true, "{config}");
+    let org = ada.ok(
+        "POST",
+        "/v1/console/orgs",
+        json!({ "slug": "acme", "name": "Acme" }),
+    );
+    let base = format!("/v1/console/orgs/{}", org["id"].as_str().unwrap());
+    let tenant = ada.ok("POST", &format!("{base}/tenants"), Value::Null);
+    let tenant = tenant["tenant_id"].as_str().unwrap().to_string();
+
+    let billing = ada.ok(
+        "GET",
+        &format!("{base}/billing?tenant={tenant}"),
+        Value::Null,
+    );
+    assert_eq!(
+        billing["actions"],
+        json!({ "checkout": true, "portal": true })
+    );
+
+    // Before a checkout there is no customer, so no portal.
+    let (status, _) = ada.call(
+        "POST",
+        &format!("{base}/billing/portal"),
+        json!({ "tenant": tenant }),
+    );
+    assert_eq!(status, 409);
+    let session = ada.ok(
+        "POST",
+        &format!("{base}/billing/checkout"),
+        json!({ "tenant": tenant }),
+    );
+    assert!(
+        session["url"].as_str().is_some_and(|u| !u.is_empty()),
+        "{session}"
+    );
+    ada.ok(
+        "POST",
+        &format!("{base}/billing/portal"),
+        json!({ "tenant": tenant }),
+    );
+
+    // A read-only member may look but not pay.
+    let mut ro = server.browser();
+    ro.join("ro@example.com");
+    ada.ok(
+        "POST",
+        &format!("{base}/invites"),
+        json!({ "email": "ro@example.com", "role": "read-only" }),
+    );
+    let invite = server.token_from_mail("ro@example.com", "invite");
+    ro.ok(
+        "POST",
+        "/v1/console/invites/accept",
+        json!({ "token": invite }),
+    );
+    ro.ok(
+        "GET",
+        &format!("{base}/billing?tenant={tenant}"),
+        Value::Null,
+    );
+    for action in ["checkout", "portal"] {
+        let (status, body) = ro.call(
+            "POST",
+            &format!("{base}/billing/{action}"),
+            json!({ "tenant": tenant }),
+        );
+        assert_eq!(status, 403, "{action}: {body}");
+    }
+
+    // Another organization's tenant is not reachable through this one.
+    let mut eve = server.browser();
+    eve.join("eve@example.com");
+    let other = eve.ok(
+        "POST",
+        "/v1/console/orgs",
+        json!({ "slug": "evil", "name": "Evil" }),
+    );
+    let other_base = format!("/v1/console/orgs/{}", other["id"].as_str().unwrap());
+    let (status, _) = eve.call(
+        "POST",
+        &format!("{other_base}/billing/checkout"),
+        json!({ "tenant": tenant }),
+    );
+    assert_eq!(status, 404);
+}
+
+/// Without a provider and return URL the console offers no payment
+/// buttons.
+#[test]
+fn the_console_offers_no_billing_actions_without_self_service() {
+    let server = Server::new();
+    let mut ada = server.browser();
+    ada.join("ada@example.com");
+    let config = ada.ok("GET", "/v1/console/config", Value::Null);
+    assert_eq!(config["billing_actions"], false);
+}
+
+/// Dunning notices reach the organization's owners and admins by email,
+/// after the configured notifier took them; members do not get them.
+#[test]
+fn dunning_notices_are_emailed_to_owners_and_admins() {
+    let server = billing_server();
+    let mut ada = server.browser();
+    ada.join("ada@example.com");
+    let org = ada.ok(
+        "POST",
+        "/v1/console/orgs",
+        json!({ "slug": "acme", "name": "Acme" }),
+    );
+    let base = format!("/v1/console/orgs/{}", org["id"].as_str().unwrap());
+    let tenant = ada.ok("POST", &format!("{base}/tenants"), Value::Null);
+    let tenant = tenant["tenant_id"].as_str().unwrap().to_string();
+    for (email, role) in [("bob@example.com", "admin"), ("mel@example.com", "member")] {
+        let mut b = server.browser();
+        b.join(email);
+        ada.ok(
+            "POST",
+            &format!("{base}/invites"),
+            json!({ "email": email, "role": role }),
+        );
+        let invite = server.token_from_mail(email, "invite");
+        b.ok(
+            "POST",
+            "/v1/console/invites/accept",
+            json!({ "token": invite }),
+        );
+    }
+
+    let Server { state, mail } = server;
+    let state = Arc::new(state);
+    let inner = Arc::new(Notices::default());
+    let notifier = crate::billing_notify::EmailNotifier::new(inner.clone());
+    let notice = kosha_control::dunning::Notice {
+        id: "in_1/payment_failed".into(),
+        tenant: tenant.clone(),
+        kind: kosha_control::dunning::NoticeKind::PaymentFailed,
+        invoice_id: "in_1".into(),
+        period: "2030-10".into(),
+        amount_cents: 8961,
+        currency: "usd".into(),
+        due_at_ms: 0,
+        state: kosha_control::billing::AccountState::Active,
+        next_retry_at_ms: None,
+        failure_reason: Some("card_declined".into()),
+        message: "Your payment failed.".into(),
+        at_ms: 0,
+    };
+    let billing_mail = |to: &str| {
+        mail.sent()
+            .into_iter()
+            .filter(|(t, s, _)| t == to && s.starts_with("Kosha billing"))
+            .count()
+    };
+    // Not attached yet: only the inner notifier hears about it.
+    use kosha_control::dunning::Notifier;
+    notifier.notify(&notice).unwrap();
+    assert_eq!(billing_mail("ada@example.com"), 0);
+    notifier.attach(&state);
+    notifier.notify(&notice).unwrap();
+    assert_eq!(inner.0.lock().unwrap().len(), 2);
+    assert_eq!(billing_mail("ada@example.com"), 1);
+    assert_eq!(billing_mail("bob@example.com"), 1);
+    assert_eq!(billing_mail("mel@example.com"), 0);
+    let (_, _, body) = mail
+        .sent()
+        .into_iter()
+        .rfind(|(t, _, _)| t == "ada@example.com")
+        .unwrap();
+    assert!(
+        body.contains("89.61 USD") && body.contains("card_declined"),
+        "{body}"
+    );
+}

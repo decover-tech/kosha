@@ -67,6 +67,9 @@ pub enum Permission {
     ManageApiKeys,
     /// Configure the organization's single sign-on.
     ManageSso,
+    /// Start a self-service checkout or open the billing portal for one of
+    /// the organization's tenants (#349).
+    ManageBilling,
 }
 
 impl Role {
@@ -95,7 +98,8 @@ impl Role {
             | Permission::ManageMembers
             | Permission::ViewAuditLog
             | Permission::ManageApiKeys
-            | Permission::ManageSso => matches!(self, Role::Owner | Role::Admin),
+            | Permission::ManageSso
+            | Permission::ManageBilling => matches!(self, Role::Owner | Role::Admin),
         }
     }
 }
@@ -841,6 +845,22 @@ pub fn link_tenant(
     })
 }
 
+/// Check that `actor` holds `permission` in `org_id` (which must exist and
+/// not be deleted); the actor's role, `None` for the operator. For callers
+/// that act outside this module on the organization's behalf, such as the
+/// console starting a billing checkout.
+pub fn check_permission(
+    store: &dyn OrgStore,
+    actor: &Actor,
+    org_id: &str,
+    permission: Permission,
+) -> Result<Option<Role>, OrgError> {
+    run(store, |tx| {
+        require_org(tx, org_id, false)?;
+        authorize(tx, actor, org_id, permission)
+    })
+}
+
 pub fn list_tenants(
     store: &dyn OrgStore,
     actor: &Actor,
@@ -1223,18 +1243,19 @@ mod tests {
                 ViewAuditLog,
                 ManageApiKeys,
                 ManageSso,
+                ManageBilling,
             ]
             .map(|p| role.allows(p))
         };
-        assert_eq!(allowed(Role::Owner), [true; 8]);
-        assert_eq!(allowed(Role::Admin), [true; 8]);
+        assert_eq!(allowed(Role::Owner), [true; 9]);
+        assert_eq!(allowed(Role::Admin), [true; 9]);
         assert_eq!(
             allowed(Role::Member),
-            [true, true, false, false, false, false, false, false]
+            [true, true, false, false, false, false, false, false, false]
         );
         assert_eq!(
             allowed(Role::ReadOnly),
-            [true, false, false, false, false, false, false, false]
+            [true, false, false, false, false, false, false, false, false]
         );
     }
 

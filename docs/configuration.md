@@ -602,7 +602,9 @@ invoice is paid. A notice goes out once per invoice (claimed in `kosha.billing_n
 is sent, released if sending fails); a pass that finds several new stages sends only the most
 severe one. Notices go to the log, or as a JSON `POST` to `KOSHA_BILLING_NOTIFY_URL` with
 `x-kosha-notice-id` and, with `KOSHA_BILLING_NOTIFY_SECRET`, an `x-kosha-signature` in Stripe's
-scheme; any 2xx answer is delivery. `POST /v1/admin/billing/dunning` runs a pass now. The account
+scheme; any 2xx answer is delivery. With the console on (`KOSHA_CONSOLE`), each delivered notice
+is also emailed through the console's mailer to the owners and admins of the organization the
+tenant belongs to; a failed email is logged and does not hold the notice back. `POST /v1/admin/billing/dunning` runs a pass now. The account
 state itself still follows the oldest unpaid invoice's due date (below); dunning collects and
 tells, it does not change the clock.
 

@@ -1455,6 +1455,24 @@ pub fn record_tenant_event(
     })
 }
 
+/// Who hears about billing for `tenant_id` (#349 dunning notices): the
+/// email addresses of the owners and admins of the organization the tenant
+/// is linked to, owners first. Empty for a tenant no organization owns.
+pub fn billing_contacts(store: &dyn OrgStore, tenant_id: &str) -> Result<Vec<String>, OrgError> {
+    orgs::run(store, |tx| {
+        let Some(link) = tx.tenant(tenant_id)? else {
+            return Ok(Vec::new());
+        };
+        let mut members: Vec<orgs::Member> = tx
+            .members(&link.org_id)?
+            .into_iter()
+            .filter(|m| matches!(m.role, Role::Owner | Role::Admin))
+            .collect();
+        members.sort_by_key(|m| (m.role != Role::Owner, m.email.clone()));
+        Ok(members.into_iter().map(|m| m.email).collect())
+    })
+}
+
 // ── In-memory store ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]

@@ -1,7 +1,13 @@
 //! Where dunning notices go (#349): the log (the default) or an HTTP
 //! webhook (`KOSHA_BILLING_NOTIFY_URL`). Both implement
-//! `kosha_control::dunning::Notifier`; an email sender can implement the
-//! same trait and be handed to `Billing::with_notifier`.
+//! `kosha_control::dunning::Notifier`.
+//!
+//! When the self-service console is on (#345), [`EmailNotifier`] also
+//! emails each notice, through the console's mailer, to the owners and
+//! admins of the organization the tenant belongs to. The email goes out
+//! only after the log or webhook took the notice, so a notice the dunning
+//! pass offers again is not mailed twice; a failed email is logged and does
+//! not hold the notice back. A tenant no organization owns gets no email.
 //!
 //! The webhook receives each notice as a JSON `POST` (the fields of
 //! `kosha_control::dunning::Notice`) with `x-kosha-notice-id` (the notice
@@ -12,7 +18,7 @@
 //! anything else (or no answer within 10 s) leaves the notice to the next
 //! dunning pass.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use kosha_control::dunning::{LogNotifier, Notice, Notifier};
@@ -77,6 +83,85 @@ impl Notifier for HttpNotifier {
                 response.status()
             )))
         }
+    }
+}
+
+/// Hands each notice to `inner`, then emails it to the tenant's billing
+/// contacts once [`EmailNotifier::attach`] gave it the server (see the
+/// module doc).
+pub(crate) struct EmailNotifier {
+    inner: Arc<dyn Notifier>,
+    state: OnceLock<Weak<crate::AppState>>,
+}
+
+impl EmailNotifier {
+    pub(crate) fn new(inner: Arc<dyn Notifier>) -> Self {
+        Self {
+            inner,
+            state: OnceLock::new(),
+        }
+    }
+
+    /// Start emailing, with the console's mailer and organization store.
+    pub(crate) fn attach(&self, state: &Arc<crate::AppState>) {
+        let _ = self.state.set(Arc::downgrade(state));
+    }
+
+    fn email(&self, state: &crate::AppState, notice: &Notice) -> Result<usize, String> {
+        if !state.console.enabled() {
+            return Ok(0);
+        }
+        let store = state.orgs.identity_store(state.auth())?;
+        let contacts = kosha_control::identity::billing_contacts(&*store, &notice.tenant)
+            .map_err(|e| e.to_string())?;
+        let subject = format!(
+            "Kosha billing: {} ({})",
+            notice.kind.as_str().replace('_', " "),
+            notice.tenant
+        );
+        let body = email_body(notice);
+        let mut sent = 0;
+        for to in &contacts {
+            match state.console.mailer.send(to, &subject, &body) {
+                Ok(()) => sent += 1,
+                Err(e) => eprintln!("WARN: billing: notice {} to {to} failed: {e}", notice.id),
+            }
+        }
+        Ok(sent)
+    }
+}
+
+/// The plain-text email for `notice`.
+fn email_body(notice: &Notice) -> String {
+    let mut body = format!(
+        "{}\n\nTenant: {}\nInvoice: {} ({})\nAmount: {}.{:02} {}\n",
+        notice.message,
+        notice.tenant,
+        notice.invoice_id,
+        notice.period,
+        notice.amount_cents / 100,
+        notice.amount_cents % 100,
+        notice.currency.to_uppercase(),
+    );
+    if let Some(reason) = &notice.failure_reason {
+        body.push_str(&format!("Reason given by the payment provider: {reason}\n"));
+    }
+    body
+}
+
+impl Notifier for EmailNotifier {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn notify(&self, notice: &Notice) -> Result<(), KoshaError> {
+        self.inner.notify(notice)?;
+        if let Some(state) = self.state.get().and_then(Weak::upgrade) {
+            if let Err(e) = self.email(&state, notice) {
+                eprintln!("WARN: billing: notice {} not emailed: {e}", notice.id);
+            }
+        }
+        Ok(())
     }
 }
 

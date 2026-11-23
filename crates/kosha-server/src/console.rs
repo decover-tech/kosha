@@ -194,6 +194,11 @@ pub(crate) struct Console {
 }
 
 impl Console {
+    /// Whether `KOSHA_CONSOLE` turned the console (and its mailer) on.
+    pub(crate) fn enabled(&self) -> bool {
+        self.enabled
+    }
+
     pub(crate) fn disabled() -> Self {
         Self {
             enabled: false,
@@ -697,8 +702,8 @@ impl Ctx<'_> {
                 },
                 "sso": self.console.secret_key.is_some(),
                 "min_password_length": identity::MIN_PASSWORD_LEN,
-                // #349: set when Stripe Checkout / Portal routes exist.
-                "billing_actions": billing_actions_available(),
+                // #349: whether the plan page offers Checkout / Portal.
+                "billing_actions": billing_actions_available(self.state),
             }),
         )
     }
@@ -1285,6 +1290,9 @@ impl Ctx<'_> {
             ("GET", ["namespaces"]) => self.namespaces(&actor, org),
             ("GET", ["usage"]) => self.tenant_read(&actor, org, "usage"),
             ("GET", ["billing"]) => self.tenant_read(&actor, org, "billing"),
+            ("POST", ["billing", action @ ("checkout" | "portal")]) => {
+                self.billing_session(&actor, org, action)
+            }
             ("GET", ["audit-log"]) => {
                 let number = |name: &str| -> Result<Option<i64>, http::Response> {
                     self.req
@@ -1455,6 +1463,31 @@ impl Ctx<'_> {
         Ok(reply(200, json!({ "namespaces": out })))
     }
 
+    /// `POST .../billing/checkout` or `.../billing/portal` `{tenant}`: a
+    /// hosted provider page for one of the organization's tenants (#349),
+    /// for owners and admins. The provider sends the user back to
+    /// `KOSHA_BILLING_RETURN_URL`; a caller cannot choose another target.
+    fn billing_session(&self, actor: &Actor, org: &str, action: &str) -> Answer {
+        orgs::check_permission(self.store, actor, org, orgs::Permission::ManageBilling)
+            .map_err(|e| org_error(&e))?;
+        let body = self.req.json()?;
+        let tenant = required(&body, "tenant")?;
+        if !self.tenants(actor, org)?.iter().any(|t| t == tenant) {
+            return Err(error(404, "no such tenant in this organization"));
+        }
+        let Some(billing) = self.state.billing.as_deref() else {
+            return Err(error(404, "billing is off on this server"));
+        };
+        let session = match action {
+            "checkout" => crate::billing::start_checkout(billing, tenant, None, None),
+            _ => crate::billing::start_portal(billing, tenant, None),
+        };
+        match session {
+            Ok(s) => Ok(reply(200, json!({ "id": s.id, "url": s.url }))),
+            Err(e) => Err(error(e.status, &e.message)),
+        }
+    }
+
     /// `GET /v1/usage` or `GET /v1/billing` for one of the organization's
     /// tenants (`?tenant=`), answered by the existing tenant routes.
     fn tenant_read(&self, actor: &Actor, org: &str, what: &str) -> Answer {
@@ -1601,25 +1634,23 @@ fn orgs_now_ms() -> i64 {
 
 // ── Integration hooks ───────────────────────────────────────────────────────
 
-/// Whether the console can offer Checkout/Portal buttons.
-///
-/// TODO(#349, Stripe Checkout/Portal): return true once
-/// [`billing_actions`] returns links.
-pub(crate) fn billing_actions_available() -> bool {
-    false
+/// Whether the console can offer Checkout/Portal buttons: billing runs on
+/// this pod with a payment provider and `KOSHA_BILLING_RETURN_URL`.
+pub(crate) fn billing_actions_available(state: &AppState) -> bool {
+    state
+        .billing
+        .as_deref()
+        .is_some_and(crate::billing::Billing::self_service_enabled)
 }
 
-/// What the console's plan page can do for `tenant_id` of `org_id`, added
-/// as `actions` to `GET /v1/console/orgs/{org}/billing`. The UI shows a
-/// "Manage billing" placeholder while this is `None`.
-///
-/// TODO(#349, Stripe Checkout/Portal): return e.g.
-/// `{"checkout_url": ..., "portal_url": ...}` from the billing provider
-/// (and flip [`billing_actions_available`]). Only owners and admins should
-/// get a portal link; the caller has already checked the user may view the
-/// organization.
-pub(crate) fn billing_actions(_state: &AppState, _org_id: &str, _tenant_id: &str) -> Option<Value> {
-    None
+/// What the console's plan page can do for a tenant, added as `actions` to
+/// `GET /v1/console/orgs/{org}/billing`: which of
+/// `POST .../billing/checkout` and `.../billing/portal` apply. No provider
+/// session is created here (that happens only on the POST, which also
+/// checks the user may manage billing); `None` while self-service billing
+/// is off, and the UI then says to contact support.
+pub(crate) fn billing_actions(state: &AppState, _org_id: &str, _tenant_id: &str) -> Option<Value> {
+    billing_actions_available(state).then(|| json!({ "checkout": true, "portal": true }))
 }
 
 /// Record a data-plane event (a namespace deleted, a tenant deleted) in the

@@ -565,19 +565,29 @@
 
   function billingTab(ctx) {
     return tenantPicker(ctx, async (tenant, out) => {
-      // TODO(#349): Stripe Checkout / Customer Portal. When the server's
-      // billing response carries `actions` (checkout_url / portal_url),
-      // these buttons link there.
+      // #349: with self-service billing on, the server's answer carries
+      // `actions`; each button asks the server for a hosted provider page
+      // (Stripe Checkout or the customer portal) and goes there.
       const placeholder = el(
         "div",
         { class: "notice warn" },
-        "Online payment (upgrade, payment method, invoices) is coming soon. Contact support to change your plan."
+        "Online payment is not enabled on this server. Contact support to change your plan."
       );
+      const go = (action) => async (ev) => {
+        ev.target.disabled = true;
+        try {
+          const s = await api("POST", ctx.base + "/billing/" + action, { tenant });
+          window.location.assign(s.url);
+        } catch (e) {
+          ev.target.disabled = false;
+          out.prepend(notice("error", e.message));
+        }
+      };
       try {
         const b = await api("GET", ctx.base + "/billing?tenant=" + encodeURIComponent(tenant));
         const actions = el("div", { class: "row" });
-        if (b.actions && b.actions.checkout_url) actions.append(el("a", { href: b.actions.checkout_url }, el("button", { type: "button" }, "Upgrade")));
-        if (b.actions && b.actions.portal_url && ctx.manage) actions.append(el("a", { href: b.actions.portal_url }, el("button", { type: "button", class: "secondary" }, "Manage billing")));
+        if (b.actions && b.actions.checkout && ctx.manage) actions.append(el("button", { type: "button", onclick: go("checkout") }, "Upgrade / add payment method"));
+        if (b.actions && b.actions.portal && ctx.manage) actions.append(el("button", { type: "button", class: "secondary", onclick: go("portal") }, "Manage billing"));
         const summary = table(
           ["", ""],
           [

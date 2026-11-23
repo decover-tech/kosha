@@ -104,6 +104,9 @@ pub(crate) struct Billing {
     pub(crate) provider: Option<Arc<dyn BillingProvider>>,
     pub(crate) ledger: Arc<dyn BillingLedger>,
     pub(crate) notifier: Arc<dyn Notifier>,
+    /// Set by `from_env`: the notifier also emails organization owners and
+    /// admins once the server attaches itself (`attach_billing_email`).
+    email: Option<Arc<crate::billing_notify::EmailNotifier>>,
     clock: Clock,
     standings: RwLock<Arc<Standings>>,
     refresh_interval: Duration,
@@ -213,6 +216,7 @@ impl Billing {
             provider,
             ledger: Arc::new(MemoryBillingLedger::new()),
             notifier: Arc::new(LogNotifier),
+            email: None,
             clock,
             standings: RwLock::new(Arc::new(Standings::new())),
             refresh_interval: Duration::from_secs(60),
@@ -231,9 +235,19 @@ impl Billing {
         self
     }
 
-    /// Send dunning notices through `notifier`.
+    /// Send dunning notices through `notifier` (tests; `from_env` uses
+    /// `with_email_notifier`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn with_notifier(mut self, notifier: Arc<dyn Notifier>) -> Self {
         self.notifier = notifier;
+        self
+    }
+
+    /// Send dunning notices through `inner` and, once attached, by email.
+    fn with_email_notifier(mut self, inner: Arc<dyn Notifier>) -> Self {
+        let email = Arc::new(crate::billing_notify::EmailNotifier::new(inner));
+        self.notifier = email.clone();
+        self.email = Some(email);
         self
     }
 
@@ -254,6 +268,12 @@ impl Billing {
     pub(crate) fn with_return_url(mut self, return_url: &str) -> Self {
         self.return_url = Some(return_url.trim_end_matches('/').to_string());
         self
+    }
+
+    /// Whether [`start_checkout`] and [`start_portal`] can work on this pod:
+    /// a return URL and a payment provider are configured.
+    pub(crate) fn self_service_enabled(&self) -> bool {
+        self.return_url.is_some() && self.provider.is_some()
     }
 
     /// Read the catalog from `path` on reload (and watch it with `watch`).
@@ -313,7 +333,7 @@ impl Billing {
         let (store, ledger) = stores_from_env()?;
         let mut billing = Self::new(catalog, store, usage, provider, Arc::new(unix_millis))
             .with_ledger(ledger)
-            .with_notifier(crate::billing_notify::notifier_from_env()?)
+            .with_email_notifier(crate::billing_notify::notifier_from_env()?)
             .with_plans_file(
                 PathBuf::from(&path),
                 flag_on(std::env::var("KOSHA_BILLING_PLANS_WATCH").ok().as_deref()),
@@ -675,6 +695,14 @@ pub(crate) fn gate(state: &AppState, tenant: &str, request_line: &str) -> Option
 }
 
 impl AppState {
+    /// Let dunning notices be emailed to organization owners and admins
+    /// through the console's mailer (see `billing_notify`).
+    pub(crate) fn attach_billing_email(self: &Arc<Self>) {
+        if let Some(email) = self.billing.as_ref().and_then(|b| b.email.as_ref()) {
+            email.attach(self);
+        }
+    }
+
     /// Keep the standings snapshot fresh for the life of the process.
     pub(crate) fn spawn_billing_refresher(self: &Arc<Self>) {
         let Some(billing) = self.billing.clone() else {
