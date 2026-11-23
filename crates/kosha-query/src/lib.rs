@@ -3183,8 +3183,6 @@ struct KnnPlan {
     cutoff_rule: Option<KnnCutoffRule>,
     /// See [`SearchPhaseStats::knn_plan_exact_centroids`].
     exact_centroids: usize,
-    /// Bench diagnostics: see `SearchPhaseStats::knn_plan_split_ms`.
-    split: [f64; 5],
 }
 
 /// One probed segment as kNN planning sees it: the scores of its
@@ -3194,11 +3192,14 @@ trait KnnPlanSource: Sync {
     /// How many postings the segment has; every method below is about
     /// postings `0..postings()`.
     fn postings(&self) -> usize;
-    /// Every posting's rank score, in posting order.
-    fn scores(&self) -> Vec<f32>;
+    /// Every posting's rank score, in posting order; `None` when the
+    /// segment cannot be scored after all, which leaves it out of the
+    /// plan (it then ranks its own postings, as before #469).
+    fn scores(&self) -> Option<Vec<f32>>;
     /// The scores of `postings`, in the order given: the very values
-    /// [`Self::scores`] has at those positions.
-    fn scores_for(&self, postings: &[u32]) -> Vec<f32>;
+    /// [`Self::scores`] has at those positions. `None` as for
+    /// [`Self::scores`].
+    fn scores_for(&self, postings: &[u32]) -> Option<Vec<f32>>;
     /// `lower[i] <= scores()[i] <= upper[i]` for every posting, or `None`
     /// when the segment can only be scored exactly.
     fn score_bounds(&self) -> Option<kosha_segment::KnnCentroidScoreBounds>;
@@ -3218,24 +3219,113 @@ impl KnnPlanSource for ColumnPlanSource<'_> {
         self.postings
     }
 
-    fn scores(&self) -> Vec<f32> {
-        self.reader
-            .knn_centroid_distances_with_alpha(self.field, self.query, self.alpha)
-            .filter(|scores| scores.len() == self.postings)
-            // The column was just counted through the same reader, so it
-            // is there. Were it not, no posting of it may be chosen.
-            .unwrap_or_else(|| vec![f32::INFINITY; self.postings])
+    // The column was just counted through the same reader, so these
+    // only fail if it went away since (its vector field no longer loads).
+    // That segment must still be searched: it leaves the plan and ranks its
+    // own postings, rather than taking no posting at all.
+    fn scores(&self) -> Option<Vec<f32>> {
+        let scores = self
+            .reader
+            .knn_centroid_distances_with_alpha(self.field, self.query, self.alpha);
+        match scores {
+            Some(scores) if scores.len() == self.postings => Some(scores),
+            Some(scores) => {
+                self.unscorable(&format!(
+                    "{} centroid scores where the plan counted {}",
+                    scores.len(),
+                    self.postings
+                ));
+                None
+            }
+            None => {
+                self.unscorable("its centroids are unavailable");
+                None
+            }
+        }
     }
 
-    fn scores_for(&self, postings: &[u32]) -> Vec<f32> {
-        self.reader
-            .knn_centroid_scores_for(self.field, self.query, postings, self.alpha)
-            .unwrap_or_else(|| vec![f32::INFINITY; postings.len()])
+    fn scores_for(&self, postings: &[u32]) -> Option<Vec<f32>> {
+        let scores = self
+            .reader
+            .knn_centroid_scores_for(self.field, self.query, postings, self.alpha);
+        match scores {
+            Some(scores) if scores.len() == postings.len() => Some(scores),
+            _ => {
+                self.unscorable(&format!(
+                    "exact scores for {} of its postings are unavailable",
+                    postings.len()
+                ));
+                None
+            }
+        }
     }
 
     fn score_bounds(&self) -> Option<kosha_segment::KnnCentroidScoreBounds> {
         self.reader
             .knn_centroid_score_bounds(self.field, self.query, self.alpha)
+    }
+}
+
+impl ColumnPlanSource<'_> {
+    /// Logs, rate-limited, that this segment left the kNN plan and why.
+    fn unscorable(&self, reason: &str) {
+        static LIMIT: RateLimitedWarn = RateLimitedWarn::new(10);
+        LIMIT.warn(|suppressed| {
+            format!(
+                "WARN: kNN plan could not score field '{}' of {}: {reason} — the segment ranks \
+                 its own postings instead ({suppressed} similar warnings suppressed)",
+                self.field,
+                self.reader.segment_dir().display()
+            )
+        });
+    }
+}
+
+/// A warning printed at most once per `interval_secs`, for a condition
+/// that, once it holds, would otherwise print on every request. The lines
+/// held back are counted and reported with the next one printed.
+struct RateLimitedWarn {
+    interval_secs: u64,
+    /// Seconds since [`Self::epoch`] before which nothing is printed.
+    next_secs: AtomicU64,
+    suppressed: AtomicU64,
+}
+
+impl RateLimitedWarn {
+    const fn new(interval_secs: u64) -> Self {
+        Self {
+            interval_secs,
+            next_secs: AtomicU64::new(0),
+            suppressed: AtomicU64::new(0),
+        }
+    }
+
+    fn epoch() -> Instant {
+        static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        *EPOCH.get_or_init(Instant::now)
+    }
+
+    /// Prints `line(suppressed)` unless a line was printed within the
+    /// interval; returns whether it printed.
+    fn warn(&self, line: impl FnOnce(u64) -> String) -> bool {
+        let now = Self::epoch().elapsed().as_secs();
+        let next = self.next_secs.load(Ordering::Relaxed);
+        if now < next
+            || self
+                .next_secs
+                .compare_exchange(
+                    next,
+                    now + self.interval_secs,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+        {
+            self.suppressed.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        eprintln!("{}", line(self.suppressed.swap(0, Ordering::Relaxed)));
+        true
     }
 }
 
@@ -3245,13 +3335,12 @@ impl KnnPlanSource for ColumnPlanSource<'_> {
 struct KnnRankedPostings {
     cutoff: f32,
     rule: Option<KnnCutoffRule>,
-    /// One per source, in the order given.
-    rankings: Vec<kosha_segment::KnnSegmentRanking>,
+    /// One per source, in the order given; `None` for a source that could
+    /// not be scored ([`KnnPlanSource::scores`]), which took no part in
+    /// the cutoff.
+    rankings: Vec<Option<kosha_segment::KnnSegmentRanking>>,
     /// Postings that were given an exact score.
     exact_centroids: usize,
-    /// Bench diagnostics: ms in stage 1, selecting U, stage 2, and the
-    /// cutoff plus rankings.
-    split: [f64; 4],
 }
 
 /// Picks the global probe cutoff over `sources`' postings and ranks each
@@ -3303,6 +3392,12 @@ struct KnnRankedPostings {
 /// function cannot return NaN and the bounds are refused upstream when
 /// anything is not finite, but should a NaN show up anyway the plan is
 /// redone single-stage.
+///
+/// A source that cannot be scored ([`KnnPlanSource::scores`] is `None`)
+/// gets no ranking and its postings take no part in the cutoff, which is
+/// then the one the other sources alone give (the stage's argument needs
+/// every source's exact scores, so a failure there also redoes the plan
+/// single-stage).
 fn knn_rank_postings<S: KnnPlanSource>(
     sources: &[S],
     budget: usize,
@@ -3315,9 +3410,10 @@ fn knn_rank_postings<S: KnnPlanSource>(
             return ranked;
         }
     }
-    let scores: Vec<Vec<f32>> = sources.par_iter().map(|s| s.scores()).collect();
-    let mut all: Vec<f32> = scores.iter().flatten().copied().collect();
-    let (cutoff, rule) = knn_budget_cutoff_of(&mut all, total, budget, relative);
+    let scores: Vec<Option<Vec<f32>>> = sources.par_iter().map(|s| s.scores()).collect();
+    let mut all: Vec<f32> = scores.iter().flatten().flatten().copied().collect();
+    let scored = all.len();
+    let (cutoff, rule) = knn_budget_cutoff_of(&mut all, scored, budget, relative);
     // Hand every probed segment its postings inside the cutoff, ranked
     // (#436). The scores are the ones the cutoff was just picked from, so
     // the segment's ranking and the cutoff cannot drift apart, and the
@@ -3326,19 +3422,21 @@ fn knn_rank_postings<S: KnnPlanSource>(
     // all of them.
     let rankings = scores
         .into_iter()
-        .map(|scores| kosha_segment::KnnSegmentRanking::new(scores, cutoff, budget))
+        .map(|scores| {
+            scores.map(|scores| kosha_segment::KnnSegmentRanking::new(scores, cutoff, budget))
+        })
         .collect();
     KnnRankedPostings {
         cutoff,
         rule,
         rankings,
-        exact_centroids: total,
-        split: [0.0; 4],
+        exact_centroids: scored,
     }
 }
 
 /// The two-stage half of [`knn_rank_postings`], which holds the proof.
-/// Requires `total > budget >= 1`. `None` when a NaN turned up.
+/// Requires `total > budget >= 1`. `None` when a NaN turned up or a source
+/// could not be scored.
 fn knn_rank_postings_two_stage<S: KnnPlanSource>(
     sources: &[S],
     total: usize,
@@ -3350,7 +3448,6 @@ fn knn_rank_postings_two_stage<S: KnnPlanSource>(
         Exact(Vec<f32>),
         Bounds(kosha_segment::KnnCentroidScoreBounds),
     }
-    let t_s1 = Instant::now();
     let stage1: Vec<Stage1> = sources
         .par_iter()
         .map(|source| {
@@ -3359,14 +3456,12 @@ fn knn_rank_postings_two_stage<S: KnnPlanSource>(
                 .score_bounds()
                 .filter(|b| b.lower.len() == n && b.upper.len() == n)
             {
-                Some(bounds) => Stage1::Bounds(bounds),
-                None => Stage1::Exact(source.scores()),
+                Some(bounds) => Some(Stage1::Bounds(bounds)),
+                None => source.scores().map(Stage1::Exact),
             }
         })
-        .collect();
+        .collect::<Option<_>>()?;
 
-    let s1_ms = t_s1.elapsed().as_secs_f64() * 1e3;
-    let t_sel = Instant::now();
     // U: the `budget`-th smallest upper bound.
     let mut upper: Vec<f32> = Vec::with_capacity(total);
     for stage in &stage1 {
@@ -3389,8 +3484,6 @@ fn knn_rank_postings_two_stage<S: KnnPlanSource>(
         })
         .1;
     drop(upper);
-    let sel_ms = t_sel.elapsed().as_secs_f64() * 1e3;
-    let t_s2 = Instant::now();
 
     // Stage two: exact scores for the candidates only.
     enum Stage2 {
@@ -3403,7 +3496,7 @@ fn knn_rank_postings_two_stage<S: KnnPlanSource>(
         .par_iter()
         .zip(stage1)
         .map(|(source, stage)| match stage {
-            Stage1::Exact(scores) => Stage2::Exact(scores),
+            Stage1::Exact(scores) => Some(Stage2::Exact(scores)),
             Stage1::Bounds(bounds) => {
                 let mut candidates: Vec<(u32, f32)> = Vec::new();
                 let mut unresolved: Vec<u32> = Vec::new();
@@ -3418,19 +3511,21 @@ fn knn_rank_postings_two_stage<S: KnnPlanSource>(
                         }
                     }
                 }
-                let exact = source.scores_for(&unresolved);
+                let exact = if unresolved.is_empty() {
+                    Vec::new()
+                } else {
+                    source.scores_for(&unresolved)?
+                };
                 let mut exact = exact.into_iter();
                 for candidate in candidates.iter_mut().filter(|c| c.1.is_nan()) {
                     // A short answer leaves the NaN, caught below.
                     candidate.1 = exact.next().unwrap_or(f32::NAN);
                 }
-                Stage2::Candidates(candidates, unresolved.len())
+                Some(Stage2::Candidates(candidates, unresolved.len()))
             }
         })
-        .collect();
+        .collect::<Option<_>>()?;
 
-    let s2_ms = t_s2.elapsed().as_secs_f64() * 1e3;
-    let t_rank = Instant::now();
     let mut all: Vec<f32> = Vec::new();
     let mut exact_centroids = 0usize;
     for stage in &stage2 {
@@ -3452,21 +3547,26 @@ fn knn_rank_postings_two_stage<S: KnnPlanSource>(
     let rankings = sources
         .par_iter()
         .zip(stage2)
-        .map(|(source, stage)| match stage {
-            Stage2::Exact(scores) => kosha_segment::KnnSegmentRanking::new(scores, cutoff, budget),
-            Stage2::Candidates(candidates, _) => kosha_segment::KnnSegmentRanking::from_candidates(
-                source.postings(),
-                &candidates,
-                cutoff,
-                budget,
-            ),
+        .map(|(source, stage)| {
+            Some(match stage {
+                Stage2::Exact(scores) => {
+                    kosha_segment::KnnSegmentRanking::new(scores, cutoff, budget)
+                }
+                Stage2::Candidates(candidates, _) => {
+                    kosha_segment::KnnSegmentRanking::from_candidates(
+                        source.postings(),
+                        &candidates,
+                        cutoff,
+                        budget,
+                    )
+                }
+            })
         })
         .collect();
     Some(KnnRankedPostings {
         cutoff,
         rule,
         rankings,
-        split: [s1_ms, sel_ms, s2_ms, t_rank.elapsed().as_secs_f64() * 1e3],
         exact_centroids,
     })
 }
@@ -3566,9 +3666,6 @@ pub struct SearchPhaseStats {
     /// is every centroid of the segments the budget is shared between.
     /// Zero for non-kNN queries and on the per-segment fallback.
     pub knn_plan_exact_centroids: usize,
-    /// Bench diagnostics: ms of the plan spent before ranking (segment
-    /// opens, counts), in stage 1, selecting U, stage 2, cutoff + rankings.
-    pub knn_plan_split_ms: [f64; 5],
     /// Segment directories holding at least one document of the returned
     /// page, deduplicated, in page order: the segments whose doc store this
     /// search read. The server's access tracker (#213) counts these as
@@ -3979,6 +4076,11 @@ impl Searcher {
     /// among them are rescored and the rest are dropped, so the result is
     /// no longer guaranteed by the bounds. `None` (the default, or
     /// `KOSHA_KNN_GLOBAL_RESCORE_MAX` unset or `0`) means no cap.
+    pub fn with_knn_global_rescore_max(mut self, max: Option<usize>) -> Self {
+        self.knn_global_rescore_max = max.filter(|&m| m > 0);
+        self
+    }
+
     /// Whether kNN planning bounds centroid scores from i8 codes first and
     /// scores exactly only the centroids that could be inside the probe
     /// budget (`KOSHA_KNN_PLAN_I8`, default on). The plan, and so every
@@ -3987,11 +4089,6 @@ impl Searcher {
     /// scored exactly whatever this says.
     pub fn with_knn_plan_i8(mut self, on: bool) -> Self {
         self.knn_plan_i8 = on;
-        self
-    }
-
-    pub fn with_knn_global_rescore_max(mut self, max: Option<usize>) -> Self {
-        self.knn_global_rescore_max = max.filter(|&m| m > 0);
         self
     }
 
@@ -4530,7 +4627,6 @@ impl Searcher {
         permit: &AdmissionPermit,
         open_stats: &OpenStatsCollector,
     ) -> Result<KnnPlan, KoshaError> {
-        let t_plan0 = Instant::now();
         let budgeted = knn_global_budget_enabled();
         let requested = knn.num_candidates.max(1);
         let prunable = query.has_prunable_filter();
@@ -4730,7 +4826,6 @@ impl Searcher {
             filtered_candidates,
             cutoff_rule: None,
             exact_centroids: 0,
-            split: [0.0; 5],
         };
 
         if !budgeted {
@@ -4791,22 +4886,20 @@ impl Searcher {
         };
         // Score the centroids, pick the cutoff and rank every probed
         // segment's postings inside it: see `knn_rank_postings`.
-        let prep_ms = t_plan0.elapsed().as_secs_f64() * 1e3;
         let ranked = knn_rank_postings(&sources, budget, relative, self.knn_plan_i8);
-        plan.split = [
-            prep_ms,
-            ranked.split[0],
-            ranked.split[1],
-            ranked.split[2],
-            ranked.split[3],
-        ];
+        // A segment that could not be scored gets no ranking and ranks its
+        // own postings under the cutoff; when none could, there is no
+        // cutoff either (as when nothing is probeable).
+        if ranked.rankings.iter().all(Option::is_none) {
+            return Ok(plan);
+        }
         plan.cutoff = Some((ranked.cutoff, budget));
         plan.cutoff_rule = ranked.rule;
         plan.exact_centroids = ranked.exact_centroids;
         plan.rankings = probed
             .iter()
-            .map(|info| info.segment_id.clone())
             .zip(ranked.rankings)
+            .filter_map(|(info, ranking)| Some((info.segment_id.clone(), ranking?)))
             .collect();
         Ok(plan)
     }
@@ -7566,7 +7659,6 @@ impl Searcher {
         phase_stats.knn_filtered_candidates = knn_plan.filtered_candidates;
         phase_stats.knn_cutoff_rule = knn_plan.cutoff_rule;
         phase_stats.knn_plan_exact_centroids = knn_plan.exact_centroids;
-        phase_stats.knn_plan_split_ms = knn_plan.split;
 
         // ── global bound-driven rescoring (#381) ───────────────────────
         // Off by default. Unfiltered single-vector kNN only: a filtered
