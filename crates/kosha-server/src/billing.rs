@@ -49,8 +49,8 @@ use kosha_core::KoshaError;
 
 use crate::tenant_limits::{LimitsProvider, TenantLimits};
 use crate::{
-    is_search_route, is_write_path, json_error, json_ok, parse_method_and_path, request_id,
-    unix_millis, valid_name_component, AppState, SERVICE_TENANT,
+    is_search_route, is_write_path, json_error, json_ok, parse_method_and_path, unix_millis,
+    valid_name_component, AppState, SERVICE_TENANT,
 };
 
 /// The time source: Unix milliseconds. Tests substitute their own.
@@ -329,13 +329,8 @@ pub(crate) fn operation(request_line: &str) -> Operation {
 }
 
 /// The `402 Payment Required` for a request billing refuses.
-fn payment_required(tenant: &str, standing: &TenantStanding, block: &Block) -> String {
-    eprintln!(
-        "WARN: request refused: status=402 tenant={tenant} reason={} plan={}{}",
-        block.reason(),
-        standing.plan,
-        request_id()
-    );
+fn payment_required(standing: &TenantStanding, block: &Block) -> String {
+    // Logged once, by `log_request`, from the body's reason/plan fields.
     let mut body = serde_json::json!({
         "error": block.message(),
         "reason": block.reason(),
@@ -365,7 +360,7 @@ pub(crate) fn gate(state: &AppState, tenant: &str, request_line: &str) -> Option
     let standings = billing.snapshot();
     let standing = standings.get(tenant)?;
     let block = standing.block(operation(request_line))?;
-    Some(payment_required(tenant, standing, &block))
+    Some(payment_required(standing, &block))
 }
 
 impl AppState {

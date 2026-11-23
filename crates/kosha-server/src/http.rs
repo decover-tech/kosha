@@ -188,8 +188,8 @@ impl Response {
             .map(|(_, v)| v.as_str())
     }
 
-    /// ` error="…" reason=… limit=… retry_after_ms=…` from a JSON error
-    /// body (`{"error": …}` and the 429 fields), empty when the body is
+    /// ` error="…" reason=… limit=… retry_after_ms=… plan=…` from a JSON
+    /// error body (`{"error": …}`, the 429 and 402 fields), empty when the body is
     /// not one. For the request log line of a failed request only: it
     /// parses the body.
     pub fn error_fields(&self) -> String {
@@ -200,7 +200,7 @@ impl Response {
             return String::new();
         };
         let mut out = String::new();
-        for field in ["error", "reason", "limit", "retry_after_ms"] {
+        for field in ["error", "reason", "limit", "retry_after_ms", "plan"] {
             match body.get(field) {
                 Some(serde_json::Value::String(s)) if field == "error" => {
                     out.push_str(&format!(" error={s:?}"))

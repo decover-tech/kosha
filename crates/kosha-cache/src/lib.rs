@@ -750,8 +750,8 @@ impl Cache {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        self.write_or_discard(key, &dest, |dest| {
-            std::fs::copy(source_path, dest).map(|_| ())
+        self.write_atomically(key, &dest, |tmp| {
+            std::fs::copy(source_path, tmp).map(|_| ())
         })?;
         let new_len = dest.metadata().map(|m| m.len()).unwrap_or(0);
         self.account(key, new_len);
@@ -764,31 +764,24 @@ impl Cache {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        self.write_or_discard(key, &dest, |dest| std::fs::write(dest, data))?;
+        self.write_atomically(key, &dest, |tmp| std::fs::write(tmp, data))?;
         self.account(key, data.len() as u64);
         Ok(CachedFile { local_path: dest })
     }
 
-    /// Run `write` against `dest` (`key`'s path); when it fails, drop
-    /// whatever it left behind. A failed write (`ENOSPC` mid-file, say)
-    /// leaves a truncated file that [`Self::get`] would otherwise serve as
-    /// a hit, and a failed overwrite would leave the old size counted.
-    fn write_or_discard(
+    /// Write `key`'s file through a temp file and a rename
+    /// ([`kosha_core::atomic_write_with`]), so a write that fails part-way
+    /// (`ENOSPC`, say) never leaves a truncated file that [`Self::get`]
+    /// would serve as a hit; an existing file stays as it was.
+    fn write_atomically(
         &self,
         key: &str,
         dest: &Path,
-        write: impl FnOnce(&Path) -> std::io::Result<()>,
-    ) -> std::io::Result<()> {
-        let Err(e) = write(dest) else {
-            return Ok(());
-        };
-        match self.evict(key) {
-            Ok(_) => eprintln!("WARN: disk cache write {key} failed: {e} (partial removed)"),
-            Err(rm) => eprintln!(
-                "WARN: disk cache write {key} failed: {e}; removing the partial file also failed: {rm}"
-            ),
-        }
-        Err(e)
+        fill: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) -> Result<(), KoshaError> {
+        kosha_core::atomic_write_with(dest, fill).inspect_err(|e| {
+            eprintln!("WARN: disk cache write {key} failed: {e} (partial removed)");
+        })
     }
 
     /// Record `key`'s new size in the running and per-tenant totals and the
@@ -2267,6 +2260,7 @@ mod tests {
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
         if fs::write(locked.join("probe"), b"").is_ok() {
             // Running as root: permissions do not stop the removal.
+            println!("skipped: running as root, a read-only directory cannot block removal");
             fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
             let _ = fs::remove_dir_all(&dir);
             return;
@@ -2292,26 +2286,34 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// A write that fails part-way leaves no file behind for `get` to serve
-    /// as a hit, and no stale size in the totals.
+    /// A write that fails part-way leaves the cached file as it was (no
+    /// truncated file for `get` to serve as a hit), its size unchanged,
+    /// and no temp file behind.
     #[test]
-    fn failed_write_removes_the_partial_file() {
+    fn failed_write_leaves_no_partial_file() {
         let dir =
             std::env::temp_dir().join(format!("kosha-test-cache-partial-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let cache = Cache::with_max_bytes(dir.clone(), Some(1000));
         cache.put_bytes("t/ns/seg/a.bin", &[0; 100]).unwrap();
-        assert_eq!(cache.total_size(), 100);
 
         let dest = cache.path_for("t/ns/seg/a.bin").unwrap();
-        let result = cache.write_or_discard("t/ns/seg/a.bin", &dest, |dest| {
-            fs::write(dest, [1u8; 10])?;
+        let result = cache.write_atomically("t/ns/seg/a.bin", &dest, |tmp| {
+            fs::write(tmp, [1u8; 10])?;
             Err(std::io::Error::other("no space left on device"))
         });
         assert!(result.is_err());
-        assert!(!dest.exists(), "the partial file is removed");
-        assert!(cache.get("t/ns/seg/a.bin").is_none());
-        assert_eq!(cache.total_size(), 0, "its old size is no longer counted");
+        assert_eq!(
+            fs::read(&dest).unwrap(),
+            vec![0u8; 100],
+            "the old file is intact"
+        );
+        assert_eq!(cache.total_size(), 100);
+        assert_eq!(
+            fs::read_dir(dest.parent().unwrap()).unwrap().count(),
+            1,
+            "no temp file left"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

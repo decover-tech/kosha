@@ -499,7 +499,7 @@ mod s3_objects {
                 .map_err(|e| {
                     format!(
                         "create_multipart_upload {key}: {}",
-                        aws_sdk_s3::error::DisplayErrorContext(&e)
+                        crate::s3_storage::log_s3_error("create_multipart_upload", key, &e)
                     )
                 })?;
             let upload_id = upload
@@ -535,7 +535,7 @@ mod s3_objects {
                     Err(e) => {
                         failure = Some(format!(
                             "upload_part_copy {key} part {number}: {}",
-                            aws_sdk_s3::error::DisplayErrorContext(&e)
+                            crate::s3_storage::log_s3_error("upload_part_copy", key, &e)
                         ));
                         break;
                     }
@@ -559,7 +559,7 @@ mod s3_objects {
                     Err(e) => {
                         failure = Some(format!(
                             "complete_multipart_upload {key}: {}",
-                            aws_sdk_s3::error::DisplayErrorContext(&e)
+                            crate::s3_storage::log_s3_error("complete_multipart_upload", key, &e)
                         ))
                     }
                 }
@@ -624,7 +624,7 @@ mod s3_objects {
                     .map_err(|e| {
                         format!(
                             "copy_object {source} -> {key}: {}",
-                            aws_sdk_s3::error::DisplayErrorContext(&e)
+                            crate::s3_storage::log_s3_error("copy_object", &key, &e)
                         )
                     })
             })
@@ -657,7 +657,11 @@ mod s3_objects {
                         .map_err(|e| {
                             format!(
                                 "delete_objects: {}",
-                                aws_sdk_s3::error::DisplayErrorContext(&e)
+                                crate::s3_storage::log_s3_error(
+                                    "delete_objects",
+                                    batch.first().map_or("-", String::as_str),
+                                    &e
+                                )
                             )
                         })?;
                     if let Some(err) = out.errors().first() {

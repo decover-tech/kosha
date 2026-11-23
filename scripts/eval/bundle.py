@@ -98,6 +98,10 @@ def pct(values, p):
     return round(values[min(len(values) - 1, int(round((len(values) - 1) * p)))], 1) if values else None
 
 
+# Per-request fields of a `request failed:` line (see `log_request`).
+PER_REQUEST = re.compile(r" (?:ms|in_bytes|out_bytes)=\S+")
+
+
 def finish(out, samples_path):
     open(f"{out}/STOP", "w").close()
     time.sleep(16)
@@ -129,7 +133,10 @@ def finish(out, samples_path):
                 if "search timing:" in line:
                     entry.update(FIELD.findall(line))
                 elif "request failed:" in line:
-                    entry["failed"] = line.split("request failed:")[1].split(" rid=")[0].strip()[:110]
+                    # One line per failure carries ms= and byte counts; drop
+                    # them so failures group by status and message.
+                    failed = line.split("request failed:")[1].split(" rid=")[0]
+                    entry["failed"] = PER_REQUEST.sub("", failed).strip()[:110]
     by_pod = collections.defaultdict(lambda: {"ms": collections.defaultdict(list), "errors": collections.Counter(), "n": 0})
     knn = collections.defaultdict(lambda: collections.Counter())
     unmatched = total = 0
