@@ -50,6 +50,7 @@ class KoshaClient:
         timeout: int = 60,
         max_retries: int = 3,
         retry_on_timeout: bool = True,
+        retry_budget: float = 20.0,
         pool_maxsize: int = 20,
         **kwargs: Any,
     ) -> None:
@@ -94,6 +95,7 @@ class KoshaClient:
             timeout=timeout,
             max_retries=max_retries,
             retry_on_timeout=retry_on_timeout,
+            retry_budget=retry_budget,
         )
 
         self._kosha_url = kosha_url
