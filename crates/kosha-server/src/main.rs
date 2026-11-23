@@ -18236,6 +18236,87 @@ mod tests {
         }
     }
 
+    /// Finding 32: a kNN search whose `vector.idx` posting ranges are shed
+    /// (here: they would take the request over its byte ceiling) finds
+    /// those postings not local, and the segment reports degraded. The
+    /// answer must be the shed's 429, never a 200 with
+    /// `knn_degraded_segments > 0`. `hydrate_vector_postings` does not read
+    /// its `FileSpanOutcome::shed`: the ranged read marks the request
+    /// itself shed, and the handler turns "shed + degraded" into the 429
+    /// (`knn_shed_response`). This pins that chain end to end, including
+    /// that a shed range is not fetched by some other route.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn knn_search_whose_vector_posting_ranges_are_shed_is_a_429() {
+        const NS: &str = "vector-shed";
+        let node = || {
+            let (s3, mut state, manifest, _) = single_flight_node(
+                NS,
+                |w| w.with_vector_store_mode(kosha_segment::VectorStoreMode::Sidecar),
+                |i| {
+                    vec![
+                        Field::text("text", format!("contract clause {i}")),
+                        Field::vector("emb", vec![1.0, i as f32, 0.5, 0.0]),
+                    ]
+                },
+            );
+            state.posting_read_mode = doc_spans::ReadMode::Ranged;
+            (s3, state, manifest)
+        };
+        let query = serde_json::json!({
+            "query_text": "",
+            "max_results": 3,
+            "knn": {"field": "emb", "vector": [1.0, 0.0, 0.5, 0.0], "k": 3, "num_candidates": 100},
+        });
+        let search = |state: &AppState| {
+            let mut body = query.clone();
+            body["namespace"] = NS.into();
+            let resp = handle_search_post(body.to_string().as_bytes(), state);
+            let json: serde_json::Value =
+                serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..])
+                    .unwrap_or_default();
+            (status_of(&resp), json)
+        };
+        let vector_gets = |s3: &crate::doc_store_fallback_tests::FakeS3| {
+            s3.gets
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|k| k.ends_with("vector.idx"))
+                .count()
+        };
+
+        // Control: with room for everything, the cold kNN search reads its
+        // postings by range from `vector.idx` and answers in full.
+        let (s3, state, _) = node();
+        let (status, full) = search(&state);
+        assert_eq!(status, 200, "{full}");
+        assert_eq!(full["knn_degraded_segments"], 0, "{full}");
+        assert!(!full["results"].as_array().unwrap().is_empty(), "{full}");
+        assert!(vector_gets(&s3) > 0, "the postings are read by range");
+
+        // A pod whose scoring set is local but whose postings are not.
+        // Then a ceiling no posting range fits under.
+        let (s3, mut state, manifest) = node();
+        let scoring = state.hydrate_segments_for_search(
+            &NamespaceId(NS.into()),
+            &manifest,
+            &serde_json::from_value(query.clone()).unwrap(),
+            &Arc::new(RequestHydration::new(u64::MAX)),
+            None,
+        );
+        assert!(scoring.missing.is_empty() && !scoring.shed);
+        assert_eq!(vector_gets(&s3), 0, "scoring hydration reads no posting");
+        state.hydrate_request_max_bytes = 1;
+        let (status, body) = search(&state);
+        assert_eq!(
+            status, 429,
+            "a shed kNN must be a 429, not a partial answer: {body}"
+        );
+        assert_eq!(body["reason"], "search_hydration_limit", "{body}");
+        assert_eq!(vector_gets(&s3), 0, "a shed range is never fetched");
+    }
+
     // ── bloom_pruned: a filtered query's hydration success must not be
     //    cached as "whole namespace hydrated" ──────────────────────────
     //
