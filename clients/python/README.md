@@ -43,3 +43,23 @@ npx @openapitools/openapi-generator-cli generate \
 Phase 1 ships with a lightweight hand-written client (`client.py`) that directly calls the
 Kosha HTTP API. As the API stabilises, the hand-written code will shrink to just `transport.py`
 + `compat.py` + the delegation layer in `client.py`.
+
+## Changelog
+
+### 0.2.11.1
+
+Retry-only release on top of 0.2.11; nothing else from 0.2.12+ is included.
+
+- **Behavior change:** the transport retries what the server asks it to retry. A `429`
+  (any request) and a `502`/`503`/`504` on a read (`GET`, or a `POST` to the `search`
+  route) are retried after the server's `Retry-After` plus jitter, or a full-jitter
+  exponential backoff without one. Attempts in total are `max_retries` (default 3), and no
+  retry starts later than `retry_budget` seconds (default 20) after the first attempt; a
+  `Retry-After` that does not fit the budget (a quota refusal says 60 s) raises at once.
+  `5xx` on writes, `500` and every other `4xx` (including `402`) are raised immediately, as
+  before. `retry_budget=0` restores the old behavior.
+- The attempts and the budget apply **per HTTP call**: `bulk` (one call per namespace and
+  operation, plus a flush per namespace, per `helpers.bulk` chunk) can wait up to
+  `retry_budget` once per call.
+- An error body that is not a JSON object now raises `KoshaRequestError` with the raw body as
+  `error`, instead of an `AttributeError`.
