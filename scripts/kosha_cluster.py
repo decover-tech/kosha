@@ -370,10 +370,16 @@ def upgrade(kubectl: list[str], args: argparse.Namespace) -> None:
         except subprocess.CalledProcessError:
             # Nothing has written the new formats yet, so undoing is safe.
             subprocess.run([*kubectl, "rollout", "undo", "deployment/kosha-query"], check=True)
-            scale_indexer(replicas)
+            # Restart the indexer only if it was running on ingest's image. After
+            # a failed ingest release it stays stopped: ingest may already have
+            # written formats the old indexer cannot read.
+            if not stopped and (
+                container(indexer)["image"] == container(deployments["kosha"])["image"]
+            ):
+                scale_indexer(replicas)
             raise ValueError(
-                "query rollout failed and was undone; ingest and indexer were not "
-                "changed. Fix the release and retry."
+                "query rollout failed and was undone; ingest and indexer images were "
+                "not changed. Fix the release and retry."
             ) from None
     if "kosha" in pending:
         set_image("kosha")
