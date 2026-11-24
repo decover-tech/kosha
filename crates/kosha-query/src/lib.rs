@@ -12569,9 +12569,9 @@ mod tests {
     fn knn_segment_pruning_precedes_namespace_posting_selection() {
         use kosha_segment::namespace_centroids::{Directory, Snapshot};
 
-        let (dir, ns, manifest, mut query) = knn_segment_pruning_corpus("routing");
+        let (dir, ns, mut manifest, mut query) = knn_segment_pruning_corpus("routing");
         let mut directory = Directory::default();
-        for entry in &manifest.segments {
+        for entry in manifest.segments.clone() {
             let path = manifest.segment_dir(&dir, &ns, &entry.segment_id);
             directory.insert_segment(
                 &entry.segment_id.0,
