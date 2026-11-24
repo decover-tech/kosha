@@ -4918,7 +4918,13 @@ impl Searcher {
                         (true, Some(cost)) => knn_exact_is_cheaper(
                             cost,
                             passing,
-                            (cost_budget * cost.postings).div_ceil(cost_postings.max(1)),
+                            // Without global budgeting each segment probes
+                            // up to `num_candidates` on its own.
+                            if budgeted {
+                                (cost_budget * cost.postings).div_ceil(cost_postings.max(1))
+                            } else {
+                                requested
+                            },
                             knn.k,
                             kosha_segment::vector_rescore_factor(),
                             knn_cost_posting_overhead_bytes(),
