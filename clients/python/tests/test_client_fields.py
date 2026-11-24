@@ -582,3 +582,16 @@ def test_strong_consistency_makes_wait_for_flush_free(monkeypatch):
 def test_consistency_is_validated():
     with pytest.raises(ValueError):
         KoshaClient(hosts="http://kosha.invalid", api_key="k", consistency="sometimes")
+
+
+def test_source_to_fields_keeps_a_stored_keyword_matrix_keyword():
+    """A matrix stored as Keyword before #205 and read back with its type
+    (update_by_query rewrites) is not silently re-typed as a Vector bag."""
+    bag = [[0.01 * (i + t) for i in range(12)] for t in range(3)]
+    fields = KoshaClient._source_to_fields(
+        {"m": bag, "__type__m": "Keyword", "fresh": bag}
+    )
+    by_name = {f["name"]: f for f in fields}
+    assert by_name["m"]["field_type"] == "Keyword"
+    assert json.loads(by_name["m"]["value"]) == bag
+    assert by_name["fresh"]["field_type"] == "Vector"

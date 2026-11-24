@@ -1358,9 +1358,13 @@ class KoshaClient:
                 # Vector field holding the JSON bag, which the server
                 # indexes for MaxSim. Decoded back to a list of lists by
                 # _decode_field_value.
+                # A field read back as Keyword (stored before #205, e.g.
+                # rewritten by update_by_query) keeps its type so exact-match
+                # filters on it still work.
+                bag_type = "Keyword" if declared_type == "Keyword" else "Vector"
                 fields.append(
                     cls._field_to_kosha(
-                        k, json.dumps([list(t) for t in v]), "Vector"
+                        k, json.dumps([list(t) for t in v]), bag_type
                     )
                 )
             elif isinstance(v, (list, tuple)):
