@@ -43,7 +43,8 @@ latency guarantees and the limits Kosha enforces.
 | `fuzzy` | Typo-tolerant term matching: `"fuzzy": {"field": "content", "value": "recieve", "fuzziness": 1}` finds `receive`. `fuzziness` is `0`, `1`, `2` or `"auto"` (default; Elasticsearch `AUTO:3,6`: exact below 3 characters, one edit up to 5, two from 6; `"auto:low,high"` moves the thresholds). An edit is an insertion, deletion, substitution or — with `transpositions` (default `true`) — a swap of adjacent characters. `prefix_length` (default 0) leading characters must match exactly and make expansion cheaper; `max_expansions` (default 50, at most 1024) caps the terms each token expands to per segment, nearest first, the exact term always kept. A non-exact match must leave a character of the shorter string untouched (`ox` never matches `o`). The value is analyzed with each segment's own analyzer and every token is expanded against that segment's sorted term dictionary (a Levenshtein-automaton walk that skips whole prefix ranges); several tokens combine with `operator` (AND by default). Scoring is tiered so **an exact match always outranks a one-edit match, which always outranks a two-edit one**: per token, `score = (2 − edits) + tf_norm` with `tf_norm ∈ (0, 1]` BM25's length-normalized tf saturation (namespace `avgdl`); no IDF, since expansions differ per segment. `field` (`""` / `_all` / `*` = every `Text` field) restricts it to one field's postings; segments written before per-field indexes answer from their combined index. Its own lexical query: not combinable with `query_text` / `fields` / `wildcard` / `match_phrase`, but can be the lexical leg of a hybrid request and takes `rank_by`. Segments are bloom-pruned for 0- and 1-edit tokens (see [Fuzzy bloom](#fuzzy-bloom)). Runs on an exhaustive path (no block-max WAND). On 1M docs x 30 words in 8 segments (1.08M distinct terms), warm: ~0.5–1 ms at 1 edit and ~3.5–4.5 ms at 2 edits for mid-frequency and rare words, ~10–14 ms when an expansion is a very frequent word (every posting is scored; the exact `query_text` WAND query takes 0.5 ms). The dictionary walk itself is ~0.2 ms per segment at 1 edit and ~2 ms at 2 edits (~0.3 ms with `prefix_length: 2`). Non-fuzzy queries are unchanged (`cargo bench -p kosha-query --bench fuzzy_expansion`) |
 | kNN / ANN vector search | Cluster-and-posting on-disk vector index with centroid probing and triangle-inequality lower bounds; global probe budget; flat/HNSW fallback for older segments. Compaction merges the inputs' postings and repairs them with SPFresh's LIRE split / merge / reassign instead of re-clustering every vector (`KOSHA_VECTOR_COMPACTION=lire`, the default; `rebuild` re-clusters as before). Same on-disk format either way (#253) |
 | Hybrid retrieval (RRF) | A lexical query (`query_text` / `wildcard` / `match_phrase` / `fuzzy`) plus a `knn` clause is fused with Reciprocal Rank Fusion, `score = Σ 1/(rank_constant + rank)`. Tune with `"rank": {"rrf": {"rank_window_size": 100, "rank_constant": 60}}` (Elasticsearch names and defaults: window = `max_results`, constant = 60; window must be ≥ `max_results`). Each retriever is ranked across the whole namespace before fusing: the lexical list is the best `rank_window_size` BM25 hits, the vector list the nearest `min(knn.k, rank_window_size)`. Vector-only hits are kept. Each hit returns the fused `score` plus `rank_details` (`lexical_rank` / `lexical_score` / `knn_rank` / `knn_score`). The fused list is at most `rank_window_size` long; `from` / `max_results`, `sort`, `collapse` and `search_after` (e.g. on `[_score desc, _id asc]`) apply within it. `total_hits` and aggregations count the lexical matches plus the vector window. Optional `"mode": "lexical" \| "semantic" \| "hybrid"` is checked against the clauses present |
-| Filters | `term`, `terms`, `range` (`gte`/`gt`/`lte`/`lt`), `exists`, `prefix`, `bool` (`must` / `must_not` / `should` / `minimum_should_match`; OpenSearch's `filter` is accepted as `must`), `match_all`. Every clause composes inside `bool` and works in `filter`, `knn.filter` and `/delete`. An unknown or malformed clause is a 400, never a match-all. On a multi-valued field (a list, or a [nested path](#nested-attributes) with several values) a clause matches if ANY value does |
+| Weighted multi-query RRF | `"rank_by": {"rrf": {"queries": [...], "k": 60, "weights": [...], "rank_window_size": 100}}` fuses independent lexical and vector retrievers before paging. See [Weighted multi-query RRF](#weighted-multi-query-rrf). |
+| Filters | `term`, `terms`, `range` (`gte`/`gt`/`lte`/`lt`), `exists`, `prefix`, `bool` (`must` / `must_not` / `should` / `minimum_should_match`; OpenSearch's `filter` is accepted as `must`), `match_all`. Every clause composes inside `bool` and works in `filter`, `knn.filter` and `/delete`. An unknown or malformed clause is a 400, never a match-all. `exists` is `{"exists": {"field": "matterId"}}` and matches a document that has a value for the field in any column type: an empty string `""` is a value (as in OpenSearch), an empty list `[]`, a list of only nulls, or an absent field is not. The "missing" case is `{"bool": {"must_not": [{"exists": {"field": "matterId"}}]}}`. On a multi-valued field (a list, or a [nested path](#nested-attributes) with several values) a clause matches if ANY value does |
 | `prefix` filter | `{"prefix": {"path": "/matters/2026/"}}`, or the long form `{"prefix": {"path": {"value": "/matters/2026/", "case_insensitive": true}}}`. Case-sensitive by default, like `term` (and unlike the `wildcard` query): `"ab"` matches `abc` and `ab`, not `a`, `xab` or `ABC`. A list value matches when any element does. The empty prefix matches exactly the documents `exists` matches. String fields only: a `prefix` on an `Integer`/`Float` field is a 400. Only `value` and `case_insensitive` are accepted in the long form. Evaluated by a scan of the segment's filter column (each distinct value once on a columnar segment), cached per segment; bloom filters cannot skip segments for it |
 | Multiple vector columns | A namespace can hold several `Vector` fields (e.g. a 384-dim `title_emb` and a 1536-dim `body_emb`); each segment builds one index per field and `knn.field` picks the one searched. Each field has one dimension per namespace, fixed by the first vector written to it: a document whose vector disagrees is rejected with a 400, and so is a `knn` naming a field no segment indexes or a query vector of the wrong dimension. Segments written before this change keep serving any `knn.field` from their single index, unless their `doc_vectors.bin` names exactly one field (#204) |
 | i8 vector quantization | `KOSHA_VECTOR_QUANTIZATION=i8` (or per field, `KOSHA_VECTOR_QUANTIZATION_FIELDS=body_emb:i8,title_emb:f32`) stores each segment's ANN posting entries as one f32 scale plus `dim` signed bytes instead of `dim` f32s: `vector.idx`, the bytes a cold kNN hydrates and the warm posting cache all shrink ~4x (measured 3.96x at 768 dims). The probe scores with an i8 dot product, then rescores its best `k * KOSHA_VECTOR_RESCORE_FACTOR` candidates (default 4, `0` disables) with the full-precision vectors in `doc_vectors.bin`, so final scores are exact cosine. f32 and i8 segments mix freely in a namespace. Default `f32`; see the rollout note below (#210) |
@@ -61,6 +62,52 @@ latency guarantees and the limits Kosha enforces.
 | Total-hit accounting | Capped counting with an `eq` / `gte` relation (`track_total_hits`-style), overridable per query via `exact_total_hits` / `total_hits_cap` |
 | Rerank | `"rerank": {"provider": "cohere", "model": "rerank-v3.5", "field": "content", "top_n": 50, "timeout_ms": 2000}` sends the top `top_n` hits (the fused list for a hybrid request) to an external reranker and pages the reordered list. `top_n` defaults to `from + max_results` and must be ≥ it (≤ 1000; ≤ `rank_window_size` when that is set); `timeout_ms` defaults to 2000. Each hit then has `score` = `rerank_score` (the provider's) and `fused_score` (the search-stage score). On timeout or provider error the hits keep search order and the response has `rerank_degraded: true` and `rerank_degraded_reason`; such responses are not cached. Not combinable with `sort` / `search_after`. Providers are configured on the server from the environment (`KOSHA_RERANK_PROVIDERS`, `KOSHA_RERANK_<NAME>_URL` / `_API_KEY` / `_MODEL`; `cohere` reads `COHERE_API_KEY`); any Cohere-style `POST /rerank` API works. Per-provider calls, outcomes, documents, billed units and a latency histogram are under `rerank` in admin `/stats` |
 | Degradation signal | `knn_degraded_segments` reports segments whose vector search failed, so a 200 with silently missing neighbors is visible to the caller |
+
+### Weighted multi-query RRF
+
+```json
+{
+  "namespace": "articles",
+  "query_text": "",
+  "rank_by": {
+    "rrf": {
+      "queries": [
+        {"query_text": "breach notice"},
+        {"query_text": "security incident", "fields": ["title"]},
+        {"knn": {"field": "embedding", "vector": [0.1, 0.2], "k": 20}}
+      ],
+      "k": 60,
+      "weights": [2, 1, 0.5],
+      "rank_window_size": 100
+    }
+  },
+  "max_results": 10
+}
+```
+
+Supply 1–16 subqueries, each with one lexical or kNN retriever. The outer
+`filter` and each subquery's `filter` are applied together. The contribution
+from each list is `weight / (k + rank)`, where rank starts at 1 and `k`
+defaults to 60. Omit weights to use 1 for each list; otherwise provide one
+finite, nonnegative weight per list with a positive finite sum.
+
+The fixed per-retriever window defaults to 100 (1–1000); kNN also honors
+the retriever's own `knn.k`. The fused result set is the deduplicated union
+of those lists. `total_hits` counts this union independently of the page
+and uses the usual capped `gte` relation unless exact counting is requested.
+To page in score-descending, ID-ascending order, use `from` / `max_results`
+or pass the last hit's `[score, doc_id]` as strings in `search_after`, keeping
+the retrievers, weights, and window unchanged. Cursor paging assumes an
+unchanged namespace snapshot. Explicitly sorting by `_id asc` instead
+uses a one-value `[doc_id]` cursor, as the Go and TypeScript iterators do
+by default. This variant does not use the response cache.
+
+To rerank the fused top `top_n`, add the regular `rerank` object with an
+explicit `rerank.query` and page with `from` / `max_results`. The default
+`top_n` is fixed at 100, regardless of the page offset. This variant does
+not accept top-level retrieval clauses, legacy `rank` / `mode`,
+aggregations, highlighting, `collapse`, or `limit_per`. The existing
+two-retriever hybrid and `rank_by.functions` score modifiers are unchanged.
 
 ### Aggregations
 
@@ -377,7 +424,7 @@ own document, or combine the two values into one leaf (`"name_org": "Ada|beta"`)
 
 ### Not supported yet
 
-- Per-retriever weights for RRF. Reranking over more than one field, and ES `text_similarity_reranker` retrievers in the Python client.
+- Reranking over more than one field, and ES `text_similarity_reranker` retrievers in the Python client.
 - Multi-field scoring other than a boosted sum (`dis_max` / `best_fields` tie-breakers, turbopuffer `Product` / `Max` of fields), field-name patterns in `fields`, and block-max WAND for `fields` queries.
 - Analyzer features beyond the list in [Analyzers](#analyzers): per-language stemmers other than English, synonyms, n-grams, CJK dictionary segmentation (`standard@2` splits Han ideographs one per token), full Unicode case folding (`ß` and `SS` stay distinct). Other `FieldSchema` members (`type`, `indexed`, `stored`) are stored but not enforced — field types still come with each document, and changing them is always online ([Schema evolution](#schema-evolution)).
 - Fuzzy: block-max WAND over expansions (fuzzy queries score every posting of every expansion), highlighting of fuzzy matches, fuzzy inside `fields` / `match_phrase`, bloom pruning for two-edit tokens.

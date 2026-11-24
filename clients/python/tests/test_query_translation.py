@@ -118,6 +118,52 @@ def test_exists_and_range_options():
     assert ranged == {"range": {"publishedAt": {"gte": "2024-01-01", "lte": "2024-12-31"}}}
 
 
+def test_exists_drops_boost_and_refuses_malformed_bodies():
+    assert KoshaClient._to_filter({"exists": {"field": "a", "boost": 2}}) == {
+        "exists": {"field": "a"}
+    }
+    assert KoshaClient._to_filter({"exists": {"field": "a", "_name": "has_a"}}) == {
+        "exists": {"field": "a"}
+    }
+    for spec in [None, "a", ["a"], {}, {"field": ""}, {"field": 7}, {"field": "a", "x": 1}]:
+        with pytest.raises(KoshaRequestError, match="exists"):
+            KoshaClient._to_filter({"exists": spec})
+
+
+def test_exists_survives_search_translation_in_query_and_bool_context():
+    exists = {"exists": {"field": "sentAt"}}
+    missing = {"bool": {"must_not": [exists]}}
+    assert translate({"query": exists})["filter"] == exists
+    assert translate({"query": missing})["filter"] == missing
+    assert translate({"query": {"bool": {"filter": [exists]}}})["filter"] == {
+        "bool": {"must": [exists]}
+    }
+
+
+def test_named_exists_ignores_metadata_without_changing_the_filter():
+    named = {"exists": {"field": "sentAt", "_name": "q1", "boost": 2.0}}
+    assert translate({"query": {"bool": {"must_not": [named]}}})["filter"] == {
+        "bool": {"must_not": [{"exists": {"field": "sentAt"}}]}
+    }
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        None,
+        {},
+        "sentAt",
+        ["sentAt"],
+        {"field": ""},
+        {"field": 1},
+        {"field": "sentAt", "extra": True},
+    ],
+)
+def test_malformed_exists_is_refused(spec):
+    message = refused({"query": {"bool": {"must_not": [{"exists": spec}]}}})
+    assert "exists clause" in message
+
+
 def test_prefix_short_and_long_forms():
     assert KoshaClient._to_filter({"prefix": {"path": "/matters/2026/"}}) == {
         "prefix": {"path": "/matters/2026/"}
