@@ -3854,6 +3854,9 @@ pub struct Searcher {
     /// Two-stage kNN planning over i8 centroid codes; see
     /// [`Searcher::with_knn_plan_i8`]. Default from `KOSHA_KNN_PLAN_I8`.
     knn_plan_i8: bool,
+    knn_namespace_centroids: bool,
+    namespace_centroids: Mutex<Option<CachedNamespaceCentroids>>,
+    namespace_centroid_source: Option<Box<NamespaceCentroidSource>>,
     /// Per-segment rescoring counters (#381): see
     /// [`Searcher::with_knn_rescore_stats`]. Default from
     /// `KOSHA_KNN_RESCORE_STATS`, off.
@@ -3862,6 +3865,14 @@ pub struct Searcher {
 
 /// Weak handles to the readers of one released segment.
 type DrainingReaders = Vec<std::sync::Weak<TrackedSegment>>;
+type NamespaceCentroidSource = dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync;
+
+struct CachedNamespaceCentroids {
+    namespace: NamespaceId,
+    version: u64,
+    loaded_at: Instant,
+    snapshot: Option<Arc<kosha_segment::namespace_centroids::Snapshot>>,
+}
 
 /// Result of a [`Searcher::warm_segments`] pass — how many segments were
 /// newly opened/cached vs. already resident, and the estimated bytes
@@ -3979,6 +3990,9 @@ impl Searcher {
             knn_global_rescore: knn_global_rescore_from_env(),
             knn_global_rescore_max: knn_global_rescore_max_from_env(),
             knn_plan_i8: kosha_segment::knn_plan_i8_from_env(),
+            knn_namespace_centroids: kosha_segment::namespace_centroids::enabled(),
+            namespace_centroids: Mutex::new(None),
+            namespace_centroid_source: None,
             knn_rescore_stats: knn_rescore_stats_from_env(),
         }
     }
@@ -4102,6 +4116,64 @@ impl Searcher {
     pub fn with_knn_plan_i8(mut self, on: bool) -> Self {
         self.knn_plan_i8 = on;
         self
+    }
+
+    pub fn with_knn_namespace_centroids(mut self, on: bool) -> Self {
+        self.knn_namespace_centroids = on;
+        self
+    }
+
+    pub fn with_namespace_centroid_source(
+        mut self,
+        source: impl Fn(&str) -> Option<Vec<u8>> + Send + Sync + 'static,
+    ) -> Self {
+        self.namespace_centroid_source = Some(Box::new(source));
+        self
+    }
+
+    fn namespace_centroid_snapshot(
+        &self,
+        namespace: &NamespaceId,
+        manifest: &Manifest,
+    ) -> Option<Arc<kosha_segment::namespace_centroids::Snapshot>> {
+        use kosha_segment::namespace_centroids::{Snapshot, FILE_NAME};
+        let matches = |snapshot: &Snapshot| {
+            snapshot.matches(
+                manifest.version,
+                manifest.segments.iter().map(|s| s.segment_id.0.as_str()),
+            )
+        };
+        {
+            let cache = self.namespace_centroids.lock().unwrap();
+            if let Some(cached) = cache
+                .as_ref()
+                .filter(|c| c.namespace == *namespace && c.version == manifest.version)
+            {
+                match &cached.snapshot {
+                    Some(snapshot) if matches(snapshot) => return Some(Arc::clone(snapshot)),
+                    None if cached.loaded_at.elapsed() < Duration::from_secs(1) => return None,
+                    _ => {}
+                }
+            }
+        }
+        let path = format!("{}/{FILE_NAME}", namespace.0);
+        let decode = |bytes: Vec<u8>| {
+            serde_json::from_slice::<Snapshot>(&bytes)
+                .ok()
+                .filter(matches)
+        };
+        let snapshot = std::fs::read(self.data_dir.join(&path))
+            .ok()
+            .and_then(decode)
+            .or_else(|| self.namespace_centroid_source.as_ref()?(&path).and_then(decode))
+            .map(Arc::new);
+        *self.namespace_centroids.lock().unwrap() = Some(CachedNamespaceCentroids {
+            namespace: namespace.clone(),
+            version: manifest.version,
+            loaded_at: Instant::now(),
+            snapshot: snapshot.clone(),
+        });
+        snapshot
     }
 
     /// Whether global bound-driven kNN rescoring (#381) is on. The server
@@ -4782,11 +4854,6 @@ impl Searcher {
                 })
             })
             .collect();
-        open_stats.knn_centroids.fetch_add(
-            per_segment.iter().filter_map(|info| info.centroids).sum(),
-            Ordering::Relaxed,
-        );
-
         check_knn_field(namespace, knn, per_segment.iter().map(|info| &info.status))?;
 
         // ── exact or probed, per segment ──
@@ -4865,6 +4932,60 @@ impl Searcher {
             }
         });
         let alpha = kosha_segment::knn_probe_radius_alpha();
+        // Restricted searches may refill outside the posting budget and
+        // legacy columns have no stable posting ids. Keep their existing
+        // planner rather than silently dropping any of their candidates.
+        if self.knn_namespace_centroids
+            && !restricted
+            && !prunable
+            && knn.vector.iter().all(|x| x.is_finite())
+            && tombstones.is_none_or(|t| t.values().all(HashSet::is_empty))
+            && knn_relative_cutoff_eps().is_none()
+            && !probed.is_empty()
+            && per_segment.iter().all(|info| {
+                matches!(info.status, VectorFieldStatus::Absent)
+                    || matches!(info.status, VectorFieldStatus::Indexed { dim } if dim != knn.vector.len())
+                    || info.centroids.is_some()
+            })
+        {
+            if let Some(snapshot) = self.namespace_centroid_snapshot(namespace, manifest) {
+                let eligible: HashMap<_, _> = probed
+                    .iter()
+                    .map(|info| (info.segment_id.0.as_str(), info.centroids.unwrap()))
+                    .collect();
+                let directory = &snapshot.directory;
+                if eligible.iter().all(|(&id, &count)| {
+                    directory.posting_count(id, &knn.field, knn.vector.len()) == count
+                }) {
+                    let (hits, scored) = directory.lookup(
+                        &knn.field, &knn.vector, alpha, requested, |id| eligible.contains_key(id),
+                    );
+                    if let Some(last) = hits.last() {
+                        let cutoff = last.score;
+                        let mut selected = HashMap::<&str, Vec<_>>::new();
+                        for hit in hits {
+                            selected.entry(hit.segment).or_default().push((hit.posting, hit.score));
+                        }
+                        plan.rankings = probed.iter().map(|info| {
+                            let id = info.segment_id;
+                            let postings = eligible[id.0.as_str()];
+                            let candidates = selected.get(id.0.as_str()).map_or(&[][..], Vec::as_slice);
+                            (id.clone(), kosha_segment::KnnSegmentRanking::from_candidates(
+                                postings, candidates, cutoff, requested,
+                            ))
+                        }).collect();
+                        plan.cutoff = Some((cutoff, requested));
+                        plan.exact_centroids = scored;
+                        open_stats.knn_centroids.fetch_add(scored, Ordering::Relaxed);
+                        return Ok(plan);
+                    }
+                }
+            }
+        }
+        open_stats.knn_centroids.fetch_add(
+            per_segment.iter().filter_map(|info| info.centroids).sum(),
+            Ordering::Relaxed,
+        );
         let sources: Vec<ColumnPlanSource<'_>> = probed
             .iter()
             .filter_map(|info| {

@@ -95,6 +95,17 @@ ANN structure when a segment is opened.
   floored at `KOSHA_KNN_BUDGET_FRACTION` (5%) of the namespace's centroids and
   capped by `KOSHA_KNN_BUDGET_MAX_CAP`. Filtered kNN widens it by the filter's
   selectivity, or scores passing documents exactly when few pass (#252).
+- **Namespace centroid routing** (#253, experimental and off by default).
+  With `KOSHA_KNN_NAMESPACE_CENTROIDS=1`, the indexer maintains a separate
+  directory of the existing segment centroids and posting IDs when it
+  observes a committed flush or publishes a compaction. A standalone
+  server maintains it directly when publishing a manifest.
+  Changes remove retired segments and read offsets only for new segments.
+  Eligible queries look up the global top `num_candidates` postings in the
+  directory instead of applying the percentage floor, so posting reads are
+  bounded by the request. Missing or stale directories and searches that
+  may need to refill (for example, filtered kNN) use the default planner.
+  This does not change the segment layout or eliminate segment opens.
 - **Radius-aware ranking.** Postings are ranked by the triangle-inequality
   lower bound `max(0, distance(query, centroid) - radius)` instead of raw
   centroid distance, so a posting with an unremarkable centroid but a close
@@ -105,11 +116,8 @@ ANN structure when a segment is opened.
 
 ### Not wired yet
 
-- A namespace- or shard-level centroid index whose postings are shared across
-  segments and updated from the WAL (#253 step 2, after the indexer role in
-  #254). Today every segment carries its own postings, so the number of
-  centroids a query ranks grows with segment count; compaction only reduces it
-  by producing fewer, larger segments.
+- Shared posting objects or a cluster-aligned segment layout. Namespace
+  routing points to immutable postings already stored in each segment.
 - LIRE on flush: a flush has no seed (every vector is new), so it still
   clusters from scratch; the post-build refinement above is what gives its
   postings LIRE-like radii.

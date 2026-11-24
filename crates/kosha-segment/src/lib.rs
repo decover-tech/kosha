@@ -25,6 +25,7 @@ use kosha_core::{AnalysisConfig, AnalyzerSpec, SegmentAnalysis};
 pub use analysis::Analyzer;
 use doc_store_zstd::{compress_doc_store, parse_dict_trailer, rebuild_offsets, DocStoreDecoder};
 pub use doc_store_zstd::{DocStoreCompressionMode, DocStoreZstdConfig, DOC_STORE_DICT_MAGIC};
+pub use kosha_vector_spfresh::namespace_centroids;
 pub use multivec::{LateInteractionHits, LateInteractionParams};
 pub use reorder::{BpConfig, DocReorder};
 
@@ -8576,6 +8577,58 @@ impl SegmentReader {
             version: vi.version,
             postings,
         }))
+    }
+
+    /// Reads namespace routing metadata from existing offsets sidecars,
+    /// without opening lexical files or hydrating any posting body.
+    pub fn namespace_centroids(
+        dir: &Path,
+    ) -> Result<Vec<kosha_vector_spfresh::namespace_centroids::Column>, KoshaError> {
+        use kosha_vector_spfresh::namespace_centroids::{Centroid, Column};
+        let footer = Self::read_footer(dir)?;
+        let Some(fields) = footer.vector_fields else {
+            return Ok(Vec::new()); // the planner falls back for legacy vector columns
+        };
+        fields
+            .iter()
+            .filter(|meta| meta.offsets)
+            .map(|meta| {
+                let col = Self::load_vector_index_from_offsets(
+                    &dir.join(meta.idx_file()),
+                    &dir.join(meta.offsets_file()),
+                    meta.slot,
+                    Some(meta.name.clone()),
+                )
+                .filter(|col| {
+                    col.dim == meta.dim as usize
+                        && col
+                            .centroids
+                            .iter()
+                            .chain(&col.radii)
+                            .all(|x| x.is_finite())
+                })
+                .ok_or_else(|| {
+                    KoshaError::CorruptSegment(format!(
+                        "{}: missing centroid offsets for {}",
+                        dir.display(),
+                        meta.name
+                    ))
+                })?;
+                Ok(Column {
+                    field: meta.name.clone(),
+                    dim: col.dim,
+                    centroids: col
+                        .centroid_rows()
+                        .zip(&col.radii)
+                        .map(|(vector, &radius)| Centroid {
+                            vector: vector.to_vec(),
+                            radius,
+                            unit_norm: col.unit_norm,
+                        })
+                        .collect(),
+                })
+            })
+            .collect()
     }
 
     /// The flat (legacy / missing-sidecar) vectors of this segment's first

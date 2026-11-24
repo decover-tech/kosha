@@ -145,6 +145,7 @@ struct AppState {
     /// `KOSHA_COMPACTION_ON_INGEST` (#254): whether a writer pod also runs
     /// the compaction scheduler.
     compaction_on_ingest: bool,
+    namespace_centroids_enabled: bool,
     admin_auth_key: Option<String>,
     /// Organizations, users, projects and the audit log (#345), served
     /// under `/v1/admin/users` and `/v1/admin/orgs`.
@@ -1746,6 +1747,12 @@ impl AppState {
             segment_live_max_bytes,
             admission_timeout,
         );
+        #[cfg(feature = "s3")]
+        let searcher = if let Some(s3) = &s3_storage {
+            searcher.with_namespace_centroid_source(s3.namespace_centroid_source())
+        } else {
+            searcher
+        };
 
         // ── Control plane: in-memory or Postgres ─────────────────────────
         #[cfg_attr(not(feature = "postgres"), allow(unused_mut))]
@@ -2154,6 +2161,7 @@ impl AppState {
             role,
             writer_leases,
             compaction_on_ingest,
+            namespace_centroids_enabled: kosha_segment::namespace_centroids::enabled(),
             // `None` when `KOSHA_ADMIN_BOOTSTRAP_KEY` switches it off (#346).
             admin_auth_key: auth::bootstrap_admin_key(),
             orgs: org_admin::OrgBackend::from_env(),
@@ -2684,6 +2692,7 @@ impl AppState {
                 synced.insert(synced_key(&remote, ns, &entry.segment_id));
             }
         }
+        self.maintain_namespace_centroids(ns, &remote);
         self.indexer.restore_manifest(ns.clone(), remote);
         Ok(())
     }
@@ -3572,6 +3581,7 @@ impl AppState {
                     // acknowledged locally (WAL not reclaimed).
                     fail::fail_point!("publish.after_cas_before_ack");
                     self.indexer.acknowledge_manifest(ns, &manifest)?;
+                    self.maintain_namespace_centroids(ns, &manifest);
                     println!(
                         "manifest published: ns={} version={} segments={} ms={:.1}",
                         ns.0,
@@ -3618,6 +3628,51 @@ impl AppState {
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    fn maintain_namespace_centroids(&self, ns: &NamespaceId, manifest: &kosha_core::Manifest) {
+        if self.namespace_centroids_enabled {
+            if let Err(error) = self.update_namespace_centroids(ns, manifest) {
+                eprintln!("WARN: namespace centroid update for {}: {error}", ns.0);
+            }
+        }
+    }
+
+    fn update_namespace_centroids(
+        &self,
+        ns: &NamespaceId,
+        manifest: &kosha_core::Manifest,
+    ) -> Result<(), KoshaError> {
+        #[cfg(feature = "s3")]
+        if let Some(s3) = &self.s3_storage {
+            let path = format!("{}/{}", ns.0, kosha_segment::namespace_centroids::FILE_NAME);
+            let previous = s3.refresh_namespace_centroids(&path).ok();
+            let bytes = self.indexer.update_namespace_centroids(
+                ns,
+                manifest,
+                previous.as_deref(),
+                |segment| {
+                    let footer = s3.read(&format!("{segment}/footer.json"))?;
+                    let footer: kosha_core::Footer = serde_json::from_slice(&footer)?;
+                    for field in footer
+                        .vector_fields
+                        .into_iter()
+                        .flatten()
+                        .filter(|f| f.offsets)
+                    {
+                        s3.read(&format!("{segment}/{}", field.offsets_file()))?;
+                    }
+                    Ok(())
+                },
+            )?;
+            if let Some(bytes) = bytes {
+                s3.upload_namespace_centroids(&path, bytes)?;
+            }
+            return Ok(());
+        }
+        self.indexer
+            .update_namespace_centroids(ns, manifest, None, |_| Ok(()))?;
+        Ok(())
     }
 
     /// Upload every segment in `ns`'s current manifest that this process
@@ -14797,6 +14852,52 @@ mod tests {
             )
             .unwrap();
         state.indexer.flush_namespace(ns).unwrap();
+    }
+
+    #[test]
+    fn indexer_maintains_namespace_centroids_when_it_follows_an_ingest_flush() {
+        use kosha_segment::namespace_centroids::{Snapshot, FILE_NAME};
+
+        let shared = shared_store();
+        let ns = NamespaceId("routing".into());
+        let mut ingest = test_state();
+        ingest.role = role::Role::Ingest;
+        ingest.namespace_centroids_enabled = false;
+        let mut indexer = test_state();
+        indexer.role = role::Role::Indexer;
+        indexer.namespace_centroids_enabled = true;
+        for state in [&ingest, &indexer] {
+            *state.controller.lock().unwrap() = Box::new(shared.clone());
+        }
+        for i in 0..2 {
+            ingest
+                .indexer
+                .index_documents(
+                    ns.clone(),
+                    vec![Document {
+                        id: DocumentId(format!("doc-{i}")),
+                        fields: vec![Field::vector("emb", vec![1.0, i as f32])],
+                    }],
+                )
+                .unwrap();
+            ingest.indexer.flush_namespace(&ns).unwrap();
+            ingest.publish_namespace(&ns).unwrap();
+            let manifest = shared.manifest_cloned(&ns).unwrap();
+            let segment = &manifest.segments.last().unwrap().segment_id;
+            copy_dir(
+                &manifest.segment_dir(&ingest.data_dir, &ns, segment),
+                &manifest.segment_dir(&indexer.data_dir, &ns, segment),
+            );
+            indexer.indexer_follow_namespace(&ns).unwrap();
+            let path = indexer.data_dir.join(&ns.0).join(FILE_NAME);
+            let snapshot: Snapshot = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert!(snapshot.matches(
+                manifest.version,
+                manifest.segments.iter().map(|s| s.segment_id.0.as_str()),
+            ));
+            assert_eq!(snapshot.directory.posting_count(&segment.0, "emb", 2), 1);
+        }
+        assert!(!ingest.data_dir.join(&ns.0).join(FILE_NAME).exists());
     }
 
     fn wal_is_empty(state: &AppState) -> bool {
