@@ -2185,6 +2185,7 @@ dependencies = [
 name = "kosha-segment"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "cap",
  "crc32fast",
  "instant-distance",

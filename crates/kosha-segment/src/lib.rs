@@ -2358,6 +2358,40 @@ fn decode_f32_entries_into(bytes: &[u8], dim: usize, ids: &mut Vec<u32>, vectors
     }
 }
 
+/// A posting's f32 entries viewed in place, without decoding: entry `i` is
+/// `words[i * (dim + 1)]` (the id's bits) followed by its `dim` floats.
+/// `None` when `bytes` is not 4-byte aligned or the target is big endian;
+/// the caller then decodes with [`decode_f32_entries_into`]. Both give the
+/// same ids and the same float bits. Trailing bytes short of one entry are
+/// ignored.
+fn f32_entries_in_place(bytes: &[u8], dim: usize) -> Option<&[f32]> {
+    if !cfg!(target_endian = "little") {
+        return None;
+    }
+    let record_size = 4 + 4 * dim;
+    let whole = bytes.len() / record_size * record_size;
+    bytemuck::try_cast_slice(&bytes[..whole]).ok()
+}
+
+/// [`for_each_f32_similarity`] over entries viewed in place by
+/// [`f32_entries_in_place`].
+fn for_each_f32_similarity_in_place(
+    words: &[f32],
+    dim: usize,
+    accept: Option<&dyn Fn(u32) -> bool>,
+    f32_similarity: impl Fn(&[f32]) -> f32,
+    mut emit: impl FnMut(u32, f32, f32),
+) {
+    for entry in words.chunks_exact(dim + 1) {
+        let (id, vector) = entry.split_at(1);
+        let id = id[0].to_bits();
+        if accept.is_some_and(|accept| !accept(id)) {
+            continue;
+        }
+        emit(id, f32_similarity(vector), 0.0);
+    }
+}
+
 /// Calls `emit(id, similarity, 0.0)` for each flat f32 entry `accept` lets
 /// through (see [`decode_f32_entries_into`] for the layout).
 fn for_each_f32_similarity(
@@ -7694,7 +7728,8 @@ struct ProbedCandidates {
 pub struct KnnScanStats {
     /// Reading posting bytes from local disk (idx file or span cache).
     pub read_nanos: u64,
-    /// Decoding those bytes into ids and vectors (or codes).
+    /// Decoding those bytes into ids and vectors (or codes). Zero for an
+    /// f32 posting scored in place from the read buffer.
     pub decode_nanos: u64,
     /// Scoring entries against the query, candidate collection included.
     pub score_nanos: u64,
@@ -7708,8 +7743,9 @@ pub struct KnnScanStats {
     /// Postings read and decoded into an owned posting (admitted to the
     /// cache, or a quantized column's).
     pub postings_decoded: usize,
-    /// f32 postings read and scored from the probe's reused buffers,
-    /// without building a posting.
+    /// f32 postings read and scored from the probe's reused buffers
+    /// (in place from the read buffer on little-endian targets), without
+    /// building a posting.
     pub postings_scanned: usize,
 }
 
@@ -7756,7 +7792,8 @@ struct PostingScan<'a> {
     probe: ProbeQuery<'a>,
     accept: Option<&'a dyn Fn(u32) -> bool>,
     reader: span_cache::LocalRangeReader,
-    /// Decode scratch for an f32 posting that is not kept.
+    /// Decode scratch for an f32 posting that is not kept and cannot be
+    /// scored in place (a big-endian target).
     ids: Vec<u32>,
     vectors: Vec<f32>,
     stats: KnnScanStats,
@@ -8898,11 +8935,13 @@ impl SegmentReader {
     ///
     /// * second touch (see below) of a posting the cache has room for, or
     ///   any quantized posting: decoded into an owned posting, as before;
-    /// * any other f32 posting: decoded into `scan`'s reused flat scratch
-    ///   and scored from it. No posting is built and nothing is allocated.
+    /// * any other f32 posting: scored in place from the read buffer, which
+    ///   is 4-byte aligned (on a big-endian target, decoded into `scan`'s
+    ///   reused flat scratch and scored from it). No posting is built,
+    ///   nothing is allocated and nothing is copied after the read.
     ///
-    /// Both paths decode the same bytes into the same floats and score
-    /// them with the same kernel in the same order, so the scores are
+    /// Every path reads the same bytes as the same floats and scores them
+    /// with the same kernel in the same order, so the scores are
     /// bit-identical.
     fn scan_posting(
         &self,
@@ -8971,6 +9010,18 @@ impl SegmentReader {
                     .vector_cache
                     .accepts(f32_posting_resident_bytes(count, vi.dim));
             if !keep {
+                if let Some(words) = f32_entries_in_place(bytes, vi.dim) {
+                    for_each_f32_similarity_in_place(
+                        words,
+                        vi.dim,
+                        scan.accept,
+                        f32_similarity,
+                        emit,
+                    );
+                    scan.stats.postings_scanned += 1;
+                    scan.stats.score_nanos += lap_nanos(&mut clock);
+                    return Ok(());
+                }
                 decode_f32_entries_into(bytes, vi.dim, &mut scan.ids, &mut scan.vectors);
                 scan.stats.decode_nanos += lap_nanos(&mut clock);
                 for_each_f32_similarity(
