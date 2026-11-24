@@ -26,6 +26,12 @@ path = "src/bin/cluster_eval.rs"
 name = "kosha-posting-order-eval"
 path = "src/bin/posting_order_eval.rs"
 
+# Recall / nDCG of late-interaction retrieval (#205) on a token-embedding
+# corpus with qrels, against exact MaxSim and mean-pooled single vectors.
+[[bin]]
+name = "kosha-late-interaction-eval"
+path = "src/bin/late_interaction_eval.rs"
+
 [lints]
 workspace = true
 
