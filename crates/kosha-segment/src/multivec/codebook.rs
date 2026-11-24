@@ -88,7 +88,9 @@ fn spread(n: usize, k: usize, rng: &mut DeterministicRng) -> Vec<usize> {
 }
 
 /// Spherical k-means over `tokens[ids]` into at most `k` unit centroids
-/// (flat). An emptied cluster is re-seeded with a random member.
+/// (flat). An emptied cluster is re-seeded with a random member; centroids
+/// that own no token at the end (duplicates, when the tokens repeat) are
+/// dropped.
 fn spherical_kmeans(
     tokens: &[f32],
     dim: usize,
@@ -134,7 +136,22 @@ fn spherical_kmeans(
         }
         centroids = sums;
     }
+    let nearest_of = |&id: &u32| nearest(&centroids, dim, token(tokens, dim, id));
+    let owners: Vec<usize> = if parallel {
+        ids.par_iter().map(nearest_of).collect()
+    } else {
+        ids.iter().map(nearest_of).collect()
+    };
+    let mut owned = vec![false; k];
+    for c in owners {
+        owned[c] = true;
+    }
     centroids
+        .chunks_exact(dim)
+        .zip(owned)
+        .filter(|(_, owned)| *owned)
+        .flat_map(|(c, _)| c.iter().copied())
+        .collect()
 }
 
 impl Codebook {
@@ -252,6 +269,19 @@ impl Codebook {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_tokens_collapse_to_one_centroid() {
+        let dim = 8;
+        let n = TWO_LEVEL_FROM * MIN_MEAN_POSTING * 4;
+        assert!(codebook_size(n) >= TWO_LEVEL_FROM);
+        let mut t = vec![1.0f32; dim];
+        normalize_in_place(&mut t);
+        let tokens: Vec<f32> = t.iter().copied().cycle().take(n * dim).collect();
+        let book = Codebook::train(&tokens, dim);
+        assert_eq!(book.centroids().len(), dim);
+        assert!(book.assign(&tokens).iter().all(|&c| c == 0));
+    }
 
     #[test]
     fn size_follows_sixteen_sqrt_n_capped_by_posting_size() {
