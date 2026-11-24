@@ -2190,7 +2190,18 @@ impl Indexer {
             return Ok(CompactResult::unchanged(segments_before));
         }
 
+        let vector_builds = writer.vector_index_builds();
         let footer = writer.finalize(bm25_params)?;
+        // Staleness signals of every seeded column (#464), one line each:
+        // what a KOSHA_VECTOR_REBUILD_* threshold is tuned from.
+        for build in vector_builds.lock().unwrap().iter() {
+            if build.lire || build.rebuild.is_some() {
+                eprintln!(
+                    "INFO: compaction {}/{} vector field '{}': {build}",
+                    namespace.0, seg_id.0, build.field
+                );
+            }
+        }
         let output_segment_id = seg_id.clone();
         // Crash-point seam (#257): the merged segment is on disk, the
         // manifest still lists its inputs.
@@ -3835,11 +3846,11 @@ fn seed_merged_vector_index(
                 .collect();
             kosha_segment::VectorSeedPosting {
                 centroid: p.centroid,
-                dropped: doc_seqs.len() != before,
+                dropped: before - doc_seqs.len(),
                 doc_seqs,
             }
         });
-        writer.seed_vector_postings(&meta.name, seeds);
+        writer.seed_vector_postings_with_reference(&meta.name, seeds, meta.radius_reference);
     }
 }
 
