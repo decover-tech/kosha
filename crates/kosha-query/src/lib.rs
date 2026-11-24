@@ -1168,12 +1168,14 @@ pub fn approx_segment_bytes(seg_dir: &std::path::Path, load_vectors: bool) -> u6
             let offsets_file = kosha_core::vector_offsets_file(slot);
             let vec_offsets = size(&offsets_file);
             total = total.saturating_add(if vec_offsets > 0 {
-                // Plus the i8 centroid codes the open derives from the
-                // sidecar (two-stage kNN planning): resident like the
-                // centroids, but in no file, so no size above covers them.
-                vec_offsets.saturating_add(kosha_segment::vector_centroid_code_bytes(
-                    &seg_dir.join(&offsets_file),
-                ))
+                // Plus the i8 centroid codes (two-stage kNN planning) and
+                // the centroid cap (segment pruning) the open derives from
+                // the sidecar: resident like the centroids, but in no file,
+                // so no size above covers them.
+                let offsets_path = seg_dir.join(&offsets_file);
+                vec_offsets
+                    .saturating_add(kosha_segment::vector_centroid_code_bytes(&offsets_path))
+                    .saturating_add(kosha_segment::vector_centroid_cap_bytes(&offsets_path))
             } else {
                 size(&kosha_core::vector_idx_file(slot))
             });
@@ -2826,6 +2828,19 @@ pub fn segment_embedding_model_mismatch(footer: &Footer, knn: &kosha_core::KnnQu
         .any(|recorded| recorded != model)
 }
 
+/// Whether `query` reads the segments' single-vector columns
+/// (`vector[.n].idx`, `vector[.n].offsets`, and `doc_vectors.bin` for a
+/// legacy footer): a kNN scored by cosine. A late-interaction kNN (#205)
+/// reads only its field's `multivec.{i}` files, so it opens segments as a
+/// lexical query does (sharing their cache entries, and charging no vector
+/// bytes at admission), and the server hydrates no vector column for it.
+pub fn query_reads_vector_columns(query: &SearchQuery) -> bool {
+    query
+        .knn
+        .as_ref()
+        .is_some_and(|knn| !knn.is_late_interaction())
+}
+
 fn late_interaction_params(knn: &kosha_core::KnnQuery) -> kosha_segment::LateInteractionParams {
     kosha_segment::LateInteractionParams {
         nprobe: late_interaction_nprobe(),
@@ -3057,6 +3072,20 @@ fn knn_budget_cutoff_of(
 /// selective filter hydrates whole postings of documents it then rejects.
 pub const DEFAULT_KNN_EXACT_THRESHOLD: usize = 50_000;
 
+/// `KOSHA_KNN_SEGMENT_PRUNE`: `0`, `false` or `off` plans every segment's
+/// centroids even when a segment's score floor shows it cannot hold a
+/// posting inside the probe budget. Default on; see
+/// [`Searcher::with_knn_segment_prune`].
+fn knn_segment_prune_from_env() -> bool {
+    !matches!(
+        std::env::var("KOSHA_KNN_SEGMENT_PRUNE")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("0") | Some("false") | Some("off")
+    )
+}
+
 fn knn_exact_threshold_from_env() -> usize {
     std::env::var("KOSHA_KNN_EXACT_THRESHOLD")
         .ok()
@@ -3203,6 +3232,13 @@ trait KnnPlanSource: Sync {
     /// `lower[i] <= scores()[i] <= upper[i]` for every posting, or `None`
     /// when the segment can only be scored exactly.
     fn score_bounds(&self) -> Option<kosha_segment::KnnCentroidScoreBounds>;
+    /// A value no score in [`Self::scores`] is below, or `None` when the
+    /// segment has no cheap guarantee. Lets the plan leave out a segment
+    /// none of whose postings can be inside the budget without scoring
+    /// it (see [`knn_rank_postings_pruned`]).
+    fn score_floor(&self) -> Option<f32> {
+        None
+    }
 }
 
 /// [`KnnPlanSource`] over an open segment's column.
@@ -3263,6 +3299,11 @@ impl KnnPlanSource for ColumnPlanSource<'_> {
     fn score_bounds(&self) -> Option<kosha_segment::KnnCentroidScoreBounds> {
         self.reader
             .knn_centroid_score_bounds(self.field, self.query, self.alpha)
+    }
+
+    fn score_floor(&self) -> Option<f32> {
+        self.reader
+            .knn_centroid_score_floor(self.field, self.query, self.alpha)
     }
 }
 
@@ -3404,16 +3445,56 @@ fn knn_rank_postings<S: KnnPlanSource>(
     relative: Option<RelativeCutoff>,
     two_stage: bool,
 ) -> KnnRankedPostings {
+    knn_rank_postings_of(sources, None, budget, relative, two_stage)
+}
+
+/// [`knn_rank_postings`], first leaving out, when `prune` is on, every
+/// segment whose score floor shows none of its postings can be inside the
+/// budget ([`knn_rank_postings_pruned`]). The plan is the same either way.
+fn knn_rank_postings_with<S: KnnPlanSource>(
+    sources: &[S],
+    budget: usize,
+    relative: Option<RelativeCutoff>,
+    two_stage: bool,
+    prune: bool,
+) -> KnnRankedPostings {
+    if prune {
+        if let Some(ranked) = knn_rank_postings_pruned(sources, budget, relative, two_stage) {
+            return ranked;
+        }
+    }
+    knn_rank_postings(sources, budget, relative, two_stage)
+}
+
+/// [`knn_rank_postings`] over `sources`, which are all of the query's
+/// postings unless `cutoff_total` says how many there are in all; then
+/// `sources` must hold every posting scoring at or under the `budget`-th
+/// smallest score of all of them (see [`knn_budget_cutoff_of`]), with
+/// `cutoff_total > budget >= 1`.
+fn knn_rank_postings_of<S: KnnPlanSource>(
+    sources: &[S],
+    cutoff_total: Option<usize>,
+    budget: usize,
+    relative: Option<RelativeCutoff>,
+    two_stage: bool,
+) -> KnnRankedPostings {
     let total: usize = sources.iter().map(|s| s.postings()).sum();
-    if two_stage && budget >= 1 && total > budget {
-        if let Some(ranked) = knn_rank_postings_two_stage(sources, total, budget, relative) {
+    if two_stage && budget >= 1 && total >= budget && cutoff_total.unwrap_or(total) > budget {
+        if let Some(ranked) = knn_rank_postings_two_stage(
+            sources,
+            total,
+            cutoff_total.unwrap_or(total),
+            budget,
+            relative,
+        ) {
             return ranked;
         }
     }
     let scores: Vec<Option<Vec<f32>>> = sources.par_iter().map(|s| s.scores()).collect();
     let mut all: Vec<f32> = scores.iter().flatten().flatten().copied().collect();
     let scored = all.len();
-    let (cutoff, rule) = knn_budget_cutoff_of(&mut all, scored, budget, relative);
+    let (cutoff, rule) =
+        knn_budget_cutoff_of(&mut all, cutoff_total.unwrap_or(scored), budget, relative);
     // Hand every probed segment its postings inside the cutoff, ranked
     // (#436). The scores are the ones the cutoff was just picked from, so
     // the segment's ranking and the cutoff cannot drift apart, and the
@@ -3435,11 +3516,14 @@ fn knn_rank_postings<S: KnnPlanSource>(
 }
 
 /// The two-stage half of [`knn_rank_postings`], which holds the proof.
-/// Requires `total > budget >= 1`. `None` when a NaN turned up or a source
-/// could not be scored.
+/// Requires `cutoff_total > budget >= 1` and `total >= budget`, where
+/// `total` is how many postings `sources` have and `cutoff_total` is as
+/// for [`knn_rank_postings_of`] (`total` when `sources` are all of them).
+/// `None` when a NaN turned up or a source could not be scored.
 fn knn_rank_postings_two_stage<S: KnnPlanSource>(
     sources: &[S],
     total: usize,
+    cutoff_total: usize,
     budget: usize,
     relative: Option<RelativeCutoff>,
 ) -> Option<KnnRankedPostings> {
@@ -3543,7 +3627,7 @@ fn knn_rank_postings_two_stage<S: KnnPlanSource>(
     if all.iter().any(|x| x.is_nan()) {
         return None;
     }
-    let (cutoff, rule) = knn_budget_cutoff_of(&mut all, total, budget, relative);
+    let (cutoff, rule) = knn_budget_cutoff_of(&mut all, cutoff_total, budget, relative);
     let rankings = sources
         .par_iter()
         .zip(stage2)
@@ -3569,6 +3653,176 @@ fn knn_rank_postings_two_stage<S: KnnPlanSource>(
         rankings,
         exact_centroids,
     })
+}
+
+/// [`knn_rank_postings`] without scoring the segments that cannot hold a
+/// posting inside the budget. `None` when there is nothing to leave out
+/// or the shortcut cannot be taken; the caller then plans every segment.
+///
+/// # Why the plan is the same
+///
+/// With `s(B)` the `B`-th smallest exact score over all `N > B >= 1`
+/// postings, as in [`knn_rank_postings`]:
+///
+/// 1. Seed: the segments with the smallest floors, until they hold at
+///    least `B` postings. `t`, the `B`-th smallest of their exact scores
+///    (or of their guaranteed upper bounds, with `two_stage`), is
+///    `>= s(B)`: at least `B` scores are `<= t`.
+/// 2. A segment whose floor is `> t` has every score `> s(B)`, so the
+///    segments kept (floor `<= t`, the seed among them) hold every
+///    posting scoring `<= s(B)`, which is what [`knn_rank_postings_of`]
+///    needs to give the cutoff and rule of all `N` postings.
+/// 3. The cutoff is never above `s(B)`, so a segment left out has no
+///    posting inside it and its ranking is empty, as it would be.
+///
+/// A floor that is not a finite positive number is treated as `0`, which
+/// never leaves a segment out. A seed that cannot be scored, or a kept
+/// segment that turns out unscorable, sends the query back to the full
+/// plan, which handles that case.
+fn knn_rank_postings_pruned<S: KnnPlanSource>(
+    sources: &[S],
+    budget: usize,
+    relative: Option<RelativeCutoff>,
+    two_stage: bool,
+) -> Option<KnnRankedPostings> {
+    let total: usize = sources.iter().map(|s| s.postings()).sum();
+    if budget == 0 || total <= budget {
+        return None;
+    }
+    let floors: Vec<f32> = sources
+        .par_iter()
+        .map(|s| {
+            s.score_floor()
+                .filter(|f| f.is_finite() && *f > 0.0)
+                .unwrap_or(0.0)
+        })
+        .collect();
+    if floors.iter().all(|&f| f == 0.0) {
+        return None;
+    }
+    let mut order: Vec<usize> = (0..sources.len()).collect();
+    order.sort_by(|&a, &b| floors[a].total_cmp(&floors[b]).then(a.cmp(&b)));
+    let mut seeds = 0;
+    let mut seeded = 0;
+    while seeded < budget {
+        seeded += sources[order[seeds]].postings();
+        seeds += 1;
+    }
+
+    let mut cached: Vec<Prescored> = (0..sources.len()).map(|_| Prescored::None).collect();
+    let seed_scores: Vec<Prescored> = order[..seeds]
+        .par_iter()
+        .map(|&i| {
+            let source = &sources[i];
+            let n = source.postings();
+            if two_stage {
+                if let Some(bounds) = source
+                    .score_bounds()
+                    .filter(|b| b.lower.len() == n && b.upper.len() == n)
+                {
+                    return Some(Prescored::Bounds(bounds));
+                }
+            }
+            source
+                .scores()
+                .filter(|s| s.len() == n)
+                .map(Prescored::Scores)
+        })
+        .collect::<Option<_>>()?;
+    let mut upper: Vec<f32> = Vec::with_capacity(seeded);
+    for (&i, pre) in order[..seeds].iter().zip(seed_scores) {
+        match &pre {
+            Prescored::Scores(scores) => upper.extend_from_slice(scores),
+            Prescored::Bounds(bounds) => upper.extend_from_slice(&bounds.upper),
+            Prescored::None => {}
+        }
+        cached[i] = pre;
+    }
+    if upper.len() != seeded || upper.iter().any(|x| x.is_nan()) {
+        return None;
+    }
+    let t = *upper.select_nth_unstable_by(budget - 1, f32::total_cmp).1;
+    drop(upper);
+
+    let kept: Vec<usize> = (0..sources.len()).filter(|&i| floors[i] <= t).collect();
+    let kept_sources: Vec<PrescoredSource<'_, S>> = kept
+        .iter()
+        .map(|&i| PrescoredSource {
+            inner: &sources[i],
+            pre: std::mem::replace(&mut cached[i], Prescored::None),
+        })
+        .collect();
+    let ranked = knn_rank_postings_of(&kept_sources, Some(total), budget, relative, two_stage);
+    if ranked.rankings.iter().any(Option::is_none) {
+        return None;
+    }
+    let mut kept_rankings = kept.iter().copied().zip(ranked.rankings).peekable();
+    let rankings = (0..sources.len())
+        .map(|i| match kept_rankings.peek() {
+            Some(&(k, _)) if k == i => kept_rankings.next().and_then(|(_, r)| r),
+            _ => Some(kosha_segment::KnnSegmentRanking::from_candidates(
+                sources[i].postings(),
+                &[],
+                ranked.cutoff,
+                budget,
+            )),
+        })
+        .collect();
+    Some(KnnRankedPostings {
+        cutoff: ranked.cutoff,
+        rule: ranked.rule,
+        rankings,
+        exact_centroids: ranked.exact_centroids,
+    })
+}
+
+/// What [`knn_rank_postings_pruned`] already computed for a seed segment.
+enum Prescored {
+    None,
+    Scores(Vec<f32>),
+    Bounds(kosha_segment::KnnCentroidScoreBounds),
+}
+
+/// A [`KnnPlanSource`] that answers from what was [`Prescored`] for it.
+struct PrescoredSource<'a, S> {
+    inner: &'a S,
+    pre: Prescored,
+}
+
+impl<S: KnnPlanSource> KnnPlanSource for PrescoredSource<'_, S> {
+    fn postings(&self) -> usize {
+        self.inner.postings()
+    }
+
+    fn scores(&self) -> Option<Vec<f32>> {
+        match &self.pre {
+            Prescored::Scores(scores) => Some(scores.clone()),
+            _ => self.inner.scores(),
+        }
+    }
+
+    fn scores_for(&self, postings: &[u32]) -> Option<Vec<f32>> {
+        match &self.pre {
+            Prescored::Scores(scores) => postings
+                .iter()
+                .map(|&p| scores.get(p as usize).copied())
+                .collect(),
+            _ => self.inner.scores_for(postings),
+        }
+    }
+
+    fn score_bounds(&self) -> Option<kosha_segment::KnnCentroidScoreBounds> {
+        match &self.pre {
+            // Exact already: the plan should use the scores, not bounds.
+            Prescored::Scores(_) => None,
+            Prescored::Bounds(bounds) => Some(bounds.clone()),
+            Prescored::None => self.inner.score_bounds(),
+        }
+    }
+
+    fn score_floor(&self) -> Option<f32> {
+        self.inner.score_floor()
+    }
 }
 
 /// Flat kNN search: compute cosine similarity against all stored vectors,
@@ -3856,6 +4110,13 @@ pub struct Searcher {
     /// Two-stage kNN planning over i8 centroid codes; see
     /// [`Searcher::with_knn_plan_i8`]. Default from `KOSHA_KNN_PLAN_I8`.
     knn_plan_i8: bool,
+    knn_namespace_centroids: bool,
+    namespace_centroids: Mutex<Option<CachedNamespaceCentroids>>,
+    namespace_centroid_source: Option<Box<NamespaceCentroidSource>>,
+    /// Leaving segments out of the kNN plan by their score floors; see
+    /// [`Searcher::with_knn_segment_prune`]. Default from
+    /// `KOSHA_KNN_SEGMENT_PRUNE`.
+    knn_segment_prune: bool,
     /// Per-segment rescoring counters (#381): see
     /// [`Searcher::with_knn_rescore_stats`]. Default from
     /// `KOSHA_KNN_RESCORE_STATS`, off.
@@ -3864,6 +4125,14 @@ pub struct Searcher {
 
 /// Weak handles to the readers of one released segment.
 type DrainingReaders = Vec<std::sync::Weak<TrackedSegment>>;
+type NamespaceCentroidSource = dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync;
+
+struct CachedNamespaceCentroids {
+    namespace: NamespaceId,
+    version: u64,
+    loaded_at: Instant,
+    snapshot: Option<Arc<kosha_segment::namespace_centroids::Snapshot>>,
+}
 
 /// Result of a [`Searcher::warm_segments`] pass — how many segments were
 /// newly opened/cached vs. already resident, and the estimated bytes
@@ -3981,6 +4250,10 @@ impl Searcher {
             knn_global_rescore: knn_global_rescore_from_env(),
             knn_global_rescore_max: knn_global_rescore_max_from_env(),
             knn_plan_i8: kosha_segment::knn_plan_i8_from_env(),
+            knn_namespace_centroids: kosha_segment::namespace_centroids::enabled(),
+            namespace_centroids: Mutex::new(None),
+            namespace_centroid_source: None,
+            knn_segment_prune: knn_segment_prune_from_env(),
             knn_rescore_stats: knn_rescore_stats_from_env(),
         }
     }
@@ -4103,6 +4376,73 @@ impl Searcher {
     /// scored exactly whatever this says.
     pub fn with_knn_plan_i8(mut self, on: bool) -> Self {
         self.knn_plan_i8 = on;
+        self
+    }
+
+    pub fn with_knn_namespace_centroids(mut self, on: bool) -> Self {
+        self.knn_namespace_centroids = on;
+        self
+    }
+
+    pub fn with_namespace_centroid_source(
+        mut self,
+        source: impl Fn(&str) -> Option<Vec<u8>> + Send + Sync + 'static,
+    ) -> Self {
+        self.namespace_centroid_source = Some(Box::new(source));
+        self
+    }
+
+    fn namespace_centroid_snapshot(
+        &self,
+        namespace: &NamespaceId,
+        manifest: &Manifest,
+    ) -> Option<Arc<kosha_segment::namespace_centroids::Snapshot>> {
+        use kosha_segment::namespace_centroids::{Snapshot, FILE_NAME};
+        let matches = |snapshot: &Snapshot| {
+            snapshot.matches(
+                manifest.version,
+                manifest.segments.iter().map(|s| s.segment_id.0.as_str()),
+            )
+        };
+        {
+            let cache = self.namespace_centroids.lock().unwrap();
+            if let Some(cached) = cache
+                .as_ref()
+                .filter(|c| c.namespace == *namespace && c.version == manifest.version)
+            {
+                match &cached.snapshot {
+                    Some(snapshot) if matches(snapshot) => return Some(Arc::clone(snapshot)),
+                    None if cached.loaded_at.elapsed() < Duration::from_secs(1) => return None,
+                    _ => {}
+                }
+            }
+        }
+        let path = format!("{}/{FILE_NAME}", namespace.0);
+        let decode = |bytes: Vec<u8>| {
+            serde_json::from_slice::<Snapshot>(&bytes)
+                .ok()
+                .filter(matches)
+        };
+        let snapshot = std::fs::read(self.data_dir.join(&path))
+            .ok()
+            .and_then(decode)
+            .or_else(|| self.namespace_centroid_source.as_ref()?(&path).and_then(decode))
+            .map(Arc::new);
+        *self.namespace_centroids.lock().unwrap() = Some(CachedNamespaceCentroids {
+            namespace: namespace.clone(),
+            version: manifest.version,
+            loaded_at: Instant::now(),
+            snapshot: snapshot.clone(),
+        });
+        snapshot
+    }
+
+    /// Whether kNN planning leaves out, unscored, every segment whose
+    /// centroids all lie so far from the query that none of its postings
+    /// can be inside the probe budget (`KOSHA_KNN_SEGMENT_PRUNE`, default
+    /// on). The plan, and so every result, is the same either way.
+    pub fn with_knn_segment_prune(mut self, on: bool) -> Self {
+        self.knn_segment_prune = on;
         self
     }
 
@@ -4786,11 +5126,6 @@ impl Searcher {
                 })
             })
             .collect();
-        open_stats.knn_centroids.fetch_add(
-            per_segment.iter().filter_map(|info| info.centroids).sum(),
-            Ordering::Relaxed,
-        );
-
         check_knn_field(namespace, knn, per_segment.iter().map(|info| &info.status))?;
 
         // ── exact or probed, per segment ──
@@ -4869,6 +5204,60 @@ impl Searcher {
             }
         });
         let alpha = kosha_segment::knn_probe_radius_alpha();
+        // Restricted searches may refill outside the posting budget and
+        // legacy columns have no stable posting ids. Keep their existing
+        // planner rather than silently dropping any of their candidates.
+        if self.knn_namespace_centroids
+            && !restricted
+            && !prunable
+            && knn.vector.iter().all(|x| x.is_finite())
+            && tombstones.is_none_or(|t| t.values().all(HashSet::is_empty))
+            && knn_relative_cutoff_eps().is_none()
+            && !probed.is_empty()
+            && per_segment.iter().all(|info| {
+                matches!(info.status, VectorFieldStatus::Absent)
+                    || matches!(info.status, VectorFieldStatus::Indexed { dim } if dim != knn.vector.len())
+                    || info.centroids.is_some()
+            })
+        {
+            if let Some(snapshot) = self.namespace_centroid_snapshot(namespace, manifest) {
+                let eligible: HashMap<_, _> = probed
+                    .iter()
+                    .map(|info| (info.segment_id.0.as_str(), info.centroids.unwrap()))
+                    .collect();
+                let directory = &snapshot.directory;
+                if eligible.iter().all(|(&id, &count)| {
+                    directory.posting_count(id, &knn.field, knn.vector.len()) == count
+                }) {
+                    let (hits, scored) = directory.lookup(
+                        &knn.field, &knn.vector, alpha, requested, |id| eligible.contains_key(id),
+                    );
+                    if let Some(last) = hits.last() {
+                        let cutoff = last.score;
+                        let mut selected = HashMap::<&str, Vec<_>>::new();
+                        for hit in hits {
+                            selected.entry(hit.segment).or_default().push((hit.posting, hit.score));
+                        }
+                        plan.rankings = probed.iter().map(|info| {
+                            let id = info.segment_id;
+                            let postings = eligible[id.0.as_str()];
+                            let candidates = selected.get(id.0.as_str()).map_or(&[][..], Vec::as_slice);
+                            (id.clone(), kosha_segment::KnnSegmentRanking::from_candidates(
+                                postings, candidates, cutoff, requested,
+                            ))
+                        }).collect();
+                        plan.cutoff = Some((cutoff, requested));
+                        plan.exact_centroids = scored;
+                        open_stats.knn_centroids.fetch_add(scored, Ordering::Relaxed);
+                        return Ok(plan);
+                    }
+                }
+            }
+        }
+        open_stats.knn_centroids.fetch_add(
+            per_segment.iter().filter_map(|info| info.centroids).sum(),
+            Ordering::Relaxed,
+        );
         let sources: Vec<ColumnPlanSource<'_>> = probed
             .iter()
             .filter_map(|info| {
@@ -4902,7 +5291,13 @@ impl Searcher {
         };
         // Score the centroids, pick the cutoff and rank every probed
         // segment's postings inside it: see `knn_rank_postings`.
-        let ranked = knn_rank_postings(&sources, budget, relative, self.knn_plan_i8);
+        let ranked = knn_rank_postings_with(
+            &sources,
+            budget,
+            relative,
+            self.knn_plan_i8,
+            self.knn_segment_prune,
+        );
         // A segment that could not be scored gets no ranking and ranks its
         // own postings under the cutoff; when none could, there is no
         // cutoff either (as when nothing is probeable).
@@ -5049,7 +5444,7 @@ impl Searcher {
                     // use for this segment, so the two passes share one
                     // cache entry. A segment the filter prunes is never
                     // opened by the scoring pass, so it is opened lexical-only.
-                    let load_vectors = query.knn.is_some()
+                    let load_vectors = query_reads_vector_columns(query)
                         && query.segment_may_match_filters(footer.filter_blooms.as_ref());
                     let reader = self
                         .open_segment(
@@ -5500,12 +5895,14 @@ impl Searcher {
 
         // Lexical/BM25 queries (no query.knn) never touch vectors or the
         // HNSW graph — skip loading both so keyword search latency stops
-        // scaling with embedding volume/segment count.
+        // scaling with embedding volume/segment count. Neither does a
+        // late-interaction kNN (#205): it reads the multivec files, which
+        // need no vector columns (see `query_reads_vector_columns`).
         let reader = self.open_segment(
             &namespace.0,
             &entry.segment_id.0,
             seg_dir,
-            query.knn.is_some(),
+            query_reads_vector_columns(query),
             manifest_footer,
             Some(permit),
             Some(open_stats),
@@ -7581,14 +7978,18 @@ impl Searcher {
         } else {
             let load_modes: &[bool] = match query.multi_rrf() {
                 Some(rrf) => match (
-                    rrf.queries.iter().any(|q| q.knn.is_some()),
-                    rrf.queries.iter().any(|q| q.knn.is_none()),
+                    rrf.queries
+                        .iter()
+                        .any(|q| q.knn.as_ref().is_some_and(|knn| !knn.is_late_interaction())),
+                    rrf.queries
+                        .iter()
+                        .any(|q| q.knn.as_ref().is_none_or(|knn| knn.is_late_interaction())),
                 ) {
                     (true, true) => &[false, true],
                     (true, false) => &[true],
                     _ => &[false],
                 },
-                None => &[query.knn.is_some()],
+                None => &[query_reads_vector_columns(query)],
             };
             Some(self.admit_search(namespace, manifest, load_modes)?)
         };
@@ -11284,6 +11685,7 @@ mod tests {
     use kosha_core::{DocumentId, Field, ManifestEntry, SegmentId, SortOrder};
     use kosha_segment::SegmentWriter;
 
+    mod knn_plan_prune;
     mod knn_plan_two_stage;
 
     /// #195: each requested field is marked up with its own tags; a
@@ -12382,11 +12784,13 @@ mod tests {
                     .map(|f| on_disk(d, f))
                     .sum::<u64>();
             if load_vectors {
-                // The sidecar's centroids, and the i8 codes of them that
-                // the open derives (resident, but in no file; their size
-                // is checked against a loaded column in kosha-segment).
+                // The sidecar's centroids, and the i8 codes and centroid
+                // cap the open derives from them (resident, but in no file;
+                // their sizes are checked against a loaded column in
+                // kosha-segment).
                 t += on_disk(d, "vector.offsets")
-                    + kosha_segment::vector_centroid_code_bytes(&d.join("vector.offsets"));
+                    + kosha_segment::vector_centroid_code_bytes(&d.join("vector.offsets"))
+                    + kosha_segment::vector_centroid_cap_bytes(&d.join("vector.offsets"));
             }
             t
         };
