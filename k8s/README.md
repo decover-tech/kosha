@@ -235,9 +235,12 @@ Before applying it:
    `/etc/kosha/tls`.
 2. Move every other client of port 8080 to `https://` and configure trust for
    the internal CA. HTTPS is per port, so the pod no longer answers plain
-   HTTP there. The segment GC and stage compaction CronJobs already mount
-   the CA and use HTTPS; update external clients of `kosha-service` before
-   the rollout. Include the hostnames those clients use in the certificate SANs.
+   HTTP there. The component switches segment GC to HTTPS and mounts its CA;
+   the stage compaction CronJob already does both. Overlays that don't include
+   the component leave segment GC on HTTP for legacy images or explicit local
+   opt-out. Include the component before upgrading those overlays to the
+   TLS-required release. Update external clients of `kosha-service` before
+   the rollout and include their hostnames in the certificate SANs.
 3. Check the Prometheus scrape job. `/metrics` is on the same port, so it
    is HTTPS-only too (it needs no client certificate). The component adds
    `prometheus.io/scheme: https` next to the existing `prometheus.io/*`
