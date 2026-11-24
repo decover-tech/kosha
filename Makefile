@@ -218,6 +218,10 @@ db-migrate: db-bootstrap
 	psql "$$KOSHA_DB_URL" -v ON_ERROR_STOP=1 -f crates/kosha-control/migrations/006_orgs_users_projects.sql; \
 	psql "$$KOSHA_DB_URL" -v ON_ERROR_STOP=1 -f crates/kosha-control/migrations/007_billing.sql; \
 	psql "$$KOSHA_DB_URL" -v ON_ERROR_STOP=1 -f crates/kosha-control/migrations/008_tenant_kms_keys.sql; \
+	psql "$$KOSHA_DB_URL" -v ON_ERROR_STOP=1 -f crates/kosha-control/migrations/008_identity_sessions.sql; \
+	psql "$$KOSHA_DB_URL" -v ON_ERROR_STOP=1 -f crates/kosha-control/migrations/009_api_key_scrub.sql; \
+	psql "$$KOSHA_DB_URL" -v ON_ERROR_STOP=1 -f crates/kosha-control/migrations/010_namespace_lifecycle.sql; \
+	psql "$$KOSHA_DB_URL" -v ON_ERROR_STOP=1 -f crates/kosha-control/migrations/011_billing_ledger.sql; \
 	psql "$$KOSHA_DB_URL" -v ON_ERROR_STOP=1 -f crates/kosha-control/migrations/002_grant_kosha_role.sql
 
 # ── All ────────────────────────────────────────────────────────────────────

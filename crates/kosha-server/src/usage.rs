@@ -11,8 +11,28 @@
 //! - An accepted document write (`/documents`, legacy `/index` and
 //!   `/replace`) emits `bytes_written` and `documents_written`, on the pod
 //!   that executed it (a query pod forwards writes and emits nothing).
+//! - An applied delete by query emits `documents_deleted` and
+//!   `bytes_deleted` (the deleted records' bytes in the doc store), on the
+//!   pod that executed it.
 //! - A pod that accepts writes snapshots each namespace's `stored_bytes`
-//!   once an hour ([`run_snapshot_tick`]).
+//!   and `vector_dimensions` once an hour ([`run_snapshot_tick`]).
+//!
+//! # Vector dimensions
+//!
+//! `vector_dimensions` is `dim x vectors` summed over the vector columns
+//! (and `dim x tokens` over the late-interaction fields) of every segment
+//! the manifest references and owns. The numbers are in each segment's
+//! footer (`Footer::vector_fields`, `Footer::multi_vectors`), not in the
+//! manifest, and a segment never changes once written, so each segment's
+//! footer is read once (from the manifest's in-memory footer cache, the
+//! local `footer.json`, or object storage, in that order) and its number
+//! kept for as long as a manifest lists it. An hourly snapshot then costs
+//! one map lookup per segment. The manifest and segment formats are
+//! unchanged. A segment written before vector columns existed (#204) has
+//! no per-column inventory in its footer and counts 0 until compaction
+//! rewrites it. A footer that cannot be read skips the namespace's
+//! vector snapshot for that tick (retried at the next one) without holding
+//! back its `stored_bytes` snapshot: the two are separate events.
 //!
 //! The billable "bytes scanned" meter is not emitted per search. Bytes
 //! fetched depend on what happened to be cached, and nothing in the engine
@@ -34,7 +54,8 @@
 //! What survives what:
 //! - Store unreachable: events wait in the spool, up to
 //!   `KOSHA_USAGE_SPOOL_MAX_BYTES`; beyond that new events are dropped and
-//!   counted (`dropped_events` in `GET /v1/admin/usage`).
+//!   counted (`dropped_events` in `GET /v1/admin/usage`, and
+//!   `kosha_usage_events_dropped_total` on `/metrics`).
 //! - Process crash or restart on the same disk: files left by the old
 //!   process are adopted and sent at startup.
 //! - Host crash, or a pod replaced with an empty disk: events appended
@@ -93,6 +114,8 @@ struct Spool {
     max_bytes: u64,
     nonce: String,
     inner: Mutex<SpoolInner>,
+    /// Bytes waiting, mirrored for `/metrics` after every change.
+    depth: Arc<PipelineStats>,
 }
 
 #[derive(Default)]
@@ -106,7 +129,7 @@ struct SpoolInner {
 impl Spool {
     /// Open the spool, adopting whatever an earlier process left: its
     /// sealed files as they are, and its active file sealed as it stands.
-    fn open(dir: PathBuf, max_bytes: u64, nonce: String) -> Self {
+    fn open(dir: PathBuf, max_bytes: u64, nonce: String, depth: Arc<PipelineStats>) -> Self {
         if let Err(e) = std::fs::create_dir_all(&dir) {
             eprintln!(
                 "WARN: usage metering: cannot create spool dir {}: {e}",
@@ -133,6 +156,7 @@ impl Spool {
             max_bytes,
             nonce,
             inner: Mutex::new(SpoolInner::default()),
+            depth,
         };
         let adopted: u64 = spool
             .sealed_files()
@@ -140,8 +164,18 @@ impl Spool {
             .filter_map(|path| std::fs::metadata(path).ok())
             .map(|meta| meta.len())
             .sum();
-        spool.inner.lock().unwrap().sealed_bytes = adopted;
+        {
+            let mut inner = spool.inner.lock().unwrap();
+            inner.sealed_bytes = adopted;
+            spool.mirror(&inner);
+        }
         spool
+    }
+
+    fn mirror(&self, inner: &SpoolInner) {
+        self.depth
+            .spool_bytes
+            .store(inner.active_bytes + inner.sealed_bytes, Ordering::Relaxed);
     }
 
     fn active_path(&self) -> PathBuf {
@@ -177,6 +211,7 @@ impl Spool {
             return false;
         }
         inner.active_bytes += len;
+        self.mirror(&inner);
         true
     }
 
@@ -227,6 +262,7 @@ impl Spool {
     fn released(&self, len: u64) {
         let mut inner = self.inner.lock().unwrap();
         inner.sealed_bytes = inner.sealed_bytes.saturating_sub(len);
+        self.mirror(&inner);
     }
 
     fn bytes(&self) -> u64 {
@@ -295,13 +331,44 @@ pub(crate) struct UsageMeter {
     next_id: AtomicU64,
     flush_interval: Duration,
     snapshot_tick: Duration,
-    /// Root namespace -> the hour this process last snapshotted it.
+    /// Root namespace -> the hour this process last snapshotted its
+    /// `stored_bytes`.
     snapshotted: Mutex<HashMap<String, u64>>,
-    spooled_events: AtomicU64,
-    dropped_events: AtomicU64,
-    delivered_events: AtomicU64,
-    malformed_lines: AtomicU64,
+    /// The same for `vector_dimensions`.
+    vector_snapshotted: Mutex<HashMap<String, u64>>,
+    /// Segment (logical dir) -> its vector dimensions, read once from its
+    /// footer. Kept for the segments the last tick saw.
+    segment_vector_dims: Mutex<HashMap<String, u64>>,
+    stats: Arc<PipelineStats>,
     last_flush_error: Mutex<Option<String>>,
+}
+
+/// This pod's usage pipeline counters, shared with the `/metrics`
+/// collector (`pipeline_metrics.rs`).
+#[derive(Debug, Default)]
+pub(crate) struct PipelineStats {
+    /// Events the pod tried to spool (spooled + dropped).
+    pub emitted: AtomicU64,
+    pub spooled: AtomicU64,
+    /// Events delivered to the store (a resent row it already had
+    /// included).
+    pub delivered: AtomicU64,
+    pub dropped: AtomicU64,
+    pub malformed_lines: AtomicU64,
+    /// Flushes that failed (store or spool error).
+    pub sink_errors: AtomicU64,
+    /// Bytes waiting in the spool.
+    pub spool_bytes: AtomicU64,
+    /// Unix ms of the last flush that delivered everything; 0 never.
+    pub last_flush_ok_ms: AtomicU64,
+    pub snapshot_runs: AtomicU64,
+    pub stored_snapshots: AtomicU64,
+    pub vector_snapshots: AtomicU64,
+    /// Namespace snapshots a tick could not take (listing or footer
+    /// failure); retried at the next tick.
+    pub snapshot_failures: AtomicU64,
+    /// Segment footers read for `vector_dimensions` (cache misses).
+    pub footer_reads: AtomicU64,
 }
 
 impl UsageMeter {
@@ -323,19 +390,24 @@ impl UsageMeter {
         } else {
             format!("{host}-{nonce}")
         };
+        let stats = Arc::new(PipelineStats::default());
         Self {
             store,
-            spool: Spool::open(config.spool_dir, config.spool_max_bytes, nonce),
+            spool: Spool::open(
+                config.spool_dir,
+                config.spool_max_bytes,
+                nonce,
+                Arc::clone(&stats),
+            ),
             flush_lock: Mutex::new(()),
             id_prefix,
             next_id: AtomicU64::new(0),
             flush_interval: config.flush_interval,
             snapshot_tick: config.snapshot_tick,
             snapshotted: Mutex::new(HashMap::new()),
-            spooled_events: AtomicU64::new(0),
-            dropped_events: AtomicU64::new(0),
-            delivered_events: AtomicU64::new(0),
-            malformed_lines: AtomicU64::new(0),
+            vector_snapshotted: Mutex::new(HashMap::new()),
+            segment_vector_dims: Mutex::new(HashMap::new()),
+            stats,
             last_flush_error: Mutex::new(None),
         }
     }
@@ -370,11 +442,12 @@ impl UsageMeter {
     fn emit(&self, event: &UsageEvent) -> bool {
         let mut line = serde_json::to_vec(event).expect("UsageEvent serializes");
         line.push(b'\n');
+        self.stats.emitted.fetch_add(1, Ordering::Relaxed);
         if self.spool.append(&line) {
-            self.spooled_events.fetch_add(1, Ordering::Relaxed);
+            self.stats.spooled.fetch_add(1, Ordering::Relaxed);
             true
         } else {
-            if self.dropped_events.fetch_add(1, Ordering::Relaxed) == 0 {
+            if self.stats.dropped.fetch_add(1, Ordering::Relaxed) == 0 {
                 eprintln!(
                     "ERROR: usage metering: dropping events (spool {} full or unwritable); \
                      see dropped_events in GET /v1/admin/usage",
@@ -383,6 +456,11 @@ impl UsageMeter {
             }
             false
         }
+    }
+
+    /// The pipeline counters, for `/metrics`.
+    pub(crate) fn stats(&self) -> Arc<PipelineStats> {
+        Arc::clone(&self.stats)
     }
 
     /// The store this meter delivers to (billing reads usage from it).
@@ -421,6 +499,26 @@ impl UsageMeter {
         });
     }
 
+    /// An applied delete by query of `documents` documents from `ns`,
+    /// whose records held `bytes` in the doc store. Nothing is emitted for
+    /// a delete that matched nothing.
+    pub(crate) fn record_delete(&self, ns: &NamespaceId, documents: u64, bytes: u64) {
+        if documents == 0 {
+            return;
+        }
+        let (tenant, namespace) = usage_identity(ns);
+        self.emit(&UsageEvent {
+            id: self.next_event_id(),
+            tenant,
+            namespace,
+            at_ms: unix_millis(),
+            meters: BTreeMap::from([
+                (meter::DOCUMENTS_DELETED.to_string(), documents),
+                (meter::BYTES_DELETED.to_string(), bytes),
+            ]),
+        });
+    }
+
     /// Seal the spool and send every sealed file to the store, oldest
     /// first. Stops at the first file the store refuses; that file and the
     /// ones after it stay for the next flush.
@@ -430,11 +528,15 @@ impl UsageMeter {
         let mut last = self.last_flush_error.lock().unwrap();
         match &result {
             Ok(_) => {
+                self.stats
+                    .last_flush_ok_ms
+                    .store(unix_millis(), Ordering::Relaxed);
                 if last.take().is_some() {
                     println!("usage metering: delivery recovered");
                 }
             }
             Err(e) => {
+                self.stats.sink_errors.fetch_add(1, Ordering::Relaxed);
                 if last.is_none() {
                     eprintln!("WARN: usage metering: delivery failed, events stay spooled: {e}");
                 }
@@ -469,9 +571,11 @@ impl UsageMeter {
                 return Err(format!("remove {}: {e}", path.display()));
             }
             self.spool.released(data.len() as u64);
-            self.delivered_events
+            self.stats
+                .delivered
                 .fetch_add(events.len() as u64, Ordering::Relaxed);
-            self.malformed_lines
+            self.stats
+                .malformed_lines
                 .fetch_add(malformed as u64, Ordering::Relaxed);
             report.files += 1;
             report.events += events.len();
@@ -494,10 +598,10 @@ impl UsageMeter {
     /// Delivery counters of this pod, for the admin read.
     fn pipeline_json(&self) -> serde_json::Value {
         serde_json::json!({
-            "spooled_events": self.spooled_events.load(Ordering::Relaxed),
-            "delivered_events": self.delivered_events.load(Ordering::Relaxed),
-            "dropped_events": self.dropped_events.load(Ordering::Relaxed),
-            "malformed_lines": self.malformed_lines.load(Ordering::Relaxed),
+            "spooled_events": self.stats.spooled.load(Ordering::Relaxed),
+            "delivered_events": self.stats.delivered.load(Ordering::Relaxed),
+            "dropped_events": self.stats.dropped.load(Ordering::Relaxed),
+            "malformed_lines": self.stats.malformed_lines.load(Ordering::Relaxed),
             "spool_bytes": self.spool.bytes(),
             "last_flush_error": *self.last_flush_error.lock().unwrap(),
         })
@@ -562,7 +666,7 @@ pub(crate) fn documents_logical_bytes(documents: &[kosha_core::Document]) -> u64
 /// list (local-only mode, or a flush not uploaded yet). `None` when the
 /// manifest is not loaded or the listing failed: no snapshot is better
 /// than a wrong one.
-fn namespace_stored_bytes(state: &AppState, ns: &NamespaceId) -> Option<u64> {
+pub(crate) fn namespace_stored_bytes(state: &AppState, ns: &NamespaceId) -> Option<u64> {
     let manifest = state.indexer.manifest_shared(ns)?;
     owned_segment_bytes(state, ns, &manifest, false)
 }
@@ -610,9 +714,93 @@ pub(crate) fn owned_segment_bytes(
     })
 }
 
-/// Emit the `stored_bytes` snapshot of hour `now_ms / HOUR_MS` for every
-/// namespace this process has not snapshotted in that hour yet. Returns
-/// how many it emitted.
+/// Vector dimensions stored by the segment `footer` describes: `dim x
+/// count` per vector column plus `dim x tokens` per late-interaction field.
+pub(crate) fn footer_vector_dimensions(footer: &kosha_core::Footer) -> u64 {
+    let columns: u64 = footer
+        .vector_fields
+        .iter()
+        .flatten()
+        .map(|field| u64::from(field.dim).saturating_mul(u64::from(field.count)))
+        .fold(0, u64::saturating_add);
+    let bags: u64 = footer
+        .multi_vectors
+        .iter()
+        .map(|field| u64::from(field.dim).saturating_mul(field.tokens))
+        .fold(0, u64::saturating_add);
+    columns.saturating_add(bags)
+}
+
+/// Read a segment's footer for its vector dimensions: from the manifest's
+/// footer cache, the local `footer.json`, or object storage.
+fn read_segment_vector_dimensions(
+    state: &AppState,
+    manifest: &kosha_core::Manifest,
+    ns: &NamespaceId,
+    segment: &kosha_core::SegmentId,
+) -> Option<u64> {
+    if let Some(footer) = manifest.segment_footers.get(segment) {
+        return Some(footer_vector_dimensions(footer));
+    }
+    let local = manifest.segment_dir(&state.data_dir, ns, segment);
+    if let Ok(footer) = kosha_segment::SegmentReader::read_footer(&local) {
+        return Some(footer_vector_dimensions(&footer));
+    }
+    #[cfg(feature = "s3")]
+    if let Some(ref s3) = state.s3_storage {
+        let path = format!("{}/footer.json", manifest.segment_rel_dir(ns, segment));
+        let footer = s3.read_remote(&path).and_then(|bytes| {
+            serde_json::from_slice::<kosha_core::Footer>(&bytes).map_err(KoshaError::from)
+        });
+        return match footer {
+            Ok(footer) => Some(footer_vector_dimensions(&footer)),
+            Err(e) => {
+                eprintln!("WARN: usage metering: cannot read footer {path}: {e}");
+                None
+            }
+        };
+    }
+    eprintln!(
+        "WARN: usage metering: cannot read the footer of {}/{}",
+        ns.0, segment.0
+    );
+    None
+}
+
+/// `vector_dimensions` of the segments `ns`'s manifest references and
+/// owns, from `cache` (segment logical dir -> dimensions, earlier ticks)
+/// or the segment's footer, recording every segment it used in `seen`.
+/// `None` when the manifest is not loaded or a footer could not be read.
+fn namespace_vector_dimensions(
+    state: &AppState,
+    meter: &UsageMeter,
+    ns: &NamespaceId,
+    cache: &HashMap<String, u64>,
+    seen: &mut HashMap<String, u64>,
+) -> Option<u64> {
+    let manifest = state.indexer.manifest_shared(ns)?;
+    let mut total = 0u64;
+    for entry in &manifest.segments {
+        if manifest.is_inherited_segment(ns, &entry.segment_id) {
+            continue;
+        }
+        let key = manifest.segment_rel_dir(ns, &entry.segment_id);
+        let dims = match cache.get(&key).or_else(|| seen.get(&key)) {
+            Some(dims) => *dims,
+            None => {
+                meter.stats.footer_reads.fetch_add(1, Ordering::Relaxed);
+                read_segment_vector_dimensions(state, &manifest, ns, &entry.segment_id)?
+            }
+        };
+        seen.insert(key, dims);
+        total = total.saturating_add(dims);
+    }
+    Some(total)
+}
+
+/// Emit the `stored_bytes` and `vector_dimensions` snapshots of hour
+/// `now_ms / HOUR_MS` for every namespace this process has not snapshotted
+/// in that hour yet. Returns how many `stored_bytes` snapshots it emitted.
 ///
 /// The event id is `stored/<tenant>/<namespace>/<hour>` and its time is the
 /// start of the hour, so a second snapshot of the same hour (this pod after
@@ -623,6 +811,7 @@ pub(crate) fn run_snapshot_tick(state: &AppState, now_ms: u64) -> usize {
     let Some(meter) = state.usage.as_ref() else {
         return 0;
     };
+    meter.stats.snapshot_runs.fetch_add(1, Ordering::Relaxed);
     let hour = now_ms / HOUR_MS;
     let mut roots: BTreeMap<String, Vec<NamespaceId>> = BTreeMap::new();
     for ns in state.indexer.namespaces() {
@@ -631,36 +820,76 @@ pub(crate) fn run_snapshot_tick(state: &AppState, now_ms: u64) -> usize {
             .or_default()
             .push(ns);
     }
-    meter
-        .snapshotted
-        .lock()
-        .unwrap()
-        .retain(|root, at| *at == hour && roots.contains_key(root));
+    for done in [&meter.snapshotted, &meter.vector_snapshotted] {
+        done.lock()
+            .unwrap()
+            .retain(|root, at| *at == hour && roots.contains_key(root));
+    }
+    // Footers read in earlier ticks. Only the segments this tick sees are
+    // kept, so a segment no manifest lists any more is forgotten.
+    let cache = std::mem::take(&mut *meter.segment_vector_dims.lock().unwrap());
+    let mut seen: HashMap<String, u64> = HashMap::new();
     let mut emitted = 0;
     for (root, members) in roots {
-        if meter.snapshotted.lock().unwrap().contains_key(&root) {
+        let (tenant, namespace) = usage_identity(&NamespaceId(root.clone()));
+        if !meter.snapshotted.lock().unwrap().contains_key(&root) {
+            match members
+                .iter()
+                .map(|ns| namespace_stored_bytes(state, ns))
+                .sum::<Option<u64>>()
+            {
+                Some(bytes) => {
+                    let spooled = meter.emit(&UsageEvent {
+                        id: format!("stored/{root}/{hour}"),
+                        tenant: tenant.clone(),
+                        namespace: namespace.clone(),
+                        at_ms: hour * HOUR_MS,
+                        meters: BTreeMap::from([(meter::STORED_BYTES.to_string(), bytes)]),
+                    });
+                    if spooled {
+                        meter.snapshotted.lock().unwrap().insert(root.clone(), hour);
+                        meter.stats.stored_snapshots.fetch_add(1, Ordering::Relaxed);
+                        emitted += 1;
+                    }
+                }
+                // Retried next tick.
+                None => {
+                    meter
+                        .stats
+                        .snapshot_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        // Walked even when this hour's vector snapshot is taken, so the
+        // namespace's segments stay in the cache (map lookups only).
+        let vectors = members
+            .iter()
+            .map(|ns| namespace_vector_dimensions(state, meter, ns, &cache, &mut seen))
+            .sum::<Option<u64>>();
+        if meter.vector_snapshotted.lock().unwrap().contains_key(&root) {
             continue;
         }
-        let Some(bytes) = members
-            .iter()
-            .map(|ns| namespace_stored_bytes(state, ns))
-            .sum::<Option<u64>>()
-        else {
+        let Some(dims) = vectors else {
+            meter
+                .stats
+                .snapshot_failures
+                .fetch_add(1, Ordering::Relaxed);
             continue; // retried next tick
         };
-        let (tenant, namespace) = usage_identity(&NamespaceId(root.clone()));
         let spooled = meter.emit(&UsageEvent {
-            id: format!("stored/{root}/{hour}"),
+            id: format!("vectors/{root}/{hour}"),
             tenant,
             namespace,
             at_ms: hour * HOUR_MS,
-            meters: BTreeMap::from([(meter::STORED_BYTES.to_string(), bytes)]),
+            meters: BTreeMap::from([(meter::VECTOR_DIMENSIONS.to_string(), dims)]),
         });
         if spooled {
-            meter.snapshotted.lock().unwrap().insert(root, hour);
-            emitted += 1;
+            meter.vector_snapshotted.lock().unwrap().insert(root, hour);
+            meter.stats.vector_snapshots.fetch_add(1, Ordering::Relaxed);
         }
     }
+    *meter.segment_vector_dims.lock().unwrap() = seen;
     emitted
 }
 

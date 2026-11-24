@@ -2,7 +2,7 @@
 //! disposable database:
 //! KOSHA_TEST_DATABASE_URL=... cargo test -p kosha-control --features postgres --test postgres_api_keys -- --ignored
 #![cfg(feature = "postgres")]
-use kosha_control::{hash_api_key, NewApiKey, PgStore, Scope, Scopes};
+use kosha_control::{hash_api_key, LockoutGuard, NewApiKey, PgStore, Scope, Scopes};
 
 fn url() -> String {
     std::env::var("KOSHA_TEST_DATABASE_URL").expect("set a dedicated test database URL")
@@ -428,11 +428,15 @@ fn operator_credentials_and_tenant_keys_never_mix() {
     assert!(operators.iter().any(|c| &c.key_hash == credential_id));
     assert!(operators.iter().all(|c| &c.key_hash != key_id));
     assert!(store
-        .revoke_operator_credentials(OperatorCredentials::KeyHash(key_id), "operator")
+        .revoke_operator_credentials(
+            OperatorCredentials::KeyHash(key_id),
+            "operator",
+            LockoutGuard::Off
+        )
         .unwrap()
         .is_empty());
     assert!(store
-        .rotate_operator_credential(key_id, 60, None, "operator")
+        .rotate_operator_credential(key_id, 60, None, "operator", LockoutGuard::Off)
         .unwrap()
         .is_none());
     assert_eq!(store.validate_api_key(&key.api_key), Some(t.clone()));
@@ -468,7 +472,13 @@ fn operator_credentials_rotate_and_revoke_with_an_audit_trail() {
     // credential kept only for the overlap.
     let before = now();
     let rotated = store
-        .rotate_operator_credential(&first.record.key_hash, 600, None, &by_alice)
+        .rotate_operator_credential(
+            &first.record.key_hash,
+            600,
+            None,
+            &by_alice,
+            LockoutGuard::Off,
+        )
         .unwrap()
         .expect("active credential");
     assert_ne!(rotated.new.api_key, first.api_key);
@@ -496,6 +506,7 @@ fn operator_credentials_rotate_and_revoke_with_an_audit_trail() {
         .revoke_operator_credentials(
             OperatorCredentials::KeyHash(&first.record.key_hash),
             &by_alice,
+            LockoutGuard::Off,
         )
         .unwrap();
     assert_eq!(
@@ -506,24 +517,41 @@ fn operator_credentials_rotate_and_revoke_with_an_audit_trail() {
     assert!(store
         .revoke_operator_credentials(
             OperatorCredentials::KeyHash(&first.record.key_hash),
-            &by_alice
+            &by_alice,
+            LockoutGuard::Off
         )
         .unwrap()
         .is_empty());
     assert!(store
-        .rotate_operator_credential(&first.record.key_hash, 600, None, &by_alice)
+        .rotate_operator_credential(
+            &first.record.key_hash,
+            600,
+            None,
+            &by_alice,
+            LockoutGuard::Off
+        )
         .unwrap()
         .is_none());
 
     // Offboarding: every credential of the operator, by name. Rotate once
     // more first, so there are two to revoke.
     let again = store
-        .rotate_operator_credential(&rotated.new.record.key_hash, 600, None, "operator")
+        .rotate_operator_credential(
+            &rotated.new.record.key_hash,
+            600,
+            None,
+            "operator",
+            LockoutGuard::Off,
+        )
         .unwrap()
         .unwrap();
     assert_eq!(mine(&store).len(), 2);
     let mut gone = store
-        .revoke_operator_credentials(OperatorCredentials::Operator(&alice), "operator:bob")
+        .revoke_operator_credentials(
+            OperatorCredentials::Operator(&alice),
+            "operator:bob",
+            LockoutGuard::Off,
+        )
         .unwrap();
     gone.sort();
     let mut expected = vec![
@@ -668,4 +696,116 @@ fn create_rotate_and_revoke_are_audited_without_secrets() {
             assert!(!detail.contains(secret.as_str()), "{detail}");
         }
     }
+}
+
+/// The self-service variants (#346): bound to one tenant, and audited as
+/// whoever made the change.
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn tenant_bound_changes_name_their_actor_and_stay_in_their_tenant() {
+    let store = PgStore::new(&url()).unwrap();
+    let (t, other) = (tenant("self"), tenant("other"));
+    let by_key = "api_key:0123456789ab";
+    let mine = store.create_api_key_as(&full_access(&t), by_key).unwrap();
+    let theirs = store.create_api_key(&full_access(&other)).unwrap();
+    assert_eq!(
+        store.get_api_key(&mine.record.key_hash).unwrap(),
+        Some(mine.record.clone())
+    );
+
+    // Another tenant's key is out of reach, by rotation and by revocation.
+    assert!(store
+        .rotate_api_key_as(&theirs.record.key_hash, Some(&t), 60, None, by_key)
+        .unwrap()
+        .is_none());
+    assert!(!store
+        .revoke_api_key_as(&theirs.record.key_hash, Some(&t), by_key)
+        .unwrap());
+    assert_eq!(store.validate_api_key(&theirs.api_key), Some(other.clone()));
+
+    let rotated = store
+        .rotate_api_key_as(
+            &mine.record.key_hash,
+            Some(&t),
+            60,
+            Some(now() + 600),
+            by_key,
+        )
+        .unwrap()
+        .expect("own key");
+    assert_eq!(rotated.new.record.tenant_id, t);
+    assert!(store
+        .revoke_api_key_as(&rotated.new.record.key_hash, Some(&t), by_key)
+        .unwrap());
+    assert_eq!(
+        store.get_api_key(&rotated.new.record.key_hash).unwrap(),
+        None
+    );
+
+    // An operator credential is never created through the tenant path.
+    let mut operator_row = full_access(&kosha_control::api_keys::operator_tenant_id("x"));
+    operator_row.scopes = Scopes::NONE;
+    assert!(store.create_api_key_as(&operator_row, by_key).is_err());
+
+    let actors: Vec<(String, String)> = sql(
+        "SELECT actor, action FROM kosha.audit_log WHERE target_id = $1 ORDER BY id",
+        &[&t],
+    );
+    assert_eq!(
+        actors,
+        vec![
+            (by_key.to_string(), "api_key.created".to_string()),
+            (by_key.to_string(), "api_key.rotated".to_string()),
+            (by_key.to_string(), "api_key.revoked".to_string()),
+        ]
+    );
+}
+
+/// The lock-out guard (#346) never stands in the way of a change that
+/// leaves another usable credential. (The refusals themselves depend on
+/// every operator credential in the database, which other tests share, so
+/// they are covered by `api_keys::check_lockout`'s unit tests.)
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn the_lockout_guard_lets_through_what_keeps_an_operator_in() {
+    use kosha_control::OperatorCredentials;
+    let store = PgStore::new(&url()).unwrap();
+    let (alice, bob) = (operator("alice"), operator("bob"));
+    let a = store
+        .create_operator_credential(&alice, "", None, "operator")
+        .unwrap()
+        .unwrap();
+    store
+        .create_operator_credential(&bob, "", None, "operator")
+        .unwrap()
+        .unwrap();
+    // Bob (no expiry) stays: rotating alice to a short-lived credential and
+    // then revoking her are both fine.
+    let rotated = store
+        .rotate_operator_credential(
+            &a.record.key_hash,
+            0,
+            Some(now() + 60),
+            "operator",
+            LockoutGuard::On,
+        )
+        .unwrap()
+        .unwrap();
+    let revoked = store
+        .revoke_operator_credentials(
+            OperatorCredentials::Operator(&alice),
+            "operator",
+            LockoutGuard::On,
+        )
+        .unwrap();
+    assert!(revoked
+        .iter()
+        .any(|(hash, _)| hash == &rotated.new.record.key_hash));
+    store
+        .revoke_operator_credentials(
+            OperatorCredentials::Operator(&bob),
+            "operator",
+            LockoutGuard::Off,
+        )
+        .unwrap();
 }
