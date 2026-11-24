@@ -24,6 +24,7 @@ mod point;
 mod posting;
 mod quant;
 mod rabitq;
+pub mod replication;
 mod rng;
 mod search;
 

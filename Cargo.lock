@@ -2112,6 +2112,7 @@ dependencies = [
  "clap",
  "kosha-core",
  "kosha-segment",
+ "kosha-vector-spfresh",
  "rayon",
  "serde",
  "serde_json",
