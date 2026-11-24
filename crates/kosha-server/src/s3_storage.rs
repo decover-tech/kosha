@@ -837,6 +837,37 @@ impl S3Storage {
         join_s3_key(&self.prefix, path)
     }
 
+    pub(crate) fn read_uncached(&self, path: &str) -> Result<Vec<u8>, KoshaError> {
+        self.rt.block_on(Self::read_remote_bytes(
+            &self.client,
+            &self.bucket,
+            &self.s3_key(path),
+        ))
+    }
+
+    pub(crate) fn namespace_centroid_source(
+        &self,
+    ) -> impl Fn(&str) -> Option<Vec<u8>> + Send + Sync + 'static {
+        let runtime = self.rt.handle().clone();
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let prefix = self.prefix.clone();
+        move |path| {
+            let key = join_s3_key(&prefix, path);
+            runtime
+                .block_on(Self::read_remote_bytes(&client, &bucket, &key))
+                .ok()
+        }
+    }
+
+    pub(crate) fn upload_namespace_centroids(
+        &self,
+        path: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(), KoshaError> {
+        self.upload_bytes(bytes, path)
+    }
+
     /// Upload a locally-built segment directory and commit it (#231): every
     /// data file first, in sorted order, then the `_COMMIT` marker last,
     /// listing each file's size and CRC32. Only a segment whose `_COMMIT`
@@ -1133,38 +1164,9 @@ impl S3Storage {
 
     /// Download a file from S3 to local cache.
     fn download_from_s3(&self, s3_key: &str, local_path: &Path) -> Result<Vec<u8>, KoshaError> {
-        let client = self.client.clone();
-        let bucket = self.bucket.clone();
-        let key = s3_key.to_string();
-
-        let data = self.rt.block_on(async move {
-            let resp = client
-                .get_object()
-                .bucket(&bucket)
-                .key(&key)
-                .send()
-                .await
-                .map_err(|e| {
-                    KoshaError::NotFound(format!(
-                        "S3 get_object: {}",
-                        log_get_object_error(&key, &e)
-                    ))
-                })?;
-
-            let bytes = resp
-                .body
-                .collect()
-                .await
-                .map_err(|e| {
-                    KoshaError::NotFound(format!(
-                        "S3 read body: {}",
-                        log_s3_error("read body", &key, &e)
-                    ))
-                })?
-                .into_bytes();
-            Ok::<Vec<u8>, KoshaError>(bytes.to_vec())
-        })?;
-
+        let data = self
+            .rt
+            .block_on(Self::read_remote_bytes(&self.client, &self.bucket, s3_key))?;
         if let Some(parent) = local_path.parent() {
             kosha_core::create_dir_named(parent)?;
         }
@@ -1177,8 +1179,36 @@ impl S3Storage {
                 local_path.display()
             )
         })?;
-
         Ok(data)
+    }
+
+    async fn read_remote_bytes(
+        client: &aws_sdk_s3::Client,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Vec<u8>, KoshaError> {
+        let resp = client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| {
+                KoshaError::NotFound(format!("S3 get_object: {}", log_get_object_error(key, &e)))
+            })?;
+
+        let bytes = resp
+            .body
+            .collect()
+            .await
+            .map_err(|e| {
+                KoshaError::NotFound(format!(
+                    "S3 read body: {}",
+                    log_s3_error("read body", key, &e)
+                ))
+            })?
+            .into_bytes();
+        Ok(bytes.to_vec())
     }
 
     /// List object key basenames (and sizes) under a logical (unprefixed)

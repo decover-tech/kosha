@@ -518,6 +518,53 @@ def test_knn_query_text_is_passed_through_for_server_side_embedding():
     assert "query_text" in message
 
 
+def test_knn_vectors_and_scoring_are_passed_through_for_late_interaction():
+    bag = [[0.1] * 16, [0.2] * 16, [0.3] * 16]
+    kosha = translate(
+        {
+            "size": 10,
+            "query": {
+                "knn": {
+                    "tokens": {
+                        "vectors": bag,
+                        "scoring": "late_interaction",
+                        "k": 10,
+                        "num_candidates": 50,
+                        "filter": {"bool": {"must": [scope_filter()]}},
+                    }
+                }
+            },
+        }
+    )
+    knn = kosha["knn"]
+    assert knn["field"] == "tokens"
+    assert knn["vectors"] == bag
+    assert knn["scoring"] == "late_interaction"
+    assert "vector" not in knn and "query_text" not in knn
+    assert knn["k"] == 10 and knn["num_candidates"] == 50
+    assert knn["filter"] == {"bool": {"must": [SCOPE_KOSHA]}}
+
+    # Without `scoring` the server infers late interaction from `vectors`;
+    # tuples are sent as lists.
+    kosha = translate({"knn": {"tokens": {"vectors": [tuple(bag[0])]}}})
+    assert kosha["knn"]["vectors"] == [bag[0]]
+    assert "scoring" not in kosha["knn"]
+
+    # `scoring` with a single `vector` (a one-token bag) is passed as is.
+    kosha = translate(
+        {"query": {"knn": {"tokens": {"vector": bag[0], "scoring": "late_interaction"}}}}
+    )
+    assert kosha["knn"]["vector"] == bag[0]
+    assert kosha["knn"]["scoring"] == "late_interaction"
+
+    assert "vectors" in refused(
+        {"query": {"knn": {"tokens": {"vector": bag[0], "vectors": bag}}}}
+    )
+    assert "query_text" in refused(
+        {"query": {"knn": {"tokens": {"vectors": bag, "query_text": "x"}}}}
+    )
+
+
 def test_knn_filter_that_cannot_be_expressed_refuses_the_search():
     message = refused(
         {
