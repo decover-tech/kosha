@@ -9072,6 +9072,26 @@ fn existing_ids_in(
     namespace: &NamespaceId,
     ids: &[kosha_core::DocumentId],
 ) -> Result<std::collections::HashSet<kosha_core::DocumentId>, String> {
+    let version = state.indexer.published_version(namespace);
+    let first = lookup_existing_ids(state, namespace, ids);
+    // A separate compactor can retire segments still in the ingest manifest.
+    // Rebase once on a newer publication without dropping the ingest buffer.
+    if matches!(&first, Err((true, _)))
+        && state.ingest_host.is_none()
+        && state.refresh_write_manifest(namespace).is_ok()
+        && state.indexer.published_version(namespace) > version
+    {
+        return lookup_existing_ids(state, namespace, ids).map_err(|(_, response)| response);
+    }
+    first.map_err(|(_, response)| response)
+}
+
+/// The error includes whether a missing segment can be retried on a newer manifest.
+fn lookup_existing_ids(
+    state: &AppState,
+    namespace: &NamespaceId,
+    ids: &[kosha_core::DocumentId],
+) -> Result<std::collections::HashSet<kosha_core::DocumentId>, (bool, String)> {
     // Existence scans immutable segments, so materialize any S3-backed
     // segment directories before entering the indexer lock. Batched across
     // the whole manifest — see handle_index for why this isn't a per-segment
@@ -9090,14 +9110,16 @@ fn existing_ids_in(
             // fetch them.
             let outcome = state.ensure_segments_local(&paths, true);
             if let Some(error) = hydration_error_response(&outcome) {
-                return Err(error);
+                return Err((!outcome.shed && !outcome.missing.is_empty(), error));
             }
         }
     }
-    state
-        .indexer
-        .existing_ids(namespace, ids)
-        .map_err(|e| api_error(ErrorCode::Internal, &format!("exists error: {e}")))
+    state.indexer.existing_ids(namespace, ids).map_err(|e| {
+        (
+            matches!(e, KoshaError::SegmentNotFound(_)),
+            api_error(ErrorCode::Internal, &format!("exists error: {e}")),
+        )
+    })
 }
 
 // ─── POST /replace ──────────────────────────────────────────────────────────
@@ -21436,6 +21458,52 @@ mod tests {
             "{response}"
         );
         assert!(response.contains("\"missing\":[\"absent\"]"), "{response}");
+    }
+
+    #[test]
+    fn exists_recovers_after_remote_compaction_and_keeps_buffered_documents() {
+        let shared = shared_store();
+        let ns = NamespaceId("test/compacted".into());
+        let ingest = test_state();
+        let compactor = test_state();
+        for state in [&ingest, &compactor] {
+            *state.controller.lock().unwrap() = Box::new(shared.clone());
+        }
+        write_and_flush(&compactor, &ns, "a");
+        write_and_flush(&compactor, &ns, "b");
+        compactor.publish_namespace(&ns).unwrap();
+        let before = shared.manifest_cloned(&ns).unwrap();
+        index_one(&ingest, &ns.0, "buffered");
+        ingest.indexer.restore_manifest(ns.clone(), before.clone());
+
+        assert!(
+            compactor
+                .indexer
+                .compact_namespace_with_options(&ns, kosha_write::CompactOptions::full())
+                .unwrap()
+                .merged
+        );
+        compactor.publish_namespace(&ns).unwrap();
+        let after = shared.manifest_cloned(&ns).unwrap();
+        assert!(segment_set(&before).is_disjoint(&segment_set(&after)));
+        for segment in &after.segments {
+            copy_dir(
+                &after.segment_dir(&compactor.data_dir, &ns, &segment.segment_id),
+                &after.segment_dir(&ingest.data_dir, &ns, &segment.segment_id),
+            );
+        }
+
+        let response = route(
+            "POST /v1/namespaces/compacted/exists HTTP/1.1\r\n",
+            &HashMap::new(),
+            br#"{"ids":["a","b","buffered","missing"]}"#,
+            "test",
+            &ingest,
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let body = json_body(&response);
+        assert_eq!(body["existing"], serde_json::json!(["a", "b", "buffered"]));
+        assert_eq!(body["missing"], serde_json::json!(["missing"]));
     }
 
     #[test]
