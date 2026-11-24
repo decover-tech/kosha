@@ -268,6 +268,7 @@ Read once in `crates/kosha-query/src/lib.rs`.
 | `KOSHA_BM25_STATS` | Server-wide BM25 statistics scope: `namespace` or `segment` (debugging). A request's `bm25_params.stats` overrides it | `namespace` | enum |
 | `KOSHA_EXACT_TOTAL_HITS` | Default for `exact_total_hits` when a request omits it | off | flag |
 | `KOSHA_TOTAL_HITS_CAP` | Default `total_hits` cap (`relation: gte` above it). `0` is treated as `1` | `10000` | hits |
+| `KOSHA_TWO_TIER_QUERY` | Set to `exact` to try head-only certification on eligible v8 BM25 queries (#387); when off or uncertified, read full postings | off | enum |
 
 ## kNN / vector search
 
@@ -803,6 +804,7 @@ before rolling back, until every reader understands the newer one. Read once in
 | `KOSHA_FIELD_INDEX` | Per-field inverted indexes (#249); `off` writes segments exactly as before. Set it and compact before rolling back past #249 | on | flag (default on) |
 | `KOSHA_FILTERS_WRITE_VERSION` | Filter index written: `1` (`filters.bin`) or `2` (columnar `filters.toc` + `filters-NNN.col`, #244) (`filter_columns.rs`) | `1` | version |
 | `KOSHA_POSTINGS_RAW_BLOBS` | Leave `postings-*.bin` shards uncompressed so a cold query can fetch term spans by range (#245); `0` keeps compressing them | on | flag |
+| `KOSHA_TWO_TIER_HEAD_FRACTION` | A fraction in `(0, 1)` opts new segment writers into v8 head/tail postings (#387), overriding the ordinary postings format. Enable only once every reader supports v8; disable and compact before rolling back | unset | fraction |
 
 ## Reranking
 

@@ -1132,7 +1132,9 @@ pub fn approx_segment_bytes(seg_dir: &std::path::Path, load_vectors: bool) -> u6
     };
 
     // Always resident: the parsed footer and the inverted index's TOC.
-    let mut total = size("footer.json").saturating_add(size("inverted.idx"));
+    let mut total = size("footer.json")
+        .saturating_add(size("inverted.idx"))
+        .saturating_add(kosha_segment::tier_metadata_heap_bytes(seg_dir));
 
     // Resident: the offsets index (lazy) or the whole store (legacy eager).
     let doc_offsets = size("doc_store.offsets");
@@ -2282,6 +2284,7 @@ fn score_fuzzy_query(
     params: Bm25Params,
     combined: &Bm25Scorer,
     rejected: &dyn Fn(u32) -> bool,
+    span_fetch: Option<VectorSpanFetch<'_>>,
 ) -> Result<HashMap<u32, f64>, KoshaError> {
     let field_index = reader.field_index();
     // A segment without per-field indexes (before #249) answers a field
@@ -2318,12 +2321,13 @@ fn score_fuzzy_query(
                 &mut ExpandStats::default(),
             );
             let keys: Vec<String> = expansions.iter().map(|e| e.key.clone()).collect();
+            let _tier_holds = reader.fetch_tier_tails(keys.iter().map(String::as_str), span_fetch);
             let edits_of: HashMap<&str, u8> = expansions
                 .iter()
                 .map(|e| (e.key.as_str(), e.edits))
                 .collect();
-            let postings = reader.postings_for_terms(&keys);
-            if reader.take_blob_read_failure() {
+            let postings = reader.read_postings_for_terms(&keys)?;
+            if !reader.is_tiered() && reader.take_blob_read_failure() {
                 return Err(KoshaError::CorruptSegment(format!(
                     "segment {segment}: posting blob unreadable for a fuzzy expansion \
                      (evicted or corrupt) — retry after rehydration"
@@ -2410,6 +2414,7 @@ fn score_field_query(
     params: Bm25Params,
     combined: &Bm25Scorer,
     rejected: &dyn Fn(u32) -> bool,
+    span_fetch: Option<VectorSpanFetch<'_>>,
 ) -> Result<HashMap<u32, f64>, KoshaError> {
     let Some(field_index) = reader.field_index() else {
         return Ok(HashMap::new());
@@ -2462,11 +2467,15 @@ fn score_field_query(
         });
     }
 
+    let _tier_holds = reader.fetch_tier_tails(
+        slots.values().flatten().map(|(_, key)| key.as_str()),
+        span_fetch,
+    );
     let mut matched: Option<HashMap<u32, f64>> = None;
     for keys in slots.values() {
         let mut slot_scores: HashMap<u32, f64> = HashMap::new();
         for (i, key) in keys {
-            let Some(postings) = reader.postings(key) else {
+            let Some(postings) = reader.read_postings(key)? else {
                 continue;
             };
             let field = &scoring[*i];
@@ -2488,7 +2497,7 @@ fn score_field_query(
                     field.boost * scorer.score_term(posting.term_frequency, df, length);
             }
         }
-        if reader.take_blob_read_failure() {
+        if !reader.is_tiered() && reader.take_blob_read_failure() {
             return Err(KoshaError::CorruptSegment(format!(
                 "segment {segment}: posting blob unreadable for a present field term \
                  (evicted or corrupt) — retry after rehydration"
@@ -3915,6 +3924,7 @@ pub struct Searcher {
     /// default; only tests and benches turn it off, to compare against
     /// per-segment pruning — see [`Searcher::set_global_wand_threshold`].
     global_wand: std::sync::atomic::AtomicBool,
+    two_tier_exact: bool,
     /// Per-segment score-ceiling inputs per manifest version (issue #248).
     ceilings: CeilingCache,
     /// Readers of retired segments, released from the cache by
@@ -4059,6 +4069,7 @@ impl Searcher {
             ledger: Arc::new(MemoryLedger::new(max_live_bytes, admission_timeout)),
             corpus_stats: CorpusStatsCache::default(),
             global_wand: std::sync::atomic::AtomicBool::new(true),
+            two_tier_exact: std::env::var("KOSHA_TWO_TIER_QUERY").as_deref() == Ok("exact"),
             ceilings: CeilingCache::default(),
             draining: Mutex::new(HashMap::new()),
             knn_exact_threshold: knn_exact_threshold_from_env(),
@@ -4092,6 +4103,12 @@ impl Searcher {
 
     pub fn set_global_wand_threshold(&self, enabled: bool) {
         self.global_wand.store(enabled, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn with_two_tier_exact(mut self, enabled: bool) -> Self {
+        self.two_tier_exact = enabled;
+        self
     }
 
     /// Forget everything cached in memory for the namespaces `matches`
@@ -5534,6 +5551,9 @@ impl Searcher {
                     ) else {
                         return unknown();
                     };
+                    if reader.is_tiered() {
+                        return unknown();
+                    }
                     let slot_of = |term: &str| missing.iter().position(|t| t == term);
                     // A term the TOC has whose postings do not come back
                     // was unreadable: its ceiling stays unknown. (The
@@ -5873,6 +5893,42 @@ impl Searcher {
         let field_query = analysis
             .fields()
             .filter(|_| analysis.has_text() && !is_wildcard_mode && reader.field_index().is_some());
+        let restricted_phrase = analysis
+            .phrase_fields()
+            .zip(query.match_phrase.as_ref())
+            .zip(reader.field_index());
+        let _tier_holds = if reader.is_tiered() && (has_query || multi_reading) {
+            if self.two_tier_exact
+                && !multi_reading
+                && wand_eligible_query(query, analysis.has_text())
+                && (operator == kosha_core::QueryOperator::Or || effective_terms.len() == 1)
+            {
+                if let Some(output) = two_tier::certify_segment(
+                    &reader,
+                    &effective_terms,
+                    &scorer,
+                    query.collect_depth(),
+                    count_budget,
+                    restricted,
+                    &rejected,
+                )? {
+                    return Ok(Some(output));
+                }
+            }
+            if query.fuzzy.is_none()
+                && field_query.is_none()
+                && restricted_phrase.is_none()
+                && !multi_reading
+                && !missing_required_term
+            {
+                let terms = phrase_tokenized.unwrap_or(&effective_terms);
+                Some(reader.fetch_tier_tails(terms.iter().map(String::as_str), vector_fetch))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         if let Some(ref fuzzy) = query.fuzzy {
             let scored = score_fuzzy_query(
                 &reader,
@@ -5884,6 +5940,7 @@ impl Searcher {
                 params.clone(),
                 &scorer,
                 &rejected,
+                vector_fetch,
             )?;
             for (doc_seq, score) in scored {
                 if reader.doc_meta(doc_seq).is_some() {
@@ -5901,6 +5958,7 @@ impl Searcher {
                 params.clone(),
                 &scorer,
                 &rejected,
+                vector_fetch,
             )?;
             for (doc_seq, score) in scored {
                 if reader.doc_meta(doc_seq).is_some() {
@@ -6047,7 +6105,8 @@ impl Searcher {
                     // Alongside each source, the `df` its scores and block
                     // ceilings use (namespace-level unless segment stats).
                     let (score_dfs, sources): (Vec<u32>, Vec<ScoringBlocks<'_>>) = reader
-                        .scoring_postings_for_terms(terms_for_bm25)
+                        .read_scoring_postings_for_terms(terms_for_bm25)
+                        .ok()?
                         .into_iter()
                         .map(|(term, scoring)| {
                             let source = ScoringBlocks::new(scoring);
@@ -6055,7 +6114,7 @@ impl Searcher {
                             (scorer.doc_frequency(term, segment_df), source)
                         })
                         .unzip();
-                    if reader.take_blob_read_failure() {
+                    if !reader.is_tiered() && reader.take_blob_read_failure() {
                         // A TOC-present term's blob shard was unreadable —
                         // fall through to the general path, whose refetch
                         // either succeeds or surfaces a hard error. Serving
@@ -6690,6 +6749,9 @@ impl Searcher {
                                  scorer: &Bm25Scorer,
                                  lengths: Option<&[u32]>|
              -> Result<HashMap<u32, f64>, KoshaError> {
+                let _tier_holds = (multi_reading || restricted_phrase.is_some()).then(|| {
+                    reader.fetch_tier_tails(terms_for_bm25.iter().map(String::as_str), vector_fetch)
+                });
                 let length_of = |doc_seq: u32, combined: u32| -> u32 {
                     match lengths {
                         Some(lengths) => lengths.get(doc_seq as usize).copied().unwrap_or(0),
@@ -6702,8 +6764,8 @@ impl Searcher {
                 // — see `SegmentReader::postings`. Fetched once per term here
                 // and held for the whole scoring pass either way.
                 let term_postings: Vec<(&str, kosha_segment::PostingsRef<'_>)> =
-                    reader.postings_for_terms(terms_for_bm25);
-                if reader.take_blob_read_failure() {
+                    reader.read_postings_for_terms(terms_for_bm25)?;
+                if !reader.is_tiered() && reader.take_blob_read_failure() {
                     // A term the TOC contains could not be served (blob shard
                     // evicted/corrupt). Erroring here — instead of scoring
                     // without the term — is what keeps eviction races from
@@ -6838,9 +6900,11 @@ impl Searcher {
                     // the once-per-term discipline matters for real: the decoded
                     // handles are bound first (they must outlive the maps, which
                     // borrow position slices out of them).
-                    let phrase_postings_data: Vec<Option<kosha_segment::PostingsRef<'_>>> =
-                        phrase_terms.iter().map(|pt| reader.postings(pt)).collect();
-                    if reader.take_blob_read_failure() {
+                    let phrase_postings_data = phrase_terms
+                        .iter()
+                        .map(|pt| reader.read_postings(pt))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if !reader.is_tiered() && reader.take_blob_read_failure() {
                         // Same contract as the scoring fetch above: an
                         // unreadable blob for a TOC-present phrase term must
                         // error, not silently fail the phrase.
@@ -6895,10 +6959,6 @@ impl Searcher {
 
                 Ok(scored)
             };
-            let restricted_phrase = analysis
-                .phrase_fields()
-                .zip(query.match_phrase.as_ref())
-                .zip(reader.field_index());
             let scored = if let Some(((phrase_fields, mp), field_index)) = restricted_phrase {
                 // A phrase restricted to fields (#249): matched in each
                 // field's own postings, read with that field's chain and
@@ -7666,6 +7726,8 @@ impl Searcher {
     /// probe in parallel, so their calls overlap (one round trip of wall
     /// time); a restricted probe that runs past its budget calls again for
     /// the next few postings.
+    /// On tiered lexical segments the same callback can also fetch
+    /// required ranges of `tail-00.bin`.
     pub fn search_with_hydrators(
         &self,
         namespace: &NamespaceId,
