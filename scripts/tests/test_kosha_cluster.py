@@ -432,6 +432,20 @@ def test_upgrade_fixes_forward_past_a_failed_digest_pinned_ingest(kubectl, capsy
     assert set_image("kosha-indexer", fixed) in calls
 
 
+def test_upgrade_with_digest_pin_still_refuses_known_rollbacks(kubectl, capsys):
+    invoke, _, responses, _ = kubectl
+    digest = "registry.example:5000/kosha@sha256:" + "a" * 64
+    prime(responses, query=NEW, ingest=NEW, indexer=digest, ready=False,
+          indexer_replicas=0)
+    assert invoke("upgrade", "--image", OLD, "--confirm-forward-only") == 1
+    assert "refusing to roll back" in capsys.readouterr().err
+    prime(responses, query=OLD, ingest=NEW, indexer=digest, ready=False,
+          indexer_replicas=0)
+    assert invoke("upgrade", "--image", digest[:-1] + "b",
+                  "--confirm-forward-only") == 1
+    assert "mixed images" in capsys.readouterr().err
+
+
 def test_upgrade_refuses_reader_older_than_writer(kubectl, capsys):
     invoke, _, responses, _ = kubectl
     prime(responses, query=OLD, ingest=NEW, indexer="registry.example:5000/kosha:1.0.0")

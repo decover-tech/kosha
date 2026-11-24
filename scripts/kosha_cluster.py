@@ -257,6 +257,7 @@ def plan_upgrade(deployments: dict[str, dict], target: str, wal_mode: str,
     ):
         raise mixed
     versions = [release_version(image) for image in rest]
+    known = [v for v in versions if v is not None]
     if len(set(rest)) > 1:
         if None in versions and not args.confirm_forward_only:
             raise ValueError(
@@ -264,17 +265,16 @@ def plan_upgrade(deployments: dict[str, dict], target: str, wal_mode: str,
                 "after checking each role's image is at least as new as the next "
                 "role's and the target is not older. " + UPGRADE_NOTE
             )
-        if None not in versions and any(a < b for a, b in zip(versions, versions[1:])):
+        if any(a < b for a, b in zip(known, known[1:])):
             raise mixed
     new = release_version(target)
-    if rest and new and None not in versions:
-        if any(new < old for old in versions):
-            raise ValueError(
-                f"refusing to roll back to {target} (running {found}): older readers "
-                "cannot read the new manifest object or v2/v3 WAL frames, and "
-                "rolling back requires converting both formats. " + UPGRADE_NOTE
-            )
-    elif rest and not args.confirm_forward_only:
+    if rest and new and any(new < old for old in known):
+        raise ValueError(
+            f"refusing to roll back to {target} (running {found}): older readers "
+            "cannot read the new manifest object or v2/v3 WAL frames, and "
+            "rolling back requires converting both formats. " + UPGRADE_NOTE
+        )
+    if rest and (new is None or None in versions) and not args.confirm_forward_only:
         raise ValueError(
             f"cannot order {found} and {target} by release tag. Pass "
             "--confirm-forward-only after checking the target is not older."
