@@ -8,6 +8,7 @@ pub use compaction::{
 };
 
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -2289,6 +2290,7 @@ impl Indexer {
             .unwrap_or(0);
 
         if let Some(builds) = vector_profile {
+            let mut stderr = std::io::stderr().lock();
             for build in builds.lock().unwrap().iter() {
                 if let Some(profile) = &build.rewrite_profile {
                     let event = serde_json::json!({
@@ -2298,7 +2300,7 @@ impl Indexer {
                         "lire": build.lire,
                         "rewrite": profile,
                     });
-                    eprintln!("vector_compaction_profile {event}");
+                    let _ = writeln!(stderr, "vector_compaction_profile {event}");
                 }
             }
         }
