@@ -130,6 +130,94 @@ fn ids(body: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
+#[cfg(feature = "onnx")]
+#[test]
+fn onnx_embeds_ingest_and_search_with_a_persisted_model() {
+    use base64::Engine;
+
+    // ONNX opset 13: mask IDs, gather two-dimensional word vectors, and sum
+    // them into a sentence vector. Red and blue have orthogonal vectors.
+    let graph = base64::engine::general_purpose::STANDARD
+        .decode(concat!(
+            "CAg6zwIKLAoJaW5wdXRfaWRzCg5hdHRlbnRpb25fbWFzaxIKbWFza2VkX2lkcyIDTXVsCiYKB3dlaWdodHMKCm1hc2tl",
+            "ZF9pZHMSB3ZlY3RvcnMiBkdhdGhlcgo/Cgd2ZWN0b3JzCgRheGVzEhJzZW50ZW5jZV9lbWJlZGRpbmciCVJlZHVjZVN1",
+            "bSoPCghrZWVwZGltcxgAoAECEg53b3JkX2VtYmVkZGluZyoxCgIEAhABIiAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8A",
+            "AAAAAAAAAEIHd2VpZ2h0cyoOCgEBEAc6AQFCBGF4ZXNaIAoOYXR0ZW50aW9uX21hc2sSDgoMCAcSCAoCCAEKAggEWhsK",
+            "CWlucHV0X2lkcxIOCgwIBxIICgIIAQoCCARiJAoSc2VudGVuY2VfZW1iZWRkaW5nEg4KDAgBEggKAggBCgIIAkICEA0=",
+        ))
+        .unwrap();
+    let dir = test_dir();
+    let model_path = dir.join("model.onnx");
+    let tokenizer_path = dir.join("tokenizer.json");
+    std::fs::write(&model_path, graph).unwrap();
+    std::fs::write(
+        &tokenizer_path,
+        serde_json::json!({
+            "version": "1.0",
+            "pre_tokenizer": {"type": "Whitespace"},
+            "model": {"type": "WordLevel", "unk_token": "[UNK]",
+                "vocab": {"[PAD]": 0, "red": 1, "blue": 2, "[UNK]": 3}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let model_config = serde_json::json!({"words@1": {
+        "model_path": model_path, "tokenizer_path": tokenizer_path, "sequence_length": 4
+    }});
+    let state = state_with(EmbedderRegistry::from_lookup(|key| match key {
+        "KOSHA_EMBEDDING_PROVIDERS" => Some("onnx".into()),
+        "KOSHA_EMBEDDING_ONNX_MODELS" => Some(model_config.to_string()),
+        _ => None,
+    }));
+    assert_eq!(state.embedders.providers(), ["onnx"]);
+    let mut schema = serde_json::json!({"fields": {"emb": {"type": "FIELD_TYPE_VECTOR",
+        "embedding": {"model": "words@1", "dims": 2, "distance_metric": "cosine", "provider": "onnx"}
+    }}});
+    let (status, body) = call(
+        &state,
+        "POST /v1/namespaces",
+        serde_json::json!({"namespace": "local", "schema": schema}),
+    );
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = index_texts(&state, "local", &[("first", "blue"), ("second", "red")]);
+    assert_eq!(status, 200, "{body}");
+    flush(&state, "local");
+    let (status, body) = knn_text(&state, "local", "red red red red red");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        ids(&body).first().map(String::as_str),
+        Some("second"),
+        "{body}"
+    );
+    let (status, body) = knn_text(&state, "local", "blue");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        ids(&body).first().map(String::as_str),
+        Some("first"),
+        "{body}"
+    );
+
+    let manifest = state
+        .indexer
+        .manifest(&NamespaceId("acme/local".into()))
+        .unwrap();
+    let persisted = serde_json::to_value(manifest).unwrap();
+    let embedding = &persisted["schema"]["fields"]["emb"]["embedding"];
+    assert_eq!(embedding["model"], "words@1");
+    assert_eq!(embedding["distance_metric"], "cosine");
+    schema["fields"]["emb"]["embedding"]["model"] = "words@2".into();
+    let (status, body) = put_schema(&state, "local", schema);
+    assert_eq!(status, 409, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("requires a reindex"),
+        "{body}"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 const DOCS: &[(&str, &str)] = &[
     ("shoes", "red trail running shoes"),
     ("jacket", "blue running jacket for winter"),
@@ -258,6 +346,14 @@ fn changing_the_model_of_an_indexed_field_is_a_conflict() {
     assert_eq!(status, 400);
     let (status, _) = put_schema(&state, "pin", schema("mock-a", 5000));
     assert_eq!(status, 400);
+    let mut unsupported = schema("mock-a", 32);
+    unsupported["fields"]["emb"]["embedding"]["distance_metric"] = "euclidean".into();
+    let (status, body) = put_schema(&state, "pin", unsupported);
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("distance_metric"),
+        "{body}"
+    );
 }
 
 #[test]

@@ -8403,7 +8403,7 @@ fn parse_namespace_schema(value: &serde_json::Value) -> Result<serde_json::Value
                     };
                     canonical.insert("analyzer".into(), serde_json::json!(analyzers));
                 }
-                "stopwords" => {
+                "stopwords" | "embedding" => {
                     canonical.insert(key.clone(), v.clone());
                 }
                 other => return Err(format!("schema field '{name}' has unknown key '{other}'")),

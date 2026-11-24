@@ -816,16 +816,38 @@ field opts in through the namespace schema
 then embeds text sent for that field at ingest and `knn.query_text` at query time. Ingest and
 query pods need the same settings; an `indexer` pod needs none (compaction copies vectors and
 never embeds). A schema naming a model this pod has no provider for answers
-`503` to text writes and `query_text` searches; namespaces without a declared model never call a
+`501` to text writes and `query_text` searches; namespaces without a declared model never call a
 provider. The API key is never logged or returned.
 
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
-| `KOSHA_EMBEDDING_PROVIDERS` | Enabled providers: `http` (OpenAI-compatible server) and/or `mock` (deterministic hashed bag of words, for tests and local development only) | unset (no native embedding) | list |
+| `KOSHA_EMBEDDING_PROVIDERS` | Enabled providers: `onnx` (local CPU inference), `http` (OpenAI-compatible server) and/or `mock` (deterministic hashed bag of words, for tests and local development only) | unset (no native embedding) | list |
+| `KOSHA_EMBEDDING_ONNX_MODELS` | Map of model IDs to local artifact paths and sequence lengths. Required for `onnx` | unset | JSON object |
 | `KOSHA_EMBEDDING_URL` | Base URL of the OpenAI-compatible server; `/embeddings` is appended. Required for `http` | unset | URL |
 | `KOSHA_EMBEDDING_API_KEY` | Sent as `Authorization: Bearer ...` | unset | string |
 | `KOSHA_EMBEDDING_TIMEOUT_MS` | Timeout of one provider request | `10000` | ms |
 | `KOSHA_EMBEDDING_BATCH_SIZE` | Texts per provider request | `64` | count |
+
+### Local ONNX models
+
+Build with `cargo build --release -p kosha-server --features onnx`. Enable
+`KOSHA_EMBEDDING_PROVIDERS=onnx` and supply a JSON model map, for example:
+
+```json
+{"my-model@1": {"model_path": "/models/my-model/model.onnx", "tokenizer_path": "/models/my-model/tokenizer.json", "sequence_length": 128}}
+```
+
+Set the field's `embedding` to `{"model":"my-model@1","dims":384,"distance_metric":"cosine","provider":"onnx"}`.
+Kosha loads local files on first use; it does not download artifacts. The ONNX graph must take
+`int64` `input_ids` and `attention_mask`, with optional `token_type_ids`, shaped
+`[1, sequence_length]`, and output one pooled `float32` tensor shaped `[1, dims]`. A
+tokenizer export must supply padding settings or contain a `[PAD]` token. Inputs are truncated
+and padded to the configured sequence length (1–512). Graphs that output per-token embeddings
+need to be exported with pooling before they can be used here.
+
+Mount identical artifacts and use the same sequence length on every ingest and query pod.
+Treat a model ID as immutable: use a new ID for a different graph, tokenizer, or sequence length,
+and reindex before serving queries against that new model.
 
 ## CLI and Python client
 
