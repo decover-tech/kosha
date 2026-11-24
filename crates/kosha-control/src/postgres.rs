@@ -10,6 +10,8 @@ use kosha_core::{
     ControlStore, Footer, KoshaError, Manifest, ManifestEntry, NamespaceId, SegmentId,
 };
 use serde::{Deserialize, Serialize};
+use sqlx::postgres::{PgConnection, PgPoolOptions};
+use std::future::Future;
 use std::time::Duration;
 
 /// Postgres-backed store.
@@ -35,6 +37,68 @@ struct SegmentEntry {
 
 fn control_plane_error(e: sqlx::Error) -> KoshaError {
     KoshaError::ControlPlane(e.to_string())
+}
+
+async fn is_writable(conn: &mut PgConnection) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT NOT pg_is_in_recovery() AND current_setting('transaction_read_only') = 'off'",
+    )
+    .fetch_one(conn)
+    .await
+}
+
+pub(crate) fn writer_pool_options() -> PgPoolOptions {
+    PgPoolOptions::new()
+        .test_before_acquire(false)
+        .before_acquire(|conn, _| Box::pin(is_writable(conn)))
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                if is_writable(conn).await? {
+                    Ok(())
+                } else {
+                    Err(sqlx::Error::Protocol(
+                        "Postgres endpoint is read-only".into(),
+                    ))
+                }
+            })
+        })
+}
+
+fn transient_pg_error(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut => true,
+        sqlx::Error::Database(error) => error.code().is_some_and(|code| {
+            code.starts_with("08")
+                || matches!(
+                    code.as_ref(),
+                    "57P01" | "57P02" | "57P03" | "25006" | "40001" | "40P01"
+                )
+        }),
+        _ => false,
+    }
+}
+
+async fn retry_pg<T, F: Future<Output = Result<T, sqlx::Error>>>(
+    mut operation: impl FnMut() -> F,
+) -> Result<T, sqlx::Error> {
+    for delay_ms in [25, 75] {
+        match operation().await {
+            Err(error) if transient_pg_error(&error) => {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            result => return result,
+        }
+    }
+    operation().await
+}
+
+async fn retry_manifest_read<T, F: Future<Output = Result<T, sqlx::Error>>>(
+    operation: impl FnMut() -> F,
+) -> Result<T, KoshaError> {
+    tokio::time::timeout(Duration::from_secs(2), retry_pg(operation))
+        .await
+        .map_err(|_| KoshaError::ControlPlane("Postgres manifest read timed out".into()))?
+        .map_err(control_plane_error)
 }
 
 fn decode_manifest(version: u64, segments_json: &str) -> Option<Manifest> {
@@ -313,7 +377,7 @@ impl PgStore {
 
         let pool = rt
             .block_on(
-                sqlx::postgres::PgPoolOptions::new()
+                writer_pool_options()
                     .max_connections(5)
                     .acquire_timeout(Duration::from_secs(10))
                     .connect(database_url),
@@ -419,6 +483,11 @@ impl PgStore {
 }
 
 impl ControlStore for PgStore {
+    fn check_writable(&self) -> Result<(), KoshaError> {
+        self.rt
+            .block_on(crate::writer_lease::check_writable(&self.pool))
+    }
+
     fn create_namespace(&mut self, id: NamespaceId) -> Result<(), KoshaError> {
         let id_str = id.0.clone();
         self.rt.block_on(async {
@@ -490,12 +559,12 @@ impl ControlStore for PgStore {
     fn manifest_version(&self, id: &NamespaceId) -> Result<Option<u64>, KoshaError> {
         let id_str = id.0.clone();
         self.rt.block_on(async {
-            let row: Option<(i64,)> =
+            let row: Option<(i64,)> = retry_manifest_read(|| {
                 sqlx::query_as("SELECT version FROM kosha.manifests WHERE namespace_id = $1")
                     .bind(&id_str)
                     .fetch_optional(&self.pool)
-                    .await
-                    .map_err(control_plane_error)?;
+            })
+            .await?;
             Ok(row.map(|(version,)| version as u64))
         })
     }
@@ -504,11 +573,11 @@ impl ControlStore for PgStore {
     /// namespace, independent of how many namespaces the pod serves.
     fn manifest_versions(&self) -> Result<Vec<(NamespaceId, u64)>, KoshaError> {
         self.rt.block_on(async {
-            let rows: Vec<(String, i64)> =
+            let rows: Vec<(String, i64)> = retry_manifest_read(|| {
                 sqlx::query_as("SELECT namespace_id, version FROM kosha.manifests")
                     .fetch_all(&self.pool)
-                    .await
-                    .map_err(control_plane_error)?;
+            })
+            .await?;
             Ok(rows
                 .into_iter()
                 .map(|(id, version)| (NamespaceId(id), version as u64))
@@ -523,13 +592,14 @@ impl ControlStore for PgStore {
     fn try_manifest_cloned(&self, id: &NamespaceId) -> Result<Option<Manifest>, KoshaError> {
         let id_str = id.0.clone();
         self.rt.block_on(async {
-            let row: Option<(i64, String)> = sqlx::query_as(
-                "SELECT version, segments_json FROM kosha.manifests WHERE namespace_id = $1",
-            )
-            .bind(&id_str)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(control_plane_error)?;
+            let row: Option<(i64, String)> = retry_manifest_read(|| {
+                sqlx::query_as(
+                    "SELECT version, segments_json FROM kosha.manifests WHERE namespace_id = $1",
+                )
+                .bind(&id_str)
+                .fetch_optional(&self.pool)
+            })
+            .await?;
 
             let Some((version, segments_json)) = row else {
                 return Ok(None);
@@ -648,7 +718,7 @@ impl ControlStore for PgStore {
     }
 
     /// The plain CAS plus, with a token, the fencing check in the same
-    /// transaction, before the `UPDATE` (see `writer_lease::check_fencing`).
+    /// transaction, before the `UPDATE` (see `writer_lease::fencing_conflict`).
     fn compare_and_swap_manifest_fenced(
         &mut self,
         id: &NamespaceId,
@@ -659,12 +729,12 @@ impl ControlStore for PgStore {
         let id_str = id.0.clone();
         let segments_json = serde_json::to_string(&new_manifest)?;
 
-        self.rt.block_on(async {
-            let io_error = |e: sqlx::Error| KoshaError::NotFound(e.to_string());
-            let mut tx = self.pool.begin().await.map_err(io_error)?;
+        self.rt.block_on(retry_pg(|| async {
+            let mut tx = self.pool.begin().await?;
             if let Some(token) = token {
-                // Dropping `tx` on the error path rolls it back.
-                crate::writer_lease::check_fencing(&mut tx, id, token).await?;
+                if let Some(conflict) = crate::writer_lease::fencing_conflict(&mut tx, id, token).await? {
+                    return Ok(Err(conflict));
+                }
             }
             // Bootstrap is transactional and never replaces an existing row.
             // A missing namespace is bootstrapped by a writer that knows
@@ -672,26 +742,26 @@ impl ControlStore for PgStore {
             // and re-created namespace starts at (see `delete_namespace`).
             let retired: Option<(i64,)> =
                 sqlx::query_as("SELECT last_version FROM kosha.retired_namespaces WHERE id = $1")
-                    .bind(&id_str).fetch_optional(&mut *tx).await.map_err(io_error)?;
+                    .bind(&id_str).fetch_optional(&mut *tx).await?;
             let initial = kosha_core::initial_manifest_version(retired.map(|(v,)| v as u64));
             let bootstrap = expected_version == 0 || expected_version == initial;
             if bootstrap {
                 sqlx::query("INSERT INTO kosha.namespaces (id) VALUES ($1) ON CONFLICT DO NOTHING")
-                    .bind(&id_str).execute(&mut *tx).await.map_err(io_error)?;
+                    .bind(&id_str).execute(&mut *tx).await?;
                 sqlx::query(INSERT_INITIAL_MANIFEST)
-                    .bind(&id_str).execute(&mut *tx).await.map_err(io_error)?;
+                    .bind(&id_str).execute(&mut *tx).await?;
             }
             let result = sqlx::query(
                 "UPDATE kosha.manifests SET version = $1, segments_json = $2, updated_at = NOW() \
                  WHERE namespace_id = $3 AND version = $4 AND version < $1"
             ).bind(new_manifest.version as i64).bind(&segments_json).bind(&id_str)
-                .bind(expected_version as i64).execute(&mut *tx).await.map_err(io_error)?;
+                .bind(expected_version as i64).execute(&mut *tx).await?;
             if result.rows_affected() == 0 {
                 // A retry after a lost reply succeeds only for the exact
                 // snapshot already committed. Equal version alone is unsafe.
                 let row: Option<(i64, String)> = sqlx::query_as(
                     "SELECT version, segments_json FROM kosha.manifests WHERE namespace_id = $1 FOR UPDATE"
-                ).bind(&id_str).fetch_optional(&mut *tx).await.map_err(io_error)?;
+                ).bind(&id_str).fetch_optional(&mut *tx).await?;
                 let same = row.as_ref().and_then(|(version, json)| decode_manifest(*version as u64, json))
                     .is_some_and(|current| current.same_contents(&new_manifest));
                 if !same {
@@ -699,17 +769,21 @@ impl ControlStore for PgStore {
                     // that met a retired namespace rebases onto the empty
                     // manifest at its initial version, which must exist.
                     if bootstrap && row.is_some() {
-                        tx.commit().await.map_err(io_error)?;
+                        if let Err(error) = tx.commit().await {
+                            return Ok(Err(control_plane_error(error)));
+                        }
                     }
-                    return Err(KoshaError::ManifestConflict {
+                    return Ok(Err(KoshaError::ManifestConflict {
                         namespace: id.clone(), expected: expected_version,
                         actual: row.map(|(version, _)| version as u64),
-                    });
+                    }));
                 }
             }
-            tx.commit().await.map_err(io_error)?;
-            Ok(())
-        })
+            // A lost COMMIT reply is ambiguous. Do not replay it here:
+            // a subsequent publication might already have superseded it.
+            Ok(tx.commit().await.map_err(control_plane_error))
+        }))
+        .map_err(control_plane_error)?
     }
 
     fn delete_namespace(
@@ -826,6 +900,76 @@ impl PgStore {
 #[cfg(test)]
 mod retry_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+    fn pool_discards_a_connection_that_became_read_only() {
+        let url =
+            std::env::var("KOSHA_TEST_DATABASE_URL").expect("set a dedicated test database URL");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let pool = writer_pool_options()
+                .max_connections(1)
+                .connect(&url)
+                .await
+                .unwrap();
+            let mut conn = pool.acquire().await.unwrap();
+            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+            sqlx::query("SET default_transaction_read_only TO on")
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+            drop(conn);
+
+            let new_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_ne!(pid, new_pid);
+        });
+    }
+
+    #[test]
+    fn runtime_retry_recovers_only_from_transient_errors_and_is_bounded() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let mut attempts = 0;
+        let transient = || sqlx::Error::Io(std::io::ErrorKind::ConnectionReset.into());
+        let recovered = rt.block_on(retry_pg(|| {
+            attempts += 1;
+            std::future::ready(if attempts < 3 {
+                Err(transient())
+            } else {
+                Ok(7)
+            })
+        }));
+        assert_eq!(recovered.unwrap(), 7);
+        assert_eq!(attempts, 3);
+
+        attempts = 0;
+        let offline = rt.block_on(retry_pg(|| {
+            attempts += 1;
+            std::future::ready(Err::<(), _>(transient()))
+        }));
+        assert!(matches!(offline, Err(sqlx::Error::Io(_))));
+        assert_eq!(attempts, 3);
+
+        attempts = 0;
+        let permanent = rt.block_on(retry_pg(|| {
+            attempts += 1;
+            std::future::ready(Err::<(), _>(sqlx::Error::RowNotFound))
+        }));
+        assert!(matches!(permanent, Err(sqlx::Error::RowNotFound)));
+        assert_eq!(attempts, 1);
+    }
 
     #[test]
     fn connect_retry_backoff_schedule_doubles_from_500ms_capped_at_5s() {

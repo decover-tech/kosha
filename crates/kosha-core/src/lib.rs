@@ -37,6 +37,11 @@ pub use rank::{CompiledRankBy, RankBySpec};
 /// Postgres (`kosha_control::PgStore`) is used in production via the
 /// `postgres` feature and a `DATABASE_URL` env var.
 pub trait ControlStore: Send + Sync {
+    /// Check that the backing store can accept writes.
+    fn check_writable(&self) -> Result<(), KoshaError> {
+        Ok(())
+    }
+
     fn create_namespace(&mut self, id: NamespaceId) -> Result<(), KoshaError>;
     fn ensure_namespace(&mut self, id: NamespaceId);
     fn has_namespace(&self, id: &NamespaceId) -> bool;

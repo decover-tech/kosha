@@ -1394,6 +1394,12 @@ fn publication_error(context: &str, error: &KoshaError) -> String {
                 .retry_after(ttl.max(Duration::from_secs(1)))
                 .into_raw()
         }
+        KoshaError::ControlPlane(_) => ApiError::new(ErrorCode::Unavailable, message)
+            .redact(format!("{context}: the control store could not be reached"))
+            .detail("reason", "control_store")
+            .detail("outcome", "unknown")
+            .not_retryable()
+            .into_raw(),
         _ => api_error(ErrorCode::Internal, &message),
     }
 }
@@ -1941,7 +1947,7 @@ impl AppState {
         #[cfg_attr(not(feature = "postgres"), allow(unused_mut))]
         let mut lease_backend = writer_lease::LeaseBackend::ControlStore;
         #[cfg(feature = "postgres")]
-        if lease_enabled && control_plane_kind == "postgres" {
+        if !query_role && control_plane_kind == "postgres" {
             if let Ok(db_url) = std::env::var("DATABASE_URL") {
                 match kosha_control::PgWriterLeaseStore::new(&db_url) {
                     Ok(store) => lease_backend = writer_lease::LeaseBackend::Postgres(store),
@@ -2606,6 +2612,26 @@ impl AppState {
             Ok(_) => Ok(()),
             Err(error) => Err(self.write_refusal(&error)),
         }
+    }
+
+    fn control_store_write_refusal(&self, request_line: &str) -> Option<String> {
+        let mutating = match routes::lookup_line(request_line) {
+            Some(route) => route.class == routes::Class::Write,
+            None => is_write_path(request_line),
+        };
+        if !mutating {
+            return None;
+        }
+        self.writer_leases
+            .check_writable(&self.controller)
+            .err()
+            .map(|error| {
+                ApiError::new(ErrorCode::Unavailable, format!("write refused: {error}"))
+                    .redact("write refused: the control store is not writable")
+                    .detail("reason", "control_store")
+                    .retry_after(Duration::from_secs(1))
+                    .into_raw()
+            })
     }
 
     /// 503 + `Retry-After` for a write this writer may not make.
@@ -7856,6 +7882,9 @@ fn route_checked(
         if let Some(response) = unrouted_v1(method, path) {
             return response;
         }
+        if let Some(response) = state.control_store_write_refusal(request_line) {
+            return response;
+        }
         // Organizations, users, projects, audit log (#345).
         let key_table = match auth::global() {
             auth::Auth::Keys(keys) => Some(keys),
@@ -7919,6 +7948,9 @@ fn route_checked(
             }
             auth::record_legacy_use(tenant, bare_path);
             state.metrics.record_legacy_request(bare_path, tenant);
+        }
+        if let Some(response) = state.control_store_write_refusal(request_line) {
+            return response;
         }
         if method == "GET" && (bare_path == "/stats" || bare_path == "/v1/stats") {
             return if admin_actor(headers, state).is_some() {
@@ -14347,6 +14379,10 @@ mod tests {
         }
     }
     impl ControlStore for OutageStore {
+        fn check_writable(&self) -> Result<(), KoshaError> {
+            self.check()
+        }
+
         fn create_namespace(&mut self, id: NamespaceId) -> Result<(), KoshaError> {
             self.inner.create_namespace(id)
         }
@@ -14764,6 +14800,34 @@ mod tests {
             stats_json(&query)["manifest_refresh"]["consecutive_errors"],
             0
         );
+    }
+
+    #[test]
+    fn control_plane_outage_refuses_writes_before_buffering_and_recovers() {
+        let store = outage_store();
+        let (ingest, _) = ingest_and_query(&store, None);
+        let ns = NamespaceId("tenant/outage".into());
+        let send = || {
+            dispatch_as(
+                &ingest,
+                "tenant",
+                "POST /v1/namespaces/outage/documents",
+                one_doc("a", "hello"),
+            )
+            .into_raw_string()
+        };
+
+        store.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        let refused = send();
+        assert!(refused.starts_with("HTTP/1.1 503"), "{refused}");
+        assert_eq!(header_value(&refused, "retry-after"), Some("1"));
+        assert_eq!(body_of(&refused)["details"]["reason"], "control_store");
+        assert_eq!(ingest.indexer.pending_doc_count(&ns), 0);
+
+        store.down.store(false, std::sync::atomic::Ordering::SeqCst);
+        let recovered = send();
+        assert!(recovered.starts_with("HTTP/1.1 200"), "{recovered}");
+        assert_eq!(ingest.indexer.pending_doc_count(&ns), 1);
     }
 
     /// `KOSHA_MANIFEST_REFRESH_MS=0`: no refresher, so every search checks

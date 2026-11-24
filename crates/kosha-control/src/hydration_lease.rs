@@ -72,7 +72,7 @@ impl HydrationLeaseStore {
         // connections, hence a small pool of its own.
         let pool = rt
             .block_on(
-                sqlx::postgres::PgPoolOptions::new()
+                crate::postgres::writer_pool_options()
                     .max_connections(3)
                     .acquire_timeout(Duration::from_secs(5))
                     .connect(database_url),
