@@ -8667,11 +8667,15 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
     if let Err(response) = check_embedded_dims(state, &ns, &documents) {
         return response;
     }
+    let vector_dimensions = state
+        .usage
+        .as_ref()
+        .map_or(0, |_| usage::documents_vector_dimensions(&documents));
     match write_routed(state, &ns, documents, index_into) {
         Ok(count) => {
             state.metrics.record_indexed(count as u64);
             if let Some(meter) = state.usage.as_ref() {
-                meter.record_write(&ns, logical_bytes, count as u64);
+                meter.record_write(&ns, logical_bytes, count as u64, vector_dimensions);
             }
             json_ok(&IndexResponse {
                 indexed_count: count,
@@ -9054,11 +9058,15 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
     if let Err(response) = check_embedded_dims(state, &namespace, &documents) {
         return response;
     }
+    let vector_dimensions = state
+        .usage
+        .as_ref()
+        .map_or(0, |_| usage::documents_vector_dimensions(&documents));
     match write_routed(state, &namespace, documents, replace_into) {
         Ok(count) => {
             state.metrics.record_indexed(count as u64);
             if let Some(meter) = state.usage.as_ref() {
-                meter.record_write(&namespace, logical_bytes, count as u64);
+                meter.record_write(&namespace, logical_bytes, count as u64, vector_dimensions);
             }
             json_ok(&IndexResponse {
                 indexed_count: count,

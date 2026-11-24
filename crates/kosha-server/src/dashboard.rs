@@ -377,6 +377,14 @@ mod tests {
     }
 
     #[test]
+    fn the_usage_page_reads_the_tenant_usage_route() {
+        assert!(INDEX_HTML.contains("href=\"#/usage\""));
+        assert!(APP_JS.contains("\"/v1/usage?from=\""));
+        // Tenant route only: the dashboard has no admin views.
+        assert!(!APP_JS.contains("/v1/admin/usage"));
+    }
+
+    #[test]
     fn ring_keeps_the_last_capacity_samples() {
         let dashboard = Dashboard::new(true);
         for i in 0..(RING_CAPACITY + 50) {

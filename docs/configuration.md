@@ -347,11 +347,18 @@ What is recorded:
   attribution, not billing.
 - An accepted document write (`/documents`, legacy `/index` and `/replace`): `bytes_written`
   (each document's id plus every field's name and value, as submitted) and `documents_written`.
-  Recorded on the pod that executes the write. Deletes are not metered.
+  Recorded on the pod that executes the write. Deletes are not metered. A write with vectors also
+  records `vector_dimensions_written`: each flat vector's dimension, plus dimension x tokens of each
+  late-interaction bag, counted after server-side embedding (so a field the server embeds counts
+  the vector it produced).
 - Once an hour, on a pod that accepts writes: `stored_bytes`, the object bytes of every segment
   the namespace's manifest references. Shards are added up under their root namespace; a segment
   a branch inherits is counted on the namespace that owns it. The WAL and superseded segments not
-  yet garbage-collected are not included.
+  yet garbage-collected are not included. The same hourly event carries
+  `stored_vector_dimensions`: dimension x vectors indexed in every segment the namespace owns, read
+  from the segment footers. Like `stored_bytes` it counts deleted documents until compaction drops
+  them. An hour in which a footer cannot be read, or a segment predates per-column vector metadata
+  (#204), gets its `stored_bytes` snapshot without the vector gauge.
 
 `GET /v1/usage` (the caller's tenant) and `GET /v1/admin/usage[?tenant=]` (admin key) summarize the
 raw events over `?from=&to=` (Unix seconds, `to` exclusive; default the last 30 days). The summary
@@ -359,7 +366,10 @@ adds `bytes_queried`, the billing meter for query volume: each search priced at 
 `stored_bytes` snapshot current at that hour. It does not depend on what the search read, so it is
 the same for whole-file, ranged and fully cached searches. `stored_byte_hours` is the sum of the
 hourly snapshots in the window; an hour with no writer running has no snapshot and contributes
-nothing (`stored_snapshots` counts the hours that did).
+nothing (`stored_snapshots` counts the hours that did). `vector_dimensions_written` is summed;
+`stored_vector_dimension_hours` and `stored_vector_dimensions_latest` are the vector counterparts of
+`stored_byte_hours` and `stored_bytes_latest`. With `KOSHA_DASHBOARD=on` the dashboard's **Usage**
+page shows the same summary for the pasted key's tenant.
 
 Delivery: a request appends its event to a spool file and returns; a background thread sends
 sealed spool files to the store and deletes each one after the store accepted it. The store ignores

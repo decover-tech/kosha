@@ -43,6 +43,16 @@ pub mod meter {
     /// that owns them). A gauge: one event per namespace per hour, with a
     /// deterministic id, so the hour's sum is the snapshot.
     pub const STORED_BYTES: &str = "stored_bytes";
+    /// Vector values in an accepted write, as stored: the dimension of each
+    /// flat vector, plus dimension x tokens of each late-interaction bag.
+    /// Counted after server-side embedding, so a field the server embeds
+    /// counts the vector it produced.
+    pub const VECTOR_DIMENSIONS_WRITTEN: &str = "vector_dimensions_written";
+    /// Vector dimensions x vectors indexed in every segment the namespace
+    /// owns, from the segment footers. A gauge carried by the same hourly
+    /// event as [`STORED_BYTES`]; absent from an hour whose footers could
+    /// not all be read.
+    pub const STORED_VECTOR_DIMENSIONS: &str = "stored_vector_dimensions";
 }
 
 /// One hour in milliseconds: the bucket width of [`UsageStore::hourly`].
@@ -138,6 +148,13 @@ pub struct NamespaceUsage {
     pub stored_snapshots: u64,
     /// The latest snapshot in the window, if any.
     pub stored_bytes_latest: Option<u64>,
+    pub vector_dimensions_written: u64,
+    /// Sum of the hourly `stored_vector_dimensions` snapshots in the
+    /// window: dimension-hours, the vector counterpart of
+    /// `stored_byte_hours`.
+    pub stored_vector_dimension_hours: u64,
+    /// The latest `stored_vector_dimensions` snapshot in the window, if any.
+    pub stored_vector_dimensions_latest: Option<u64>,
     /// Meters this build does not know, summed.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub other: BTreeMap<String, u64>,
@@ -163,6 +180,19 @@ impl NamespaceUsage {
             self.stored_bytes_latest =
                 Some(self.stored_bytes_latest.unwrap_or(0).saturating_add(latest));
         }
+        self.vector_dimensions_written = self
+            .vector_dimensions_written
+            .saturating_add(other.vector_dimensions_written);
+        self.stored_vector_dimension_hours = self
+            .stored_vector_dimension_hours
+            .saturating_add(other.stored_vector_dimension_hours);
+        if let Some(latest) = other.stored_vector_dimensions_latest {
+            self.stored_vector_dimensions_latest = Some(
+                self.stored_vector_dimensions_latest
+                    .unwrap_or(0)
+                    .saturating_add(latest),
+            );
+        }
         for (meter, quantity) in &other.other {
             let total = self.other.entry(meter.clone()).or_default();
             *total = total.saturating_add(*quantity);
@@ -180,6 +210,7 @@ pub fn summarize(buckets: &[UsageBucket], carry_in: &[UsageGauge]) -> Vec<Namesp
     struct Hour {
         queries: u64,
         stored: Option<u64>,
+        vectors: Option<u64>,
     }
     #[derive(Default)]
     struct Acc {
@@ -210,6 +241,14 @@ pub fn summarize(buckets: &[UsageBucket], carry_in: &[UsageGauge]) -> Vec<Namesp
                 usage.stored_snapshots += 1;
                 acc.hours.entry(bucket.hour_start_ms).or_default().stored = Some(q);
             }
+            meter::VECTOR_DIMENSIONS_WRITTEN => {
+                usage.vector_dimensions_written = usage.vector_dimensions_written.saturating_add(q)
+            }
+            meter::STORED_VECTOR_DIMENSIONS => {
+                usage.stored_vector_dimension_hours =
+                    usage.stored_vector_dimension_hours.saturating_add(q);
+                acc.hours.entry(bucket.hour_start_ms).or_default().vectors = Some(q);
+            }
             other => {
                 let total = usage.other.entry(other.to_string()).or_default();
                 *total = total.saturating_add(q);
@@ -230,6 +269,9 @@ pub fn summarize(buckets: &[UsageBucket], carry_in: &[UsageGauge]) -> Vec<Namesp
                 .or(first_in_window)
                 .unwrap_or(0);
             for hour in acc.hours.values() {
+                if let Some(vectors) = hour.vectors {
+                    acc.usage.stored_vector_dimensions_latest = Some(vectors);
+                }
                 if let Some(stored) = hour.stored {
                     size = stored;
                     acc.usage.stored_bytes_latest = Some(stored);
@@ -742,6 +784,58 @@ mod tests {
         assert_eq!(total.other.get("gpu_ms"), Some(&7));
         assert_eq!(total.stored_bytes_latest, Some(11));
         assert_eq!(total.stored_byte_hours, 11);
+    }
+
+    #[test]
+    fn vector_meters_are_summed_and_the_latest_snapshot_kept() {
+        let store = MemoryUsageStore::new();
+        let snapshot = |ns: &str, hour: u64, bytes: u64, dims: u64| {
+            let mut event = stored(ns, hour, bytes);
+            event
+                .meters
+                .insert(meter::STORED_VECTOR_DIMENSIONS.into(), dims);
+            event
+        };
+        store
+            .record(&[
+                // Recorded out of order: the later hour still wins.
+                snapshot("docs", 3, 10, 9_000),
+                snapshot("docs", 2, 10, 6_000),
+                // A snapshot that could not read its footers has bytes only.
+                stored("docs", 4, 10),
+                event(
+                    "w1",
+                    "docs",
+                    2 * H,
+                    &[(meter::VECTOR_DIMENSIONS_WRITTEN, 768)],
+                ),
+                event(
+                    "w2",
+                    "docs",
+                    3 * H,
+                    &[(meter::VECTOR_DIMENSIONS_WRITTEN, 384)],
+                ),
+                snapshot("logs", 3, 5, 100),
+                // Before #348's vector meters: no vector fields at all.
+                stored("old", 3, 7),
+            ])
+            .unwrap();
+        let usage = usage_summary(&store, Some("acme"), 0, 10 * H).unwrap();
+        let docs = &usage[0];
+        assert_eq!(docs.vector_dimensions_written, 1_152);
+        assert_eq!(docs.stored_vector_dimension_hours, 15_000);
+        assert_eq!(docs.stored_vector_dimensions_latest, Some(9_000));
+        assert_eq!(docs.stored_snapshots, 3, "vector meters add no snapshots");
+        assert_eq!(usage[2].namespace, "old");
+        assert_eq!(usage[2].stored_vector_dimensions_latest, None);
+        let mut total = NamespaceUsage::default();
+        for namespace in &usage {
+            total.add(namespace);
+        }
+        assert_eq!(total.vector_dimensions_written, 1_152);
+        assert_eq!(total.stored_vector_dimension_hours, 15_100);
+        assert_eq!(total.stored_vector_dimensions_latest, Some(9_100));
+        assert!(total.other.is_empty(), "{:?}", total.other);
     }
 
     #[test]

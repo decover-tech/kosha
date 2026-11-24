@@ -306,7 +306,7 @@ fn events_spooled_by_a_dead_process_are_delivered_by_the_next() {
         assert!(dead.flush().is_err());
         // ...and these two are still in the active file at the "crash".
         dead.record_query(&ns, 20, 0);
-        dead.record_write(&ns, 300, 3);
+        dead.record_write(&ns, 300, 3, 0);
     }
     assert_eq!(store.inner.row_count(), 0);
     store.down.store(false, Ordering::SeqCst);
@@ -495,6 +495,68 @@ fn stored_bytes_are_snapshotted_hourly_and_price_every_search_alike() {
     )
     .unwrap();
     assert_eq!(next[0].stored_bytes_latest, Some(grown));
+}
+
+#[test]
+fn vector_dimensions_are_metered_on_write_and_snapshotted_hourly() {
+    let (state, store) = metered_state();
+    let vector_doc = |id: &str, emb: &str| {
+        serde_json::json!({"id": id, "fields": [
+            {"name": "title", "field_type": "Text", "value": "fox"},
+            {"name": "emb", "field_type": "Vector", "value": emb}]})
+    };
+    let bag_doc = serde_json::json!({"id": "c1", "fields": [
+        {"name": "title", "field_type": "Text", "value": "fox"},
+        {"name": "tokens", "field_type": "Vector", "value": "[[1.0, 0.0], [0.0, 1.0]]"}]});
+    ok(call(
+        &state,
+        "acme",
+        "POST /v1/namespaces/docs/documents",
+        serde_json::json!({"documents": [
+            vector_doc("v1", "[1.0, 0.0, 0.0]"),
+            vector_doc("v2", "[0.0, 1.0, 0.0]"),
+            bag_doc,
+            doc("t1", "no vectors here"),
+        ]}),
+    ));
+    // A write without vectors records no vector row.
+    ok(call(
+        &state,
+        "acme",
+        "POST /v1/namespaces/text/documents",
+        serde_json::json!({"documents": [doc("t2", "plain")]}),
+    ));
+    for ns in ["docs", "text"] {
+        ok(call(
+            &state,
+            "acme",
+            &format!("POST /v1/namespaces/{ns}/flush"),
+            serde_json::json!({}),
+        ));
+    }
+    let now = unix_millis();
+    assert_eq!(usage::run_snapshot_tick(&state, now), 2);
+    flush(&state);
+
+    let usage = stored_usage(&store, "acme");
+    let docs = usage.iter().find(|u| u.namespace == "docs").unwrap();
+    // Two 3-dimension vectors and one bag of two 2-dimension tokens.
+    assert_eq!(docs.vector_dimensions_written, 2 * 3 + 2 * 2);
+    assert_eq!(docs.stored_vector_dimensions_latest, Some(2 * 3 + 2 * 2));
+    assert_eq!(docs.stored_vector_dimension_hours, 2 * 3 + 2 * 2);
+    let text = usage.iter().find(|u| u.namespace == "text").unwrap();
+    assert_eq!(text.vector_dimensions_written, 0);
+    assert_eq!(text.stored_vector_dimensions_latest, Some(0));
+
+    // The read API reports them per namespace and in the total.
+    let read = body_of(&ok(call(
+        &state,
+        "acme",
+        "GET /v1/usage",
+        serde_json::Value::Null,
+    )));
+    assert_eq!(read["total"]["vector_dimensions_written"], 10);
+    assert_eq!(read["total"]["stored_vector_dimensions_latest"], 10);
 }
 
 /// A restarted writer (or a second one) snapshotting an hour that is
