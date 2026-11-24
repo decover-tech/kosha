@@ -12748,6 +12748,10 @@ fn log_search_timing(
             phases.knn_read_ms, phases.knn_decode_ms, phases.knn_dot_ms, phases.knn_rank_ms, phases.knn_postings_cached,
         ));
     }
+    // Only while the experimental #384 bound stop is on.
+    if phases.knn_mode.is_some() && kosha_segment::knn_bound_stop_alpha().is_some() {
+        knn_rescore.push_str(&format!(" knn_bound_skips={}", phases.knn_bound_skips));
+    }
     println!(
         "search timing: ns={} total_ms={:.1} wall_ms={:.1} hydrate_ms={:.1} hydrate_files={} \
          hydrate_mb={:.1} queue_ms={:.1} admit_ms={:.1} bm25_stats={} bm25_stats_ms={:.2} \

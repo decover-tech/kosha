@@ -407,10 +407,16 @@ table is appended to the job summary). Points:
   `a0rel1m500`, `a0rel0.5m1000` (`KOSHA_KNN_RELATIVE_MIN_PROBES` 500 /
   1000). The relative points all use alpha 0: at alpha 1 the best score
   is usually 0 and eps has no effect.
+- `bound`: the alpha-scaled bound stop (`KOSHA_KNN_BOUND_STOP_ALPHA`), 5
+  points: `f0.05` (baseline), `b1`, `b0.95`,
+  `b0.9`, `b0.85`. `b1` only skips postings whose similarity bound cannot
+  beat the segment's k-th score; the report's `knn_postings` column against
+  `f0.05` is the #384 success bar.
 - `label:ENV=V,ENV=V;label2:...`, over these knobs only:
   `KOSHA_KNN_BUDGET_FRACTION`, `KOSHA_KNN_BUDGET_MAX_CAP`,
   `KOSHA_KNN_RELATIVE_CUTOFF_EPS`, `KOSHA_KNN_RELATIVE_MIN_PROBES`,
-  `KOSHA_KNN_PROBE_RADIUS_ALPHA`. Include an `f0.05` point (or pass the
+  `KOSHA_KNN_PROBE_RADIUS_ALPHA`, `KOSHA_KNN_BOUND_STOP_ALPHA`. Include an
+  `f0.05` point (or pass the
   report `--baseline`) for the comparison column.
 
 `recall_check.py` reports, per query and summarized (mean, p1/p5/p10/p50):
@@ -444,6 +450,7 @@ The #384 engine flags are off by default:
 | `KOSHA_KNN_RELATIVE_CUTOFF_EPS` | unset (off) | unfiltered kNN probes a posting only if its rank score <= (1 + eps) x the best posting's score (SPANN's relative cutoff); never fewer than `KOSHA_KNN_RELATIVE_MIN_PROBES` postings, never more than the fixed budget |
 | `KOSHA_KNN_RELATIVE_MIN_PROBES` | the query's `num_candidates` | floor for the relative cutoff |
 | `KOSHA_KNN_PROBE_RADIUS_ALPHA` | 1.0 (`d - radius`, unchanged) | posting rank score `max(0, d(q,c) - alpha x radius)`; 0 = raw centroid distance |
+| `KOSHA_KNN_BOUND_STOP_ALPHA` | unset (off) | a segment's probe skips a budgeted posting once its k-th guaranteed similarity >= alpha x the posting's similarity ceiling (angle triangle inequality on centroid distance and radius); never more than the fixed budget |
 
 With the default alpha the best posting's score is often clamped to 0, so
 the relative cutoff then falls back to `min_probes`; SPANN's own rule is
