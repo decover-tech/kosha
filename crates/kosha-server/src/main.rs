@@ -8107,15 +8107,25 @@ fn route_inner(
     }
 
     if let Some(ns) = extract_namespace(no_query(request_line), "POST /v1/namespaces/", "/schema") {
-        let require_online_safe = parse_method_and_path(request_line)
+        let query = parse_method_and_path(request_line)
             .and_then(|(_, path)| path.split_once('?'))
-            .is_some_and(|(_, query)| {
-                query.split('&').any(|pair| {
-                    pair.split_once('=').is_some_and(|(key, value)| {
-                        url_decode(key) == "require_online_safe" && url_decode(value) == "true"
-                    })
-                })
-            });
+            .map_or("", |(_, query)| query);
+        let mut require_online_safe = false;
+        for pair in query.split('&') {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            if url_decode(key) != "require_online_safe" {
+                continue;
+            }
+            let value = url_decode(value);
+            if value.eq_ignore_ascii_case("true") {
+                require_online_safe = true;
+            } else if !value.eq_ignore_ascii_case("false") {
+                return api_error(
+                    ErrorCode::InvalidArgument,
+                    "'require_online_safe' must be true or false",
+                );
+            }
+        }
         return handle_put_schema_with_ns(&ns, tenant, body, require_online_safe, state);
     }
 
@@ -21870,17 +21880,32 @@ mod tests {
             }}),
         );
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-        for schema in [
-            serde_json::json!({"fields": {"price": {"type": "float"}, "brand": {"type": "Keyword"}}}),
-            serde_json::json!({"fields": {"brand": {"type": "Keyword"}}}),
+        for (action, schema) in [
+            (
+                strict,
+                serde_json::json!({"fields": {"price": {"type": "float"}, "brand": {"type": "Keyword"}}}),
+            ),
+            (
+                "schema?require_online_safe=True",
+                serde_json::json!({"fields": {"brand": {"type": "Keyword"}}}),
+            ),
         ] {
-            let response = call(strict, schema);
+            let response = call(action, schema);
             assert!(response.starts_with("HTTP/1.1 409"), "{response}");
             assert_eq!(
                 response_body_json(&response)["details"]["reason"],
                 "reindex_required"
             );
             assert!(response.contains("price"), "{response}");
+        }
+        for action in [
+            "schema?require_online_safe",
+            "schema?require_online_safe=",
+            "schema?require_online_safe=maybe",
+        ] {
+            let response = call(action, serde_json::json!({"fields": {}}));
+            assert_eq!(status_of(&response), 400, "{response}");
+            assert_eq!(body_of(&response)["code"], "invalid_argument");
         }
         let response = route(
             "GET /v1/namespaces/shop/schema HTTP/1.1",
@@ -21898,7 +21923,7 @@ mod tests {
             "Keyword"
         );
         let response = call(
-            "schema?require_online_safe=false",
+            "schema?require_online_safe=FaLsE",
             serde_json::json!({"fields": {"price": {"type": "float"}}}),
         );
         assert_eq!(status_of(&response), 200, "{response}");
