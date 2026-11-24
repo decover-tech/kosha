@@ -577,6 +577,7 @@ fn main() {
                             w.add_document(id, fields);
                         }
                     }
+                    let vector_builds = w.vector_index_builds();
                     w.finalize(bm25.clone())
                         .unwrap_or_else(|e| panic!("finalize {} failed: {e}", seg_id.0));
                     built += 1;
@@ -586,6 +587,12 @@ fn main() {
                         t.elapsed().as_secs_f64(),
                         reorder_secs
                     );
+                    for build in vector_builds.lock().unwrap().iter() {
+                        println!(
+                            "segment {} vector field {:?}: {} postings, imbalance factor {:.4}",
+                            seg_id.0, build.field, build.postings, build.imbalance_factor
+                        );
+                    }
                 }
                 built
             })

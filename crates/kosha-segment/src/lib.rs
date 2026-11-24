@@ -1347,6 +1347,9 @@ impl SegmentWriter {
         };
         let mut postings = index.snapshot();
         build.postings = postings.len();
+        build.imbalance_factor = kosha_vector_spfresh::posting_imbalance_factor(
+            postings.iter().map(|p| p.entries.len()),
+        );
         let format_version = if unit_norm {
             for p in &mut postings {
                 kosha_vector_spfresh::normalize_in_place(&mut p.centroid);
@@ -1463,7 +1466,7 @@ pub struct VectorSeedPosting {
 }
 
 /// How [`SegmentWriter::finalize`] built one vector column's index.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct VectorIndexBuild {
     pub field: String,
     /// Seeded from compaction inputs' postings and repaired by LIRE
@@ -1482,6 +1485,8 @@ pub struct VectorIndexBuild {
     pub postings_merged: usize,
     /// Postings written.
     pub postings: usize,
+    /// Faiss imbalance factor over the posting sizes written for this field.
+    pub imbalance_factor: f64,
 }
 
 /// Compaction inputs with fewer indexed vectors in a column than this
