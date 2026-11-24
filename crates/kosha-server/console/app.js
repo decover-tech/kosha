@@ -299,11 +299,18 @@
           ],
           "Add or change member",
           async (v) => {
-            const existing = members.members.some((m) => m.user_id === v.user_id);
-            if (existing) {
-              await api("POST", base + "/members/" + encodeURIComponent(v.user_id) + "/role", { role: v.role });
+            const setRole = () =>
+              api("POST", base + "/members/" + encodeURIComponent(v.user_id) + "/role", { role: v.role });
+            if (members.members.some((m) => m.user_id === v.user_id)) {
+              await setRole();
             } else {
-              await api("POST", base + "/members", v);
+              // The roster may be truncated: 409 means already a member.
+              try {
+                await api("POST", base + "/members", v);
+              } catch (e) {
+                if (e.status !== 409) throw e;
+                await setRole();
+              }
             }
             reload();
           }
