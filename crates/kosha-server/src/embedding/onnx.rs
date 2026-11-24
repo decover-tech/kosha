@@ -49,7 +49,11 @@ impl OnnxEmbedder {
         }
         let truncation = TruncationParams {
             max_length: sequence_length,
-            ..tokenizer.get_truncation().cloned().unwrap_or_default()
+            direction: tokenizer
+                .get_truncation()
+                .map(|params| params.direction)
+                .unwrap_or_default(),
+            ..TruncationParams::default()
         };
         tokenizer
             .with_truncation(Some(truncation))

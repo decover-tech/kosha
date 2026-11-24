@@ -133,6 +133,35 @@ fn ids(body: &serde_json::Value) -> Vec<String> {
 #[cfg(feature = "onnx")]
 #[test]
 fn onnx_embeds_ingest_and_search_with_a_persisted_model() {
+    exercise_onnx_embedding(serde_json::Value::Null);
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn onnx_ignores_saved_stride_equal_to_its_token_budget() {
+    exercise_onnx_embedding(serde_json::json!({
+        "max_length": 128, "stride": 4, "strategy": "LongestFirst"
+    }));
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn onnx_ignores_saved_stride_above_its_token_budget() {
+    exercise_onnx_embedding(serde_json::json!({
+        "max_length": 128, "stride": 8, "strategy": "LongestFirst"
+    }));
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn onnx_ignores_saved_pair_only_truncation() {
+    exercise_onnx_embedding(serde_json::json!({
+        "max_length": 128, "stride": 0, "strategy": "OnlySecond"
+    }));
+}
+
+#[cfg(feature = "onnx")]
+fn exercise_onnx_embedding(truncation: serde_json::Value) {
     use base64::Engine;
 
     // ONNX opset 13: mask IDs, gather two-dimensional word vectors, and sum
@@ -154,6 +183,7 @@ fn onnx_embeds_ingest_and_search_with_a_persisted_model() {
         &tokenizer_path,
         serde_json::json!({
             "version": "1.0",
+            "truncation": truncation,
             "pre_tokenizer": {"type": "Whitespace"},
             "model": {"type": "WordLevel", "unk_token": "[UNK]",
                 "vocab": {"[PAD]": 0, "red": 1, "blue": 2, "[UNK]": 3}}
