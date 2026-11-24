@@ -30,6 +30,12 @@ spec:
       labels:
         app: kosha
         role: ingest
+      annotations:
+        # Scraped by annotation-based Prometheus pod discovery (#223). See
+        # docs/metrics.md.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
     spec:
       serviceAccountName: kosha
       # Land only on the Karpenter-managed kosha NVMe pool. The label is
@@ -56,6 +62,11 @@ spec:
           env:
             - name: KOSHA_ROLE
               value: ingest
+            # Compaction runs on the kosha-indexer Deployment (#254). An
+            # overlay that drops the indexer must set this back to "true", or
+            # nothing bounds segment counts.
+            - name: KOSHA_COMPACTION_ON_INGEST
+              value: "false"
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -66,18 +77,62 @@ spec:
                 secretKeyRef:
                   name: kosha-secret
                   key: bootstrap-api-key
+            # Pod-to-pod credential for /internal/* routes. Query pods use it
+            # to read the ingest pod's unindexed writes for strong-consistency
+            # searches (#255); without it they default to eventual
+            # consistency. Optional so clusters without the key still start.
+            - name: KOSHA_INTERNAL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: kosha-secret
+                  key: internal-api-key
+                  optional: true
+            # Admin routes on this pod are synchronous and long:
+            # /v1/admin/compact-namespace (without "async": true) hydrates
+            # and merges capped groups of staging's 22.35GiB
+            # paragraph_index_hnsw inside the request. The default is
+            # 300s, so such a call answers into a dead socket while the
+            # work continues server-side, leaving the caller with no way to
+            # tell success from failure. This is a per-syscall read/write
+            # budget, not a request deadline (see the comment where it is
+            # parsed), so raising it costs nothing for normal traffic — it
+            # only stops a slow handler's response from being unsendable.
+            # 1800 matches what deployment-query.yaml already carries.
+            - name: KOSHA_HTTP_IO_TIMEOUT_SECS
+              value: "1800"
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /v1/healthz
               port: 8080
             initialDelaySeconds: 5
             periodSeconds: 10
+          # Cold start is dominated by the control-plane restore, which reads
+          # every segment ref for every namespace out of S3 before the server
+          # binds :8080. On 2026-08-29 the staging ingest pod was rescheduled
+          # onto a fresh r5dn node, so the instance-store hostPath cache was
+          # empty; the restore then took 93-101s (3,280 segment refs, ~126MB
+          # pulled from S3) while liveness — initialDelay 15s, period 20s,
+          # failureThreshold 3 — killed the container at ~55-75s. Nothing was
+          # listening yet, so every probe got "connection refused" and the pod
+          # crashlooped 127 times over 8h with kosha-ingest-service holding
+          # zero endpoints. A startupProbe is the fix: liveness and readiness
+          # stay suspended until it first succeeds, so a cold restore gets a
+          # 600s budget while a warm one still goes ready in ~10s. The budget
+          # scales with segment count, so keep it generous.
+          startupProbe:
+            httpGet:
+              path: /v1/healthz
+              port: 8080
+            periodSeconds: 10
+            failureThreshold: 60
+            timeoutSeconds: 3
           livenessProbe:
             httpGet:
-              path: /healthz
+              path: /v1/healthz
               port: 8080
             initialDelaySeconds: 15
             periodSeconds: 20
+            timeoutSeconds: 5
           resources:
             # ephemeral-storage now only covers the container filesystem
             # (logs, /tmp) — the segment cache is on the instance-store
@@ -95,6 +150,13 @@ spec:
           volumeMounts:
             - name: cache
               mountPath: /var/cache/kosha
+            # TLS between pods (#343): the certificate Secret, if one exists
+            # (see certificate-internal-tls.example.yaml). Mounting it does
+            # nothing on its own; the KOSHA_TLS_* / KOSHA_INTERNAL_TLS_*
+            # settings in configmap.yaml turn it on.
+            - name: internal-tls
+              mountPath: /etc/kosha/tls
+              readOnly: true
       volumes:
         # The node's user-data (EC2NodeClass) formats and mounts the NVMe
         # instance store at this exact path. Data here is a cache: it is
@@ -104,3 +166,9 @@ spec:
           hostPath:
             path: /var/lib/kosha-cache
             type: DirectoryOrCreate
+        - name: internal-tls
+          secret:
+            secretName: kosha-internal-tls
+            # Optional so clusters without the Secret still start; with
+            # KOSHA_INTERNAL_TLS on, a missing file stops the pod instead.
+            optional: true

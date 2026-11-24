@@ -9,7 +9,7 @@ metadata:
 spec:
   # Bootstrap value only — the HPA (hpa-query.yaml) takes ownership of this
   # field once applied.
-  replicas: 1
+  replicas: 3
   selector:
     matchLabels:
       app: kosha
@@ -24,11 +24,29 @@ spec:
       labels:
         app: kosha
         role: query
+      annotations:
+        # A replaced pod starts with an empty cache; Karpenter consolidation
+        # was replacing idle warm pods several times a day.
+        karpenter.sh/do-not-disrupt: "true"
+        # Scraped by annotation-based Prometheus pod discovery (#223). See
+        # docs/metrics.md.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
     spec:
       serviceAccountName: kosha
       # Deliberately NOT on the dedicated NVMe/Karpenter pool — that pool is
       # already near capacity from the single ingest pod, and scheduling N
       # query replicas there risks starving ingest. General node pool only.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          nodeTaintsPolicy: Honor
+          labelSelector:
+            matchLabels:
+              app: kosha
+              role: query
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -36,6 +54,7 @@ spec:
               podAffinityTerm:
                 labelSelector:
                   matchLabels:
+                    app: kosha
                     role: query
                 topologyKey: kubernetes.io/hostname
       containers:
@@ -79,18 +98,43 @@ spec:
                 secretKeyRef:
                   name: kosha-secret
                   key: bootstrap-api-key
+            # Pod-to-pod credential for /internal/* routes. Query pods use it
+            # to read the ingest pod's unindexed writes for strong-consistency
+            # searches (#255); without it they default to eventual
+            # consistency. Optional so clusters without the key still start.
+            - name: KOSHA_INTERNAL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: kosha-secret
+                  key: internal-api-key
+                  optional: true
           readinessProbe:
             httpGet:
-              path: /readyz
+              path: /v1/readyz
               port: 8080
             initialDelaySeconds: 5
             periodSeconds: 10
+          # Same cold-start race as the ingest Deployment (see the comment
+          # there): a query pod on a fresh node has to restore every segment
+          # ref from S3 before it binds, which outruns the liveness budget and
+          # crashloops the pod. These two survived only because they were last
+          # scheduled when the corpus was smaller — the next node recycle would
+          # have hit it. Liveness/readiness stay suspended until this first
+          # succeeds.
+          startupProbe:
+            httpGet:
+              path: /v1/healthz
+              port: 8080
+            periodSeconds: 10
+            failureThreshold: 60
+            timeoutSeconds: 3
           livenessProbe:
             httpGet:
-              path: /healthz
+              path: /v1/healthz
               port: 8080
             initialDelaySeconds: 15
             periodSeconds: 20
+            timeoutSeconds: 5
           resources:
             # Placeholder — overridden by stage/prod overlay patches. Base
             # stays small/no-op like the rest of this file's defaults.
@@ -105,6 +149,13 @@ spec:
           volumeMounts:
             - name: cache
               mountPath: /var/cache/kosha
+            # TLS between pods (#343): the certificate Secret, if one exists
+            # (see certificate-internal-tls.example.yaml). Mounting it does
+            # nothing on its own; the KOSHA_TLS_* / KOSHA_INTERNAL_TLS_*
+            # settings in configmap.yaml turn it on.
+            - name: internal-tls
+              mountPath: /etc/kosha/tls
+              readOnly: true
       volumes:
         # No hostPath here — this tier is stateless and interchangeable, so
         # each pod's cache is a private, disposable emptyDir. A cold start
@@ -113,3 +164,9 @@ spec:
         # tied to a specific node like the ingest pod's instance store.
         - name: cache
           emptyDir: {}
+        - name: internal-tls
+          secret:
+            secretName: kosha-internal-tls
+            # Optional so clusters without the Secret still start; with
+            # KOSHA_INTERNAL_TLS on, a missing file stops the pod instead.
+            optional: true

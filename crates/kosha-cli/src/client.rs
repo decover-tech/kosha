@@ -17,6 +17,63 @@ impl std::fmt::Display for ClientError {
     }
 }
 
+/// A non-2xx response, kept apart from transport errors so callers can
+/// explain a status (an admin 403, a Postgres-only route) in plain words.
+#[derive(Debug)]
+pub struct HttpError {
+    pub method: Method,
+    pub path: String,
+    pub status: u16,
+    /// The server's `{"error": "..."}` message, or the start of the body
+    /// when it is not that shape.
+    pub message: String,
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} \u{2192} {}: {}",
+            self.method, self.path, self.status, self.message
+        )
+    }
+}
+
+impl std::error::Error for HttpError {}
+
+/// Every failure a request can end in.
+#[derive(Debug)]
+pub enum RequestError {
+    Http(HttpError),
+    Other(ClientError),
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RequestError::Http(e) => e.fmt(f),
+            RequestError::Other(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for RequestError {}
+
+impl From<ClientError> for RequestError {
+    fn from(e: ClientError) -> Self {
+        RequestError::Other(e)
+    }
+}
+
+/// Pull the `error` field out of a JSON error body; fall back to the first
+/// 500 characters of the body as text.
+fn error_message(text: &str) -> String {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+        .unwrap_or_else(|| text.chars().take(500).collect())
+}
+
 impl std::error::Error for ClientError {}
 
 pub struct Client {
@@ -27,8 +84,17 @@ pub struct Client {
 
 impl Client {
     pub fn new(conn: &Connection) -> Result<Self, ClientError> {
+        Self::with_timeout(conn, std::time::Duration::from_secs(60))
+    }
+
+    /// Like [`Client::new`] with a different per-request timeout, for
+    /// admin calls that can legitimately run for minutes (`import`).
+    pub fn with_timeout(
+        conn: &Connection,
+        timeout: std::time::Duration,
+    ) -> Result<Self, ClientError> {
         let http = HttpClient::builder()
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(timeout)
             .build()
             .map_err(|e| ClientError(format!("failed to build HTTP client: {e}")))?;
         Ok(Self {
@@ -38,15 +104,15 @@ impl Client {
         })
     }
 
-    pub fn health(&self) -> Result<Value, ClientError> {
+    pub fn health(&self) -> Result<Value, RequestError> {
         self.request(Method::GET, "/v1/healthz", None)
     }
 
-    pub fn stats(&self) -> Result<Value, ClientError> {
+    pub fn stats(&self) -> Result<Value, RequestError> {
         self.request(Method::GET, "/v1/stats", None)
     }
 
-    pub fn namespace_stats(&self, namespace: &str) -> Result<Value, ClientError> {
+    pub fn namespace_stats(&self, namespace: &str) -> Result<Value, RequestError> {
         self.request(
             Method::GET,
             &format!("/v1/namespaces/{}/stats", encode_ns(namespace)),
@@ -58,7 +124,7 @@ impl Client {
         &self,
         namespace: &str,
         documents: Vec<Document>,
-    ) -> Result<IndexResponse, ClientError> {
+    ) -> Result<IndexResponse, RequestError> {
         let body = IndexRequest {
             namespace: NamespaceId(namespace.to_string()),
             documents,
@@ -70,7 +136,11 @@ impl Client {
         )
     }
 
-    pub fn search(&self, namespace: &str, query: SearchQuery) -> Result<SearchResult, ClientError> {
+    pub fn search(
+        &self,
+        namespace: &str,
+        query: SearchQuery,
+    ) -> Result<SearchResult, RequestError> {
         let mut body = serde_json::to_value(&query).map_err(|e| ClientError(e.to_string()))?;
         if let Some(obj) = body.as_object_mut() {
             obj.insert("namespace".into(), Value::String(namespace.to_string()));
@@ -82,7 +152,7 @@ impl Client {
         )
     }
 
-    pub fn search_body(&self, namespace: &str, mut body: Value) -> Result<Value, ClientError> {
+    pub fn search_body(&self, namespace: &str, mut body: Value) -> Result<Value, RequestError> {
         if let Some(obj) = body.as_object_mut() {
             obj.insert("namespace".into(), Value::String(namespace.to_string()));
         }
@@ -93,19 +163,39 @@ impl Client {
         )
     }
 
-    pub fn flush(&self, namespace: Option<&str>) -> Result<Value, ClientError> {
+    pub fn flush(&self, namespace: Option<&str>) -> Result<Value, RequestError> {
         match namespace {
             Some(ns) => self.request(
                 Method::POST,
                 &format!("/v1/namespaces/{}/flush", encode_ns(ns)),
                 Some(serde_json::json!({})),
             ),
-            // Legacy route supports flush-all when namespace is omitted.
-            None => self.request(Method::POST, "/flush", Some(serde_json::json!({}))),
+            // Every namespace of the caller: `/v1` has no flush-all, so list
+            // them and flush each (#350; the unversioned `/flush` is
+            // deprecated).
+            None => {
+                let listed: Value = self.request(Method::GET, "/v1/namespaces", None)?;
+                let names: Vec<String> = listed
+                    .get("namespaces")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|ns| ns.get("name").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect();
+                for ns in &names {
+                    let _: Value = self.request(
+                        Method::POST,
+                        &format!("/v1/namespaces/{}/flush", encode_ns(ns)),
+                        Some(serde_json::json!({})),
+                    )?;
+                }
+                Ok(serde_json::json!({"status": "flushed", "namespaces": names}))
+            }
         }
     }
 
-    pub fn delete(&self, namespace: &str, filter: Value) -> Result<Value, ClientError> {
+    pub fn delete(&self, namespace: &str, filter: Value) -> Result<Value, RequestError> {
         self.request(
             Method::POST,
             &format!("/v1/namespaces/{}/delete", encode_ns(namespace)),
@@ -113,7 +203,7 @@ impl Client {
         )
     }
 
-    pub fn rebuild_filter_blooms(&self, namespace: &str) -> Result<Value, ClientError> {
+    pub fn rebuild_filter_blooms(&self, namespace: &str) -> Result<Value, RequestError> {
         self.request(
             Method::POST,
             "/v1/admin/rebuild-filter-blooms",
@@ -121,7 +211,7 @@ impl Client {
         )
     }
 
-    pub fn backfill_offset_tables(&self, namespace: &str) -> Result<Value, ClientError> {
+    pub fn backfill_offset_tables(&self, namespace: &str) -> Result<Value, RequestError> {
         self.request(
             Method::POST,
             "/v1/admin/backfill-offset-tables",
@@ -129,12 +219,94 @@ impl Client {
         )
     }
 
+    /// `POST /v1/namespaces/{ns}/exists` with `{"ids": [...]}`; answers
+    /// `{"namespace", "existing": [...], "missing": [...]}`.
+    pub fn exists(&self, namespace: &str, ids: &[String]) -> Result<Value, RequestError> {
+        self.request(
+            Method::POST,
+            &format!("/v1/namespaces/{}/exists", encode_ns(namespace)),
+            Some(serde_json::json!({ "ids": ids })),
+        )
+    }
+
+    /// `POST /v1/admin/compact-namespace`. `body` carries `namespace`,
+    /// `mode`, `max_segment_bytes` and `async`.
+    pub fn compact_namespace(&self, body: Value) -> Result<Value, RequestError> {
+        self.request(Method::POST, "/v1/admin/compact-namespace", Some(body))
+    }
+
+    /// `GET /v1/admin/compaction-status`.
+    pub fn compaction_status(&self) -> Result<Value, RequestError> {
+        self.request(Method::GET, "/v1/admin/compaction-status", None)
+    }
+
+    /// `GET /v1/admin/compaction-jobs/{job_id}`.
+    pub fn compaction_job(&self, job_id: &str) -> Result<Value, RequestError> {
+        self.request(
+            Method::GET,
+            &format!("/v1/admin/compaction-jobs/{}", urlencoding::encode(job_id)),
+            None,
+        )
+    }
+
+    /// `POST /v1/admin/import-namespace`: rebuild a namespace's manifest
+    /// from the segment footers under its S3 prefix.
+    pub fn import_namespace(
+        &self,
+        namespace: &str,
+        overwrite: bool,
+    ) -> Result<Value, RequestError> {
+        self.request(
+            Method::POST,
+            "/v1/admin/import-namespace",
+            Some(serde_json::json!({"namespace": namespace, "overwrite": overwrite})),
+        )
+    }
+
+    /// `POST /v1/admin/api-keys`. `body` names the tenant and, optionally,
+    /// the key's scopes, namespaces and expiry.
+    pub fn create_api_key(&self, body: Value) -> Result<Value, RequestError> {
+        self.request(Method::POST, "/v1/admin/api-keys", Some(body))
+    }
+
+    /// `GET /v1/admin/api-keys`: keys that are not revoked, without secrets.
+    pub fn list_api_keys(&self, tenant_id: Option<&str>) -> Result<Value, RequestError> {
+        let path = match tenant_id {
+            Some(tenant) => format!(
+                "/v1/admin/api-keys?tenant_id={}",
+                urlencoding::encode(tenant)
+            ),
+            None => "/v1/admin/api-keys".to_string(),
+        };
+        self.request(Method::GET, &path, None)
+    }
+
+    /// `POST /v1/admin/api-keys/revoke`.
+    pub fn revoke_api_key(&self, key_id: &str) -> Result<Value, RequestError> {
+        self.request(
+            Method::POST,
+            "/v1/admin/api-keys/revoke",
+            Some(serde_json::json!({ "key_id": key_id })),
+        )
+    }
+
+    /// `POST /v1/admin/api-keys/rotate`. `body` names the key and,
+    /// optionally, the overlap window and the new key's expiry.
+    pub fn rotate_api_key(&self, body: Value) -> Result<Value, RequestError> {
+        self.request(Method::POST, "/v1/admin/api-keys/rotate", Some(body))
+    }
+
+    /// `POST /v1/admin/api-keys/scrub-plaintext`.
+    pub fn scrub_plaintext_api_keys(&self) -> Result<Value, RequestError> {
+        self.request(Method::POST, "/v1/admin/api-keys/scrub-plaintext", None)
+    }
+
     pub fn curl(
         &self,
         method: Method,
         path: &str,
         body: Option<Value>,
-    ) -> Result<Value, ClientError> {
+    ) -> Result<Value, RequestError> {
         let path = if path.starts_with('/') {
             path.to_string()
         } else {
@@ -148,7 +320,7 @@ impl Client {
         method: Method,
         path: &str,
         body: Option<Value>,
-    ) -> Result<T, ClientError> {
+    ) -> Result<T, RequestError> {
         let url = format!("{}{}", self.host, path);
         let mut req = self.http.request(method.clone(), &url);
         req = req.header("content-type", "application/json");
@@ -167,21 +339,24 @@ impl Client {
             .text()
             .map_err(|e| ClientError(format!("failed to read response body: {e}")))?;
         if !status.is_success() {
-            let snippet: String = text.chars().take(500).collect();
-            return Err(ClientError(format!(
-                "{method} {path} → {status}: {snippet}"
-            )));
+            return Err(RequestError::Http(HttpError {
+                method,
+                path: path.to_string(),
+                status: status.as_u16(),
+                message: error_message(&text),
+            }));
         }
         if text.trim().is_empty() {
             // Some endpoints might return empty; normalize to null JSON.
             return serde_json::from_str("null")
-                .map_err(|e| ClientError(format!("empty response parse error: {e}")));
+                .map_err(|e| ClientError(format!("empty response parse error: {e}")).into());
         }
         serde_json::from_str(&text).map_err(|e| {
             ClientError(format!(
                 "invalid JSON from {method} {path}: {e}; body={}",
                 text.chars().take(200).collect::<String>()
             ))
+            .into()
         })
     }
 }
@@ -251,6 +426,17 @@ fn shorthand_field(name: &str, value: &Value) -> Result<kosha_core::Field, Clien
 mod tests {
     use super::*;
     use kosha_core::FieldType;
+
+    #[test]
+    fn error_message_prefers_the_servers_error_field() {
+        assert_eq!(
+            error_message(r#"{"error":"admin credential required"}"#),
+            "admin credential required"
+        );
+        assert_eq!(error_message("plain text"), "plain text");
+        let long = "x".repeat(600);
+        assert_eq!(error_message(&long).len(), 500);
+    }
 
     #[test]
     fn parses_native_document() {

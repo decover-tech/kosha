@@ -1,6 +1,6 @@
 [package]
 name = "kosha-vector-spfresh"
-description = "Standalone SPFresh/SPANN-style incremental posting-based ANN index (LIRE: split/merge/reassign) — algorithmic core prototype, not wired into kosha-segment's on-disk format; see README.md"
+description = "SPFresh/SPANN-style posting-based ANN index with LIRE split/merge/reassign: builds kosha segments' vector indexes and merges them in compaction; see README.md"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,10 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-# Intentionally empty: pure std, in-memory prototype — see README.md
-# "Simplifications". Keeping this crate dependency-free is deliberate: it
-# stays trivially embeddable in a future on-disk-format pass without
-# dragging in anything from the rest of the workspace.
+serde = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -25,4 +22,8 @@ instant-distance = "0.6"
 
 [[bench]]
 name = "build_query_cost"
+harness = false
+
+[[bench]]
+name = "distance_kernels"
 harness = false

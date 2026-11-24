@@ -7,5 +7,16 @@ metadata:
   name: kosha-query
   namespace: kosha
 spec:
-  minReplicas: 2
+  minReplicas: 3
   maxReplicas: 6
+  # Scale down slowly: a new pod was measured warming a 6.6 GB warm set for
+  # ~256 s before it was ready (plus EBS volume create/attach), so dropping pods the moment CPU dips and adding cold ones on the
+  # next spike (2 -> 4 -> 2 within minutes during an eval) costs more than
+  # it saves.
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120

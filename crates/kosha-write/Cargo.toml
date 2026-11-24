@@ -13,3 +13,38 @@ kosha-core = { path = "../kosha-core" }
 kosha-segment = { path = "../kosha-segment" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+crc32c = "0.6"
+uuid = { version = "1", features = ["v4"] }
+# Named failpoints on the durability path (#257). The macros compile to
+# nothing unless the `failpoints` feature is on, and even then every point
+# is inert until a test configures it.
+fail = "0.5"
+
+[features]
+default = []
+failpoints = ["fail/failpoints"]
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+kosha-query = { path = "../kosha-query" }
+proptest = "1"
+
+[[test]]
+name = "interleavings"
+required-features = ["failpoints"]
+
+[[bench]]
+name = "sustained_concurrent_flush"
+harness = false
+
+[[bench]]
+name = "upsert_write_amplification"
+harness = false
+
+[[bench]]
+name = "wal_group_commit"
+harness = false
+
+[[bench]]
+name = "s3_wal_ack"
+harness = false

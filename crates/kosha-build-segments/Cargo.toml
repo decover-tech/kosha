@@ -9,6 +9,23 @@ license.workspace = true
 name = "kosha-build-segments"
 path = "src/main.rs"
 
+# Measures i8 vector quantization (#210) on segment sets built above.
+[[bin]]
+name = "kosha-vector-quant-eval"
+path = "src/bin/vector_quant_eval.rs"
+
+# Compares segment layouts (input order vs --cluster-layout namespace, #380)
+# under the global kNN probe budget at matched recall.
+[[bin]]
+name = "kosha-cluster-eval"
+path = "src/bin/cluster_eval.rs"
+
+# Recall / nDCG of late-interaction retrieval (#205) on a token-embedding
+# corpus with qrels, against exact MaxSim and mean-pooled single vectors.
+[[bin]]
+name = "kosha-late-interaction-eval"
+path = "src/bin/late_interaction_eval.rs"
+
 [lints]
 workspace = true
 
@@ -18,3 +35,4 @@ kosha-segment = { path = "../kosha-segment" }
 clap = { version = "4", features = ["derive"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+rayon = { workspace = true }

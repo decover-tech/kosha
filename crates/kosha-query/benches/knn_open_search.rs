@@ -19,6 +19,9 @@
 //! # bigger corpus / real-embedding dimensionality:
 //! KOSHA_BENCH_SEGS=16 KOSHA_BENCH_DOCS=4000 KOSHA_BENCH_DIM=384 \
 //!   cargo bench -p kosha-query --bench knn_open_search
+//! # distinct warm queries, so the decoded-posting cache is mostly missed:
+//! KOSHA_BENCH_SEGS=16 KOSHA_BENCH_DOCS=20000 KOSHA_BENCH_DIM=1024 KOSHA_BENCH_K=50 \
+//!   KOSHA_BENCH_QUERIES=16 cargo bench -p kosha-query --bench knn_open_search
 //! # CI-grade percentiles:
 //! KOSHA_BENCH_COLD_ITERS=25 KOSHA_BENCH_WARM_ITERS=200 \
 //!   KOSHA_BENCH_JSON=/tmp/knn_bench.json cargo bench -p kosha-query --bench knn_open_search
@@ -127,6 +130,15 @@ fn build_corpus(root: &Path, ns: &NamespaceId, segs: usize, docs: usize, dim: us
         version: 1,
         segments: entries,
         segment_footers: Default::default(),
+        footer_crc32: Default::default(),
+        wal_checkpoint: 0,
+        wal_origin: None,
+        tombstones: Default::default(),
+        deletion_vectors: Default::default(),
+        branch: None,
+        schema: None,
+        retired: Default::default(),
+        shards: None,
     }
 }
 
@@ -137,32 +149,52 @@ fn mk_query(text: &str, knn: Option<KnnQuery>) -> SearchQuery {
         query_text: text.into(),
         max_results: 10,
         from: 0,
-        bm25_params: Bm25Params::default(),
+        bm25_params: Default::default(),
         filter: None,
         sort: vec![],
         search_after: None,
         highlight: None,
         aggs: HashMap::new(),
         wildcard: None,
+        fuzzy: None,
         match_phrase: None,
         knn,
         exact_total_hits: None,
         total_hits_cap: None,
         operator: None,
         no_cache: None,
+        collapse: None,
+        limit_per: None,
+        rank_by: None,
+        source_includes: None,
+        source_excludes: None,
+        rank: None,
+        mode: None,
+        fields: Vec::new(),
+        rerank: None,
     }
 }
 
 fn mk_knn(dim: usize, k: usize) -> KnnQuery {
+    mk_knn_seeded(dim, k, 0)
+}
+
+/// Query vector number `n` (`KOSHA_BENCH_QUERIES` rotates through several;
+/// `0` is the one every other shape uses).
+fn mk_knn_seeded(dim: usize, k: usize, n: u64) -> KnnQuery {
     // Deterministic query vector from its own seed — not a corpus vector,
     // so the search can't degenerate into an exact-match shortcut.
-    let mut rng = Lcg(0xC0FFEE);
+    let mut rng = Lcg(0xC0FFEE + n);
     KnnQuery {
+        query_text: None,
+        embedding_model: None,
         field: "embedding".into(),
         vector: (0..dim).map(|_| rng.coord()).collect(),
         k,
         num_candidates: 10 * k,
         filter: None,
+        vectors: None,
+        scoring: None,
     }
 }
 
@@ -249,9 +281,7 @@ fn main() {
             // v2 segments carry the lazy posting index; legacy/flat ones
             // carry a populated vector_store (served by exact flat_knn).
             assert!(
-                r.has_lazy_vector_index()
-                    || r.hnsw_map.is_some()
-                    || !r.vector_store.vectors.is_empty(),
+                r.has_lazy_vector_index() || !r.vector_store().vectors.is_empty(),
                 "vector segment opened without any vector index"
             );
         }
@@ -287,16 +317,67 @@ fn main() {
             mk_query("the", Some(mk_knn(dim, k))),
         ),
     ];
+    // `KOSHA_BENCH_QUERIES` > 1 rotates each warm shape through that many
+    // distinct query vectors, so successive queries probe different
+    // postings and the process-wide decoded-posting cache (second-touch
+    // admission, `KOSHA_VECTOR_POSTINGS_CACHE_MAX_BYTES`) is mostly missed,
+    // as it is under real traffic. The default repeats one vector.
+    let distinct = env_usize("KOSHA_BENCH_QUERIES", 1).max(1);
     let mut warm = Vec::new();
+    // Posting-scan split of the warm kNN shape (#435), summed over its
+    // samples: read / decode / dot ms (across scoring threads), postings
+    // served from the decoded cache, postings scanned.
+    let mut scan = (0.0f64, 0.0f64, 0.0f64, 0usize, 0usize);
+    // Of the same samples (#436): `knn_plan` wall ms, the scoring pass's
+    // wall ms, the ms segments spent ranking their own centroids (summed
+    // over threads), centroids the plan scanned, and those of them it
+    // scored exactly in f32 (`knn_plan_exact_centroids`).
+    let mut phases = (0.0f64, 0.0f64, 0.0f64, 0usize, 0usize);
+    // FNV-1a over every warm kNN sample's hits (document id and score
+    // bits, in order): two builds that return the same top-k for the same
+    // knobs print the same digest.
+    let mut digest: u64 = 0xcbf29ce484222325;
     for (label, key, query) in shapes {
-        searcher.search(&ns, &manifest, &query, None).unwrap(); // warmup
+        let variants: Vec<SearchQuery> = (0..distinct as u64)
+            .map(|n| {
+                let mut q = query.clone();
+                q.knn = Some(mk_knn_seeded(dim, k, n));
+                q
+            })
+            .collect();
+        searcher.search(&ns, &manifest, &variants[0], None).unwrap(); // warmup
         let mut samples = Vec::new();
-        for _ in 0..warm_iters {
+        for i in 0..warm_iters {
+            let query = &variants[i % distinct];
             let t = Instant::now();
-            let r = searcher.search(&ns, &manifest, &query, None).unwrap();
+            let (r, stats) = searcher
+                .search_with_stats(&ns, &manifest, query, None)
+                .unwrap();
             samples.push(t.elapsed().as_secs_f64() * 1e3);
             assert!(r.total_hits > 0, "{label} returned 0 hits");
             black_box(r.total_hits);
+            if key == "knn" {
+                scan.0 += stats.knn_read_ms;
+                scan.1 += stats.knn_decode_ms;
+                scan.2 += stats.knn_dot_ms;
+                scan.3 += stats.knn_postings_cached;
+                scan.4 += stats.knn_postings_probed;
+                phases.0 += stats.knn_plan_ms;
+                phases.1 += stats.score_wall_ms;
+                phases.2 += stats.knn_rank_ms;
+                phases.3 += stats.knn_centroids_scanned;
+                phases.4 += stats.knn_plan_exact_centroids;
+                for hit in &r.results {
+                    let bytes = hit
+                        .doc_id
+                        .0
+                        .bytes()
+                        .chain(hit.score.to_bits().to_le_bytes());
+                    for b in bytes {
+                        digest = (digest ^ b as u64).wrapping_mul(0x100000001b3);
+                    }
+                }
+            }
         }
         warm.push((label, key, Dist::from_samples(samples)));
     }
@@ -326,6 +407,33 @@ fn main() {
     for (label, _, d) in &warm {
         row(label, d);
     }
+    let per_query = |total: f64| total / warm_iters.max(1) as f64;
+    // The mean over every warm kNN sample: distinct query vectors probe
+    // different numbers of postings, so one sample's count is not it.
+    let knn_postings = per_query(scan.4 as f64);
+    println!(
+        "warm kNN: {distinct} distinct quer(ies), {knn_postings:.1} postings probed per query (mean)"
+    );
+    println!(
+        "warm kNN posting scan per query (summed over threads): read {:.2}ms, decode {:.2}ms, \
+         dot {:.2}ms; {:.0}% of postings from the decoded cache",
+        per_query(scan.0),
+        per_query(scan.1),
+        per_query(scan.2),
+        100.0 * scan.3 as f64 / scan.4.max(1) as f64,
+    );
+
+    println!(
+        "warm kNN phases per query (mean): knn_plan {:.3}ms, score wall {:.3}ms, segment centroid \
+         ranking {:.3}ms (summed over threads); {:.0} centroids scanned by the plan, \
+         knn_plan_exact_centroids {:.1}",
+        per_query(phases.0),
+        per_query(phases.1),
+        per_query(phases.2),
+        per_query(phases.3 as f64),
+        per_query(phases.4 as f64),
+    );
+    println!("warm kNN top-k digest (ids and score bits of every sample): {digest:016x}");
 
     if let Ok(path) = std::env::var("KOSHA_BENCH_JSON") {
         let warm_json: serde_json::Map<String, serde_json::Value> = warm
@@ -341,6 +449,22 @@ fn main() {
             "open_bytes": open_bytes,
             "cold_knn_ms": cold_knn.json(),
             "warm_ms": warm_json,
+            "warm_knn_scan": {
+                "distinct_queries": distinct,
+                "postings_per_query": knn_postings,
+                "read_ms": per_query(scan.0),
+                "decode_ms": per_query(scan.1),
+                "dot_ms": per_query(scan.2),
+                "cached_fraction": scan.3 as f64 / scan.4.max(1) as f64,
+            },
+            "warm_knn_phases": {
+                "knn_plan_ms": per_query(phases.0),
+                "score_wall_ms": per_query(phases.1),
+                "knn_rank_ms": per_query(phases.2),
+                "centroids_per_query": per_query(phases.3 as f64),
+                "knn_plan_exact_centroids": per_query(phases.4 as f64),
+                "topk_digest": format!("{digest:016x}"),
+            },
         });
         std::fs::write(&path, serde_json::to_string_pretty(&report).unwrap())
             .unwrap_or_else(|e| panic!("write KOSHA_BENCH_JSON={path}: {e}"));

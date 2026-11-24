@@ -1,0 +1,22 @@
+# Overlay for the repo-root docker-compose.yml that makes segment layout
+# deterministic for the conformance suite (one explicit flush = one segment),
+# so the reference model can predict exact per-segment BM25 scores.
+#
+#   docker compose -f docker-compose.yml \
+#     -f scripts/conformance/docker-compose.conformance.yml up --build -d
+services:
+  kosha-server:
+    environment:
+      KOSHA_FLUSH_THRESHOLD: "1000000"
+      KOSHA_MAX_CONCURRENT_FLUSH_WRITERS: "1"
+      # No idle-buffer flush timer (#241): the "buffered" stage asserts
+      # unflushed docs stay invisible, and segments come only from /flush.
+      KOSHA_FLUSH_MAX_AGE_MS: "0"
+      KOSHA_COMPACTION_INTERVAL_MS: "0"
+      # The compacted checkpoint calls /v1/admin/compact-namespace, which
+      # needs the dedicated admin credential (#263). Dev-only value.
+      KOSHA_ADMIN_API_KEY: sk-kosha-admin-dev
+      # Legacy unversioned routes off (#350): the conformance suite, the wire
+      # check and the client smoke test use only /v1, so a 410 here is a
+      # caller that regressed to a legacy route.
+      KOSHA_LEGACY_ROUTES: "off"

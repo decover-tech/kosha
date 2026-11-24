@@ -61,6 +61,17 @@ NO_CACHE = False
 KNN_VECS = None
 KNN_FIELD = "text_emb"
 KNN_NUM_CANDIDATES = 100
+SERVER_TIMINGS = False
+# What each hit carries back. "ids" (default) asks for no stored fields
+# (source_includes: []), so a hit is just doc_id + score: what
+# turbopuffer's benchmark queries return (no include_attributes). "all"
+# returns every stored field, including the 1024-dim embedding as JSON
+# (~100-200KB per top-10 kNN response), which also overflows the 64MB
+# result cache on the 1,677-query cycle.
+RETURN_FIELDS = "ids"
+# --raw-ids: also record each response's ranked doc_ids and scores in the
+# --raw-out records (#385 ranking parity, topk_parity.py).
+RAW_IDS = False
 
 
 def payload_for(namespace: str, query_text: str, topk: int, qidx: int = 0) -> dict:
@@ -82,17 +93,118 @@ def payload_for(namespace: str, query_text: str, topk: int, qidx: int = 0) -> di
             payload["operator"] = OPERATOR
     if NO_CACHE:
         payload["no_cache"] = True
+    if SERVER_TIMINGS:
+        # Server phase breakdown in the response (needs KOSHA_DASHBOARD on
+        # the server; silently absent otherwise).
+        payload["timings"] = True
+    if RETURN_FIELDS == "ids":
+        payload["source_includes"] = []
     return payload
+
+
+def read_blocks_decoded(session, host: str, admin_key: str | None) -> int | None:
+    """The server's scoring_blocks_decoded counter from GET /v1/stats (#385);
+    None when not asked for, unreachable, or an older server without it."""
+    if not admin_key:
+        return None
+    try:
+        resp = session.get(f"{host}/v1/stats", headers=auth_headers(admin_key), timeout=60)
+        resp.raise_for_status()
+        value = resp.json().get("scoring_blocks_decoded")
+        return int(value) if value is not None else None
+    except Exception as e:  # noqa: BLE001 - reporting only, never fails a run
+        print(f"WARN: could not read scoring_blocks_decoded from /v1/stats: {e}")
+        return None
+
+
+def load_queries(path: Path) -> list[str]:
+    """Non-empty lines of a queries file, in order."""
+    queries = [l.strip() for l in path.read_text().splitlines() if l.strip()]
+    if not queries:
+        raise SystemExit(f"no queries in {path}")
+    return queries
+
+
+def query_order(n: int, order: str, seed: int, zipf_s: float, rank_seed: int = 389):
+    """qidx for the i-th request. cycle (default): i % n, the fixed loop
+    every earlier run used. shuffle: a seeded random permutation, re-drawn
+    each pass, so no query is a fixed distance from its repeat. zipf:
+    i.i.d. draws with P(rank r) ~ 1/r^s over a random ranking of the
+    queries, a skewed popularity mix (#389 cache-policy runs: a pure loop
+    is adversarial to FIFO/LRU and flattering to SIEVE/S3-FIFO). The
+    ranking comes from rank_seed, so the popular queries stay the same
+    across stages run with different draw seeds."""
+    import random as _random
+
+    if order == "cycle":
+        return lambda i: i % n
+    rng = _random.Random(seed)
+    if order == "shuffle":
+        state = {"pass": -1, "perm": []}
+
+        def shuffled(i: int) -> int:
+            p = i // n
+            if p != state["pass"]:
+                state["pass"] = p
+                state["perm"] = list(range(n))
+                rng.shuffle(state["perm"])
+            return state["perm"][i % n]
+
+        return shuffled
+    if order == "zipf":
+        ranking = list(range(n))
+        _random.Random(rank_seed).shuffle(ranking)
+        weights = [1.0 / (r + 1) ** zipf_s for r in range(n)]
+        cum, total = [], 0.0
+        for w in weights:
+            total += w
+            cum.append(total)
+        import bisect
+
+        return lambda _i: ranking[min(bisect.bisect_left(cum, rng.random() * total), n - 1)]
+    raise SystemExit(f"unknown --order {order}")
+
+
+def load_knn_vectors(path: Path, n_queries: int, dim: int = 1024) -> list[list[float]]:
+    """queries_emb.f32 (dim-float32 records aligned with the queries file)."""
+    import array as _array
+
+    raw = path.read_bytes()
+    if len(raw) % (dim * 4) != 0:
+        raise SystemExit(f"{path} is not a whole number of {dim}-float records")
+    vecs = []
+    for off in range(0, len(raw), dim * 4):
+        a = _array.array("f")
+        a.frombytes(raw[off : off + dim * 4])
+        vecs.append(list(a))
+    if len(vecs) != n_queries:
+        raise SystemExit(
+            f"{len(vecs)} query embeddings vs {n_queries} queries — "
+            "misaligned inputs, refusing to run"
+        )
+    return vecs
 
 
 def run_query(
     session, host, namespace, headers, query_text, topk, timeout,
     results, lock, errors, hit_counts, degraded_counts, qidx=0,
+    raw=None, seq=0, scheduled=0.0, start=0.0,
 ):
     t0 = time.time()
+    rec = None
+    if raw is not None:
+        rec = {
+            "seq": seq,
+            "qidx": qidx,
+            "terms": len(query_text.split()),
+            "t_send_s": round(t0 - start, 4),
+            # Client-side lateness: thread start vs the open-loop schedule.
+            # Large values mean the load generator, not the server, added delay.
+            "send_lag_ms": round((t0 - scheduled) * 1000, 2),
+        }
     try:
         resp = session.post(
-            f"{host}/search",
+            f"{host}/v1/namespaces/{namespace}/search",
             json=payload_for(namespace, query_text, topk, qidx),
             headers=headers,
             timeout=timeout,
@@ -114,9 +226,24 @@ def run_query(
             results.append(latency)
             hit_counts.append(hits)
             degraded_counts.append(degraded if degraded is not None else 0)
+            if rec is not None:
+                rec.update(latency_ms=round(latency * 1000, 3), hits=hits)
+                if RAW_IDS:
+                    # Ranked ids and scores, so two runs over different
+                    # snapshots can be checked for identical top-k per
+                    # qidx (topk_parity.py, #385).
+                    res = body.get("results", [])
+                    rec["ids"] = [r.get("doc_id") for r in res]
+                    rec["scores"] = [r.get("score") for r in res]
+                if "timings" in body:
+                    rec["server"] = body["timings"]
+                raw.append(rec)
     except Exception as e:  # noqa: BLE001 - benchmark tool, record and move on
         with lock:
             errors.append(str(e))
+            if rec is not None:
+                rec.update(latency_ms=round((time.time() - t0) * 1000, 3), error=str(e)[:200])
+                raw.append(rec)
 
 
 def main() -> None:
@@ -161,33 +288,77 @@ def main() -> None:
         default=100,
         help="ANN candidate pool per query (tpuf-comparable default)",
     )
+    ap.add_argument(
+        "--order",
+        choices=["cycle", "shuffle", "zipf"],
+        default="cycle",
+        help="request order over the queries file: cycle (default, the fixed loop), "
+        "shuffle (seeded permutation per pass) or zipf (seeded skewed popularity)",
+    )
+    ap.add_argument(
+        "--order-seed",
+        type=int,
+        default=389,
+        help="seed for the shuffle / zipf draws; use a different one per stage",
+    )
+    ap.add_argument(
+        "--zipf-rank-seed",
+        type=int,
+        default=389,
+        help="seed for which queries are popular under --order zipf (keep fixed across stages)",
+    )
+    ap.add_argument("--zipf-s", type=float, default=1.0, help="zipf exponent for --order zipf")
     ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument(
+        "--raw-out",
+        type=Path,
+        default=None,
+        help="write one JSON line per request (qidx, terms, send lag, latency, "
+        "hits, server timings) for tail analysis; gzipped if the name ends .gz",
+    )
+    ap.add_argument(
+        "--server-timings",
+        action="store_true",
+        help="send timings=true so each response carries the server phase "
+        "breakdown (requires KOSHA_DASHBOARD on the server)",
+    )
+    ap.add_argument(
+        "--return",
+        dest="return_fields",
+        choices=["ids", "all"],
+        default="ids",
+        help="ids (default): hits carry doc_id + score only (source_includes: []), "
+        "as turbopuffer's benchmark queries do; all: every stored field, "
+        "including embeddings",
+    )
+    ap.add_argument(
+        "--raw-ids",
+        action="store_true",
+        help="with --raw-out, also record each response's ranked doc_ids and "
+        "scores (ids, scores), for an off-vs-on ranking parity check with "
+        "topk_parity.py (#385)",
+    )
+    ap.add_argument(
+        "--stats-api-key",
+        default=None,
+        help="admin key for GET /v1/stats: if set, read the server's "
+        "scoring_blocks_decoded counter before and after the phase and report "
+        "the delta and blocks decoded per successful request (#385). The "
+        "counter is process wide, so it is only per-query when nothing else "
+        "queries the server during the phase",
+    )
     args = ap.parse_args()
-    global OPERATOR, NO_CACHE, KNN_VECS, KNN_FIELD, KNN_NUM_CANDIDATES
+    global OPERATOR, NO_CACHE, KNN_VECS, KNN_FIELD, KNN_NUM_CANDIDATES, SERVER_TIMINGS, RETURN_FIELDS, RAW_IDS
     OPERATOR = args.operator
     NO_CACHE = args.no_cache
+    SERVER_TIMINGS = args.server_timings
+    RETURN_FIELDS = args.return_fields
+    RAW_IDS = args.raw_ids
 
-    queries = [l.strip() for l in args.queries_file.read_text().splitlines() if l.strip()]
-    if not queries:
-        raise SystemExit(f"no queries in {args.queries_file}")
+    queries = load_queries(args.queries_file)
 
     if args.knn_embeddings:
-        import array as _array
-
-        DIM = 1024
-        raw = args.knn_embeddings.read_bytes()
-        if len(raw) % (DIM * 4) != 0:
-            raise SystemExit(f"{args.knn_embeddings} is not a whole number of {DIM}-float records")
-        vecs = []
-        for off in range(0, len(raw), DIM * 4):
-            a = _array.array("f")
-            a.frombytes(raw[off : off + DIM * 4])
-            vecs.append(list(a))
-        if len(vecs) != len(queries):
-            raise SystemExit(
-                f"{len(vecs)} query embeddings vs {len(queries)} queries — "
-                "misaligned inputs, refusing to run"
-            )
+        vecs = load_knn_vectors(args.knn_embeddings, len(queries))
         KNN_VECS = vecs
         KNN_FIELD = args.knn_field
         KNN_NUM_CANDIDATES = args.knn_num_candidates
@@ -199,15 +370,20 @@ def main() -> None:
     errors: list[str] = []
     hit_counts: list[int] = []
     degraded_counts: list[int] = []
+    raw: list[dict] | None = [] if args.raw_out else None
     lock = threading.Lock()
     threads: list[threading.Thread] = []
 
     interval = 1.0 / args.qps
+    next_qidx = query_order(
+        len(queries), args.order, args.order_seed, args.zipf_s, args.zipf_rank_seed
+    )
     print(
         f"phase={args.phase} qps={args.qps} topk={args.topk} "
-        f"duration={args.duration}s (~{int(args.qps * args.duration)} requests)"
+        f"duration={args.duration}s (~{int(args.qps * args.duration)} requests) order={args.order}"
     )
 
+    blocks_before = read_blocks_decoded(session, args.host, args.stats_api_key)
     start = time.time()
     next_send = start
     i = 0
@@ -215,7 +391,7 @@ def main() -> None:
         now = time.time()
         if now < next_send:
             time.sleep(next_send - now)
-        qidx = i % len(queries)
+        qidx = next_qidx(i)
         query_text = queries[qidx]
         i += 1
         th = threading.Thread(
@@ -234,6 +410,10 @@ def main() -> None:
                 hit_counts,
                 degraded_counts,
                 qidx,
+                raw,
+                i - 1,
+                next_send,
+                start,
             ),
             daemon=True,
         )
@@ -246,6 +426,7 @@ def main() -> None:
         th.join(timeout=args.timeout + 5)
 
     elapsed = time.time() - start
+    blocks_after = read_blocks_decoded(session, args.host, args.stats_api_key)
     achieved_qps = len(results) / elapsed if elapsed > 0 else 0
 
     # Correctness signal, not just latency: a 200 with an empty/short page,
@@ -265,6 +446,7 @@ def main() -> None:
         "target_qps": args.qps,
         "achieved_qps": achieved_qps,
         "topk": args.topk,
+        "order": args.order,
         "duration_s": elapsed,
         "requests": i,
         "successes": len(results),
@@ -289,6 +471,10 @@ def main() -> None:
         "knn_degraded_rate": (knn_degraded_requests / n) if n else float("nan"),
         "knn_degraded_segments_total": knn_degraded_segments_total,
     }
+    if blocks_before is not None and blocks_after is not None:
+        delta = blocks_after - blocks_before
+        summary["scoring_blocks_decoded"] = delta
+        summary["scoring_blocks_decoded_per_request"] = (delta / len(results)) if results else float("nan")
 
     print(json.dumps(summary, indent=2))
     if errors:
@@ -307,6 +493,15 @@ def main() -> None:
     if args.out:
         args.out.write_text(json.dumps(summary, indent=2))
         print(f"\nwrote {args.out}")
+    if raw is not None:
+        import gzip
+
+        raw.sort(key=lambda r: r["seq"])
+        opener = gzip.open if str(args.raw_out).endswith(".gz") else open
+        with opener(args.raw_out, "wt") as f:
+            for r in raw:
+                f.write(json.dumps(r) + "\n")
+        print(f"wrote {len(raw)} request records to {args.raw_out}")
 
 
 if __name__ == "__main__":

@@ -15,6 +15,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 instant-distance = "0.6"
 zstd = "0.13"
+roaring = "0.11"
+crc32fast = "1"
+unicode-segmentation = "1"
+rust-stemmers = "1"
+rayon = { workspace = true }
+# Safe casts between the posting read buffer's bytes and its f32s (#435).
+bytemuck = "1"
 
 [dev-dependencies]
 # `stats` feature for `total_allocated()` (bytes ever requested, including
@@ -25,3 +32,16 @@ zstd = "0.13"
 # this workspace's `unsafe_code` lint (confirmed: kosha-query's existing
 # benches use this same crate for the same reason).
 cap = { version = "0.1.2", features = ["stats"] }
+proptest = "1"
+
+[[bench]]
+name = "tokenizer"
+harness = false
+
+[[bench]]
+name = "doc_store_zstd"
+harness = false
+
+[[bench]]
+name = "postings_codec"
+harness = false

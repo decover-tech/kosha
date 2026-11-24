@@ -1,0 +1,10 @@
+# The pods carry prometheus.io/scrape|port|path annotations (docs/metrics.md).
+# With port 8080 on HTTPS, a scrape over plain HTTP fails, so tell
+# annotation-based discovery which scheme to use. This only works when the
+# Prometheus scrape job maps the annotation onto __scheme__ and can complete
+# the handshake (the internal CA as `tls_config.ca_file` with
+# `server_name: kosha-internal`, or `insecure_skip_verify`); see
+# k8s/README.md. /metrics needs no client certificate.
+- op: add
+  path: /spec/template/metadata/annotations/prometheus.io~1scheme
+  value: https

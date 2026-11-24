@@ -1,28 +1,38 @@
 #!/usr/bin/env python3
-"""Render the direct ES → Kosha migration Job manifest for staging.
+"""Render the direct ES -> Kosha migration Job manifest (``kosha-server migrate``).
 
-    python scripts/gen_es_migration_job.py > k8s/stage/es-to-kosha-migration-job.yaml
+    python scripts/gen_es_migration_job.py --index my_index --index other_index \
+        > k8s/stage/es-to-kosha-migration-job.yaml
+
+or ``make migration-job-manifest MIGRATION_INDICES="my_index other_index"``.
+
+The Job runs ``kosha-server migrate``, which sliced-scrolls OpenSearch, builds
+segments in-process, uploads them to S3 and publishes their manifest entries
+directly (no HTTP API). For copying through the public ``/v1`` API instead,
+see ``scripts/copy_es_to_kosha.py`` and docs/migration/from-elasticsearch.md.
 
 The manifest is applied by hand and is intentionally not part of the
 kustomize overlay, so normal deployments cannot restart a one-shot backfill.
+
+Index names are arguments, never committed defaults. Pass the exact names or
+aliases to copy: each becomes a namespace of the same name, and resolving an
+alias through ``_cat/indices`` would return its concrete backing index name
+instead.
+
+The cluster-specific endpoints are read from the environment (or flags) so no
+account id, registry, or search-domain hostname is committed. The defaults
+render placeholders; set these before applying the manifest for real:
+
+    KOSHA_MIGRATION_ES_HOST     OpenSearch endpoint to read from (--es-host)
+    KOSHA_MIGRATION_IMAGE       fully-qualified kosha-server image (--image)
+    AWS_REGION                  region for both, default us-east-1 (--region)
 """
 
 from __future__ import annotations
 
-ES_HOST = "https://vpc-decoverai-nonprod-search-rdaf2ygjik3teui5prmuotjlx4.us-east-1.es.amazonaws.com"
-REGION = "us-east-1"
-KOSHA_IMAGE = "010928200670.dkr.ecr.us-east-1.amazonaws.com/decover/kosha:main"
-
-# Exact alias names Sage reads. Never resolve these through `_cat/indices`,
-# which returns concrete *_v2 backing names and would mis-name namespaces.
-INDEX_NAMES = [
-    "paragraph_index_hnsw",
-    "page_index",
-    "findings_index",
-    "document_index",
-    "completions_index",
-    "cases_index",
-]
+import argparse
+import os
+import sys
 
 JOB = """\
 # GENERATED FILE — do not edit by hand.
@@ -95,9 +105,16 @@ __ARGS__
 """
 
 
-def render() -> str:
+def render(
+    indices: list[str],
+    es_host: str = "https://<opensearch-endpoint>",
+    region: str = "us-east-1",
+    image: str = "<registry>/decover/kosha:main",
+) -> str:
+    if not indices:
+        raise ValueError("at least one index is required")
     parts: list[str] = []
-    for name in INDEX_NAMES:
+    for name in indices:
         parts.extend(["--index", name])
     parts.extend(
         [
@@ -113,12 +130,38 @@ def render() -> str:
     )
     args = "\n".join(f'            - "{part}"' for part in parts)
     return (
-        JOB.replace("__ES_HOST__", ES_HOST)
-        .replace("__REGION__", REGION)
-        .replace("__KOSHA_IMAGE__", KOSHA_IMAGE)
+        JOB.replace("__ES_HOST__", es_host)
+        .replace("__REGION__", region)
+        .replace("__KOSHA_IMAGE__", image)
         .replace("__ARGS__", args)
     )
 
 
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Render the ES -> Kosha migration Job manifest to stdout."
+    )
+    parser.add_argument(
+        "--index",
+        action="append",
+        required=True,
+        help="Exact ES index or alias to copy (repeatable); also the namespace name.",
+    )
+    parser.add_argument(
+        "--es-host",
+        default=os.environ.get("KOSHA_MIGRATION_ES_HOST", "https://<opensearch-endpoint>"),
+    )
+    parser.add_argument("--region", default=os.environ.get("AWS_REGION", "us-east-1"))
+    parser.add_argument(
+        "--image",
+        default=os.environ.get("KOSHA_MIGRATION_IMAGE", "<registry>/decover/kosha:main"),
+    )
+    args = parser.parse_args(argv)
+    # end="" — render() already ends in a newline, and a second one would
+    # fail the end-of-file-fixer pre-commit hook on the generated manifest.
+    print(render(args.index, args.es_host, args.region, args.image), end="")
+    return 0
+
+
 if __name__ == "__main__":
-    print(render())
+    sys.exit(main())

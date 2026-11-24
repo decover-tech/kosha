@@ -1,0 +1,85 @@
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'kosha_search_requests_total{cluster="busy",outcome="ok"}'
+        values: '0+120x40'
+      - series: 'kosha_search_requests_total{cluster="busy",outcome="rejected"}'
+        values: '0+3x40'
+      - series: 'kosha_search_requests_total{cluster="quiet",outcome="ok"}'
+        values: '0+20x40'
+      - series: 'kosha_search_requests_total{cluster="quiet",outcome="rejected"}'
+        values: '0+3x40'
+      - series: 'kosha_search_phase_seconds_bucket{cluster="busy",phase="hydrate",le="1"}'
+        values: '0+50x40'
+      - series: 'kosha_search_phase_seconds_bucket{cluster="busy",phase="hydrate",le="2.5"}'
+        values: '0+100x40'
+      - series: 'kosha_search_phase_seconds_bucket{cluster="busy",phase="hydrate",le="+Inf"}'
+        values: '0+100x40'
+      - series: 'kosha_hydrations_total{cluster="busy",source="s3"}'
+        values: '0+360x40'
+      - series: 'kosha_hydrations_total{cluster="quiet",source="s3"}'
+        values: '0+360x40'
+      - series: 'kosha_cache_hits_total{cluster="busy",cache="nvme",tenant="one"}'
+        values: '0+60x40'
+      - series: 'kosha_cache_hits_total{cluster="busy",cache="nvme",tenant="two"}'
+        values: '0+60x40'
+      - series: 'kosha_cache_hits_total{cluster="quiet",cache="nvme"}'
+        values: '0+60x40'
+      - series: 'kosha_cache_misses_total{cluster="busy",cache="nvme",tenant="two"}'
+        values: '0+60x40'
+      - series: 'kosha_cache_evictions_total{cluster="busy",cache="nvme",tenant="two"}'
+        values: '0+120x40'
+      - series: 'kosha_cache_misses_total{cluster="quiet",cache="nvme"}'
+        values: '0+60x40'
+      - series: 'kosha_cache_evictions_total{cluster="quiet",cache="nvme"}'
+        values: '0+120x40'
+      - series: 'kosha_span_writes_total{cluster="busy",outcome="inline"}'
+        values: '0+1x40'
+      - series: 'kosha_ops_compaction_namespaces_needing_compaction{cluster="busy"}'
+        values: '3+0x40'
+      - series: 'kosha_ops_compaction_namespaces_needing_compaction{cluster="quiet"}'
+        values: '0+0x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: KoshaSearchSaturation
+        exp_alerts:
+          - exp_labels: {cluster: busy, severity: warning}
+            exp_annotations: {summary: Kosha is shedding more than 1% of searches}
+      - eval_time: 5m
+        alertname: KoshaColdHydration
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: KoshaColdHydration
+        exp_alerts:
+          - exp_labels: {cluster: busy, severity: warning}
+            exp_annotations: {summary: Slow search hydration coincides with sustained object-store fetches}
+      - eval_time: 20m
+        alertname: KoshaNvmeCacheChurn
+        exp_alerts:
+          - exp_labels: {cluster: busy, severity: warning}
+            exp_annotations: {summary: High NVMe cache misses coincide with sustained evictions}
+          - exp_labels: {cluster: quiet, severity: warning}
+            exp_annotations: {summary: High NVMe cache misses coincide with sustained evictions}
+      - eval_time: 20m
+        alertname: KoshaTenantNvmeCacheChurn
+        exp_alerts:
+          - exp_labels: {cluster: busy, tenant: two, severity: warning}
+            exp_annotations: {summary: A tenant has high NVMe cache misses and sustained evictions}
+      - eval_time: 5m
+        alertname: KoshaSpanCacheInlineWrites
+        exp_alerts:
+          - exp_labels: {cluster: busy, severity: warning}
+            exp_annotations: {summary: The span cache is forcing inline writes on fetching threads}
+      - eval_time: 29m
+        alertname: KoshaCompactionBacklog
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: KoshaCompactionBacklog
+        exp_alerts:
+          - exp_labels: {cluster: busy, severity: warning}
+            exp_annotations: {summary: Compaction has outstanding work for at least 30 minutes}

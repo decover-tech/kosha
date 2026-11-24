@@ -1,0 +1,101 @@
+# Scheduled compaction for the staging paragraph namespace.
+#
+# Since #242 the ingest pod compacts on its own: a background scheduler runs
+# a tiered pass on every namespace past the segment trigger
+# (KOSHA_COMPACTION_INTERVAL_MS, default 30s), hydrating only the small
+# segments it may merge. This CronJob is no longer needed to keep segment
+# count bounded. It stays (suspended) only as a way to run a scheduled
+# `full` pass. If you enable it, send "async": true and poll
+# /v1/admin/compaction-jobs/{id} rather than holding a 3-hour request open.
+# The comments below predate the scheduler.
+#
+# Since #254 the compaction pod exists: the kosha-indexer Deployment
+# (KOSHA_ROLE=indexer, k8s/base/deployment-indexer.yaml) runs the scheduler
+# and the ingest pod sets KOSHA_COMPACTION_ON_INGEST=false. KOSHA_ROLE is now
+# validated at startup; the old value `compaction` is refused (it used to
+# start a second, uncoordinated writer) with a pointer to `indexer`, and
+# every writer holds a per-namespace writer lease whose fencing token each
+# manifest CAS checks.
+#
+# This CronJob calls POST /v1/admin/compact-namespace through the ingest
+# service, which still serves the admin compaction API.
+#
+# Why it is needed: paragraph_index_hnsw reached 1,529 segments at manifest
+# version ~5460 with a 12MB manifest, because KoshaClient.bulk() issues an
+# explicit /flush after every batch — one segment per <=500 documents,
+# which bypasses KOSHA_FLUSH_THRESHOLD entirely. That sprawl is what makes
+# ingest cold start ~100s, makes full-namespace scans hydrate 1.69GiB of
+# filters.bin in a single request, and makes one scan page cost ~17s
+# (materialize_ms=13764 merge-sorting across all those segments).
+#
+# Uses curl rather than kosha-cli: the CLI has no compact command, and the
+# image ships only kosha-server (Dockerfile:35) with no HTTP client.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: kosha-compaction
+  namespace: kosha
+spec:
+  # Daily, off-peak UTC. A pass hydrates one capped merge group at a time
+  # (about 2 x 5GiB of local disk at peak, #242; it used to hydrate the
+  # whole 22.35GiB namespace) but still competes with live write traffic
+  # on that single pod, so it should not overlap the working day or a
+  # catch-up run.
+  schedule: "0 4 * * *"
+  timeZone: Etc/UTC
+  # A second run starting while the first is still merging would have two
+  # compactions racing on one manifest.
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  # Start suspended: enable deliberately once a first manual run has been
+  # observed end to end on this namespace.
+  suspend: true
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      # Hard ceiling well past a realistic run. The endpoint is synchronous
+      # (without "async": true) and runs every merge inside the request.
+      activeDeadlineSeconds: 10800
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: compact
+              image: curlimages/curl:8.11.1
+              env:
+                - name: KOSHA_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: kosha-secret
+                      key: bootstrap-api-key
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  # Addresses the ingest Service directly. kosha-service
+                  # routes to query pods, which would only forward this
+                  # back to the ingest anyway.
+                  URL="http://kosha-ingest-service.kosha.svc.cluster.local:8080/v1/admin/compact-namespace"
+                  for NS in paragraph_index_hnsw findings_index; do
+                    echo "compacting ${NS}"
+                    # --max-time is generous because the handler runs the
+                    # whole hydrate-then-merge inside the request. If it is
+                    # exceeded the merge still continues server-side; the
+                    # ingest pod log is the source of truth for the result,
+                    # not this exit code.
+                    curl -sS --fail-with-body --max-time 9000 \
+                      -H "Authorization: Bearer ${KOSHA_API_KEY}" \
+                      -H "Content-Type: application/json" \
+                      -X POST -d "{\"namespace\":\"${NS}\",\"mode\":\"tiered\"}" \
+                      "${URL}"
+                    echo
+                  done
+              resources:
+                requests:
+                  cpu: "50m"
+                  memory: "64Mi"
+                limits:
+                  cpu: "200m"
+                  memory: "128Mi"

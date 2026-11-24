@@ -515,6 +515,10 @@ struct Publisher {
     original_entries: usize,
     published_entries: usize,
     replacement: Manifest,
+    /// The control-store version this run last read or committed: every
+    /// publish is a CAS against it, so a concurrent writer is never
+    /// clobbered.
+    committed_version: u64,
 }
 
 impl Publisher {
@@ -530,6 +534,18 @@ impl Publisher {
                 version: existing.version,
                 segments: Vec::new(),
                 segment_footers: Default::default(),
+                footer_crc32: Default::default(),
+                wal_checkpoint: 0,
+                wal_origin: None,
+                tombstones: Default::default(),
+                deletion_vectors: Default::default(),
+                branch: None,
+                // The rebuilt segments were analyzed with this schema.
+                schema: existing.schema.clone(),
+                retired: Default::default(),
+                // A replace rebuilds the namespace unsharded: its segments
+                // are written to the root itself (#207).
+                shards: None,
             },
             PublishMode::Append => existing.clone(),
         };
@@ -541,6 +557,7 @@ impl Publisher {
             // selecting newly flushed entries to publish.
             original_entries: existing.segments.len(),
             published_entries: 0,
+            committed_version: existing.version,
             replacement,
         }
     }
@@ -558,7 +575,13 @@ impl Publisher {
             if let Some(footer) = manifest.segment_footer(&entry.segment_id).cloned() {
                 self.replacement.remember_segment_footer(footer);
             }
-            self.store.save_manifest(namespace, &self.replacement)?;
+            commit_manifest(
+                &mut self.store,
+                namespace,
+                self.committed_version,
+                &self.replacement,
+            )?;
+            self.committed_version = self.replacement.version;
             let local_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
             if let Err(error) = std::fs::remove_dir_all(&local_dir) {
                 eprintln!(
@@ -576,6 +599,35 @@ impl Publisher {
     }
 }
 
+/// Publish `manifest` over exactly `expected`, the version this run last
+/// read or committed. Migration never rebases: if anything else published
+/// to the namespace meanwhile, the run stops with `ManifestConflict`
+/// rather than overwrite it.
+fn commit_manifest(
+    store: &mut dyn ControlStore,
+    namespace: &NamespaceId,
+    expected: u64,
+    manifest: &Manifest,
+) -> std::result::Result<(), kosha_core::KoshaError> {
+    let mut manifest = manifest.clone();
+    // A replacement run drops the namespace's previous segments: record
+    // them so segment GC (#239) can delete them after its grace window.
+    if let Some(previous) = store
+        .manifest_cloned(namespace)
+        .filter(|m| m.version == expected)
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        kosha_core::gc::record_retirements(
+            &kosha_core::gc::CommittedRefs::of(&previous),
+            &mut manifest,
+            |_, _| now,
+        );
+    }
+    store.compare_and_swap_manifest(namespace, expected, manifest)
+}
+
 pub fn run(argv: impl IntoIterator<Item = String>) -> Result<()> {
     let args = Args::parse(argv)?;
     let es = EsClient::from_env()?;
@@ -585,12 +637,15 @@ pub fn run(argv: impl IntoIterator<Item = String>) -> Result<()> {
     std::fs::create_dir_all(&data_dir)?;
     let database_url =
         std::env::var("DATABASE_URL").map_err(|_| "DATABASE_URL is required for migrate")?;
+    // Same TLS rule as the server (#343), before the first connection.
+    crate::internal_tls::check_database_url_env()?;
     let s3_config = S3Config::from_env().ok_or("KOSHA_S3_BUCKET is required for migrate")?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     let mut s3 = rt.block_on(S3Storage::new(data_dir.clone(), s3_config))?;
     let mut store = PgStore::new(&database_url)?;
+    s3.set_tenant_kms_key_store(store.clone());
 
     println!(
         "migrate: indices={:?} workers={} scroll_size={} batch_size={} flush_docs={} limit={:?} mode={:?} ids_file={:?}",
@@ -632,6 +687,15 @@ pub fn run(argv: impl IntoIterator<Item = String>) -> Result<()> {
             version: 0,
             segments: Vec::new(),
             segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            branch: None,
+            schema: None,
+            retired: Default::default(),
+            shards: None,
         });
         // Restore to advance segment IDs beyond an existing/partial run.
         // Replace mode: Publisher publishes only this run's segments.
@@ -763,6 +827,48 @@ mod tests {
         assert_eq!(args.workers, 8);
         assert_eq!(args.flush_docs, 20_000);
         assert_eq!(args.mode, PublishMode::Replace);
+    }
+
+    #[test]
+    fn publish_refuses_to_clobber_a_newer_manifest() {
+        let ns = NamespaceId("migrated".into());
+        let mut store = kosha_control::Controller::new();
+        let manifest = |version: u64, segment: &str| Manifest {
+            version,
+            segments: vec![kosha_core::ManifestEntry {
+                segment_id: kosha_core::SegmentId(segment.into()),
+                doc_count: 1,
+            }],
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            branch: None,
+            schema: None,
+            retired: Default::default(),
+            shards: None,
+        };
+        commit_manifest(&mut store, &ns, 0, &manifest(1, "run-1")).unwrap();
+        // An ingest writer publishes on top while the run is uploading.
+        store
+            .compare_and_swap_manifest(&ns, 1, manifest(2, "ingest"))
+            .unwrap();
+        let err = commit_manifest(&mut store, &ns, 1, &manifest(2, "run-2")).unwrap_err();
+        assert!(
+            matches!(err, kosha_core::KoshaError::ManifestConflict { .. }),
+            "{err}"
+        );
+        let err = commit_manifest(&mut store, &ns, 1, &manifest(3, "run-2")).unwrap_err();
+        assert!(matches!(
+            err,
+            kosha_core::KoshaError::ManifestConflict { .. }
+        ));
+        assert_eq!(
+            store.manifest(&ns).unwrap().segments[0].segment_id.0,
+            "ingest"
+        );
     }
 
     #[test]

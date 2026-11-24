@@ -9,7 +9,15 @@ resources:
   - service.yaml
   - service-ingest.yaml
   - deployment-query.yaml
+  - pdb-query.yaml
+  # Compaction-only pod (#254); the ingest Deployment sets
+  # KOSHA_COMPACTION_ON_INGEST=false.
+  - deployment-indexer.yaml
   - hpa-query.yaml
+  # Suspended and dry-run by default; see the file header.
+  - cronjob-segment-gc.yaml
+  # Suspended by default (#348); see the file header.
+  - cronjob-usage-reconcile.yaml
 
 # rbac.yaml is intentionally NOT listed here. It grants the CI deploy role
 # its own permissions — Kubernetes' RBAC escalation check correctly forbids

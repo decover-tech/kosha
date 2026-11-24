@@ -1,51 +1,63 @@
 #!/usr/bin/env python3
-"""Create a Kosha API key for a customer tenant.
+"""Create a Kosha API key for a tenant. Deprecated: use the CLI directly.
 
-This script talks to the Kosha admin API (requires an existing admin key).
+    kosha admin create-api-key --tenant acme-corp --description "staging key"
+
+This script is a thin wrapper that runs exactly that command, so existing
+runbooks keep working. Connection settings come from the CLI's usual
+sources: KOSHA_HOST, KOSHA_API_KEY (which must be an admin credential: an
+operator credential from POST /v1/admin/operators, or the server's
+KOSHA_ADMIN_API_KEY while KOSHA_ADMIN_BOOTSTRAP_KEY is not `disabled`), or a
+profile in ~/.kosha/config.toml.
+
+The CLI binary is found in this order: $KOSHA_BIN, `kosha` on PATH, then
+`cargo run -p kosha-cli` from this checkout.
 
 Usage:
     python scripts/create_api_key.py acme-corp "staging key for Acme Corp"
 """
 
 import os
+import shutil
 import sys
-import urllib.request
-import urllib.parse
-import json
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "clients", "python"))
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+def kosha_command():
+    explicit = os.environ.get("KOSHA_BIN")
+    if explicit:
+        return [explicit]
+    on_path = shutil.which("kosha")
+    if on_path:
+        return [on_path]
+    cargo = shutil.which("cargo")
+    if cargo:
+        manifest = os.path.join(REPO_ROOT, "Cargo.toml")
+        return [cargo, "run", "-q", "--manifest-path", manifest, "-p", "kosha-cli", "--"]
+    sys.exit(
+        "ERROR: the kosha CLI was not found. Install it with "
+        "`cargo install --path crates/kosha-cli` or set KOSHA_BIN."
+    )
 
 
 def main():
-    if len(sys.argv) < 2:
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         print("Usage: python scripts/create_api_key.py <tenant_id> [description]")
-        sys.exit(1)
+        print("Prefer: kosha admin create-api-key --tenant <tenant_id> [--description ...]")
+        sys.exit(0 if len(sys.argv) >= 2 else 1)
 
     tenant_id = sys.argv[1]
     description = sys.argv[2] if len(sys.argv) > 2 else ""
-
-    host = os.environ.get("KOSHA_HOST", "http://localhost:8080")
-    api_key = os.environ.get("KOSHA_API_KEY")
-    if not api_key:
-        print("ERROR: KOSHA_API_KEY env var required")
-        sys.exit(1)
-
-    url = f"{host.rstrip('/')}/v1/admin/api-keys"
-    body = json.dumps({"tenant_id": tenant_id, "description": description}).encode()
-    req = urllib.request.Request(url, data=body, method="POST")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("Authorization", f"Bearer {api_key}")
-
-    try:
-        resp = urllib.request.urlopen(req)
-        result = json.loads(resp.read().decode())
-        print(f"Created API key for tenant '{result['tenant_id']}':")
-        print(f"  API Key: {result['api_key']}")
-        print(f"\nSet this as KOSHA_API_KEY for the customer, or add it to the database.")
-    except urllib.error.HTTPError as e:
-        body = e.read().decode()
-        print(f"ERROR {e.code}: {body}", file=sys.stderr)
-        sys.exit(1)
+    argv = kosha_command() + [
+        "admin",
+        "create-api-key",
+        "--tenant",
+        tenant_id,
+        "--description",
+        description,
+    ]
+    os.execv(argv[0], argv)
 
 
 if __name__ == "__main__":

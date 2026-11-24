@@ -9,17 +9,86 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  proto:
-    name: proto lint
+  # The public API contract (#350, ADR-350 §d): the proto lints, the
+  # checked-in OpenAPI documents are exactly what `make openapi` generates
+  # from it (spec-sync), and a changed contract carries a version bump and a
+  # changelog entry. The route table is checked against the same documents
+  # by `public_routes_match_spec` in the test job. buf, protoc-gen-openapiv2
+  # and apispec are pinned in tools/codegen/go.mod.
+  api-contract:
+    name: api contract
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
-      - uses: bufbuild/buf-setup-action@v1
         with:
-          version: latest
-      - uses: bufbuild/buf-lint-action@v1
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
         with:
-          input: proto
+          go-version-file: tools/codegen/go.mod
+          cache-dependency-path: tools/codegen/go.sum
+      - name: buf lint
+        run: make proto-lint
+      - name: spec-sync (make openapi, then a clean tree)
+        run: make api-check
+      # FILE-level breaking changes against main. Pre-1.0 (main's spec
+      # below 1.0.0, or no spec on main yet) the contract is still being
+      # made wire-accurate, so this only reports.
+      - name: buf breaking
+        run: |
+          base_version=$(git show origin/main:api/openapi/v1/kosha.openapi.json 2>/dev/null \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["info"]["version"])' 2>/dev/null || echo none)
+          echo "contract version on main: $base_version"
+          case "$base_version" in
+            none|0.*)
+              build/bin/buf breaking proto --against '.git#branch=origin/main,subdir=proto' \
+                || echo "::warning::breaking proto changes (allowed before 1.0.0)" ;;
+            *)
+              build/bin/buf breaking proto --against '.git#branch=origin/main,subdir=proto' ;;
+          esac
+      # OpenAPI-level breaking changes to the public document (ADR-350 §d
+      # step 4). Enforced once main's contract is 1.0.0 or later; before
+      # that (or with no spec on main yet) it is skipped. The PR label
+      # `api-breaking` overrides it only together with an api/CHANGELOG.md
+      # "Changed" or "Removed" entry (a correction that makes the spec match
+      # the wire, which check_wire.py proves). The admin document is beta:
+      # warn only. oasdiff is pinned here; v1.10.27 is the last release that
+      # builds with the Go in tools/codegen/go.mod.
+      - name: oasdiff breaking
+        env:
+          OASDIFF: github.com/tufin/oasdiff@v1.10.27
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          base_version=$(git show origin/main:api/openapi/v1/kosha.openapi.json 2>/dev/null \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["info"]["version"])' 2>/dev/null || echo none)
+          case "$base_version" in
+            none|0.*) echo "contract on main is $base_version (pre-1.0): oasdiff skipped"; exit 0 ;;
+          esac
+          mkdir -p build/openapi
+          git show origin/main:api/openapi/v1/kosha.openapi.json > build/openapi/base.openapi.json
+          git show origin/main:api/openapi/v1/kosha-admin.openapi.json > build/openapi/base-admin.openapi.json 2>/dev/null || true
+          (cd tools/codegen && GOBIN="$GITHUB_WORKSPACE/build/bin" go install "$OASDIFF")
+          if [ -s build/openapi/base-admin.openapi.json ]; then
+            build/bin/oasdiff breaking build/openapi/base-admin.openapi.json \
+              api/openapi/v1/kosha-admin.openapi.json \
+              || echo "::warning::breaking changes to the admin (beta) document"
+          fi
+          if build/bin/oasdiff breaking build/openapi/base.openapi.json \
+              api/openapi/v1/kosha.openapi.json --fail-on ERR; then
+            exit 0
+          fi
+          case ",$LABELS," in
+            *,api-breaking,*)
+              if git diff origin/main -- api/CHANGELOG.md | grep -qE '^\+### (Changed|Removed)'; then
+                echo "::warning::breaking change accepted by the api-breaking label and a changelog entry"
+                exit 0
+              fi
+              echo "::error::api-breaking needs an api/CHANGELOG.md Changed or Removed entry"; exit 1 ;;
+          esac
+          echo "::error::breaking change to the public v1 contract: ship it as /v2, or label api-breaking for a wire-proven correction"
+          exit 1
+      # Kosha's own clients, bench and tools call only /v1 (#350).
+      - name: no legacy callers
+        run: bash scripts/api/check_no_legacy_callers.sh
 
   fmt:
     name: rustfmt
@@ -54,6 +123,24 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-features --locked
+      # `GET /metrics` (#223): check the exposition with Prometheus' own
+      # linter. The sample comes from a test that renders the registry, so
+      # this reuses the build above.
+      - name: promtool check metrics
+        env:
+          PROMETHEUS_VERSION: "2.53.4"
+          PROMETHEUS_SHA256: b8b497c4610d1b93208252b60c8f20f6b2e78596ae8df43397a2e805aa53d475
+        run: |
+          PROMTOOL_METRICS_DUMP="$RUNNER_TEMP/metrics.txt" \
+            cargo test -p kosha-server --all-features --locked --bin kosha-server \
+            -- --exact metrics::tests::dump_exposition_for_promtool
+          tarball="prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/$tarball"
+          echo "$PROMETHEUS_SHA256  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool" \
+            check metrics < "$RUNNER_TEMP/metrics.txt"
 
   python-client:
     name: python client
@@ -69,9 +156,14 @@ jobs:
       - name: Install client + pytest
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e . pytest
+          # pyyaml: tests/test_dsl_registry.py reads scripts/conformance/dsl/cases.yaml
+          python -m pip install -e . pytest pyyaml
       - name: Run unit tests
         run: python -m pytest tests/ -q
+      # The ES -> Kosha copy script against a stub Elasticsearch and a fake
+      # Kosha, including every command in docs/migration/from-elasticsearch.md.
+      - name: Copy script smoke test
+        run: python -m pytest ../../scripts/tests/ -q
 
   # Regression tests for the commit_bench_section.sh hook + amend driver
   # (scripts/test_commit_bench_section.sh). Uses a cargo shim so no real
@@ -82,6 +174,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: bash scripts/test_commit_bench_section.sh
+
+  # docs/guarantees.md (#352): every limit on the page must equal its code
+  # constant, and every cited results file, run id and commit must exist.
+  # Full history so the cited commits can be verified.
+  guarantees:
+    name: guarantees page
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: python3 scripts/docs/check_guarantees.py --self-test
+      - run: python3 scripts/docs/check_guarantees.py
 
   # The Dockerfile is a release artifact (deployed as `kosha:latest`) — never
   # let it break on main.

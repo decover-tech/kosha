@@ -6,7 +6,9 @@
 //! segment open rebuilds its HNSW graph from scratch; nothing is
 //! persisted).
 //!
-//! Run: `cargo bench -p kosha-vector-spfresh --bench build_query_cost`.
+//! Run: `cargo bench -p kosha-vector-spfresh --bench build_query_cost`
+//! (`-- compaction_vector_index` for just the #253 compaction comparison,
+//! `-- build_refine` for the post-build refinement's cost).
 //! Not wired into CI's `bench-compare.yml` gate (that only runs
 //! `kosha-query`'s `segment_memory` today) — this is a local-run comparison,
 //! per README.md.
@@ -15,7 +17,9 @@ use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use kosha_segment::{build_hnsw, CosinePoint};
-use kosha_vector_spfresh::{ClusterIndex, ClusterIndexConfig, DeterministicRng};
+use kosha_vector_spfresh::{
+    mean_vector, ClusterIndex, ClusterIndexConfig, DeterministicRng, PostingSnapshot,
+};
 
 const SIZES: &[usize] = &[1_000, 10_000, 50_000];
 const DIMS: &[usize] = &[128, 1536];
@@ -78,6 +82,31 @@ fn bench_build_cost(c: &mut Criterion) {
             });
             group.bench_function(format!("hnsw_rebuild/{n}x{dim}"), |b| {
                 b.iter(|| black_box(build_hnsw(black_box(&vectors))))
+            });
+        }
+    }
+    group.finish();
+}
+
+/// Post-build refinement (#253): `ClusterIndex::build` with
+/// `build_refine_rounds` at its default and at 0 (plain bisection, what
+/// `KOSHA_VECTOR_BUILD_REFINE=off` builds), from flush sizes up to a large
+/// compaction rebuild.
+fn bench_build_refine(c: &mut Criterion) {
+    let mut group = c.benchmark_group("build_refine");
+    group.sample_size(10);
+    let dim = 128;
+    for &n in &[1_000usize, 10_000, 100_000] {
+        let vectors = gen_vectors(n, dim, 1);
+        group.throughput(Throughput::Elements(n as u64));
+        for on in [false, true] {
+            let mut cfg = ClusterIndexConfig::new(dim);
+            if !on {
+                cfg.build_refine_rounds = 0;
+            }
+            let name = if on { "refine_on" } else { "refine_off" };
+            group.bench_function(format!("{name}/{n}x{dim}"), |b| {
+                b.iter(|| black_box(ClusterIndex::build(black_box(&vectors), cfg.clone()).unwrap()))
             });
         }
     }
@@ -185,10 +214,166 @@ fn bench_query_latency(c: &mut Criterion) {
     group.finish();
 }
 
+/// Compaction's vector-index step (#253): merge N input segments into one
+/// index, either clustering every live vector from scratch (`rebuild`,
+/// what compaction did before) or seeding from the largest input's
+/// postings, absorbing the other inputs' postings and loose vectors, and
+/// letting LIRE repair what changed (`lire`, what kosha-segment's
+/// `seed_cluster_index` does). Two shapes:
+///
+/// * `big+flushes`: one large, previously compacted segment of `n`
+///   vectors, `pct`% of them updated — deleted there, new versions in 4
+///   flush-sized segments (too small to adopt, absorbed vector by vector).
+///   The common steady state: LIRE's cost should track `pct`, not `n`.
+/// * `4_equal`: a tiered merge of four equal inputs (`n/4` each, 1% of
+///   them deleted): every input's postings overlap the base's, so most of
+///   the index changes — the worst case for LIRE.
+///
+/// Input snapshots are built outside the timed region: compaction reads
+/// them from the inputs' `vector.offsets`, it does not re-cluster them.
+fn bench_compaction_vector_index(c: &mut Criterion) {
+    let mut group = c.benchmark_group("compaction_vector_index");
+    group.sample_size(10);
+    for &dim in &[128usize] {
+        for &n in &[10_000usize, 50_000] {
+            for &pct in &[1usize, 5] {
+                let cfg = ClusterIndexConfig::new(dim);
+                let base = gen_vectors(n, dim, 5);
+                let changed = n * pct / 100;
+                let mut rng = DeterministicRng::new(6);
+                let mut deleted = std::collections::HashSet::new();
+                while deleted.len() < changed {
+                    deleted.insert(rng.next_usize(n) as u32);
+                }
+                let fresh: Vec<(u32, Vec<f32>)> = gen_vectors(changed, dim, 7)
+                    .into_iter()
+                    .map(|(id, v)| (id + n as u32, v))
+                    .collect();
+                let base_postings = ClusterIndex::build(&base, cfg.clone()).unwrap().snapshot();
+                let live: Vec<(u32, Vec<f32>)> = base
+                    .iter()
+                    .filter(|(id, _)| !deleted.contains(id))
+                    .chain(fresh.iter())
+                    .cloned()
+                    .collect();
+                group.throughput(Throughput::Elements(live.len() as u64));
+                group.bench_function(format!("rebuild/big+flushes/{n}x{dim}/{pct}pct"), |b| {
+                    b.iter(|| {
+                        black_box(ClusterIndex::build(black_box(&live), cfg.clone()).unwrap())
+                    })
+                });
+                group.bench_function(format!("lire/big+flushes/{n}x{dim}/{pct}pct"), |b| {
+                    b.iter_batched(
+                        || (base_postings.clone(), fresh.clone()),
+                        |(postings, fresh)| {
+                            black_box(lire_merge(vec![postings], fresh, &deleted, &cfg))
+                        },
+                        BatchSize::LargeInput,
+                    )
+                });
+            }
+
+            // Tiered merge of four equal inputs.
+            let cfg = ClusterIndexConfig::new(dim);
+            let parts: Vec<Vec<(u32, Vec<f32>)>> = (0..4u64)
+                .map(|p| {
+                    gen_vectors(n / 4, dim, 10 + p)
+                        .into_iter()
+                        .map(|(id, v)| (id + (p as usize * n / 4) as u32, v))
+                        .collect()
+                })
+                .collect();
+            let mut rng = DeterministicRng::new(8);
+            let mut deleted = std::collections::HashSet::new();
+            while deleted.len() < n / 100 {
+                deleted.insert(rng.next_usize(n) as u32);
+            }
+            let snapshots: Vec<Vec<PostingSnapshot>> = parts
+                .iter()
+                .map(|p| ClusterIndex::build(p, cfg.clone()).unwrap().snapshot())
+                .collect();
+            let live: Vec<(u32, Vec<f32>)> = parts
+                .iter()
+                .flatten()
+                .filter(|(id, _)| !deleted.contains(id))
+                .cloned()
+                .collect();
+            group.throughput(Throughput::Elements(live.len() as u64));
+            group.bench_function(format!("rebuild/4_equal/{n}x{dim}"), |b| {
+                b.iter(|| black_box(ClusterIndex::build(black_box(&live), cfg.clone()).unwrap()))
+            });
+            group.bench_function(format!("lire/4_equal/{n}x{dim}"), |b| {
+                b.iter_batched(
+                    || snapshots.clone(),
+                    |snapshots| black_box(lire_merge(snapshots, Vec::new(), &deleted, &cfg)),
+                    BatchSize::LargeInput,
+                )
+            });
+        }
+    }
+    group.finish();
+}
+
+/// kosha-segment's `seed_cluster_index`, on in-memory snapshots: the
+/// largest input's postings (minus `deleted`, recentred where something
+/// was dropped) seed the index; the other inputs and `loose` vectors are
+/// absorbed; LIRE rebalances.
+fn lire_merge(
+    inputs: Vec<Vec<PostingSnapshot>>,
+    loose: Vec<(u32, Vec<f32>)>,
+    deleted: &std::collections::HashSet<u32>,
+    cfg: &ClusterIndexConfig,
+) -> ClusterIndex {
+    let mut groups: Vec<Vec<PostingSnapshot>> = inputs
+        .into_iter()
+        .map(|g| {
+            g.into_iter()
+                .map(|p| {
+                    let before = p.entries.len();
+                    let entries: Vec<(u32, Vec<f32>)> = p
+                        .entries
+                        .into_iter()
+                        .filter(|(id, _)| !deleted.contains(id))
+                        .collect();
+                    let centroid = if entries.len() == before {
+                        p.centroid
+                    } else {
+                        mean_vector(entries.iter().map(|(_, v)| v.as_slice()), cfg.dim)
+                    };
+                    PostingSnapshot {
+                        centroid,
+                        entries,
+                        radius: 0.0,
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    let size = |g: &Vec<PostingSnapshot>| g.iter().map(|p| p.entries.len()).sum::<usize>();
+    let base = (0..groups.len()).max_by_key(|&i| size(&groups[i])).unwrap();
+    let mut idx = ClusterIndex::from_postings(groups.swap_remove(base), cfg.clone()).unwrap();
+    for g in groups {
+        idx.absorb_postings(g, 8).unwrap();
+    }
+    let loose = loose
+        .into_iter()
+        .map(|(id, v)| PostingSnapshot {
+            centroid: v.clone(),
+            entries: vec![(id, v)],
+            radius: 0.0,
+        })
+        .collect();
+    idx.absorb_postings(loose, 8).unwrap();
+    idx.rebalance();
+    idx
+}
+
 criterion_group!(
     benches,
     bench_build_cost,
+    bench_build_refine,
     bench_incremental_update_cost,
-    bench_query_latency
+    bench_query_latency,
+    bench_compaction_vector_index
 );
 criterion_main!(benches);

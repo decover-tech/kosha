@@ -15,3 +15,41 @@ data:
   KOSHA_HTTP_PORT: "8080"
   KOSHA_DATA_DIR: /var/cache/kosha/data
   KOSHA_CACHE_DIR: /var/cache/kosha
+  # S3 server-side encryption (#343). Unset = `none`: no SSE header, the
+  # bucket's default encryption applies. The IRSA role needs
+  # kms:Decrypt + kms:GenerateDataKey on every key named here (see
+  # k8s/README.md, "Encryption at rest"). An invalid value stops the pod at
+  # startup rather than writing unencrypted objects.
+  # KOSHA_S3_SSE: "aws:kms"
+  # KOSHA_S3_SSE_KMS_KEY_ID: arn:aws:kms:us-east-1:111122223333:key/DEFAULT-KEY-ID
+  # KOSHA_S3_SSE_BUCKET_KEY: "true"
+  # Fallback per-tenant keys (BYOK); kosha.tenants.kms_key_id takes precedence.
+  # KOSHA_S3_TENANT_KMS_KEYS: acme=arn:aws:kms:us-east-1:111122223333:key/ACME-KEY-ID
+  # ...or the same map as JSON from a mounted file:
+  # KOSHA_S3_TENANT_KMS_KEYS_FILE: /etc/kosha/tenant-kms-keys.json
+  # TLS between pods (#343). Off by default. Needs the kosha-internal-tls
+  # Secret mounted at /etc/kosha/tls by every Deployment (see
+  # certificate-internal-tls.example.yaml for a cert-manager example) and,
+  # on query pods, KOSHA_INGEST_HOST switched to https://. HTTPS is per port,
+  # so the probes need `scheme: HTTPS` once the server certificate is set.
+  # Do not uncomment these here: include the ../components/internal-tls
+  # kustomize component from an overlay instead, which sets all of them and
+  # patches the probes and KOSHA_INGEST_HOST together (k8s/README.md,
+  # "Encryption in transit"). They are listed for reference.
+  # Bad settings stop the pod at startup. See docs/configuration.md,
+  # "TLS between pods".
+  # Server side: HTTPS on :8080, and mTLS required on /internal/*.
+  # KOSHA_TLS_CERT_PATH: /etc/kosha/tls/tls.crt
+  # KOSHA_TLS_KEY_PATH: /etc/kosha/tls/tls.key
+  # KOSHA_TLS_CLIENT_CA_PATH: /etc/kosha/tls/ca.crt
+  # Client side: peer hydration and ingest forwarding.
+  # KOSHA_INTERNAL_TLS: "on"   # "required" once every pod is on TLS
+  # KOSHA_INTERNAL_TLS_CA_PATH: /etc/kosha/tls/ca.crt
+  # KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH: /etc/kosha/tls/tls.crt
+  # KOSHA_INTERNAL_TLS_CLIENT_KEY_PATH: /etc/kosha/tls/tls.key
+  # KOSHA_INTERNAL_TLS_SERVER_NAME: kosha-internal
+  # TLS to Postgres (#343) is not a ConfigMap setting: it is part of
+  # DATABASE_URL, which lives in kosha-secret (key `database-url`), e.g.
+  #   postgres://kosha:<password>@<host>:5432/kosha?sslmode=verify-full&sslrootcert=/etc/kosha/pg/ca.crt
+  # With KOSHA_INTERNAL_TLS=required a URL whose sslmode is not require,
+  # verify-ca or verify-full stops the pod at startup.

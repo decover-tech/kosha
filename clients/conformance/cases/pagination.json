@@ -1,0 +1,90 @@
+[
+  {
+    "id": "pagination.by_id",
+    "description": "search_all over 2.5 pages, default _id sort: every id exactly once, in order.",
+    "covers": ["KoshaService_Search", "KoshaService_IndexDocuments"],
+    "setup": [
+      { "op": "create_namespace", "args": { "schema": { "fields": { "title": { "type": "text", "stored": true, "indexed": true }, "tag": { "type": "keyword", "stored": true, "indexed": true } } } } },
+      {
+        "op": "upsert",
+        "args": { "documents": { "generate": { "count": 250, "id": "d{i:04}", "fields": { "title": { "type": "Text", "value": "page doc {i}" }, "tag": { "type": "Keyword", "value": "t{i%7}" } } } } }
+      }
+    ],
+    "steps": [
+      {
+        "op": "search_all",
+        "args": { "body": { "query_text": "", "filter": { "exists": { "field": "tag" } } }, "page_size": 100 },
+        "expect": { "ids": { "generate": { "count": 250, "id": "d{i:04}" } }, "unique": true }
+      }
+    ]
+  },
+  {
+    "id": "pagination.by_keyword",
+    "description": "search_all sorted by a keyword field (the SDK adds the _id tie-break and builds the cursor from stored fields).",
+    "covers": ["KoshaService_Search"],
+    "setup": [
+      { "op": "create_namespace", "args": { "schema": { "fields": { "title": { "type": "text", "stored": true, "indexed": true }, "tag": { "type": "keyword", "stored": true, "indexed": true } } } } },
+      {
+        "op": "upsert",
+        "args": { "documents": { "generate": { "count": 250, "id": "d{i:04}", "fields": { "title": { "type": "Text", "value": "page doc {i}" }, "tag": { "type": "Keyword", "value": "t{i%7}" } } } } }
+      }
+    ],
+    "steps": [
+      {
+        "op": "search_all",
+        "args": { "body": { "query_text": "", "filter": { "exists": { "field": "tag" } }, "sort": [{ "tag": { "order": "asc" } }] }, "page_size": 100 },
+        "expect": { "count": 250, "unique": true }
+      },
+      {
+        "op": "search_all",
+        "args": {
+          "body": { "query_text": "", "filter": { "term": { "tag": "t3" } }, "sort": [{ "tag": { "order": "desc" } }], "source_includes": ["title"] },
+          "page_size": 10
+        },
+        "expect": { "count": 36, "unique": true }
+      },
+      {
+        "op": "search_all",
+        "args": { "body": { "query_text": "", "filter": { "exists": { "field": "tag" } }, "sort": [{ "tag": { "order": "desc" } }], "source_excludes": ["tag"] }, "page_size": 100 },
+        "expect": { "count": 250, "unique": true }
+      },
+      {
+        "op": "search_all",
+        "args": { "body": { "query_text": "", "filter": { "exists": { "field": "tag" } }, "sort": [{ "tag": { "order": "asc" } }], "source_excludes": ["tag"] }, "page_size": 100 },
+        "expect": { "count": 250, "unique": true }
+      }
+    ]
+  },
+  {
+    "id": "pagination.by_list_keyword",
+    "description": "search_all sorted by a list-valued keyword: the cursor is the element the server sorted by (smallest ascending, largest descending), not the stored list text.",
+    "covers": ["KoshaService_Search"],
+    "setup": [
+      { "op": "create_namespace", "args": { "schema": { "fields": { "tags": { "type": "keyword", "stored": true, "indexed": true } } } } },
+      {
+        "op": "upsert",
+        "args": { "documents": { "generate": { "count": 250, "id": "d{i:04}", "fields": { "tags": { "type": "Keyword", "value": "[\"k{i%5}\",\"j{i%3}\"]" } } } } }
+      }
+    ],
+    "steps": [
+      {
+        "op": "search_all",
+        "args": { "body": { "query_text": "", "filter": { "exists": { "field": "tags" } }, "sort": [{ "tags": { "order": "asc" } }] }, "page_size": 100 },
+        "expect": { "count": 250, "unique": true }
+      },
+      {
+        "op": "search_all",
+        "args": { "body": { "query_text": "", "filter": { "exists": { "field": "tags" } }, "sort": [{ "tags": { "order": "desc" } }] }, "page_size": 100 },
+        "expect": { "count": 250, "unique": true }
+      }
+    ]
+  },
+  {
+    "id": "pagination.rejects_offset",
+    "description": "search_all refuses a body with from: nothing is sent.",
+    "covers": [],
+    "steps": [
+      { "op": "search_all", "args": { "body": { "query_text": "", "from": 10 } }, "expect": { "error": { "kind": "config" } } }
+    ]
+  }
+]

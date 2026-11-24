@@ -67,6 +67,10 @@ fn clone_all_hits(source: &[Vec<Field>], scores: &[f64]) -> Vec<ScoredDocument> 
             score: scores[i],
             fields: fields.clone(),
             highlights: None,
+            highlight: None,
+            rank_details: None,
+            fused_score: None,
+            rerank_score: None,
         });
     }
     out
@@ -105,6 +109,10 @@ fn materialize_page(
             score: c.score,
             fields: source[c.source_idx as usize].clone(),
             highlights: None,
+            highlight: None,
+            rank_details: None,
+            fused_score: None,
+            rerank_score: None,
         })
         .collect()
 }

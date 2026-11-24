@@ -1,0 +1,61 @@
+name: api-docs
+
+# Rendered API reference (#350, ADR-350 §d "Publishing"): on every push to
+# main that touches the contract or its guides, build Redoc HTML from the
+# checked-in OpenAPI documents and upload it as a workflow artifact. The
+# GitHub Pages deploy under /api/v1/ runs only once a maintainer enables
+# Pages for the repository and sets the repository variable
+# API_DOCS_PAGES=true (ADR-350 open question 5).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "api/**"
+      - "docs/api/**"
+      - ".github/workflows/api-docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Redoc
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Build
+        run: |
+          mkdir -p build/site/api/v1
+          npx --yes @redocly/cli@1.25.15 build-docs api/openapi/v1/kosha.openapi.json \
+            --output build/site/api/v1/index.html
+          npx --yes @redocly/cli@1.25.15 build-docs api/openapi/v1/kosha-admin.openapi.json \
+            --output build/site/api/v1/admin.html
+          cp api/openapi/v1/*.json build/site/api/v1/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: api-docs
+          path: build/site
+      - if: vars.API_DOCS_PAGES == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: build/site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    if: vars.API_DOCS_PAGES == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

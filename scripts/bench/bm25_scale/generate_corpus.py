@@ -28,7 +28,7 @@ There's no default bucket baked in here: pass the full s3:// URI explicitly.
 Usage:
     python3 generate_corpus.py --out-dir /data/bm25-10m --docs 10_000_000 \\
         --avg-bytes 900 --seed 42 \\
-        --s3-uri s3://decoverai-nonprod-kosha-bench/bm25-scale/10M-docs-900b-seed42
+        --s3-uri s3://<your-bench-bucket>/bm25-scale/10M-docs-900b-seed42
 """
 
 import argparse

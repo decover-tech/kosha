@@ -120,7 +120,11 @@ pub(crate) fn run_reassign(
 
         if best_pid != cur_pid {
             if let Some(p) = index.postings[cur_pid].as_mut() {
-                if let Some(e) = p.entries.iter_mut().find(|e| e.id == entry_id) {
+                if let Some(e) = p
+                    .entries
+                    .iter_mut()
+                    .find(|e| e.id == entry_id && !e.deleted)
+                {
                     e.deleted = true;
                     e.version = e.version.wrapping_add(1);
                 }
@@ -144,7 +148,8 @@ pub(crate) fn run_reassign(
     // reassignment needs its own split. Bounded by MAX_CASCADE_DEPTH inside
     // split_posting (belt-and-suspenders on top of the paper's convergence
     // proof).
-    if index.config.enable_split {
+    // Inside `ClusterIndex::rebalance` its own loop does these splits.
+    if index.config.enable_split && !index.defer_cascade_splits {
         // `grown` is a HashSet — std's default hasher is randomly seeded
         // per-process, so its iteration order (and hence the order splits
         // fire in, and hence how many `index.rng` draws precede each one)
@@ -159,7 +164,7 @@ pub(crate) fn run_reassign(
                 .map(|p| p.live_count() > index.config.max_posting_size)
                 .unwrap_or(false);
             if oversized {
-                split_posting(index, pid, depth + 1);
+                let _ = split_posting(index, pid, depth + 1);
             }
         }
     }

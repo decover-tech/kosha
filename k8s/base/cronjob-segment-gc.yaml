@@ -1,0 +1,97 @@
+# Segment garbage collection (#239): deletes S3 objects of segments and
+# deletion generations that no committed manifest references any more.
+#
+# What becomes garbage:
+# - segments a compaction merged away, and deletion generations a later
+#   delete superseded. Each publish records these in the manifest's
+#   `retired` list; GC deletes them once they have been retired longer than
+#   KOSHA_GC_GRACE (default 1h, set on the ingest pod; it must exceed the
+#   longest a query pod can keep serving an older manifest);
+# - untracked prefixes no manifest ever recorded (a crashed flush, a losing
+#   concurrent writer, compactions from before #239, an import that replaced
+#   a manifest) once their newest object is older than KOSHA_GC_ORPHAN_GRACE
+#   (default 24h).
+# Anything the current manifest references is never touched, and a namespace
+# whose manifest changes mid-run is skipped. Local disk is reclaimed
+# separately by every pod (KOSHA_LOCAL_GC_GRACE), so this job only matters
+# for S3 cost.
+#
+# Ships suspended AND in dry-run mode. To roll out:
+#   1. kubectl -n kosha create job --from=cronjob/kosha-segment-gc gc-dry-run
+#      and read the job log: it prints every candidate and the bytes a real
+#      run would reclaim.
+#   2. Once the list looks right, set DRY_RUN to "false" and unsuspend.
+#
+# Admin routes need an admin credential (#262), which this job reads from
+# kosha-secret's `admin-api-key`. That entry may hold either:
+# - the shared key: the same value the ingest pod runs with as
+#   KOSHA_ADMIN_API_KEY; or
+# - a per-operator credential issued for this job (#346), e.g.
+#   POST /v1/admin/operators {"name": "segment-gc"}. Needs Postgres.
+# Neither is provisioned by default. Before setting
+# KOSHA_ADMIN_BOOTSTRAP_KEY=disabled on the pods, switch this entry to an
+# operator credential: the shared key is then refused (401) and every run
+# of this job would fail, so S3 garbage would stop being reclaimed. If the
+# credential has an expiry, rotate it before then. The variable below keeps
+# its name only for the script; either kind of credential goes in it.
+#
+# Calls the ingest Service directly: a query pod would only forward
+# /v1/admin/* to the ingest anyway.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: kosha-segment-gc
+  namespace: kosha
+spec:
+  # Daily, off-peak UTC, an hour after the scheduled compaction CronJob.
+  schedule: "0 5 * * *"
+  timeZone: Etc/UTC
+  # Runs are serialized server-side too; this just avoids queueing them.
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  suspend: true
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 7200
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: gc
+              image: curlimages/curl:8.11.1
+              env:
+                - name: KOSHA_GC_INGEST_SCHEME
+                  value: http
+                # "true" lists what would be deleted; "false" deletes it.
+                - name: DRY_RUN
+                  value: "true"
+                - name: KOSHA_ADMIN_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: kosha-secret
+                      key: admin-api-key
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  case "${DRY_RUN}" in true|false) ;; *) echo "DRY_RUN must be true or false"; exit 2;; esac
+                  URL="${KOSHA_GC_INGEST_SCHEME}://kosha-ingest-service.kosha.svc.cluster.local:8080/v1/admin/gc"
+                  # No namespace: every namespace the control plane knows.
+                  # The handler deletes object by object; --max-time is
+                  # generous for a first run over a large backlog.
+                  curl -sS --fail-with-body --max-time 6600 \
+                    -H "Authorization: Bearer ${KOSHA_ADMIN_API_KEY}" \
+                    -H "Content-Type: application/json" \
+                    -X POST -d "{\"dry_run\":${DRY_RUN}}" \
+                    "${URL}"
+                  echo
+              resources:
+                requests:
+                  cpu: "50m"
+                  memory: "64Mi"
+                limits:
+                  cpu: "200m"
+                  memory: "128Mi"

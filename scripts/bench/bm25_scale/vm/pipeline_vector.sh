@@ -28,15 +28,15 @@ start_kosha() {
   sudo docker run -d --name kosha --network host \
     -e DATABASE_URL=$DBURL -e KOSHA_API_KEY=sk-bench \
     -e KOSHA_S3_BUCKET=decoverai-bench-kosha-segments -e KOSHA_S3_PREFIX=segments/ \
-    -e AWS_DEFAULT_REGION=us-east-1 -e KOSHA_FLUSH_THRESHOLD=500000 \
-    -e KOSHA_HTTP_IO_TIMEOUT_SECS=1800 \
+    -e AWS_DEFAULT_REGION=us-east-1 -e KOSHA_FLUSH_THRESHOLD=500000 -e KOSHA_FLUSH_MAX_AGE_MS=0 -e KOSHA_COMPACTION_INTERVAL_MS=0 \
+    -e KOSHA_HTTP_IO_TIMEOUT_SECS=1800 -e KOSHA_SLOW_SEARCH_LOG_MS=0 \
     -e KOSHA_CACHE_DIR=/var/cache/kosha -e KOSHA_DATA_DIR=/var/cache/kosha/data \
     -e KOSHA_CACHE_MAX_BYTES=644245094400 -e KOSHA_SEGMENT_CACHE_MAX_BYTES=51539607552 \
     -e KOSHA_SEGMENT_LIVE_MAX_BYTES=68719476736 -e KOSHA_SCORING_HYDRATE_CONCURRENCY=64 \
     -e KOSHA_SEGMENT_CACHE_CAPACITY=16384 \
     -e KOSHA_WARMUP_NAMESPACES="msmarco-10m-vec,default/msmarco-10m-vec" \
     -v /data/kosha:/var/cache/kosha kosha-server:bench10 >/dev/null
-  until curl -sf -H "Authorization: Bearer sk-bench" http://127.0.0.1:8080/stats >/dev/null; do sleep 3; done
+  until curl -sf http://127.0.0.1:8080/v1/healthz >/dev/null; do sleep 3; done
 }
 start_kosha
 echo "kosha up"
@@ -59,7 +59,7 @@ sudo docker stop kosha >/dev/null
 sudo rm -rf /data/kosha/data/*
 T0=$(date +%s)
 start_kosha
-until curl -sf http://127.0.0.1:8080/readyz >/dev/null 2>&1; do
+until curl -sf http://127.0.0.1:8080/v1/readyz >/dev/null 2>&1; do
   sleep 5
   [ $(( $(date +%s) - T0 )) -gt 3600 ] && { echo "WARMUP-TIMEOUT"; exit 1; }
 done

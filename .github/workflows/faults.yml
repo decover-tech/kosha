@@ -1,0 +1,87 @@
+name: faults
+
+# Process-level fault injection (#357): the ingest + query compose stack
+# with toxiproxy in front of MinIO and Postgres, driven by
+# scripts/faults/run_faults.py (SIGKILL mid-flush and mid-compaction, S3
+# latency/timeouts/resets, a Postgres cut and restart, concurrent first
+# boot). Every scenario checks zero acknowledged-write loss, the exact doc
+# count, that no manifest references a segment without a _COMMIT, and
+# measures recovery time. Then a 5-minute soak smoke (scripts/soak/soak.py)
+# against the same stack. Known bugs are listed in
+# scripts/faults/expected_failures.json; anything else fails the job.
+# Unit-level crash points are #257 (cargo test); see docs/testing.md.
+
+on:
+  schedule:
+    - cron: "17 3 * * *" # nightly
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "crates/kosha-server/**"
+      - "crates/kosha-write/**"
+      - "crates/kosha-control/**"
+      - "scripts/faults/**"
+      - "scripts/soak/**"
+      - ".github/workflows/faults.yml"
+
+concurrency:
+  group: faults-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  COMPOSE: docker compose -f docker-compose.yml -f scripts/integration/docker-compose.integration.yml -f scripts/faults/docker-compose.faults.yml
+
+jobs:
+  faults:
+    name: fault injection + soak smoke
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Self-test the runners
+        run: |
+          python3 scripts/faults/run_faults.py --self-test
+          python3 scripts/soak/soak.py --self-test
+
+      - name: Start stack
+        run: $COMPOSE up --build -d
+
+      - name: Wait for both pods
+        run: |
+          for port in 8080 8081; do
+            for i in $(seq 1 90); do
+              curl -fsS "http://localhost:$port/v1/readyz" >/dev/null && break
+              [ "$i" = 90 ] && { echo "pod on :$port not ready"; exit 1; }
+              sleep 2
+            done
+          done
+
+      - name: Fault scenarios
+        run: python3 scripts/faults/run_faults.py --out faults-report.json
+
+      - name: Soak smoke (5 minutes)
+        if: ${{ !cancelled() }}
+        run: |
+          python3 scripts/soak/soak.py --smoke \
+            --write-url http://localhost:8080 --query-url http://localhost:8081 \
+            --out soak-report.json
+
+      - name: Server logs
+        if: failure()
+        run: |
+          mkdir -p logs
+          for svc in kosha-ingest kosha-query toxiproxy postgres minio; do
+            $COMPOSE logs --no-color --timestamps "$svc" > "logs/$svc.log" 2>&1 || true
+          done
+          $COMPOSE logs --no-color --tail 300 kosha-ingest kosha-query
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: faults-report
+          path: |
+            faults-report.json
+            soak-report.json
+            logs/
+          if-no-files-found: ignore

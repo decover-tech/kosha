@@ -27,14 +27,14 @@ spec:
       serviceAccountName: kosha
       containers:
         - name: migrate
-          image: "010928200670.dkr.ecr.us-east-1.amazonaws.com/decover/kosha:main"
+          image: "<registry>/decover/kosha:main"
           imagePullPolicy: Always
           envFrom:
             - configMapRef:
                 name: kosha-config
           env:
             - name: ELASTICSEARCH_HOST
-              value: "https://vpc-decoverai-nonprod-search-rdaf2ygjik3teui5prmuotjlx4.us-east-1.es.amazonaws.com"
+              value: "https://<opensearch-endpoint>"
             - name: AWS_REGION
               value: "us-east-1"
             - name: AWS_DEFAULT_REGION
@@ -84,4 +84,3 @@ spec:
         - name: cache
           emptyDir:
             sizeLimit: "30Gi"
-

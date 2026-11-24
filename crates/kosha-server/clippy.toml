@@ -1,0 +1,8 @@
+# Error responses go through api_error (ADR-350 §b): `api_error`,
+# `ApiError::into_raw`, or `http::Response::error`. These build a response
+# with an arbitrary status and body and so bypass the error model; the one
+# legitimate caller (relaying the ingest pod's own response verbatim)
+# allows it explicitly.
+disallowed-methods = [
+    { path = "kosha_server::raw_response", reason = "bypasses the error model: build errors with api_error / ApiError (ADR-350 §b)" },
+]

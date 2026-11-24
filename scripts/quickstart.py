@@ -56,7 +56,8 @@ docs = [
     {"index": {"_index": NAMESPACE, "_id": "doc-3"}},
     {"title": "merger analysis", "content": "The proposed merger raises antitrust concerns under Section 7 of the Clayton Act."},
 ]
-result = client.bulk(body=docs)
+# refresh="wait_for": searchable on return (otherwise within ~1 s).
+result = client.bulk(body=docs, refresh="wait_for")
 print(f"   Indexed: {sum(1 for i in result.get('items', []) if i.get('index', {}).get('status') == 201)} documents")
 
 
@@ -73,8 +74,8 @@ for h in hits:
 
 # ── 4. Flush + verify ────────────────────────────────────────────────────────
 section("4. Flush + re-search")
-# The client already flushes after bulk in Phase 1, but demonstrate the explicit call.
-resp = client._transport.request("POST", "flush", body={"namespace": NAMESPACE})
+# bulk(refresh="wait_for") above already flushed; this is the raw explicit call.
+resp = client._transport.request("POST", f"v1/namespaces/{NAMESPACE}/flush", body={})
 print(f"   Flush: {resp}")
 
 resp = client.search(index=NAMESPACE, body={"query": {"match": {"content": "antitrust"}}})
@@ -88,12 +89,10 @@ for h in hits:
 
 # ── 5. Stats ─────────────────────────────────────────────────────────────────
 section("5. Stats")
-resp = client._transport.request("GET", "stats")
-total_docs = resp.get("total_documents", 0)
-namespaces = resp.get("namespaces", [])
-print(f"   Total documents: {total_docs}")
-for ns in namespaces:
-    print(f"     {ns['namespace']}: {ns['documents']} docs, {ns['segments']} segment(s)")
+# Server-wide stats (GET /v1/stats) need the admin key; a tenant key reads
+# its own namespace's.
+resp = client._transport.request("GET", f"v1/namespaces/{NAMESPACE}/stats")
+print(f"     {resp['namespace']}: {resp['documents']} docs, {resp['segments']} segment(s)")
 
 
 print(f"\n✅  Quickstart complete.  Namespace '{NAMESPACE}' has 3 documents ready to search.")

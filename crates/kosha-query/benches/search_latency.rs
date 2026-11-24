@@ -78,6 +78,15 @@ fn build_corpus(dir: &PathBuf) -> (NamespaceId, Manifest) {
             doc_count: HIT_COUNT as u32,
         }],
         segment_footers: Default::default(),
+        footer_crc32: Default::default(),
+        wal_checkpoint: 0,
+        wal_origin: None,
+        tombstones: Default::default(),
+        deletion_vectors: Default::default(),
+        branch: None,
+        schema: None,
+        retired: Default::default(),
+        shards: None,
     };
     (ns, manifest)
 }
@@ -87,13 +96,14 @@ fn mk_query(text: &str) -> SearchQuery {
         query_text: text.into(),
         max_results: PAGE_SIZE,
         from: 0,
-        bm25_params: Bm25Params::default(),
+        bm25_params: Default::default(),
         filter: None,
         sort: vec![],
         search_after: None,
         highlight: None,
         aggs: HashMap::new(),
         wildcard: None,
+        fuzzy: None,
         match_phrase: None,
         knn: None,
         // This bench validates total_hits correctness itself (HIT_COUNT,
@@ -103,6 +113,15 @@ fn mk_query(text: &str) -> SearchQuery {
         total_hits_cap: None,
         operator: None,
         no_cache: None,
+        collapse: None,
+        limit_per: None,
+        rank_by: None,
+        source_includes: None,
+        source_excludes: None,
+        rank: None,
+        mode: None,
+        fields: Vec::new(),
+        rerank: None,
     }
 }
 
@@ -142,6 +161,15 @@ fn build_term_bloom_corpus(dir: &PathBuf) -> (NamespaceId, Manifest) {
             version: 1,
             segments: entries,
             segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            branch: None,
+            schema: None,
+            retired: Default::default(),
+            shards: None,
         },
     )
 }
@@ -187,6 +215,15 @@ fn build_broad_query_corpus(dir: &PathBuf) -> (NamespaceId, Manifest) {
             version: 1,
             segments: entries,
             segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            branch: None,
+            schema: None,
+            retired: Default::default(),
+            shards: None,
         },
     )
 }
@@ -316,9 +353,147 @@ fn bench_search_latency(c: &mut Criterion) {
             black_box(r.results.len());
         })
     });
+    // Same query with each segment pruning against its own top-k only
+    // (pre-#248). Every score ties here, so neither variant can prune:
+    // this pair measures the shared floor's fixed overhead (the ceiling
+    // pre-pass and ordered scheduling), not its win.
+    bq_searcher.set_global_wand_threshold(false);
+    bq_group.bench_function("bm25_broad_query_53segs_all_match_per_segment_floor", |b| {
+        b.iter(|| {
+            let r = bq_searcher
+                .search(
+                    black_box(&bq_ns),
+                    black_box(&bq_manifest),
+                    black_box(&bq_query),
+                    None,
+                )
+                .unwrap();
+            black_box(r.total_hits);
+        })
+    });
+    bq_searcher.set_global_wand_threshold(true);
     bq_group.finish();
 
     let _ = std::fs::remove_dir_all(&bq_dir);
+
+    // ── Namespace-wide top-k floor on a 200-segment namespace (#248) ────
+    // Scores vary (term frequency and length differ per doc), so pruning
+    // has something to work with. `shared_floor` is the default; the
+    // `per_segment_floor` variant is the pre-#248 behavior on the same
+    // searcher and corpus. Pages are asserted identical.
+    let gw_dir = std::env::temp_dir().join("kosha-bench-search-latency-global-wand");
+    let (gw_ns, gw_manifest) = build_many_segment_corpus(&gw_dir);
+    let gw_searcher = Searcher::with_segment_cache_capacity(gw_dir.clone(), MANY_SEGS + 1);
+    let mut gw_group = c.benchmark_group("global_wand_200segs");
+    gw_group.throughput(Throughput::Elements((MANY_SEGS * MANY_DOCS_PER_SEG) as u64));
+    gw_group.sample_size(30);
+    for (name, text) in [("single_term", "contract"), ("and", "contract dispute")] {
+        let q = mk_query_k(text, 10);
+        gw_searcher.set_global_wand_threshold(false);
+        let off = gw_searcher.search(&gw_ns, &gw_manifest, &q, None).unwrap();
+        gw_searcher.set_global_wand_threshold(true);
+        let on = gw_searcher.search(&gw_ns, &gw_manifest, &q, None).unwrap();
+        let page = |r: &kosha_core::SearchResult| {
+            r.results
+                .iter()
+                .map(|d| (d.doc_id.0.clone(), d.score.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(page(&on), page(&off), "{name}: pages must be identical");
+        assert_eq!(on.total_hits, off.total_hits);
+        for enabled in [true, false] {
+            gw_searcher.set_global_wand_threshold(enabled);
+            let label = format!(
+                "{name}_{}",
+                if enabled {
+                    "shared_floor"
+                } else {
+                    "per_segment_floor"
+                }
+            );
+            gw_group.bench_function(label, |b| {
+                b.iter(|| {
+                    let r = gw_searcher
+                        .search(
+                            black_box(&gw_ns),
+                            black_box(&gw_manifest),
+                            black_box(&q),
+                            None,
+                        )
+                        .unwrap();
+                    black_box(r.total_hits);
+                })
+            });
+        }
+        gw_searcher.set_global_wand_threshold(true);
+    }
+    gw_group.finish();
+    let _ = std::fs::remove_dir_all(&gw_dir);
+}
+
+const MANY_SEGS: usize = 200;
+const MANY_DOCS_PER_SEG: usize = 2_000;
+
+fn mk_query_k(text: &str, k: usize) -> SearchQuery {
+    let mut q = mk_query(text);
+    q.max_results = k;
+    q
+}
+
+/// 200 segments × 2,000 docs. Every doc says "contract" and "dispute" with a
+/// pseudo-random term frequency and length, so BM25 scores spread out and
+/// segments differ in their best possible score.
+fn build_many_segment_corpus(dir: &PathBuf) -> (NamespaceId, Manifest) {
+    let _ = std::fs::remove_dir_all(dir);
+    let ns = NamespaceId("bench-global-wand".into());
+    let mut entries = Vec::with_capacity(MANY_SEGS);
+    let mut state: u64 = 0x2480_2480;
+    let mut next = move |n: u64| {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) % n
+    };
+    for s in 0..MANY_SEGS {
+        let seg_id = format!("s{s}");
+        let mut w = SegmentWriter::new(SegmentId(seg_id.clone()), dir.join(&ns.0).join(&seg_id));
+        for i in 0..MANY_DOCS_PER_SEG {
+            // Mostly tf 1-2, occasionally up to 8: a Zipf-like tail.
+            let tf = 1 + (next(64) * next(64) / 512) as usize;
+            let content = format!(
+                "{}{}{}",
+                "contract ".repeat(tf),
+                "dispute ".repeat(1 + next(3) as usize),
+                "lorem ipsum ".repeat(5 + next(40) as usize)
+            );
+            w.add_document(
+                DocumentId(format!("s{s}-d{i}")),
+                vec![Field::text("content", content)],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+        entries.push(ManifestEntry {
+            segment_id: SegmentId(seg_id),
+            doc_count: MANY_DOCS_PER_SEG as u32,
+        });
+    }
+    (
+        ns,
+        Manifest {
+            version: 1,
+            segments: entries,
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            branch: None,
+            schema: None,
+            retired: Default::default(),
+            shards: None,
+        },
+    )
 }
 
 criterion_group!(benches, bench_search_latency);

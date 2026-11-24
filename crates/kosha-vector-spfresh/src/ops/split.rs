@@ -15,7 +15,19 @@ use crate::ClusterIndex;
 /// 64 is a defensive margin, not a realistic depth.
 const MAX_CASCADE_DEPTH: usize = 64;
 
-pub(crate) fn split_posting(index: &mut ClusterIndex, posting_id: PostingId, depth: usize) {
+/// Returns whether the posting was actually bisected (`false` when GC alone
+/// brought it back under `max_posting_size`, or it would not separate).
+pub(crate) fn split_posting(index: &mut ClusterIndex, posting_id: PostingId, depth: usize) -> bool {
+    split_posting_sibling(index, posting_id, depth).is_some()
+}
+
+/// [`split_posting`], returning the id of the new sibling posting (the
+/// right half) when a split happened.
+pub(crate) fn split_posting_sibling(
+    index: &mut ClusterIndex,
+    posting_id: PostingId,
+    depth: usize,
+) -> Option<PostingId> {
     assert!(
         depth < MAX_CASCADE_DEPTH,
         "LIRE split cascade exceeded MAX_CASCADE_DEPTH ({MAX_CASCADE_DEPTH}) — this should be \
@@ -33,7 +45,7 @@ pub(crate) fn split_posting(index: &mut ClusterIndex, posting_id: PostingId, dep
 
     if live_count <= index.config.max_posting_size {
         // GC alone resolved the overflow — no split, no reassign needed.
-        return;
+        return None;
     }
 
     let members: Vec<(u32, &[f32])> = {
@@ -48,7 +60,7 @@ pub(crate) fn split_posting(index: &mut ClusterIndex, posting_id: PostingId, dep
     if result.left_ids.is_empty() || result.right_ids.is_empty() {
         // Degenerate (e.g. every remaining vector numerically identical) —
         // leave the posting oversized rather than create an empty one.
-        return;
+        return None;
     }
 
     let entries_by_id = |posting: &Posting, ids: &[u32]| -> Vec<PostingEntry> {
@@ -91,4 +103,5 @@ pub(crate) fn split_posting(index: &mut ClusterIndex, posting_id: PostingId, dep
     }
 
     run_reassign(index, &[old_centroid], &[posting_id, right_id], depth);
+    Some(right_id)
 }
