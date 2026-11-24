@@ -411,6 +411,19 @@ fn flushed_column_carries_no_radius_reference() {
     let reader = SegmentReader::open(dir).unwrap();
     let meta = &reader.footer().vector_fields.as_ref().unwrap()[0];
     assert_eq!(meta.radius_reference, None);
+
+    // A compaction output clustered from scratch (no usable seeds) keeps
+    // its fresh profile as the next merge's baseline.
+    let out = temp_dir("unseeded-compaction-ref");
+    let mut w = SegmentWriter::new(SegmentId("lire".into()), out.clone())
+        .with_vector_radius_reference(true);
+    for i in 0..2_000 {
+        let (id, fields) = doc(i);
+        w.add_document(id, fields);
+    }
+    let footer = w.finalize(Bm25Params::default()).unwrap();
+    let meta = &footer.vector_fields.unwrap()[0];
+    assert_eq!(meta.radius_reference.unwrap().vectors, 2_000);
 }
 
 #[test]
@@ -578,4 +591,23 @@ fn rebuild_trigger_parses_env_values() {
         ("KOSHA_VECTOR_REBUILD_MIN_CHANGED", "NaN"),
     ]));
     assert_eq!(bad, VectorRebuildTrigger::default());
+}
+
+#[test]
+fn zero_radius_reference_still_inflates() {
+    let (ids, seeds) = merge_input("zero-ref", |_| true);
+    let zero = VectorRadiusReference {
+        p50: 0.0,
+        p90: 0.0,
+        vectors: 3_000,
+    };
+    let out = temp_dir("zero-ref-out");
+    let trigger = VectorRebuildTrigger {
+        radius_inflation: Some(1.5),
+        ..VectorRebuildTrigger::default()
+    };
+    let (build, meta) = write_triggered(&out, ids, seeds, Some(zero), trigger);
+    assert_eq!(build.radius_inflation, Some(f32::INFINITY), "{build:?}");
+    assert_eq!(build.rebuild, Some(VectorRebuildReason::RadiusInflation));
+    assert!(meta.radius_reference.unwrap().p90 > 0.0);
 }

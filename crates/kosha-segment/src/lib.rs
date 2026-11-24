@@ -143,6 +143,9 @@ pub struct SegmentWriter {
     /// When a seeded column is rebuilt from scratch instead (#464). See
     /// [`VectorRebuildTrigger`].
     vector_rebuild_trigger: VectorRebuildTrigger,
+    /// Persist each clustered column's radius reference even without
+    /// seeds. See [`Self::with_vector_radius_reference`].
+    record_radius_reference: bool,
     /// How each column's index was built by `finalize`, for tests and
     /// diagnostics. See [`VectorIndexBuild`].
     vector_index_builds: Arc<Mutex<Vec<VectorIndexBuild>>>,
@@ -267,6 +270,7 @@ impl SegmentWriter {
             doc_vector_entries: Vec::new(),
             vector_seeds: HashMap::new(),
             vector_rebuild_trigger: VectorRebuildTrigger::from_env(),
+            record_radius_reference: false,
             vector_index_builds: Arc::new(Mutex::new(Vec::new())),
             default_analyzer: Analyzer::new(&AnalyzerSpec::legacy()),
             field_analyzers: HashMap::new(),
@@ -473,6 +477,16 @@ impl SegmentWriter {
     /// [`VectorRebuildTrigger`].
     pub fn with_vector_rebuild_trigger(mut self, trigger: VectorRebuildTrigger) -> Self {
         self.vector_rebuild_trigger = trigger;
+        self
+    }
+
+    /// Write `VectorFieldMeta::radius_reference` for every clustered
+    /// column, seeded or not (#464). Compaction sets it, so an output
+    /// clustered from scratch (no input big enough to seed from, or
+    /// `KOSHA_VECTOR_COMPACTION=rebuild`) is the baseline its next LIRE
+    /// merge measures against. Seeded columns always write one.
+    pub fn with_vector_radius_reference(mut self, record: bool) -> Self {
+        self.record_radius_reference = record;
         self
     }
 
@@ -1306,10 +1320,11 @@ impl SegmentWriter {
                 offsets: true,
                 quantization,
                 embedding_model: self.embedding_models.get(&column.name).cloned(),
-                // Only compaction outputs carry one: a flush segment's
-                // postings are never adopted (it is under
-                // LIRE_ADOPT_MIN_VECTORS or rebuilt by its first merge).
-                radius_reference: seeds.and(build.radius_reference),
+                // Compaction outputs only: a flush segment's footer stays
+                // as it was before #464.
+                radius_reference: (self.record_radius_reference || seeds.is_some())
+                    .then_some(build.radius_reference)
+                    .flatten(),
             };
             self.vector_index_builds
                 .lock()
@@ -1597,10 +1612,15 @@ impl VectorIndexBuild {
         let profile = radius_profile(postings, vectors);
         self.radius_p50 = profile.p50;
         self.radius_p90 = profile.p90;
-        self.radius_inflation = self
-            .radius_reference
-            .filter(|r| r.p90 > 0.0)
-            .map(|r| profile.p90 / r.p90);
+        // A zero baseline (every posting's members on its centroid) is
+        // inflated by any spread at all.
+        self.radius_inflation =
+            self.radius_reference
+                .map(|r| match (r.p90 > 0.0, profile.p90 > 0.0) {
+                    (true, _) => profile.p90 / r.p90,
+                    (false, true) => f32::INFINITY,
+                    (false, false) => 1.0,
+                });
         self.npa_violation_rate = sampled_npa_violation_rate(postings);
     }
 }

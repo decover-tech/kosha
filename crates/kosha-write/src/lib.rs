@@ -2031,7 +2031,8 @@ impl Indexer {
         });
         let mut writer = kosha_segment::SegmentWriter::new(seg_id.clone(), seg_dir)
             .with_analysis(&analysis)
-            .inherit_doc_store_compression(any_input_compressed);
+            .inherit_doc_store_compression(any_input_compressed)
+            .with_vector_radius_reference(true);
         let mut any_docs = false;
         let old_segment_ids = plan.input_ids();
         let seed_vectors = vector_index
