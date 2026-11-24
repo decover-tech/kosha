@@ -292,6 +292,10 @@ const CACHES: [&str; 6] = [
 /// hits, misses and evictions but no `kosha_cache_bytes` series.
 const ENTRY_BOUNDED_CACHES: [&str; 2] = ["corpus_stats", "ceiling"];
 
+/// The decoded-postings caches, process-wide and not split by tenant: their
+/// `kosha_cache_*` series carry only the `cache` label (#197).
+const DECODED_CACHES: [&str; 2] = ["postings", "vector_postings"];
+
 /// Caches that report only hits and misses: the posting-blob presence
 /// cache holds one entry per namespace, replaced rather than evicted when
 /// the manifest version or eviction generation moves, and its bytes are
@@ -308,6 +312,8 @@ pub(crate) struct Scrape {
     pub segment_checksum_failures: u64,
     /// Per-tenant bytes, hits, misses and evictions of every cache (#342).
     pub cache_tenants: Vec<CacheTenantSample>,
+    /// Totals of each of [`DECODED_CACHES`], in that order.
+    pub decoded_caches: [kosha_segment::PostingsCacheStats; 2],
     /// The background span writer's totals (`span_writes`).
     pub span_writes: crate::span_writes::SpanWriteStats,
 }
@@ -327,6 +333,8 @@ struct ScrapeCollector {
     span_queued_bytes: AtomicU64,
     span_held_bytes: AtomicU64,
     cache_tenants: Mutex<Vec<CacheTenantSample>>,
+    /// Bytes, evictions, hits and misses of each of [`DECODED_CACHES`].
+    decoded_caches: [[AtomicU64; 4]; 2],
     /// Label the `kosha_cache_*` families by tenant (#342).
     tenant_labels: bool,
 }
@@ -343,6 +351,16 @@ impl ScrapeCollector {
             .fetch_max(s.nvme_evictions, Ordering::Relaxed);
         self.checksum_failures
             .fetch_max(s.segment_checksum_failures, Ordering::Relaxed);
+        for (figures, stats) in self.decoded_caches.iter().zip(&s.decoded_caches) {
+            figures[0].store(stats.bytes, Ordering::Relaxed);
+            for (counter, value) in
+                figures[1..]
+                    .iter()
+                    .zip([stats.evictions, stats.hits, stats.misses])
+            {
+                counter.fetch_max(value, Ordering::Relaxed);
+            }
+        }
         let w = &s.span_writes;
         for (counter, value) in self
             .span_writes
@@ -435,6 +453,16 @@ impl Collector for ScrapeCollector {
                         .map(|t| pick(&t.stats))
                         .sum(),
                 };
+                encode_value(&mut family, &[("cache", cache)], metric_type, value)?;
+            }
+            let figure = match name {
+                "kosha_cache_bytes" => 0,
+                "kosha_cache_evictions" => 1,
+                "kosha_cache_hits" => 2,
+                _ => 3,
+            };
+            for (cache, figures) in DECODED_CACHES.iter().zip(&self.decoded_caches) {
+                let value = load(&figures[figure]);
                 encode_value(&mut family, &[("cache", cache)], metric_type, value)?;
             }
         }
@@ -531,7 +559,7 @@ pub(crate) struct Metrics {
     lease_outcomes: [Counter; 3],
     knn_degraded_segments: Counter,
     tenant_rejections: Family<Labels, Counter>,
-    tenant_rejection_reasons: [Counter; 8],
+    tenant_rejection_reasons: [Counter; crate::tenant_limits::RejectReason::ALL.len()],
     legacy_requests: Family<Labels, Counter>,
 }
 
@@ -793,6 +821,12 @@ impl Metrics {
         self.lease_outcomes[outcome as usize].inc();
     }
 
+    /// Add a collector read at scrape time: the usage pipeline's and
+    /// billing's families (`pipeline_metrics.rs`, #348/#349).
+    pub(crate) fn register_collector(&mut self, collector: Box<dyn Collector>) {
+        self.registry.register_collector(collector);
+    }
+
     /// The registry in Prometheus text format (0.0.4), with `scrape` as
     /// the current value of every scrape-time series.
     pub(crate) fn render(&self, scrape: &Scrape) -> String {
@@ -939,6 +973,20 @@ pub(crate) mod tests {
                 cache_sample("posting_blob_presence", "acme", 0, 6, 2, 0),
                 cache_sample("posting_blob_presence", "beta", 0, 3, 1, 0),
             ],
+            decoded_caches: [
+                kosha_segment::PostingsCacheStats {
+                    hits: 11,
+                    misses: 3,
+                    evictions: 2,
+                    bytes: 512,
+                },
+                kosha_segment::PostingsCacheStats {
+                    hits: 6,
+                    misses: 4,
+                    evictions: 0,
+                    bytes: 2048,
+                },
+            ],
             span_writes: crate::span_writes::SpanWriteStats {
                 written: 9,
                 dropped: 2,
@@ -1038,6 +1086,16 @@ pub(crate) mod tests {
             1.0
         );
         assert!(value(&samples, "kosha_cache_bytes", &[("cache", "ceiling")]).is_none());
+        // #197: the decoded-postings caches, process-wide.
+        let postings = [("cache", "postings")];
+        assert_eq!(get(&samples, "kosha_cache_hits_total", &postings), 11.0);
+        assert_eq!(get(&samples, "kosha_cache_misses_total", &postings), 3.0);
+        assert_eq!(get(&samples, "kosha_cache_evictions_total", &postings), 2.0);
+        assert_eq!(get(&samples, "kosha_cache_bytes", &postings), 512.0);
+        let vectors = [("cache", "vector_postings")];
+        assert_eq!(get(&samples, "kosha_cache_hits_total", &vectors), 6.0);
+        assert_eq!(get(&samples, "kosha_cache_misses_total", &vectors), 4.0);
+        assert_eq!(get(&samples, "kosha_cache_bytes", &vectors), 2048.0);
         let presence = [("cache", "posting_blob_presence")];
         assert_eq!(get(&samples, "kosha_cache_hits_total", &presence), 9.0);
         assert_eq!(get(&samples, "kosha_cache_misses_total", &presence), 3.0);
@@ -1062,7 +1120,13 @@ pub(crate) mod tests {
         assert!(samples
             .iter()
             .filter(|s| s.name.starts_with("kosha_cache_"))
+            .filter(|s| !DECODED_CACHES.contains(&s.labels["cache"].as_str()))
             .all(|s| s.labels.contains_key("tenant")));
+        assert_eq!(get(&samples, "kosha_cache_hits_total", &vectors), 6.0);
+        assert!(samples
+            .iter()
+            .filter(|s| s.labels.get("cache").map(String::as_str) == Some("postings"))
+            .all(|s| !s.labels.contains_key("tenant")));
     }
 
     #[test]

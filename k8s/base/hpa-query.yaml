@@ -8,12 +8,12 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: kosha-query
-  # Base ships a no-op placeholder — stage/prod overlays patch real
+  # Base maintains the three-zone floor — stage/prod overlays patch
   # min/max/target values. Requires the cluster's metrics-server to be
   # healthy (`kubectl top pods -n kosha` returning real numbers); confirm
   # that in isolation before relying on this to scale anything.
-  minReplicas: 1
-  maxReplicas: 1
+  minReplicas: 3
+  maxReplicas: 3
   metrics:
     - type: Resource
       resource:

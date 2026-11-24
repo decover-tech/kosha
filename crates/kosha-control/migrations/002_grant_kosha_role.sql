@@ -37,3 +37,26 @@ ALTER TABLE IF EXISTS kosha.audit_log OWNER TO kosha;
 -- 007_billing.sql (#349). IF EXISTS for the same reason.
 ALTER TABLE IF EXISTS kosha.billing_accounts OWNER TO kosha;
 ALTER TABLE IF EXISTS kosha.billing_invoices OWNER TO kosha;
+-- 008_identity_sessions.sql (#345 part 2). IF EXISTS for the same reason.
+ALTER TABLE IF EXISTS kosha.user_credentials OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.auth_tokens OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.sessions OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.user_identities OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.org_sso OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.login_flows OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.api_key_creators OWNER TO kosha;
+-- 009_api_key_scrub.sql (#346). IF EXISTS for the same reason.
+ALTER TABLE IF EXISTS kosha.api_key_scrub OWNER TO kosha;
+-- 010_namespace_lifecycle.sql (#347). IF EXISTS for the same reason.
+ALTER TABLE IF EXISTS kosha.pods OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.deletion_acks OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.exports OWNER TO kosha;
+-- 011_billing_ledger.sql (#349). IF EXISTS for the same reason. Moving
+-- billing_plan_changes also moves the sequence its BIGSERIAL id owns.
+ALTER TABLE IF EXISTS kosha.billing_plan_changes OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.billing_webhook_events OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.billing_payment_failures OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.billing_notices OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.billing_payment_methods OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.billing_jobs OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.billing_leases OWNER TO kosha;

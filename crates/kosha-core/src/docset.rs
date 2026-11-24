@@ -788,6 +788,34 @@ mod tests {
         );
     }
 
+    /// Issue #194: an empty string is a value (as in OpenSearch, where `""`
+    /// is non-null), so `exists` matches it; an absent field, an empty
+    /// list and a list of only nulls are not.
+    #[test]
+    fn exists_counts_empty_string_but_not_empty_list() {
+        let mut store = FilterStore::default();
+        store.string_fields.insert(
+            "code".into(),
+            vec![
+                (0, "".into()),
+                (1, "x".into()),
+                (2, "[]".into()),
+                (3, "[null]".into()),
+                (4, r#"[""]"#.into()),
+                // 5: no `code`
+            ],
+        );
+        let eval = |json: &str| -> Vec<u32> {
+            let clause: FilterClause = serde_json::from_str(json).unwrap();
+            evaluate_filter(&clause, &store, 6).iter().collect()
+        };
+        assert_eq!(eval(r#"{"exists": {"field": "code"}}"#), vec![0, 1, 4]);
+        assert_eq!(
+            eval(r#"{"bool": {"must_not": [{"exists": {"field": "code"}}]}}"#),
+            vec![2, 3, 5]
+        );
+    }
+
     /// Codes for the `prefix` acceptance criteria, plus a list value, a
     /// document without the field, and a mixed-case value.
     fn prefix_store() -> FilterStore {
