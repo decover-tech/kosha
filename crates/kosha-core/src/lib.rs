@@ -3850,7 +3850,12 @@ impl SearchQuery {
             }
         }
         for (i, leg) in self.rrf_subqueries().into_iter().flatten().enumerate() {
-            if leg.has_lexical_query() == leg.knn.is_some()
+            let lexical_retrievers = usize::from(!leg.query_text.trim().is_empty())
+                + usize::from(leg.wildcard.is_some())
+                + usize::from(leg.match_phrase.is_some())
+                + usize::from(leg.fuzzy.is_some());
+            if lexical_retrievers > 1
+                || leg.has_lexical_query() == leg.knn.is_some()
                 || (!leg.has_lexical_query() && (!leg.fields.is_empty() || leg.operator.is_some()))
             {
                 return Err(invalid(&format!(
@@ -6267,5 +6272,32 @@ mod knn_query_text {
         assert_eq!(meta.embedding_model, None);
         let json = serde_json::to_string(&meta).unwrap();
         assert!(!json.contains("embedding_model"), "{json}");
+    }
+}
+
+#[cfg(test)]
+mod multi_rrf_validation {
+    use super::*;
+
+    fn rrf_query(leg: serde_json::Value) -> SearchQuery {
+        serde_json::from_value(serde_json::json!({
+            "query_text": "",
+            "rank_by": {"rrf": {"queries": [leg]}}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_leg_with_two_lexical_retrievers_is_rejected() {
+        assert!(rrf_query(serde_json::json!({"query_text": "alpha"}))
+            .validate()
+            .is_ok());
+        let err = rrf_query(serde_json::json!({
+            "query_text": "alpha",
+            "wildcard": {"field": "", "pattern": "al*"}
+        }))
+        .validate()
+        .unwrap_err();
+        assert!(err.to_string().contains("queries[0]"), "{err}");
     }
 }
