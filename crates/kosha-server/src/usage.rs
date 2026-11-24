@@ -573,10 +573,15 @@ pub(crate) fn documents_logical_bytes(documents: &[kosha_core::Document]) -> u64
 
 /// Vector values in `documents` as they will be stored: each flat vector's
 /// dimension, and each late-interaction bag's dimension x tokens. A value
-/// that is not a JSON number array (or array of them) counts 0.
+/// that is not a JSON number array (or array of them) counts 0. A doc id
+/// repeated in the batch counts once, as its last copy: the writer keeps
+/// only that one.
 pub(crate) fn documents_vector_dimensions(documents: &[kosha_core::Document]) -> u64 {
-    documents
-        .iter()
+    let mut last: HashMap<&str, &kosha_core::Document> = HashMap::new();
+    for doc in documents {
+        last.insert(doc.id.0.as_str(), doc);
+    }
+    last.values()
         .flat_map(|doc| doc.fields.iter())
         .filter(|field| field.field_type == kosha_core::FieldType::Vector)
         .map(|field| {

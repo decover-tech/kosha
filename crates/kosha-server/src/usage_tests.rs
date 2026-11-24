@@ -801,3 +801,18 @@ fn metering_is_off_by_default() {
     assert_eq!(status_of(&response), 404, "{response}");
     state.flush_usage_on_shutdown();
 }
+
+#[test]
+fn a_doc_id_repeated_in_a_batch_meters_only_its_last_copy() {
+    let vector_doc = |id: &str, emb: &str| -> kosha_core::Document {
+        serde_json::from_value(serde_json::json!({"id": id, "fields": [
+            {"name": "emb", "field_type": "Vector", "value": emb}]}))
+        .unwrap()
+    };
+    let documents = [
+        vector_doc("a", "[1.0, 0.0, 0.0, 0.0]"),
+        vector_doc("b", "[1.0, 0.0]"),
+        vector_doc("a", "[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]"),
+    ];
+    assert_eq!(usage::documents_vector_dimensions(&documents), 2 + 6);
+}
