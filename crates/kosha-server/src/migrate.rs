@@ -645,6 +645,7 @@ pub fn run(argv: impl IntoIterator<Item = String>) -> Result<()> {
         .build()?;
     let mut s3 = rt.block_on(S3Storage::new(data_dir.clone(), s3_config))?;
     let mut store = PgStore::new(&database_url)?;
+    s3.set_tenant_kms_key_store(store.clone());
 
     println!(
         "migrate: indices={:?} workers={} scroll_size={} batch_size={} flush_docs={} limit={:?} mode={:?} ids_file={:?}",

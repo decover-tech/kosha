@@ -1641,7 +1641,8 @@ impl AppState {
             .filter(|n| *n > 0)
             .unwrap_or(flush_threshold);
         #[cfg(feature = "s3")]
-        let s3_storage = {
+        #[cfg_attr(not(feature = "postgres"), allow(unused_mut))]
+        let mut s3_storage = {
             match s3_storage::S3Config::from_env() {
                 Some(cfg) => {
                     let bucket = cfg.bucket.clone();
@@ -1757,6 +1758,10 @@ impl AppState {
             match kosha_control::PgStore::connect_with_retry(&db_url) {
                 Ok(store) => {
                     control_plane_kind = "postgres";
+                    #[cfg(feature = "s3")]
+                    if let Some(s3) = s3_storage.as_mut() {
+                        s3.set_tenant_kms_key_store(store.clone());
+                    }
                     println!("control plane: postgres ({})", redact_database_url(&db_url));
                     Box::new(store)
                 }

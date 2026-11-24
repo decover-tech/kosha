@@ -144,7 +144,9 @@ vars, which key an object uses, key rotation) is in
 **S3.** Set `KOSHA_S3_SSE=aws:kms` (and optionally
 `KOSHA_S3_SSE_KMS_KEY_ID`, `KOSHA_S3_SSE_BUCKET_KEY=true` and per-tenant
 `KOSHA_S3_TENANT_KMS_KEYS` / `KOSHA_S3_TENANT_KMS_KEYS_FILE`) in the
-ConfigMap; see the commented example in `base/configmap.yaml`. Every pod
+ConfigMap; see the commented example in `base/configmap.yaml`. A key on the
+control-plane tenant record (`kosha.tenants.kms_key_id`) takes precedence over
+the configured tenant map. Every pod
 that reads or writes S3 (ingest, query, indexer, the GC CronJob and
 `migrate`) runs as the `kosha` service account, so its IRSA role needs KMS
 access to every key in use, the old key included until a rotation's hard
@@ -232,10 +234,11 @@ Before applying it:
    `/etc/kosha/tls`.
 2. Move every other client of port 8080 to `https://` in the same change:
    HTTPS is per port, so a pod with a certificate no longer answers plain
-   HTTP. In this repo that is the `curl` URL in `base/cronjob-segment-gc.yaml`
-   and `stage/cronjob-compaction.yaml` (they also need the CA, for example
-   `--cacert` with the Secret mounted); the component does not patch them.
-   Outside it, that is every service calling `kosha-service`.
+   HTTP. The component switches `base/cronjob-segment-gc.yaml` to HTTPS and
+   mounts the CA for it. It does not patch `stage/cronjob-compaction.yaml`
+   (switch its `curl` URL to `https://` and add `--cacert` with the Secret
+   mounted). Outside this repo, that is every service calling `kosha-service`;
+   add their hostnames to the certificate SANs.
 3. Check the Prometheus scrape job. `/metrics` is on the same port, so it
    is HTTPS-only too (it needs no client certificate). The component adds
    `prometheus.io/scheme: https` next to the existing `prometheus.io/*`

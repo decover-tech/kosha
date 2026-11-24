@@ -70,8 +70,11 @@ Key ids are never logged.
 **Which key an object uses.** Every object under a namespace is
 `{namespace}/{segment}/{file}`, and a tenant-scoped namespace is `{tenant}/{name}` (branches
 and shards stay under the same tenant). The tenant is the namespace's first component, and its
-key comes from the tenant map, falling back to the default key. These objects have no tenant
-and always use the default key:
+key comes, in SSE-KMS mode, from `kosha.tenants.kms_key_id` in the Postgres control plane.
+If the tenant has no record or its key is NULL, Kosha uses the configured tenant map, then
+the default key. A lookup error stops the write instead of silently using another key.
+Operators can set or clear `kms_key_id` on an existing tenant row; this is not a tenant-facing API.
+These objects have no tenant and always use the default key:
 
 - objects of a bare namespace, such as `migrate` without `--namespace`;
 - **WAL objects** (`{prefix}/_wal/{writer_id}/...`). A WAL stream belongs to one ingest writer,
@@ -92,7 +95,9 @@ written with and stay readable (subject to the KMS permissions above).
 - **KMS automatic rotation** (recommended): enable rotation on the key in KMS. KMS keeps the
   old key material for decryption, so nothing is re-encrypted and no Kosha config changes.
 - **Switching to a different key** (a new `KOSHA_S3_SSE_KMS_KEY_ID` or a new tenant entry):
-  roll out the new value. New objects use the new key at once. Old objects keep the old key
+  give the pod role access to the new key, then update the tenant row's `kms_key_id` or roll out
+  the new configuration value. New writes resolve the control-plane key without a pod restart.
+  Old objects keep the old key
   and stay readable as long as the role can still `kms:Decrypt` with it, so keep the old key
   enabled and in the IAM policy. Compaction rewrites segments into new objects, so the old
   key's share of the data shrinks over time. The tenant map (including
@@ -784,6 +789,10 @@ seconds or a unit (`90s`, `5m`, `1h`).
 | `KOSHA_GC_ORPHAN_GRACE` | How old an object no manifest ever referenced must be before GC deletes it | `24h` | duration |
 | `KOSHA_LOCAL_GC_GRACE` | How long a retired segment's local files stay after the publish that dropped it (and after every search that could read them ends) | `5m` | duration |
 | `KOSHA_LOCAL_GC_INTERVAL_MS` | How often each pod reclaims retired local segments; `0` disables | `60000` | milliseconds |
+
+The Kubernetes `kosha-segment-gc` CronJob uses `KOSHA_GC_INGEST_SCHEME` as the URL scheme for
+`POST /v1/admin/gc`. The base manifest sets it to `http` for plaintext ingest; the
+`internal-tls` component sets it to `https` and mounts the CA for verification.
 
 ## Deleted namespaces (cache purge and retry)
 
