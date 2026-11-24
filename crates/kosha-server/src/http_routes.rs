@@ -63,6 +63,9 @@ fn route_checked(
         if let Some(response) = unrouted_v1(method, path) {
             return response;
         }
+        if let Some(response) = state.control_store_write_refusal(request_line) {
+            return response;
+        }
         // Organizations, users, projects, audit log (#345).
         let key_table = match auth::global() {
             auth::Auth::Keys(keys) => Some(keys),
@@ -126,6 +129,9 @@ fn route_checked(
             }
             auth::record_legacy_use(tenant, bare_path);
             state.metrics.record_legacy_request(bare_path, tenant);
+        }
+        if let Some(response) = state.control_store_write_refusal(request_line) {
+            return response;
         }
         if method == "GET" && (bare_path == "/stats" || bare_path == "/v1/stats") {
             return if admin_actor(headers, state).is_some() {
