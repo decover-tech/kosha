@@ -3329,6 +3329,41 @@ impl AppState {
             .clone()
     }
 
+    /// Bring a quota-checked writer up to date without waiting for a
+    /// publication conflict. Rebasing keeps unpublished writes intact.
+    fn refresh_write_manifest(&self, ns: &NamespaceId) -> Result<(), KoshaError> {
+        let lock = self.publication_lock(ns);
+        let _guard = lock.lock().unwrap();
+        let stored = self.controller.lock().unwrap().manifest_version(ns)?;
+        if stored <= self.indexer.published_version(ns) {
+            return Ok(());
+        }
+        let Some(remote) = self.hydrated_remote_manifest(ns)? else {
+            return Err(KoshaError::ManifestConflict {
+                namespace: ns.clone(),
+                expected: stored.unwrap_or_default(),
+                actual: None,
+            });
+        };
+        self.rebase_write_manifest(ns, remote).map(|_| ())
+    }
+
+    fn rebase_write_manifest(
+        &self,
+        ns: &NamespaceId,
+        remote: kosha_core::Manifest,
+    ) -> Result<kosha_write::RebaseOutcome, KoshaError> {
+        #[cfg(feature = "s3")]
+        {
+            // Committed segments are already durable and need no upload.
+            let mut synced = self.synced_segments.lock().unwrap();
+            for entry in &remote.segments {
+                synced.insert(synced_key(&remote, ns, &entry.segment_id));
+            }
+        }
+        self.indexer.rebase_onto(ns, remote)
+    }
+
     /// Drop the cached hydration verdict for one manifest version, so the
     /// next search re-checks its scoring set on disk instead of trusting a
     /// verdict that a failed search just proved stale.
@@ -3593,17 +3628,8 @@ impl AppState {
                          found {}): rebasing, attempt {rebases}/{MANIFEST_REBASE_ATTEMPTS}",
                         ns.0, remote.version
                     );
-                    #[cfg(feature = "s3")]
-                    {
-                        // The committed manifest's segments are durable by
-                        // the publish protocol; the other writer uploaded
-                        // them and this node has nothing local to send.
-                        let mut synced = self.synced_segments.lock().unwrap();
-                        for entry in &remote.segments {
-                            synced.insert(synced_key(&remote, ns, &entry.segment_id));
-                        }
-                    }
-                    if self.indexer.rebase_onto(ns, remote)? == kosha_write::RebaseOutcome::Adopted
+                    if self.rebase_write_manifest(ns, remote)?
+                        == kosha_write::RebaseOutcome::Adopted
                     {
                         return Ok(());
                     }
@@ -7038,9 +7064,9 @@ fn handle_metrics(state: &AppState, headers: &HashMap<String, String>) -> String
 
 /// [`route`] an authenticated request this pod handles itself, after its
 /// tenant's request-entry limits (#341): a search takes a qps token and a
-/// concurrent-query slot (held until the response is built); a write route
-/// is checked against the tenant's body size cap and write bytes per
-/// second. A query pod forwards writes before this runs, so write limits
+/// concurrent-query slot (held until the response is built). The body cap
+/// applies to all requests; the write-byte rate applies only to writes.
+/// A query pod forwards writes before this runs, so write limits
 /// are enforced where writes execute: on the ingest pod.
 fn serve_tenant_request(
     request_line: &str,
@@ -7051,14 +7077,17 @@ fn serve_tenant_request(
 ) -> String {
     let mut _query_slot = None;
     if tenant_is_limited(state, tenant) {
+        if let Err(rejection) =
+            state
+                .tenant_limits
+                .admit_body(tenant, body.len(), is_write_path(request_line))
+        {
+            return tenant_rejection(state, tenant, &rejection);
+        }
         if is_search_route(request_line) {
             match state.tenant_limits.admit_query(tenant) {
                 Ok(slot) => _query_slot = Some(slot),
                 Err(rejection) => return tenant_rejection(state, tenant, &rejection),
-            }
-        } else if is_write_path(request_line) {
-            if let Err(rejection) = state.tenant_limits.admit_write_body(tenant, body.len()) {
-                return tenant_rejection(state, tenant, &rejection);
             }
         }
     }
@@ -7106,6 +7135,9 @@ fn tenant_rejection(
         .alias("limit", limit);
     if code == ErrorCode::PayloadTooLarge {
         error = error.detail("scope", "tenant");
+    }
+    if rejection.reason == tenant_limits::RejectReason::StorageQuota {
+        error = error.detail("reason", rejection.reason.as_str());
     }
     error.into_raw()
 }
@@ -7190,6 +7222,80 @@ fn namespace_doc_estimate(state: &AppState, ns: &NamespaceId) -> u64 {
         }
     }
     committed + pending
+}
+
+/// Segment bytes owned by the namespace, plus estimates for the tail and
+/// new documents. Sample the tail first so a concurrent flush may count
+/// a document twice, but cannot move it out of both samples.
+fn check_namespace_storage(
+    state: &AppState,
+    ns: &NamespaceId,
+    tenant: &str,
+    max: u64,
+    documents: &[kosha_core::Document],
+    replace: bool,
+) -> Result<(), String> {
+    let mut members = vec![ns.clone()];
+    let shards = state.indexer.shard_count(ns);
+    if let Some(shards) = shards {
+        members.extend(kosha_core::sharding::shard_namespaces(ns, shards));
+    }
+    let mut bytes = 0u64;
+    for member in members {
+        state
+            .refresh_write_manifest(&member)
+            .map_err(|error| match error {
+                KoshaError::ControlPlane(_) => control_store_unavailable(&error.to_string()),
+                _ => publication_error("namespace storage manifest refresh failed", &error),
+            })?;
+        bytes = bytes.saturating_add(state.indexer.pending_storage_bytes(&member));
+        if let Some(manifest) = state.indexer.manifest_shared(&member) {
+            let Some(stored) = usage::owned_segment_bytes(state, &member, &manifest, true) else {
+                return Err(api_error(
+                    ErrorCode::Unavailable,
+                    "namespace storage size unavailable",
+                ));
+            };
+            bytes = bytes.saturating_add(stored);
+        }
+    }
+    if bytes <= max {
+        let incoming = if replace {
+            let batches = match shards {
+                Some(shards) => route_to_shards(ns, shards, documents.to_vec()),
+                None => vec![(ns.clone(), documents.to_vec())],
+            };
+            batches
+                .into_iter()
+                .try_fold(0u64, |total, (member, docs)| {
+                    hydrate_replacement_segments(state, &member)?;
+                    let bytes = state
+                        .indexer
+                        .merged_replacement_bytes(&member, docs)
+                        .map_err(|error| {
+                            api_error(
+                                ErrorCode::Internal,
+                                &format!("replacement size estimate failed: {error}"),
+                            )
+                        })?;
+                    Ok::<_, String>(total.saturating_add(bytes))
+                })?
+        } else {
+            documents
+                .iter()
+                .map(kosha_write::approx_document_bytes)
+                .fold(0, u64::saturating_add)
+        };
+        bytes = bytes.saturating_add(incoming);
+    }
+    if bytes > max {
+        return Err(tenant_rejection(
+            state,
+            tenant,
+            &tenant_limits::Rejection::quota(tenant_limits::RejectReason::StorageQuota, max),
+        ));
+    }
+    Ok(())
 }
 
 /// The widest vector in `documents` (a bag of vectors counts its widest).
@@ -8667,7 +8773,7 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
     if let Err(response) = check_embedded_dims(state, &ns, &documents) {
         return response;
     }
-    match write_routed(state, &ns, documents, index_into) {
+    match write_routed(state, &ns, documents, false) {
         Ok(count) => {
             state.metrics.record_indexed(count as u64);
             if let Some(meter) = state.usage.as_ref() {
@@ -8830,6 +8936,24 @@ fn route_to_shards(
 /// written, which a client retry of the whole (idempotent, id-keyed) batch
 /// repairs. Returns how many documents were written.
 fn write_routed(
+    state: &AppState,
+    ns: &NamespaceId,
+    documents: Vec<kosha_core::Document>,
+    replace: bool,
+) -> Result<usize, String> {
+    let write = if replace { replace_into } else { index_into };
+    if let Some((tenant, limits)) = write_limits(state, ns) {
+        if let Some(max) = limits.bytes_per_namespace {
+            return state.tenant_limits.with_storage_admission(&tenant, || {
+                check_namespace_storage(state, ns, &tenant, max, &documents, replace)?;
+                write_to_shards(state, ns, documents, write)
+            });
+        }
+    }
+    write_to_shards(state, ns, documents, write)
+}
+
+fn write_to_shards(
     state: &AppState,
     ns: &NamespaceId,
     documents: Vec<kosha_core::Document>,
@@ -9054,7 +9178,7 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
     if let Err(response) = check_embedded_dims(state, &namespace, &documents) {
         return response;
     }
-    match write_routed(state, &namespace, documents, replace_into) {
+    match write_routed(state, &namespace, documents, true) {
         Ok(count) => {
             state.metrics.record_indexed(count as u64);
             if let Some(meter) = state.usage.as_ref() {
@@ -9082,32 +9206,7 @@ fn replace_into(
         return Err(response);
     }
 
-    // Replacement scans immutable segments, so materialize any S3-backed
-    // segment directories before entering the indexer lock. Batched across
-    // the whole manifest — see handle_index for why this isn't a per-segment
-    // loop.
-    #[cfg(feature = "s3")]
-    {
-        let manifest = {
-            let indexer = &state.indexer;
-            indexer.manifest_cloned(&namespace)
-        };
-        if let Some(manifest) = manifest {
-            let paths: Vec<PathBuf> = manifest
-                .segments
-                .iter()
-                .map(|entry| manifest.segment_dir(&state.data_dir, &namespace, &entry.segment_id))
-                .collect();
-            // Rewrite/lookup paths must see a segment's full fidelity,
-            // including vectors — unlike the search path, there's no
-            // per-call signal here for whether vectors matter, so always
-            // fetch them.
-            let outcome = state.ensure_segments_local(&paths, true);
-            if let Some(error) = hydration_error_response(&outcome) {
-                return Err(error);
-            }
-        }
-    }
+    hydrate_replacement_segments(state, &namespace)?;
 
     let count = {
         let indexer = &state.indexer;
@@ -9133,6 +9232,24 @@ fn replace_into(
     }
 
     Ok(count)
+}
+
+/// Replacement and quota estimation read the full document including vectors.
+fn hydrate_replacement_segments(state: &AppState, ns: &NamespaceId) -> Result<(), String> {
+    #[cfg(feature = "s3")]
+    if let Some(manifest) = state.indexer.manifest_shared(ns) {
+        let paths: Vec<_> = manifest
+            .segments
+            .iter()
+            .map(|entry| manifest.segment_dir(&state.data_dir, ns, &entry.segment_id))
+            .collect();
+        if let Some(error) = hydration_error_response(&state.ensure_segments_local(&paths, true)) {
+            return Err(error);
+        }
+    }
+    #[cfg(not(feature = "s3"))]
+    let _ = (state, ns);
+    Ok(())
 }
 
 // ─── POST /flush ────────────────────────────────────────────────────────────
@@ -24851,6 +24968,232 @@ mod tests {
         let big = globex_write(one_doc("big", &"x".repeat(5000)));
         let body = assert_rejected(&big, "body_too_large");
         assert_eq!(body["limit"], 4096);
+    }
+
+    #[test]
+    fn namespace_storage_quota_counts_pending_and_committed_shards() {
+        let state =
+            limited_state(r#"{"default_plan":"p","plans":{"p":{"bytes_per_namespace":120}}}"#);
+        let write = |tenant: &str, path: &str, body| as_tenant(&state, tenant, path, body);
+        let response = write(
+            "acme",
+            "POST /v1/namespaces",
+            serde_json::json!({"namespace": "one"}),
+        );
+        assert_eq!(status_of(&response), 200, "{response}");
+        let response = write(
+            "acme",
+            "POST /v1/namespaces/one/shards",
+            serde_json::json!({"shards": 2}),
+        );
+        assert_eq!(status_of(&response), 200, "{response}");
+
+        let title = "x".repeat(70);
+        let response = write(
+            "acme",
+            "POST /v1/namespaces/one/documents",
+            one_doc("a", &title),
+        );
+        assert_eq!(status_of(&response), 200, "{response}");
+
+        let refused = |path| {
+            let response = write("acme", path, one_doc("b", &title));
+            assert_eq!(status_of(&response), 403, "{response}");
+            let body = body_of(&response);
+            assert_eq!(body["code"], "permission_denied");
+            assert_eq!(body["details"]["reason"], "storage_quota_exceeded");
+            assert_eq!(body["details"]["limit"], 120);
+            assert_eq!(body["retryable"], false);
+            assert_eq!(header_of(&response, "retry-after"), None);
+        };
+        refused("POST /v1/namespaces/one/documents");
+        refused("POST /v1/namespaces/one/replace");
+
+        let response = write(
+            "acme",
+            "POST /v1/namespaces/one/flush",
+            serde_json::json!({}),
+        );
+        assert_eq!(status_of(&response), 200, "{response}");
+        refused("POST /v1/namespaces/one/documents");
+
+        for (tenant, ns) in [("globex", "one"), ("acme", "two")] {
+            let response = write(
+                tenant,
+                &format!("POST /v1/namespaces/{ns}/documents"),
+                one_doc("b", &title),
+            );
+            assert_eq!(status_of(&response), 200, "{response}");
+        }
+    }
+
+    #[test]
+    fn namespace_storage_quota_adopts_remote_compaction_before_admission() {
+        let shared = shared_store();
+        let ns = NamespaceId("acme/one".into());
+        let compactor = test_state();
+        *compactor.controller.lock().unwrap() = Box::new(shared.clone());
+        write_and_flush(&compactor, &ns, "a");
+        write_and_flush(&compactor, &ns, "b");
+        compactor.publish_namespace(&ns).unwrap();
+        let before = shared.manifest_cloned(&ns).unwrap();
+        let old_bytes = usage::owned_segment_bytes(&compactor, &ns, &before, true).unwrap();
+        let ingest = test_state();
+        copy_dir(
+            &compactor.data_dir.join(&ns.0),
+            &ingest.data_dir.join(&ns.0),
+        );
+        ingest.indexer.restore_manifest(ns.clone(), before.clone());
+
+        assert!(
+            compactor
+                .indexer
+                .compact_namespace_with_options(&ns, kosha_write::CompactOptions::full())
+                .unwrap()
+                .merged
+        );
+        compactor.publish_namespace(&ns).unwrap();
+        let after = shared.manifest_cloned(&ns).unwrap();
+        let max = usage::owned_segment_bytes(&compactor, &ns, &after, true).unwrap() + 64;
+        assert!(
+            old_bytes > max,
+            "old {old_bytes} must exceed new quota {max}"
+        );
+        copy_dir(
+            &compactor.data_dir.join(&ns.0),
+            &ingest.data_dir.join(&ns.0),
+        );
+        let config = tenant_limits::LimitsConfig::parse(
+            &format!(r#"{{"tenants":{{"acme":{{"bytes_per_namespace":{max}}}}}}}"#),
+            None,
+        )
+        .unwrap();
+        let mut ingest = ingest;
+        ingest.tenant_limits = tenant_limits::TenantLimiter::new(Arc::new(
+            tenant_limits::ConfigLimitsProvider::from_config(config),
+        ));
+        *ingest.controller.lock().unwrap() = Box::new(shared);
+        assert_eq!(ingest.indexer.manifest_version(&ns), Some(before.version));
+        let response = as_tenant(
+            &ingest,
+            "acme",
+            "POST /v1/namespaces/one/documents",
+            one_doc("c", "z"),
+        );
+        assert_eq!(status_of(&response), 200, "{response}");
+        assert_eq!(ingest.indexer.published_version(&ns), Some(after.version));
+    }
+
+    #[test]
+    fn namespace_storage_quota_counts_merged_replacements_before_writing_shards() {
+        let mut state = test_state();
+        let ns = NamespaceId("acme/one".into());
+        let response = as_tenant(
+            &state,
+            "acme",
+            "POST /v1/namespaces",
+            serde_json::json!({"namespace": "one"}),
+        );
+        assert_eq!(status_of(&response), 200, "{response}");
+        let response = as_tenant(
+            &state,
+            "acme",
+            "POST /v1/namespaces/one/shards",
+            serde_json::json!({"shards": 2}),
+        );
+        assert_eq!(status_of(&response), 200, "{response}");
+        let shards = kosha_core::sharding::shard_namespaces(&ns, 2);
+        let [first, second] = shards.as_slice() else {
+            unreachable!()
+        };
+        let first_id = (0..)
+            .map(|i| format!("doc-{i}"))
+            .find(|id| {
+                kosha_core::sharding::shard_namespace(
+                    &ns,
+                    kosha_core::sharding::shard_for_document(id, 2),
+                ) == *first
+            })
+            .unwrap();
+        let second_id = (0..)
+            .map(|i| format!("doc-{i}"))
+            .find(|id| {
+                kosha_core::sharding::shard_namespace(
+                    &ns,
+                    kosha_core::sharding::shard_for_document(id, 2),
+                ) == *second
+            })
+            .unwrap();
+        let seeded = as_tenant(
+            &state,
+            "acme",
+            "POST /v1/namespaces/one/documents",
+            one_doc(&second_id, &"unchanged ".repeat(1024)),
+        );
+        assert_eq!(status_of(&seeded), 200, "{seeded}");
+        flush_and_publish_namespace(&state, &ns).unwrap();
+        let version = state.indexer.manifest_version(first);
+        let stored = usage::owned_segment_bytes(
+            &state,
+            second,
+            &state.indexer.manifest_shared(second).unwrap(),
+            true,
+        )
+        .unwrap();
+        let config = tenant_limits::LimitsConfig::parse(
+            &serde_json::json!({"tenants": {"acme": {"bytes_per_namespace": stored + 256}}})
+                .to_string(),
+            None,
+        )
+        .unwrap();
+        state.tenant_limits = tenant_limits::TenantLimiter::new(Arc::new(
+            tenant_limits::ConfigLimitsProvider::from_config(config),
+        ));
+
+        let replace = |body| as_tenant(&state, "acme", "POST /v1/namespaces/one/replace", body);
+        let response = replace(serde_json::json!({"documents": [
+            {"id": first_id, "fields": [{"name": "title", "field_type": "Text", "value": "small"}]},
+            {"id": second_id, "fields": [{"name": "tag", "field_type": "Keyword", "value": "small"}]}
+        ]}));
+        assert_eq!(status_of(&response), 403, "{response}");
+        assert_eq!(
+            body_of(&response)["details"]["reason"],
+            "storage_quota_exceeded"
+        );
+        assert_eq!(
+            state.indexer.manifest_version(first),
+            version,
+            "no earlier shard should be written"
+        );
+        let response = replace(one_doc(&second_id, "short"));
+        assert_eq!(status_of(&response), 200, "{response}");
+    }
+
+    #[test]
+    fn search_body_cap_does_not_spend_query_tokens_or_use_write_rate() {
+        let state = limited_state(
+            r#"{"default_plan":"p","plans":{"p":{"qps":1,"max_body_bytes":64,"write_bytes_per_sec":1}}}"#,
+        );
+        let response = as_tenant(
+            &state,
+            "acme",
+            "POST /v1/namespaces",
+            serde_json::json!({"namespace": "one"}),
+        );
+        assert_eq!(status_of(&response), 200, "{response}");
+        let search = |query| {
+            as_tenant(
+                &state,
+                "acme",
+                "POST /v1/namespaces/one/search",
+                serde_json::json!({"query_text": query}),
+            )
+        };
+        let body = assert_rejected(&search("x".repeat(65)), "body_too_large");
+        assert_eq!(body["details"]["scope"], "tenant");
+        let allowed = search("x".to_string());
+        assert_eq!(status_of(&allowed), 200, "{allowed}");
+        assert_rejected(&search("x".to_string()), "tenant_qps_exceeded");
     }
 
     #[test]

@@ -1210,6 +1210,78 @@ impl Indexer {
         self.upsert_documents(namespace, documents, true)
     }
 
+    /// Estimate the complete documents a partial replacement would write.
+    /// This is a read-only preflight so a namespace-level quota can check
+    /// all shards before the first shard is written.
+    pub fn merged_replacement_bytes(
+        &self,
+        namespace: &NamespaceId,
+        documents: Vec<Document>,
+    ) -> Result<u64, KoshaError> {
+        let handle = self.ns_handle(namespace);
+        let _compact = handle.compact.lock().unwrap();
+        let _mutation = handle.mutation.lock().unwrap();
+        self.ensure_id_index(namespace, &handle)?;
+        let snapshot = handle.state.lock().unwrap().clone();
+        dedupe_documents_last_wins(documents)
+            .into_iter()
+            .try_fold(0u64, |bytes, mut doc| {
+                let latest = Self::live_upsert_locations(&snapshot, &doc.id)
+                    .next_back()
+                    .filter(|_| !snapshot.recovered_deletes.contains(&doc.id));
+                self.merge_replacement(namespace, &snapshot, &mut doc, latest)?;
+                Ok(bytes.saturating_add(approx_document_bytes(&doc)))
+            })
+    }
+
+    fn live_upsert_locations<'a>(
+        snapshot: &'a NamespaceState,
+        id: &DocumentId,
+    ) -> impl DoubleEndedIterator<Item = &'a (SegmentId, u32)> {
+        snapshot
+            .id_index
+            .as_ref()
+            .unwrap()
+            .get(id)
+            .into_iter()
+            .flatten()
+            .filter(|(seg, seq)| {
+                !snapshot
+                    .tombstones
+                    .get(seg)
+                    .is_some_and(|ids| ids.contains(seq))
+            })
+    }
+
+    fn merge_replacement(
+        &self,
+        namespace: &NamespaceId,
+        snapshot: &NamespaceState,
+        doc: &mut Document,
+        latest: Option<&(SegmentId, u32)>,
+    ) -> Result<(), KoshaError> {
+        let buffered = snapshot
+            .buffer
+            .as_ref()
+            .and_then(|b| b.documents.iter().rev().find(|d| d.id == doc.id));
+        let fields = if let Some(buffered) = buffered {
+            buffered.fields.clone()
+        } else if let Some((seg, seq)) = latest {
+            let path = snapshot
+                .manifest
+                .segment_dir(&self.data_dir, namespace, seg);
+            let reader = kosha_segment::SegmentReader::open_with_options(path, false)?;
+            reader
+                .doc_record_full(*seq)?
+                .ok_or_else(|| KoshaError::NotFound("replacement document missing".into()))?
+                .fields
+        } else {
+            return Ok(());
+        };
+        doc.fields = merge_fields(fields, std::mem::take(&mut doc.fields));
+        Ok(())
+    }
+
     /// Mark prior copies deleted and write only the incoming documents. When `merge` is true, patch fields onto the latest existing
     /// copy (`/replace`); when false, the incoming document fully replaces it
     /// (`/index` upsert).
@@ -1249,52 +1321,14 @@ impl Indexer {
         let snapshot = handle.state.lock().unwrap().clone();
         before_io();
         fail::fail_point!("upsert.before_io");
-        let index = snapshot.id_index.as_ref().unwrap();
         let mut locations = Vec::new();
         let mut replacements = Vec::with_capacity(count);
         for mut doc in documents {
-            let live: Vec<_> = index
-                .get(&doc.id)
-                .into_iter()
-                .flatten()
-                .filter(|(seg, seq)| {
-                    !snapshot
-                        .tombstones
-                        .get(seg)
-                        .is_some_and(|ids| ids.contains(seq))
-                })
-                .cloned()
-                .collect();
+            let from = locations.len();
+            locations.extend(Self::live_upsert_locations(&snapshot, &doc.id).cloned());
             if merge {
-                let buffered = snapshot
-                    .buffer
-                    .as_ref()
-                    .and_then(|b| b.documents.iter().rev().find(|d| d.id == doc.id));
-                let fields = if let Some(buffered) = buffered {
-                    Some(buffered.fields.clone())
-                } else if let Some((seg, seq)) = live.last() {
-                    let reader = kosha_segment::SegmentReader::open_with_options(
-                        snapshot
-                            .manifest
-                            .segment_dir(&self.data_dir, &namespace, seg),
-                        false,
-                    )?;
-                    Some(
-                        reader
-                            .doc_record_full(*seq)?
-                            .ok_or_else(|| {
-                                KoshaError::NotFound("replacement document missing".into())
-                            })?
-                            .fields,
-                    )
-                } else {
-                    None
-                };
-                if let Some(fields) = fields {
-                    doc.fields = merge_fields(fields, doc.fields);
-                }
+                self.merge_replacement(&namespace, &snapshot, &mut doc, locations[from..].last())?;
             }
-            locations.extend(live);
             replacements.push(doc);
         }
         // WAL fsync and segment I/O happen with state unlocked. The operation
@@ -2943,6 +2977,13 @@ impl Indexer {
         Some(manifest)
     }
 
+    /// The committed version the writer's local manifest is based on.
+    pub fn published_version(&self, namespace: &NamespaceId) -> Option<u64> {
+        let handle = self.namespaces.lock().unwrap().get(namespace).cloned()?;
+        let state = handle.state.lock().unwrap();
+        state.known.then_some(state.published_version)
+    }
+
     /// Capture the CAS anchor and candidate under one namespace lock. The
     /// anchor advances only after a successful control-store commit.
     pub fn publication_snapshot(&self, namespace: &NamespaceId) -> Option<(u64, Manifest)> {
@@ -3006,6 +3047,33 @@ impl Indexer {
         flushing.chain(buffered).fold((0, 0), |(docs, bytes), doc| {
             (docs + 1, bytes + approx_document_bytes(doc))
         })
+    }
+
+    /// Approximate bytes not yet represented by a segment, including WAL
+    /// records awaiting replay after recovery.
+    pub fn pending_storage_bytes(&self, namespace: &NamespaceId) -> u64 {
+        let Some(handle) = self.namespaces.lock().unwrap().get(namespace).cloned() else {
+            return 0;
+        };
+        let state = handle.state.lock().unwrap();
+        state
+            .flushing_docs
+            .iter()
+            .flat_map(|chunk| chunk.iter())
+            .chain(
+                state
+                    .buffer
+                    .iter()
+                    .flat_map(|buffer| buffer.documents.iter()),
+            )
+            .chain(
+                state
+                    .recovered
+                    .iter()
+                    .flat_map(|(_, record)| record.documents.iter()),
+            )
+            .map(approx_document_bytes)
+            .fold(0, u64::saturating_add)
     }
 
     /// The namespace's unindexed tail (#255): every acknowledged write that
