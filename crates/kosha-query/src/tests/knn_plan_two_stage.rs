@@ -748,10 +748,10 @@ fn searches_are_identical_with_the_i8_stage_on_and_off() {
 // ── the plan at the 10M bench's size ──────────────────────────────────
 
 /// [`KnnPlanSource`] over centroids held in memory.
-struct MatrixSource<'a> {
-    matrix: &'a kosha_segment::KnnCentroidMatrix,
-    query: &'a [f32],
-    alpha: f32,
+pub(super) struct MatrixSource<'a> {
+    pub(super) matrix: &'a kosha_segment::KnnCentroidMatrix,
+    pub(super) query: &'a [f32],
+    pub(super) alpha: f32,
 }
 
 impl KnnPlanSource for MatrixSource<'_> {
@@ -769,6 +769,9 @@ impl KnnPlanSource for MatrixSource<'_> {
 
     fn score_bounds(&self) -> Option<KnnCentroidScoreBounds> {
         self.matrix.score_bounds(self.query, self.alpha)
+    }
+    fn score_floor(&self) -> Option<f32> {
+        self.matrix.score_floor(self.query, self.alpha)
     }
 }
 
