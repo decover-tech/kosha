@@ -4466,7 +4466,11 @@ impl Searcher {
         namespace: &NamespaceId,
         manifest: &Manifest,
     ) -> Option<Arc<NamespaceCentroidSnapshot>> {
-        let key = corpus_key(namespace, manifest);
+        let key @ (_, _, _, has_tail) = corpus_key(namespace, manifest);
+        // The published directory never contains transient tail segments.
+        if has_tail {
+            return None;
+        }
         let matches = |snapshot: &NamespaceCentroidSnapshot| {
             snapshot.matches(
                 manifest.version,
