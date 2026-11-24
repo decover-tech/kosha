@@ -407,10 +407,28 @@ fn main() {
         let mut r = Rng((cli.seed ^ salt).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
         (0..n).map(|_| (r.uniform() as f64) < s).collect()
     };
+    // A segment set built with `--max-docs` holds fewer documents than the
+    // embeddings: only indexed ones can pass, so the truth stays reachable.
+    let mut indexed = vec![false; n];
+    for seg in &segments {
+        seg.corpus_index.iter().for_each(|&i| indexed[i] = true);
+    }
+    let random_pass = |s: f64, salt: u64| -> Vec<bool> {
+        let mut pass = random_pass(s, salt);
+        pass.iter_mut().zip(&indexed).for_each(|(p, &x)| *p &= x);
+        pass
+    };
     let mask = |chosen: Vec<usize>| {
         let mut pass = vec![false; n];
         chosen.into_iter().for_each(|i| pass[i] = true);
         pass
+    };
+    let unindexed_low = |scores: &[f32]| -> Vec<f32> {
+        scores
+            .iter()
+            .zip(&indexed)
+            .map(|(&s, &x)| if x { s } else { f32::NEG_INFINITY })
+            .collect()
     };
 
     println!(
@@ -423,7 +441,7 @@ fn main() {
             let count = ((s * n as f64).round() as usize).max(1);
             let fixed = match filter.as_str() {
                 "random" => Some(random_pass(s, 0x51)),
-                "clustered" => Some(mask(top_n(&anchor_sims, count))),
+                "clustered" => Some(mask(top_n(&unindexed_low(&anchor_sims), count))),
                 "near" | "far" => None,
                 other => panic!("--filters: unknown filter {other:?}"),
             };
@@ -432,10 +450,10 @@ fn main() {
                 .iter()
                 .map(|qs| match (&fixed, filter.as_str()) {
                     (Some(p), _) => p.clone(),
-                    (None, "near") => mask(top_n(qs, count)),
+                    (None, "near") => mask(top_n(&unindexed_low(qs), count)),
                     _ => {
                         let neg: Vec<f32> = qs.iter().map(|x| -x).collect();
-                        mask(top_n(&neg, count))
+                        mask(top_n(&unindexed_low(&neg), count))
                     }
                 })
                 .collect();
