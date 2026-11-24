@@ -1,0 +1,54 @@
+# Multi-tenant SaaS cell (#359): one Kosha stack serving many tenants.
+#
+# A cell is k8s/base plus multi-tenant-safe defaults: tenant quotas and fair
+# admission, legacy unversioned routes off, TLS between pods required,
+# SSE-KMS with per-tenant keys, the S3 WAL, usage metering, billing, the
+# self-service console, the usage reconcile CronJob, and a wider query HPA.
+# Tenants are onboarded through the control-plane APIs (console sign-up or
+# /v1/admin/orgs), never by installing another stack. See
+# docs/deployment-model.md and k8s/README.md, "Multi-tenant SaaS cells".
+#
+# Install and upgrade a cell with scripts/kosha_cluster.py
+# (`install --overlay saas`, `upgrade`); it fills in the per-cell values that
+# are not committed here (S3 bucket/prefix, region, IRSA role, the console's
+# public URL, the default KMS key) and enforces the upgrade order.
+#
+# Prerequisites in namespace `kosha` (never committed):
+#   - Secret kosha-secret: database-url (sslmode=verify-full),
+#     bootstrap-api-key, internal-api-key, stripe-api-key; optional
+#     admin-api-key, stripe-webhook-secret, console-secret-key.
+#   - Secret kosha-internal-tls: tls.crt, tls.key, ca.crt
+#     (base/certificate-internal-tls.example.yaml).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: kosha
+
+resources:
+  - ../base
+
+components:
+  - ../components/internal-tls
+
+# Not hashed: pods re-read these files (KOSHA_TENANT_LIMITS_RELOAD_SECS,
+# KOSHA_BILLING_PLANS_WATCH), so an edit applies without rolling every pod.
+generatorOptions:
+  disableNameSuffixHash: true
+
+configMapGenerator:
+  - name: kosha-saas-plans
+    files:
+      - tenant-limits.json
+      - billing-plans.json
+
+patches:
+  - path: configmap-patch.yaml
+  - path: hpa-query-patch.yaml
+  - path: cronjob-usage-reconcile-patch.yaml
+  # Plans volume and the SaaS secrets, for all three Deployments.
+  - path: deployment-saas-patch.yaml
+    target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: kosha(-query|-indexer)?

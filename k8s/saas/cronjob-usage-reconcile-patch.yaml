@@ -1,0 +1,9 @@
+# Metering is on from a cell's first boot, so the reconcile runs from day
+# one (base ships it suspended). A failed Job is the alert.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: kosha-usage-reconcile
+  namespace: kosha
+spec:
+  suspend: false

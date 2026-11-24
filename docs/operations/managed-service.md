@@ -4,7 +4,8 @@ This is an operator-only starting point, not a customer SLA. It does not deploy 
 commercial entitlements, publish a status site, or assign people to on-call.
 
 Related operator docs: [high availability and Postgres failover](../high-availability.md) and
-[backups and point-in-time restore](backup-restore.md).
+[backups and point-in-time restore](backup-restore.md). The deployment model these assume is a
+shared multi-tenant cell ([deployment model](../deployment-model.md), `k8s/saas`).
 
 ## Draft search SLOs
 

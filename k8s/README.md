@@ -19,6 +19,10 @@ recovery drill, see [Backups and namespace point-in-time recovery](../docs/opera
                 transit"); not included by stage or prod
       stage/    floating `:main` image tag + larger memory for warm hydration
       prod/     versioned release image tag
+      saas/     multi-tenant SaaS cell: base + internal-tls + tenant quotas,
+                fair admission, /v1 only, SSE-KMS, S3 WAL, metering,
+                billing, console, usage reconcile (see "Multi-tenant SaaS
+                cells" and ../docs/deployment-model.md)
 
 ## Query/ingest split and request routing
 
@@ -345,10 +349,114 @@ of the three Deployments' images and readiness counts.
 **Install only.** The command refuses to run if any Kosha Deployment
 already exists, including after a partial install. Do not use it with
 storage from a previous installation, even on a new Kubernetes cluster:
-`--confirm-empty-storage` is your confirmation, not a storage check. For
-upgrades or rollbacks, follow the [manifest and WAL compatibility
-rules](../README.md#s3-wal-kosha_wal_modes3) in the main README before
-resuming writes; old binaries cannot read the new formats.
+`--confirm-empty-storage` is your confirmation, not a storage check. To move
+a running stack to a new release use `upgrade` (below); it follows the
+[manifest and WAL compatibility rules](../README.md#s3-wal-kosha_wal_modes3)
+in the main README. Old binaries cannot read the new formats, so it refuses
+rollbacks.
+
+### Multi-tenant SaaS cells
+
+Kosha's deployment model is multi-tenant SaaS
+([decision record](../docs/deployment-model.md)). A **cell** is one stack
+built from `k8s/saas`, shared by many organizations and tenants. Add capacity
+by scaling a cell or adding another cell, never by installing a stack per
+customer.
+
+**What the overlay sets.** `k8s/saas` is `base` plus
+`components/internal-tls` and:
+
+| Concern | Setting |
+| --- | --- |
+| Tenant quotas | `KOSHA_TENANT_LIMITS_FILE` = `tenant-limits.json` (ConfigMap `kosha-saas-plans`), default plan `saas-default` |
+| Fair admission | `KOSHA_SEARCH_QUEUE_DEPTH_PER_TENANT=8`, `KOSHA_ADMISSION_TENANT_SHARES=on` |
+| Public API | `KOSHA_LEGACY_ROUTES=off` (list holdouts in `KOSHA_LEGACY_ROUTES_TENANTS`) |
+| TLS between pods | `KOSHA_INTERNAL_TLS=required`, HTTPS probes and ingest forwarding |
+| Encryption at rest | `KOSHA_S3_SSE=aws:kms`, bucket keys on; per-tenant keys from `kosha.tenants.kms_key_id` (or `KOSHA_S3_TENANT_KMS_KEYS_FILE`) |
+| Durability | `KOSHA_WAL_MODE=s3` |
+| Metering and billing | `KOSHA_USAGE_METERING`, `KOSHA_BILLING` (Stripe), `KOSHA_BILLING_SCHEDULER`; catalog `billing-plans.json`; `kosha-usage-reconcile` CronJob unsuspended |
+| Console | `KOSHA_CONSOLE=on`, `KOSHA_SIGNUP=off` until a mailer (`KOSHA_MAILER=smtp`) and paid plans exist |
+| Roles and HA | ingest (1, `Recreate`), query (3 to 12 via HPA, zone spread, PDB `minAvailable: 2`), indexer (1) |
+
+`billing-plans.json` ships empty and the `saas-default` limits are
+conservative guardrails: both wait on the pricing hypothesis (TODO in the
+decision record). Edit them in place; pods reload both files without a
+restart.
+
+**Before installing**, in addition to the [fresh-install
+prerequisites](#fresh-install-on-an-existing-cluster):
+
+- `kosha-secret` must hold `database-url` (with `sslmode=verify-full`,
+  see "Encryption in transit" above), `bootstrap-api-key`, `internal-api-key` and
+  `stripe-api-key`. Optional: `admin-api-key` (operator onboarding),
+  `stripe-webhook-secret`, `console-secret-key` (organization OIDC secrets).
+- `kosha-internal-tls` must hold `tls.crt`, `tls.key` and `ca.crt`
+  (`base/certificate-internal-tls.example.yaml`).
+- The IRSA role needs `kms:GenerateDataKey` and `kms:Decrypt` on the default
+  key and every per-tenant key.
+
+The installer checks the Secret key names (never their values) before
+creating anything.
+
+```sh
+python3 scripts/kosha_cluster.py --context saas-cell-1 install --overlay saas \
+  --image "ravidecoverai/kosha:${KOSHA_RELEASE_TAG}" \
+  --s3-bucket example-kosha-cell-1 --s3-prefix segments/ --aws-region us-east-1 \
+  --irsa-role-arn arn:aws:iam::123456789012:role/kosha \
+  --console-public-url https://console.example.com \
+  --kms-key-id alias/kosha-cell-1 \
+  --confirm-empty-storage
+```
+
+**Onboarding a tenant** goes through the cell's control plane, never a new
+cluster: self-service through the console once sign-up is open, or an
+operator calls `POST /v1/admin/orgs`, then `.../projects`, `.../tenants` and
+`.../tenants/{tenant}/api-keys` ([organizations](../docs/organizations.md)).
+Plans and per-tenant KMS keys are set on the tenant through the same APIs.
+
+**Upgrading a cell.** `upgrade` moves every role to one release:
+
+```sh
+python3 scripts/kosha_cluster.py --context saas-cell-1 upgrade \
+  --image "ravidecoverai/kosha:${KOSHA_RELEASE_TAG}" --dry-run   # print the plan
+python3 scripts/kosha_cluster.py --context saas-cell-1 upgrade \
+  --image "ravidecoverai/kosha:${KOSHA_RELEASE_TAG}"
+```
+
+It enforces the [manifest/WAL rules](../README.md#s3-wal-kosha_wal_modes3):
+
+- It refuses a lower release tag than the running one (old readers cannot
+  read the manifest object or v2/v3 WAL frames). Digests and non-semver tags
+  need `--confirm-forward-only`.
+- It refuses unless every role runs the same image and is fully ready, and
+  ingest runs one replica with `Recreate` (one WAL writer).
+- It refuses a local WAL (`KOSHA_WAL_MODE` not `s3`) unless
+  `--allow-local-wal` confirms the ingest pod keeps its node and WAL directory.
+- Order: stop the indexer (it also writes manifests), roll query, then
+  ingest, then restart the indexer on the new image and move CronJobs on the
+  old image. Readers are always at least as new as the writer.
+- A failed query rollout is undone (nothing has written new formats yet). A
+  failed ingest rollout is not rolled back: fix forward and rerun `upgrade`,
+  which resumes from where it stopped.
+
+Changing a segment format setting (`KOSHA_POSTINGS_WRITE_VERSION`,
+`KOSHA_VECTOR_QUANTIZATION`, ...) is a separate step after the upgrade: see
+the rollout and rollback gates in [configuration](../docs/configuration.md).
+
+**Fleet health.** `status` is read-only and takes one `--context` per cell:
+
+```sh
+python3 scripts/kosha_cluster.py --context saas-cell-1 --context saas-cell-2 status
+python3 scripts/kosha_cluster.py --context saas-cell-1 status --json
+```
+
+Per cell it reports each role's image and ready/desired replicas, CronJob
+suspension and last success, HPA and PDB state, and problems (a role not
+ready, roles on different images, an unreachable cluster). It exits 1 if any
+cell is unhealthy, so it can gate a fleet-wide rollout.
+
+BYOC and dedicated clusters are deferred: there is no Terraform for customer
+cloud accounts. See the decision record for how they stay possible.
 
 ### Stage and production workflows
 
@@ -604,6 +712,7 @@ one-off pod with the server's configuration:
 ## Local verification
 
     kustomize build k8s/stage
+    kustomize build k8s/saas
     kubectl apply --dry-run=client -k k8s/stage
     # with real cluster credentials:
     kubectl apply --dry-run=server -k k8s/stage

@@ -1,0 +1,50 @@
+# The plans files and the SaaS secrets for ingest, query and indexer. Every
+# pod validates billing and console settings at startup, so all three get
+# the same values.
+- op: add
+  path: /spec/template/spec/volumes/-
+  value:
+    name: saas-plans
+    configMap:
+      name: kosha-saas-plans
+- op: add
+  path: /spec/template/spec/containers/0/volumeMounts/-
+  value:
+    name: saas-plans
+    mountPath: /etc/kosha/plans
+    readOnly: true
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: KOSHA_STRIPE_API_KEY
+    valueFrom:
+      secretKeyRef:
+        name: kosha-secret
+        key: stripe-api-key
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: KOSHA_STRIPE_WEBHOOK_SECRET
+    valueFrom:
+      secretKeyRef:
+        name: kosha-secret
+        key: stripe-webhook-secret
+        optional: true
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: KOSHA_CONSOLE_SECRET_KEY
+    valueFrom:
+      secretKeyRef:
+        name: kosha-secret
+        key: console-secret-key
+        optional: true
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: KOSHA_ADMIN_API_KEY
+    valueFrom:
+      secretKeyRef:
+        name: kosha-secret
+        key: admin-api-key
+        optional: true

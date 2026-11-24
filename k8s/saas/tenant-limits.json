@@ -1,0 +1,17 @@
+{
+  "default_plan": "saas-default",
+  "plans": {
+    "saas-default": {
+      "qps": 50,
+      "concurrent_queries": 8,
+      "write_docs_per_sec": 2000,
+      "write_bytes_per_sec": 16777216,
+      "namespaces": 100,
+      "docs_per_namespace": 10000000,
+      "bytes_per_namespace": 10737418240,
+      "vector_dims": 4096,
+      "max_body_bytes": 33554432
+    }
+  },
+  "tenants": {}
+}
