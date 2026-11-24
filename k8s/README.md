@@ -55,6 +55,13 @@ ConfigMap). The role is validated at startup (#254): `query` requires
   kosha` returning real numbers, not `FailedGetResourceMetric`) or the HPA
   is a no-op.
 
+  The deployment and HPA start at three replicas. Zone spread requires
+  eligible worker capacity across three AZs to place one replica in each;
+  hostname anti-affinity prefers distinct nodes. The PDB keeps two query
+  replicas available during voluntary evictions. See the
+  [HA deployment and failover runbook](../docs/high-availability.md)
+  before rolling this out or changing the ingest replica count.
+
 **Clients only ever need `kosha-service`** — for both reads and writes,
 exactly like a single OpenSearch cluster endpoint. `kosha-service` selects
 `role: query`; a query pod handles reads itself and *transparently forwards*
