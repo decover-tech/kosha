@@ -200,8 +200,9 @@ the bound covers only the suite namespace), runs the workload unmeasured
 for `fill` seconds, and measures only the no-result-cache phase,
 `repeats` times (`warm_or_nocache_rN` / `knn_warm_nocache_rN`).
 S3 misses are part of the measured latency by design. It writes
-`footprint.tsv` (local bytes every 60 s) and `evictions.tsv` (files and
-MB the server evicted per stage, from its `disk cache evicted` lines).
+`footprint.tsv` (local bytes every 60 s), `phase_footprint.tsv` (start
+and end samples for each measured repeat), and `evictions.tsv` (files and MB
+the server evicted per stage).
 
 ### Disk-cache experiment input (research #389): `cache_experiment`
 
@@ -225,7 +226,22 @@ every file once on every path, which is what `KOSHA_CACHE_ACCOUNTING=exact`
 used to provide. A legacy control and a policy arm get the same effective
 capacity without it.
 
-Compare arms with `cache_sim.py p99ci --a <control raw-out files> --b <arm
+For each timed run, download the `bench-results` artifact and report the arm:
+
+```sh
+python3 scripts/bench/cache_sim/cache_sim.py arm --run-dir results > arm.json
+```
+
+The JSON includes per-repeat results and pooled latency percentiles, S3 work
+per submitted query, and estimated local GiB-hours and cost. Local occupancy
+is integrated between samples during measured repeats only; warm fill and
+the gaps between repeats are excluded. This prices occupied bytes, not the
+entire provisioned volume. Use the same deployment prices for all arms;
+`arm --help` lists the overrides. Check HTTP errors and degraded kNN
+requests before treating an arm as comparable. GETs are estimates from logged
+searches; failed requests may do work that the timing lines do not capture.
+
+Compare tails with `cache_sim.py p99ci --a <control raw-out files> --b <arm
 raw-out files>` (bootstrap CIs for p50/p99 and their difference).
 
 ### What each hit returns (`return_fields`: `ids` (default) or `all`)

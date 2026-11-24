@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cache_sim as cs  # noqa: E402
@@ -288,6 +289,74 @@ class P99CiTests(unittest.TestCase):
         lo, hi = out["p99"]["a_ci"]
         self.assertLessEqual(lo, out["p99"]["a"])
         self.assertGreaterEqual(hi, out["p99"]["a"])
+
+
+class ArmTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    def make_arm(self, suite):
+        (self.root / "meta.json").write_text(json.dumps({
+            "suite": suite, "warm_gate": "timed", "phase_repeats": "2", "cache_policy": "sieve",
+        }))
+        out = self.root / suite
+        (out / "server").mkdir(parents=True)
+        gib = 1 << 30
+        prefix = "warm_or_nocache" if suite == "bm25" else "knn_warm_nocache"
+        labels = [f"{prefix}_r{i}" for i in (1, 2)]
+        (out / "phase_footprint.tsv").write_text(
+            "phase\tstart_s\tstart_bytes\tend_s\tend_bytes\n"
+            f"{labels[0]}\t100\t{gib}\t200\t{gib}\n"
+            f"{labels[1]}\t300\t{2 * gib}\t400\t{4 * gib}\n"
+        )
+        # Warm fill, exact boundary duplicates and the gap are all excluded.
+        (out / "footprint.tsv").write_text(
+            f"50\t{100 * gib}\n100\t{100 * gib}\n150\t{3 * gib}\n250\t{100 * gib}\n"
+        )
+        for i, label in enumerate(labels):
+            (out / f"{label}.json").write_text(json.dumps({
+                "requests": 3, "successes": 2, "errors": 1,
+                "knn_degraded_requests": i if suite == "vector" else 0,
+            }))
+            with gzip.open(out / f"{label}.requests.jsonl.gz", "wt") as f:
+                for rec in ({"latency_ms": 1 + 2 * i}, {"latency_ms": 2 + 2 * i}, {"error": "timeout"}):
+                    f.write(json.dumps(rec) + "\n")
+            with gzip.open(out / "server" / f"{label}.log.gz", "wt") as f:
+                f.write(("search timing: hydrate_files=1 page_gets=1 page_whole_files=0 "
+                         "postings_gets=0 vector_gets=0 vector_whole_files=0 s3_bytes=4096\n") * 2)
+        return out, labels
+
+    def test_measured_cost_and_pooled_latency(self):
+        self.make_arm("bm25")
+        c = cs.Costs(get_per_1k=1, nvme_gb_month=0.73)
+        totals = cs.run_arm(self.root, c)["totals"]
+        self.assertEqual(totals["requests"], 6)
+        self.assertEqual(totals["errors"], 2)
+        self.assertEqual(totals["s3_gets"], 8)
+        self.assertAlmostEqual(totals["s3_bytes_per_query"], 4 * 4096 / 6)
+        self.assertEqual(totals["duration_s"], 200)
+        self.assertAlmostEqual(totals["local_gib_hours"], 500 / 3600)
+        self.assertAlmostEqual(totals["mean_local_bytes"], 2.5 * (1 << 30))
+        self.assertEqual(totals["end_local_bytes"], 4 << 30)
+        self.assertAlmostEqual(totals["p99_ms"], 3.97)
+        self.assertAlmostEqual(totals["dollars_per_1k_queries"], (0.008 + 0.001 * 500 / 3600) * 1000 / 6)
+
+    def test_vector_arm_surfaces_degradation_and_rejects_missing_logs(self):
+        out, labels = self.make_arm("vector")
+        self.assertEqual(cs.run_arm(self.root, cs.Costs())["totals"]["knn_degraded_requests"], 1)
+        with gzip.open(out / "server" / f"{labels[0]}.log.gz", "wt") as f:
+            f.write("no search timings\n")
+        with self.assertRaisesRegex(ValueError, "expected 2 to 3 server search timings, got 0"):
+            cs.run_arm(self.root, cs.Costs())
+
+    def test_rejects_incomplete_repeats(self):
+        out, _ = self.make_arm("bm25")
+        windows = out / "phase_footprint.tsv"
+        windows.write_text("\n".join(windows.read_text().splitlines()[:-1]) + "\n")
+        with self.assertRaisesRegex(ValueError, "expected measured repeats"):
+            cs.run_arm(self.root, cs.Costs())
 
 
 if __name__ == "__main__":
