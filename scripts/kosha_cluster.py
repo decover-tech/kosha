@@ -196,11 +196,21 @@ def is_ready(deployment: dict) -> bool:
     )
 
 
+def image_repo(image: str) -> str:
+    """The image without its tag or digest."""
+    name = image.split("@", 1)[0]
+    head, _, tail = name.rpartition("/")
+    return f"{head}/{tail.split(':', 1)[0]}" if head else tail.split(":", 1)[0]
+
+
 def plan_upgrade(deployments: dict[str, dict], target: str, wal_mode: str,
-                 args: argparse.Namespace) -> tuple[str, list[str]]:
-    """Validate the stack and return (current image, roles still to upgrade).
+                 args: argparse.Namespace) -> list[str]:
+    """Validate the stack and return the roles whose image is not yet ``target``.
 
     Raises ValueError for any state the README compatibility rules forbid.
+    Resumable states: along ROLLOUT_ORDER, images form contiguous groups that
+    never get newer (readers at least as new as the writer), for example a
+    finished query rollout, or a failed ingest release being fixed forward.
     """
     missing = [name for name in ROLLOUT_ORDER if name not in deployments]
     if missing:
@@ -210,29 +220,34 @@ def plan_upgrade(deployments: dict[str, dict], target: str, wal_mode: str,
     while done < len(images) and images[done] == target:
         done += 1
     rest = images[done:]
-    if not rest:
-        return target, []
-    if len(set(rest)) != 1 or target in rest:
-        found = ", ".join(f"{ROLE[n]}={i}" for n, i in zip(ROLLOUT_ORDER, images))
-        raise ValueError(
-            f"roles run mixed images ({found}) that are not a resumable upgrade "
-            f"to {target}. Bring every role to one release first. " + UPGRADE_NOTE
-        )
-    current = rest[0]
-    old, new = release_version(current), release_version(target)
-    if old and new:
-        if new < old:
+    found = ", ".join(f"{ROLE[n]}={i}" for n, i in zip(ROLLOUT_ORDER, images))
+    mixed = ValueError(
+        f"roles run mixed images ({found}) that are not a resumable upgrade "
+        f"to {target}. Bring every role to one release first. " + UPGRADE_NOTE
+    )
+    if target in rest or len(set(images)) != sum(
+        1 for i, image in enumerate(images) if i == 0 or images[i - 1] != image
+    ):
+        raise mixed
+    versions = [release_version(image) for image in rest]
+    if len(set(rest)) > 1 and (
+        None in versions or any(a < b for a, b in zip(versions, versions[1:]))
+    ):
+        raise mixed
+    new = release_version(target)
+    if rest and new and None not in versions:
+        if any(new < old for old in versions):
             raise ValueError(
-                f"refusing to roll back from {current} to {target}: older readers "
+                f"refusing to roll back to {target} (running {found}): older readers "
                 "cannot read the new manifest object or v2/v3 WAL frames, and "
                 "rolling back requires converting both formats. " + UPGRADE_NOTE
             )
-    elif not args.confirm_forward_only:
+    elif rest and not args.confirm_forward_only:
         raise ValueError(
-            f"cannot order {current} and {target} by release tag. Pass "
+            f"cannot order {found} and {target} by release tag. Pass "
             "--confirm-forward-only after checking the target is not older."
         )
-    if wal_mode.strip().lower() != "s3" and not args.allow_local_wal:
+    if rest and wal_mode.strip().lower() != "s3" and not args.allow_local_wal:
         raise ValueError(
             "KOSHA_WAL_MODE is not s3: the ingest WAL lives on the node's disk and "
             "must be preserved across the restart. Pass --allow-local-wal only if "
@@ -244,15 +259,32 @@ def plan_upgrade(deployments: dict[str, dict], target: str, wal_mode: str,
             "deployment/kosha must run one replica with strategy Recreate: two "
             "ingest pods must never write the same WAL. " + UPGRADE_NOTE
         )
-    for name in ROLLOUT_ORDER[done:]:
+    # Query must be fully rolled out (no old reader pods left) before ingest
+    # changes, including when its new image was set by an interrupted run.
+    # Ingest may be down only on a failed newer release being fixed forward.
+    oldest = images[-1]
+    for name, image in zip(ROLLOUT_ORDER, images):
         if name == "kosha-indexer" and deployments[name]["spec"].get("replicas", 1) == 0:
+            continue
+        if name == "kosha" and image not in (oldest, target) and name in ROLLOUT_ORDER[done:]:
             continue
         if not is_ready(deployments[name]):
             raise ValueError(
                 f"deployment/{name} is not fully rolled out and ready; "
-                "fix it before upgrading."
+                "wait for or fix it before upgrading."
             )
-    return current, list(ROLLOUT_ORDER[done:])
+    return list(ROLLOUT_ORDER[done:])
+
+
+def stale_cronjobs(jobs: dict, target: str) -> list[tuple[str, str]]:
+    """(cronjob, container) pairs running another tag of the target image."""
+    repo = image_repo(target)
+    return [
+        (job["metadata"]["name"], box["name"])
+        for job in jobs.get("items", [])
+        for box in job["spec"]["jobTemplate"]["spec"]["template"]["spec"].get("containers", [])
+        if image_repo(box.get("image", "")) == repo and box.get("image") != target
+    ]
 
 
 def upgrade(kubectl: list[str], args: argparse.Namespace) -> None:
@@ -262,15 +294,24 @@ def upgrade(kubectl: list[str], args: argparse.Namespace) -> None:
     wal_mode = read(
         kubectl, "get", "configmap/kosha-config", "-o", "jsonpath={.data.KOSHA_WAL_MODE}",
     )
-    current, pending = plan_upgrade(deployments, target, wal_mode, args)
-    if not pending:
+    pending = plan_upgrade(deployments, target, wal_mode, args)
+    jobs = stale_cronjobs(json.loads(read(kubectl, "get", "cronjob", "-o", "json")), target)
+    indexer = deployments["kosha-indexer"]
+    stopped = indexer["spec"].get("replicas", 1) == 0
+    replicas = indexer["spec"].get("replicas", 1) or args.indexer_replicas
+    if not pending and not stopped and not jobs:
         print(f"all roles already run {target}")
         return
-    indexer = deployments["kosha-indexer"]
-    replicas = indexer["spec"].get("replicas", 1) or args.indexer_replicas
-    steps = [f"scale indexer to 0 (back to {replicas} after the upgrade)"]
-    steps += [f"{ROLE[name]}: {current} -> {target}" for name in pending]
-    steps.append(f"CronJobs still on {current} -> {target}")
+    steps = []
+    if pending:
+        steps.append(f"scale indexer to 0 (back to {replicas} after the upgrade)")
+        steps += [
+            f"{ROLE[name]}: {container(deployments[name])['image']} -> {target}"
+            for name in pending
+        ]
+    elif stopped:
+        steps.append(f"scale indexer back to {replicas}")
+    steps += [f"cronjob/{job} {box} -> {target}" for job, box in jobs]
     print("upgrade plan:\n  " + "\n  ".join(steps))
     if args.dry_run:
         return
@@ -292,8 +333,9 @@ def upgrade(kubectl: list[str], args: argparse.Namespace) -> None:
             *kubectl, "scale", "deployment/kosha-indexer", f"--replicas={count}",
         ], check=True)
 
-    scale_indexer(0)
-    rollout("kosha-indexer")
+    if pending:
+        scale_indexer(0)
+        rollout("kosha-indexer")
     if "kosha-query" in pending:
         set_image("kosha-query")
         try:
@@ -314,21 +356,16 @@ def upgrade(kubectl: list[str], args: argparse.Namespace) -> None:
             raise ValueError(
                 "ingest rollout failed. Do not roll back query or ingest: the new "
                 "ingest may already have written the new manifest/WAL formats. "
-                "Fix forward and rerun upgrade; the indexer stays at 0 replicas. "
-                + UPGRADE_NOTE
+                "Fix forward: rerun upgrade with this or a newer fixed release; "
+                "the indexer stays at 0 replicas until then. " + UPGRADE_NOTE
             ) from None
-    set_image("kosha-indexer")
-    scale_indexer(replicas)
-    rollout("kosha-indexer")
-    jobs = json.loads(read(kubectl, "get", "cronjob", "-o", "json"))
-    for job in jobs.get("items", []):
-        template = job["spec"]["jobTemplate"]["spec"]["template"]["spec"]
-        for box in template.get("containers", []):
-            if box.get("image") == current:
-                subprocess.run([
-                    *kubectl, "set", "image", f"cronjob/{job['metadata']['name']}",
-                    f"{box['name']}={target}",
-                ], check=True)
+    if "kosha-indexer" in pending:
+        set_image("kosha-indexer")
+    if pending or stopped:
+        scale_indexer(replicas)
+        rollout("kosha-indexer")
+    for job, box in jobs:
+        subprocess.run([*kubectl, "set", "image", f"cronjob/{job}", f"{box}={target}"], check=True)
     print(f"upgraded to {target}")
 
 

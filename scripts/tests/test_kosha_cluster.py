@@ -233,11 +233,12 @@ def deployment(name, image, replicas=1, ready=True, strategy="RollingUpdate"):
     }
 
 
-def stack(query=OLD, ingest=OLD, indexer=OLD, indexer_replicas=1, **ingest_kw):
+def stack(query=OLD, ingest=OLD, indexer=OLD, indexer_replicas=1, query_ready=True,
+          **ingest_kw):
     ingest_kw.setdefault("strategy", "Recreate")
     return json.dumps({"items": [
         deployment("kosha", ingest, **ingest_kw),
-        deployment("kosha-query", query, replicas=3),
+        deployment("kosha-query", query, replicas=3, ready=query_ready),
         deployment("kosha-indexer", indexer, replicas=indexer_replicas, strategy="Recreate"),
     ]})
 
@@ -274,12 +275,12 @@ def test_upgrade_rolls_readers_before_writer_with_indexer_stopped(kubectl):
     prime(responses)
     assert invoke("upgrade", "--image", NEW) == 0
     assert calls == [
-        UP_LOOKUP, WAL,
+        UP_LOOKUP, WAL, CRONJOBS,
         scale(0), rollout("kosha-indexer"),
         set_image("kosha-query"), rollout("kosha-query"),
         set_image("kosha"), rollout("kosha"),
         set_image("kosha-indexer"), scale(1), rollout("kosha-indexer"),
-        CRONJOBS, ["set", "image", "cronjob/kosha-usage-reconcile", f"reconcile={NEW}"],
+        ["set", "image", "cronjob/kosha-usage-reconcile", f"reconcile={NEW}"],
     ]
 
 
@@ -287,7 +288,7 @@ def test_upgrade_dry_run_changes_nothing(kubectl, capsys):
     invoke, calls, responses, _ = kubectl
     prime(responses)
     assert invoke("upgrade", "--image", NEW, "--dry-run") == 0
-    assert calls == [UP_LOOKUP, WAL]
+    assert calls == [UP_LOOKUP, WAL, CRONJOBS]
     assert "query: " in capsys.readouterr().out
 
 
@@ -296,7 +297,7 @@ def test_upgrade_resumes_after_query_was_upgraded(kubectl):
     prime(responses, query=NEW, indexer_replicas=0)
     assert invoke("upgrade", "--image", NEW) == 0
     assert set_image("kosha-query") not in calls
-    assert calls[2:8] == [
+    assert calls[3:9] == [
         scale(0), rollout("kosha-indexer"), set_image("kosha"), rollout("kosha"),
         set_image("kosha-indexer"), scale(1),
     ]
@@ -305,8 +306,9 @@ def test_upgrade_resumes_after_query_was_upgraded(kubectl):
 def test_upgrade_noop_when_current(kubectl, capsys):
     invoke, calls, responses, _ = kubectl
     prime(responses, query=NEW, ingest=NEW, indexer=NEW)
+    responses[tuple(CRONJOBS)] = cronjobs(NEW)
     assert invoke("upgrade", "--image", NEW) == 0
-    assert calls == [UP_LOOKUP, WAL]
+    assert calls == [UP_LOOKUP, WAL, CRONJOBS]
     assert "already run" in capsys.readouterr().out
 
 
@@ -361,6 +363,41 @@ def test_failed_ingest_rollout_is_not_rolled_back(kubectl, capsys):
     assert calls[-1] == rollout("kosha")
     assert not any(call[:2] == ["rollout", "undo"] for call in calls)
     assert "Do not roll back" in capsys.readouterr().err
+
+
+def test_upgrade_resume_waits_for_query_rollout(kubectl, capsys):
+    invoke, calls, responses, _ = kubectl
+    prime(responses, query=NEW, query_ready=False)
+    assert invoke("upgrade", "--image", NEW) == 1
+    assert calls == [UP_LOOKUP, WAL]
+    assert "kosha-query is not fully rolled out" in capsys.readouterr().err
+
+
+def test_upgrade_retry_restores_indexer_and_cronjobs(kubectl):
+    invoke, calls, responses, _ = kubectl
+    prime(responses, query=NEW, ingest=NEW, indexer=NEW, indexer_replicas=0)
+    assert invoke("upgrade", "--image", NEW) == 0
+    assert calls[3:] == [
+        scale(1), rollout("kosha-indexer"),
+        ["set", "image", "cronjob/kosha-usage-reconcile", f"reconcile={NEW}"],
+    ]
+
+
+def test_upgrade_fixes_forward_past_a_failed_ingest_release(kubectl):
+    invoke, calls, responses, _ = kubectl
+    fixed = "registry.example:5000/kosha:1.3.1"
+    prime(responses, query=NEW, ingest=NEW, ready=False, indexer_replicas=0)
+    assert invoke("upgrade", "--image", fixed) == 0
+    assert set_image("kosha-query", fixed) in calls
+    assert set_image("kosha", fixed) in calls
+    assert set_image("kosha-indexer", fixed) in calls
+
+
+def test_upgrade_refuses_reader_older_than_writer(kubectl, capsys):
+    invoke, _, responses, _ = kubectl
+    prime(responses, query=OLD, ingest=NEW, indexer="registry.example:5000/kosha:1.0.0")
+    assert invoke("upgrade", "--image", "registry.example:5000/kosha:1.4.0") == 1
+    assert "mixed images" in capsys.readouterr().err
 
 
 def test_upgrade_takes_one_context(monkeypatch, capsys):

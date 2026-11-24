@@ -387,7 +387,9 @@ restart.
 prerequisites](#fresh-install-on-an-existing-cluster):
 
 - `kosha-secret` must hold `database-url` (with `sslmode=verify-full`,
-  see "Encryption in transit" above), `bootstrap-api-key`, `internal-api-key` and
+  see "Encryption in transit" above; put its CA in ConfigMap `kosha-pg-ca`,
+  key `ca.crt`, which the overlay mounts at `/etc/kosha/pg` in the
+  Deployments and the reconcile CronJob), `bootstrap-api-key`, `internal-api-key` and
   `stripe-api-key`. Optional: `admin-api-key` (operator onboarding),
   `stripe-webhook-secret`, `console-secret-key` (organization OIDC secrets).
 - `kosha-internal-tls` must hold `tls.crt`, `tls.key` and `ca.crt`
@@ -428,16 +430,19 @@ It enforces the [manifest/WAL rules](../README.md#s3-wal-kosha_wal_modes3):
 - It refuses a lower release tag than the running one (old readers cannot
   read the manifest object or v2/v3 WAL frames). Digests and non-semver tags
   need `--confirm-forward-only`.
-- It refuses unless every role runs the same image and is fully ready, and
-  ingest runs one replica with `Recreate` (one WAL writer).
+- It refuses mixed images unless they are a resumable state with readers at
+  least as new as the writer (an interrupted run, or a failed ingest release
+  being fixed forward), refuses a query tier that is not fully rolled out,
+  and requires ingest to run one replica with `Recreate` (one WAL writer).
 - It refuses a local WAL (`KOSHA_WAL_MODE` not `s3`) unless
   `--allow-local-wal` confirms the ingest pod keeps its node and WAL directory.
 - Order: stop the indexer (it also writes manifests), roll query, then
   ingest, then restart the indexer on the new image and move CronJobs on the
   old image. Readers are always at least as new as the writer.
 - A failed query rollout is undone (nothing has written new formats yet). A
-  failed ingest rollout is not rolled back: fix forward and rerun `upgrade`,
-  which resumes from where it stopped.
+  failed ingest rollout is not rolled back: fix forward by rerunning
+  `upgrade` with the same or a newer fixed release. A rerun also restores a
+  stopped indexer and CronJobs left on another tag.
 
 Changing a segment format setting (`KOSHA_POSTINGS_WRITE_VERSION`,
 `KOSHA_VECTOR_QUANTIZATION`, ...) is a separate step after the upgrade: see
