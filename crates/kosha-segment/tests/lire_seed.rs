@@ -134,12 +134,19 @@ fn centroids(dir: &Path) -> Vec<Vec<f32>> {
 fn layout_lists_every_posting_member_once() {
     let dir = temp_dir("layout");
     let n = 2_000u32;
-    write(&dir, 0..n as u64, VectorQuantization::F32, Vec::new());
+    let builds = write(&dir, 0..n as u64, VectorQuantization::F32, Vec::new());
     assert_eq!(layout_doc_seqs(&dir), (0..n).collect::<Vec<_>>());
     let reader = SegmentReader::open(dir.clone()).unwrap();
     let layout = reader.vector_posting_layout("emb").unwrap().unwrap();
     assert_eq!(layout.dim, DIM);
     assert_eq!(layout.version, RADIUS_AWARE_VECTOR_INDEX_VERSION);
+    let sum_squared: usize = layout
+        .postings
+        .iter()
+        .map(|p| p.doc_seqs.len().pow(2))
+        .sum();
+    let expected = layout.postings.len() as f64 * sum_squared as f64 / f64::from(n).powi(2);
+    assert_eq!(builds[0].imbalance_factor, expected);
     assert!(reader.vector_posting_layout("missing").unwrap().is_none());
 
     // Without the sidecar the column is served by exact scan: no layout.

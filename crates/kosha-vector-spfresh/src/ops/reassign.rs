@@ -12,7 +12,7 @@ use std::collections::HashSet;
 
 use crate::centroid_probe::nearest_active_postings;
 use crate::ops::split::split_posting;
-use crate::point::cosine_distance;
+use crate::point::{cosine_distance, dot, elkan_cutoff};
 use crate::posting::PostingId;
 use crate::ClusterIndex;
 
@@ -43,6 +43,11 @@ pub(crate) fn run_reassign(
         .collect();
     let neighbors = nearest_active_postings(&index.postings, &touched_centroids, touched, radius);
 
+    // The scope any candidate is allowed to move within. Re-verifying
+    // within this scope, never a full index scan, keeps reassignment local.
+    let mut scope: Vec<PostingId> = touched.to_vec();
+    scope.extend(neighbors.iter().copied());
+
     // --- Gather candidates (read-only pass over the pre-move state) ---
     let mut candidates: Vec<(PostingId, u32)> = Vec::new();
 
@@ -51,12 +56,16 @@ pub(crate) fn run_reassign(
     // posting might now be strictly closer than either.
     for &pid in touched {
         let posting = index.postings[pid].as_ref().unwrap();
+        let cutoff = reassign_cutoff(index, pid, &scope);
         for e in posting.live_entries() {
+            let d_self = cosine_distance(&posting.centroid, &e.vector);
+            if d_self < cutoff && dot(&e.vector, &e.vector).is_normal() {
+                continue;
+            }
             let d_old = old_centroids
                 .iter()
                 .map(|c| cosine_distance(c, &e.vector))
                 .fold(f32::INFINITY, f32::min);
-            let d_self = cosine_distance(&posting.centroid, &e.vector);
             if d_old <= d_self {
                 candidates.push((pid, e.id));
             }
@@ -67,24 +76,23 @@ pub(crate) fn run_reassign(
     // whom a new/touched centroid is now closer than their own posting's.
     for &pid in &neighbors {
         let posting = index.postings[pid].as_ref().unwrap();
+        // If no touched centroid can win, Condition 2 cannot nominate
+        // this entry, regardless of the other neighbours in the scope.
+        let cutoff = reassign_cutoff(index, pid, touched);
         for e in posting.live_entries() {
+            let d_self = cosine_distance(&posting.centroid, &e.vector);
+            if d_self < cutoff && dot(&e.vector, &e.vector).is_normal() {
+                continue;
+            }
             let d_touched = touched_centroids
                 .iter()
                 .map(|c| cosine_distance(c, &e.vector))
                 .fold(f32::INFINITY, f32::min);
-            let d_self = cosine_distance(&posting.centroid, &e.vector);
             if d_touched <= d_self {
                 candidates.push((pid, e.id));
             }
         }
     }
-
-    // The scope any candidate is allowed to move within: touched + the
-    // neighbors we already bounded above. Re-verifying against only this
-    // scope (never a full index scan) is what keeps a reassign event O(R),
-    // not O(active_postings).
-    let mut scope: Vec<PostingId> = touched.to_vec();
-    scope.extend(neighbors.iter().copied());
 
     // --- Re-verify + move ---
     let mut grown: HashSet<PostingId> = HashSet::new();
@@ -179,6 +187,62 @@ pub(crate) fn run_reassign(
             if oversized {
                 let _ = split_posting(index, pid, depth + 1);
             }
+        }
+    }
+}
+
+fn reassign_cutoff(index: &ClusterIndex, pid: PostingId, others: &[PostingId]) -> f32 {
+    if !index.config.enable_elkan_pruning {
+        return 0.0;
+    }
+    let own = &index.postings[pid].as_ref().unwrap().centroid;
+    if !dot(own, own).is_normal() {
+        return 0.0;
+    }
+    let mut nearest = 2.0f32;
+    for &q in others {
+        if q != pid {
+            let other = &index.postings[q].as_ref().unwrap().centroid;
+            if !dot(other, other).is_normal() {
+                return 0.0;
+            }
+            nearest = nearest.min(cosine_distance(own, other));
+        }
+    }
+    elkan_cutoff(nearest, index.config.dim)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ClusterIndexConfig, PostingSnapshot};
+
+    #[test]
+    fn elkan_preserves_touched_and_neighbour_moves() {
+        let fixture = || {
+            vec![
+                PostingSnapshot {
+                    centroid: vec![1.0, 0.0],
+                    entries: vec![(0, vec![1.0, 0.0]), (1, vec![0.0, 1.0])],
+                    radius: 0.0,
+                },
+                PostingSnapshot {
+                    centroid: vec![0.0, 1.0],
+                    entries: vec![(2, vec![0.99, 0.01]), (3, vec![0.0, 1.0])],
+                    radius: 0.0,
+                },
+            ]
+        };
+        for prune in [false, true] {
+            let mut cfg = ClusterIndexConfig::new(2);
+            cfg.enable_elkan_pruning = prune;
+            let mut index = ClusterIndex::from_postings(fixture(), cfg).unwrap();
+            if prune {
+                assert!(reassign_cutoff(&index, 0, &[0, 1]) > 0.0);
+                assert!(reassign_cutoff(&index, 1, &[0]) > 0.0);
+            }
+            run_reassign(&mut index, &[vec![0.0, 1.0]], &[0], 0);
+            assert_eq!([0, 1, 2, 3].map(|id| index.owner_map[&id]), [0, 1, 0, 1]);
         }
     }
 }

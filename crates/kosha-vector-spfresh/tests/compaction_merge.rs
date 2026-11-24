@@ -344,6 +344,28 @@ fn build_refinement_off_is_deterministic_and_on_is_too() {
     }
 }
 
+#[test]
+fn elkan_pruning_preserves_build_and_rebalance_with_approximate_candidates() {
+    let dim = 24;
+    let mut live = mixture(8_000, dim, 200, 0, 0.0, 7);
+    // Include duplicates and a zero vector alongside positive-margin cases.
+    live.push((8_000, live[0].1.clone()));
+    live.push((8_001, vec![0.0; dim]));
+    let mut cfg = config(dim, 0);
+    cfg.min_posting_size = 4;
+    cfg.target_posting_size = 16;
+    cfg.max_posting_size = 24;
+    for eta in [None, Some(4.0)] {
+        cfg.build_refine_anisotropic_eta = eta;
+        cfg.enable_elkan_pruning = false;
+        let unpruned = ClusterIndex::build(&live, cfg.clone()).unwrap().snapshot();
+        assert!(unpruned.len() > 256);
+        cfg.enable_elkan_pruning = true;
+        let pruned = ClusterIndex::build(&live, cfg.clone()).unwrap().snapshot();
+        assert_eq!(pruned, unpruned, "eta {eta:?}");
+    }
+}
+
 /// Absorbing loose vectors goes through the coarse centroid index once the
 /// index has 256+ postings: each vector must still land in its exact
 /// nearest posting almost always, and in exactly one posting.
@@ -599,6 +621,123 @@ fn rebalance_of_untouched_postings_does_nothing() {
     let stats = idx.rebalance();
     assert_eq!(stats, Default::default());
     assert_eq!(idx.snapshot(), before);
+}
+
+#[test]
+#[ignore]
+fn build_quality_sweep() {
+    let (n, dim, query_count) = (50_000, 128, 1_000);
+    let corpus = |count, seed| {
+        let mut jitter = DeterministicRng::new(seed + 1);
+        let mut vectors = mixture(count, dim, 200, 0, 0.0, seed);
+        for (_, v) in &mut vectors {
+            for x in &mut *v {
+                *x += jitter.next_f32_range(-1.25, 1.25);
+            }
+            normalize_in_place(v);
+        }
+        vectors
+    };
+    let live = corpus(n, 1);
+    let queries: Vec<_> = corpus(query_count, 999)
+        .into_iter()
+        .map(|(_, q)| {
+            let top10 = brute_force_topk(&live, &q, 10)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            (q, top10)
+        })
+        .collect();
+
+    eprintln!("build-quality sweep: {n} vectors, dim={dim}, {query_count} held-out queries, median of 3 builds");
+    eprintln!("radius eta elkan build_ms radius_p50 radius_p90 imbalance recall@1/2/3/5% mean_scanned@0.95");
+    let settings = std::iter::once((8, None, false)).chain(
+        [8, 16, 32, 64]
+            .into_iter()
+            .flat_map(|radius| [None, Some(4.0)].map(|eta| (radius, eta, true))),
+    );
+    for (radius, eta, elkan) in settings {
+        let mut cfg = ClusterIndexConfig::new(dim);
+        cfg.reassign_radius = radius;
+        cfg.build_refine_anisotropic_eta = eta;
+        cfg.enable_elkan_pruning = elkan;
+        let mut build_times = Vec::new();
+        let idx = (0..3)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                let built = ClusterIndex::build(&live, cfg.clone()).unwrap();
+                build_times.push(start.elapsed());
+                built
+            })
+            .last()
+            .unwrap();
+        build_times.sort_unstable();
+        let snap = idx.snapshot();
+        let (recalls, scanned) = build_quality_probe_curve(&snap, &queries);
+        let [r1, r2, r3, r5] = recalls;
+        let eta = if eta.is_some() { "4" } else { "off" };
+        eprintln!(
+            "{radius:>2} {eta:>3} {elkan:>5} {:>8.1} {:.4} {:.4} {:.4} {r1:.3}/{r2:.3}/{r3:.3}/{r5:.3} {scanned:.1}",
+            build_times[1].as_secs_f64() * 1e3,
+            median_radius(&snap),
+            radius_quantile(&snap, 0.9),
+            idx.stats().imbalance_factor
+        );
+    }
+}
+
+fn build_quality_probe_curve(
+    snap: &[PostingSnapshot],
+    queries: &[(Vec<f32>, Vec<u32>)],
+) -> ([f64; 4], f64) {
+    let max_id = snap
+        .iter()
+        .flat_map(|p| p.entries.iter().map(|(id, _)| *id as usize))
+        .max()
+        .unwrap();
+    let mut owners = vec![0; max_id + 1];
+    for (pid, p) in snap.iter().enumerate() {
+        for (id, _) in &p.entries {
+            owners[*id as usize] = pid;
+        }
+    }
+    let mut hits_at = vec![0; snap.len()];
+    let mut scanned_at = vec![0; snap.len()];
+    let mut total_truth = 0;
+    for (q, truth) in queries {
+        let mut order: Vec<_> = snap
+            .iter()
+            .enumerate()
+            .map(|(pid, p)| (pid, (cosine_distance(q, &p.centroid) - p.radius).max(0.0)))
+            .collect();
+        order.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+        // Every global top-10 hit in a probed posting survives exact
+        // reranking; its posting rank tells us when it enters the curve.
+        let mut ranks = vec![0; snap.len()];
+        let mut scanned = 0;
+        for (rank, (pid, _)) in order.into_iter().enumerate() {
+            ranks[pid] = rank;
+            scanned += snap[pid].entries.len();
+            scanned_at[rank] += scanned;
+        }
+        for &id in truth {
+            hits_at[ranks[owners[id as usize]]] += 1;
+        }
+        total_truth += truth.len();
+    }
+    let mut cumulative = 0;
+    for hits in &mut hits_at {
+        cumulative += *hits;
+        *hits = cumulative;
+    }
+    let recalls = [1, 2, 3, 5]
+        .map(|pct| hits_at[(snap.len() * pct).div_ceil(100) - 1] as f64 / total_truth as f64);
+    let rank = hits_at
+        .iter()
+        .position(|&hits| hits * 20 >= total_truth * 19)
+        .unwrap();
+    (recalls, scanned_at[rank] as f64 / queries.len() as f64)
 }
 
 /// Wall-clock numbers for the PR / README (`cargo test --release -p

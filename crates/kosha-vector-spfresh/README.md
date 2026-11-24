@@ -180,6 +180,16 @@ vectors, rewritten by compaction, which shapes these choices:
 billion-scale defaults (it uses `reassign_radius = 64`). `nprobe` applies only
 to this crate's own `search`; kosha-query uses the global budget above.
 
+`build_refine_anisotropic_eta` defaults to `None` (cosine assignment).
+Set it to `Some(4.0)` to try ScaNN's weighted residual loss against the
+unnormalized means in the cosine-generated refinement shortlist. The
+stray lookup still proposes a cosine neighbour; Split/Merge/Reassign and
+queries still use cosine. `enable_elkan_pruning` defaults to `false`.
+It skips comparisons in cosine refinement and LIRE reassignment using
+half the angular separation, not half the non-metric cosine distance.
+Faiss's posting-size imbalance factor is available in index stats and the
+offline segment build log, per vector field; it is not stored on disk.
+
 ## Tests and benchmarks
 
 - `tests/compaction_merge.rs`: compaction-shaped merges (one big input plus
@@ -192,6 +202,13 @@ to this crate's own `search`; kosha-query uses the global budget above.
   build time, median radius and recall with refinement off and on, and
   wall-clock rebuild vs lire times
   (`cargo test --release -p kosha-vector-spfresh --test compaction_merge -- --ignored --nocapture`).
+- Run the #459 sweep with
+  `cargo test --release -p kosha-vector-spfresh --test compaction_merge build_quality_sweep -- --ignored --nocapture`.
+  It compares the unchanged default with the radius/η grid using Elkan
+  pruning on 50k synthetic vectors and 1,000 held-out queries. Scan cost at
+  0.95 recall is mean vectors visited at the first shared posting budget
+  that reaches 0.95 mean recall. This is an in-memory probe simulation,
+  not the #384 MS MARCO baseline; it doesn't measure serving latency or I/O.
 - `tests/churn_ablation.rs`: the paper's Figure 10 ablation on one
   insert/delete/drift sequence.
 - `tests/invariants.rs`, `tests/recall.rs`: structural invariants and recall

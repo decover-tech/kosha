@@ -90,6 +90,12 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     1.0 - cosine_distance(a, b)
 }
 
+/// Convert half the angular separation into cosine-distance units. Stay
+/// away from the boundary by a margin for f32 dot products and normalization.
+pub(crate) fn elkan_cutoff(nearest_distance: f32, dim: usize) -> f32 {
+    1.0 - (1.0 - 0.5 * nearest_distance).max(0.0).sqrt() - (dim as f32 + 8.0) * (4.0 * f32::EPSILON)
+}
+
 /// Component-wise arithmetic mean of a set of vectors. Used for centroid
 /// (re)computation everywhere in this crate. `cosine_distance` normalizes
 /// both operands at compare time, so the centroid's raw magnitude doesn't
