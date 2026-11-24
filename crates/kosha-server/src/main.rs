@@ -3351,6 +3351,7 @@ impl AppState {
                 synced.insert(synced_key(&manifest, ns, &entry.segment_id));
             }
         }
+        self.maintain_namespace_centroids(ns, &manifest);
         self.indexer.restore_manifest(ns.clone(), manifest);
         Ok(())
     }
