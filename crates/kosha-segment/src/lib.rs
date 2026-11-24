@@ -510,11 +510,16 @@ impl SegmentWriter {
     /// which then cover more than one range. Other vector columns are
     /// clustered as usual and gain nothing: one segment has one order.
     /// The segment format is unchanged. `None` when no document has a
-    /// usable vector or clustering fails; keep the input order then.
+    /// usable vector, clustering fails, or vector write version 1 (a flat
+    /// index, no postings) is in effect; keep the input order then.
     pub fn posting_order<'a, I>(&self, docs: I, field: &str) -> Option<PostingOrder>
     where
         I: IntoIterator<Item = &'a [Field]>,
     {
+        // Vector write version 1 writes a flat index with no postings.
+        if vector_write_version() == 1 {
+            return None;
+        }
         let mut dim = None;
         let mut vectors: Vec<(u32, Vec<f32>)> = Vec::new();
         let mut rest: Vec<u32> = Vec::new();
