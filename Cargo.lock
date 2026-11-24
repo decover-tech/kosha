@@ -2478,6 +2478,7 @@ dependencies = [
  "base64 0.22.1",
  "crc32fast",
  "fail",
+ "form_urlencoded",
  "http 1.5.0",
  "http-body-util",
  "hyper 1.10.1",
