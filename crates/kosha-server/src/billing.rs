@@ -31,8 +31,19 @@
 //! - `POST /v1/admin/billing/invoices/mark-paid` (`{invoice_id}`): record a
 //!   payment collected outside the provider.
 //!
-//! Nothing here schedules the monthly job: an operator (or a CronJob) calls
-//! `close-period` and `sync`. Both are safe to repeat.
+//! - `POST /webhooks/stripe`: Stripe's payment notifications. Not an API
+//!   key route: each event is checked against its `Stripe-Signature`
+//!   ([`verify_stripe_signature`]) instead, and the route is served only
+//!   when `KOSHA_STRIPE_WEBHOOK_SECRET` is set.
+//!
+//! # Scheduling
+//!
+//! With `KOSHA_BILLING_SCHEDULER=on` the pod runs the jobs itself
+//! ([`Billing::run_scheduled`]): every `KOSHA_BILLING_SCHEDULER_SECS` it
+//! closes last month once `KOSHA_BILLING_CLOSE_DELAY_SECS` of the new month
+//! have passed, and copies payment results from the provider. Without it an
+//! operator (or a CronJob) calls `close-period` and `sync`. Both are safe
+//! to repeat, so the scheduler may run on several pods.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,8 +52,8 @@ use std::time::Duration;
 
 use kosha_control::billing::{
     rate, total_cents, AccountState, Biller, BillingAccount, BillingPeriod, BillingProvider,
-    BillingStore, Block, Catalog, Invoice, InvoiceStatus, MemoryBillingStore, Operation,
-    PlanQuotas, ProviderInvoiceStatus, TenantStanding,
+    BillingStore, Block, Catalog, CloseReport, Invoice, InvoiceStatus, MemoryBillingStore,
+    Operation, PlanQuotas, ProviderInvoiceStatus, SyncReport, TenantStanding,
 };
 use kosha_control::usage::UsageStore;
 use kosha_core::KoshaError;
@@ -72,7 +83,36 @@ pub(crate) struct Billing {
     /// not know which tenants have accounts, so it must not hand out the
     /// default plan's quotas either (see `LimitsProvider for Billing`).
     refreshed: AtomicBool,
+    /// The signing secret of the Stripe webhook endpoint; the webhook
+    /// route is served only when it is set.
+    pub(crate) stripe_webhook_secret: Option<String>,
+    /// `Some` when this pod runs the billing jobs itself.
+    pub(crate) schedule: Option<Schedule>,
+    /// The last period the scheduler closed without errors.
+    last_closed: Mutex<Option<BillingPeriod>>,
 }
+
+/// When the scheduler runs the billing jobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Schedule {
+    /// Time between runs.
+    pub interval: Duration,
+    /// How long into a month the previous one is closed: long enough for
+    /// every pod to have delivered its usage for it.
+    pub close_delay: Duration,
+}
+
+/// What one [`Billing::run_scheduled`] did.
+#[derive(Debug, Default)]
+pub(crate) struct ScheduledRun {
+    /// `Some` when last month was closed in this run.
+    pub closed: Option<CloseReport>,
+    pub synced: Option<SyncReport>,
+}
+
+/// How far a webhook's signed timestamp may be from this pod's clock,
+/// Stripe's own default tolerance.
+const STRIPE_WEBHOOK_TOLERANCE_MS: u64 = 5 * 60 * 1000;
 
 /// Whether `base` may be sent the Stripe secret key: `https`, or plain
 /// `http` to this machine only (a local stub).
@@ -124,6 +164,9 @@ impl Billing {
             refresh_interval: Duration::from_secs(60),
             last_refresh_error: Mutex::new(None),
             refreshed: AtomicBool::new(false),
+            stripe_webhook_secret: None,
+            schedule: None,
+            last_closed: Mutex::new(None),
         }
     }
 
@@ -177,18 +220,41 @@ impl Billing {
             provider,
             Arc::new(unix_millis),
         );
-        billing.refresh_interval = Duration::from_secs(
-            env_nonempty("KOSHA_BILLING_REFRESH_SECS")
+        let secs = |name: &str, default: u64| {
+            env_nonempty(name)
                 .and_then(|v| v.parse::<u64>().ok())
                 .filter(|s| *s > 0)
-                .unwrap_or(60),
-        );
+                .unwrap_or(default)
+        };
+        billing.refresh_interval = Duration::from_secs(secs("KOSHA_BILLING_REFRESH_SECS", 60));
+        billing.stripe_webhook_secret = env_nonempty("KOSHA_STRIPE_WEBHOOK_SECRET");
+        if billing.stripe_webhook_secret.is_some()
+            && billing.provider.as_ref().map(|p| p.name()) != Some("stripe")
+        {
+            return Err(
+                "KOSHA_STRIPE_WEBHOOK_SECRET is set but KOSHA_BILLING_PROVIDER is not stripe"
+                    .into(),
+            );
+        }
+        if flag_on(std::env::var("KOSHA_BILLING_SCHEDULER").ok().as_deref()) {
+            billing.schedule = Some(Schedule {
+                interval: Duration::from_secs(secs("KOSHA_BILLING_SCHEDULER_SECS", 3600)),
+                close_delay: Duration::from_secs(secs("KOSHA_BILLING_CLOSE_DELAY_SECS", 3600)),
+            });
+        }
         println!(
-            "billing: on ({} plan(s) from {path}, default plan {}, provider {}, refresh every {}s)",
+            "billing: on ({} plan(s) from {path}, default plan {}, provider {}, refresh every {}s, \
+             stripe webhook {}, scheduler {})",
             billing.catalog.plans.len(),
             billing.catalog.default_plan.as_deref().unwrap_or("none"),
             billing.provider.as_ref().map_or("none", |p| p.name()),
-            billing.refresh_interval.as_secs()
+            billing.refresh_interval.as_secs(),
+            if billing.stripe_webhook_secret.is_some() { "on" } else { "off" },
+            billing.schedule.map_or("off".to_string(), |s| format!(
+                "every {}s, closing {}s into a month",
+                s.interval.as_secs(),
+                s.close_delay.as_secs()
+            )),
         );
         if let Err(e) = billing.refresh() {
             eprintln!("WARN: billing: initial refresh failed; nobody is restricted until one succeeds: {e}");
@@ -232,6 +298,57 @@ impl Billing {
         if let Err(e) = self.refresh() {
             eprintln!("WARN: billing: refresh failed, keeping previous standings: {e}");
         }
+    }
+
+    /// One scheduler run at the billing clock's now: close last month if
+    /// it is `close_delay` over and this pod has not closed it cleanly
+    /// yet, then sync payments. `flush` delivers this pod's spooled usage
+    /// before a close. Errors are in the reports (and logged); a period
+    /// closed with errors is closed again by the next run.
+    pub(crate) fn run_scheduled(&self, flush: impl FnOnce()) -> ScheduledRun {
+        let Some(schedule) = self.schedule else {
+            return ScheduledRun::default();
+        };
+        let now_ms = self.now_ms();
+        let this_month = BillingPeriod::containing(now_ms);
+        let period = this_month.previous();
+        let delay_ms = u64::try_from(schedule.close_delay.as_millis()).unwrap_or(u64::MAX);
+        let due = now_ms >= this_month.start_ms().saturating_add(delay_ms);
+        let mut run = ScheduledRun::default();
+        if due && *self.last_closed.lock().unwrap() != Some(period) {
+            flush();
+            match self.biller().close_period(period, now_ms) {
+                Ok(report) => {
+                    if report.errors.is_empty() {
+                        *self.last_closed.lock().unwrap() = Some(period);
+                    } else {
+                        eprintln!("WARN: billing: closing {period}: {:?}", report.errors);
+                    }
+                    println!(
+                        "billing: closed {period}: {} created, {} existing, {} submitted, {} error(s)",
+                        report.created.len(),
+                        report.existing,
+                        report.submitted,
+                        report.errors.len()
+                    );
+                    run.closed = Some(report);
+                }
+                Err(e) => eprintln!("WARN: billing: closing {period} failed: {e}"),
+            }
+        }
+        if self.provider.is_some() {
+            match self.biller().sync_payments(now_ms) {
+                Ok(report) => {
+                    if !report.errors.is_empty() {
+                        eprintln!("WARN: billing: payment sync: {:?}", report.errors);
+                    }
+                    run.synced = Some(report);
+                }
+                Err(e) => eprintln!("WARN: billing: payment sync failed: {e}"),
+            }
+        }
+        self.refresh_logged();
+        run
     }
 
     fn snapshot(&self) -> Arc<Standings> {
@@ -377,6 +494,148 @@ impl AppState {
                 std::thread::sleep(billing.refresh_interval);
                 billing.refresh_logged();
             });
+    }
+}
+
+impl AppState {
+    /// Run the billing jobs on this pod, when `KOSHA_BILLING_SCHEDULER` is on.
+    pub(crate) fn spawn_billing_scheduler(self: &Arc<Self>) {
+        let Some(schedule) = self.billing.as_ref().and_then(|b| b.schedule) else {
+            return;
+        };
+        let state = Arc::clone(self);
+        let _ = std::thread::Builder::new()
+            .name("kosha-billing-jobs".into())
+            .spawn(move || loop {
+                if let Some(billing) = state.billing.as_ref() {
+                    billing.run_scheduled(|| {
+                        if let Some(meter) = state.usage.as_ref() {
+                            let _ = meter.flush();
+                        }
+                    });
+                }
+                std::thread::sleep(schedule.interval);
+            });
+    }
+}
+
+// ─── Stripe webhook ─────────────────────────────────────────────────────────
+
+/// The path Stripe posts payment events to.
+pub(crate) const STRIPE_WEBHOOK_PATH: &str = "/webhooks/stripe";
+
+/// Whether `request_line` is a delivery to the Stripe webhook.
+pub(crate) fn is_stripe_webhook(request_line: &str) -> bool {
+    parse_method_and_path(request_line).is_some_and(|(method, target)| {
+        method == "POST" && target.split('?').next() == Some(STRIPE_WEBHOOK_PATH)
+    })
+}
+
+fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
+/// Check a `Stripe-Signature` header (`t=<unix secs>,v1=<hex>[,v1=...]`)
+/// for `body`: some `v1` must be the HMAC-SHA256, keyed with `secret`, of
+/// `<t>.<body>`, and `t` within five minutes of `now_ms`.
+pub(crate) fn verify_stripe_signature(
+    header: &str,
+    body: &[u8],
+    secret: &str,
+    now_ms: u64,
+) -> Result<(), &'static str> {
+    use hmac::{Hmac, Mac};
+    let mut timestamp = None;
+    let mut signatures = Vec::new();
+    for part in header.split(',') {
+        match part.trim().split_once('=') {
+            Some(("t", value)) => timestamp = value.parse::<u64>().ok(),
+            Some(("v1", value)) => signatures.extend(hex_decode(value)),
+            _ => {}
+        }
+    }
+    let timestamp = timestamp.ok_or("Stripe-Signature has no timestamp")?;
+    if signatures.is_empty() {
+        return Err("Stripe-Signature has no v1 signature");
+    }
+    if timestamp.saturating_mul(1000).abs_diff(now_ms) > STRIPE_WEBHOOK_TOLERANCE_MS {
+        return Err("Stripe-Signature timestamp is outside the tolerance");
+    }
+    let signed = |signature: &[u8]| {
+        let Ok(mut mac) = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()) else {
+            return false;
+        };
+        mac.update(timestamp.to_string().as_bytes());
+        mac.update(b".");
+        mac.update(body);
+        mac.verify_slice(signature).is_ok()
+    };
+    if signatures.iter().any(|s| signed(s)) {
+        Ok(())
+    } else {
+        Err("no Stripe-Signature signature matches")
+    }
+}
+
+/// `POST /webhooks/stripe`: record an invoice Stripe reports paid or void,
+/// in place of waiting for the next `sync`. Other events are acknowledged
+/// and ignored. A store failure answers 503, so Stripe retries the event.
+pub(crate) fn handle_stripe_webhook(
+    state: &AppState,
+    headers: &std::collections::HashMap<String, String>,
+    body: &[u8],
+) -> String {
+    let Some((billing, secret)) = state
+        .billing
+        .as_deref()
+        .and_then(|b| Some((b, b.stripe_webhook_secret.as_deref()?)))
+    else {
+        return api_error(ErrorCode::NotFound, "not found");
+    };
+    let signature = headers.get("stripe-signature").map_or("", String::as_str);
+    if let Err(why) = verify_stripe_signature(signature, body, secret, billing.now_ms()) {
+        eprintln!("WARN: billing: stripe webhook refused: {why}");
+        return api_error(ErrorCode::InvalidArgument, why);
+    }
+    let event: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(event) => event,
+        Err(e) => {
+            return api_error(
+                ErrorCode::InvalidArgument,
+                &format!("invalid JSON body: {e}"),
+            )
+        }
+    };
+    let status = match event["type"].as_str() {
+        Some("invoice.paid") => ProviderInvoiceStatus::Paid,
+        Some("invoice.voided") => ProviderInvoiceStatus::Void,
+        _ => return json_ok(&serde_json::json!({"received": true, "invoice": null})),
+    };
+    let object = &event["data"]["object"];
+    let Some(stripe_id) = object["id"].as_str() else {
+        return api_error(ErrorCode::InvalidArgument, "the event has no invoice id");
+    };
+    let ours = object["metadata"]["kosha_invoice_id"].as_str();
+    match billing
+        .biller()
+        .record_provider_status(ours, stripe_id, status, billing.now_ms())
+    {
+        Ok(Some(status)) => {
+            billing.refresh_logged();
+            json_ok(&serde_json::json!({
+                "received": true,
+                "invoice": ours,
+                "status": status.as_str(),
+            }))
+        }
+        Ok(None) => json_ok(&serde_json::json!({"received": true, "invoice": null})),
+        Err(e) => unavailable(&e, false),
     }
 }
 

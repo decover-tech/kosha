@@ -6731,6 +6731,7 @@ fn main() {
     state.spawn_usage_flusher();
     state.spawn_usage_snapshotter();
     state.spawn_billing_refresher();
+    state.spawn_billing_scheduler();
     let listener = TcpListener::bind(&addr).expect("failed to bind HTTP listener");
     let config =
         http::Config::from_env(Duration::from_secs(io_timeout_secs), auth::max_body_bytes());
@@ -6851,6 +6852,14 @@ fn dispatch_request(state: &AppState, request: http::Request) -> http::Response 
     // through the authenticated API below. 404 unless KOSHA_DASHBOARD is on.
     if let Some(resp) = dashboard::static_response(&request_line, state.dashboard.enabled()) {
         return http::Response::from_raw(resp);
+    }
+
+    // Stripe's payment events (#349) carry a signature, not an API key.
+    if billing::is_stripe_webhook(&request_line) {
+        let response =
+            http::Response::from_raw(billing::handle_stripe_webhook(state, &headers, &body));
+        log_request(&request_line, "-", body.len(), &response, started);
+        return response;
     }
 
     // ── API key authentication ──────────────────────────────────────────

@@ -501,15 +501,23 @@ below are an example. It is read at startup only: restart the pods to change it.
 rounded half up and the invoice total is the sum of its lines. `POST /v1/admin/billing/close-period`
 (`{"period": "YYYY-MM"}`, default last month) is the monthly job: one invoice per tenant, id
 `<tenant>/<YYYY-MM>`. It is safe to run again: an existing invoice is never re-rated, and one that
-could not be handed to the payment provider is handed over by the next run. Nothing schedules it;
-call it from a CronJob once every pod has delivered its usage for the month (usage that arrives
-after a period is closed is not on the invoice). An invoice is rated on the plan the tenant is on
+could not be handed to the payment provider is handed over by the next run. With
+`KOSHA_BILLING_SCHEDULER=on` a pod runs it itself: every `KOSHA_BILLING_SCHEDULER_SECS` it closes
+last month once `KOSHA_BILLING_CLOSE_DELAY_SECS` of the new month have passed (flushing its own
+usage first), then syncs payments. Several pods may run the scheduler. Otherwise call
+`close-period` and `sync` from a CronJob. Either way, close a month only once every pod has
+delivered its usage for it (usage that arrives after a period is closed is not on the invoice). An invoice is rated on the plan the tenant is on
 when the period is closed; plan changes inside a month are not prorated. An invoice that totals
 zero is recorded as paid.
 
 **Payment provider.** With `KOSHA_BILLING_PROVIDER=stripe` an invoice is sent to Stripe (a
 customer per tenant, an invoice with one item per charged line, `collection_method=send_invoice`),
-and `POST /v1/admin/billing/sync` copies paid and void results back. Without a provider invoices
+and `POST /v1/admin/billing/sync` copies paid and void results back. With
+`KOSHA_STRIPE_WEBHOOK_SECRET` set, Stripe's `invoice.paid` and `invoice.voided` events are recorded
+as they happen: point a Stripe webhook endpoint at `POST /webhooks/stripe` on the ingest Service.
+It takes no API key; each event's `Stripe-Signature` must verify against the secret and be at most
+five minutes old, or it gets `400`. Other events, and invoices Kosha did not create, are
+acknowledged and ignored; `sync` still catches anything a webhook missed. Without a provider invoices
 are only recorded, and a payment collected elsewhere is recorded with
 `POST /v1/admin/billing/invoices/mark-paid` (`{"invoice_id": ...}`).
 
@@ -548,6 +556,10 @@ far, and its invoices. `GET /v1/admin/billing/accounts` and
 | `KOSHA_BILLING_PROVIDER` | `stripe`, or `none` to only record invoices | `none` | name |
 | `KOSHA_STRIPE_API_KEY` | Stripe secret key. Required with `KOSHA_BILLING_PROVIDER=stripe`; keep it in a secret, never in a tracked file | unset | secret |
 | `KOSHA_STRIPE_API_BASE` | Base URL of the Stripe API. Must be `https://`; plain `http://` is accepted for `localhost`, `127.0.0.1` and `[::1]` only (the secret key is sent to it), and startup fails otherwise | `https://api.stripe.com` | URL |
+| `KOSHA_STRIPE_WEBHOOK_SECRET` | Signing secret (`whsec_...`) of the Stripe webhook endpoint. Serves `POST /webhooks/stripe` when set (404 otherwise); startup fails if it is set without `KOSHA_BILLING_PROVIDER=stripe`. Keep it in a secret | unset | secret |
+| `KOSHA_BILLING_SCHEDULER` | `on`, `true` or `1`: this pod closes last month and syncs payments itself | off | flag |
+| `KOSHA_BILLING_SCHEDULER_SECS` | Time between scheduler runs | `3600` | seconds |
+| `KOSHA_BILLING_CLOSE_DELAY_SECS` | How long into a month the scheduler waits before closing the previous one | `3600` | seconds |
 
 ## HTTP server and auth
 

@@ -117,6 +117,16 @@ struct Fixture {
 }
 
 fn fixture(catalog: &str, with_provider: bool, start_ms: u64) -> Fixture {
+    fixture_with(catalog, with_provider, start_ms, |_| {})
+}
+
+/// [`fixture`], with `configure` run on the billing before the pod starts.
+fn fixture_with(
+    catalog: &str,
+    with_provider: bool,
+    start_ms: u64,
+    configure: impl FnOnce(&mut Billing),
+) -> Fixture {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
         "kosha-test-billing-{}-{}-{}",
@@ -132,13 +142,14 @@ fn fixture(catalog: &str, with_provider: bool, start_ms: u64) -> Fixture {
         let now = now.clone();
         Arc::new(move || now.load(Ordering::SeqCst))
     };
-    let billing = Billing::new(
+    let mut billing = Billing::new(
         Catalog::parse(catalog).unwrap(),
         store.clone(),
         usage.clone(),
         with_provider.then(|| provider.clone() as Arc<dyn BillingProvider>),
         clock,
     );
+    configure(&mut billing);
     let mut state = AppState::with_options(
         dir.clone(),
         StateOptions {
@@ -1152,4 +1163,404 @@ fn stripe_provider_sends_the_invoice_as_items_in_cents() {
     // An unreachable API is an error, not a status.
     let stripe = StripeProvider::new("http://127.0.0.1:1", "sk_test_stub", 14).unwrap();
     assert!(stripe.invoice_status("in_stub1").is_err());
+}
+
+const WEBHOOK_SECRET: &str = "whsec_test_secret";
+
+/// A `Stripe-Signature` header for `body`, signed at `at_ms`.
+fn stripe_signature(body: &[u8], secret: &str, at_ms: u64) -> String {
+    use hmac::{Hmac, Mac};
+    let t = at_ms / 1000;
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(format!("{t}.").as_bytes());
+    mac.update(body);
+    let hex: String = mac
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("t={t},v1={hex}")
+}
+
+fn stripe_event(kind: &str, stripe_id: &str, ours: Option<&str>) -> Vec<u8> {
+    let metadata = match ours {
+        Some(id) => serde_json::json!({"kosha_invoice_id": id}),
+        None => serde_json::json!({}),
+    };
+    serde_json::to_vec(&serde_json::json!({
+        "id": "evt_1",
+        "object": "event",
+        "type": kind,
+        "data": {"object": {"id": stripe_id, "object": "invoice", "metadata": metadata}},
+    }))
+    .unwrap()
+}
+
+impl Fixture {
+    /// A delivery to the Stripe webhook through the pod's dispatch, with no
+    /// API key.
+    fn webhook(&self, body: &[u8], signature: Option<&str>) -> (u16, serde_json::Value) {
+        let mut headers = HashMap::new();
+        if let Some(signature) = signature {
+            headers.insert("stripe-signature".to_string(), signature.to_string());
+        }
+        let response = dispatch_request(
+            &self.state,
+            http::Request {
+                method: "POST".into(),
+                target: billing::STRIPE_WEBHOOK_PATH.into(),
+                headers,
+                body: body.to_vec(),
+            },
+        );
+        let raw = response.into_raw_string();
+        (status_of(&raw), body_of(&raw))
+    }
+}
+
+#[test]
+fn stripe_signatures_are_checked() {
+    let body = br#"{"type":"invoice.paid"}"#;
+    let now = 1_790_000_000_000;
+    let good = stripe_signature(body, WEBHOOK_SECRET, now);
+    assert_eq!(
+        billing::verify_stripe_signature(&good, body, WEBHOOK_SECRET, now + 60_000),
+        Ok(())
+    );
+    // A rotated secret: Stripe sends one v1 per active secret.
+    let other = stripe_signature(body, "whsec_old", now);
+    let both = format!("{good},{}", other.split_once(',').unwrap().1);
+    assert!(billing::verify_stripe_signature(&both, body, WEBHOOK_SECRET, now).is_ok());
+    for (header, at) in [
+        (good.as_str(), now + 6 * 60_000),
+        (other.as_str(), now),
+        ("v1=00", now),
+        ("t=1790000000", now),
+        ("", now),
+    ] {
+        assert!(
+            billing::verify_stripe_signature(header, body, WEBHOOK_SECRET, at).is_err(),
+            "{header}"
+        );
+    }
+    assert!(billing::verify_stripe_signature(
+        &good,
+        br#"{"type":"invoice.voided"}"#,
+        WEBHOOK_SECRET,
+        now
+    )
+    .is_err());
+}
+
+#[test]
+fn a_stripe_webhook_marks_an_invoice_paid_and_lifts_the_restriction() {
+    let oct = oct();
+    let f = fixture_with(CATALOG, true, oct.start_ms(), |b| {
+        b.stripe_webhook_secret = Some(WEBHOOK_SECRET.into());
+    });
+    f.admin_ok(
+        "POST /v1/admin/billing/accounts",
+        serde_json::json!({"tenant": "acme", "plan": "payg"}),
+    );
+    f.record(
+        "acme",
+        "q",
+        oct.start_ms() + 1,
+        &[(meter::QUERIES, 2_000_000)],
+    );
+    f.now.store(oct.end_ms() + HOUR_MS, Ordering::SeqCst);
+    f.admin_ok(
+        "POST /v1/admin/billing/close-period",
+        serde_json::Value::Null,
+    );
+    let stripe_id = f.provider.submitted()[0].provider_invoice_id.clone();
+
+    // Unpaid well past its due date: suspended.
+    f.now.store(oct.end_ms() + 40 * DAY_MS, Ordering::SeqCst);
+    f.refresh();
+    let standing = body_of(&f.call("acme", "GET /v1/billing", serde_json::Value::Null));
+    assert_eq!(standing["state"], "suspended", "{standing}");
+
+    let now = f.now.load(Ordering::SeqCst);
+    // Unsigned, badly signed or stale deliveries change nothing.
+    let paid = stripe_event("invoice.paid", &stripe_id, Some("acme/2026-10"));
+    assert_eq!(f.webhook(&paid, None).0, 400);
+    let forged = stripe_signature(&paid, "whsec_wrong", now);
+    assert_eq!(f.webhook(&paid, Some(&forged)).0, 400);
+    let stale = stripe_signature(&paid, WEBHOOK_SECRET, now - 10 * 60_000);
+    assert_eq!(f.webhook(&paid, Some(&stale)).0, 400);
+    assert_eq!(
+        f.store.invoice("acme/2026-10").unwrap().unwrap().status,
+        InvoiceStatus::Open
+    );
+
+    // Events for other objects, or invoices that are not ours, are
+    // acknowledged and ignored.
+    let other = stripe_event("customer.created", "cus_1", None);
+    let (status, body) = f.webhook(&other, Some(&stripe_signature(&other, WEBHOOK_SECRET, now)));
+    assert_eq!(
+        (status, body["invoice"].clone()),
+        (200, serde_json::Value::Null)
+    );
+    let foreign = stripe_event("invoice.paid", "in_someone_else", None);
+    let (status, body) = f.webhook(
+        &foreign,
+        Some(&stripe_signature(&foreign, WEBHOOK_SECRET, now)),
+    );
+    assert_eq!(
+        (status, body["invoice"].clone()),
+        (200, serde_json::Value::Null)
+    );
+    let mismatched = stripe_event("invoice.paid", "in_someone_else", Some("acme/2026-10"));
+    let (status, body) = f.webhook(
+        &mismatched,
+        Some(&stripe_signature(&mismatched, WEBHOOK_SECRET, now)),
+    );
+    assert_eq!(
+        (status, body["invoice"].clone()),
+        (200, serde_json::Value::Null)
+    );
+
+    // The real one: paid at once, and the standing is refreshed with it.
+    let (status, body) = f.webhook(&paid, Some(&stripe_signature(&paid, WEBHOOK_SECRET, now)));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["invoice"], "acme/2026-10");
+    assert_eq!(body["status"], "paid");
+    let invoice = f.store.invoice("acme/2026-10").unwrap().unwrap();
+    assert_eq!(invoice.status, InvoiceStatus::Paid);
+    assert_eq!(invoice.paid_at_ms, Some(now));
+    let standing = body_of(&f.call("acme", "GET /v1/billing", serde_json::Value::Null));
+    assert_eq!(standing["state"], "active", "{standing}");
+
+    // A redelivery is harmless.
+    let (status, body) = f.webhook(&paid, Some(&stripe_signature(&paid, WEBHOOK_SECRET, now)));
+    assert_eq!(
+        (status, body["invoice"].clone()),
+        (200, serde_json::Value::Null)
+    );
+}
+
+#[test]
+fn the_stripe_webhook_is_off_without_a_secret() {
+    let f = fixture(CATALOG, true, oct().start_ms());
+    let body = stripe_event("invoice.paid", "in_1", None);
+    let sig = stripe_signature(&body, WEBHOOK_SECRET, oct().start_ms());
+    assert_eq!(f.webhook(&body, Some(&sig)).0, 404);
+    assert!(billing::is_stripe_webhook(
+        "POST /webhooks/stripe HTTP/1.1\r\n"
+    ));
+    assert!(!billing::is_stripe_webhook(
+        "GET /webhooks/stripe HTTP/1.1\r\n"
+    ));
+    assert!(!billing::is_stripe_webhook(
+        "POST /webhooks/stripe/x HTTP/1.1\r\n"
+    ));
+}
+
+#[test]
+fn the_scheduler_closes_last_month_once_and_syncs_payments() {
+    let oct = oct();
+    let f = fixture_with(CATALOG, true, oct.start_ms(), |b| {
+        b.schedule = Some(billing::Schedule {
+            interval: std::time::Duration::from_secs(60),
+            close_delay: std::time::Duration::from_secs(2 * 3600),
+        });
+    });
+    f.admin_ok(
+        "POST /v1/admin/billing/accounts",
+        serde_json::json!({"tenant": "acme", "plan": "payg"}),
+    );
+    f.record(
+        "acme",
+        "q",
+        oct.start_ms() + 1,
+        &[(meter::QUERIES, 2_000_000)],
+    );
+    let flushes = AtomicU64::new(0);
+    let flush = || {
+        flushes.fetch_add(1, Ordering::SeqCst);
+    };
+
+    // During October, and in the first two hours of November, September
+    // (empty) and then October are not closed early.
+    f.now.store(oct.start_ms() + 10 * DAY_MS, Ordering::SeqCst);
+    let run = f.billing().run_scheduled(flush);
+    assert!(
+        run.closed.is_some(),
+        "September closes once October is 2h old"
+    );
+    assert!(run.closed.unwrap().created.is_empty());
+    f.now.store(oct.end_ms() + HOUR_MS, Ordering::SeqCst);
+    let run = f.billing().run_scheduled(flush);
+    assert!(run.closed.is_none());
+    assert!(f.store.invoices(None).unwrap().is_empty());
+
+    // Past the delay: October is closed and submitted, once.
+    f.now.store(oct.end_ms() + 3 * HOUR_MS, Ordering::SeqCst);
+    let run = f.billing().run_scheduled(flush);
+    let closed = run.closed.expect("closes October");
+    assert_eq!(closed.created, vec!["acme/2026-10".to_string()]);
+    assert_eq!(closed.submitted, 1);
+    assert_eq!(
+        flushes.load(Ordering::SeqCst),
+        2,
+        "usage flushed before each close"
+    );
+    f.advance(HOUR_MS);
+    let run = f.billing().run_scheduled(flush);
+    assert!(run.closed.is_none());
+    assert_eq!(f.provider.submitted().len(), 1);
+    assert_eq!(run.synced.unwrap().checked, 1);
+
+    // The provider collects; the next run records it.
+    assert!(f
+        .provider
+        .pay(&f.provider.submitted()[0].provider_invoice_id));
+    f.advance(HOUR_MS);
+    let run = f.billing().run_scheduled(flush);
+    assert_eq!(run.synced.unwrap().paid, vec!["acme/2026-10".to_string()]);
+    assert_eq!(
+        f.store.invoice("acme/2026-10").unwrap().unwrap().status,
+        InvoiceStatus::Paid
+    );
+}
+
+#[test]
+fn the_scheduler_retries_a_close_that_failed() {
+    let oct = oct();
+    let f = fixture_with(CATALOG, true, oct.start_ms(), |b| {
+        b.schedule = Some(billing::Schedule {
+            interval: std::time::Duration::from_secs(60),
+            close_delay: std::time::Duration::from_secs(3600),
+        });
+    });
+    f.admin_ok(
+        "POST /v1/admin/billing/accounts",
+        serde_json::json!({"tenant": "acme", "plan": "payg"}),
+    );
+    f.now.store(oct.end_ms() + 2 * HOUR_MS, Ordering::SeqCst);
+    f.provider.set_failing(true);
+    let run = f.billing().run_scheduled(|| {});
+    assert_eq!(run.closed.unwrap().errors.len(), 1);
+    f.provider.set_failing(false);
+    let run = f.billing().run_scheduled(|| {});
+    let closed = run.closed.expect("closed again after the failure");
+    assert!(closed.errors.is_empty(), "{:?}", closed.errors);
+    assert_eq!(f.provider.submitted().len(), 1);
+}
+
+#[test]
+fn billing_off_or_unscheduled_runs_nothing() {
+    let f = fixture(CATALOG, true, oct().end_ms() + 2 * DAY_MS);
+    let run = f
+        .billing()
+        .run_scheduled(|| panic!("no flush when unscheduled"));
+    assert!(run.closed.is_none() && run.synced.is_none());
+}
+
+/// The issue's "done when" against Stripe itself, in test mode: a month of
+/// synthetic usage is closed by the scheduler, the invoice Stripe holds
+/// totals what Kosha rated, and once Stripe records the payment the next
+/// run copies it back. Opt in with a test-mode key:
+/// `STRIPE_TEST_SECRET_KEY=sk_test_... cargo test -p kosha-server
+/// stripe_test_mode -- --ignored`.
+#[test]
+#[ignore = "calls Stripe; needs STRIPE_TEST_SECRET_KEY (sk_test_...)"]
+fn stripe_test_mode_charges_a_month_of_synthetic_usage() {
+    let key = std::env::var("STRIPE_TEST_SECRET_KEY").expect("STRIPE_TEST_SECRET_KEY");
+    assert!(
+        key.starts_with("sk_test_"),
+        "only a test-mode key may be used"
+    );
+    let base = "https://api.stripe.com";
+    let oct = oct();
+    let tenant = format!("kosha-e2e-{}", unix_millis());
+    let usage = Arc::new(MemoryUsageStore::new());
+    let store = Arc::new(MemoryBillingStore::new());
+    let now = Arc::new(AtomicU64::new(oct.start_ms()));
+    let clock: billing::Clock = {
+        let now = now.clone();
+        Arc::new(move || now.load(Ordering::SeqCst))
+    };
+    let mut billing = Billing::new(
+        Catalog::parse(CATALOG).unwrap(),
+        store.clone(),
+        usage.clone(),
+        Some(Arc::new(StripeProvider::new(base, &key, 30).unwrap())),
+        clock,
+    );
+    billing.schedule = Some(billing::Schedule {
+        interval: std::time::Duration::from_secs(60),
+        close_delay: std::time::Duration::from_secs(3600),
+    });
+    store
+        .put_account(&BillingAccount {
+            tenant: tenant.clone(),
+            plan: "payg".into(),
+            provider_customer_id: None,
+            created_at_ms: oct.start_ms(),
+        })
+        .unwrap();
+    let mut events = Vec::new();
+    for hour in 0..oct.hours() {
+        let at = oct.start_ms() + hour * HOUR_MS;
+        let mut meters = BTreeMap::from([
+            (meter::STORED_BYTES.to_string(), 3 * GIB),
+            (meter::QUERIES.to_string(), 2_000),
+        ]);
+        if hour % 24 == 0 {
+            meters.insert(meter::BYTES_WRITTEN.to_string(), GIB);
+        }
+        events.push(UsageEvent {
+            id: format!("{tenant}/{hour}"),
+            tenant: tenant.clone(),
+            namespace: "docs".into(),
+            at_ms: at,
+            meters,
+        });
+    }
+    usage.record(&events).unwrap();
+
+    now.store(oct.end_ms() + 2 * HOUR_MS, Ordering::SeqCst);
+    let closed = billing.run_scheduled(|| {}).closed.expect("closes October");
+    assert!(closed.errors.is_empty(), "{:?}", closed.errors);
+    assert_eq!(closed.submitted, 1);
+    const EXPECTED_CENTS: u64 = 2500 + 195 + 6200 + 66;
+    let invoice = store
+        .invoice(&format!("{tenant}/2026-10"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(invoice.total_cents, EXPECTED_CENTS);
+    let stripe_id = invoice.provider_invoice_id.clone().expect("sent to Stripe");
+
+    let client = reqwest::blocking::Client::new();
+    let at_stripe: serde_json::Value = client
+        .get(format!("{base}/v1/invoices/{stripe_id}"))
+        .bearer_auth(&key)
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(at_stripe["status"], "open", "{at_stripe}");
+    assert_eq!(at_stripe["currency"], "usd");
+    assert_eq!(at_stripe["amount_due"], EXPECTED_CENTS, "{at_stripe}");
+    assert_eq!(
+        at_stripe["metadata"]["kosha_invoice_id"],
+        format!("{tenant}/2026-10")
+    );
+
+    let paid: serde_json::Value = client
+        .post(format!("{base}/v1/invoices/{stripe_id}/pay"))
+        .bearer_auth(&key)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("paid_out_of_band=true")
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(paid["status"], "paid", "{paid}");
+    now.fetch_add(HOUR_MS, Ordering::SeqCst);
+    let synced = billing.run_scheduled(|| {}).synced.expect("synced");
+    assert_eq!(synced.paid, vec![format!("{tenant}/2026-10")]);
 }

@@ -1295,30 +1295,66 @@ impl Biller<'_> {
                 continue;
             };
             report.checked += 1;
-            let result = provider.invoice_status(provider_id).and_then(|status| {
-                match status {
-                    ProviderInvoiceStatus::Open => {}
-                    ProviderInvoiceStatus::Paid => {
-                        self.store.set_invoice_status(
-                            &invoice.id,
-                            InvoiceStatus::Paid,
-                            Some(now_ms),
-                        )?;
-                        report.paid.push(invoice.id.clone());
-                    }
-                    ProviderInvoiceStatus::Void => {
-                        self.store
-                            .set_invoice_status(&invoice.id, InvoiceStatus::Void, None)?;
-                        report.voided.push(invoice.id.clone());
-                    }
-                }
-                Ok(())
-            });
-            if let Err(e) = result {
-                report.errors.push((invoice.id.clone(), e.to_string()));
+            let result = provider
+                .invoice_status(provider_id)
+                .and_then(|status| self.apply_provider_status(&invoice, status, now_ms));
+            match result {
+                Ok(Some(InvoiceStatus::Paid)) => report.paid.push(invoice.id.clone()),
+                Ok(Some(InvoiceStatus::Void)) => report.voided.push(invoice.id.clone()),
+                Ok(_) => {}
+                Err(e) => report.errors.push((invoice.id.clone(), e.to_string())),
             }
         }
         Ok(report)
+    }
+
+    /// Record what the provider reports for one of our invoices, as a
+    /// payment notification (a webhook) delivers it: `id` is ours when the
+    /// provider echoes it back, and `provider_invoice_id` must be the one
+    /// we submitted. `Ok(None)` when the invoice is not ours or is no
+    /// longer open; otherwise the status it now has.
+    pub fn record_provider_status(
+        &self,
+        id: Option<&str>,
+        provider_invoice_id: &str,
+        status: ProviderInvoiceStatus,
+        now_ms: u64,
+    ) -> Result<Option<InvoiceStatus>, KoshaError> {
+        let invoice = match id {
+            Some(id) => self.store.invoice(id)?,
+            None => self
+                .store
+                .invoices(None)?
+                .into_iter()
+                .find(|i| i.provider_invoice_id.as_deref() == Some(provider_invoice_id)),
+        };
+        let Some(invoice) = invoice else {
+            return Ok(None);
+        };
+        if invoice.provider_invoice_id.as_deref() != Some(provider_invoice_id)
+            || invoice.status != InvoiceStatus::Open
+        {
+            return Ok(None);
+        }
+        self.apply_provider_status(&invoice, status, now_ms)
+    }
+
+    /// Store `status` on the open `invoice`; the status it changed to, if
+    /// it changed.
+    fn apply_provider_status(
+        &self,
+        invoice: &Invoice,
+        status: ProviderInvoiceStatus,
+        now_ms: u64,
+    ) -> Result<Option<InvoiceStatus>, KoshaError> {
+        let (status, paid_at_ms) = match status {
+            ProviderInvoiceStatus::Open => return Ok(None),
+            ProviderInvoiceStatus::Paid => (InvoiceStatus::Paid, Some(now_ms)),
+            ProviderInvoiceStatus::Void => (InvoiceStatus::Void, None),
+        };
+        self.store
+            .set_invoice_status(&invoice.id, status, paid_at_ms)?;
+        Ok(Some(status))
     }
 
     /// Month-to-date usage of one tenant at `now_ms`.
