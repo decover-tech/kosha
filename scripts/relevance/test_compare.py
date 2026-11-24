@@ -96,6 +96,11 @@ class CompareTest(unittest.TestCase):
         head = dict(BASE, **{"vector.recall@100": None})
         self.assertEqual(failures(compare_metrics(BASE, head))[0]["status"], "missing")
 
+    def test_ood_uses_the_same_selectivity_threshold(self):
+        name = "ood.filtered_knn.probe@0.1%.recall@10"
+        self.assertEqual(failures(compare_metrics({name: 1}, {name: 0.985})), [])
+        self.assertEqual(len(failures(compare_metrics({name: 1}, {name: 0.975}))), 1)
+
     def test_rows_follow_mode_then_selectivity_order(self):
         names = [
             "filtered_knn.probe@0.1%.recall@10",
@@ -187,7 +192,27 @@ class CompareTest(unittest.TestCase):
         for sel in rep["config"]["selectivities"]:
             for policy in ("probe", "planned"):
                 self.assertIsNotNone(metrics[f"filtered_knn.{policy}@{sel}.recall@10"])
+                self.assertIsNotNone(metrics[f"ood.filtered_knn.{policy}@{sel}.recall@10"])
         self.assertEqual(rep["config"]["selectivities"], ["100%", "50%", "10%", "1%", "0.1%"])
+        for cohort in ("id", "ood"):
+            points = rep["kmr"][cohort]["points"]
+            self.assertGreater(len(points), 1)
+            scans = [p["mean_vectors_scanned"] for p in points]
+            self.assertEqual(scans, sorted(scans))
+            self.assertGreater(scans[-1], scans[0])
+            self.assertTrue(all(0 <= p["recall_at_10"] <= 1 for p in points))
+        for metric in ("ndcg@10", "mrr@10"):
+            scores = rep["vector_vs_exact"][metric]
+            self.assertAlmostEqual(scores["delta"], scores["ann"] - scores["exact"])
+            self.assertEqual(metrics[f"vector_ann.{metric}"], scores["ann"])
+
+    def test_comment_renders_vector_quality_delta_from_exact(self):
+        head_report = report()
+        head_report["vector_vs_exact"] = {
+            "mrr@10": {"ann": 0.7, "exact": 0.75, "delta": -0.05, "queries": 10},
+        }
+        md = render_comment([], base_label="a", head_label="b", head_report=head_report)
+        self.assertIn("| `mrr@10` | 70.00 | 75.00 | -5.00 | 10 |", md)
 
 
 if __name__ == "__main__":

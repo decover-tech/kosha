@@ -89,8 +89,8 @@ def is_idempotent(method: str, path: str) -> bool:
     flush and namespace delete. Not: namespace create, schema put, branch
     create and delete, shards, and any route this table does not know.
 
-    The deprecated ``POST /replace`` counts as merge: the client still sends
-    merges there against servers older than API 0.9.0 (``client._request``).
+    Explicit calls to the deprecated ``POST /replace`` through this transport
+    also count as merges.
     """
     m = method.upper()
     if m in ("GET", "HEAD"):

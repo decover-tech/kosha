@@ -33,6 +33,7 @@ fn namespace_tenant(ns: &str) -> Option<&str> {
 /// credentials. Operator traffic is never tenant-limited (#341).
 const SERVICE_TENANT: &str = "service";
 
+mod admin_audit;
 mod api_error;
 mod api_key_admin;
 #[cfg(test)]
@@ -42,6 +43,11 @@ mod authz;
 mod branching;
 mod cache_reads;
 mod compaction_sched;
+// Self-service console (#345): sign-up, sessions, OAuth/SSO, `/console`.
+mod console;
+mod console_crypto;
+mod console_net;
+mod console_oauth;
 mod dashboard;
 mod deletion_purge;
 mod doc_spans;
@@ -50,11 +56,14 @@ mod doc_store_fallback_tests;
 mod embedding;
 #[cfg(test)]
 mod embedding_server_tests;
+mod exports;
 mod fair_admission;
 mod http;
+mod http_routes;
 #[cfg(feature = "s3")]
 mod hydration_budget;
 mod internal_tls;
+mod mailer;
 mod manifest_follow;
 mod metrics;
 #[cfg(feature = "migrate")]
@@ -67,6 +76,7 @@ mod org_admin;
 #[cfg(all(test, feature = "s3"))]
 mod posting_presence_tests;
 mod posting_spans;
+mod public_url;
 mod rerank;
 mod role;
 mod routes;
@@ -74,13 +84,19 @@ mod routes;
 mod s3_storage;
 #[cfg(feature = "s3")]
 mod s3_wal;
+mod schema_rules;
 // The crash-point harness uploads to an in-memory bucket through the same
 // commit-marker sequence as S3, so it needs this module without `s3`.
 mod billing;
+mod billing_notify;
+mod billing_scheduler;
+#[cfg(test)]
+mod billing_stripe_tests;
 #[cfg(test)]
 mod billing_tests;
 #[cfg(all(test, feature = "failpoints"))]
 mod crash_points_tests;
+mod pipeline_metrics;
 #[cfg(any(feature = "s3", all(test, feature = "failpoints")))]
 #[cfg_attr(not(feature = "s3"), allow(dead_code))]
 mod segment_commit;
@@ -88,6 +104,7 @@ mod segment_gc;
 #[cfg(all(test, feature = "s3"))]
 mod segment_pin_tests;
 mod span_writes;
+mod tenant_key_admin;
 mod tenant_limits;
 mod unindexed;
 mod usage;
@@ -104,6 +121,9 @@ mod writer_lease;
 mod writer_lease_tests;
 
 use api_error::{api_error, api_error_status, ApiError, ErrorCode};
+use http_routes::{
+    internal_segment_response, legacy_route_disabled, route, with_legacy_deprecation,
+};
 #[cfg(feature = "s3")]
 use hydration_budget::{HydrationBudget, RequestHydration};
 use kosha_cache::Cache;
@@ -145,6 +165,7 @@ struct AppState {
     /// `KOSHA_COMPACTION_ON_INGEST` (#254): whether a writer pod also runs
     /// the compaction scheduler.
     compaction_on_ingest: bool,
+    namespace_centroids_enabled: bool,
     admin_auth_key: Option<String>,
     /// Organizations, users, projects and the audit log (#345), served
     /// under `/v1/admin/users` and `/v1/admin/orgs`.
@@ -344,6 +365,8 @@ struct AppState {
     gc_stats: segment_gc::GcStats,
     /// Purge of deleted namespaces' cached copies on this pod (#347).
     deletion_purge: deletion_purge::PurgeState,
+    /// Namespace exports (#347).
+    exports: exports::ExportRuntime,
     /// Serializes `POST /v1/admin/gc` runs.
     gc_lock: Mutex<()>,
     /// Namespace-level cached hydration verdict (Tier 1 O2). Keyed by
@@ -506,8 +529,8 @@ struct AppState {
     /// `warm` and `warm_run`.
     warming: warm_run::Warming,
     /// `KOSHA_INGEST_HOST` — set only on query-role pods (deployment-query.yaml).
-    /// When present, write-path requests this pod receives are forwarded here
-    /// instead of executed locally — see `is_write_path`/`forward_to_ingest`.
+    /// When present, writes and writer-backed reads are forwarded here
+    /// instead of executed locally — see `is_ingest_path`/`forward_to_ingest`.
     /// `None` on the ingest pod itself, which never forwards.
     ingest_host: Option<String>,
     /// Built once, lazily, only when `ingest_host` is set — no cost on the
@@ -534,6 +557,14 @@ struct AppState {
     unindexed: unindexed::UnindexedState,
     /// `KOSHA_DASHBOARD` and the per-namespace recent-query rings (#214).
     dashboard: dashboard::Dashboard,
+    /// `KOSHA_CONSOLE`: the self-service console (#345), `/v1/console/*`
+    /// and `/console`.
+    console: console::Console,
+    /// Tests only: the API-key table requests authenticate against instead
+    /// of the process-wide one (`auth::global()`, which unit tests leave
+    /// disabled), so a test can prove a key it created really works.
+    #[cfg(test)]
+    auth_override: Option<auth::Auth>,
 }
 
 /// One cached merged manifest over a sharded namespace (#207).
@@ -1015,15 +1046,41 @@ fn exact_knn_wants_doc_vectors_header(footer: Option<&kosha_core::Footer>, field
 /// `None` without kNN.
 #[cfg_attr(not(feature = "s3"), allow(dead_code))]
 fn knn_verdict_key(query: &SearchQuery) -> Option<String> {
-    query.knn.as_ref().map(|knn| {
-        if knn.is_late_interaction() {
-            format!("late_interaction:{}", knn.field)
-        } else if query.needs_filter_columns() {
-            format!("filtered:{}", knn.field)
+    if let Some(field) = single_vector_knn_field(query) {
+        return Some(if query.needs_filter_columns() {
+            format!("filtered:{field}")
         } else {
-            knn.field.clone()
-        }
-    })
+            field.to_string()
+        });
+    }
+    late_interaction_knn_field(query).map(|field| format!("late_interaction:{field}"))
+}
+
+/// The single-vector column a search scores against: `knn.field` of a
+/// cosine kNN. Only then does its hydration pass fetch vector-column files
+/// (`vector[.n].idx`, `vector[.n].offsets`, a legacy footer's
+/// `doc_vectors.bin`). `None` for a query without kNN, and for late
+/// interaction (#205) — hybrid or not — which reads the field's multivec
+/// files instead (see [`late_interaction_knn_field`]). Mirrors the
+/// searcher's [`kosha_query::query_reads_vector_columns`], which opens such
+/// a query's segments without their vector columns.
+fn single_vector_knn_field(query: &SearchQuery) -> Option<&str> {
+    query
+        .knn
+        .as_ref()
+        .filter(|_| kosha_query::query_reads_vector_columns(query))
+        .map(|knn| knn.field.as_str())
+}
+
+/// The late-interaction field (#205) a search scores against, whose
+/// `multivec.{i}.bags` / `.ivf` its hydration pass fetches. `None` unless
+/// the query's kNN is scored with late interaction.
+fn late_interaction_knn_field(query: &SearchQuery) -> Option<&str> {
+    query
+        .knn
+        .as_ref()
+        .filter(|knn| knn.is_late_interaction())
+        .map(|knn| knn.field.as_str())
 }
 
 /// Filter column names a query reads (`SearchQuery::filter_column_fields`).
@@ -1398,6 +1455,14 @@ fn publication_error(context: &str, error: &KoshaError) -> String {
                 .retry_after(ttl.max(Duration::from_secs(1)))
                 .into_raw()
         }
+        KoshaError::ControlPlane(_) | KoshaError::ManifestCommitNotAttempted(_) => {
+            ApiError::new(ErrorCode::Unavailable, message)
+                .redact(format!("{context}: the control store could not be reached"))
+                .detail("reason", "control_store")
+                .detail("outcome", "unknown")
+                .not_retryable()
+                .into_raw()
+        }
         _ => api_error(ErrorCode::Internal, &message),
     }
 }
@@ -1645,7 +1710,8 @@ impl AppState {
             .filter(|n| *n > 0)
             .unwrap_or(flush_threshold);
         #[cfg(feature = "s3")]
-        let s3_storage = {
+        #[cfg_attr(not(feature = "postgres"), allow(unused_mut))]
+        let mut s3_storage = {
             match s3_storage::S3Config::from_env() {
                 Some(cfg) => {
                     let bucket = cfg.bucket.clone();
@@ -1750,6 +1816,12 @@ impl AppState {
             segment_live_max_bytes,
             admission_timeout,
         );
+        #[cfg(feature = "s3")]
+        let searcher = if let Some(s3) = &s3_storage {
+            searcher.with_namespace_centroid_source(s3.namespace_centroid_source())
+        } else {
+            searcher
+        };
 
         // ── Control plane: in-memory or Postgres ─────────────────────────
         #[cfg_attr(not(feature = "postgres"), allow(unused_mut))]
@@ -1761,6 +1833,10 @@ impl AppState {
             match kosha_control::PgStore::connect_with_retry(&db_url) {
                 Ok(store) => {
                     control_plane_kind = "postgres";
+                    #[cfg(feature = "s3")]
+                    if let Some(s3) = s3_storage.as_mut() {
+                        s3.set_tenant_kms_key_store(store.clone());
+                    }
                     println!("control plane: postgres ({})", redact_database_url(&db_url));
                     Box::new(store)
                 }
@@ -1945,7 +2021,7 @@ impl AppState {
         #[cfg_attr(not(feature = "postgres"), allow(unused_mut))]
         let mut lease_backend = writer_lease::LeaseBackend::ControlStore;
         #[cfg(feature = "postgres")]
-        if lease_enabled && control_plane_kind == "postgres" {
+        if !query_role && control_plane_kind == "postgres" {
             if let Ok(db_url) = std::env::var("DATABASE_URL") {
                 match kosha_control::PgWriterLeaseStore::new(&db_url) {
                     Ok(store) => lease_backend = writer_lease::LeaseBackend::Postgres(store),
@@ -2158,6 +2234,7 @@ impl AppState {
             role,
             writer_leases,
             compaction_on_ingest,
+            namespace_centroids_enabled: kosha_segment::namespace_centroids::enabled(),
             // `None` when `KOSHA_ADMIN_BOOTSTRAP_KEY` switches it off (#346).
             admin_auth_key: auth::bootstrap_admin_key(),
             orgs: org_admin::OrgBackend::from_env(),
@@ -2166,7 +2243,7 @@ impl AppState {
                 .filter(|k| !k.is_empty()),
             publication_locks: Mutex::new(HashMap::new()),
             branch_lock: Mutex::new(()),
-            metrics: metrics::Metrics::from_env(),
+            metrics: pipeline_metrics::server_metrics(usage.as_ref(), billing.as_deref()),
             #[cfg(feature = "s3")]
             segment_checksum_failures: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "s3")]
@@ -2294,6 +2371,7 @@ impl AppState {
             gc_settings: segment_gc::GcSettings::from_env(),
             gc_stats: segment_gc::GcStats::default(),
             deletion_purge: deletion_purge::PurgeState::default(),
+            exports: exports::ExportRuntime::default(),
             gc_lock: Mutex::new(()),
             completed_hydrations: Mutex::new(HashMap::new()),
             #[cfg(feature = "s3")]
@@ -2321,7 +2399,19 @@ impl AppState {
             unindexed_cap: unindexed::UnindexedCap::from_env(),
             unindexed: unindexed::UnindexedState::new(query_role),
             dashboard: dashboard::Dashboard::from_env(),
+            console: console::Console::from_env(),
+            #[cfg(test)]
+            auth_override: None,
         }
+    }
+
+    /// The API-key table: `auth::global()`, or a test's own.
+    fn auth(&self) -> &auth::Auth {
+        #[cfg(test)]
+        if let Some(auth) = &self.auth_override {
+            return auth;
+        }
+        auth::global()
     }
 
     /// Construct inside an `Arc` with `self_ref` wired up — the constructor
@@ -2613,6 +2703,26 @@ impl AppState {
         }
     }
 
+    fn control_store_write_refusal(&self, request_line: &str) -> Option<String> {
+        let mutating = match routes::lookup_line(request_line) {
+            Some(route) => route.class == routes::Class::Write,
+            None => is_write_path(request_line),
+        };
+        if !mutating {
+            return None;
+        }
+        self.writer_leases
+            .check_writable(&self.controller)
+            .err()
+            .map(|error| {
+                ApiError::new(ErrorCode::Unavailable, format!("write refused: {error}"))
+                    .redact("write refused: the control store is not writable")
+                    .detail("reason", "control_store")
+                    .retry_after(Duration::from_secs(1))
+                    .into_raw()
+            })
+    }
+
     /// 503 + `Retry-After` for a write this writer may not make.
     fn write_refusal(&self, error: &KoshaError) -> String {
         ApiError::new(ErrorCode::Unavailable, format!("write refused: {error}"))
@@ -2689,6 +2799,7 @@ impl AppState {
                 synced.insert(synced_key(&remote, ns, &entry.segment_id));
             }
         }
+        self.maintain_namespace_centroids(ns, &remote);
         self.indexer.restore_manifest(ns.clone(), remote);
         Ok(())
     }
@@ -2830,13 +2941,16 @@ impl AppState {
     fn branch_references(&self) -> Result<kosha_core::branch::References, String> {
         let _lineage = self.branch_lock.lock().unwrap();
         let (_, manifests) = self.every_manifest()?;
-        kosha_core::branch::References::collect(
+        let mut refs = kosha_core::branch::References::collect(
             manifests
                 .iter()
                 .filter(|(_, manifest)| manifest.branch.is_some())
                 .map(|(ns, manifest)| (ns, manifest)),
         )
-        .map_err(|e| format!("cannot resolve branch references: {e}"))
+        .map_err(|e| format!("cannot resolve branch references: {e}"))?;
+        // What a running export reads stays too (#347).
+        self.pin_export_references(&mut refs)?;
+        Ok(refs)
     }
 
     /// The object store segment GC sweeps: S3 when configured, otherwise
@@ -2884,7 +2998,12 @@ impl AppState {
                     .iter()
                     .filter(|(other, manifest)| other != ns && manifest.branch.is_some())
                     .map(|(other, manifest)| (other, manifest)),
-            );
+            )
+            .map_err(|e| e.to_string())
+            // A running export's pinned manifests (#347), this namespace's
+            // own included: a compaction mid-export must not cost it a
+            // segment.
+            .and_then(|mut refs| self.pin_export_references(&mut refs).map(|()| refs));
             let config = match referenced {
                 Ok(refs) => kosha_core::gc::GcConfig {
                     referenced_elsewhere: Some(Arc::new(refs)),
@@ -3333,6 +3452,7 @@ impl AppState {
                 synced.insert(synced_key(&manifest, ns, &entry.segment_id));
             }
         }
+        self.maintain_namespace_centroids(ns, &manifest);
         self.indexer.restore_manifest(ns.clone(), manifest);
         Ok(())
     }
@@ -3344,6 +3464,41 @@ impl AppState {
             .entry(ns.clone())
             .or_default()
             .clone()
+    }
+
+    /// Bring a quota-checked writer up to date without waiting for a
+    /// publication conflict. Rebasing keeps unpublished writes intact.
+    fn refresh_write_manifest(&self, ns: &NamespaceId) -> Result<(), KoshaError> {
+        let lock = self.publication_lock(ns);
+        let _guard = lock.lock().unwrap();
+        let stored = self.controller.lock().unwrap().manifest_version(ns)?;
+        if stored <= self.indexer.published_version(ns) {
+            return Ok(());
+        }
+        let Some(remote) = self.hydrated_remote_manifest(ns)? else {
+            return Err(KoshaError::ManifestConflict {
+                namespace: ns.clone(),
+                expected: stored.unwrap_or_default(),
+                actual: None,
+            });
+        };
+        self.rebase_write_manifest(ns, remote).map(|_| ())
+    }
+
+    fn rebase_write_manifest(
+        &self,
+        ns: &NamespaceId,
+        remote: kosha_core::Manifest,
+    ) -> Result<kosha_write::RebaseOutcome, KoshaError> {
+        #[cfg(feature = "s3")]
+        {
+            // Committed segments are already durable and need no upload.
+            let mut synced = self.synced_segments.lock().unwrap();
+            for entry in &remote.segments {
+                synced.insert(synced_key(&remote, ns, &entry.segment_id));
+            }
+        }
+        self.indexer.rebase_onto(ns, remote)
     }
 
     /// Drop the cached hydration verdict for one manifest version, so the
@@ -3589,6 +3744,7 @@ impl AppState {
                     // acknowledged locally (WAL not reclaimed).
                     fail::fail_point!("publish.after_cas_before_ack");
                     self.indexer.acknowledge_manifest(ns, &manifest)?;
+                    self.maintain_namespace_centroids(ns, &manifest);
                     println!(
                         "manifest published: ns={} version={} segments={} ms={:.1}",
                         ns.0,
@@ -3610,17 +3766,8 @@ impl AppState {
                          found {}): rebasing, attempt {rebases}/{MANIFEST_REBASE_ATTEMPTS}",
                         ns.0, remote.version
                     );
-                    #[cfg(feature = "s3")]
-                    {
-                        // The committed manifest's segments are durable by
-                        // the publish protocol; the other writer uploaded
-                        // them and this node has nothing local to send.
-                        let mut synced = self.synced_segments.lock().unwrap();
-                        for entry in &remote.segments {
-                            synced.insert(synced_key(&remote, ns, &entry.segment_id));
-                        }
-                    }
-                    if self.indexer.rebase_onto(ns, remote)? == kosha_write::RebaseOutcome::Adopted
+                    if self.rebase_write_manifest(ns, remote)?
+                        == kosha_write::RebaseOutcome::Adopted
                     {
                         return Ok(());
                     }
@@ -3635,6 +3782,51 @@ impl AppState {
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    fn bootstrap_namespace_centroids(&self) {
+        for ns in self.indexer.namespaces() {
+            let lock = self.publication_lock(&ns);
+            let _guard = lock.lock().unwrap();
+            if let Some((published, manifest)) = self.indexer.publication_snapshot(&ns) {
+                if published == manifest.version && !manifest.segments.is_empty() {
+                    self.maintain_namespace_centroids(&ns, &manifest);
+                }
+            }
+        }
+    }
+
+    fn maintain_namespace_centroids(&self, ns: &NamespaceId, manifest: &kosha_core::Manifest) {
+        if self.namespace_centroids_enabled {
+            if let Err(error) = self.update_namespace_centroids(ns, manifest) {
+                eprintln!("WARN: namespace centroid update for {}: {error}", ns.0);
+            }
+        }
+    }
+
+    fn update_namespace_centroids(
+        &self,
+        ns: &NamespaceId,
+        manifest: &kosha_core::Manifest,
+    ) -> Result<(), KoshaError> {
+        #[cfg(feature = "s3")]
+        if let Some(s3) = &self.s3_storage {
+            let path = format!("{}/{}", ns.0, kosha_segment::namespace_centroids::FILE_NAME);
+            let previous = s3.read_uncached(&path).ok();
+            let bytes = self.indexer.update_namespace_centroids(
+                ns,
+                manifest,
+                previous.as_deref(),
+                Some(&|file| s3.read_uncached(file)),
+            )?;
+            if let Some(bytes) = bytes {
+                s3.upload_namespace_centroids(&path, bytes)?;
+            }
+            return Ok(());
+        }
+        self.indexer
+            .update_namespace_centroids(ns, manifest, None, None)?;
+        Ok(())
     }
 
     /// Upload every segment in `ns`'s current manifest that this process
@@ -4115,10 +4307,11 @@ impl AppState {
         pages: &[PageSegment<'_>],
         request: &Arc<RequestHydration>,
         rid: &str,
+        mode: doc_spans::ReadMode,
     ) -> doc_spans::PageFetchStats {
         let mut stats = doc_spans::PageFetchStats::default();
         let mut fallback_error = None;
-        let whole: Vec<PathBuf> = match (self.doc_read_mode, &self.s3_storage) {
+        let whole: Vec<PathBuf> = match (mode, &self.s3_storage) {
             (_, None) => return stats,
             (doc_spans::ReadMode::Whole, Some(_)) => {
                 pages.iter().map(|p| p.segment_dir.to_path_buf()).collect()
@@ -4465,8 +4658,12 @@ impl AppState {
         let mut fetch_from_s3: Vec<(String, u64)> = Vec::new();
         let mut owned_leases: Vec<String> = Vec::new();
 
-        for (path, size) in files {
+        for (index, (path, size)) in files.iter().enumerate() {
             match leases.try_claim(path, own_addr, LEASE_TTL) {
+                kosha_control::HydrationLease::Unavailable => {
+                    fetch_from_s3.extend_from_slice(&files[index..]);
+                    break;
+                }
                 kosha_control::HydrationLease::Owner => {
                     self.metrics.record_lease(metrics::LeaseOutcome::Won);
                     owned_leases.push(path.clone());
@@ -4507,7 +4704,9 @@ impl AppState {
         // failure) — releasing earlier could let a waiter's peer-fetch land
         // on us before the bytes actually exist locally.
         for path in &owned_leases {
-            leases.release(path, own_addr);
+            if !leases.release(path, own_addr) {
+                break;
+            }
         }
     }
 
@@ -4756,6 +4955,19 @@ impl AppState {
         // fetched. `None` for warm-up, which reads nothing afterwards.
         pins: Option<&mut SegmentPins<'_>>,
     ) -> HydrationOutcome {
+        self.hydrate_search_scoring_set(ns, manifest, query, request, pins, false)
+    }
+
+    #[cfg(feature = "s3")]
+    fn hydrate_search_scoring_set(
+        &self,
+        ns: &NamespaceId,
+        manifest: &kosha_core::Manifest,
+        query: &SearchQuery,
+        request: &Arc<RequestHydration>,
+        pins: Option<&mut SegmentPins<'_>>,
+        exact_quantized_vectors: bool,
+    ) -> HydrationOutcome {
         // The query is analyzed per segment with the chains its footer
         // records (#220), so which terms (and posting-blob shards) a
         // segment needs depends on its footer.
@@ -4763,12 +4975,9 @@ impl AppState {
         let needs_bloom_check =
             query.has_prunable_filter() || kosha_query::term_bloom_prune_mode(query).is_some();
         // Single-vector kNN reads its column's index; late interaction
-        // (#205) reads the field's multivec files instead (below).
-        let knn_field = query
-            .knn
-            .as_ref()
-            .filter(|knn| !knn.is_late_interaction())
-            .map(|knn| knn.field.as_str());
+        // (#205) reads the field's multivec files instead (below), and no
+        // vector column at all.
+        let knn_field = single_vector_knn_field(query);
         let filter_fields = query_filter_fields(query);
         let all_seg_paths: Vec<PathBuf> = manifest
             .segments
@@ -4861,13 +5070,16 @@ impl AppState {
             &posting_files,
             request,
         );
-        if let (Some(field), false) = (knn_field, filter_files.is_empty()) {
+        if let Some(field) =
+            knn_field.filter(|_| !filter_files.is_empty() || exact_quantized_vectors)
+        {
             self.fetch_exact_knn_headers(
                 &to_hydrate,
                 field,
                 &manifest_footers,
                 request,
                 &mut outcome,
+                filter_files.is_empty(),
             );
         }
         outcome.files_fetched += postings_outcome.files_fetched;
@@ -4878,7 +5090,7 @@ impl AppState {
         // Late interaction (#205) reads the queried field's bag store and
         // token index, which only some segments have (their footers say
         // which); single-vector kNN never fetches them.
-        if let Some(knn) = query.knn.as_ref().filter(|k| k.is_late_interaction()) {
+        if let Some(li_field) = late_interaction_knn_field(query) {
             let scoring: std::collections::HashSet<&PathBuf> = to_hydrate.iter().collect();
             let mut by_file: std::collections::BTreeMap<String, Vec<PathBuf>> = Default::default();
             for (entry, seg_path) in manifest.segments.iter().zip(&all_seg_paths) {
@@ -4886,7 +5098,7 @@ impl AppState {
                     continue;
                 }
                 let Some(i) = segment_footer(entry)
-                    .and_then(|f| f.multi_vectors.iter().position(|m| m.name == knn.field))
+                    .and_then(|f| f.multi_vectors.iter().position(|m| m.name == li_field))
                 else {
                     continue;
                 };
@@ -5086,6 +5298,7 @@ impl AppState {
         manifest_footers: &HashMap<PathBuf, &kosha_core::Footer>,
         request: &Arc<RequestHydration>,
         outcome: &mut HydrationOutcome,
+        quantized_only: bool,
     ) {
         let Some(ref s3) = self.s3_storage else {
             return;
@@ -5100,9 +5313,12 @@ impl AppState {
                     local_footer.as_ref()
                 }
             };
-            if !exact_knn_wants_doc_vectors_header(footer, field)
-                || doc_spans::doc_vectors_header_local(seg)
-            {
+            let needs_header = if quantized_only {
+                knn_wants_doc_vectors_header_with(footer, field, true)
+            } else {
+                exact_knn_wants_doc_vectors_header(footer, field)
+            };
+            if !needs_header || doc_spans::doc_vectors_header_local(seg) {
                 continue;
             }
             let (Some(footer), Ok(rel)) = (footer, seg.strip_prefix(&self.data_dir)) else {
@@ -5146,8 +5362,7 @@ impl AppState {
                 doc_spans::HeaderStatus::Failed => {
                     outcome.exact_knn_headers_missing += 1;
                     eprintln!(
-                        "WARN: doc_vectors.bin header of {} could not be fetched for a filtered \
-                         kNN on '{field}': its exact path scans the column's vector postings",
+                        "WARN: doc_vectors.bin header of {} could not be fetched for kNN on '{field}'",
                         dir.display()
                     );
                 }
@@ -6769,6 +6984,7 @@ fn main() {
     // purge silently off (#347).
     let deletion_purge_settings =
         deletion_purge::PurgeSettings::from_env().unwrap_or_else(|e| fatal(&e));
+    let export_settings = exports::ExportSettings::from_env().unwrap_or_else(|e| fatal(&e));
     let state = AppState::new_shared_as(PathBuf::from(data_dir.clone()), role);
     // Pre-#262 bare namespaces no tenant can reach (#344).
     namespace_migrate::warn_unreachable_bare_namespaces(
@@ -6785,13 +7001,25 @@ fn main() {
     state.spawn_posting_promoter();
     state.spawn_idle_flush_timer();
     state.spawn_compaction_scheduler();
+    if state.namespace_centroids_enabled
+        && matches!(state.role, role::Role::Indexer | role::Role::Standalone)
+    {
+        let state = Arc::clone(&state);
+        std::thread::Builder::new()
+            .name("kosha-namespace-centroid-bootstrap".into())
+            .spawn(move || state.bootstrap_namespace_centroids())
+            .expect("failed to spawn namespace centroid bootstrap thread");
+    }
     state.spawn_writer_lease_renewer();
     state.spawn_manifest_refresher();
     state.spawn_local_gc();
     state.spawn_deletion_purge(deletion_purge_settings);
+    state.spawn_exports(export_settings);
     state.spawn_usage_flusher();
     state.spawn_usage_snapshotter();
+    state.attach_billing_email();
     state.spawn_billing_refresher();
+    state.spawn_billing_scheduler();
     let listener = TcpListener::bind(&addr).expect("failed to bind HTTP listener");
     let config =
         http::Config::from_env(Duration::from_secs(io_timeout_secs), auth::max_body_bytes());
@@ -6907,6 +7135,15 @@ fn dispatch_request(state: &AppState, request: http::Request) -> http::Response 
         return response;
     }
 
+    // Stripe webhooks (#349): the signature on the body is the credential,
+    // so they are answered before API-key authentication, on whichever pod
+    // receives them (never forwarded).
+    if let Some(response) = billing::webhook_response(state, &request_line, &headers, &body) {
+        let response = http::Response::from_raw(response);
+        log_request(&request_line, "stripe", body.len(), &response, started);
+        return response;
+    }
+
     // Built-in dashboard (#214): its static assets hold no data and are
     // served without a key; every data call the page makes comes back
     // through the authenticated API below. 404 unless KOSHA_DASHBOARD is on.
@@ -6914,8 +7151,20 @@ fn dispatch_request(state: &AppState, request: http::Request) -> http::Response 
         return http::Response::from_raw(resp);
     }
 
+    // Self-service console (#345): `/console` and `/v1/console/*`, answered
+    // here, before API keys: these routes authenticate with a session
+    // cookie, and a session never reaches anything below. 404 unless
+    // KOSHA_CONSOLE is on.
+    if let Some(response) = console::handle(state, &request_line, &headers, &body) {
+        if response.status() >= 400 {
+            log_request(&request_line, "console", body.len(), &response, started);
+        }
+        return response;
+    }
+
     // ── API key authentication ──────────────────────────────────────────
     // Per proto/kosha/v1/kosha.proto: Authorization: Bearer <key> or X-Api-Key.
+    let mut tenant_key = None;
     let authentication = if admin_actor(&headers, state).is_some()
         || service_authorized(&headers, state.internal_service_key.as_deref())
     {
@@ -6925,7 +7174,7 @@ fn dispatch_request(state: &AppState, request: http::Request) -> http::Response 
         // allow-list cover this request (#346). Checked here, ahead of
         // the role routing below, so a query pod refuses a request itself
         // instead of forwarding it to the ingest pod.
-        match authenticate(&headers) {
+        match authenticate(&headers, state.auth()) {
             Err(e) => Err(e),
             Ok(principal) => {
                 // Before authorization, so the key's allow-list is checked
@@ -6937,20 +7186,28 @@ fn dispatch_request(state: &AppState, request: http::Request) -> http::Response 
                 }
                 let (method, path) = parse_method_and_path(&request_line).unwrap_or(("", ""));
                 match authz::authorize(&principal, method, path, &body) {
-                    Ok(()) => Ok(principal.tenant),
+                    Ok(()) => {
+                        let tenant = principal.tenant.clone();
+                        tenant_key = Some(principal);
+                        Ok(tenant)
+                    }
                     Err(message) => Err(api_error(ErrorCode::PermissionDenied, &message)),
                 }
             }
         }
     };
-    dispatch_authenticated(
-        state,
-        &request_line,
-        &headers,
-        &body,
-        authentication,
-        started,
-    )
+    // The key's grant, for the handlers that narrow their answer to it
+    // (namespace listing, `/v1/api-keys`): `authz::current_principal`.
+    authz::with_principal(tenant_key, || {
+        dispatch_authenticated(
+            state,
+            &request_line,
+            &headers,
+            &body,
+            authentication,
+            started,
+        )
+    })
 }
 
 /// The rest of [`dispatch`] once the caller is known: `authentication` is
@@ -6964,11 +7221,8 @@ fn dispatch_authenticated(
     started: Instant,
 ) -> http::Response {
     // ── Query/ingest role routing ────────────────────────────────────────
-    // A query-role pod (KOSHA_INGEST_HOST set) forwards write-path requests
-    // to the single ingest pod instead of executing them locally — see
-    // is_write_path/forward_to_ingest. Every other request (all reads, and
-    // everything on the ingest pod itself, which never forwards) is handled
-    // locally exactly as before this existed.
+    // A query-role pod forwards writes and reads of writer-local state
+    // to the ingest pod; all other requests are handled locally.
     // ── Billing gate (#349) ──────────────────────────────────────────────
     // Ahead of the role routing, so a query pod refuses a blocked write
     // itself instead of forwarding it.
@@ -6995,14 +7249,20 @@ fn dispatch_authenticated(
                  /v1/admin/compact* and /v1/admin/compaction-*",
             ))
         }
-        (Ok(_), Some(ingest_host), Some(client)) if is_write_path(request_line) => {
-            http::Response::from_raw(forward_to_ingest(
-                client,
-                ingest_host,
-                request_line,
-                headers,
-                body,
-            ))
+        (Ok(tenant), Some(ingest_host), Some(client)) if is_ingest_path(request_line) => {
+            if let Some((_, path)) =
+                legacy_route(request_line).filter(|_| !auth::legacy_routes_enabled_for(tenant))
+            {
+                http::Response::from_raw(with_legacy_deprecation(legacy_route_disabled(path)))
+            } else {
+                http::Response::from_raw(forward_to_ingest(
+                    client,
+                    ingest_host,
+                    request_line,
+                    headers,
+                    body,
+                ))
+            }
         }
         // Pod-to-pod segment transfer streams the file instead of building
         // a `String` (#259). Any other credential falls through to `route`,
@@ -7012,6 +7272,10 @@ fn dispatch_authenticated(
                 && service_authorized(headers, state.internal_service_key.as_deref()) =>
         {
             internal_segment_response(request_line, state)
+        }
+        // An export part streams from a file too (#347).
+        (Ok(tenant), _, _) if exports::is_download_route(request_line) => {
+            exports::download_response(request_line, tenant, state)
         }
         (Ok(tenant), _, _) => http::Response::from_raw(serve_tenant_request(
             request_line,
@@ -7094,6 +7358,10 @@ fn handle_metrics(state: &AppState, headers: &HashMap<String, String>) -> String
         nvme_evictions: state.cache.eviction_generation(),
         segment_checksum_failures,
         cache_tenants: cache_tenant_samples(state),
+        decoded_caches: [
+            kosha_segment::text_postings_cache_stats(),
+            kosha_segment::vector_postings_cache_stats(),
+        ],
         span_writes: state.span_writes.stats(),
     });
     format!(
@@ -7107,9 +7375,9 @@ fn handle_metrics(state: &AppState, headers: &HashMap<String, String>) -> String
 
 /// [`route`] an authenticated request this pod handles itself, after its
 /// tenant's request-entry limits (#341): a search takes a qps token and a
-/// concurrent-query slot (held until the response is built); a write route
-/// is checked against the tenant's body size cap and write bytes per
-/// second. A query pod forwards writes before this runs, so write limits
+/// concurrent-query slot (held until the response is built). The body cap
+/// applies to all requests; the write-byte rate applies only to writes.
+/// A query pod forwards writes before this runs, so write limits
 /// are enforced where writes execute: on the ingest pod.
 fn serve_tenant_request(
     request_line: &str,
@@ -7120,14 +7388,17 @@ fn serve_tenant_request(
 ) -> String {
     let mut _query_slot = None;
     if tenant_is_limited(state, tenant) {
+        if let Err(rejection) =
+            state
+                .tenant_limits
+                .admit_body(tenant, body.len(), is_write_path(request_line))
+        {
+            return tenant_rejection(state, tenant, &rejection);
+        }
         if is_search_route(request_line) {
             match state.tenant_limits.admit_query(tenant) {
                 Ok(slot) => _query_slot = Some(slot),
                 Err(rejection) => return tenant_rejection(state, tenant, &rejection),
-            }
-        } else if is_write_path(request_line) {
-            if let Err(rejection) = state.tenant_limits.admit_write_body(tenant, body.len()) {
-                return tenant_rejection(state, tenant, &rejection);
             }
         }
     }
@@ -7143,13 +7414,7 @@ fn tenant_is_limited(state: &AppState, tenant: &str) -> bool {
 /// (its [`routes::ROUTES`] row), and the legacy `POST /search` and
 /// `GET /search?...`.
 fn is_search_route(request_line: &str) -> bool {
-    if let Some(route) = routes::lookup_line(request_line) {
-        return route.class == routes::Class::Search;
-    }
-    matches!(
-        legacy_route(request_line),
-        Some(("POST" | "GET", "/search"))
-    )
+    request_route_class(request_line) == routes::Class::Search
 }
 
 /// The response for a request refused by a tenant limit (#341, #350): its
@@ -7175,6 +7440,9 @@ fn tenant_rejection(
         .alias("limit", limit);
     if code == ErrorCode::PayloadTooLarge {
         error = error.detail("scope", "tenant");
+    }
+    if rejection.reason == tenant_limits::RejectReason::StorageQuota {
+        error = error.detail("reason", rejection.reason.as_str());
     }
     error.into_raw()
 }
@@ -7259,6 +7527,80 @@ fn namespace_doc_estimate(state: &AppState, ns: &NamespaceId) -> u64 {
         }
     }
     committed + pending
+}
+
+/// Segment bytes owned by the namespace, plus estimates for the tail and
+/// new documents. Sample the tail first so a concurrent flush may count
+/// a document twice, but cannot move it out of both samples.
+fn check_namespace_storage(
+    state: &AppState,
+    ns: &NamespaceId,
+    tenant: &str,
+    max: u64,
+    documents: &[kosha_core::Document],
+    replace: bool,
+) -> Result<(), String> {
+    let mut members = vec![ns.clone()];
+    let shards = state.indexer.shard_count(ns);
+    if let Some(shards) = shards {
+        members.extend(kosha_core::sharding::shard_namespaces(ns, shards));
+    }
+    let mut bytes = 0u64;
+    for member in members {
+        state
+            .refresh_write_manifest(&member)
+            .map_err(|error| match error {
+                KoshaError::ControlPlane(_) => control_store_unavailable(&error.to_string()),
+                _ => publication_error("namespace storage manifest refresh failed", &error),
+            })?;
+        bytes = bytes.saturating_add(state.indexer.pending_storage_bytes(&member));
+        if let Some(manifest) = state.indexer.manifest_shared(&member) {
+            let Some(stored) = usage::owned_segment_bytes(state, &member, &manifest, true) else {
+                return Err(api_error(
+                    ErrorCode::Unavailable,
+                    "namespace storage size unavailable",
+                ));
+            };
+            bytes = bytes.saturating_add(stored);
+        }
+    }
+    if bytes <= max {
+        let incoming = if replace {
+            let batches = match shards {
+                Some(shards) => route_to_shards(ns, shards, documents.to_vec()),
+                None => vec![(ns.clone(), documents.to_vec())],
+            };
+            batches
+                .into_iter()
+                .try_fold(0u64, |total, (member, docs)| {
+                    hydrate_replacement_segments(state, &member)?;
+                    let bytes = state
+                        .indexer
+                        .merged_replacement_bytes(&member, docs)
+                        .map_err(|error| {
+                            api_error(
+                                ErrorCode::Internal,
+                                &format!("replacement size estimate failed: {error}"),
+                            )
+                        })?;
+                    Ok::<_, String>(total.saturating_add(bytes))
+                })?
+        } else {
+            documents
+                .iter()
+                .map(kosha_write::approx_document_bytes)
+                .fold(0, u64::saturating_add)
+        };
+        bytes = bytes.saturating_add(incoming);
+    }
+    if bytes > max {
+        return Err(tenant_rejection(
+            state,
+            tenant,
+            &tenant_limits::Rejection::quota(tenant_limits::RejectReason::StorageQuota, max),
+        ));
+    }
+    Ok(())
 }
 
 /// The widest vector in `documents` (a bag of vectors counts its widest).
@@ -7586,8 +7928,11 @@ fn request_log_line(
 
 /// Extract and validate the API key from request headers.
 /// Returns who the key authenticates as, or a 401 response string on failure.
-fn authenticate(headers: &HashMap<String, String>) -> Result<auth::Principal, String> {
-    let store = match auth::global() {
+fn authenticate(
+    headers: &HashMap<String, String>,
+    auth: &auth::Auth,
+) -> Result<auth::Principal, String> {
+    let store = match auth {
         // Only reachable with an explicit `KOSHA_AUTH=disabled`; an empty
         // key set no longer means "auth off" (see `auth::init_global`).
         auth::Auth::Disabled => return Ok(auth::Principal::full("dev")),
@@ -7630,24 +7975,27 @@ fn unauthenticated(message: &str) -> String {
         .into_raw()
 }
 
-/// True for every write-mutating route — the set a query pod forwards to
-/// `KOSHA_INGEST_HOST` instead of handling locally. False for read-only
-/// routes (search/exists/stats/healthz), which every pod always handles
-/// itself.
-///
-/// `/v1` routes are classified by their row in [`routes::ROUTES`] (#350),
-/// the same table `route()` admits them by, so the two cannot drift. Only
-/// the legacy unversioned routes are matched here by hand, exactly.
-fn is_write_path(request_line: &str) -> bool {
+fn request_route_class(request_line: &str) -> routes::Class {
+    use routes::Class::{Read, Search, Write, WriterRead};
     if let Some(route) = routes::lookup_line(request_line) {
-        return matches!(
-            route.class,
-            routes::Class::Write | routes::Class::WriterRead
-        );
+        return route.class;
     }
+    match legacy_route(request_line) {
+        Some(("POST", "/index" | "/replace" | "/flush" | "/delete")) => Write,
+        Some(("POST", "/exists")) => WriterRead,
+        Some(("POST" | "GET", "/search")) => Search,
+        _ => Read,
+    }
+}
+
+fn is_write_path(request_line: &str) -> bool {
+    request_route_class(request_line) == routes::Class::Write
+}
+
+fn is_ingest_path(request_line: &str) -> bool {
     matches!(
-        legacy_route(request_line),
-        Some(("POST", "/index" | "/replace" | "/flush" | "/delete"))
+        request_route_class(request_line),
+        routes::Class::Write | routes::Class::WriterRead
     )
 }
 
@@ -7669,7 +8017,7 @@ fn legacy_route(request_line: &str) -> Option<(&str, &'static str)> {
     Some((method, path))
 }
 
-/// Forward a write-path request to the single ingest pod, verbatim, and
+/// Forward a writer-routed request to the single ingest pod, verbatim, and
 /// relay its response back as received: status (with its correct reason
 /// phrase), body, and the headers that are part of the API contract
 /// ([`RELAYED_HEADERS`]: `Retry-After`, `X-Request-Id`, `Allow`, the
@@ -7818,7 +8166,7 @@ fn admin_actor(
     headers: &HashMap<String, String>,
     state: &AppState,
 ) -> Option<kosha_control::orgs::Actor> {
-    admin_actor_in(headers, state.admin_auth_key.as_deref(), auth::global())
+    admin_actor_in(headers, state.admin_auth_key.as_deref(), state.auth())
 }
 
 /// A tenant id as presented on a request: non-empty, not `.` or `..`, and
@@ -7878,452 +8226,6 @@ fn valid_new_tenant_id(tenant: &str) -> bool {
 /// names fit the filesystem (see [`MAX_NAMESPACE_NAME_BYTES`]).
 fn valid_new_key_tenant_id(tenant: &str) -> bool {
     valid_new_tenant_id(tenant) && tenant.len() <= MAX_TENANT_ID_BYTES
-}
-
-/// Authorize before dispatch, including compatibility and internal routes.
-/// A response on a legacy unversioned route carries the deprecation
-/// headers (ADR-350 §c): `Deprecation`, `Sunset`, and a `Link` to the
-/// migration notes.
-fn route(
-    request_line: &str,
-    headers: &HashMap<String, String>,
-    body: &[u8],
-    tenant: &str,
-    state: &AppState,
-) -> String {
-    let response = route_checked(request_line, headers, body, tenant, state);
-    if legacy_route(request_line).is_none() {
-        return response;
-    }
-    let response = with_header(
-        response,
-        "link",
-        &format!("<{}>; rel=\"deprecation\"", auth::LEGACY_DEPRECATION_LINK),
-    );
-    let response = with_header(response, "sunset", auth::LEGACY_SUNSET);
-    with_header(
-        response,
-        "deprecation",
-        &format!("@{}", auth::LEGACY_DEPRECATED_AT),
-    )
-}
-
-fn route_checked(
-    request_line: &str,
-    headers: &HashMap<String, String>,
-    body: &[u8],
-    tenant: &str,
-    state: &AppState,
-) -> String {
-    let Some((method, path)) = parse_method_and_path(request_line) else {
-        return api_error(ErrorCode::InvalidArgument, "invalid request line");
-    };
-    if path.starts_with("/v1/admin/") {
-        let Some(operator) = admin_actor(headers, state) else {
-            return api_error(ErrorCode::PermissionDenied, "admin credential required");
-        };
-        if let Some(response) = unrouted_v1(method, path) {
-            return response;
-        }
-        // Organizations, users, projects, audit log (#345).
-        let key_table = match auth::global() {
-            auth::Auth::Keys(keys) => Some(keys),
-            auth::Auth::Disabled => None,
-        };
-        if let Some(response) = org_admin::handle(
-            method,
-            path,
-            headers,
-            body,
-            &state.orgs,
-            key_table,
-            &operator,
-        ) {
-            return response;
-        }
-        // Every other admin route is the operator's and knows nothing of
-        // roles. A request that names a user must not reach one: it would
-        // run with the operator's powers (a key for any tenant, gc, ...).
-        if org_admin::names_actor(headers) {
-            return api_error(
-                ErrorCode::PermissionDenied,
-                "this route is operator-only: it cannot be called with an 'x-kosha-actor' header",
-            );
-        }
-        // Per-operator admin credentials (#346).
-        if let Some(response) = operator_admin::handle(method, path, body, &operator) {
-            return response;
-        }
-    } else if path.starts_with("/internal/") {
-        if !service_authorized(headers, state.internal_service_key.as_deref()) {
-            return api_error(
-                ErrorCode::PermissionDenied,
-                "internal service credential required",
-            );
-        }
-    } else {
-        if !valid_name_component(tenant) {
-            return api_error(ErrorCode::PermissionDenied, "invalid tenant");
-        }
-        if let Some(rest) = path.strip_prefix("/v1/namespaces/") {
-            // `/v1/namespaces/{ns}/{action}`, or the bare
-            // `/v1/namespaces/{ns}` that `DELETE` addresses.
-            // The query string goes first: a '/' in it must not move the
-            // split (`DELETE /v1/namespaces/_shard-0001?x=/` would
-            // otherwise validate `_shard-0001?x=` and delete the shard).
-            let rest = rest.split('?').next().unwrap_or(rest);
-            let ns = match rest.rsplit_once('/') {
-                Some((ns, _action)) => ns,
-                None => rest,
-            };
-            if !addressable_namespace(state, tenant, &path_decode(ns)) {
-                return api_error(ErrorCode::InvalidArgument, "invalid namespace");
-            }
-        }
-        let bare_path = path.split('?').next().unwrap_or(path);
-        let is_legacy = legacy_route(request_line).is_some();
-        if is_legacy {
-            if !auth::legacy_routes_enabled_for(tenant) {
-                return legacy_route_disabled(bare_path);
-            }
-            auth::record_legacy_use(tenant, bare_path);
-            state.metrics.record_legacy_request(bare_path, tenant);
-        }
-        if method == "GET" && (bare_path == "/stats" || bare_path == "/v1/stats") {
-            return if admin_actor(headers, state).is_some() {
-                handle_stats(state)
-            } else {
-                api_error(ErrorCode::PermissionDenied, "use namespace-scoped stats")
-            };
-        }
-        if method == "POST"
-            && [
-                "/index", "/exists", "/replace", "/search", "/flush", "/delete",
-            ]
-            .contains(&bare_path)
-        {
-            let mut value: serde_json::Value = match serde_json::from_slice(body) {
-                Ok(v) => v,
-                Err(_) => return api_error(ErrorCode::InvalidArgument, "invalid JSON"),
-            };
-            let Some(ns) = value.get("namespace").and_then(|v| v.as_str()) else {
-                return api_error(ErrorCode::InvalidArgument, "missing namespace");
-            };
-            if !addressable_namespace(state, tenant, ns) {
-                return api_error(
-                    ErrorCode::InvalidArgument,
-                    "invalid namespace; use an unqualified namespace name",
-                );
-            }
-            value["namespace"] = serde_json::json!(tenant_namespace(tenant, ns));
-            return route_inner(
-                request_line,
-                headers,
-                &serde_json::to_vec(&value).unwrap(),
-                tenant,
-                state,
-            );
-        }
-        if method == "GET" && bare_path == "/search" {
-            let Some((_, query)) = path.split_once('?') else {
-                return api_error(ErrorCode::InvalidArgument, "missing query parameters");
-            };
-            let mut pairs = Vec::new();
-            let mut found = false;
-            for pair in query.split('&') {
-                if let Some(raw) = pair.strip_prefix("ns=") {
-                    if found {
-                        return api_error(ErrorCode::InvalidArgument, "duplicate namespace");
-                    }
-                    let ns = url_decode(raw);
-                    if !addressable_namespace(state, tenant, &ns) {
-                        return api_error(ErrorCode::InvalidArgument, "invalid namespace");
-                    }
-                    // The original escaped component is preserved; tenant names
-                    // are escaped too so they cannot inject query parameters.
-                    let encoded_tenant: String =
-                        tenant.bytes().map(|b| format!("%{b:02X}")).collect();
-                    pairs.push(format!("ns={encoded_tenant}%2F{raw}"));
-                    found = true;
-                } else {
-                    pairs.push(pair.to_string());
-                }
-            }
-            if !found {
-                return api_error(ErrorCode::InvalidArgument, "missing ns");
-            }
-            let scoped = format!("GET /search?{} HTTP/1.1", pairs.join("&"));
-            return route_inner(&scoped, headers, body, tenant, state);
-        }
-        if bare_path.starts_with("/v1/") {
-            if let Some(response) = unrouted_v1(method, path) {
-                return response;
-            }
-        } else if bare_path != "/healthz" {
-            return api_error(ErrorCode::NotFound, "not found");
-        }
-    }
-    route_inner(request_line, headers, body, tenant, state)
-}
-
-/// The 404 (unknown path) or 405 with `Allow` (known path, wrong method)
-/// for a `/v1` request [`routes::ROUTES`] does not serve; `None` when it
-/// does. Everything `route_inner` answers under `/v1` must have a row.
-fn unrouted_v1(method: &str, path: &str) -> Option<String> {
-    if routes::lookup(method, path).is_some() {
-        return None;
-    }
-    let allowed = routes::allowed_methods(path);
-    if allowed.is_empty() {
-        return Some(api_error(ErrorCode::NotFound, "not found"));
-    }
-    let allow = allowed.join(", ");
-    Some(
-        ApiError::new(
-            ErrorCode::MethodNotAllowed,
-            format!("method {method} is not allowed on this path (allowed: {allow})"),
-        )
-        .detail("allowed", allowed)
-        .header("allow", &allow)
-        .into_raw(),
-    )
-}
-
-/// The `/v1` route that replaces a legacy unversioned one.
-fn legacy_replacement(path: &str) -> &'static str {
-    match path {
-        "/index" => "POST /v1/namespaces/{namespace}/documents",
-        "/replace" => "POST /v1/namespaces/{namespace}/replace",
-        "/exists" => "POST /v1/namespaces/{namespace}/exists",
-        "/search" => "POST /v1/namespaces/{namespace}/search",
-        "/flush" => "POST /v1/namespaces/{namespace}/flush",
-        "/delete" => "POST /v1/namespaces/{namespace}/delete",
-        "/stats" => "GET /v1/namespaces/{namespace}/stats",
-        _ => "/v1/namespaces/{namespace}/...",
-    }
-}
-
-/// The 410 for a legacy route that is off for the caller.
-fn legacy_route_disabled(path: &str) -> String {
-    let replacement = legacy_replacement(path);
-    ApiError::new(
-        ErrorCode::LegacyRouteDisabled,
-        format!(
-            "unversioned route {path} is disabled (KOSHA_LEGACY_ROUTES=off); use {replacement}"
-        ),
-    )
-    .detail("route", path)
-    .detail("replacement", replacement)
-    .into_raw()
-}
-
-fn route_inner(
-    request_line: &str,
-    _headers: &HashMap<String, String>,
-    body: &[u8],
-    tenant: &str,
-    state: &AppState,
-) -> String {
-    // ── v1 routes ──────────────────────────────────────────────────────────
-    // `route` admitted only paths in `routes::ROUTES` (#350), the table the
-    // checked-in OpenAPI documents are tested against.
-    if request_line.starts_with("GET /v1/healthz") {
-        return json_ok(&serde_json::json!({"status": "ok"}));
-    }
-
-    if is_create_namespace_route(request_line) {
-        return handle_create_namespace(body, tenant, state);
-    }
-
-    if let Some(ns) = bare_namespace(request_line, "DELETE") {
-        return handle_delete_namespace(&ns, tenant, state);
-    }
-
-    if is_list_namespaces_route(request_line) {
-        return handle_list_namespaces(tenant, state);
-    }
-
-    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/documents") {
-        return handle_index_with_ns(&ns, tenant, body, state);
-    }
-
-    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/replace") {
-        return handle_replace_with_ns(&ns, tenant, body, state);
-    }
-
-    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/search") {
-        return handle_search_post_with_ns(&ns, tenant, body, state);
-    }
-
-    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/flush") {
-        return handle_flush_with_ns(&ns, tenant, body, state);
-    }
-
-    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/delete") {
-        return handle_delete_with_ns(&ns, tenant, body, state);
-    }
-
-    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/exists") {
-        return handle_exists_with_ns(&ns, tenant, body, state);
-    }
-
-    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/schema") {
-        return handle_put_schema_with_ns(&ns, tenant, body, state);
-    }
-
-    if let Some(ns) = extract_namespace(request_line, "GET /v1/namespaces/", "/schema") {
-        return handle_get_schema_with_ns(&ns, tenant, state);
-    }
-
-    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/shards") {
-        return handle_put_shards_with_ns(&ns, tenant, body, state);
-    }
-
-    // ── Namespace branching (#208) ─────────────────────────────────────────
-    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/branch") {
-        return branching::handle_branch_create(&ns, tenant, body, state);
-    }
-
-    if let Some(ns) = extract_namespace(request_line, "GET /v1/namespaces/", "/branches") {
-        return branching::handle_branch_list(&ns, tenant, state);
-    }
-
-    if let Some(ns) = extract_namespace(request_line, "DELETE /v1/namespaces/", "/branch") {
-        return branching::handle_branch_delete(&ns, tenant, state);
-    }
-
-    if request_line.starts_with("GET /v1/stats") {
-        return handle_stats(state);
-    }
-
-    if let Some(ns) = extract_namespace(request_line, "GET /v1/namespaces/", "/stats") {
-        return handle_namespace_stats(&ns, tenant, state);
-    }
-
-    // ── Usage metering (#348) ──────────────────────────────────────────────
-    if request_line.starts_with("GET /v1/usage ") || request_line.starts_with("GET /v1/usage?") {
-        return usage::handle_usage(request_line, Some(tenant), false, state);
-    }
-
-    if request_line.starts_with("GET /v1/admin/usage ")
-        || request_line.starts_with("GET /v1/admin/usage?")
-    {
-        return usage::handle_admin_usage(request_line, state);
-    }
-
-    if request_line.starts_with("GET /v1/admin/usage/reconcile ")
-        || request_line.starts_with("GET /v1/admin/usage/reconcile?")
-    {
-        return usage_reconcile::handle_admin_reconcile(request_line, state);
-    }
-
-    // ── Billing (#349) ─────────────────────────────────────────────────────
-    if let Some(response) = billing::route(request_line, body, tenant, state) {
-        return response;
-    }
-
-    // ── Admin routes (Postgres-backed only) ────────────────────────────────
-    if let Some(response) = api_key_admin::handle(request_line, body) {
-        return response;
-    }
-
-    if request_line.starts_with("POST /v1/admin/rebuild-filter-blooms") {
-        return handle_rebuild_filter_blooms(body, tenant, state);
-    }
-
-    if request_line.starts_with("POST /v1/admin/backfill-offset-tables") {
-        return handle_backfill_offset_tables(body, tenant, state);
-    }
-
-    if request_line.starts_with("POST /v1/admin/compact-namespace") {
-        return handle_compact_namespace(body, tenant, state);
-    }
-
-    if request_line.starts_with("GET /v1/admin/warmup-status") {
-        return json_ok(&state.warmup_status_json());
-    }
-
-    if request_line.starts_with("GET /v1/admin/compaction-status") {
-        return handle_compaction_status(state);
-    }
-
-    if let Some(rest) = request_line.strip_prefix("GET /v1/admin/compaction-jobs/") {
-        let job_id = rest.split([' ', '?']).next().unwrap_or_default();
-        return handle_compaction_job(job_id, state);
-    }
-
-    if request_line.starts_with("POST /v1/admin/import-namespace") {
-        return handle_import_namespace(body, tenant, state);
-    }
-
-    if request_line.starts_with("POST /v1/admin/gc ")
-        || request_line.starts_with("POST /v1/admin/gc?")
-    {
-        return handle_segment_gc(body, state);
-    }
-
-    // Tenant deletion and deletion records (#347).
-    if let Some(response) = namespace_deletion::route_admin(request_line, body, state) {
-        return response;
-    }
-
-    // `GET /internal/segment/...` (pod-to-pod) never reaches here: it
-    // streams a file, so `dispatch` answers it (`internal_segment_response`)
-    // once the internal credential checks out. `route` still answers 403
-    // to any other credential.
-
-    // A query pod's strong-consistency search reads the ingest pod's
-    // unindexed tail (#255). Authorized like the segment route above.
-    if let Some(rest) = request_line.strip_prefix("GET /internal/namespaces/") {
-        let target = rest.split(' ').next().unwrap_or("");
-        let (path, query) = target.split_once('?').unwrap_or((target, ""));
-        return match path.strip_suffix("/unindexed") {
-            Some(ns) if !ns.is_empty() => {
-                unindexed::handle_internal_unindexed(&path_decode(ns), query, state)
-            }
-            _ => api_error(ErrorCode::NotFound, "not found"),
-        };
-    }
-
-    // ── Legacy Phase 1 routes (backward compat) ────────────────────────────
-    // These will be removed after DecoverAI cuts over to the v1 paths.
-    if request_line.starts_with("GET /healthz") {
-        return json_ok(&serde_json::json!({"status": "ok"}));
-    }
-
-    if request_line.starts_with("POST /index") {
-        return handle_index(body, state);
-    }
-
-    if request_line.starts_with("POST /exists") {
-        return handle_exists(body, state);
-    }
-
-    if request_line.starts_with("POST /replace") {
-        return handle_replace(body, state);
-    }
-
-    if request_line.starts_with("GET /search") {
-        return handle_search_get(request_line, state);
-    }
-
-    if request_line.starts_with("POST /search") {
-        return handle_search_post(body, state);
-    }
-
-    if request_line.starts_with("POST /flush") {
-        return handle_flush(body, state);
-    }
-
-    if request_line.starts_with("POST /delete") {
-        return handle_delete(body, state);
-    }
-
-    if request_line.starts_with("GET /stats") {
-        return handle_stats(state);
-    }
-
-    api_error(ErrorCode::NotFound, "not found")
 }
 
 /// Extract a namespace from a v1 path: `METHOD /v1/namespaces/{ns}/suffix ...`
@@ -8389,6 +8291,42 @@ const SCHEMA_FIELD_TYPES: [&str; 8] = [
     "FIELD_TYPE_VECTOR",
 ];
 
+fn parse_schema_field_type(value: &serde_json::Value) -> Option<&'static str> {
+    match value {
+        serde_json::Value::Number(n) => n
+            .as_u64()
+            .and_then(|i| SCHEMA_FIELD_TYPES.get(i as usize).copied()),
+        serde_json::Value::String(t) => {
+            let upper = t.trim().to_ascii_uppercase();
+            let bare = upper.strip_prefix("FIELD_TYPE_").unwrap_or(&upper);
+            SCHEMA_FIELD_TYPES
+                .iter()
+                .copied()
+                .find(|known| known.strip_prefix("FIELD_TYPE_") == Some(bare))
+        }
+        _ => None,
+    }
+}
+
+fn validate_embedding_schema_field_types(schema: &serde_json::Value) -> Result<(), String> {
+    let Some(fields) = schema.get("fields").and_then(serde_json::Value::as_object) else {
+        return Ok(());
+    };
+    for (name, field) in fields {
+        if field.get("embedding").is_some_and(|value| !value.is_null())
+            && ["type", "field_type"]
+                .iter()
+                .filter_map(|key| field.get(*key))
+                .any(|value| parse_schema_field_type(value) != Some("FIELD_TYPE_VECTOR"))
+        {
+            return Err(format!(
+                "schema field '{name}': 'embedding' is only supported on vector fields"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Validate a `NamespaceSchema` from a `CreateNamespaceRequest` and return
 /// it in canonical proto-JSON form: every field has `type` (the
 /// `FIELD_TYPE_*` name), `indexed`, `stored` and `analyzer`. A field type
@@ -8397,7 +8335,7 @@ const SCHEMA_FIELD_TYPES: [&str; 8] = [
 /// Unknown keys and unknown types are rejected rather than ignored. The
 /// analysis extensions `POST /v1/namespaces/{ns}/schema` takes
 /// (`default_analyzer`, `default_stopwords`, and a field's `stopwords`)
-/// pass through unchanged.
+/// and embedding declarations pass through unchanged.
 fn parse_namespace_schema(value: &serde_json::Value) -> Result<serde_json::Value, String> {
     const EXTENSIONS: [&str; 2] = ["default_analyzer", "default_stopwords"];
     let obj = value
@@ -8414,6 +8352,7 @@ fn parse_namespace_schema(value: &serde_json::Value) -> Result<serde_json::Value
         Some(serde_json::Value::Object(map)) => map.clone(),
         Some(_) => return Err("schema.fields must be an object".into()),
     };
+    validate_embedding_schema_field_types(value)?;
     let mut out = serde_json::Map::new();
     for (name, field) in fields {
         if name.is_empty() {
@@ -8423,7 +8362,13 @@ fn parse_namespace_schema(value: &serde_json::Value) -> Result<serde_json::Value
             .as_object()
             .ok_or_else(|| format!("schema field '{name}' must be an object"))?;
         let mut canonical = serde_json::Map::new();
-        let mut field_type = SCHEMA_FIELD_TYPES[0];
+        // An embedding declaration implies a vector field, so the canonical
+        // schema can be saved back through `POST /v1/namespaces/{ns}/schema`.
+        let mut field_type = if field.get("embedding").is_some_and(|v| !v.is_null()) {
+            "FIELD_TYPE_VECTOR"
+        } else {
+            SCHEMA_FIELD_TYPES[0]
+        };
         let mut seen_type = false;
         for (key, v) in field {
             match key.as_str() {
@@ -8432,21 +8377,8 @@ fn parse_namespace_schema(value: &serde_json::Value) -> Result<serde_json::Value
                         return Err(format!("schema field '{name}' names its type twice"));
                     }
                     seen_type = true;
-                    field_type = match v {
-                        serde_json::Value::Number(n) => n
-                            .as_u64()
-                            .and_then(|i| SCHEMA_FIELD_TYPES.get(i as usize).copied()),
-                        serde_json::Value::String(t) => {
-                            let upper = t.trim().to_ascii_uppercase();
-                            let bare = upper.strip_prefix("FIELD_TYPE_").unwrap_or(&upper);
-                            SCHEMA_FIELD_TYPES
-                                .iter()
-                                .copied()
-                                .find(|known| known.strip_prefix("FIELD_TYPE_") == Some(bare))
-                        }
-                        _ => None,
-                    }
-                    .ok_or_else(|| format!("schema field '{name}' has unknown type {v}"))?;
+                    field_type = parse_schema_field_type(v)
+                        .ok_or_else(|| format!("schema field '{name}' has unknown type {v}"))?;
                 }
                 "indexed" | "stored" => {
                     let flag = v
@@ -8472,7 +8404,7 @@ fn parse_namespace_schema(value: &serde_json::Value) -> Result<serde_json::Value
                     };
                     canonical.insert("analyzer".into(), serde_json::json!(analyzers));
                 }
-                "stopwords" => {
+                "stopwords" | "embedding" => {
                     canonical.insert(key.clone(), v.clone());
                 }
                 other => return Err(format!("schema field '{name}' has unknown key '{other}'")),
@@ -8692,7 +8624,19 @@ fn branches_referencing(
 fn handle_delete_namespace(name: &str, tenant: &str, state: &AppState) -> String {
     let id = NamespaceId(tenant_namespace(tenant, name));
     match state.delete_namespace_recorded(&id, None) {
-        Ok(deleted) => namespace_deletion::namespace_deleted_response(name, &deleted),
+        Ok(deleted) => {
+            // #345: audited for a tenant an organization owns.
+            console::audit_tenant_event(
+                state,
+                tenant,
+                &format!("tenant:{tenant}"),
+                "namespace.deleted",
+                "namespace",
+                name,
+                serde_json::json!({ "deletion_id": deleted.record.id }),
+            );
+            namespace_deletion::namespace_deleted_response(name, &deleted)
+        }
         Err(response) => response,
     }
 }
@@ -8736,7 +8680,7 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
     if let Err(response) = check_embedded_dims(state, &ns, &documents) {
         return response;
     }
-    match write_routed(state, &ns, documents, index_into) {
+    match write_routed(state, &ns, documents, false) {
         Ok(count) => {
             state.metrics.record_indexed(count as u64);
             if let Some(meter) = state.usage.as_ref() {
@@ -8832,11 +8776,8 @@ fn resolve_knn_query_text(
     state: &AppState,
     ns: &NamespaceId,
     max_staleness: Option<Duration>,
-    query: &mut kosha_core::SearchQuery,
+    knn: &mut kosha_core::KnnQuery,
 ) -> Result<(), String> {
-    let Some(knn) = query.knn.as_mut() else {
-        return Ok(());
-    };
     let Some(text) = knn.query_text.take() else {
         return Ok(());
     };
@@ -8899,6 +8840,24 @@ fn route_to_shards(
 /// written, which a client retry of the whole (idempotent, id-keyed) batch
 /// repairs. Returns how many documents were written.
 fn write_routed(
+    state: &AppState,
+    ns: &NamespaceId,
+    documents: Vec<kosha_core::Document>,
+    replace: bool,
+) -> Result<usize, String> {
+    let write = if replace { replace_into } else { index_into };
+    if let Some((tenant, limits)) = write_limits(state, ns) {
+        if let Some(max) = limits.bytes_per_namespace {
+            return state.tenant_limits.with_storage_admission(&tenant, || {
+                check_namespace_storage(state, ns, &tenant, max, &documents, replace)?;
+                write_to_shards(state, ns, documents, write)
+            });
+        }
+    }
+    write_to_shards(state, ns, documents, write)
+}
+
+fn write_to_shards(
     state: &AppState,
     ns: &NamespaceId,
     documents: Vec<kosha_core::Document>,
@@ -9123,7 +9082,7 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
     if let Err(response) = check_embedded_dims(state, &namespace, &documents) {
         return response;
     }
-    match write_routed(state, &namespace, documents, replace_into) {
+    match write_routed(state, &namespace, documents, true) {
         Ok(count) => {
             state.metrics.record_indexed(count as u64);
             if let Some(meter) = state.usage.as_ref() {
@@ -9151,32 +9110,7 @@ fn replace_into(
         return Err(response);
     }
 
-    // Replacement scans immutable segments, so materialize any S3-backed
-    // segment directories before entering the indexer lock. Batched across
-    // the whole manifest — see handle_index for why this isn't a per-segment
-    // loop.
-    #[cfg(feature = "s3")]
-    {
-        let manifest = {
-            let indexer = &state.indexer;
-            indexer.manifest_cloned(&namespace)
-        };
-        if let Some(manifest) = manifest {
-            let paths: Vec<PathBuf> = manifest
-                .segments
-                .iter()
-                .map(|entry| manifest.segment_dir(&state.data_dir, &namespace, &entry.segment_id))
-                .collect();
-            // Rewrite/lookup paths must see a segment's full fidelity,
-            // including vectors — unlike the search path, there's no
-            // per-call signal here for whether vectors matter, so always
-            // fetch them.
-            let outcome = state.ensure_segments_local(&paths, true);
-            if let Some(error) = hydration_error_response(&outcome) {
-                return Err(error);
-            }
-        }
-    }
+    hydrate_replacement_segments(state, &namespace)?;
 
     let count = {
         let indexer = &state.indexer;
@@ -9202,6 +9136,24 @@ fn replace_into(
     }
 
     Ok(count)
+}
+
+/// Replacement and quota estimation read the full document including vectors.
+fn hydrate_replacement_segments(state: &AppState, ns: &NamespaceId) -> Result<(), String> {
+    #[cfg(feature = "s3")]
+    if let Some(manifest) = state.indexer.manifest_shared(ns) {
+        let paths: Vec<_> = manifest
+            .segments
+            .iter()
+            .map(|entry| manifest.segment_dir(&state.data_dir, ns, &entry.segment_id))
+            .collect();
+        if let Some(error) = hydration_error_response(&state.ensure_segments_local(&paths, true)) {
+            return Err(error);
+        }
+    }
+    #[cfg(not(feature = "s3"))]
+    let _ = (state, ns);
+    Ok(())
 }
 
 // ─── POST /flush ────────────────────────────────────────────────────────────
@@ -9389,18 +9341,21 @@ fn handle_delete(body: &[u8], state: &AppState) -> String {
         None => return api_error(ErrorCode::InvalidArgument, "missing 'filter' or 'query'"),
     };
 
+    // Each (shard) namespace meters its own deletes as soon as they are
+    // applied (#348), so a later publish failure or another shard's error
+    // cannot drop deletes that did happen.
     let deleted = match state.indexer.shard_count(&ns) {
-        None => delete_in(state, &ns, &filter),
+        None => delete_in(state, &ns, &ns, &filter),
         // A sharded namespace (#207): delete in every shard that exists.
         Some(shards) => kosha_core::sharding::shard_namespaces(&ns, shards)
             .into_iter()
             .filter(|shard| state.indexer.manifest_version(shard).is_some())
-            .try_fold(0, |total, shard| {
-                delete_in(state, &shard, &filter).map(|count| total + count)
+            .try_fold((0, 0), |(count, bytes), shard| {
+                delete_in(state, &shard, &ns, &filter).map(|(c, b)| (count + c, bytes + b))
             }),
     };
     match deleted {
-        Ok(count) => json_ok(&serde_json::json!({
+        Ok((count, _bytes)) => json_ok(&serde_json::json!({
             "deleted": count,
             "namespace": ns.0,
         })),
@@ -9409,12 +9364,16 @@ fn handle_delete(body: &[u8], state: &AppState) -> String {
 }
 
 /// Delete by query in one (unsharded or shard) namespace and publish.
-/// `Err` carries a ready-to-send error response.
+/// `Ok` is the documents deleted and their doc-store bytes (#348); `Err`
+/// carries a ready-to-send error response. The deletes are metered under
+/// `metered_as` (the namespace the client named, the root of a shard) as
+/// soon as they are applied, before the publish, which can fail after.
 fn delete_in(
     state: &AppState,
     ns: &NamespaceId,
+    metered_as: &NamespaceId,
     filter: &kosha_core::FilterClause,
-) -> Result<usize, String> {
+) -> Result<(usize, u64), String> {
     state.ensure_writable(ns)?;
     #[cfg(feature = "s3")]
     if let Some(manifest) = state.indexer.manifest_cloned(ns) {
@@ -9433,20 +9392,23 @@ fn delete_in(
         Some(m) => m,
         None => return Err(namespace_not_found(&ns.0)),
     };
-    let count = state
+    let outcome = state
         .indexer
-        .delete_by_query(ns, &manifest, filter)
+        .delete_by_query_measured(ns, &manifest, filter)
         .map_err(|e| match e {
             // A filter the data cannot answer (e.g. `prefix` on a numeric
             // field) is the client's mistake, not a server fault.
             KoshaError::InvalidQuery(_) => api_error(ErrorCode::InvalidArgument, &e.to_string()),
             e => api_error(ErrorCode::Internal, &format!("delete error: {e}")),
         })?;
+    if let Some(meter) = state.usage.as_ref() {
+        meter.record_delete(metered_as, outcome.documents as u64, outcome.stored_bytes);
+    }
 
     if let Err(e) = state.publish_namespace(ns) {
         return Err(publication_error("deletion publication failed", &e));
     }
-    Ok(count)
+    Ok((outcome.documents, outcome.stored_bytes))
 }
 
 // ─── GET /stats ──────────────────────────────────────────────────────────────
@@ -9544,6 +9506,7 @@ fn handle_stats(state: &AppState) -> String {
             state.indexer.local_retired_count(),
         ),
         "deletion_purge": state.deletion_purge.to_json(),
+        "exports": state.exports.to_json(),
         "rerank": state.rerankers.stats_json(),
         "embedding_providers": state.embedders.providers(),
     }))
@@ -9565,9 +9528,11 @@ fn add_manifest_follow_stats(state: &AppState, ns: &NamespaceId, entry: &mut ser
     let status = state.manifest_follow.status(ns);
     let lag = state.manifest_follow.lag(ns, Instant::now());
     entry["stored_manifest_version"] = serde_json::json!(status.as_ref().map(|s| s.stored_version));
-    entry["last_refresh_at"] = serde_json::json!(status
-        .as_ref()
-        .map(|s| manifest_follow::unix_seconds(s.last_refresh_at)));
+    entry["last_refresh_at"] = serde_json::json!(status.as_ref().map(|s| s
+        .last_refresh_at
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()));
     entry["manifest_lag_seconds"] = serde_json::json!(lag.map(|d| d.as_secs_f64()));
 }
 
@@ -9580,7 +9545,7 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
 fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String {
     let t_request = Instant::now();
     // Parse the full JSON body that includes namespace alongside SearchQuery fields.
-    let body_val: serde_json::Value = match serde_json::from_slice(body) {
+    let mut body_val: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => return api_error(ErrorCode::InvalidArgument, &format!("invalid JSON: {e}")),
     };
@@ -9613,6 +9578,9 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
         Err(e) => return api_error(ErrorCode::InvalidArgument, &e),
     };
 
+    if body_val.pointer("/rank_by/rrf").is_some() && body_val.get("query_text").is_none() {
+        body_val["query_text"] = serde_json::Value::String(String::new());
+    }
     let mut query: kosha_core::SearchQuery = match serde_json::from_value(body_val) {
         Ok(q) => q,
         Err(e) => {
@@ -9629,8 +9597,18 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     }
     // `knn.query_text` becomes `knn.vector` here (#209), before the cache
     // key and the searcher see the query.
-    if let Err(response) = resolve_knn_query_text(state, &ns, max_staleness, &mut query) {
-        return response;
+    let subqueries = match &mut query.rank_by {
+        Some(kosha_core::RankBy::Fusion(fusion)) => fusion.rrf.queries.as_mut_slice(),
+        _ => &mut [],
+    };
+    for knn in query.knn.iter_mut().chain(
+        subqueries
+            .iter_mut()
+            .filter_map(|subquery| subquery.knn.as_mut()),
+    ) {
+        if let Err(response) = resolve_knn_query_text(state, &ns, max_staleness, knn) {
+            return response;
+        }
     }
     let query = query;
     // A reranked request searches for its first stage (top `top_n` from
@@ -9686,14 +9664,14 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     // A `rank_by` decaying from `"now"` (#212) answers differently a moment
     // later on an unchanged manifest, so it is never cached.
     let time_dependent = query
-        .rank_by
-        .as_ref()
+        .score_modifiers()
         .is_some_and(|rank_by| rank_by.is_time_dependent());
     // A search that included unindexed writes (#255) answers for more than
     // `manifest.version`, so it neither reads nor fills the cache.
     let cache_key = if result_cache_budget() > 0
         && !query.no_cache.unwrap_or(false)
         && !time_dependent
+        && query.multi_rrf().is_none()
         && view.is_plain()
     {
         canonical_query_for_cache(&query).map(|mut canonical| {
@@ -9763,7 +9741,7 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     // Footer-first hydrate: bloom-prune before downloading full segments.
     let t_hydrate = Instant::now();
     #[cfg(feature = "s3")]
-    let hydration = {
+    let mut hydrate = |search_query: &SearchQuery, fused| {
         // Namespace-level cached hydration verdict (Tier 1 O2): skip
         // `hydrate_segments_for_search` entirely when we've already
         // confirmed — for this `(namespace, manifest_version)` pair — that
@@ -9782,14 +9760,23 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
         // need one of them; `covers` enforces that per-file-class check
         // instead of trusting a flat "namespace hydrated" bool.
         let needs_filters = query_filter_fields(search_query);
+        let exact_quantized_vectors = fused
+            && state.s3_storage.is_some()
+            && search_query
+                .knn
+                .as_ref()
+                .is_some_and(|knn| !knn.is_late_interaction());
         let needs_vectors_key = knn_verdict_key(search_query);
         let needs_vectors = needs_vectors_key.as_deref();
-        let cached_covers = state
-            .completed_hydrations
-            .lock()
-            .unwrap()
-            .get(&verdict_key)
-            .is_some_and(|v| v.covers(needs_filters.as_ref(), needs_vectors));
+        // Exact shortlist rescoring needs its header even if a previous
+        // non-fusion query marked the scoring set warm.
+        let cached_covers = !exact_quantized_vectors
+            && state
+                .completed_hydrations
+                .lock()
+                .unwrap()
+                .get(&verdict_key)
+                .is_some_and(|v| v.covers(needs_filters.as_ref(), needs_vectors));
         let outcome = if cached_covers {
             // The cached verdict can only ever cover the *static* scoring
             // set (footers/TOCs/offsets/filters). Posting blobs are fetched
@@ -9809,12 +9796,13 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
                 &mut segment_pins,
             )
         } else {
-            let outcome = state.hydrate_segments_for_search(
+            let outcome = state.hydrate_search_scoring_set(
                 &ns,
                 manifest,
                 search_query,
                 &hydration_request,
                 Some(&mut segment_pins),
+                exact_quantized_vectors,
             );
             // Cache what this pass verified: the static scoring set is
             // local for this manifest version, so future warm queries with
@@ -9853,9 +9841,29 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
             outcome
         };
         if let Some(error) = hydration_error_response(&outcome) {
-            return error;
+            return Err(error);
         }
-        outcome
+        Ok(outcome)
+    };
+    #[cfg(feature = "s3")]
+    let hydration = if let Some(subqueries) = search_query.rrf_subqueries() {
+        let mut combined = HydrationOutcome::default();
+        for subquery in subqueries {
+            let outcome = match hydrate(&subquery, true) {
+                Ok(outcome) => outcome,
+                Err(error) => return error,
+            };
+            combined.files_fetched += outcome.files_fetched;
+            combined.bytes_fetched += outcome.bytes_fetched;
+            combined.rounds += outcome.rounds;
+            combined.postings.add(&outcome.postings);
+        }
+        combined
+    } else {
+        match hydrate(search_query, false) {
+            Ok(outcome) => outcome,
+            Err(error) => return error,
+        }
     };
     #[cfg(not(feature = "s3"))]
     let hydration = HydrationOutcome::default();
@@ -9887,7 +9895,12 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     let ensure_doc_store = |pages: &[PageSegment<'_>]| {
         // Same accountant as the scoring-set fetch above: the request pays
         // for its page's bytes, so the request's ceiling has to cover them.
-        let stats = state.hydrate_page_docs(pages, &hydration_request, &rid);
+        let mode = if search_query.multi_rrf().is_some() && pages.iter().any(|page| page.vectors) {
+            doc_spans::ReadMode::Ranged
+        } else {
+            state.doc_read_mode
+        };
+        let stats = state.hydrate_page_docs(pages, &hydration_request, &rid, mode);
         page_fetch.lock().unwrap().add(&stats);
     };
     #[cfg(feature = "s3")]
@@ -10529,7 +10542,7 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
     let ensure_doc_store = |pages: &[PageSegment<'_>]| {
         // Same accountant as the scoring-set fetch above: the request pays
         // for its page's bytes, so the request's ceiling has to cover them.
-        let stats = state.hydrate_page_docs(pages, &hydration_request, &rid);
+        let stats = state.hydrate_page_docs(pages, &hydration_request, &rid, state.doc_read_mode);
         page_fetch.lock().unwrap().add(&stats);
     };
     #[cfg(feature = "s3")]
@@ -10718,6 +10731,9 @@ fn handle_put_schema_with_ns(
         Some(inner) => inner.clone(),
         None => value,
     };
+    if let Err(e) = validate_embedding_schema_field_types(&value) {
+        return api_error(ErrorCode::InvalidArgument, &format!("invalid schema: {e}"));
+    }
     let schema: kosha_core::NamespaceSchema = match serde_json::from_value(value) {
         Ok(schema) => schema,
         Err(e) => return api_error(ErrorCode::InvalidArgument, &format!("invalid schema: {e}")),
@@ -10732,6 +10748,12 @@ fn handle_put_schema_with_ns(
     if let Some(shards) = state.indexer.shard_count(&ns) {
         pinned.extend(kosha_core::sharding::shard_namespaces(&ns, shards));
     }
+    // Schema evolution rules (#347): a change existing documents cannot
+    // follow is a 409 naming the field and the rule.
+    let changes = match schema_rules::check(state, &pinned, &schema) {
+        Ok(changes) => changes,
+        Err(response) => return response,
+    };
     for target in &pinned {
         if let Some(conflict) = state.indexer.embedding_conflict(target, &schema) {
             return api_error(ErrorCode::Conflict, &conflict);
@@ -10739,6 +10761,9 @@ fn handle_put_schema_with_ns(
     }
     let changed = match state.indexer.set_schema(&ns, schema.clone()) {
         Ok(changed) => changed,
+        Err(KoshaError::InvalidQuery(message)) if schema_rules::is_reindex_refusal(&message) => {
+            return api_error(ErrorCode::Conflict, &message)
+        }
         Err(KoshaError::InvalidQuery(message)) => {
             return api_error(ErrorCode::InvalidArgument, &message)
         }
@@ -10761,6 +10786,7 @@ fn handle_put_schema_with_ns(
         "namespace": namespace,
         "schema": schema,
         "changed": changed,
+        "changes": changes,
     }))
 }
 
@@ -10975,6 +11001,8 @@ fn handle_list_namespaces(tenant: &str, state: &AppState) -> String {
         .into_iter()
         .filter_map(|ns| ns.0.strip_prefix(&prefix).map(str::to_string))
         .filter(|name| !name.is_empty() && !name.contains('/'))
+        // A key restricted to namespaces lists only those (#346).
+        .filter(|name| authz::may_see_namespace(name))
         .collect();
     names.sort_unstable();
     names.dedup();
@@ -12625,54 +12653,6 @@ fn capped_segment_list<'a>(segments: impl ExactSizeIterator<Item = &'a str>) -> 
     }
 }
 
-// ─── Internal (pod-to-pod) routes ───────────────────────────────────────────
-
-/// `GET /internal/segment/<relative-path>` — stream an already-cached
-/// segment file's raw bytes to a peer replica, for `fetch_from_peer`, as
-/// `application/octet-stream` in O(chunk) memory (#259). Only called once
-/// the internal service credential checked out (see `dispatch`); ordinary
-/// tenant credentials cannot retrieve another tenant's cached files.
-///
-/// `relative_path` is validated the same way any other cache key is
-/// (`Cache::path_for` rejects `..`/absolute-path traversal). 404 (not an
-/// error — the caller retries against the lease owner) when the path isn't
-/// cached on this pod, whether because it's not the owner or hydration is
-/// still in flight.
-fn internal_segment_response(request_line: &str, state: &AppState) -> http::Response {
-    #[cfg(all(feature = "s3", feature = "postgres"))]
-    {
-        let raw = request_line
-            .strip_prefix("GET /internal/segment/")
-            .and_then(|rest| rest.split(' ').next())
-            .unwrap_or("");
-        let relative_path = path_decode(raw.split('?').next().unwrap_or(raw));
-        let local_path = match state.cache.path_for(&relative_path) {
-            Ok(p) => p,
-            Err(_) => {
-                return http::Response::from_raw(api_error(
-                    ErrorCode::InvalidArgument,
-                    "invalid path",
-                ))
-            }
-        };
-        // Files land in the cache by rename, complete, so an open file is
-        // a whole one; its length is fixed from here on.
-        let opened = std::fs::File::open(&local_path)
-            .and_then(|file| file.metadata().map(|meta| (file, meta)));
-        match opened {
-            Ok((file, meta)) if meta.is_file() => {
-                http::Response::file(file, meta.len(), "application/octet-stream")
-            }
-            _ => http::Response::from_raw(api_error(ErrorCode::NotFound, "not cached here")),
-        }
-    }
-    #[cfg(not(all(feature = "s3", feature = "postgres")))]
-    {
-        let _ = (request_line, state);
-        http::Response::from_raw(api_error(ErrorCode::NotFound, "not found"))
-    }
-}
-
 // ─── JSON response helpers ──────────────────────────────────────────────────
 
 fn json_ok<T: serde::Serialize>(value: &T) -> String {
@@ -12909,7 +12889,7 @@ fn search_error_response(e: &KoshaError) -> String {
         KoshaError::Overloaded(_) => {
             overload_shed_response("search_overloaded", &format!("search overloaded: {e}"))
         }
-        KoshaError::ControlPlane(_) => {
+        KoshaError::ControlPlane(_) | KoshaError::ManifestCommitNotAttempted(_) => {
             ApiError::new(ErrorCode::Unavailable, format!("search unavailable: {e}"))
                 .redact("search unavailable: the control store could not be reached")
                 .detail("reason", "control_store")
@@ -13154,6 +13134,7 @@ impl Drop for AppState {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use crate::http_routes::route_inner;
     use kosha_core::{Document, DocumentId, Field};
     use std::fs;
     use std::io::{BufRead, BufReader, Read, Write};
@@ -13189,11 +13170,23 @@ mod tests {
     #[derive(Clone)]
     pub(crate) struct SharedManifestStore {
         inner: Arc<Mutex<kosha_control::Controller>>,
+        branch_commit_failure: Arc<Mutex<Option<InjectedBranchCommitFailure>>>,
         lose_next_commit_reply: Arc<std::sync::atomic::AtomicBool>,
         /// Commit this manifest (over the stored version) right after the
         /// next `manifest_version` read: a writer racing the reader.
         commit_on_next_version_read: Arc<Mutex<Option<kosha_core::Manifest>>>,
     }
+    struct InjectedBranchCommitFailure {
+        namespace: NamespaceId,
+        expected_version: u64,
+        failure: BranchCommitFailure,
+    }
+
+    enum BranchCommitFailure {
+        BeforeCommit,
+        LostReply,
+    }
+
     impl ControlStore for SharedManifestStore {
         fn create_namespace(&mut self, id: NamespaceId) -> Result<(), KoshaError> {
             self.inner.lock().unwrap().create_namespace(id)
@@ -13236,10 +13229,30 @@ mod tests {
             expected: u64,
             manifest: kosha_core::Manifest,
         ) -> Result<(), KoshaError> {
+            let failure = {
+                let mut failure = self.branch_commit_failure.lock().unwrap();
+                if failure.as_ref().is_some_and(|injected| {
+                    &injected.namespace == id && injected.expected_version == expected
+                }) {
+                    failure.take().map(|injected| injected.failure)
+                } else {
+                    None
+                }
+            };
+            if matches!(failure, Some(BranchCommitFailure::BeforeCommit)) {
+                return Err(KoshaError::ManifestCommitNotAttempted(
+                    "injected pre-commit failure".into(),
+                ));
+            }
             self.inner
                 .lock()
                 .unwrap()
                 .compare_and_swap_manifest(id, expected, manifest)?;
+            if matches!(failure, Some(BranchCommitFailure::LostReply)) {
+                return Err(KoshaError::ControlPlane(
+                    "injected lost commit reply".into(),
+                ));
+            }
             if self
                 .lose_next_commit_reply
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -13329,12 +13342,73 @@ mod tests {
         ) -> Result<Vec<kosha_core::deletion::DeletionRecord>, KoshaError> {
             Ok(self.inner.lock().unwrap().deletions_after(after, limit))
         }
+        // #347 part 2: the pod registry, acknowledgements and exports.
+        fn note_deletion_exports(&mut self, id: &str, count: u64) -> Result<(), KoshaError> {
+            ControlStore::note_deletion_exports(&mut *self.inner.lock().unwrap(), id, count)
+        }
+        fn heartbeat_pod(
+            &mut self,
+            pod: &kosha_core::deletion::PodHeartbeat,
+        ) -> Result<(), KoshaError> {
+            ControlStore::heartbeat_pod(&mut *self.inner.lock().unwrap(), pod)
+        }
+        fn acknowledge_deletion(&mut self, id: &str, pod: &str) -> Result<(), KoshaError> {
+            ControlStore::acknowledge_deletion(&mut *self.inner.lock().unwrap(), id, pod)
+        }
+        fn deletion_ack_status(
+            &self,
+            id: &str,
+            live_within_ms: u64,
+        ) -> Result<kosha_core::deletion::AckStatus, KoshaError> {
+            ControlStore::deletion_ack_status(&*self.inner.lock().unwrap(), id, live_within_ms)
+        }
+        fn finalize_deletion(
+            &mut self,
+            id: &str,
+            live_within_ms: u64,
+        ) -> Result<kosha_core::deletion::DeletionRecord, KoshaError> {
+            ControlStore::finalize_deletion(&mut *self.inner.lock().unwrap(), id, live_within_ms)
+        }
+        fn create_export(
+            &mut self,
+            export: &kosha_core::export::NewExport,
+        ) -> Result<kosha_core::export::ExportRecord, KoshaError> {
+            ControlStore::create_export(&mut *self.inner.lock().unwrap(), export)
+        }
+        fn export(&self, id: &str) -> Result<Option<kosha_core::export::ExportRecord>, KoshaError> {
+            ControlStore::export(&*self.inner.lock().unwrap(), id)
+        }
+        fn exports(
+            &self,
+            filter: &kosha_core::export::ExportFilter,
+        ) -> Result<Vec<kosha_core::export::ExportRecord>, KoshaError> {
+            ControlStore::exports(&*self.inner.lock().unwrap(), filter)
+        }
+        fn update_export(
+            &mut self,
+            id: &str,
+            update: &kosha_core::export::ExportUpdate,
+        ) -> Result<Option<kosha_core::export::ExportRecord>, KoshaError> {
+            ControlStore::update_export(&mut *self.inner.lock().unwrap(), id, update)
+        }
+        fn claim_export(
+            &mut self,
+            id: &str,
+            holder: &str,
+            stale_after_ms: u64,
+        ) -> Result<Option<kosha_core::export::ExportRecord>, KoshaError> {
+            ControlStore::claim_export(&mut *self.inner.lock().unwrap(), id, holder, stale_after_ms)
+        }
+        fn delete_exports(&mut self, ids: &[String]) -> Result<u64, KoshaError> {
+            ControlStore::delete_exports(&mut *self.inner.lock().unwrap(), ids)
+        }
     }
 
     impl SharedManifestStore {
         pub(crate) fn new(inner: Arc<Mutex<kosha_control::Controller>>) -> Self {
             Self {
                 inner,
+                branch_commit_failure: Default::default(),
                 lose_next_commit_reply: Default::default(),
                 commit_on_next_version_read: Default::default(),
             }
@@ -14389,6 +14463,7 @@ mod tests {
     pub(crate) fn shared_store() -> SharedManifestStore {
         SharedManifestStore {
             inner: Arc::new(Mutex::new(kosha_control::Controller::new())),
+            branch_commit_failure: Default::default(),
             lose_next_commit_reply: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             commit_on_next_version_read: Arc::new(Mutex::new(None)),
         }
@@ -14416,6 +14491,10 @@ mod tests {
         }
     }
     impl ControlStore for OutageStore {
+        fn check_writable(&self) -> Result<(), KoshaError> {
+            self.check()
+        }
+
         fn create_namespace(&mut self, id: NamespaceId) -> Result<(), KoshaError> {
             self.inner.create_namespace(id)
         }
@@ -14630,7 +14709,7 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(entry["manifest_version"], published);
-        assert!(entry["last_refresh_at"].as_f64().unwrap() > 0.0);
+        assert!(entry["last_refresh_at"].as_i64().unwrap() > 0);
         assert!(entry["manifest_lag_seconds"].as_f64().unwrap() < 5.0);
         assert_eq!(stats["manifest_refresh"]["enabled"], true);
         assert_eq!(stats["manifest_refresh"]["interval_ms"], 20);
@@ -14835,6 +14914,106 @@ mod tests {
         );
     }
 
+    #[test]
+    fn control_plane_outage_refuses_writes_before_buffering_and_recovers() {
+        let store = outage_store();
+        let (ingest, _) = ingest_and_query(&store, None);
+        let ns = NamespaceId("tenant/outage".into());
+        let send = || {
+            dispatch_as(
+                &ingest,
+                "tenant",
+                "POST /v1/namespaces/outage/documents",
+                one_doc("a", "hello"),
+            )
+            .into_raw_string()
+        };
+
+        store.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        let refused = send();
+        assert!(refused.starts_with("HTTP/1.1 503"), "{refused}");
+        assert_eq!(header_value(&refused, "retry-after"), Some("1"));
+        assert_eq!(body_of(&refused)["details"]["reason"], "control_store");
+        assert_eq!(ingest.indexer.pending_doc_count(&ns), 0);
+
+        store.down.store(false, std::sync::atomic::Ordering::SeqCst);
+        let recovered = send();
+        assert!(recovered.starts_with("HTTP/1.1 200"), "{recovered}");
+        assert_eq!(ingest.indexer.pending_doc_count(&ns), 1);
+    }
+
+    #[test]
+    fn branch_creation_retries_only_when_the_commit_was_not_attempted() {
+        let store = shared_store();
+        let state = test_state();
+        *state.controller.lock().unwrap() = Box::new(store.clone());
+        index_text_and_publish(&state, &NamespaceId("tenant/parent".into()), &["a"]);
+        let branch = |name| {
+            v1(
+                &state,
+                "tenant",
+                "POST /v1/namespaces/parent/branch",
+                serde_json::json!({"name": name}),
+            )
+        };
+        let version = |name| {
+            store
+                .manifest_version(&NamespaceId(format!("tenant/{name}")))
+                .unwrap()
+        };
+
+        *store.branch_commit_failure.lock().unwrap() = Some(InjectedBranchCommitFailure {
+            namespace: NamespaceId("tenant/refused".into()),
+            expected_version: 0,
+            failure: BranchCommitFailure::BeforeCommit,
+        });
+        let refused = branch("refused");
+        assert_eq!(status_of(&refused), 503, "{refused}");
+        assert_eq!(body_of(&refused)["retryable"], true);
+        assert_eq!(header_of(&refused, "retry-after").as_deref(), Some("1"));
+        assert_eq!(version("refused"), None);
+        let retried = branch("refused");
+        assert_eq!(status_of(&retried), 200, "{retried}");
+        assert_eq!(version("refused"), Some(1));
+
+        *store.branch_commit_failure.lock().unwrap() = Some(InjectedBranchCommitFailure {
+            namespace: NamespaceId("tenant/ambiguous".into()),
+            expected_version: 0,
+            failure: BranchCommitFailure::LostReply,
+        });
+        let ambiguous = branch("ambiguous");
+        assert_eq!(status_of(&ambiguous), 503, "{ambiguous}");
+        assert_eq!(body_of(&ambiguous)["retryable"], false);
+        assert_eq!(body_of(&ambiguous)["details"]["outcome"], "unknown");
+        assert_eq!(header_of(&ambiguous, "retry-after"), None);
+        assert_eq!(version("ambiguous"), Some(1));
+
+        let retired = NamespaceId("tenant/retired".into());
+        {
+            let mut controller = store.inner.lock().unwrap();
+            controller.ensure_namespace(retired.clone());
+            controller.delete_namespace(&retired, 7).unwrap();
+        }
+        assert_eq!(version("retired"), None);
+        *store.branch_commit_failure.lock().unwrap() = Some(InjectedBranchCommitFailure {
+            namespace: retired.clone(),
+            expected_version: 8,
+            failure: BranchCommitFailure::BeforeCommit,
+        });
+        let partial = branch("retired");
+        assert_eq!(status_of(&partial), 503, "{partial}");
+        let body = body_of(&partial);
+        assert_eq!(body["retryable"], false);
+        assert_eq!(header_of(&partial, "retry-after"), None);
+        assert_eq!(body["details"]["outcome"], "branch_not_created");
+        assert_eq!(body["details"]["placeholder_version"], 8);
+        let placeholder = store.manifest_cloned(&retired).unwrap();
+        assert_eq!(placeholder.version, 8);
+        assert!(placeholder.branch.is_none() && placeholder.segments.is_empty());
+        let replay = branch("retired");
+        assert_eq!(status_of(&replay), 409, "{replay}");
+    }
+
     /// `KOSHA_MANIFEST_REFRESH_MS=0`: no refresher, so every search checks
     /// the control store (the pre-#232 behavior) — and an outage still
     /// serves last-known-good.
@@ -14866,6 +15045,83 @@ mod tests {
             )
             .unwrap();
         state.indexer.flush_namespace(ns).unwrap();
+    }
+
+    #[test]
+    fn indexer_maintains_namespace_centroids_when_it_follows_an_ingest_flush() {
+        use kosha_segment::namespace_centroids::{Snapshot, FILE_NAME};
+
+        let shared = shared_store();
+        let ns = NamespaceId("routing".into());
+        let mut ingest = test_state();
+        ingest.role = role::Role::Ingest;
+        ingest.namespace_centroids_enabled = false;
+        let mut indexer = test_state();
+        indexer.role = role::Role::Indexer;
+        indexer.namespace_centroids_enabled = true;
+        for state in [&ingest, &indexer] {
+            *state.controller.lock().unwrap() = Box::new(shared.clone());
+        }
+        for i in 0..2 {
+            ingest
+                .indexer
+                .index_documents(
+                    ns.clone(),
+                    vec![Document {
+                        id: DocumentId(format!("doc-{i}")),
+                        fields: vec![Field::vector("emb", vec![1.0, i as f32])],
+                    }],
+                )
+                .unwrap();
+            ingest.indexer.flush_namespace(&ns).unwrap();
+            ingest.publish_namespace(&ns).unwrap();
+            let manifest = shared.manifest_cloned(&ns).unwrap();
+            let segment = &manifest.segments.last().unwrap().segment_id;
+            copy_dir(
+                &manifest.segment_dir(&ingest.data_dir, &ns, segment),
+                &manifest.segment_dir(&indexer.data_dir, &ns, segment),
+            );
+            indexer.indexer_follow_namespace(&ns).unwrap();
+            let path = indexer.data_dir.join(&ns.0).join(FILE_NAME);
+            let snapshot: Snapshot = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert!(snapshot.matches(
+                manifest.version,
+                manifest.segments.iter().map(|s| s.segment_id.0.as_str()),
+            ));
+            assert_eq!(snapshot.directory.posting_count(&segment.0, "emb", 2), 1);
+        }
+        assert!(!ingest.data_dir.join(&ns.0).join(FILE_NAME).exists());
+    }
+
+    #[test]
+    fn indexer_bootstraps_namespace_centroids_for_an_already_restored_manifest() {
+        use kosha_segment::namespace_centroids::{Snapshot, FILE_NAME};
+
+        let mut state = test_state();
+        state.role = role::Role::Indexer;
+        state.namespace_centroids_enabled = false;
+        let ns = NamespaceId("bootstrap-routing".into());
+        write_and_flush(&state, &ns, "before-startup");
+        state.publish_namespace(&ns).unwrap();
+        let manifest = state
+            .controller
+            .lock()
+            .unwrap()
+            .manifest_cloned(&ns)
+            .unwrap();
+        state.indexer.restore_manifest(ns.clone(), manifest.clone());
+        let path = state.data_dir.join(&ns.0).join(FILE_NAME);
+        assert!(!path.exists());
+
+        state.namespace_centroids_enabled = true;
+        state.indexer_follow_all();
+        assert!(!path.exists()); // the already-current manifest is skipped
+        state.bootstrap_namespace_centroids();
+        let snapshot: Snapshot = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(snapshot.matches(
+            manifest.version,
+            manifest.segments.iter().map(|s| s.segment_id.0.as_str()),
+        ));
     }
 
     fn wal_is_empty(state: &AppState) -> bool {
@@ -15073,7 +15329,7 @@ mod tests {
         }
     }
 
-    struct FailingManifestStore(kosha_control::Controller);
+    pub(crate) struct FailingManifestStore(pub(crate) kosha_control::Controller);
     impl ControlStore for FailingManifestStore {
         fn create_namespace(&mut self, id: NamespaceId) -> Result<(), KoshaError> {
             self.0.create_namespace(id)
@@ -16320,6 +16576,134 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
     }
 
+    #[test]
+    fn weighted_multi_rrf_pages_and_reranks_the_fused_union() {
+        let mut state = test_state();
+        let provider = Arc::new(CountingReranker {
+            name: "mock",
+            term: "beta",
+            delay: Duration::ZERO,
+            calls: Default::default(),
+        });
+        state.rerankers = rerank::RerankRegistry::with_providers(vec![provider.clone()]);
+        let ns = NamespaceId("multirrf".into());
+        let doc = |id: &str, text: &str, v: [f32; 2]| Document {
+            id: DocumentId(id.into()),
+            fields: vec![
+                Field::text("text", text),
+                Field::vector("emb", v.to_vec()),
+                Field::keyword("tag", id),
+            ],
+        };
+        for batch in [
+            vec![
+                doc("a", "alpha alpha", [-1.0, 0.0]),
+                doc("c", "alpha beta", [0.99, 0.1]),
+            ],
+            vec![
+                doc("b", "beta beta", [-1.0, 0.0]),
+                doc(
+                    "d",
+                    "beta beta beta marker marker marker marker marker",
+                    [1.0, 0.0],
+                ),
+                doc("e", "alpha muted muted muted", [0.0, 1.0]),
+            ],
+        ] {
+            state.indexer.index_documents(ns.clone(), batch).unwrap();
+            state.indexer.flush_namespace(&ns).unwrap();
+        }
+        state.publish_namespace(&ns).unwrap();
+        let mut body = serde_json::json!({
+            "namespace": "multirrf",
+            "rank_by": {"rrf": {
+                "queries": [
+                    {"query_text": "alpha"},
+                    {"query_text": "beta", "filter": {"terms": {"tag": ["b", "c"]}}},
+                    {"knn": {"field": "emb", "vector": [1.0, 0.0], "k": 2, "num_candidates": 1000}}
+                ],
+                "weights": [1.0, 1.0, 0.5],
+                "rank_window_size": 2
+            }},
+            "exact_total_hits": false,
+            "total_hits_cap": 3
+        });
+        let post =
+            |body: &serde_json::Value| handle_search_post(body.to_string().as_bytes(), &state);
+        let search = |body: &serde_json::Value| -> kosha_core::SearchResult {
+            let response = post(body);
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap()
+        };
+        let full = search(&body);
+        assert_eq!(full.total_hits, 3);
+        assert_eq!(full.total_hits_relation, kosha_core::TotalHitsRelation::Gte);
+        let ids = |result: &kosha_core::SearchResult| {
+            result
+                .results
+                .iter()
+                .map(|hit| hit.doc_id.0.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&full), ["c", "a", "b", "d"]);
+        body["max_results"] = serde_json::json!(2);
+        body["from"] = serde_json::json!(1);
+        assert_eq!(ids(&search(&body)), ["a", "b"]);
+
+        body["from"] = serde_json::json!(0);
+        body["max_results"] = serde_json::json!(1);
+        let mut paged = Vec::new();
+        for _ in 0..=full.results.len() {
+            let page = search(&body);
+            assert_eq!(page.total_hits, full.total_hits);
+            assert_eq!(page.total_hits_relation, full.total_hits_relation);
+            let Some(last) = page.results.last() else {
+                break;
+            };
+            body["search_after"] = serde_json::json!([last.score.to_string(), last.doc_id.0]);
+            paged.extend(ids(&page));
+        }
+        assert_eq!(paged, ids(&full));
+        assert!(search(&body).results.is_empty());
+
+        let mut by_id = body.clone();
+        by_id["sort"] = serde_json::json!([{"_id": {"order": "asc"}}]);
+        by_id.as_object_mut().unwrap().remove("search_after");
+        for id in ["a", "b", "c", "d"] {
+            assert_eq!(ids(&search(&by_id)), [id]);
+            by_id["search_after"] = serde_json::json!([id]);
+        }
+        assert!(search(&by_id).results.is_empty());
+
+        body.as_object_mut().unwrap().remove("search_after");
+        body["exact_total_hits"] = serde_json::json!(true);
+        body["source_includes"] = serde_json::json!(["tag"]);
+        body["rerank"] = serde_json::json!({
+            "provider": "mock", "query": "beta", "field": "text", "top_n": 3
+        });
+        let reranked = search(&body);
+        assert_eq!(ids(&reranked), ["b"]);
+        assert_eq!(reranked.total_hits, 4);
+        assert_eq!(
+            reranked.total_hits_relation,
+            kosha_core::TotalHitsRelation::Eq
+        );
+        assert_eq!(reranked.results[0].rerank_score, Some(2.0));
+        assert_eq!(reranked.results[0].fused_score, Some(full.results[2].score));
+        assert_eq!(reranked.results[0].fields.len(), 1);
+        assert_eq!(reranked.results[0].fields[0].name, "tag");
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        body["rerank"].as_object_mut().unwrap().remove("top_n");
+        assert_eq!(ids(&search(&body)), ["d"]);
+        body["from"] = serde_json::json!(1);
+        assert_eq!(ids(&search(&body)), ["b"]);
+
+        body["rank_by"]["rrf"]["weights"] = serde_json::json!([1.0]);
+        let response = post(&body);
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    }
+
     /// Scores a document by how often `term` occurs in it, after `delay`.
     struct CountingReranker {
         name: &'static str,
@@ -16754,6 +17138,7 @@ mod tests {
 
     #[test]
     fn regression_admin_credential_is_distinct_from_tenant_and_peer_keys() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let mut state = test_state();
         state.admin_auth_key = Some("admin-secret".into());
         state.internal_service_key = Some("peer-secret".into());
@@ -17050,6 +17435,7 @@ mod tests {
 
     #[test]
     fn regression_legacy_routes_cannot_read_another_tenant() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let state = test_state();
         let ns = NamespaceId("victim/private".into());
         state
@@ -17462,6 +17848,115 @@ mod tests {
                 "{f} must always be fetched regardless of needs_vectors"
             );
         }
+    }
+
+    fn knn_query(json: serde_json::Value) -> SearchQuery {
+        let q: SearchQuery = serde_json::from_value(json).unwrap();
+        q.validate().unwrap();
+        q
+    }
+
+    /// #205: a late-interaction kNN — alone or hybrid — needs no
+    /// single-vector column, so its search pass hydrates none; a cosine
+    /// kNN (alone or hybrid) still names its column.
+    #[test]
+    fn late_interaction_knn_needs_no_vector_column() {
+        let li = knn_query(serde_json::json!({"query_text": "",
+            "knn": {"field": "tokens", "vectors": [[1.0, 0.0], [0.0, 1.0]]}}));
+        assert_eq!(single_vector_knn_field(&li), None);
+        assert_eq!(late_interaction_knn_field(&li), Some("tokens"));
+        assert_eq!(
+            knn_verdict_key(&li).as_deref(),
+            Some("late_interaction:tokens")
+        );
+
+        let hybrid_li = knn_query(serde_json::json!({"query_text": "breach",
+            "knn": {"field": "tokens", "vectors": [[1.0, 0.0]]}}));
+        assert_eq!(single_vector_knn_field(&hybrid_li), None);
+        assert_eq!(late_interaction_knn_field(&hybrid_li), Some("tokens"));
+
+        // `scoring: late_interaction` with a single `vector` is a one-token
+        // bag: still no vector column.
+        let one_token = knn_query(serde_json::json!({"query_text": "",
+            "knn": {"field": "tokens", "vector": [1.0, 0.0], "scoring": "late_interaction"}}));
+        assert_eq!(single_vector_knn_field(&one_token), None);
+        assert_eq!(late_interaction_knn_field(&one_token), Some("tokens"));
+
+        for text in ["", "breach"] {
+            let cosine = knn_query(serde_json::json!({"query_text": text,
+                "knn": {"field": "emb", "vector": [1.0, 0.0]}}));
+            assert_eq!(single_vector_knn_field(&cosine), Some("emb"), "{text:?}");
+            assert_eq!(late_interaction_knn_field(&cosine), None);
+            assert_eq!(knn_verdict_key(&cosine).as_deref(), Some("emb"));
+        }
+
+        let lexical = knn_query(serde_json::json!({"query_text": "breach"}));
+        assert_eq!(single_vector_knn_field(&lexical), None);
+        assert_eq!(late_interaction_knn_field(&lexical), None);
+        assert_eq!(knn_verdict_key(&lexical), None);
+
+        // A verdict earned by one kind of pass never covers the other.
+        let mut verdict = HydrationVerdict::default();
+        verdict.merge(None, knn_verdict_key(&li).as_deref());
+        assert!(verdict.covers(None, Some("late_interaction:tokens")));
+        assert!(!verdict.covers(None, Some("tokens")));
+        assert!(!verdict.covers(None, Some("emb")));
+    }
+
+    /// #205: a segment whose single-vector files were never hydrated is
+    /// scoring-complete for a late-interaction kNN (the pass checks the
+    /// multivec files separately), and not for a cosine kNN on its column.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn late_interaction_scoring_set_has_no_single_vector_files() {
+        let dir =
+            std::env::temp_dir().join(format!("kosha-test-li-scoring-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut w =
+            kosha_segment::SegmentWriter::new(kosha_core::SegmentId("s".into()), dir.clone());
+        for i in 0..4 {
+            w.add_document(
+                DocumentId(format!("d{i}")),
+                vec![
+                    Field::text("text", "x"),
+                    Field::vector("emb", vec![1.0, i as f32]),
+                    Field {
+                        name: "tokens".into(),
+                        field_type: kosha_core::FieldType::Vector,
+                        value: serde_json::to_string(&[[1.0, i as f32], [0.0, 1.0]]).unwrap(),
+                    },
+                ],
+            );
+        }
+        let footer = w.finalize(Default::default()).unwrap();
+        assert_eq!(footer.multi_vectors.len(), 1);
+        for f in kosha_segment::vector_index_files(&dir) {
+            fs::remove_file(dir.join(f)).unwrap();
+        }
+        let _ = fs::remove_file(dir.join(kosha_segment::DOC_VECTORS_FILE));
+        // The multivec files are still there; the full-segment hydration
+        // fetches them whatever `needs_vectors` says.
+        for f in kosha_segment::multivec::multivec_files(&footer) {
+            assert!(dir.join(&f).exists(), "{f}");
+            assert!(hydration_wants_file(&f, false), "{f}");
+        }
+
+        let li = knn_query(serde_json::json!({"query_text": "",
+            "knn": {"field": "tokens", "vectors": [[1.0, 0.0]]}}));
+        let hybrid_li = knn_query(serde_json::json!({"query_text": "x",
+            "knn": {"field": "tokens", "vectors": [[1.0, 0.0]]}}));
+        let cosine = knn_query(serde_json::json!({"query_text": "",
+            "knn": {"field": "emb", "vector": [1.0, 0.0]}}));
+        let complete = |q: &SearchQuery| {
+            AppState::segment_is_scoring_complete(&dir, single_vector_knn_field(q), false, None)
+        };
+        assert!(complete(&li));
+        assert!(complete(&hybrid_li));
+        assert!(
+            !complete(&cosine),
+            "a cosine kNN still needs its column's files"
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 
     /// Core regression for the presence-cache optimization: a
@@ -18442,6 +18937,74 @@ mod tests {
         assert_eq!(body["knn_failed_segments"], 2, "{body}");
     }
 
+    #[cfg(feature = "s3")]
+    #[test]
+    fn weighted_rrf_quantized_cursor_is_stable_after_cold_whole_file_hydration() {
+        const NS: &str = "weighted-rrf-cold-i8";
+        let (s3, mut state, _, paths) = single_flight_node(
+            NS,
+            |w| {
+                w.with_vector_store_mode(kosha_segment::VectorStoreMode::Sidecar)
+                    .with_vector_quantization(kosha_segment::VectorQuantizationConfig::all(
+                        kosha_core::VectorQuantization::I8,
+                    ))
+            },
+            |i| {
+                if i == 0 {
+                    vec![
+                        Field::vector("emb", vec![-1.0, 0.0, 0.0, 0.0]),
+                        Field::vector("padding", vec![1.0; 24_000]),
+                        Field::vector("more_padding", vec![1.0; 24_000]),
+                    ]
+                } else {
+                    vec![Field::vector("emb", vec![1.0, i as f32 * 0.001, 0.0, 0.0])]
+                }
+            },
+        );
+        state.doc_read_mode = doc_spans::ReadMode::Whole;
+        state.posting_read_mode = doc_spans::ReadMode::Whole;
+        state.hydrate_request_max_bytes = 160 * 1024;
+        state.searcher = Searcher::new(state.data_dir.clone()).with_knn_global_rescore(false);
+        let sidecar = kosha_segment::DOC_VECTORS_FILE;
+        for path in &paths {
+            let relative = path.strip_prefix(&state.data_dir).unwrap();
+            let len = fs::metadata(s3.root.join(relative).join(sidecar))
+                .unwrap()
+                .len();
+            assert!(len > state.hydrate_request_max_bytes);
+        }
+        assert!(paths.iter().all(|p| !p.join(sidecar).exists()));
+        let search = |query: &serde_json::Value| {
+            let response = handle_search_post(query.to_string().as_bytes(), &state);
+            assert_eq!(status_of(&response), 200, "{response}");
+            serde_json::from_str::<kosha_core::SearchResult>(
+                response.split_once("\r\n\r\n").unwrap().1,
+            )
+            .unwrap()
+        };
+        let mut query = serde_json::json!({
+            "namespace": NS,
+            "query_text": "",
+            "max_results": 1,
+            "rank_by": {"rrf": {"queries": [{"knn": {
+                "field": "emb", "vector": [1.0, 0.01, 0.0, 0.0], "k": 2
+            }}]}}
+        });
+        let first = search(&query);
+        assert_eq!(first.results[0].doc_id.0, "d0-5");
+        assert_eq!(first.results[0].fields[0].name, "emb");
+        assert!(paths.iter().all(|p| !p.join(sidecar).exists()));
+        query["search_after"] =
+            serde_json::json!([first.results[0].score.to_string(), first.results[0].doc_id]);
+        let second = search(&query);
+        assert_eq!(second.results[0].doc_id.0, "d1-5");
+        query["search_after"] = serde_json::json!([
+            second.results[0].score.to_string(),
+            second.results[0].doc_id
+        ]);
+        assert!(search(&query).results.is_empty());
+    }
+
     /// A two-segment kNN node reading whole `vector.idx` files, with a
     /// v2 index whose column can be corrupted.
     #[cfg(feature = "s3")]
@@ -18656,8 +19219,7 @@ mod tests {
     }
 
     /// Every write route `route()` actually dispatches to a mutating
-    /// handler must also be classified `true` here — this is the drift risk
-    /// called out in `is_write_path`'s own doc comment. If this test starts
+    /// handler must also be classified `true` here. If this test starts
     /// failing after adding a new write route to `route()`, that's the
     /// signal to update `is_write_path` too, not to weaken this test.
     #[test]
@@ -18674,8 +19236,6 @@ mod tests {
             "POST /v1/admin/rebuild-filter-blooms HTTP/1.1\r\n",
             "POST /v1/admin/backfill-offset-tables HTTP/1.1\r\n",
             "POST /v1/admin/compact-namespace HTTP/1.1\r\n",
-            "GET /v1/admin/compaction-status HTTP/1.1\r\n",
-            "GET /v1/admin/compaction-jobs/cj-1-1 HTTP/1.1\r\n",
             "POST /index HTTP/1.1\r\n",
             "POST /replace HTTP/1.1\r\n",
             "POST /flush HTTP/1.1\r\n",
@@ -18938,6 +19498,8 @@ mod tests {
             "GET /healthz HTTP/1.1\r\n",
             "POST /v1/namespaces/foo/search HTTP/1.1\r\n",
             "POST /v1/namespaces/foo/exists HTTP/1.1\r\n",
+            "GET /v1/admin/compaction-status HTTP/1.1\r\n",
+            "GET /v1/admin/compaction-jobs/cj-1-1 HTTP/1.1\r\n",
             "GET /v1/stats HTTP/1.1\r\n",
             "GET /v1/namespaces/foo/stats HTTP/1.1\r\n",
             "GET /v1/namespaces/foo/schema HTTP/1.1\r\n",
@@ -20414,8 +20976,8 @@ mod tests {
 
     /// A requester with a peer HTTP client and the shared internal key.
     #[cfg(all(feature = "s3", feature = "postgres"))]
-    fn peer_requester() -> AppState {
-        let mut requester = test_state();
+    fn peer_requester(data_dir: PathBuf) -> AppState {
+        let mut requester = AppState::new(data_dir);
         requester.internal_auth_key = Some("peer-test-secret".into());
         requester.peer_http_client = Some(
             reqwest::blocking::Client::builder()
@@ -20426,37 +20988,91 @@ mod tests {
         requester
     }
 
-    /// #259 acceptance: a large segment file moves peer to peer as raw
-    /// bytes, streamed on both ends, and arrives intact.
+    /// #259 acceptance: a 500 MB file arrives intact without either peer
+    /// buffering it in memory.
     #[cfg(all(feature = "s3", feature = "postgres"))]
     #[test]
-    fn fetch_from_peer_streams_a_64_mib_file_intact() {
-        const SIZE: usize = 64 * 1024 * 1024;
-        let mut peer = test_state();
+    fn fetch_from_peer_streams_a_500_mb_file_intact() {
+        const TEST_ROOT: &str = "TEST_KOSHA_PEER_TRANSFER_ROOT";
+        let Some(root) = std::env::var_os(TEST_ROOT) else {
+            // Peak RSS includes both peers but no parallel tests. The parent
+            // owns cleanup even if the child fails or its server is still up.
+            let root = test_dir();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    std::thread::current().name().unwrap(),
+                    "--nocapture",
+                ])
+                .env(TEST_ROOT, &root)
+                .output();
+            fs::remove_dir_all(root).unwrap();
+            let output = output.unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            print!("{stdout}");
+            return;
+        };
+
+        const SIZE: usize = 500_000_000;
+        const KEY: &str = "ns/big/doc_store.bin";
+        let root = PathBuf::from(root);
+        let mut peer = AppState::new(root.join("peer"));
         peer.internal_service_key = Some("peer-test-secret".into());
-        // Deterministic, incompressible-looking bytes (xorshift).
-        let mut data = vec![0u8; SIZE];
+        let source = peer.cache.path_for(KEY).unwrap();
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        let mut file = fs::File::create(&source).unwrap();
+        let mut buffer = vec![0u8; http::FILE_CHUNK_BYTES];
+        // Generate the fixture without raising the baseline with a full-file
+        // allocation. Stamp each block so that the hash detects reordering.
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
-        for chunk in data.chunks_mut(8) {
+        for chunk in buffer.as_chunks_mut::<8>().0 {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
-            chunk.copy_from_slice(&x.to_le_bytes()[..chunk.len()]);
+            *chunk = x.to_le_bytes();
         }
-        let expected_crc = crc32fast::hash(&data);
-        peer.cache.put_bytes("ns/big/doc_store.bin", &data).unwrap();
-        drop(data);
+        let mut expected = crc32fast::Hasher::new();
+        for offset in (0..SIZE).step_by(buffer.len()) {
+            buffer[..8].copy_from_slice(&(offset as u64).to_le_bytes());
+            let block = &buffer[..(SIZE - offset).min(buffer.len())];
+            file.write_all(block).unwrap();
+            expected.update(block);
+        }
+        drop(file);
+        peer.cache.note_external_write(KEY);
         let addr = serve_state(peer);
+        let requester = peer_requester(root.join("requester"));
 
-        let requester = peer_requester();
+        #[cfg(target_os = "linux")]
+        let before = peer_transfer_peak_rss_kib();
         let written = requester
-            .fetch_from_peer(&addr.to_string(), "ns/big/doc_store.bin")
+            .fetch_from_peer(&addr.to_string(), KEY)
             .expect("peer fetch should succeed");
+        #[cfg(target_os = "linux")]
+        {
+            // Allow runtime/allocator overhead but reject a whole-file buffer.
+            let growth_kib = peer_transfer_peak_rss_kib().saturating_sub(before);
+            println!("500 MB peer transfer grew peak RSS by {growth_kib} KiB");
+            assert!(growth_kib < 32 * 1024, "peak RSS grew by {growth_kib} KiB");
+        }
         assert_eq!(written, SIZE as u64);
-        let local = requester.cache.path_for("ns/big/doc_store.bin").unwrap();
-        let received = fs::read(&local).unwrap();
-        assert_eq!(received.len(), SIZE);
-        assert_eq!(crc32fast::hash(&received), expected_crc);
+        let local = requester.cache.path_for(KEY).unwrap();
+        let mut received = fs::File::open(&local).unwrap();
+        assert_eq!(received.metadata().unwrap().len(), SIZE as u64);
+        let mut actual = crc32fast::Hasher::new();
+        loop {
+            let n = received.read(&mut buffer).unwrap();
+            if n == 0 {
+                break;
+            }
+            actual.update(&buffer[..n]);
+        }
+        assert_eq!(actual.finalize(), expected.finalize());
         // Accounted in the cache like any other hydrated file, and no temp
         // file left behind.
         assert!(requester.cache.total_size() >= SIZE as u64);
@@ -20466,6 +21082,17 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[cfg(all(feature = "s3", feature = "postgres", target_os = "linux"))]
+    fn peer_transfer_peak_rss_kib() -> u64 {
+        fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("VmHWM:"))
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|kib| kib.parse().ok())
+            .expect("VmHWM in /proc/self/status")
     }
 
     /// Rolling upgrade: a peer still on a pre-#259 build answers with the
@@ -20504,7 +21131,7 @@ mod tests {
             .unwrap();
         });
 
-        let requester = peer_requester();
+        let requester = peer_requester(test_dir());
         let written = requester
             .fetch_from_peer(&addr.to_string(), "ns/old/postings.bin")
             .expect("legacy peer fetch should succeed");
@@ -20539,7 +21166,7 @@ mod tests {
                 .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\nonly a few bytes")
                 .unwrap();
         });
-        let requester = peer_requester();
+        let requester = peer_requester(test_dir());
         assert!(requester
             .fetch_from_peer(&addr.to_string(), "ns/cut/doc_store.bin")
             .is_err());
@@ -20614,6 +21241,7 @@ mod tests {
 
     #[test]
     fn index_endpoint_works() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let state = test_state();
         let req = IndexRequest {
             namespace: NamespaceId("test-ns".into()),
@@ -20636,6 +21264,7 @@ mod tests {
 
     #[test]
     fn exists_endpoint_reports_present_and_missing() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let state = test_state();
         let ns = NamespaceId("exists-ns".into());
         let req = IndexRequest {
@@ -20679,6 +21308,7 @@ mod tests {
 
     #[test]
     fn compact_namespace_endpoint_merges_segments_and_preserves_docs() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let state = test_state();
         let ns = NamespaceId("compact-ns".into());
 
@@ -20757,6 +21387,7 @@ mod tests {
 
     #[test]
     fn gc_endpoint_dry_runs_then_collects_compaction_retired_segments() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let state = test_state();
         let ns = NamespaceId(tenant_namespace("test", "gc-ns"));
         for i in 0..3 {
@@ -20918,6 +21549,7 @@ mod tests {
 
     #[test]
     fn local_gc_keeps_compacted_inputs_until_searches_release_them() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let state = test_state();
         let ns = NamespaceId(tenant_namespace("test", "lgc-ns"));
         for i in 0..2 {
@@ -21007,6 +21639,7 @@ mod tests {
 
     /// Index `n` single-doc segments into `test/<name>` via index+flush.
     fn seed_segments(state: &AppState, name: &str, n: usize) -> NamespaceId {
+        let _legacy = auth::override_legacy_policy(true, "");
         for i in 0..n {
             let req = IndexRequest {
                 namespace: NamespaceId(name.into()),
@@ -21144,6 +21777,7 @@ mod tests {
     /// next tick must leave it alone.
     #[test]
     fn scheduler_tick_compacts_namespaces_past_the_trigger() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let state = test_shared_state();
         let trigger = state.indexer.compaction_policy().trigger_mergeable_segments;
         let busy = seed_segments(&state, "sched-busy", trigger);
@@ -21362,6 +21996,7 @@ mod tests {
     /// unknown, and lose no document.
     #[test]
     fn full_pass_hydrates_one_capped_group_at_a_time_and_evicts_inputs() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let state = test_state();
         let n = 10;
         let ns = seed_segments(&state, "bounded-disk", n);
@@ -21622,6 +22257,7 @@ mod tests {
 
     #[test]
     fn replace_endpoint_removes_old_document_version() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let state = test_state();
         let namespace = NamespaceId("test-replace".into());
         let initial = IndexRequest {
@@ -21676,6 +22312,7 @@ mod tests {
 
     #[test]
     fn index_then_search() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let state = test_state();
         let ns = "test-ns-search";
 
@@ -21969,6 +22606,7 @@ mod tests {
 
     #[test]
     fn search_missing_namespace_returns_404() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let state = test_state();
         let response = route(
             "GET /search?ns=nonexistent&q=test HTTP/1.1\r\n",
@@ -21982,6 +22620,7 @@ mod tests {
 
     #[test]
     fn search_missing_params_returns_400() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let state = test_state();
         let response = route(
             "GET /search HTTP/1.1\r\n",
@@ -21995,6 +22634,7 @@ mod tests {
 
     #[test]
     fn flush_persists_manifest_to_control_store() {
+        let _legacy = auth::override_legacy_policy(true, "");
         // Regression: manifests were only kept in the in-process indexer map
         // and never written to the control store, so a restart made every
         // namespace vanish from search.
@@ -22038,6 +22678,7 @@ mod tests {
 
     #[test]
     fn auto_flush_during_index_persists_manifest() {
+        let _legacy = auth::override_legacy_policy(true, "");
         // Regression: index_documents auto-flushes when the buffer hits the
         // flush threshold (1000) — that manifest update was never persisted.
         let state = test_state();
@@ -23309,6 +23950,7 @@ mod tests {
     /// hydration, as before.
     #[test]
     fn rewarm_makes_a_compacted_segment_local_before_the_next_search() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let shared = shared_store();
         let ingest = warm_ingest(&shared, &["hot", "idle"]);
         let ns = seed_segments(&ingest, "hot", 3);
@@ -23510,6 +24152,7 @@ mod tests {
     /// budget has left.
     #[test]
     fn warmup_honors_the_byte_budget_and_reports_warmed_and_skipped() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let shared = shared_store();
         let ingest = warm_ingest(&shared, &["big"]);
         let ns = seed_segments(&ingest, "big", 3);
@@ -24389,6 +25032,25 @@ mod tests {
         assert_eq!(listed[2]["documents"], 20, "{resp}");
         assert!(!resp.contains("_shard-"), "{resp}");
 
+        // A key restricted to namespaces lists only those it may use
+        // (#346), and names none it may not, existing or not.
+        let docs_only = auth::Principal {
+            namespaces: Some(vec!["docs".to_string(), "missing".to_string()].into()),
+            ..auth::Principal::full("acme")
+        };
+        let resp = authz::with_principal(Some(docs_only), || {
+            v1(
+                &state,
+                "acme",
+                "GET /v1/namespaces",
+                serde_json::Value::Null,
+            )
+        });
+        assert_eq!(status_of(&resp), 200, "{resp}");
+        let listed = body_of(&resp)["namespaces"].as_array().unwrap().clone();
+        let names: Vec<&str> = listed.iter().map(|n| n["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["docs"], "{resp}");
+
         let resp = v1(
             &state,
             "globex",
@@ -24810,6 +25472,7 @@ mod tests {
 
     #[test]
     fn tenant_over_its_qps_gets_429_while_another_tenant_is_served() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let state = limited_state(
             r#"{"default_plan": "free", "plans": {"free": {"qps": 2}},
                 "tenants": {"big": {"qps": 1000}}}"#,
@@ -24958,6 +25621,232 @@ mod tests {
         let big = globex_write(one_doc("big", &"x".repeat(5000)));
         let body = assert_rejected(&big, "body_too_large");
         assert_eq!(body["limit"], 4096);
+    }
+
+    #[test]
+    fn namespace_storage_quota_counts_pending_and_committed_shards() {
+        let state =
+            limited_state(r#"{"default_plan":"p","plans":{"p":{"bytes_per_namespace":120}}}"#);
+        let write = |tenant: &str, path: &str, body| as_tenant(&state, tenant, path, body);
+        let response = write(
+            "acme",
+            "POST /v1/namespaces",
+            serde_json::json!({"namespace": "one"}),
+        );
+        assert_eq!(status_of(&response), 200, "{response}");
+        let response = write(
+            "acme",
+            "POST /v1/namespaces/one/shards",
+            serde_json::json!({"shards": 2}),
+        );
+        assert_eq!(status_of(&response), 200, "{response}");
+
+        let title = "x".repeat(70);
+        let response = write(
+            "acme",
+            "POST /v1/namespaces/one/documents",
+            one_doc("a", &title),
+        );
+        assert_eq!(status_of(&response), 200, "{response}");
+
+        let refused = |path| {
+            let response = write("acme", path, one_doc("b", &title));
+            assert_eq!(status_of(&response), 403, "{response}");
+            let body = body_of(&response);
+            assert_eq!(body["code"], "permission_denied");
+            assert_eq!(body["details"]["reason"], "storage_quota_exceeded");
+            assert_eq!(body["details"]["limit"], 120);
+            assert_eq!(body["retryable"], false);
+            assert_eq!(header_of(&response, "retry-after"), None);
+        };
+        refused("POST /v1/namespaces/one/documents");
+        refused("POST /v1/namespaces/one/replace");
+
+        let response = write(
+            "acme",
+            "POST /v1/namespaces/one/flush",
+            serde_json::json!({}),
+        );
+        assert_eq!(status_of(&response), 200, "{response}");
+        refused("POST /v1/namespaces/one/documents");
+
+        for (tenant, ns) in [("globex", "one"), ("acme", "two")] {
+            let response = write(
+                tenant,
+                &format!("POST /v1/namespaces/{ns}/documents"),
+                one_doc("b", &title),
+            );
+            assert_eq!(status_of(&response), 200, "{response}");
+        }
+    }
+
+    #[test]
+    fn namespace_storage_quota_adopts_remote_compaction_before_admission() {
+        let shared = shared_store();
+        let ns = NamespaceId("acme/one".into());
+        let compactor = test_state();
+        *compactor.controller.lock().unwrap() = Box::new(shared.clone());
+        write_and_flush(&compactor, &ns, "a");
+        write_and_flush(&compactor, &ns, "b");
+        compactor.publish_namespace(&ns).unwrap();
+        let before = shared.manifest_cloned(&ns).unwrap();
+        let old_bytes = usage::owned_segment_bytes(&compactor, &ns, &before, true).unwrap();
+        let ingest = test_state();
+        copy_dir(
+            &compactor.data_dir.join(&ns.0),
+            &ingest.data_dir.join(&ns.0),
+        );
+        ingest.indexer.restore_manifest(ns.clone(), before.clone());
+
+        assert!(
+            compactor
+                .indexer
+                .compact_namespace_with_options(&ns, kosha_write::CompactOptions::full())
+                .unwrap()
+                .merged
+        );
+        compactor.publish_namespace(&ns).unwrap();
+        let after = shared.manifest_cloned(&ns).unwrap();
+        let max = usage::owned_segment_bytes(&compactor, &ns, &after, true).unwrap() + 64;
+        assert!(
+            old_bytes > max,
+            "old {old_bytes} must exceed new quota {max}"
+        );
+        copy_dir(
+            &compactor.data_dir.join(&ns.0),
+            &ingest.data_dir.join(&ns.0),
+        );
+        let config = tenant_limits::LimitsConfig::parse(
+            &format!(r#"{{"tenants":{{"acme":{{"bytes_per_namespace":{max}}}}}}}"#),
+            None,
+        )
+        .unwrap();
+        let mut ingest = ingest;
+        ingest.tenant_limits = tenant_limits::TenantLimiter::new(Arc::new(
+            tenant_limits::ConfigLimitsProvider::from_config(config),
+        ));
+        *ingest.controller.lock().unwrap() = Box::new(shared);
+        assert_eq!(ingest.indexer.manifest_version(&ns), Some(before.version));
+        let response = as_tenant(
+            &ingest,
+            "acme",
+            "POST /v1/namespaces/one/documents",
+            one_doc("c", "z"),
+        );
+        assert_eq!(status_of(&response), 200, "{response}");
+        assert_eq!(ingest.indexer.published_version(&ns), Some(after.version));
+    }
+
+    #[test]
+    fn namespace_storage_quota_counts_merged_replacements_before_writing_shards() {
+        let mut state = test_state();
+        let ns = NamespaceId("acme/one".into());
+        let response = as_tenant(
+            &state,
+            "acme",
+            "POST /v1/namespaces",
+            serde_json::json!({"namespace": "one"}),
+        );
+        assert_eq!(status_of(&response), 200, "{response}");
+        let response = as_tenant(
+            &state,
+            "acme",
+            "POST /v1/namespaces/one/shards",
+            serde_json::json!({"shards": 2}),
+        );
+        assert_eq!(status_of(&response), 200, "{response}");
+        let shards = kosha_core::sharding::shard_namespaces(&ns, 2);
+        let [first, second] = shards.as_slice() else {
+            unreachable!()
+        };
+        let first_id = (0..)
+            .map(|i| format!("doc-{i}"))
+            .find(|id| {
+                kosha_core::sharding::shard_namespace(
+                    &ns,
+                    kosha_core::sharding::shard_for_document(id, 2),
+                ) == *first
+            })
+            .unwrap();
+        let second_id = (0..)
+            .map(|i| format!("doc-{i}"))
+            .find(|id| {
+                kosha_core::sharding::shard_namespace(
+                    &ns,
+                    kosha_core::sharding::shard_for_document(id, 2),
+                ) == *second
+            })
+            .unwrap();
+        let seeded = as_tenant(
+            &state,
+            "acme",
+            "POST /v1/namespaces/one/documents",
+            one_doc(&second_id, &"unchanged ".repeat(1024)),
+        );
+        assert_eq!(status_of(&seeded), 200, "{seeded}");
+        flush_and_publish_namespace(&state, &ns).unwrap();
+        let version = state.indexer.manifest_version(first);
+        let stored = usage::owned_segment_bytes(
+            &state,
+            second,
+            &state.indexer.manifest_shared(second).unwrap(),
+            true,
+        )
+        .unwrap();
+        let config = tenant_limits::LimitsConfig::parse(
+            &serde_json::json!({"tenants": {"acme": {"bytes_per_namespace": stored + 256}}})
+                .to_string(),
+            None,
+        )
+        .unwrap();
+        state.tenant_limits = tenant_limits::TenantLimiter::new(Arc::new(
+            tenant_limits::ConfigLimitsProvider::from_config(config),
+        ));
+
+        let replace = |body| as_tenant(&state, "acme", "POST /v1/namespaces/one/replace", body);
+        let response = replace(serde_json::json!({"documents": [
+            {"id": first_id, "fields": [{"name": "title", "field_type": "Text", "value": "small"}]},
+            {"id": second_id, "fields": [{"name": "tag", "field_type": "Keyword", "value": "small"}]}
+        ]}));
+        assert_eq!(status_of(&response), 403, "{response}");
+        assert_eq!(
+            body_of(&response)["details"]["reason"],
+            "storage_quota_exceeded"
+        );
+        assert_eq!(
+            state.indexer.manifest_version(first),
+            version,
+            "no earlier shard should be written"
+        );
+        let response = replace(one_doc(&second_id, "short"));
+        assert_eq!(status_of(&response), 200, "{response}");
+    }
+
+    #[test]
+    fn search_body_cap_does_not_spend_query_tokens_or_use_write_rate() {
+        let state = limited_state(
+            r#"{"default_plan":"p","plans":{"p":{"qps":1,"max_body_bytes":64,"write_bytes_per_sec":1}}}"#,
+        );
+        let response = as_tenant(
+            &state,
+            "acme",
+            "POST /v1/namespaces",
+            serde_json::json!({"namespace": "one"}),
+        );
+        assert_eq!(status_of(&response), 200, "{response}");
+        let search = |query| {
+            as_tenant(
+                &state,
+                "acme",
+                "POST /v1/namespaces/one/search",
+                serde_json::json!({"query_text": query}),
+            )
+        };
+        let body = assert_rejected(&search("x".repeat(65)), "body_too_large");
+        assert_eq!(body["details"]["scope"], "tenant");
+        let allowed = search("x".to_string());
+        assert_eq!(status_of(&allowed), 200, "{allowed}");
+        assert_rejected(&search("x".to_string()), "tenant_qps_exceeded");
     }
 
     #[test]

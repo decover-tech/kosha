@@ -84,8 +84,9 @@ This document describes the target architecture, which was built in phases.
 > what was deferred to Phase 2 has shipped too: segments now carry a posting-based
 > `vector.idx` (cluster-and-posting ANN with centroid probing and triangle-inequality bounds),
 > requests take a `knn` clause with `knn.filter`, and a lexical query plus `knn` is fused with
-> RRF (§8 step 5). Still not implemented: the rerank hook (§8 step 6) and per-retriever RRF
-> weights. The phase plan below is kept as the historical record of how the work was ordered.
+> RRF (§8 step 5). Weighted multi-query RRF is opt-in via `rank_by.rrf`, and both
+> fusion paths support the rerank hook (§8 step 6). The phase plan below is kept
+> as the historical record of how the work was ordered.
 
 Phase 1 was BM25 lexical search only — no vector index, no ANN, no fusion, no rerank hook.
 Concretely, Phase 1 included:
@@ -100,7 +101,7 @@ Concretely, Phase 1 included:
 - Multi-tenancy (§10), migration approach (§14), and operational model (§15) — none of them
   are vector-specific.
 
-**Deferred to Phase 2** (since implemented, except the rerank hook): `vector.idx`, ANN
+**Deferred to Phase 2** (since implemented): `vector.idx`, ANN
 retrieval, RRF fusion, the rerank hook, and embedding-dependent parts of the namespace schema.
 The segment footer reserved a slot for the vector index so Phase 2 could add it without a
 segment format migration.
@@ -624,7 +625,14 @@ indexed segments, with the flush-interval lag. See §11.
      scorer lies on that frontier, and a warm query computes all ceilings from memory (~10 µs
      for 200 segments); a new term costs one pass reading skip summaries, decoding no posting. Counts are unaffected:
      exact counting still visits every match, and capped counting stops a segment only once its
-     own count reaches the cap. A legacy segment without stored summaries has an infinite
+     own count reaches the cap. In an AND join, the stop also needs the sum of every term's
+     suffix-max block ceiling (the best block still ahead) to fall below the page floor. Postings
+     are stored in ingestion order, so a term's best remaining block is usually late in its list,
+     and on real corpora this exit rarely fires before the end of the walk (#114). Checking the
+     bound before the cap is reached would not help, and every early stop reports `gte`, so the
+     gate stays at the cap. Making the exit useful needs impact-ordered postings for the join, a
+     format change. `SearchPhaseStats` reports `and_join_early_exits` and
+     `and_join_members_past_cap` (members walked after the budget was met). A legacy segment without stored summaries has an infinite
      ceiling (visited first, never skipped). A segment that publishes and then abandons its WAND
      walk for the general path (a corrupt block found mid-walk) poisons the floor and the search
      is rescored with per-segment floors. Hybrid (RRF) requests are untouched: their lexical
