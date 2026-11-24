@@ -497,6 +497,17 @@ impl Drop for WriterSlotGuard<'_> {
     }
 }
 
+/// What [`Indexer::delete_by_query_measured`] deleted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeleteOutcome {
+    /// Documents newly tombstoned.
+    pub documents: usize,
+    /// Their records' bytes in `doc_store.bin`, as stored (compressed when
+    /// the segment's doc store is). Zero for documents in legacy segments
+    /// written before `doc_store.offsets`.
+    pub stored_bytes: u64,
+}
+
 /// Thread-safe indexer with per-namespace isolation (DESIGN.md §7.1).
 ///
 /// Request handlers share one `Indexer` without a process-wide mutex: each
@@ -762,9 +773,23 @@ impl Indexer {
     pub fn delete_by_query(
         &self,
         namespace: &NamespaceId,
-        _manifest: &Manifest,
+        manifest: &Manifest,
         filter: &FilterClause,
     ) -> Result<usize, KoshaError> {
+        self.delete_by_query_measured(namespace, manifest, filter)
+            .map(|outcome| outcome.documents)
+    }
+
+    /// [`Self::delete_by_query`], also reporting the doc-store bytes of the
+    /// deleted documents (usage metering, #348). Measured from the
+    /// in-memory `doc_store.offsets` spans, so it reads nothing more than
+    /// the delete itself does.
+    pub fn delete_by_query_measured(
+        &self,
+        namespace: &NamespaceId,
+        _manifest: &Manifest,
+        filter: &FilterClause,
+    ) -> Result<DeleteOutcome, KoshaError> {
         let handle = self.ns_handle(namespace);
         let _writes = handle.writes.lock().unwrap();
         if self.needs_recovery_hydration(namespace) {
@@ -784,6 +809,7 @@ impl Indexer {
         // deletion in memory that the caller was told failed.
         let mut changes = Vec::new();
         let mut deleted_ids = HashSet::new();
+        let mut stored_bytes = 0u64;
         for entry in &state.manifest.segments {
             let seg_dir = state
                 .manifest
@@ -801,6 +827,10 @@ impl Indexer {
                     .doc_meta(*seq)
                     .ok_or_else(|| KoshaError::NotFound("delete doc metadata missing".into()))?;
                 deleted_ids.insert(DocumentId(meta.doc_id.to_owned()));
+                // `None` for a legacy segment without `doc_store.offsets`.
+                if let Some((_, length)) = reader.doc_span(*seq) {
+                    stored_bytes = stored_bytes.saturating_add(u64::from(length));
+                }
             }
             changes.push((entry.segment_id.clone(), matching));
         }
@@ -829,7 +859,10 @@ impl Indexer {
             state.manifest.version += 1;
         }
         state.manifest.tombstones = state.tombstones.clone();
-        Ok(total)
+        Ok(DeleteOutcome {
+            documents: total,
+            stored_bytes: if total > 0 { stored_bytes } else { 0 },
+        })
     }
 
     /// Get tombstoned doc_seqs for a namespace, keyed by segment.
@@ -2511,6 +2544,15 @@ impl Indexer {
         if let Some(conflict) = self.embedding_conflict_in(namespace, &handle, &schema) {
             return Err(KoshaError::InvalidQuery(conflict));
         }
+        // Schema evolution rules (#347), re-checked here for the same
+        // reason: every route that sets a schema comes through this.
+        let existing = self.schema_existing_data_in(namespace, &handle);
+        let current = handle.state.lock().unwrap().manifest.schema.clone();
+        if let Err(refused) =
+            kosha_core::schema_evolution::check(current.as_ref(), &schema, &existing)
+        {
+            return Err(KoshaError::InvalidQuery(refused.message));
+        }
         let mut state = handle.state.lock().unwrap();
         if state.known && state.manifest.schema.as_ref() == Some(&schema) {
             return Ok(false);
@@ -2536,6 +2578,79 @@ impl Indexer {
     ) -> Option<String> {
         let handle = self.ns_handle(namespace);
         self.embedding_conflict_in(namespace, &handle, schema)
+    }
+
+    /// What `namespace` holds, as the schema evolution rules (#347,
+    /// [`kosha_core::schema_evolution`]) need it: whether any document is
+    /// stored or buffered, and which vector fields hold vectors (with their
+    /// dimension, from the segment footers).
+    pub fn schema_existing_data(
+        &self,
+        namespace: &NamespaceId,
+    ) -> kosha_core::schema_evolution::ExistingData {
+        let handle = self.ns_handle(namespace);
+        self.schema_existing_data_in(namespace, &handle)
+    }
+
+    fn schema_existing_data_in(
+        &self,
+        namespace: &NamespaceId,
+        handle: &NamespaceHandle,
+    ) -> kosha_core::schema_evolution::ExistingData {
+        let state = handle.state.lock().unwrap().clone();
+        let mut data = kosha_core::schema_evolution::ExistingData::default();
+        let buffered = state
+            .buffer
+            .iter()
+            .flat_map(|buf| buf.documents.iter())
+            .chain(state.flushing_docs.iter().flat_map(|docs| docs.iter()));
+        // A buffered vector of a field the current schema embeds was
+        // embedded with that model (it is recorded when it is flushed).
+        let declared = state.manifest.schema.clone().unwrap_or_default();
+        for doc in buffered {
+            data.has_documents = true;
+            for field in &doc.fields {
+                if field.field_type == kosha_core::FieldType::Vector {
+                    data.vector_fields.entry(field.name.clone()).or_insert(None);
+                    if let Some(spec) = declared.embedding_for(&field.name) {
+                        data.vector_models
+                            .entry(field.name.clone())
+                            .or_default()
+                            .insert(spec.model.clone());
+                    }
+                }
+            }
+        }
+        for entry in &state.manifest.segments {
+            if entry.doc_count > 0 {
+                data.has_documents = true;
+            }
+            let fields = match state.manifest.segment_footer(&entry.segment_id) {
+                Some(footer) => footer.vector_fields.clone(),
+                None => {
+                    let seg_dir =
+                        state
+                            .manifest
+                            .segment_dir(&self.data_dir, namespace, &entry.segment_id);
+                    match kosha_segment::SegmentReader::read_footer(&seg_dir) {
+                        Ok(footer) => footer.vector_fields,
+                        // Unreadable here: assume it holds documents and
+                        // say nothing about its vectors.
+                        Err(_) => continue,
+                    }
+                }
+            };
+            for meta in fields.into_iter().flatten() {
+                if let Some(model) = meta.embedding_model {
+                    data.vector_models
+                        .entry(meta.name.clone())
+                        .or_default()
+                        .insert(model);
+                }
+                data.vector_fields.insert(meta.name, Some(meta.dim));
+            }
+        }
+        data
     }
 
     fn embedding_conflict_in(

@@ -6,7 +6,7 @@
 # routes, with Deprecation/Sunset headers and kosha_legacy_requests_total.
 # The prod flip follows the stage flip (see k8s/stage/configmap-patch.yaml):
 # once prod shows 7 days of zero legacy
-# requests, or the stragglers are known, add
+# requests, or the stragglers are known, change the opt-in below to
 #   KOSHA_LEGACY_ROUTES: "off"
 #   KOSHA_LEGACY_ROUTES_TENANTS: "<tenants still migrating>"
 # here (docs/api/versioning.md, "Legacy routes").
@@ -15,4 +15,5 @@ kind: ConfigMap
 metadata:
   name: kosha-config
   namespace: kosha
-data: {}
+data:
+  KOSHA_LEGACY_ROUTES: "on"

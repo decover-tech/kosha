@@ -237,7 +237,7 @@ def test_idempotency_table():
     assert not is_idempotent("POST", "/v1/namespaces/a/branch")
     assert not is_idempotent("DELETE", "/v1/namespaces/a/branch")
     assert not is_idempotent("POST", "/v1/namespaces/a/shards")
-    # The deprecated merge route the client falls back to on pre-0.9 servers.
+    # Explicit transport calls to the deprecated merge route are still safe.
     assert is_idempotent("POST", "/replace")
     assert not is_idempotent("POST", "/index")
     assert not is_idempotent("POST", "/v1/replace")
