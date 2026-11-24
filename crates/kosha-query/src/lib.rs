@@ -12166,6 +12166,7 @@ mod tests {
             });
         }
         let query = serde_json::from_value(serde_json::json!({
+            "query_text": "",
             "max_results": 10,
             "exact_total_hits": false,
             "knn": {"field": "emb", "vector": [1.0, 0.0], "k": 10, "num_candidates": 100}
