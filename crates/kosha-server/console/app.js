@@ -135,24 +135,23 @@
     );
   }
 
+  // Returns an error to show, or "" once signed in with the link.
   async function redeem(token) {
     history.replaceState(null, "", location.pathname + "#/");
+    if (getSession() && !confirm("Open this sign-in link? You will be signed out of your current account.")) {
+      return "";
+    }
     try {
       const signedIn = await api("POST", "signin/verify", { token });
       setSession(signedIn.session_token);
     } catch (e) {
-      signedOut();
-      view.prepend(el("p", { class: "error", role: "alert" }, e.message));
-      return false;
+      return e.message;
     }
-    return true;
+    return "";
   }
 
   // ── Views ─────────────────────────────────────────────────────────────
-  async function home() {
-    const me = await api("GET", "me");
-    who.textContent = me.user.email;
-    signoutButton.hidden = false;
+  function home(me) {
     show(
       el(
         "section",
@@ -300,7 +299,12 @@
           ],
           "Add or change member",
           async (v) => {
-            await api("POST", base + "/members", v);
+            const existing = members.members.some((m) => m.user_id === v.user_id);
+            if (existing) {
+              await api("POST", base + "/members/" + encodeURIComponent(v.user_id) + "/role", { role: v.role });
+            } else {
+              await api("POST", base + "/members", v);
+            }
             reload();
           }
         )
@@ -330,16 +334,30 @@
   // ── Routing ───────────────────────────────────────────────────────────
   async function route() {
     const hash = location.hash || "#/";
+    let linkError = "";
     if (hash.startsWith("#signin=")) {
-      if (!(await redeem(decodeURIComponent(hash.slice("#signin=".length))))) return;
+      linkError = await redeem(decodeURIComponent(hash.slice("#signin=".length)));
     }
-    if (!getSession()) return signedOut();
+    const alert = () => (linkError ? [el("p", { class: "error", role: "alert" }, linkError)] : []);
+    if (!getSession()) {
+      signedOut();
+      view.prepend(...alert());
+      return;
+    }
     try {
+      const me = await api("GET", "me");
+      who.textContent = me.user.email;
+      signoutButton.hidden = false;
       const match = /^#\/orgs\/([^/]+)$/.exec(location.hash);
       if (match) await org(decodeURIComponent(match[1]));
-      else await home();
+      else home(me);
+      view.prepend(...alert());
     } catch (e) {
-      if (e.status === 401) return signedOut();
+      if (e.status === 401) {
+        signedOut();
+        view.prepend(...alert());
+        return;
+      }
       show(el("section", {}, el("p", { class: "error", role: "alert" }, e.message), el("p", {}, el("a", { href: "#/" }, "Back"))));
     }
   }
