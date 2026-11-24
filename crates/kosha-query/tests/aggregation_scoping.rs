@@ -689,6 +689,47 @@ fn collapsed_vector_aggregations_keep_distinct_groups_in_the_top_k() {
     std::fs::remove_dir_all(layout.dir).unwrap();
 }
 
+#[test]
+fn field_sorted_vector_collapse_keeps_the_nearest_groups() {
+    let mut docs = corpus();
+    docs.truncate(4);
+    docs[3].owner = "cy";
+    // Ana's closest vector ranks first, but field sorting chooses her
+    // other document, whose vector ranks last.
+    for (doc, distance) in docs.iter_mut().zip([0.0, 0.3, 0.1, 0.2]) {
+        doc.vector = vec![1.0, distance, 0.0, 0.0];
+    }
+    let dir = temp_dir("field-sorted-collapse");
+    let layout = Layout {
+        name: "field-sorted-collapse",
+        manifest: build(&dir, &docs, &[1, 2], |doc| usize::from(doc.owner != "ana")),
+        dir,
+    };
+    let request = json!({
+        "query_text": "",
+        "max_results": 2,
+        "knn": {"field": "emb", "vector": [1.0, 0.0, 0.0, 0.0], "k": 2, "num_candidates": 20},
+        "collapse": {"field": "owner"},
+        "sort": [{"status": {"order": "asc"}}],
+        "aggs": aggs(),
+    });
+    let result = search(&layout, &request, None);
+    assert_eq!(result.total_hits, 2);
+    assert_eq!(
+        result
+            .results
+            .iter()
+            .map(|hit| &hit.doc_id.0)
+            .collect::<Vec<_>>(),
+        vec![&docs[1].id, &docs[2].id]
+    );
+    assert_eq!(
+        normalize(&result),
+        round_floats(brute_force(&[&docs[1], &docs[2]]))
+    );
+    std::fs::remove_dir_all(layout.dir).unwrap();
+}
+
 /// A hybrid request aggregates over what its `total_hits` counts: the
 /// lexical matches plus the vector window's other members, on row and
 /// columnar segments alike, with a page smaller than either.

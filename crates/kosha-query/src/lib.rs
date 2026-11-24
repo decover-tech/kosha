@@ -7974,22 +7974,23 @@ impl Searcher {
         // segments) said nothing about the query.
         //
         // Diversify before the cut so duplicate group members do not
-        // crowd out another group the probe found. With rank_by, the
-        // group cap instead applies after rescoring.
+        // crowd out another group the probe found. A field sort can choose
+        // a different representative for a selected group but cannot
+        // change which groups are nearest. With rank_by, the group cap
+        // instead applies after rescoring.
         let (total_hits, total_hits_relation) =
             if let Some(knn) = query.knn.as_ref().filter(|_| query.is_pure_knn()) {
                 if let Some(cap) = group_cap.filter(|_| rank_by.is_none()) {
-                    if query.collapse.is_some() {
+                    candidates.sort_by(by_score_then_id);
+                    if query.collapse.is_some() && !sort_is_default_ranking(&query.sort) {
+                        cap.retain_top_groups(&mut candidates, knn.k);
                         candidates.sort_by(sort_cmp);
-                    } else {
-                        candidates.sort_by(by_score_then_id);
                     }
                     cap.apply(&mut candidates, |c| c);
-                }
-                if candidates.len() > knn.k {
+                } else if candidates.len() > knn.k {
                     candidates.sort_by(by_score_then_id);
-                    candidates.truncate(knn.k);
                 }
+                candidates.truncate(knn.k);
                 if !query.aggs.is_empty() {
                     merge_vector_aggregations(
                         query,
@@ -9387,6 +9388,13 @@ struct GroupCap {
     cap_missing: bool,
 }
 
+#[derive(PartialEq, Eq, Hash)]
+enum GroupValue {
+    Text(String),
+    Number(u64),
+    Missing,
+}
+
 impl GroupCap {
     /// The request's cap, if any. `sort_value_fields` must already include
     /// the group field (see `search_inner`).
@@ -9404,22 +9412,34 @@ impl GroupCap {
         })
     }
 
+    fn group_value(&self, candidate: &HitCandidate) -> Option<GroupValue> {
+        match candidate.sort_values.get(self.index) {
+            Some(SortValue::Text(value)) => Some(GroupValue::Text(value.clone())),
+            Some(SortValue::Number(value)) => Some(GroupValue::Number(value.to_bits())),
+            Some(SortValue::Missing) | None if self.cap_missing => Some(GroupValue::Missing),
+            Some(SortValue::Missing) | None => None,
+        }
+    }
+
+    /// Keep all members of the first `k` collapse groups in score order
+    /// so field sorting can still choose their representatives.
+    fn retain_top_groups(&self, candidates: &mut Vec<HitCandidate>, k: usize) {
+        let mut groups = HashSet::new();
+        candidates.retain(|candidate| {
+            let group = self
+                .group_value(candidate)
+                .expect("collapse includes the missing-value group");
+            groups.contains(&group) || (groups.len() < k && groups.insert(group))
+        });
+    }
+
     /// Drop every item that has `max` items of its group ahead of it.
     /// `items` must already be in result order.
     fn apply<T>(&self, items: &mut Vec<T>, candidate: impl Fn(&T) -> &HitCandidate) {
-        #[derive(PartialEq, Eq, Hash)]
-        enum Group {
-            Text(String),
-            Number(u64),
-            Missing,
-        }
-        let mut seen: HashMap<Group, usize> = HashMap::new();
+        let mut seen: HashMap<GroupValue, usize> = HashMap::new();
         items.retain(|item| {
-            let group = match candidate(item).sort_values.get(self.index) {
-                Some(SortValue::Text(value)) => Group::Text(value.clone()),
-                Some(SortValue::Number(value)) => Group::Number(value.to_bits()),
-                Some(SortValue::Missing) | None if !self.cap_missing => return true,
-                Some(SortValue::Missing) | None => Group::Missing,
+            let Some(group) = self.group_value(candidate(item)) else {
+                return true;
             };
             let count = seen.entry(group).or_insert(0);
             *count += 1;
