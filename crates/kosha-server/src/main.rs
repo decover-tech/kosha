@@ -8391,7 +8391,13 @@ fn parse_namespace_schema(value: &serde_json::Value) -> Result<serde_json::Value
             .as_object()
             .ok_or_else(|| format!("schema field '{name}' must be an object"))?;
         let mut canonical = serde_json::Map::new();
-        let mut field_type = SCHEMA_FIELD_TYPES[0];
+        // An embedding declaration implies a vector field, so the canonical
+        // schema can be saved back through `POST /v1/namespaces/{ns}/schema`.
+        let mut field_type = if field.get("embedding").is_some_and(|v| !v.is_null()) {
+            "FIELD_TYPE_VECTOR"
+        } else {
+            SCHEMA_FIELD_TYPES[0]
+        };
         let mut seen_type = false;
         for (key, v) in field {
             match key.as_str() {

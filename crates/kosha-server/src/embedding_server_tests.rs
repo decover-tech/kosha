@@ -283,6 +283,18 @@ fn embedding_schema_rejects_explicit_non_vector_fields() {
 }
 
 #[test]
+fn an_untyped_embedding_field_is_a_vector_and_its_canonical_schema_round_trips() {
+    let schema = serde_json::json!({"fields": {"emb": {
+        "embedding": {"model": MODEL, "dims": DIMS}
+    }}});
+    let canonical = parse_namespace_schema(&schema).unwrap();
+    assert_eq!(canonical["fields"]["emb"]["type"], "FIELD_TYPE_VECTOR");
+    let state = state_with(EmbedderRegistry::with_mock());
+    let (status, body) = put_schema(&state, "shop", canonical);
+    assert_eq!(status, 200, "{body}");
+}
+
+#[test]
 fn text_is_embedded_at_ingest_and_query_text_finds_neighbours() {
     let counting = Counting::new(MODEL, DIMS);
     let state = state_with(EmbedderRegistry::default().with_embedder(counting.clone()));
