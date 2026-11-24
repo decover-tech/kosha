@@ -663,9 +663,11 @@ the URL. The check reads only the mode, so `migrate` and `migrate-namespace` do 
 
 Segment files, deletion vectors and S3 WAL group commits hold tenant data. With no custom
 endpoint, the AWS SDK talks to S3 over HTTPS. A custom endpoint (MinIO, an S3-compatible store,
-a VPC endpoint URL) is used as written, so `http://` sends that data in plaintext. The endpoint
-in effect is the first of `KOSHA_S3_ENDPOINT`, `AWS_ENDPOINT_URL` and `AWS_ENDPOINT_URL_S3`
-that is set (the SDK reads the last one itself when Kosha passes no endpoint).
+a VPC endpoint URL) is used as written, so `http://` sends that data in plaintext. Kosha passes
+`KOSHA_S3_ENDPOINT` to the SDK, or `AWS_ENDPOINT_URL` when `KOSHA_S3_ENDPOINT` is unset; when the
+value passed is empty, the SDK picks `AWS_ENDPOINT_URL_S3`, then `AWS_ENDPOINT_URL`. The check
+below applies to whichever of these is in effect. An `endpoint_url` set only in an AWS
+config-file profile is not checked.
 
 `KOSHA_INTERNAL_TLS` holds this hop to the same rule. With `required`, the server, `migrate`,
 `migrate-namespace` and `reconcile-usage` exit at startup (`FATAL: invalid S3 encryption config:

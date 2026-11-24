@@ -377,10 +377,10 @@ fn check_database_url_lookup(get: impl Fn(&str) -> Option<String>) -> Result<(),
     Ok(())
 }
 
-/// The variables an S3 endpoint can come from, in the order they take
-/// effect: `S3Config::try_from_env` reads the first two and passes the
-/// value to the SDK, which reads `AWS_ENDPOINT_URL_S3` itself when no
-/// endpoint is passed.
+/// The variables an S3 endpoint can come from. `S3Config::try_from_env`
+/// passes `KOSHA_S3_ENDPOINT` (or, when that is unset, `AWS_ENDPOINT_URL`)
+/// to the SDK; when that is empty the SDK resolves its own endpoint,
+/// `AWS_ENDPOINT_URL_S3` before `AWS_ENDPOINT_URL`.
 pub(crate) const S3_ENDPOINT_ENVS: [&str; 3] = [
     "KOSHA_S3_ENDPOINT",
     "AWS_ENDPOINT_URL",
@@ -418,8 +418,8 @@ fn check_s3_endpoint_for(
     }
 }
 
-/// [`check_s3_endpoint_for`] for the process environment: the endpoint in
-/// effect is the first of [`S3_ENDPOINT_ENVS`] that is set and not empty.
+/// [`check_s3_endpoint_for`] for the process environment and the endpoint
+/// in effect (see [`s3_endpoint_in_effect`]).
 /// Prints a `WARN:` line for a warning; `Err` when the process must not
 /// talk to S3. Reads only the mode, like [`check_database_url_env`], so the
 /// `migrate` Jobs need no TLS files.
@@ -431,10 +431,7 @@ pub(crate) fn check_s3_endpoint_env() -> Result<(), String> {
 /// [`check_s3_endpoint_env`] over any variable source (tests).
 #[cfg_attr(not(any(test, feature = "s3")), allow(dead_code))]
 fn check_s3_endpoint_lookup(get: impl Fn(&str) -> Option<String>) -> Result<(), String> {
-    let Some((source, endpoint)) = S3_ENDPOINT_ENVS
-        .iter()
-        .find_map(|name| get(name).filter(|v| !v.is_empty()).map(|v| (*name, v)))
-    else {
+    let Some((source, endpoint)) = s3_endpoint_in_effect(&get) else {
         return Ok(());
     };
     let mode = Mode::parse(&get(MODE_ENV).unwrap_or_default())?;
@@ -442,6 +439,22 @@ fn check_s3_endpoint_lookup(get: impl Fn(&str) -> Option<String>) -> Result<(), 
         eprintln!("WARN: {warning}");
     }
     Ok(())
+}
+
+/// The variable the S3 client takes its endpoint from, and its value.
+/// Mirrors `S3Config::try_from_env` (a set `KOSHA_S3_ENDPOINT` wins over
+/// `AWS_ENDPOINT_URL`, even when empty) and then the SDK's own order.
+#[cfg_attr(not(any(test, feature = "s3")), allow(dead_code))]
+fn s3_endpoint_in_effect(get: impl Fn(&str) -> Option<String>) -> Option<(&'static str, String)> {
+    let [kosha, global, s3] = S3_ENDPOINT_ENVS;
+    let set = |name: &'static str| get(name).map(|v| (name, v));
+    let passed = set(kosha).or_else(|| set(global));
+    if let Some(found) = passed.filter(|(_, v)| !v.is_empty()) {
+        return Some(found);
+    }
+    [s3, global]
+        .into_iter()
+        .find_map(|name| set(name).filter(|(_, v)| !v.is_empty()))
 }
 
 /// The `sslmode` (or `ssl-mode`) query parameter of a Postgres URL,
@@ -899,8 +912,8 @@ mod tests {
         }
     }
 
-    /// The endpoint in effect is checked: `KOSHA_S3_ENDPOINT`, then
-    /// `AWS_ENDPOINT_URL`, then the SDK's own `AWS_ENDPOINT_URL_S3`. Only
+    /// The endpoint in effect is checked, in the order Kosha and the SDK
+    /// resolve it. Only
     /// the mode is read, so the migrate Jobs need no TLS files.
     #[test]
     fn s3_endpoint_check_reads_the_endpoint_in_effect_and_only_the_mode() {
@@ -940,6 +953,33 @@ mod tests {
             ("AWS_ENDPOINT_URL", "http://minio:9000"),
         ]))
         .is_err());
+        // Kosha passes AWS_ENDPOINT_URL itself, overriding the SDK's
+        // AWS_ENDPOINT_URL_S3 ...
+        assert!(check_s3_endpoint_lookup(env(&[
+            (MODE_ENV, "required"),
+            ("AWS_ENDPOINT_URL", "http://minio:9000"),
+            ("AWS_ENDPOINT_URL_S3", "https://minio:9000"),
+        ]))
+        .is_err());
+        // ... unless KOSHA_S3_ENDPOINT is set but empty: then Kosha passes
+        // nothing and the SDK prefers AWS_ENDPOINT_URL_S3.
+        assert_eq!(
+            check_s3_endpoint_lookup(env(&[
+                (MODE_ENV, "required"),
+                ("KOSHA_S3_ENDPOINT", ""),
+                ("AWS_ENDPOINT_URL", "http://minio:9000"),
+                ("AWS_ENDPOINT_URL_S3", "https://minio:9000"),
+            ])),
+            Ok(())
+        );
+        assert!(check_s3_endpoint_lookup(env(&[
+            (MODE_ENV, "required"),
+            ("KOSHA_S3_ENDPOINT", ""),
+            ("AWS_ENDPOINT_URL", "https://minio:9000"),
+            ("AWS_ENDPOINT_URL_S3", "http://minio:9000"),
+        ]))
+        .unwrap_err()
+        .contains("AWS_ENDPOINT_URL_S3"));
         assert_eq!(
             check_s3_endpoint_lookup(env(&[
                 (MODE_ENV, "on"),
