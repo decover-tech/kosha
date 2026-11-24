@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use kosha_core::{
     Bm25Params, DocumentId, Field, Manifest, ManifestEntry, NamespaceId, SearchQuery, SearchResult,
-    SegmentId,
+    SegmentId, TotalHitsRelation,
 };
 use kosha_query::Searcher;
 use kosha_segment::SegmentWriter;
@@ -561,6 +561,175 @@ fn tombstoned_documents_are_not_aggregated() {
     }
 }
 
+fn brute_force_knn<'a>(
+    docs: &'a [Doc],
+    target: &[f32],
+    k: usize,
+    status: Option<&str>,
+) -> Vec<&'a Doc> {
+    let cosine = |v: &[f32]| -> f64 {
+        let dot: f64 = v
+            .iter()
+            .zip(target)
+            .map(|(a, b)| (*a as f64) * (*b as f64))
+            .sum();
+        let n = |x: &[f32]| x.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+        dot / (n(v) * n(target))
+    };
+    let mut nearest: Vec<&Doc> = docs
+        .iter()
+        .filter(|d| status.is_none_or(|s| d.status == s))
+        .collect();
+    nearest.sort_by(|a, b| cosine(&b.vector).total_cmp(&cosine(&a.vector)));
+    nearest.truncate(k);
+    nearest
+}
+
+#[test]
+fn vector_only_aggregations_cover_the_namespace_top_k_before_pagination() {
+    let docs = corpus();
+    let built = layouts(&docs);
+    let target = [1.0f32, 0.0, 0.3, 1.0];
+    let k = 7;
+    for status in [None, Some("open")] {
+        let matched = brute_force_knn(&docs, &target, k, status);
+        let want = round_floats(brute_force(&matched));
+        for layout in &built {
+            for (from, size, field_sort) in
+                [(0, 0, false), (0, 1, false), (2, 3, true), (0, k, false)]
+            {
+                let mut request = json!({
+                    "query_text": "",
+                    "from": from,
+                    "max_results": size,
+                    "knn": {"field": "emb", "vector": target, "k": k, "num_candidates": 200},
+                    "aggs": aggs(),
+                    "exact_total_hits": false,
+                    "total_hits_cap": k,
+                });
+                if let Some(status) = status {
+                    request["knn"]["filter"] = json!({"term": {"status": status}});
+                }
+                if field_sort {
+                    request["sort"] =
+                        json!([{"owner": {"order": "asc"}}, {"_id": {"order": "asc"}}]);
+                }
+                let result = search(layout, &request, None);
+                let what = format!("{} {status:?} page={size}+{from}", layout.name);
+                assert_eq!(bucket_sum(&result, "owners") as usize, k, "{what}");
+                assert_eq!(result.total_hits, k, "{what}");
+                assert_eq!(result.total_hits_relation, TotalHitsRelation::Eq, "{what}");
+                assert_eq!(normalize(&result), want, "{what}");
+                let mut page = matched.clone();
+                if field_sort {
+                    page.sort_by_key(|doc| (doc.owner, &doc.id));
+                }
+                assert_eq!(
+                    result
+                        .results
+                        .iter()
+                        .map(|hit| &hit.doc_id.0)
+                        .collect::<Vec<_>>(),
+                    page.iter()
+                        .skip(from)
+                        .take(size)
+                        .map(|doc| &doc.id)
+                        .collect::<Vec<_>>(),
+                    "{what}"
+                );
+            }
+        }
+    }
+    for layout in built {
+        let _ = std::fs::remove_dir_all(layout.dir);
+    }
+}
+
+#[test]
+fn collapsed_vector_aggregations_keep_distinct_groups_in_the_top_k() {
+    let mut docs = corpus();
+    docs.truncate(3);
+    // The two closest vectors share an owner; the other group is in
+    // a different segment and must not be crowded out of the top two.
+    for (i, doc) in docs.iter_mut().enumerate() {
+        doc.vector = vec![1.0, i as f32 * 0.1, 0.0, 0.0];
+    }
+    let dir = temp_dir("collapsed");
+    let layout = Layout {
+        name: "collapsed",
+        manifest: build(&dir, &docs, &[1, 2], |doc| usize::from(doc.owner == "bo")),
+        dir,
+    };
+    let mut request = json!({
+        "query_text": "",
+        "max_results": 2,
+        "knn": {"field": "emb", "vector": [1.0, 0.0, 0.0, 0.0], "k": 2, "num_candidates": 20},
+        "collapse": {"field": "owner"},
+        "aggs": aggs(),
+    });
+    for (representative, sort) in [(0, None), (1, Some(json!([{"status": {"order": "asc"}}])))] {
+        if let Some(sort) = sort {
+            request["sort"] = sort;
+        }
+        let result = search(&layout, &request, None);
+        assert_eq!(result.total_hits, 2);
+        assert_eq!(
+            result
+                .results
+                .iter()
+                .map(|hit| &hit.doc_id.0)
+                .collect::<Vec<_>>(),
+            vec![&docs[representative].id, &docs[2].id]
+        );
+        assert_eq!(
+            normalize(&result),
+            round_floats(brute_force(&[&docs[representative], &docs[2]]))
+        );
+    }
+    std::fs::remove_dir_all(layout.dir).unwrap();
+}
+
+#[test]
+fn field_sorted_vector_collapse_keeps_the_nearest_groups() {
+    let mut docs = corpus();
+    docs.truncate(4);
+    docs[3].owner = "cy";
+    // Ana's closest vector ranks first, but field sorting chooses her
+    // other document, whose vector ranks last.
+    for (doc, distance) in docs.iter_mut().zip([0.0, 0.3, 0.1, 0.2]) {
+        doc.vector = vec![1.0, distance, 0.0, 0.0];
+    }
+    let dir = temp_dir("field-sorted-collapse");
+    let layout = Layout {
+        name: "field-sorted-collapse",
+        manifest: build(&dir, &docs, &[1, 2], |doc| usize::from(doc.owner != "ana")),
+        dir,
+    };
+    let request = json!({
+        "query_text": "",
+        "max_results": 2,
+        "knn": {"field": "emb", "vector": [1.0, 0.0, 0.0, 0.0], "k": 2, "num_candidates": 20},
+        "collapse": {"field": "owner"},
+        "sort": [{"status": {"order": "asc"}}],
+        "aggs": aggs(),
+    });
+    let result = search(&layout, &request, None);
+    assert_eq!(result.total_hits, 2);
+    assert_eq!(
+        result
+            .results
+            .iter()
+            .map(|hit| &hit.doc_id.0)
+            .collect::<Vec<_>>(),
+        vec![&docs[1].id, &docs[2].id]
+    );
+    assert_eq!(
+        normalize(&result),
+        round_floats(brute_force(&[&docs[1], &docs[2]]))
+    );
+    std::fs::remove_dir_all(layout.dir).unwrap();
+}
+
 /// A hybrid request aggregates over what its `total_hits` counts: the
 /// lexical matches plus the vector window's other members, on row and
 /// columnar segments alike, with a page smaller than either.
@@ -569,21 +738,11 @@ fn hybrid_aggregations_cover_lexical_matches_and_the_vector_window() {
     let docs = corpus();
     let built = layouts(&docs);
     let target = [1.0f32, 0.0, 0.3, 1.0];
-    let cosine = |v: &[f32]| -> f64 {
-        let dot: f64 = v
-            .iter()
-            .zip(&target)
-            .map(|(a, b)| (*a as f64) * (*b as f64))
-            .sum();
-        let n = |x: &[f32]| x.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
-        dot / (n(v) * n(&target))
-    };
     let k = 7;
     for (text, status) in [("breach", None), ("breach", Some("open"))] {
         let passes = |d: &Doc| status.is_none_or(|s| d.status == s);
-        let mut nearest: Vec<&Doc> = docs.iter().filter(|d| passes(d)).collect();
-        nearest.sort_by(|a, b| cosine(&b.vector).total_cmp(&cosine(&a.vector)));
-        let mut ids: BTreeSet<&str> = nearest[..k].iter().map(|d| d.id.as_str()).collect();
+        let nearest = brute_force_knn(&docs, &target, k, status);
+        let mut ids: BTreeSet<&str> = nearest.iter().map(|d| d.id.as_str()).collect();
         let lexical: Vec<&Doc> = docs
             .iter()
             .filter(|d| passes(d) && d.words.contains(&"breach"))
