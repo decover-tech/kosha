@@ -3073,10 +3073,11 @@ pub const SKIP_SPLIT_INVERTED_VERSION: u32 = 5;
 pub const BITPACKED_SKIP_SPLIT_INVERTED_VERSION: u32 = 6;
 /// Experimental v7 (#386): v6 full scoring blocks, singleton scoring
 /// blocks implied by their skip entry, and packed position delta groups
-/// per scoring block. Position counts are the corresponding posting's tf;
-/// a term with no positions (e.g. field norms) uses a dedicated marker.
+/// per scoring block. Position counts normally come from a posting's tf;
+/// field norms keys use a marked varint stream with explicit counts.
 pub const PACKED_POSITIONS_INVERTED_VERSION: u32 = 7;
 const NO_POSITIONS_MARKER: u8 = 34;
+const EXPLICIT_POSITION_COUNTS_MARKER: u8 = 35;
 
 /// THE canonical "is this a split-format inverted TOC?" predicate. Every
 /// site that dispatches on split-ness (the server's posting-blob hydration
@@ -3590,6 +3591,7 @@ impl TermMerger {
         let Some(std::cmp::Reverse((term, i))) = self.heap.pop() else {
             return Ok(None);
         };
+        encoder.start_term(&term);
         // Per-field postings (#249) carry no per-field length in their
         // block summaries: `min_field_length` 0 is a valid, if loose,
         // ceiling. Only the combined index is scored on the block-max WAND
@@ -3725,6 +3727,7 @@ struct TermEncoder {
     position_deltas: [u32; bitpack::BP_BLOCK],
     buffered_deltas: usize,
     has_positions: Option<bool>,
+    explicit_position_counts: bool,
 }
 
 impl TermEncoder {
@@ -3747,6 +3750,20 @@ impl TermEncoder {
             position_deltas: [0; bitpack::BP_BLOCK],
             buffered_deltas: 0,
             has_positions: None,
+            explicit_position_counts: false,
+        }
+    }
+
+    fn start_term(&mut self, term: &str) {
+        // Norms and NUL-containing analyzer tokens can share a key, so
+        // tf is not a position count for every posting on these keys.
+        self.explicit_position_counts = self.version == PACKED_POSITIONS_INVERTED_VERSION
+            && term
+                .strip_prefix('\0')
+                .and_then(|s| s.strip_suffix('\0'))
+                .is_some_and(kosha_core::fields::is_indexable_field_name);
+        if self.explicit_position_counts {
+            self.positions.mem.push(EXPLICIT_POSITION_COUNTS_MARKER);
         }
     }
 
@@ -3855,7 +3872,7 @@ impl TermEncoder {
         }
         self.block_last = doc_id;
         self.in_block += 1;
-        if self.version == PACKED_POSITIONS_INVERTED_VERSION {
+        if self.version == PACKED_POSITIONS_INVERTED_VERSION && !self.explicit_position_counts {
             self.push_packed_positions(term_frequency, positions)?;
             if self.in_block == SCORING_BLOCK_LEN {
                 self.flush_position_group();
@@ -3934,6 +3951,7 @@ impl TermEncoder {
         self.prev_doc = 0;
         self.prev_block_last = 0;
         self.has_positions = None;
+        self.explicit_position_counts = false;
         Ok(len)
     }
 
@@ -6033,7 +6051,14 @@ impl BlockedTermPostings {
         let mut postings: Vec<Posting> = Vec::with_capacity(self.doc_count as usize);
         let mut block_buf: Vec<ScoringPosting> = Vec::with_capacity(SCORING_BLOCK_LEN);
         let mut positions_buf = self.span.get(self.positions_base as usize..)?;
-        let packed = self.version == PACKED_POSITIONS_INVERTED_VERSION;
+        let v7 = self.version == PACKED_POSITIONS_INVERTED_VERSION;
+        let mut packed = v7;
+        if v7 {
+            if let Some(rest) = positions_buf.strip_prefix(&[EXPLICIT_POSITION_COUNTS_MARKER]) {
+                positions_buf = rest;
+                packed = false;
+            }
+        }
         let positionless = packed && positions_buf == [NO_POSITIONS_MARKER];
         if positionless {
             positions_buf = &[];
@@ -6099,7 +6124,7 @@ impl BlockedTermPostings {
                 });
             }
         }
-        if packed && !positions_buf.is_empty() {
+        if v7 && !positions_buf.is_empty() {
             return None;
         }
         let approx_bytes = postings.len() * std::mem::size_of::<Posting>() + position_count * 4;
@@ -14688,6 +14713,43 @@ mod bounded_build_tests {
             .filter(|(n, _)| n.starts_with("postings"))
             .map(|(_, b)| b.len() as u64)
             .sum()
+    }
+
+    #[test]
+    fn v7_review_preserves_tokens_colliding_with_field_norms() {
+        let key = kosha_core::fields::field_norms_key("body");
+        let analysis = AnalysisConfig {
+            default: kosha_core::analysis::AnalyzerSpec::legacy(),
+            ..AnalysisConfig::default()
+        };
+        let mut expected = None;
+        for (i, version) in [
+            SKIP_SPLIT_INVERTED_VERSION,
+            BITPACKED_SKIP_SPLIT_INVERTED_VERSION,
+            PACKED_POSITIONS_INVERTED_VERSION,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dir = scratch(&format!("colliding-norms-{version}"));
+            let mut writer = SegmentWriter::new(SegmentId("collision".into()), dir.clone())
+                .with_field_index(true)
+                .with_analysis(&analysis)
+                .with_postings_write_version(version);
+            writer.add_document(DocumentId("0".into()), vec![Field::text("body", &key)]);
+            writer.add_document(DocumentId("1".into()), vec![Field::text("body", "foo bar")]);
+            writer.finalize(Bm25Params::default()).unwrap();
+            let reader = SegmentReader::open(dir.clone()).unwrap();
+            let postings = reader.postings(&key).unwrap().to_vec();
+            if i == 0 {
+                assert!(postings.iter().any(|p| !p.positions.is_empty()));
+                assert!(postings.iter().any(|p| p.positions.is_empty()));
+                expected = Some(postings);
+            } else {
+                assert_eq!(Some(postings), expected);
+            }
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]
