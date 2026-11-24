@@ -72,6 +72,34 @@ pub(crate) enum Mailer {
     Capture(std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>),
 }
 
+/// Emailed links must be absolute, and links are logged only for a console
+/// that is not public (no `KOSHA_CONSOLE_URL`, or a loopback one): anyone
+/// reading the log could otherwise sign in as anyone.
+fn mailer_for(public_url: &str, webhook: Option<&str>) -> Result<Mailer, String> {
+    match webhook {
+        Some(_) if public_url.trim().is_empty() => Err(
+            "KOSHA_CONSOLE_EMAIL_WEBHOOK needs KOSHA_CONSOLE_URL, the origin emailed links point to"
+                .into(),
+        ),
+        Some(url) => Ok(Mailer::Webhook(url.trim().to_string())),
+        None if public_url.trim().is_empty() || is_loopback(public_url) => Ok(Mailer::Log),
+        None => Err(format!(
+            "KOSHA_CONSOLE_URL={public_url} is public, so set KOSHA_CONSOLE_EMAIL_WEBHOOK: \
+             sign-in links are logged only for a local console"
+        )),
+    }
+}
+
+fn is_loopback(url: &str) -> bool {
+    let rest = url.trim().split_once("://").map_or(url.trim(), |(_, r)| r);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => host.rsplit_once(':').map_or(host, |(h, _)| h),
+    };
+    host.eq_ignore_ascii_case("localhost") || host.starts_with("127.") || host == "::1"
+}
+
 pub(crate) struct Console {
     enabled: bool,
     public_url: String,
@@ -89,15 +117,18 @@ impl Console {
 
     pub(crate) fn from_env() -> Self {
         let var = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
-        let mailer = match var("KOSHA_CONSOLE_EMAIL_WEBHOOK") {
-            Some(url) => Mailer::Webhook(url.trim().to_string()),
-            None => Mailer::Log,
-        };
-        Self::new(
-            flag_enabled(var("KOSHA_CONSOLE").as_deref()),
-            var("KOSHA_CONSOLE_URL").as_deref().unwrap_or(""),
-            mailer,
-        )
+        let public_url = var("KOSHA_CONSOLE_URL").unwrap_or_default();
+        let enabled = flag_enabled(var("KOSHA_CONSOLE").as_deref());
+        let webhook = var("KOSHA_CONSOLE_EMAIL_WEBHOOK");
+        match mailer_for(&public_url, webhook.as_deref()) {
+            Ok(mailer) => Self::new(enabled, &public_url, mailer),
+            Err(e) => {
+                if enabled {
+                    eprintln!("console: disabled: {e}");
+                }
+                Self::new(false, &public_url, Mailer::Log)
+            }
+        }
     }
 
     /// The response for a `/console` request, or `None` when `request_line`
@@ -363,6 +394,33 @@ mod tests {
         let (head, body) = response.split_once("\r\n\r\n").unwrap();
         let status = head.split(' ').nth(1).unwrap().parse().unwrap();
         (status, serde_json::from_str(body).unwrap_or(Value::Null))
+    }
+
+    #[test]
+    fn links_are_logged_only_for_a_local_console() {
+        assert!(matches!(mailer_for("", None), Ok(Mailer::Log)));
+        assert!(matches!(
+            mailer_for("http://localhost:8080", None),
+            Ok(Mailer::Log)
+        ));
+        assert!(matches!(
+            mailer_for("http://127.0.0.1:8080/", None),
+            Ok(Mailer::Log)
+        ));
+        assert!(matches!(
+            mailer_for("http://[::1]:8080", None),
+            Ok(Mailer::Log)
+        ));
+        assert!(mailer_for("https://kosha.example.com", None).is_err());
+        assert!(mailer_for("https://localhost.example.com", None).is_err());
+        assert!(mailer_for("", Some("https://mail.example/hook")).is_err());
+        assert!(matches!(
+            mailer_for(
+                "https://kosha.example.com",
+                Some("https://mail.example/hook")
+            ),
+            Ok(Mailer::Webhook(_))
+        ));
     }
 
     #[test]

@@ -572,8 +572,8 @@ far, and its invoices. `GET /v1/admin/billing/accounts` and
 | `KOSHA_LEGACY_ROUTES_TENANTS` | Comma-separated tenant ids that keep the legacy routes while `KOSHA_LEGACY_ROUTES=off` (a managed deployment turns the default off and lists only tenants still migrating). Read at startup | empty | list |
 | `KOSHA_DASHBOARD` | `on` (or `true`, `1`, `yes`, `enabled`) serves the read-only web UI at `/dashboard`, adds `recent_queries` to `GET /v1/namespaces/{ns}/stats`, and honors `"timings": true` on searches. See [dashboard.md](dashboard.md). `dashboard.rs`, `Dashboard::from_env` | off | flag |
 | `KOSHA_CONSOLE` | `on` (or `true`, `1`, `yes`, `enabled`) serves the self-serve web console at `/console`: email-link sign-up and sign-in, and organizations, projects, tenants, API keys, members and the audit log for the signed-in user (#345). See [console.md](console.md). `console.rs`, `Console::from_env` | off | flag |
-| `KOSHA_CONSOLE_URL` | This server's public origin (e.g. `https://kosha.example.com`), the start of every emailed sign-in link. Never taken from the request's `Host` | empty (links are logged as a bare path) | URL |
-| `KOSHA_CONSOLE_EMAIL_WEBHOOK` | URL the console POSTs each sign-in email to as JSON `{to, subject, text, link}`, for a mail service to deliver. Unset, the link is written to the server log instead (development only) | unset | URL |
+| `KOSHA_CONSOLE_URL` | This server's public origin (e.g. `https://kosha.example.com`), the start of every emailed sign-in link. Never taken from the request's `Host`. Required with `KOSHA_CONSOLE_EMAIL_WEBHOOK` | empty (links are logged as a bare path) | URL |
+| `KOSHA_CONSOLE_EMAIL_WEBHOOK` | URL the console POSTs each sign-in email to as JSON `{to, subject, text, link}`, for a mail service to deliver. Required when `KOSHA_CONSOLE_URL` is a public origin. Unset, with no URL or a loopback one, the link is written to the server log instead (development only) | unset | URL |
 
 The server refuses to start when no credential is configured (no env key, no admin or internal
 key, no Postgres keys) unless `KOSHA_AUTH=disabled`.

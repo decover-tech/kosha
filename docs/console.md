@@ -30,8 +30,10 @@ Email goes out through a webhook, so any mail service can deliver it:
 | `KOSHA_CONSOLE_URL` | This server's public origin, the start of every link. Never taken from the request's `Host`, which a caller controls. |
 | `KOSHA_CONSOLE_EMAIL_WEBHOOK` | Each email is POSTed here as JSON `{to, subject, text, link}`. A non-2xx answer fails the request. |
 
-Without a webhook the link is written to the server log, for local
-development:
+The console stays off, with an error in the log, when a webhook is set
+without `KOSHA_CONSOLE_URL`, or when `KOSHA_CONSOLE_URL` is a public origin
+and no webhook is set. Without a webhook, and with no URL or a loopback one,
+the link is written to the server log, for local development:
 
 ```sh
 KOSHA_CONSOLE=on KOSHA_ADMIN_API_KEY=dev-admin cargo run -p kosha-server
