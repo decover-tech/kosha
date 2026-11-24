@@ -1232,6 +1232,9 @@ fn stripe_signatures_are_checked() {
     let other = stripe_signature(body, "whsec_old", now);
     let both = format!("{good},{}", other.split_once(',').unwrap().1);
     assert!(billing::verify_stripe_signature(&both, body, WEBHOOK_SECRET, now).is_ok());
+    let v1 = good.split_once(',').unwrap().1;
+    let flood = format!("{good},{}", [v1; 4].join(","));
+    assert!(billing::verify_stripe_signature(&flood, body, WEBHOOK_SECRET, now).is_err());
     for (header, at) in [
         (good.as_str(), now + 6 * 60_000),
         (other.as_str(), now),

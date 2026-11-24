@@ -114,6 +114,10 @@ pub(crate) struct ScheduledRun {
 /// Stripe's own default tolerance.
 const STRIPE_WEBHOOK_TOLERANCE_MS: u64 = 5 * 60 * 1000;
 
+/// Stripe sends one `v1` per active signing secret (two while rotating);
+/// more is refused rather than hashing the body for each.
+const STRIPE_MAX_SIGNATURES: usize = 4;
+
 /// Whether `base` may be sent the Stripe secret key: `https`, or plain
 /// `http` to this machine only (a local stub).
 pub(crate) fn stripe_base_allowed(base: &str) -> bool {
@@ -558,6 +562,9 @@ pub(crate) fn verify_stripe_signature(
             Some(("t", value)) => timestamp = value.parse::<u64>().ok(),
             Some(("v1", value)) => signatures.extend(hex_decode(value)),
             _ => {}
+        }
+        if signatures.len() > STRIPE_MAX_SIGNATURES {
+            return Err("Stripe-Signature has too many signatures");
         }
     }
     let timestamp = timestamp.ok_or("Stripe-Signature has no timestamp")?;
