@@ -8,6 +8,8 @@ use super::*;
 use kosha_segment::{KnnCentroidScoreBounds, KnnSegmentRanking};
 use std::sync::atomic::AtomicUsize;
 
+mod rabitq;
+
 struct Lcg(u64);
 
 impl Lcg {
@@ -653,7 +655,8 @@ fn searches_are_identical_with_the_i8_stage_on_and_off() {
     // End to end, in whatever mode the process's KOSHA_KNN_* variables
     // select. They are read once per process, so covering a mode means
     // running this test under it: KOSHA_KNN_PROBE_RADIUS_ALPHA,
-    // KOSHA_KNN_RELATIVE_CUTOFF_EPS, KOSHA_KNN_GLOBAL_BUDGET=0,
+    // KOSHA_KNN_RELATIVE_CUTOFF_EPS, KOSHA_KNN_BOUND_STOP_ALPHA,
+    // KOSHA_KNN_GLOBAL_BUDGET=0,
     // KOSHA_KNN_GLOBAL_RESCORE=1, KOSHA_VECTOR_QUANTIZATION. A plain
     // `cargo test` covers the defaults only.
     let mut rng = Lcg(0xE2E);
@@ -792,6 +795,10 @@ impl KnnPlanSource for MatrixSource<'_> {
 #[test]
 #[ignore = "a timing harness, run by hand in release mode"]
 fn knn_plan_microbench() {
+    run_plan_microbench(false);
+}
+
+fn run_plan_microbench(rabitq: bool) {
     let knob = |name: &str, default: usize| -> usize {
         std::env::var(format!("KOSHA_PLAN_BENCH_{name}"))
             .ok()
@@ -805,7 +812,9 @@ fn knn_plan_microbench() {
     let (segs, per_seg, dim) = (knob("SEGS", 196), knob("CENTROIDS", 582), knob("DIM", 1024));
     let (n_queries, iters) = (knob("QUERIES", 16), knob("ITERS", 20));
     let requested = knob("NUM_CANDIDATES", 100);
+    assert!(segs > 0 && per_seg > 0 && dim > 0 && n_queries > 0 && iters > 0);
     let mut rng = Lcg(0xBE7C);
+    let rotation = rabitq.then(|| kosha_vector_spfresh::RaBitQRotation::new(dim));
     // Roughly normal coordinates: a sum of four uniforms.
     let noise = |rng: &mut Lcg, dim: usize| -> Vec<f32> {
         let mut v: Vec<f32> = (0..dim)
@@ -831,13 +840,13 @@ fn knn_plan_microbench() {
     // the hardest case for a bound of about a hundredth.
     for layout in ["topics", "iid"] {
         let topics: Vec<Vec<f32>> = (0..256).map(|_| noise(&mut rng, dim)).collect();
-        let mut sample: Vec<Vec<f32>> = Vec::new();
         let centroid_bytes = segs * per_seg * dim * 4;
         for (radii_name, radius_of) in [
             ("no radii", (|_: &mut Lcg| 0.0) as fn(&mut Lcg) -> f32),
             ("radii 0.2..0.6", |rng: &mut Lcg| 0.4 + rng.coord() * 0.2),
         ] {
-            let matrices: Vec<kosha_segment::KnnCentroidMatrix> = (0..segs)
+            let mut sample: Vec<Vec<f32>> = Vec::new();
+            let (matrices, codes): (Vec<_>, Vec<_>) = (0..segs)
                 .map(|_| {
                     let mut flat = Vec::with_capacity(per_seg * dim);
                     let mut radii = Vec::with_capacity(per_seg);
@@ -854,9 +863,14 @@ fn knn_plan_microbench() {
                         flat.extend_from_slice(&c);
                         radii.push(radius_of(&mut rng));
                     }
-                    kosha_segment::KnnCentroidMatrix::new(dim, &flat, &radii)
+                    let matrix = kosha_segment::KnnCentroidMatrix::new(dim, &flat, &radii);
+                    let codes = rotation
+                        .as_ref()
+                        .map(|r| rabitq::CentroidCodes::new(r, &flat, radii));
+                    (matrix, codes)
                 })
-                .collect();
+                .unzip();
+            let codes: Option<Vec<_>> = codes.into_iter().collect();
             let queries: Vec<Vec<f32>> = sample
                 .iter()
                 .map(|c| mix(c, &noise(&mut rng, dim), 0.5))
@@ -866,6 +880,11 @@ fn knn_plan_microbench() {
             for alpha in [1.0f32, 0.0] {
                 if radii_name == "no radii" && alpha == 0.0 {
                     continue; // the same scores as alpha 1
+                }
+                if let (Some(rotation), Some(codes)) = (&rotation, &codes) {
+                    println!("{layout}, {radii_name}, alpha {alpha}: {total} x {dim} centroids, budget {budget}");
+                    rabitq::measure(rotation, &matrices, codes, &queries, alpha, budget, iters);
+                    continue;
                 }
                 let mut ms = [Vec::new(), Vec::new()];
                 let (mut exact, mut plans) = (0usize, 0usize);

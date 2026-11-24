@@ -167,6 +167,19 @@ if [ "${KOSHA_DOC_STORE_COMPRESSION:-}" != zstd ] && [ "$ZSTD_FOOTERS" != 0 ]; t
   echo "::error::$ZSTD_FOOTERS segment(s) are compressed but KOSHA_DOC_STORE_COMPRESSION is not zstd. Not uploading."
   exit 1
 fi
+VECTOR_QUANTIZATIONS=$(sudo python3 - "/data/segments-out/$NS" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+formats = set()
+for path in Path(sys.argv[1]).rglob("footer.json"):
+    footer = json.loads(path.read_text())
+    for column in footer.get("vector_fields") or []:
+        formats.add(column.get("quantization", "f32"))
+print(json.dumps(sorted(formats)))
+PY
+)
 # Provenance stored next to the snapshot (build_info.txt): the builder env
 # and a fingerprint of the sources the builder compiled. The VM copy has
 # no .git, so two snapshots come from the same commit when their
@@ -204,8 +217,8 @@ echo "IMPORT-COMPLETE"
 echo "$BUILD_INFO" | aws s3 cp - "s3://$SNAPSHOT_CACHE_BUCKET/snapshots/$SNAPSHOT_NAME/build_info.txt" --only-show-errors
 # Bucket and local cache now derive from exactly this snapshot: a restore
 # of it right after keeps both instead of re-copying them.
-printf '{"snapshot": "%s", "namespace": "%s", "builder_sha": "%s", "source_digest": "%s", "build_args": "%s", "max_docs": %s, "with_embeddings": "%s", "built_at": "%s"}\n' \
-  "$SNAPSHOT_NAME" "$NS" "$BUILDER_SHA" "$SOURCE_DIGEST" "$BUILD_ARGS" "$MAX_DOCS" "$WITH_EMB" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+printf '{"snapshot": "%s", "namespace": "%s", "builder_sha": "%s", "source_digest": "%s", "build_args": "%s", "max_docs": %s, "with_embeddings": "%s", "built_at": "%s", "vector_quantizations": %s}\n' \
+  "$SNAPSHOT_NAME" "$NS" "$BUILDER_SHA" "$SOURCE_DIGEST" "$BUILD_ARGS" "$MAX_DOCS" "$WITH_EMB" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$VECTOR_QUANTIZATIONS" \
   > /tmp/build-info.json
 aws s3 cp --only-show-errors /tmp/build-info.json "s3://$SNAPSHOT_CACHE_BUCKET/snapshots/$SNAPSHOT_NAME/build-info.json"
 echo "BUILD-INFO $(cat /tmp/build-info.json)"

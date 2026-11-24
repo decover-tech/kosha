@@ -7,9 +7,9 @@ pub mod multivec;
 pub mod reorder;
 pub mod span_cache;
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -19,7 +19,7 @@ use kosha_core::{
     build_filter_blooms, build_term_bloom, AggBucket, AggBucketResult, AggMetricResult,
     AggregationResults, Bm25Params, DocRecord, DocSet, DocumentId, Field, FieldType, FilterClause,
     FilterStore, Footer, KoshaError, LocalStorage, Posting, SegmentId, StorageBackend,
-    VectorFieldMeta, VectorQuantization, VectorStore,
+    VectorFieldMeta, VectorQuantization, VectorRadiusReference, VectorStore,
 };
 use kosha_core::{AnalysisConfig, AnalyzerSpec, SegmentAnalysis};
 
@@ -86,6 +86,8 @@ pub struct SegmentWriter {
     /// Inverted-index version `finalize` writes; see
     /// [`postings_write_version`].
     postings_write_version: u32,
+    two_tier_head_fraction: Option<f64>,
+    tier_build_params: Bm25Params,
     /// Leave every `postings-*.bin` shard raw (no zstd wrapper) so query
     /// nodes can range-read single terms (#245); recorded as
     /// `Footer::posting_blobs_raw`. See [`posting_blobs_raw`].
@@ -119,6 +121,7 @@ pub struct SegmentWriter {
     /// [`kosha_core::VectorFieldMeta::slot`]), so a single-column segment
     /// keeps the `vector.idx` + `vector.offsets` layout it always had.
     vector_columns: Vec<VectorColumn>,
+    knn_segment_summaries: bool,
     /// Vectors kept for `doc_vectors.bin` but not indexed: their dimension
     /// disagreed with the first vector seen for the same field in this
     /// segment. The write API rejects such documents up front; this only
@@ -141,10 +144,17 @@ pub struct SegmentWriter {
     /// Postings of compaction inputs to seed each vector column's index
     /// from, by field name, one group per input (#253). See
     /// [`Self::seed_vector_postings`].
-    vector_seeds: HashMap<String, Vec<Vec<VectorSeedPosting>>>,
+    vector_seeds: HashMap<String, Vec<SeedGroup>>,
+    /// When a seeded column is rebuilt from scratch instead (#464). See
+    /// [`VectorRebuildTrigger`].
+    vector_rebuild_trigger: VectorRebuildTrigger,
+    /// Persist each clustered column's radius reference even without
+    /// seeds. See [`Self::with_vector_radius_reference`].
+    record_radius_reference: bool,
     /// How each column's index was built by `finalize`, for tests and
     /// diagnostics. See [`VectorIndexBuild`].
     vector_index_builds: Arc<Mutex<Vec<VectorIndexBuild>>>,
+    profile_vector_compaction: bool,
     /// Chain for `Text` fields without their own (#220).
     default_analyzer: Analyzer,
     /// Per-field chains that differ from `default_analyzer`.
@@ -245,6 +255,11 @@ impl SegmentWriter {
             peak_inverted_bytes: 0,
             build_memory_bytes: segment_build_memory_bytes(),
             postings_write_version: postings_write_version(),
+            two_tier_head_fraction: std::env::var("KOSHA_TWO_TIER_HEAD_FRACTION")
+                .ok()
+                .and_then(|value| value.parse::<f64>().ok())
+                .filter(|&fraction| fraction > 0.0 && fraction < 1.0),
+            tier_build_params: Bm25Params::default(),
             posting_blobs_raw: posting_blobs_raw(),
             runs: Vec::new(),
             io_error: None,
@@ -258,6 +273,8 @@ impl SegmentWriter {
             filters_write_version: filter_columns::filters_write_version(),
             filter_columns_meta: None,
             vector_columns: Vec::new(),
+            knn_segment_summaries: std::env::var("KOSHA_KNN_SEGMENT_SUMMARIES").as_deref()
+                == Ok("1"),
             unindexed_vectors: Vec::new(),
             text_filter_ignore_above: text_filter_ignore_above(),
             vector_store_mode: VectorStoreMode::from_env(),
@@ -265,7 +282,10 @@ impl SegmentWriter {
             vector_quantization: VectorQuantizationConfig::from_env().clone(),
             doc_vector_entries: Vec::new(),
             vector_seeds: HashMap::new(),
+            vector_rebuild_trigger: VectorRebuildTrigger::from_env(),
+            record_radius_reference: false,
             vector_index_builds: Arc::new(Mutex::new(Vec::new())),
+            profile_vector_compaction: false,
             default_analyzer: Analyzer::new(&AnalyzerSpec::legacy()),
             field_analyzers: HashMap::new(),
             analyzed_fields: BTreeMap::new(),
@@ -280,6 +300,12 @@ impl SegmentWriter {
             },
             doc_store_compression_meta: None,
         }
+    }
+
+    /// Write a coarse kNN centroid for each indexed vector column (#380).
+    pub fn with_knn_segment_summaries(mut self, enabled: bool) -> Self {
+        self.knn_segment_summaries = enabled;
+        self
     }
 
     /// Override doc-store compression (research #388): `Some` writes
@@ -371,7 +397,7 @@ impl SegmentWriter {
 
     /// Override the inverted-index version (tests, benches and mixed-version
     /// fixtures in other crates; production uses
-    /// `KOSHA_POSTINGS_WRITE_VERSION`). Accepts 4, 5 or 6.
+    /// `KOSHA_POSTINGS_WRITE_VERSION`). Accepts 4, 5, 6 or 7.
     #[doc(hidden)]
     pub fn with_postings_write_version(mut self, version: u32) -> Self {
         assert!(
@@ -380,6 +406,7 @@ impl SegmentWriter {
                 SPLIT_INVERTED_VERSION
                     | SKIP_SPLIT_INVERTED_VERSION
                     | BITPACKED_SKIP_SPLIT_INVERTED_VERSION
+                    | PACKED_POSITIONS_INVERTED_VERSION
             ),
             "unsupported postings write version {version}"
         );
@@ -391,6 +418,13 @@ impl SegmentWriter {
     /// writers use `KOSHA_POSTINGS_RAW_BLOBS`; see [`posting_blobs_raw`].
     pub fn with_raw_posting_blobs(mut self, raw: bool) -> Self {
         self.posting_blobs_raw = raw;
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_two_tier_head_fraction(mut self, fraction: f64) -> Self {
+        assert!(fraction > 0.0 && fraction < 1.0);
+        self.two_tier_head_fraction = Some(fraction);
         self
     }
 
@@ -443,16 +477,58 @@ impl SegmentWriter {
         field: &str,
         postings: impl IntoIterator<Item = VectorSeedPosting>,
     ) {
+        self.seed_vector_postings_with_reference(field, postings, None);
+    }
+
+    /// [`Self::seed_vector_postings`], plus the radius reference the
+    /// input's column carried (`VectorFieldMeta::radius_reference`, #464).
+    /// If this input's postings are adopted, the output column inherits
+    /// the reference, so radius inflation is measured against the last
+    /// from-scratch build rather than against the previous compaction.
+    pub fn seed_vector_postings_with_reference(
+        &mut self,
+        field: &str,
+        postings: impl IntoIterator<Item = VectorSeedPosting>,
+        reference: Option<VectorRadiusReference>,
+    ) {
         self.vector_seeds
             .entry(field.to_string())
             .or_default()
-            .push(postings.into_iter().collect());
+            .push(SeedGroup {
+                postings: postings.into_iter().collect(),
+                reference,
+            });
+    }
+
+    /// Override when seeded vector columns are rebuilt from scratch
+    /// (#464). Production writers use `KOSHA_VECTOR_REBUILD_*`; see
+    /// [`VectorRebuildTrigger`].
+    pub fn with_vector_rebuild_trigger(mut self, trigger: VectorRebuildTrigger) -> Self {
+        self.vector_rebuild_trigger = trigger;
+        self
+    }
+
+    /// Write `VectorFieldMeta::radius_reference` for every clustered
+    /// column, seeded or not (#464). Compaction sets it, so an output
+    /// clustered from scratch (no input big enough to seed from, or
+    /// `KOSHA_VECTOR_COMPACTION=rebuild`) is the baseline its next LIRE
+    /// merge measures against. Seeded columns always write one.
+    pub fn with_vector_radius_reference(mut self, record: bool) -> Self {
+        self.record_radius_reference = record;
+        self
     }
 
     /// A handle to how `finalize` built each vector column's index — read
     /// it after `finalize` (which consumes the writer).
     pub fn vector_index_builds(&self) -> Arc<Mutex<Vec<VectorIndexBuild>>> {
         Arc::clone(&self.vector_index_builds)
+    }
+
+    /// Measure how much of the output has the same membership as an input
+    /// posting. This is opt-in to keep comparison work off the write path.
+    pub fn with_vector_compaction_profile(mut self) -> Self {
+        self.profile_vector_compaction = true;
+        self
     }
 
     /// Override the `Text` → filter-column cap for this writer (`None`
@@ -495,6 +571,74 @@ impl SegmentWriter {
             forward.push_doc(terms.iter());
         }
         forward.bp_order(config)
+    }
+
+    /// Posting order (#456, research) for `docs`, documents about to be
+    /// added to this writer: clusters their `field` vectors exactly as
+    /// `finalize` would, then numbers documents posting by posting, so each
+    /// posting covers one contiguous `doc_seq` range. Documents without a
+    /// usable `field` vector (absent, empty, or of another dimension than
+    /// the first) go last, in their input order.
+    ///
+    /// Add `docs` in [`PostingOrder::order`] and pass
+    /// [`PostingOrder::seeds`] to [`Self::seed_vector_postings`] for
+    /// `field`: `finalize` then adopts these postings instead of
+    /// clustering a second time (an input order change would give
+    /// different postings). Its rebalance may still split or merge a few,
+    /// which then cover more than one range. Other vector columns are
+    /// clustered as usual and gain nothing: one segment has one order.
+    /// The segment format is unchanged. `None` when no document has a
+    /// usable vector, clustering fails, or vector write version 1 (a flat
+    /// index, no postings) is in effect; keep the input order then.
+    pub fn posting_order<'a, I>(&self, docs: I, field: &str) -> Option<PostingOrder>
+    where
+        I: IntoIterator<Item = &'a [Field]>,
+    {
+        // Vector write version 1 writes a flat index with no postings.
+        if vector_write_version() == 1 {
+            return None;
+        }
+        let mut dim = None;
+        let mut vectors: Vec<(u32, Vec<f32>)> = Vec::new();
+        let mut rest: Vec<u32> = Vec::new();
+        for (i, fields) in docs.into_iter().enumerate() {
+            let vector = fields
+                .iter()
+                .filter(|f| f.field_type == FieldType::Vector && f.name == field)
+                .find_map(|f| serde_json::from_str::<Vec<f32>>(&f.value).ok())
+                .filter(|v| !v.is_empty() && *dim.get_or_insert(v.len()) == v.len());
+            match vector {
+                Some(mut v) => {
+                    if vector_write_version() >= 3 {
+                        kosha_vector_spfresh::normalize_in_place(&mut v);
+                    }
+                    vectors.push((i as u32, v));
+                }
+                None => rest.push(i as u32),
+            }
+        }
+        let dim = dim?;
+        if vectors.is_empty() {
+            return None;
+        }
+        let index =
+            kosha_vector_spfresh::ClusterIndex::build(&vectors, vector_cluster_config(dim)).ok()?;
+        let base = self.field_lengths.len() as u32;
+        let mut order = Vec::with_capacity(vectors.len() + rest.len());
+        let mut seeds = Vec::new();
+        for posting in index.snapshot() {
+            let mut members: Vec<u32> = posting.entries.iter().map(|(id, _)| *id).collect();
+            members.sort_unstable();
+            let first = base + order.len() as u32;
+            order.extend_from_slice(&members);
+            seeds.push(VectorSeedPosting {
+                centroid: posting.centroid,
+                doc_seqs: (first..first + members.len() as u32).collect(),
+                dropped: 0,
+            });
+        }
+        order.extend(rest);
+        Some(PostingOrder { order, seeds })
     }
 
     /// [`Self::add_document`] with some `Vector` fields' values supplied
@@ -894,6 +1038,10 @@ impl SegmentWriter {
         self.backend.create_dir_all("")?;
         self.write_doc_store()?;
         self.write_doc_vectors()?;
+        if self.two_tier_head_fraction.is_some() {
+            self.posting_blobs_raw = true;
+            self.tier_build_params = bm25_params.clone();
+        }
         self.write_inverted_index()?;
         self.write_filters()?;
         let vector_fields = match vector_write_version() {
@@ -1005,13 +1153,18 @@ impl SegmentWriter {
             (0..POSTING_BLOB_SHARDS).map(|_| None).collect();
         let mut blob_lens: Vec<u64> = vec![0; POSTING_BLOB_SHARDS];
         let mut pool: Vec<u8> = Vec::new();
-        // (term_off_in_pool, term_len, blob_id, postings_off_in_blob, postings_len)
-        let mut entries: Vec<(u64, u32, u32, u64, u32)> = Vec::new();
-        let write_version = self.postings_write_version;
+        let mut entries = Vec::new();
+        let fraction = self.two_tier_head_fraction;
+        let write_version = fraction.map_or(self.postings_write_version, |_| {
+            TIERED_SPLIT_INVERTED_VERSION
+        });
+        let mut tier_metadata = Vec::new();
+        let mut tail_output = None;
+        let mut tail_offset = 0u64;
         // Rollout/rollback compatibility: v4 (`KOSHA_POSTINGS_WRITE_VERSION=4`)
         // streams through the same encoder; see `postings_write_version`.
         let mut encoder = TermEncoder::new(
-            write_version,
+            fraction.map_or(write_version, |_| SKIP_SPLIT_INVERTED_VERSION),
             &build_dir,
             term_spill_limit(self.build_memory_bytes),
         );
@@ -1026,7 +1179,83 @@ impl SegmentWriter {
                     slot.insert(std::io::BufWriter::new(file))
                 }
             };
-            let encoded_len = encoder.finish(blob)?;
+            let tier_record = tier_metadata.len();
+            let encoded_len = if let Some(fraction) = fraction {
+                let mut full_span = Vec::new();
+                encoder.finish(&mut full_span)?;
+                let (mut postings, _) =
+                    BlockedTermPostings::parse(Arc::new(full_span), SKIP_SPLIT_INVERTED_VERSION)
+                        .and_then(|span| span.decode_full(&term))
+                        .ok_or_else(|| {
+                            KoshaError::CorruptSegment("newly encoded tier input".into())
+                        })?;
+                let df = u32::try_from(postings.len())
+                    .map_err(|_| std::io::Error::other("tier document frequency exceeds u32"))?;
+                let mut tail = Vec::new();
+                let mut frontier = Vec::new();
+                let lengths = if kosha_core::fields::is_field_key(&term) {
+                    &[][..]
+                } else {
+                    &self.field_lengths
+                };
+                if !lengths.is_empty() && postings.len() >= SCORING_BLOCK_LEN {
+                    let head_count =
+                        ((postings.len() as f64 * fraction).ceil() as usize).min(postings.len());
+                    let avgdl = self.total_field_length as f64 / lengths.len() as f64;
+                    let impact = |posting: &Posting| {
+                        let tf = f64::from(posting.term_frequency);
+                        let dl = f64::from(lengths[posting.doc_id as usize]);
+                        // IDF and k1 + 1 are constant within the term.
+                        tf / (tf
+                            + self.tier_build_params.k1
+                                * (1.0 - self.tier_build_params.b
+                                    + self.tier_build_params.b * dl / avgdl))
+                    };
+                    if head_count < postings.len() {
+                        postings.select_nth_unstable_by(head_count, |a, b| {
+                            impact(b)
+                                .total_cmp(&impact(a))
+                                .then(a.doc_id.cmp(&b.doc_id))
+                        });
+                        tail = postings.split_off(head_count);
+                        postings.sort_unstable_by_key(|posting| posting.doc_id);
+                        tail.sort_unstable_by_key(|posting| posting.doc_id);
+                        frontier = tail_frontier(
+                            &mut tail
+                                .iter()
+                                .map(|p| (p.term_frequency, lengths[p.doc_id as usize]))
+                                .collect::<Vec<_>>(),
+                        );
+                    }
+                }
+                let mut span = Vec::new();
+                if !tail.is_empty() {
+                    write_postings_skip_split(&mut span, &tail, lengths);
+                    if tail_output.is_none() {
+                        tail_output = Some(std::io::BufWriter::new(fs::File::create(
+                            build_dir.join(TIER_TAIL_FILE),
+                        )?));
+                    }
+                    tail_output.as_mut().unwrap().write_all(&span)?;
+                }
+                let tail_len = u32::try_from(span.len())
+                    .map_err(|_| std::io::Error::other("tier span exceeds u32"))?;
+                tier_metadata.extend_from_slice(&df.to_le_bytes());
+                tier_metadata.extend_from_slice(&tail_offset.to_le_bytes());
+                tier_metadata.extend_from_slice(&tail_len.to_le_bytes());
+                tier_metadata.extend_from_slice(&(frontier.len() as u32).to_le_bytes());
+                for (dl, tf) in frontier {
+                    tier_metadata.extend_from_slice(&dl.to_le_bytes());
+                    tier_metadata.extend_from_slice(&tf.to_le_bytes());
+                }
+                tail_offset += u64::from(tail_len);
+                span.clear();
+                write_postings_skip_split(&mut span, &postings, lengths);
+                blob.write_all(&span)?;
+                span.len() as u64
+            } else {
+                encoder.finish(blob)?
+            };
             let encoded_len = u32::try_from(encoded_len).map_err(|_| {
                 KoshaError::Io(std::io::Error::other(format!(
                     "postings for term {term:?} encode to {encoded_len} bytes, over the \
@@ -1043,6 +1272,7 @@ impl SegmentWriter {
                 blob_id as u32,
                 p_off,
                 encoded_len,
+                tier_record,
             ));
         }
         drop(encoder);
@@ -1070,20 +1300,38 @@ impl SegmentWriter {
         buf.extend_from_slice(&write_version.to_le_bytes());
         buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
         buf.extend_from_slice(&(POSTING_BLOB_SHARDS as u32).to_le_bytes());
-        for (term_off, term_len, blob_id, p_off, p_len) in entries {
+        for (term_off, term_len, blob_id, p_off, p_len, tier_record) in entries {
             buf.extend_from_slice(&(pool_base + term_off).to_le_bytes());
             buf.extend_from_slice(&term_len.to_le_bytes());
             buf.extend_from_slice(&blob_id.to_le_bytes());
             buf.extend_from_slice(&p_off.to_le_bytes());
             buf.extend_from_slice(&p_len.to_le_bytes());
-            buf.extend_from_slice(&0u32.to_le_bytes());
+            let tier_offset = if fraction.is_some() {
+                u32::try_from(pool_base + pool.len() as u64 + tier_record as u64)
+                    .map_err(|_| std::io::Error::other("tier TOC exceeds u32"))?
+            } else {
+                0
+            };
+            buf.extend_from_slice(&tier_offset.to_le_bytes());
         }
         buf.extend_from_slice(&pool);
+        buf.extend_from_slice(&tier_metadata);
+        if let Some(mut tail) = tail_output {
+            tail.flush()?;
+            drop(tail);
+            fs::rename(
+                build_dir.join(TIER_TAIL_FILE),
+                self.output_dir.join(TIER_TAIL_FILE),
+            )?;
+        }
         // TOC and every posting blob are wrapped independently (see
         // `maybe_compress_inverted`) so the lazy per-shard fetch/decode
         // semantics are unchanged — each artifact self-describes.
-        let encoded_toc = maybe_compress_inverted(&buf);
-        drop(buf);
+        let encoded_toc = if fraction.is_some() {
+            buf
+        } else {
+            maybe_compress_inverted(&buf)
+        };
         self.backend.write("inverted.idx", &encoded_toc)?;
         for (blob_id, blob) in blobs.into_iter().enumerate() {
             let Some(blob) = blob else { continue };
@@ -1227,6 +1475,8 @@ impl SegmentWriter {
                 offsets: false,
                 quantization: VectorQuantization::F32,
                 embedding_model: self.embedding_models.get(&column.name).cloned(),
+                knn_segment_centroid: None,
+                radius_reference: None,
             };
             self.backend.write(&meta.idx_file(), &buf)?;
             metas.push(meta);
@@ -1246,6 +1496,7 @@ impl SegmentWriter {
     /// `vector.offsets` it always did, and further columns get
     /// `vector.<slot>.idx` + `vector.<slot>.offsets`.
     fn write_vectors_v2(&self) -> Result<Vec<VectorFieldMeta>, KoshaError> {
+        let write_version = vector_write_version();
         let mut metas = Vec::with_capacity(self.vector_columns.len());
         for (slot, column) in self.vector_columns.iter().enumerate() {
             if column.vectors.is_empty() {
@@ -1255,7 +1506,7 @@ impl SegmentWriter {
             // to an older `KOSHA_VECTOR_WRITE_VERSION` for a rolling deploy
             // keeps writing f32, which every reader of that version reads.
             let requested = self.vector_quantization.for_field(&column.name);
-            let quantization = if vector_write_version() >= 4 {
+            let quantization = if write_version >= 4 {
                 requested
             } else {
                 if !requested.is_f32() {
@@ -1263,6 +1514,15 @@ impl SegmentWriter {
                 }
                 VectorQuantization::F32
             };
+            let seeds = self.vector_seeds.get(&column.name);
+            let (idx_bytes, offsets_bytes, build) = Self::encode_vector_column(
+                &column.vectors,
+                seeds,
+                quantization,
+                write_version,
+                self.vector_rebuild_trigger,
+                self.profile_vector_compaction,
+            )?;
             let meta = VectorFieldMeta {
                 name: column.name.clone(),
                 dim: column.dim as u32,
@@ -1271,10 +1531,16 @@ impl SegmentWriter {
                 offsets: true,
                 quantization,
                 embedding_model: self.embedding_models.get(&column.name).cloned(),
+                knn_segment_centroid: self
+                    .knn_segment_summaries
+                    .then(|| coarse_vector_centroid(column))
+                    .flatten(),
+                // Compaction outputs only: a flush segment's footer stays
+                // as it was before #464.
+                radius_reference: (self.record_radius_reference || seeds.is_some())
+                    .then_some(build.radius_reference)
+                    .flatten(),
             };
-            let seeds = self.vector_seeds.get(&column.name);
-            let (idx_bytes, offsets_bytes, build) =
-                Self::encode_vector_column(&column.vectors, seeds, quantization)?;
             self.vector_index_builds
                 .lock()
                 .unwrap()
@@ -1294,11 +1560,15 @@ impl SegmentWriter {
     /// dimension (`buffer_vector` guarantees it). With `seeds`, the index
     /// is seeded from them and repaired by LIRE when they cover enough of
     /// the column (see [`Self::seed_vector_postings`]); otherwise it is
-    /// clustered from scratch.
+    /// clustered from scratch. A seeded column whose staleness signals
+    /// cross `trigger` is clustered from scratch after all (#464).
     fn encode_vector_column(
         column: &[(u32, Vec<f32>)],
-        seeds: Option<&Vec<Vec<VectorSeedPosting>>>,
+        seeds: Option<&Vec<SeedGroup>>,
         quantization: VectorQuantization,
+        write_version: u32,
+        trigger: VectorRebuildTrigger,
+        profile_compaction: bool,
     ) -> Result<(Vec<u8>, Vec<u8>, VectorIndexBuild), KoshaError> {
         let dim = column[0].1.len();
         // Unit-norm (write version 3, on-disk header version 2): normalize
@@ -1307,8 +1577,7 @@ impl SegmentWriter {
         // the geometry cosine actually ranks by), and snapshot centroids are
         // re-normalized afterwards because a mean of unit vectors is not
         // itself unit-length.
-        let unit_norm = vector_write_version() >= 3;
-        let radius_aware = vector_write_version() >= 4;
+        let unit_norm = write_version >= 3;
         let normalized: Vec<(u32, Vec<f32>)>;
         let vectors: &[(u32, Vec<f32>)] = if unit_norm {
             normalized = column
@@ -1323,33 +1592,57 @@ impl SegmentWriter {
         } else {
             column
         };
-        let mut config = kosha_vector_spfresh::ClusterIndexConfig::new(dim);
-        if !vector_build_refine() {
-            config.build_refine_rounds = 0;
-        }
+        let config = vector_cluster_config(dim);
         let seeded = match seeds {
             Some(seeds) if !seeds.is_empty() => seed_cluster_index(vectors, seeds, config.clone()),
             _ => None,
         };
-        let (index, mut build) = match seeded {
-            Some(seeded) => seeded,
+        let build_from_scratch = |config| {
+            kosha_vector_spfresh::ClusterIndex::build(vectors, config).map_err(|e| {
+                // A real ClusterIndex::build failure here (practically
+                // always DimensionMismatch — inconsistent vector
+                // dimensionality across documents in the same
+                // segment) means the legacy writer above would have
+                // silently written ragged, unparseable bytes instead.
+                // Fail loud rather than emit a corrupt vector.idx.
+                KoshaError::CorruptSegment(format!("failed to build vector index: {e}"))
+            })
+        };
+        let (mut postings, mut build) = match seeded {
+            Some((index, mut build)) => {
+                let postings = index.snapshot();
+                build.measure_staleness(&postings, vectors.len());
+                match trigger.evaluate(&build) {
+                    None => (postings, build),
+                    Some(reason) => {
+                        let postings = build_from_scratch(config)?.snapshot();
+                        let fresh = radius_profile(&postings, vectors.len());
+                        build.lire = false;
+                        build.rebuild = Some(reason);
+                        build.radius_p50 = fresh.p50;
+                        build.radius_p90 = fresh.p90;
+                        build.radius_reference = Some(fresh);
+                        (postings, build)
+                    }
+                }
+            }
             None => {
-                let index =
-                    kosha_vector_spfresh::ClusterIndex::build(vectors, config).map_err(|e| {
-                        // A real ClusterIndex::build failure here (practically
-                        // always DimensionMismatch — inconsistent vector
-                        // dimensionality across documents in the same
-                        // segment) means the legacy writer above would have
-                        // silently written ragged, unparseable bytes instead.
-                        // Fail loud rather than emit a corrupt vector.idx.
-                        KoshaError::CorruptSegment(format!("failed to build vector index: {e}"))
-                    })?;
-                (index, VectorIndexBuild::default())
+                let postings = build_from_scratch(config)?.snapshot();
+                let fresh = radius_profile(&postings, vectors.len());
+                let build = VectorIndexBuild {
+                    radius_p50: fresh.p50,
+                    radius_p90: fresh.p90,
+                    radius_reference: Some(fresh),
+                    ..VectorIndexBuild::default()
+                };
+                (postings, build)
             }
         };
-        let mut postings = index.snapshot();
         build.postings = postings.len();
-        let format_version = if unit_norm {
+        build.imbalance_factor = kosha_vector_spfresh::posting_imbalance_factor(
+            postings.iter().map(|p| p.entries.len()),
+        );
+        if unit_norm {
             for p in &mut postings {
                 kosha_vector_spfresh::normalize_in_place(&mut p.centroid);
                 // Renormalizing shifts both direction and magnitude (a mean
@@ -1360,7 +1653,7 @@ impl SegmentWriter {
                 // pass over this posting's already-small entry list, not
                 // the whole segment) and only when it'll actually be
                 // persisted.
-                if radius_aware {
+                if write_version == 4 {
                     p.radius = p
                         .entries
                         .iter()
@@ -1368,23 +1661,26 @@ impl SegmentWriter {
                         .fold(0.0f32, f32::max);
                 }
             }
-            if radius_aware && quantization == VectorQuantization::I8 {
-                // Radii were computed above from the exact vectors, so the
-                // probe's lower bound stays a bound on the true distance.
-                I8_VECTOR_INDEX_VERSION
-            } else if radius_aware && quantization == VectorQuantization::RaBitQ {
-                // Same: radii from exact vectors; codes are relative to the
-                // final (renormalized, on-disk) centroids.
-                RABITQ_VECTOR_INDEX_VERSION
-            } else if radius_aware {
-                RADIUS_AWARE_VECTOR_INDEX_VERSION
-            } else {
-                UNIT_NORM_VECTOR_INDEX_VERSION
-            }
-        } else {
-            VECTOR_INDEX_VERSION
+        }
+        let format_version = match (write_version, quantization) {
+            (5, VectorQuantization::F32) => QUANTILE_VECTOR_INDEX_VERSION,
+            (5, VectorQuantization::I8) => I8_QUANTILE_VECTOR_INDEX_VERSION,
+            (5, VectorQuantization::RaBitQ) => RABITQ_QUANTILE_VECTOR_INDEX_VERSION,
+            (4, VectorQuantization::F32) => RADIUS_AWARE_VECTOR_INDEX_VERSION,
+            (4, VectorQuantization::I8) => I8_VECTOR_INDEX_VERSION,
+            (4, VectorQuantization::RaBitQ) => RABITQ_VECTOR_INDEX_VERSION,
+            (3, _) => UNIT_NORM_VECTOR_INDEX_VERSION,
+            _ => VECTOR_INDEX_VERSION,
         };
         let (idx, offsets) = encode_vector_index_v2(dim as u32, &postings, format_version);
+        if profile_compaction {
+            build.rewrite_profile = Some(VectorPostingRewriteProfile::measure(
+                seeds.map_or(&[], Vec::as_slice),
+                &postings,
+                vector_entry_size(dim as u32, format_version),
+                idx.len() + offsets.len(),
+            ));
+        }
         Ok((idx, offsets, build))
     }
 
@@ -1442,6 +1738,69 @@ struct VectorColumn {
     vectors: Vec<(u32, Vec<f32>)>,
 }
 
+fn coarse_vector_centroid(column: &VectorColumn) -> Option<Vec<i8>> {
+    let mut mean = vec![0.0; column.dim];
+    for (_, vector) in &column.vectors {
+        let norm = vector
+            .iter()
+            .map(|&x| f64::from(x).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        if !norm.is_finite() {
+            return None;
+        }
+        if norm > 0.0 {
+            for (m, &x) in mean.iter_mut().zip(vector) {
+                *m += f64::from(x) / norm;
+            }
+        }
+    }
+    let max = mean.iter().map(|x| x.abs()).fold(0.0, f64::max);
+    (max > 0.0).then(|| {
+        mean.iter()
+            .map(|x| (127.0 * (x / max)).round() as i8)
+            .collect()
+    })
+}
+
+/// Return the summarized segments outside the top `nprobe` coarse
+/// centroids by cosine similarity. Missing or unusable summaries are
+/// never pruned. Segment keys break ties deterministically.
+pub fn knn_pruned_by_centroid<'a, T: Ord>(
+    query: &[f32],
+    centroids: impl IntoIterator<Item = (T, &'a [i8])>,
+    nprobe: usize,
+) -> Vec<T> {
+    if nprobe == 0 || query.iter().any(|x| !x.is_finite()) || !query.iter().any(|&x| x != 0.0) {
+        return Vec::new();
+    }
+    let mut scored: Vec<_> = centroids
+        .into_iter()
+        .filter(|(_, centroid)| centroid.len() == query.len())
+        .filter_map(|(key, centroid)| {
+            let (dot, norm) = query
+                .iter()
+                .zip(centroid)
+                .fold((0.0, 0.0), |(d, n), (&q, &c)| {
+                    let c = f64::from(c);
+                    (d + f64::from(q) * c, n + c * c)
+                });
+            (norm > 0.0).then(|| (dot / norm.sqrt(), key))
+        })
+        .collect();
+    if scored.len() <= nprobe {
+        return Vec::new();
+    }
+    scored.select_nth_unstable_by(nprobe, |(a, x), (b, y)| {
+        b.total_cmp(a).then_with(|| x.cmp(y))
+    });
+    scored
+        .into_iter()
+        .skip(nprobe)
+        .map(|(_, key)| key)
+        .collect()
+}
+
 /// Where a [`SegmentWriter`] buffered one parsed vector.
 #[derive(Clone, Copy)]
 enum VectorRef {
@@ -1459,13 +1818,33 @@ pub struct VectorSeedPosting {
     pub centroid: Vec<f32>,
     /// Its members that survive into the output, as output doc_seqs.
     pub doc_seqs: Vec<u32>,
-    /// Whether any member was dropped (deleted or tombstoned) on the way:
-    /// the centroid is then recomputed from the survivors.
-    pub dropped: bool,
+    /// How many members were dropped (deleted or tombstoned) on the way.
+    /// Non-zero: the centroid is recomputed from the survivors. The sum
+    /// over a column's seeds is its tombstone ratio's numerator (#464).
+    pub dropped: usize,
+}
+
+/// One compaction input's seeds for a column, with the radius reference
+/// its column carried (see
+/// [`SegmentWriter::seed_vector_postings_with_reference`]).
+#[derive(Debug, Clone, PartialEq)]
+struct SeedGroup {
+    postings: Vec<VectorSeedPosting>,
+    reference: Option<VectorRadiusReference>,
+}
+
+/// [`SegmentWriter::posting_order`]'s result (#456).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PostingOrder {
+    /// `order[new] = old`, `old` indexing the documents passed in.
+    pub order: Vec<u32>,
+    /// The column's postings in the new numbering, for
+    /// [`SegmentWriter::seed_vector_postings`].
+    pub seeds: Vec<VectorSeedPosting>,
 }
 
 /// How [`SegmentWriter::finalize`] built one vector column's index.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct VectorIndexBuild {
     pub field: String,
     /// Seeded from compaction inputs' postings and repaired by LIRE
@@ -1484,6 +1863,296 @@ pub struct VectorIndexBuild {
     pub postings_merged: usize,
     /// Postings written.
     pub postings: usize,
+    /// Membership and byte accounting, only when profiling is enabled.
+    pub rewrite_profile: Option<VectorPostingRewriteProfile>,
+    /// Faiss imbalance factor over the posting sizes written for this field.
+    pub imbalance_factor: f64,
+    /// Staleness signals of a seeded build (#464); zero / `None` for a
+    /// column clustered from scratch without seeds.
+    ///
+    /// Share of the seeds' members dropped on the way (deleted,
+    /// tombstoned, or upserted away).
+    pub tombstone_ratio: f32,
+    /// Share of the column's vectors not in an untouched posting of the
+    /// adopted input: everything absorbed, inserted, or in a posting that
+    /// lost members. O'Neil's batch-merge M, the fraction a merge changed.
+    pub changed_ratio: f32,
+    /// Median and p90 posting radius (cosine distance to the centroid) of
+    /// the index LIRE produced, or of the from-scratch build that replaced
+    /// it.
+    pub radius_p50: f32,
+    pub radius_p90: f32,
+    /// What the radii are compared with: inherited from the adopted
+    /// input's column, else measured on the adopted postings themselves.
+    /// For a from-scratch build, its own profile. Persisted as
+    /// `VectorFieldMeta::radius_reference`.
+    pub radius_reference: Option<VectorRadiusReference>,
+    /// `radius_p90 / radius_reference.p90` of the LIRE-produced index.
+    pub radius_inflation: Option<f32>,
+    /// Share of sampled vectors (up to [`NPA_SAMPLE`]) with a nearer
+    /// centroid than their own posting's: the nearest-partition-assignment
+    /// property LIRE's reassign maintains, measured after the build.
+    pub npa_violation_rate: Option<f32>,
+    /// Set when the seeded build was discarded and the column clustered
+    /// from scratch; the signals above are the discarded build's (radii
+    /// excepted).
+    pub rebuild: Option<VectorRebuildReason>,
+}
+
+/// #463 baseline: unchanged membership is not proof of byte-for-byte reuse.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct VectorPostingRewriteProfile {
+    /// Postings actually read as seeds, including those with dropped members.
+    pub input_postings_examined: usize,
+    pub output_postings: usize,
+    /// Output postings whose entire member set matches one input posting.
+    pub membership_unchanged_postings: usize,
+    /// Output `.idx` and `.offsets` file bytes, excluding the doc vectors sidecar.
+    pub index_bytes_written: usize,
+    /// Output entry bytes in membership-matched postings, excluding metadata.
+    pub membership_unchanged_payload_bytes: usize,
+    /// Bytes written minus the matched payload bytes. This estimate omits
+    /// any future remap overhead and does not validate codecs or centroids.
+    pub membership_changed_bytes_estimate: usize,
+}
+
+impl VectorPostingRewriteProfile {
+    fn measure(
+        seeds: &[SeedGroup],
+        postings: &[kosha_vector_spfresh::PostingSnapshot],
+        entry_bytes: usize,
+        index_bytes_written: usize,
+    ) -> Self {
+        let inputs: HashSet<Vec<u32>> = seeds
+            .iter()
+            .flat_map(|g| &g.postings)
+            .filter(|p| p.dropped == 0 && !p.doc_seqs.is_empty())
+            .map(|p| {
+                let mut members = p.doc_seqs.clone();
+                members.sort_unstable();
+                members
+            })
+            .collect();
+        let (mut membership_unchanged_postings, mut unchanged_entries) = (0, 0);
+        let mut members = Vec::new();
+        for posting in postings {
+            members.clear();
+            members.extend(posting.entries.iter().map(|(doc_seq, _)| *doc_seq));
+            members.sort_unstable();
+            if inputs.contains(&members) {
+                membership_unchanged_postings += 1;
+                unchanged_entries += members.len();
+            }
+        }
+        let membership_unchanged_payload_bytes = unchanged_entries * entry_bytes;
+        Self {
+            input_postings_examined: seeds.iter().map(|g| g.postings.len()).sum(),
+            output_postings: postings.len(),
+            membership_unchanged_postings,
+            index_bytes_written,
+            membership_unchanged_payload_bytes,
+            membership_changed_bytes_estimate: index_bytes_written
+                - membership_unchanged_payload_bytes,
+        }
+    }
+}
+
+impl VectorIndexBuild {
+    fn measure_staleness(
+        &mut self,
+        postings: &[kosha_vector_spfresh::PostingSnapshot],
+        vectors: usize,
+    ) {
+        let profile = radius_profile(postings, vectors);
+        self.radius_p50 = profile.p50;
+        self.radius_p90 = profile.p90;
+        // A zero baseline (every posting's members on its centroid) is
+        // inflated by any spread at all.
+        self.radius_inflation =
+            self.radius_reference
+                .map(|r| match (r.p90 > 0.0, profile.p90 > 0.0) {
+                    (true, _) => profile.p90 / r.p90,
+                    (false, true) => f32::INFINITY,
+                    (false, false) => 1.0,
+                });
+        self.npa_violation_rate = sampled_npa_violation_rate(postings);
+    }
+}
+
+impl std::fmt::Display for VectorIndexBuild {
+    /// One line of the signals, for compaction logs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let opt = |v: Option<f32>| v.map_or_else(|| "-".to_string(), |v| format!("{v:.3}"));
+        write!(
+            f,
+            "lire={} rebuild={} postings={} tombstone_ratio={:.3} changed_ratio={:.3} \
+             radius_p50={:.4} radius_p90={:.4} radius_inflation={} npa_violation_rate={}",
+            self.lire,
+            self.rebuild.map_or("-", VectorRebuildReason::as_str),
+            self.postings,
+            self.tombstone_ratio,
+            self.changed_ratio,
+            self.radius_p50,
+            self.radius_p90,
+            opt(self.radius_inflation),
+            opt(self.npa_violation_rate),
+        )
+    }
+}
+
+/// Vectors [`VectorIndexBuild::npa_violation_rate`] checks: every
+/// `n / NPA_SAMPLE`-th in posting order, each against every centroid.
+pub const NPA_SAMPLE: usize = 256;
+
+/// A nearer centroid must be nearer by more than this to count as a
+/// violation, so float noise between equidistant centroids does not.
+const NPA_TOLERANCE: f32 = 1e-6;
+
+fn sampled_npa_violation_rate(postings: &[kosha_vector_spfresh::PostingSnapshot]) -> Option<f32> {
+    use kosha_vector_spfresh::cosine_distance;
+    let total: usize = postings.iter().map(|p| p.entries.len()).sum();
+    if total == 0 {
+        return None;
+    }
+    let stride = total.div_ceil(NPA_SAMPLE);
+    let (mut sampled, mut violations, mut i) = (0usize, 0usize, 0usize);
+    for (own, posting) in postings.iter().enumerate() {
+        for (_, v) in &posting.entries {
+            if i % stride == 0 {
+                let d = cosine_distance(&posting.centroid, v) - NPA_TOLERANCE;
+                sampled += 1;
+                violations += postings
+                    .iter()
+                    .enumerate()
+                    .any(|(q, other)| q != own && cosine_distance(&other.centroid, v) < d)
+                    as usize;
+            }
+            i += 1;
+        }
+    }
+    Some(violations as f32 / sampled as f32)
+}
+
+/// Median and p90 of the postings' radii, recomputed from their entries
+/// (a snapshot's own `radius` predates the unit-norm renormalization).
+fn radius_profile(
+    postings: &[kosha_vector_spfresh::PostingSnapshot],
+    vectors: usize,
+) -> VectorRadiusReference {
+    let mut radii: Vec<f32> = postings
+        .iter()
+        .filter(|p| !p.entries.is_empty())
+        .map(|p| {
+            p.entries
+                .iter()
+                .map(|(_, v)| kosha_vector_spfresh::cosine_distance(&p.centroid, v))
+                .fold(0.0f32, f32::max)
+        })
+        .collect();
+    radii.sort_by(f32::total_cmp);
+    let quantile = |q: f64| {
+        if radii.is_empty() {
+            0.0
+        } else {
+            radii[((radii.len() - 1) as f64 * q).round() as usize]
+        }
+    };
+    VectorRadiusReference {
+        p50: quantile(0.5),
+        p90: quantile(0.9),
+        vectors: vectors as u32,
+    }
+}
+
+/// When compaction discards a column's LIRE-repaired index and clusters
+/// the column from scratch (#464). LIRE keeps postings balanced but lets
+/// partitions drift from where a fresh k-means would put them; each
+/// threshold here names one sign of that drift. `None` disables it; all
+/// `None` (the default) is the pre-#464 behaviour, LIRE always kept.
+///
+/// `KOSHA_VECTOR_REBUILD_TOMBSTONE_RATIO`,
+/// `KOSHA_VECTOR_REBUILD_RADIUS_INFLATION`,
+/// `KOSHA_VECTOR_REBUILD_NPA_VIOLATIONS`: rebuild when the
+/// [`VectorIndexBuild`] signal of that name is at or above the value.
+/// `KOSHA_VECTOR_REBUILD_MIN_CHANGED` (default `0`): rebuild only when at
+/// least this share of the column changed in this compaction, so a merge
+/// that rewrote little of a stale column does not pay for a full rebuild.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct VectorRebuildTrigger {
+    pub tombstone_ratio: Option<f32>,
+    pub radius_inflation: Option<f32>,
+    pub npa_violation_rate: Option<f32>,
+    pub min_changed_ratio: f32,
+}
+
+/// Which [`VectorRebuildTrigger`] threshold fired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorRebuildReason {
+    Tombstones,
+    RadiusInflation,
+    NpaViolations,
+}
+
+impl VectorRebuildReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tombstones => "tombstones",
+            Self::RadiusInflation => "radius_inflation",
+            Self::NpaViolations => "npa_violations",
+        }
+    }
+}
+
+impl VectorRebuildTrigger {
+    /// `KOSHA_VECTOR_REBUILD_*`, read once.
+    pub fn from_env() -> Self {
+        static TRIGGER: OnceLock<VectorRebuildTrigger> = OnceLock::new();
+        *TRIGGER.get_or_init(|| Self::parse(|key| std::env::var(key).ok()))
+    }
+
+    /// Unset, empty, or `off` disables a threshold; anything else must be
+    /// a non-negative number (warned about and disabled otherwise).
+    pub fn parse(get: impl Fn(&str) -> Option<String>) -> Self {
+        let threshold = |key: &str| {
+            let raw = get(key)?;
+            let raw = raw.trim();
+            if raw.is_empty() || raw.eq_ignore_ascii_case("off") {
+                return None;
+            }
+            match raw.parse::<f32>() {
+                Ok(v) if v.is_finite() && v >= 0.0 => Some(v),
+                _ => {
+                    eprintln!("WARN: {key}={raw} is not a non-negative number — ignoring it");
+                    None
+                }
+            }
+        };
+        Self {
+            tombstone_ratio: threshold("KOSHA_VECTOR_REBUILD_TOMBSTONE_RATIO"),
+            radius_inflation: threshold("KOSHA_VECTOR_REBUILD_RADIUS_INFLATION"),
+            npa_violation_rate: threshold("KOSHA_VECTOR_REBUILD_NPA_VIOLATIONS"),
+            min_changed_ratio: threshold("KOSHA_VECTOR_REBUILD_MIN_CHANGED").unwrap_or(0.0),
+        }
+    }
+
+    /// Whether a seeded `build` (signals measured) should be discarded for
+    /// a from-scratch one, and why. Thresholds are checked in the order of
+    /// the fields.
+    pub fn evaluate(&self, build: &VectorIndexBuild) -> Option<VectorRebuildReason> {
+        if !build.lire || build.changed_ratio < self.min_changed_ratio {
+            return None;
+        }
+        let over = |threshold: Option<f32>, value: Option<f32>| matches!((threshold, value), (Some(t), Some(v)) if v >= t);
+        if over(self.tombstone_ratio, Some(build.tombstone_ratio)) {
+            Some(VectorRebuildReason::Tombstones)
+        } else if over(self.radius_inflation, build.radius_inflation) {
+            Some(VectorRebuildReason::RadiusInflation)
+        } else if over(self.npa_violation_rate, build.npa_violation_rate) {
+            Some(VectorRebuildReason::NpaViolations)
+        } else {
+            None
+        }
+    }
 }
 
 /// Compaction inputs with fewer indexed vectors in a column than this
@@ -1542,20 +2211,26 @@ const LIRE_ABSORB_CANDIDATES: usize = 8;
 /// clusters from scratch.
 fn seed_cluster_index(
     vectors: &[(u32, Vec<f32>)],
-    groups: &[Vec<VectorSeedPosting>],
+    groups: &[SeedGroup],
     config: kosha_vector_spfresh::ClusterIndexConfig,
 ) -> Option<(kosha_vector_spfresh::ClusterIndex, VectorIndexBuild)> {
     use kosha_vector_spfresh::PostingSnapshot;
     let dim = config.dim;
-    if groups.iter().flatten().any(|s| s.centroid.len() != dim) {
+    let seeds = || groups.iter().flat_map(|g| &g.postings);
+    if seeds().any(|s| s.centroid.len() != dim) {
         return None;
     }
+    let dropped: usize = seeds().map(|s| s.dropped).sum();
+    let seeded_members: usize = seeds().map(|s| s.doc_seqs.len()).sum::<usize>() + dropped;
     let position = |doc_seq: u32| vectors.binary_search_by_key(&doc_seq, |(id, _)| *id).ok();
     let mut covered = vec![false; vectors.len()];
     let mut recentred = vec![0usize; groups.len()];
+    // Per input: members in postings kept exactly as they were.
+    let mut intact = vec![0usize; groups.len()];
     // Per input: its non-empty postings, members resolved to vectors.
     let mut snapshots: Vec<Vec<PostingSnapshot>> = Vec::with_capacity(groups.len());
     for (g, seeds) in groups.iter().enumerate() {
+        let seeds = &seeds.postings;
         let mut group = Vec::with_capacity(seeds.len());
         for seed in seeds {
             let mut entries = Vec::with_capacity(seed.doc_seqs.len());
@@ -1572,10 +2247,11 @@ fn seed_cluster_index(
             if entries.is_empty() {
                 continue;
             }
-            let centroid = if seed.dropped || entries.len() != seed.doc_seqs.len() {
+            let centroid = if seed.dropped > 0 || entries.len() != seed.doc_seqs.len() {
                 recentred[g] += 1;
                 kosha_vector_spfresh::mean_vector(entries.iter().map(|(_, v)| v.as_slice()), dim)
             } else {
+                intact[g] += entries.len();
                 seed.centroid.clone()
             };
             group.push(PostingSnapshot {
@@ -1595,11 +2271,21 @@ fn seed_cluster_index(
     // they are absorbed rather than kept side by side.
     let members = |g: &Vec<PostingSnapshot>| g.iter().map(|p| p.entries.len()).sum::<usize>();
     let base = (0..snapshots.len()).max_by_key(|&g| members(&snapshots[g]))?;
+    let reference = groups[base]
+        .reference
+        .unwrap_or_else(|| radius_profile(&snapshots[base], members(&snapshots[base])));
     let mut build = VectorIndexBuild {
         lire: true,
         seeded_postings: snapshots[base].len(),
         recentred_postings: recentred[base],
         inserted_vectors: uncovered.len(),
+        tombstone_ratio: if seeded_members == 0 {
+            0.0
+        } else {
+            dropped as f32 / seeded_members as f32
+        },
+        changed_ratio: 1.0 - intact[base] as f32 / vectors.len() as f32,
+        radius_reference: Some(reference),
         ..VectorIndexBuild::default()
     };
     let adopted = snapshots.swap_remove(base);
@@ -1665,6 +2351,7 @@ pub struct VectorPostingMembers {
 //                    vector.idx, plus — version >= RADIUS_AWARE_VECTOR_INDEX_VERSION
 //                    only — [radius:f32] (max cosine distance from centroid
 //                    to any live member; see that constant's doc comment).
+//                    Versions 6–8 append [p50:f32][p90:f32] to each record.
 //                    Small — always resident once read (mirrors
 //                    `doc_store.offsets`/`DocStoreAccess::Lazy`).
 //
@@ -1795,9 +2482,8 @@ pub const UNIT_NORM_VECTOR_INDEX_VERSION: u32 = 2;
 /// Version 3: unit-norm (implies everything version 2 does — see
 /// `is_unit_norm_vector_index_version`) plus a `radius` field per posting in
 /// `vector.offsets`: the max cosine distance from that posting's centroid to
-/// any of its live members. Ranking/admitting postings by the
-/// triangle-inequality lower bound `(distance(query, centroid) -
-/// radius).max(0.0)` instead of raw centroid distance is what lets a
+/// any of its live members. Ranking postings by
+/// `(distance(query, centroid) - radius).max(0.0)` instead of raw centroid distance lets a
 /// "diffuse" posting (mediocre centroid, but a genuinely close member
 /// buried inside it) still get probed — see kosha-query's
 /// `thin_global_budget_can_bury_the_true_neighbour_in_a_diluted_centroid`
@@ -1838,6 +2524,12 @@ pub const I8_VECTOR_INDEX_VERSION: u32 = 4;
 /// override) asks for `rabitq`, which must stay off until every query pod
 /// reads this version.
 pub const RABITQ_VECTOR_INDEX_VERSION: u32 = 5;
+/// Posting radius quantiles, with the same f32 entry layout as version 3.
+pub const QUANTILE_VECTOR_INDEX_VERSION: u32 = 6;
+/// Posting radius quantiles, with the same i8 entry layout as version 4.
+pub const I8_QUANTILE_VECTOR_INDEX_VERSION: u32 = 7;
+/// Posting radius quantiles, with the same RaBitQ entry layout as version 5.
+pub const RABITQ_QUANTILE_VECTOR_INDEX_VERSION: u32 = 8;
 
 pub fn is_known_vector_index_version(version: u32) -> bool {
     version == VECTOR_INDEX_VERSION
@@ -1845,19 +2537,32 @@ pub fn is_known_vector_index_version(version: u32) -> bool {
         || version == RADIUS_AWARE_VECTOR_INDEX_VERSION
         || version == I8_VECTOR_INDEX_VERSION
         || version == RABITQ_VECTOR_INDEX_VERSION
+        || has_radius_quantiles(version)
 }
 
-/// Whether `version`'s `vector.idx` entries are i8-quantized (see
-/// [`I8_VECTOR_INDEX_VERSION`]). `==`, not `>=`: a later version is free to
-/// choose another entry encoding, and must say so here.
+fn has_radius_quantiles(version: u32) -> bool {
+    matches!(
+        version,
+        QUANTILE_VECTOR_INDEX_VERSION
+            | I8_QUANTILE_VECTOR_INDEX_VERSION
+            | RABITQ_QUANTILE_VECTOR_INDEX_VERSION
+    )
+}
+
+/// Whether `version`'s `vector.idx` entries are i8-quantized.
 pub fn is_i8_vector_index_version(version: u32) -> bool {
-    version == I8_VECTOR_INDEX_VERSION
+    matches!(
+        version,
+        I8_VECTOR_INDEX_VERSION | I8_QUANTILE_VECTOR_INDEX_VERSION
+    )
 }
 
-/// Whether `version`'s `vector.idx` entries are RaBitQ codes (see
-/// [`RABITQ_VECTOR_INDEX_VERSION`]). `==`, like the i8 check.
+/// Whether `version`'s `vector.idx` entries are RaBitQ codes.
 pub fn is_rabitq_vector_index_version(version: u32) -> bool {
-    version == RABITQ_VECTOR_INDEX_VERSION
+    matches!(
+        version,
+        RABITQ_VECTOR_INDEX_VERSION | RABITQ_QUANTILE_VECTOR_INDEX_VERSION
+    )
 }
 
 /// Whether `version`'s entries score approximately (i8 or RaBitQ), so the
@@ -1901,6 +2606,35 @@ struct VectorPostingIndex {
     offset: u64,
     length: u32,
     radius: f32,
+    radius_quantiles: Option<[f32; 2]>,
+}
+
+/// Nearest-rank cosine distance percentiles for a posting's members.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PostingRadii {
+    pub p50: f32,
+    pub p90: f32,
+    pub max: f32,
+}
+
+impl PostingRadii {
+    /// Sort the distances in place and summarize them. Empty postings have
+    /// radius zero at every percentile.
+    pub fn from_distances(distances: &mut [f32]) -> Self {
+        distances.sort_unstable_by(f32::total_cmp);
+        let at = |percent: usize| {
+            let rank = (distances.len() * percent).div_ceil(100);
+            distances
+                .get(rank.saturating_sub(1))
+                .copied()
+                .unwrap_or(0.0)
+        };
+        Self {
+            p50: at(50),
+            p90: at(90),
+            max: at(100),
+        }
+    }
 }
 
 /// Serializes posting snapshots (as produced by `ClusterIndex::snapshot`) to
@@ -1927,11 +2661,13 @@ fn encode_vector_index_v2(
     offsets_buf.extend_from_slice(&(postings.len() as u32).to_le_bytes());
 
     let radius_aware = version >= RADIUS_AWARE_VECTOR_INDEX_VERSION;
+    let quantile_aware = has_radius_quantiles(version);
     let quantized = is_i8_vector_index_version(version);
     let rabitq = is_rabitq_vector_index_version(version)
         .then(|| kosha_vector_spfresh::RaBitQRotation::new(dim as usize));
     let mut codes: Vec<i8> = Vec::with_capacity(dim as usize);
     let mut bits: Vec<u8> = Vec::new();
+    let mut distances = Vec::new();
     for p in postings {
         let offset = idx_buf.len() as u64;
         for (id, v) in &p.entries {
@@ -1958,7 +2694,18 @@ fn encode_vector_index_v2(
         }
         offsets_buf.extend_from_slice(&offset.to_le_bytes());
         offsets_buf.extend_from_slice(&length.to_le_bytes());
-        if radius_aware {
+        if quantile_aware {
+            distances.clear();
+            distances.extend(
+                p.entries
+                    .iter()
+                    .map(|(_, v)| kosha_vector_spfresh::cosine_distance(&p.centroid, v)),
+            );
+            let radii = PostingRadii::from_distances(&mut distances);
+            offsets_buf.extend_from_slice(&radii.max.to_le_bytes());
+            offsets_buf.extend_from_slice(&radii.p50.to_le_bytes());
+            offsets_buf.extend_from_slice(&radii.p90.to_le_bytes());
+        } else if radius_aware {
             offsets_buf.extend_from_slice(&p.radius.to_le_bytes());
         }
     }
@@ -2241,7 +2988,15 @@ fn parse_vector_offsets(
     }
     let posting_count = read_u32_le(&mut cursor);
     let radius_aware = version >= RADIUS_AWARE_VECTOR_INDEX_VERSION;
-    let record_size = 4 * dim as usize + 8 + 4 + if radius_aware { 4 } else { 0 };
+    let quantile_aware = has_radius_quantiles(version);
+    let radius_bytes = if quantile_aware {
+        12
+    } else if radius_aware {
+        4
+    } else {
+        0
+    };
+    let record_size = 4 * dim as usize + 8 + 4 + radius_bytes;
     // Checked, like `parse_vector_idx_eager`: overflow is corruption.
     let expected_len = (posting_count as usize)
         .checked_mul(record_size)
@@ -2262,11 +3017,22 @@ fn parse_vector_offsets(
         } else {
             0.0
         };
+        let radius_quantiles = if quantile_aware {
+            let p50 = read_f32_le(&mut cursor);
+            let p90 = read_f32_le(&mut cursor);
+            if !(0.0 <= p50 && p50 <= p90 && p90 <= radius && radius <= 2.0) {
+                return None;
+            }
+            Some([p50, p90])
+        } else {
+            None
+        };
         out.push(VectorPostingIndex {
             centroid,
             offset,
             length,
             radius,
+            radius_quantiles,
         });
     }
     Some(out)
@@ -2802,6 +3568,9 @@ impl VectorPosting {
 mod posting_scan_tests;
 
 #[cfg(test)]
+mod bound_stop_tests;
+
+#[cfg(test)]
 mod centroid_codes_tests;
 
 #[cfg(test)]
@@ -2824,6 +3593,40 @@ mod vector_index_v2_tests {
                 radius: 0.0,
             },
         ]
+    }
+
+    #[test]
+    fn rewrite_profile_matches_whole_postings_in_remapped_order() {
+        let seed = |doc_seqs, dropped| VectorSeedPosting {
+            centroid: vec![1.0, 0.0],
+            doc_seqs,
+            dropped,
+        };
+        let group = |postings| SeedGroup {
+            postings,
+            reference: None,
+        };
+        let seeds = vec![
+            group(vec![seed(vec![3, 0], 0), seed(vec![2], 1)]),
+            group(vec![seed(vec![1, 0], 0)]),
+        ];
+        let postings = sample_postings();
+        for version in [RADIUS_AWARE_VECTOR_INDEX_VERSION, I8_VECTOR_INDEX_VERSION] {
+            let (idx, offsets) = encode_vector_index_v2(2, &postings, version);
+            let bytes = idx.len() + offsets.len();
+            let entry_bytes = vector_entry_size(2, version);
+            let profile =
+                VectorPostingRewriteProfile::measure(&seeds, &postings, entry_bytes, bytes);
+            assert_eq!(profile.input_postings_examined, 3);
+            assert_eq!(profile.output_postings, 2);
+            assert_eq!(profile.membership_unchanged_postings, 1);
+            assert_eq!(profile.index_bytes_written, bytes);
+            assert_eq!(profile.membership_unchanged_payload_bytes, 2 * entry_bytes);
+            assert_eq!(
+                profile.membership_changed_bytes_estimate,
+                entry_bytes + VECTOR_IDX_HEADER_LEN + offsets.len()
+            );
+        }
     }
 
     /// Distinct, non-zero, non-uniform radii so a round trip is a real
@@ -2902,6 +3705,143 @@ mod vector_index_v2_tests {
             .expect("valid sidecar");
         assert_eq!(parsed_v2[0].radius, 0.0);
         assert_eq!(parsed_v2[1].radius, 0.0);
+    }
+
+    #[test]
+    fn quantile_radius_changes_probe_order_without_changing_entry_encoding() {
+        let postings = [
+            kosha_vector_spfresh::PostingSnapshot {
+                centroid: vec![0.0, 1.0],
+                entries: (0..8)
+                    .map(|id| (id, vec![0.0, 1.0]))
+                    .chain([(8, vec![0.75f32.sqrt(), 0.5]), (9, vec![0.0, -1.0])])
+                    .collect(),
+                radius: 2.0,
+            },
+            kosha_vector_spfresh::PostingSnapshot {
+                centroid: vec![0.6, 0.8],
+                entries: vec![(10, vec![0.6, 0.8])],
+                radius: 0.0,
+            },
+        ];
+        assert_eq!(KnnProbeRadius::parse(None), KnnProbeRadius::Max);
+        assert_eq!(KnnProbeRadius::parse(Some("p50")), KnnProbeRadius::P50);
+        assert_eq!(KnnProbeRadius::parse(Some("p90")), KnnProbeRadius::P90);
+        assert_eq!(KnnProbeRadius::parse(Some("invalid")), KnnProbeRadius::Max);
+
+        for (old, new) in [
+            (
+                RADIUS_AWARE_VECTOR_INDEX_VERSION,
+                QUANTILE_VECTOR_INDEX_VERSION,
+            ),
+            (I8_VECTOR_INDEX_VERSION, I8_QUANTILE_VECTOR_INDEX_VERSION),
+            (
+                RABITQ_VECTOR_INDEX_VERSION,
+                RABITQ_QUANTILE_VECTOR_INDEX_VERSION,
+            ),
+        ] {
+            let (old_idx, old_offsets) = encode_vector_index_v2(2, &postings, old);
+            let (new_idx, new_offsets) = encode_vector_index_v2(2, &postings, new);
+            assert_eq!(parse_vector_idx_header(&new_idx), Some((2, 11, new)));
+            assert_eq!(
+                &new_idx[VECTOR_IDX_HEADER_LEN..],
+                &old_idx[VECTOR_IDX_HEADER_LEN..]
+            );
+            assert_eq!(new_offsets.len() - old_offsets.len(), 8 * postings.len());
+            assert!(parse_vector_offsets(&new_offsets, 2, old).is_none());
+            assert!(parse_vector_offsets(&new_offsets[..new_offsets.len() - 1], 2, new).is_none());
+            let parsed = parse_vector_offsets(&new_offsets, 2, new).unwrap();
+            assert_eq!(parsed[0].radius, 2.0);
+            assert_eq!(parsed[0].radius_quantiles, Some([0.0, 0.5]));
+            let mut corrupt = new_offsets;
+            let p50 = VECTOR_OFFSETS_HEADER_LEN + 8 + 8 + 4 + 4;
+            corrupt[p50..p50 + 4].copy_from_slice(&1.0f32.to_le_bytes());
+            assert!(parse_vector_offsets(&corrupt, 2, new).is_none());
+
+            let open = |records, version| {
+                LazyVectorIndex::from_parsed(
+                    Path::new(VECTOR_IDX_FILE),
+                    0,
+                    2,
+                    version,
+                    records,
+                    None,
+                )
+            };
+            let mut current = open(parsed, new);
+            let mut legacy = open(parse_vector_offsets(&old_offsets, 2, old).unwrap(), old);
+            let query = [1.0, 0.0];
+            for (mode, expected, first) in [
+                (KnnProbeRadius::Max, 0.0, 0),
+                (KnnProbeRadius::P50, 1.0, 1),
+                (KnnProbeRadius::P90, 0.5, 1),
+            ] {
+                current.probe_radius = mode;
+                legacy.probe_radius = mode;
+                assert_eq!(legacy.probe_radii(), &[2.0, 0.0]);
+                let scores = SegmentReader::centroid_scores(&current, &query, 1.0);
+                assert_eq!(scores[0], expected);
+                assert_eq!(KnnSegmentRanking::rank_all(&scores)[0].0, first);
+                assert_eq!(
+                    SegmentReader::centroid_scores_at(&current, &query, &[0, 1], 1.0),
+                    scores
+                );
+                if let Some(bounds) = SegmentReader::centroid_score_bounds(&current, &query, 1.0) {
+                    for (i, score) in scores.into_iter().enumerate() {
+                        assert!(bounds.lower[i] <= score && score <= bounds.upper[i]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quantile_write_tier_keeps_max_radii_from_exact_members() {
+        let column = vec![(0, vec![2.0, 0.0]), (1, vec![0.0, 3.0])];
+        for (quantization, older, newer) in [
+            (
+                VectorQuantization::F32,
+                RADIUS_AWARE_VECTOR_INDEX_VERSION,
+                QUANTILE_VECTOR_INDEX_VERSION,
+            ),
+            (
+                VectorQuantization::I8,
+                I8_VECTOR_INDEX_VERSION,
+                I8_QUANTILE_VECTOR_INDEX_VERSION,
+            ),
+            (
+                VectorQuantization::RaBitQ,
+                RABITQ_VECTOR_INDEX_VERSION,
+                RABITQ_QUANTILE_VECTOR_INDEX_VERSION,
+            ),
+        ] {
+            let (_, old_offsets, _) = SegmentWriter::encode_vector_column(
+                &column,
+                None,
+                quantization,
+                4,
+                VectorRebuildTrigger::default(),
+                false,
+            )
+            .unwrap();
+            let (idx, new_offsets, _) = SegmentWriter::encode_vector_column(
+                &column,
+                None,
+                quantization,
+                5,
+                VectorRebuildTrigger::default(),
+                false,
+            )
+            .unwrap();
+            assert_eq!(parse_vector_idx_header(&idx), Some((2, 2, newer)));
+            let old = parse_vector_offsets(&old_offsets, 2, older).unwrap();
+            let new = parse_vector_offsets(&new_offsets, 2, newer).unwrap();
+            assert_eq!(old.len(), new.len());
+            for (old, new) in old.iter().zip(&new) {
+                assert_eq!(old.radius, new.radius);
+                assert_eq!(new.radius_quantiles.unwrap()[1], new.radius);
+            }
+        }
     }
 
     #[test]
@@ -3122,6 +4062,19 @@ pub const SKIP_SPLIT_INVERTED_VERSION: u32 = 5;
 /// the positions section stay v5 varints. Written only when
 /// `KOSHA_POSTINGS_WRITE_VERSION=6`; never the default.
 pub const BITPACKED_SKIP_SPLIT_INVERTED_VERSION: u32 = 6;
+/// Experimental v7 (#386): v6 full scoring blocks, singleton scoring
+/// blocks implied by their skip entry, and packed position delta groups
+/// per scoring block. Position counts normally come from a posting's tf;
+/// field norms keys use a marked varint stream with explicit counts.
+pub const PACKED_POSITIONS_INVERTED_VERSION: u32 = 7;
+const NO_POSITIONS_MARKER: u8 = 34;
+const EXPLICIT_POSITION_COUNTS_MARKER: u8 = 35;
+
+fn is_field_norms_key(term: &str) -> bool {
+    term.strip_prefix('\0')
+        .and_then(|s| s.strip_suffix('\0'))
+        .is_some_and(kosha_core::fields::is_indexable_field_name)
+}
 
 /// THE canonical "is this a split-format inverted TOC?" predicate. Every
 /// site that dispatches on split-ness (the server's posting-blob hydration
@@ -3129,18 +4082,20 @@ pub const BITPACKED_SKIP_SPLIT_INVERTED_VERSION: u32 = 6;
 /// instead of enumerating versions locally: a version list that drifts
 /// between the hydration gate and the reader is exactly the PR #83
 /// silent-zero-hits bug — the reader accepts the segment while hydration
-/// never fetches its blobs. Adding v6 must be a one-line change here.
+/// never fetches its blobs.
 pub fn is_split_inverted_version(version: u32) -> bool {
-    version == FIXED_SPLIT_INVERTED_VERSION
+    version == TIERED_SPLIT_INVERTED_VERSION
+        || version == FIXED_SPLIT_INVERTED_VERSION
         || version == SPLIT_INVERTED_VERSION
         || version == SKIP_SPLIT_INVERTED_VERSION
         || version == BITPACKED_SKIP_SPLIT_INVERTED_VERSION
+        || version == PACKED_POSITIONS_INVERTED_VERSION
 }
 
 /// The inverted-postings version the writer emits —
 /// `KOSHA_POSTINGS_WRITE_VERSION`, accepted values `4` (varint-delta
-/// split), `5` (skip-split) and `6` (experimental bit-packed skip-split,
-/// #386 — opt-in only, readable only by builds that include #386); default
+/// split), `5` (skip-split), `6` (experimental bit-packed scoring) and
+/// `7` (experimental bit-packed scoring and positions, #386); default
 /// `5`. This is the mixed-fleet
 /// rollout/rollback gate: a reader only understands versions up to its own
 /// build, so during a rolling deploy (writer upgraded before all query
@@ -3157,10 +4112,11 @@ fn postings_write_version() -> u32 {
             Some("4") => SPLIT_INVERTED_VERSION,
             Some("5") | None => SKIP_SPLIT_INVERTED_VERSION,
             Some("6") => BITPACKED_SKIP_SPLIT_INVERTED_VERSION,
+            Some("7") => PACKED_POSITIONS_INVERTED_VERSION,
             Some(other) => {
                 eprintln!(
                     "WARN: KOSHA_POSTINGS_WRITE_VERSION={other} not supported \
-                     (accepted: 4, 5, 6) — writing v{SKIP_SPLIT_INVERTED_VERSION}"
+                     (accepted: 4, 5, 6, 7) — writing v{SKIP_SPLIT_INVERTED_VERSION}"
                 );
                 SKIP_SPLIT_INVERTED_VERSION
             }
@@ -3168,21 +4124,21 @@ fn postings_write_version() -> u32 {
     })
 }
 
-/// Default weight of a posting's radius in its probe-ranking score: the
-/// full triangle-inequality lower bound `d(q, c) - radius`.
+/// Default weight of a posting's radius in its probe-ranking score.
 pub const DEFAULT_KNN_PROBE_RADIUS_ALPHA: f32 = 1.0;
 
 /// The score a kNN probe ranks and admits postings by (#384):
 /// `(distance - alpha * radius).max(0.0)`, where `distance` is the query's
-/// cosine distance to the posting's centroid and `radius` the posting's
-/// max member distance from it.
+/// cosine distance to the posting's centroid and `radius` the selected
+/// member-distance percentile. This is a ranking heuristic, not a bound
+/// on member distance: cosine distance is not a metric.
 ///
-/// - `alpha = 1.0` (default): the triangle-inequality lower bound on the
-///   distance to any member, bit-identical to the ranking before #384.
+/// - `alpha = 1.0` (default): full radius weight, bit-identical to the
+///   ranking before #384 when using the max radius.
 /// - `alpha = 0.0`: raw centroid distance, as SPANN and plain IVF rank.
 /// - in between: partial credit for spread. At 1024 dimensions a
 ///   posting's radius is close to typical centroid distances, so the full
-///   bound is loose and ranks many diffuse postings near zero; a smaller
+///   radius weight ranks many diffuse postings near zero; a smaller
 ///   alpha is the experiment.
 ///
 /// The global cutoff (kosha-query `knn_plan`) and each segment's own
@@ -3190,6 +4146,39 @@ pub const DEFAULT_KNN_PROBE_RADIUS_ALPHA: f32 = 1.0;
 /// the same units.
 pub fn centroid_probe_score(distance: f32, radius: f32, alpha: f32) -> f32 {
     (distance - alpha * radius).max(0.0)
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum KnnProbeRadius {
+    #[default]
+    Max,
+    P50,
+    P90,
+}
+
+impl KnnProbeRadius {
+    fn parse(raw: Option<&str>) -> Self {
+        match raw {
+            None | Some("max") => Self::Max,
+            Some("p50") => Self::P50,
+            Some("p90") => Self::P90,
+            Some(other) => {
+                eprintln!("WARN: KOSHA_KNN_PROBE_RADIUS={other} not supported (accepted: max, p50, p90) — using max");
+                Self::Max
+            }
+        }
+    }
+
+    fn from_env() -> Self {
+        static RADIUS: OnceLock<KnnProbeRadius> = OnceLock::new();
+        *RADIUS.get_or_init(|| Self::parse(std::env::var("KOSHA_KNN_PROBE_RADIUS").ok().as_deref()))
+    }
+}
+
+/// Whether `KOSHA_KNN_PROBE_RADIUS` ranks postings by a radius quantile
+/// (`p50`/`p90`) rather than the maximum radius every planner stores.
+pub fn knn_probe_radius_uses_quantiles() -> bool {
+    KnnProbeRadius::from_env() != KnnProbeRadius::Max
 }
 
 /// `KOSHA_KNN_PROBE_RADIUS_ALPHA` (#384, experimental; default 1.0, the
@@ -3225,6 +4214,80 @@ fn parse_probe_radius_alpha(raw: Option<&str>) -> f32 {
             }
         },
     }
+}
+
+/// `KOSHA_KNN_BOUND_STOP_ALPHA` (#384, experimental; unset = off): a
+/// segment's budgeted kNN probe skips every posting where [`bound_stop`]
+/// holds, instead of always probing every budgeted posting. Accepts a
+/// finite value `> 0`; unset, empty or anything else is off (with a
+/// warning for a bad value). Read once per process.
+pub fn knn_bound_stop_alpha() -> Option<f32> {
+    #[cfg(test)]
+    if let Some(alpha) = BOUND_STOP_ALPHA_OVERRIDE.with(std::cell::Cell::get) {
+        return alpha;
+    }
+    static ALPHA: OnceLock<Option<f32>> = OnceLock::new();
+    *ALPHA.get_or_init(|| {
+        let raw = std::env::var("KOSHA_KNN_BOUND_STOP_ALPHA").ok();
+        let alpha = parse_bound_stop_alpha(raw.as_deref());
+        match (raw.as_deref().map(str::trim), alpha) {
+            (_, Some(alpha)) => eprintln!(
+                "INFO: KOSHA_KNN_BOUND_STOP_ALPHA={alpha}: a segment's kNN probe skips \
+                 postings once its k-th guaranteed similarity reaches {alpha} x \
+                 their similarity ceiling (#384, experimental)"
+            ),
+            (Some(raw), None) if !raw.is_empty() => {
+                eprintln!("WARN: KOSHA_KNN_BOUND_STOP_ALPHA={raw} is not a finite number > 0; off")
+            }
+            _ => {}
+        }
+        alpha
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only stand-in for `KOSHA_KNN_BOUND_STOP_ALPHA` on this thread:
+    /// `Some(setting)` replaces the process's value.
+    static BOUND_STOP_ALPHA_OVERRIDE: std::cell::Cell<Option<Option<f32>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with [`knn_bound_stop_alpha`] reading `alpha` on this thread.
+#[cfg(test)]
+fn with_bound_stop_alpha<T>(alpha: Option<f32>, f: impl FnOnce() -> T) -> T {
+    let previous = BOUND_STOP_ALPHA_OVERRIDE.with(|o| o.replace(Some(alpha)));
+    let out = f();
+    BOUND_STOP_ALPHA_OVERRIDE.with(|o| o.set(previous));
+    out
+}
+
+fn parse_bound_stop_alpha(raw: Option<&str>) -> Option<f32> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|a| a.is_finite() && *a > 0.0)
+}
+
+/// Whether a posting can be skipped: the `k` candidates found so far
+/// already score at least `alpha` times the best cosine similarity any
+/// member of the posting can have.
+///
+/// That ceiling comes from angles, which obey the triangle inequality
+/// (cosine distance does not): a member is at most `radius` (a cosine
+/// distance) from the centroid, so its angle to the query is at least
+/// `acos(1 - distance) - acos(1 - radius)`.
+///
+/// For an f32 column `theta` is the exact `k`-th score; for a RaBitQ one
+/// it is the `k`-th largest `estimate - error` (the posting's best case is
+/// below the `k`-th candidate's worst). `alpha = 1` skips only postings
+/// that cannot change the top `k` on an f32 column; on a RaBitQ one the
+/// error bound is probabilistic (`RABITQ_EPSILON0`), so a rare miss is
+/// possible. `alpha < 1` trades recall for postings.
+fn bound_stop(theta: f64, distance: f32, radius: f32, alpha: f32) -> bool {
+    let angle = |d: f32| (1.0 - d as f64).clamp(-1.0, 1.0).acos();
+    let ceiling = (angle(distance) - angle(radius)).max(0.0).cos();
+    theta >= alpha as f64 * ceiling
 }
 
 /// Whether `SegmentWriter` leaves `postings-*.bin` shards raw —
@@ -3633,6 +4696,7 @@ impl TermMerger {
         let Some(std::cmp::Reverse((term, i))) = self.heap.pop() else {
             return Ok(None);
         };
+        encoder.start_term(&term);
         // Per-field postings (#249) carry no per-field length in their
         // block summaries: `min_field_length` 0 is a valid, if loose,
         // ceiling. Only the combined index is scored on the block-max WAND
@@ -3764,6 +4828,11 @@ struct TermEncoder {
     /// partial last block is written as v5 varints on `finish`).
     bp_docs: Box<[u32; SCORING_BLOCK_LEN]>,
     bp_tfs: Box<[u32; SCORING_BLOCK_LEN]>,
+    /// v7 only: fixed-size delta buffer, reset at each scoring block.
+    position_deltas: [u32; bitpack::BP_BLOCK],
+    buffered_deltas: usize,
+    has_positions: Option<bool>,
+    explicit_position_counts: bool,
 }
 
 impl TermEncoder {
@@ -3783,12 +4852,25 @@ impl TermEncoder {
             prev_block_last: 0,
             bp_docs: Box::new([0; SCORING_BLOCK_LEN]),
             bp_tfs: Box::new([0; SCORING_BLOCK_LEN]),
+            position_deltas: [0; bitpack::BP_BLOCK],
+            buffered_deltas: 0,
+            has_positions: None,
+            explicit_position_counts: false,
         }
     }
 
-    /// v6: emit the buffered block's scoring bytes — bit-packed when full,
-    /// v5 varint pairs for a term's partial last block — then its skip
-    /// entry. Bytes match [`write_postings_skip_split_v6`].
+    fn start_term(&mut self, term: &str) {
+        // Norms and NUL-containing analyzer tokens can share a key, so
+        // tf is not a position count for every posting on these keys.
+        self.explicit_position_counts =
+            self.version == PACKED_POSITIONS_INVERTED_VERSION && is_field_norms_key(term);
+        if self.explicit_position_counts {
+            self.positions.mem.push(EXPLICIT_POSITION_COUNTS_MARKER);
+        }
+    }
+
+    /// Emit packed scoring bytes when full, otherwise use varints
+    /// (except v7 singletons, which only need their skip entry).
     fn flush_bp_block(&mut self) {
         let n = self.in_block;
         self.block_start = self.scoring.len();
@@ -3801,7 +4883,7 @@ impl TermEncoder {
                 self.prev_block_last.wrapping_add(1)
             };
             bitpack::encode_bp_block(&self.bp_docs, &self.bp_tfs, next_min, &mut self.scoring.mem);
-        } else {
+        } else if n != 1 || self.version != PACKED_POSITIONS_INVERTED_VERSION {
             let mut prev = if first { 0 } else { self.prev_block_last };
             for i in 0..n {
                 put_var_u32(&mut self.scoring.mem, self.bp_docs[i].wrapping_sub(prev));
@@ -3810,6 +4892,43 @@ impl TermEncoder {
             }
         }
         self.close_block();
+    }
+
+    fn flush_position_group(&mut self) {
+        if self.buffered_deltas > 0 {
+            bitpack::encode_position_group(
+                &self.position_deltas,
+                self.buffered_deltas,
+                &mut self.positions.mem,
+            );
+            self.buffered_deltas = 0;
+        }
+    }
+
+    fn push_packed_positions(&mut self, tf: u32, positions: &[u32]) -> Result<(), KoshaError> {
+        if tf != 0 || !positions.is_empty() {
+            let has_positions = !positions.is_empty();
+            if (has_positions && positions.len() != tf as usize)
+                || *self.has_positions.get_or_insert(has_positions) != has_positions
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "v7 terms must have either tf positions per posting or no positions",
+                )
+                .into());
+            }
+        }
+        let mut prev_pos = 0u32;
+        for &pos in positions {
+            self.position_deltas[self.buffered_deltas] = pos.wrapping_sub(prev_pos);
+            prev_pos = pos;
+            self.buffered_deltas += 1;
+            if self.buffered_deltas == bitpack::BP_BLOCK {
+                self.flush_position_group();
+                self.positions.maybe_spill()?;
+            }
+        }
+        Ok(())
     }
 
     fn push(
@@ -3835,7 +4954,7 @@ impl TermEncoder {
             return self.scoring.maybe_spill();
         }
 
-        let bitpacked = self.version == BITPACKED_SKIP_SPLIT_INVERTED_VERSION;
+        let bitpacked = self.version >= BITPACKED_SKIP_SPLIT_INVERTED_VERSION;
         if self.in_block == 0 {
             self.block_start = self.scoring.len();
             self.block_max_tf = 0;
@@ -3855,6 +4974,20 @@ impl TermEncoder {
         }
         self.block_last = doc_id;
         self.in_block += 1;
+        if self.version == PACKED_POSITIONS_INVERTED_VERSION && !self.explicit_position_counts {
+            self.push_packed_positions(term_frequency, positions)?;
+            if self.in_block == SCORING_BLOCK_LEN {
+                self.flush_position_group();
+            }
+        } else {
+            let out = &mut self.positions.mem;
+            put_var_u32(out, positions.len() as u32);
+            let mut prev_pos = 0u32;
+            for &pos in positions {
+                put_var_u32(out, pos.wrapping_sub(prev_pos));
+                prev_pos = pos;
+            }
+        }
         if self.in_block == SCORING_BLOCK_LEN {
             if bitpacked {
                 self.flush_bp_block();
@@ -3863,13 +4996,6 @@ impl TermEncoder {
             }
         }
 
-        let out = &mut self.positions.mem;
-        put_var_u32(out, positions.len() as u32);
-        let mut prev_pos = 0u32;
-        for &pos in positions {
-            put_var_u32(out, pos.wrapping_sub(prev_pos));
-            prev_pos = pos;
-        }
         self.scoring.maybe_spill()?;
         self.positions.maybe_spill()
     }
@@ -3902,11 +5028,15 @@ impl TermEncoder {
     /// Returns the span's length.
     fn finish(&mut self, out: &mut impl std::io::Write) -> Result<u64, KoshaError> {
         if self.in_block > 0 {
-            if self.version == BITPACKED_SKIP_SPLIT_INVERTED_VERSION {
+            if self.version >= BITPACKED_SKIP_SPLIT_INVERTED_VERSION {
                 self.flush_bp_block();
             } else {
                 self.close_block();
             }
+        }
+        self.flush_position_group();
+        if self.has_positions == Some(false) {
+            self.positions.mem.push(NO_POSITIONS_MARKER);
         }
         let mut header = Vec::with_capacity(5);
         put_var_u32(&mut header, self.count);
@@ -3922,6 +5052,8 @@ impl TermEncoder {
         self.skip.clear();
         self.prev_doc = 0;
         self.prev_block_last = 0;
+        self.has_positions = None;
+        self.explicit_position_counts = false;
         Ok(len)
     }
 
@@ -4607,6 +5739,15 @@ pub fn segment_uses_doc_vectors(segment_dir: &Path) -> bool {
     SegmentReader::read_footer(segment_dir).is_ok_and(|footer| footer.doc_vectors)
 }
 
+/// The clustering config every vector column's index is built with.
+fn vector_cluster_config(dim: usize) -> kosha_vector_spfresh::ClusterIndexConfig {
+    let mut config = kosha_vector_spfresh::ClusterIndexConfig::new(dim);
+    if !vector_build_refine() {
+        config.build_refine_rounds = 0;
+    }
+    config
+}
+
 /// `KOSHA_VECTOR_BUILD_REFINE`, read once: whether a from-scratch vector
 /// index build (every flush, and compaction when it does not seed from
 /// postings) refines bisection's postings by nearest-centroid reassignment
@@ -4635,8 +5776,9 @@ fn parse_vector_build_refine(raw: Option<&str>) -> bool {
 /// every open), `2` (posting-based, raw magnitudes), `3` (posting-based,
 /// unit-norm vectors + centroids → dot-only scoring; on-disk header
 /// [`UNIT_NORM_VECTOR_INDEX_VERSION`]), and `4` (posting-based, unit-norm,
-/// plus a per-posting radius for triangle-inequality-bounded probe ranking;
-/// on-disk header [`RADIUS_AWARE_VECTOR_INDEX_VERSION`]); default `4`. Same
+/// plus a per-posting max radius; on-disk header
+/// [`RADIUS_AWARE_VECTOR_INDEX_VERSION`]) and `5` (also adds p50 and p90
+/// radii; on-disk versions 6–8); default `4`. Same
 /// mixed-fleet rollout/rollback purpose as `postings_write_version`: during
 /// a rolling deploy (writer upgraded before every query replica understands
 /// the newest version) or ahead of a possible rollback, pin an older tier
@@ -4649,8 +5791,9 @@ fn vector_write_version() -> u32 {
         Some("2") => 2,
         Some("3") => 3,
         Some("4") | None => 4,
+        Some("5") => 5,
         Some(other) => {
-            eprintln!("WARN: KOSHA_VECTOR_WRITE_VERSION={other} not supported (accepted: 1, 2, 3, 4) — writing v4");
+            eprintln!("WARN: KOSHA_VECTOR_WRITE_VERSION={other} not supported (accepted: 1, 2, 3, 4, 5) — writing v4");
             4
         }
     })
@@ -4673,6 +5816,24 @@ const INVERTED_TABLE_ENTRY_LEN: usize = 24;
 const SPLIT_INVERTED_TABLE_ENTRY_LEN: usize = 32;
 pub const POSTING_BLOB_SHARDS: usize = 256;
 
+/// Experimental split TOC with separate head and tail spans using v5 encoding.
+pub const TIERED_SPLIT_INVERTED_VERSION: u32 = 8;
+pub const TIER_TAIL_FILE: &str = "tail-00.bin";
+const TIER_TERM_HEADER_LEN: usize = 20;
+
+/// Strictly increasing (field length, term frequency) points not dominated
+/// by any shorter document with the same or higher frequency.
+pub fn tail_frontier(tail: &mut [(u32, u32)]) -> Vec<(u32, u32)> {
+    tail.sort_unstable_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)));
+    let mut steps: Vec<(u32, u32)> = Vec::new();
+    for &(tf, dl) in tail.iter() {
+        if steps.last().is_none_or(|&(_, best)| tf > best) {
+            steps.push((dl, tf));
+        }
+    }
+    steps
+}
+
 fn posting_blob_id_for_term(term: &str) -> usize {
     let mut hash: u32 = 2_166_136_261;
     for byte in term.as_bytes() {
@@ -4694,6 +5855,75 @@ pub fn all_posting_blob_files() -> Vec<String> {
     (0..POSTING_BLOB_SHARDS)
         .map(posting_blob_file_for_id)
         .collect()
+}
+
+/// Whether a segment has the complete tiered postings needed for publication.
+/// Query hydration deliberately does not require the tail to be local.
+pub fn tier_files_present(segment_dir: &Path) -> bool {
+    let path = segment_dir.join("inverted.idx");
+    let mut header = [0; 8];
+    if fs::File::open(&path)
+        .and_then(|mut toc| toc.read_exact(&mut header))
+        .is_err()
+    {
+        return false;
+    }
+    if header[..4] != INVERTED_MAGIC.to_le_bytes()
+        || header[4..] != TIERED_SPLIT_INVERTED_VERSION.to_le_bytes()
+    {
+        return true;
+    }
+    let Ok(index) = fs::read(path)
+        .map_err(KoshaError::Io)
+        .and_then(|data| SplitInvertedIndex::from_bytes(data, segment_dir.to_path_buf(), None))
+    else {
+        return false;
+    };
+    let tail_len = index
+        .tier_terms
+        .as_ref()
+        .and_then(|terms| terms.last())
+        .map_or(0, |term| term.tail_end);
+    (tail_len == 0
+        || fs::metadata(segment_dir.join(TIER_TAIL_FILE)).is_ok_and(|m| m.len() == tail_len))
+        && (0..index.term_count)
+            .map(|i| index.raw_entry(i).2)
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .all(|blob| segment_dir.join(posting_blob_file_for_id(blob)).is_file())
+}
+
+/// Resident tier metadata in addition to the raw TOC bytes. Reads only
+/// the TOC header and its first entry, not the frontier points.
+pub fn tier_metadata_heap_bytes(segment_dir: &Path) -> u64 {
+    fn measure(mut toc: fs::File) -> Option<u64> {
+        let mut header = [0; INVERTED_HEADER_LEN];
+        toc.read_exact(&mut header).ok()?;
+        if header[..4] != INVERTED_MAGIC.to_le_bytes()
+            || header[4..8] != TIERED_SPLIT_INVERTED_VERSION.to_le_bytes()
+        {
+            return None;
+        }
+        let terms = u64::from(u32::from_le_bytes(header[8..12].try_into().ok()?));
+        if terms == 0 {
+            return Some(0);
+        }
+        let mut entry = [0; SPLIT_INVERTED_TABLE_ENTRY_LEN];
+        toc.read_exact(&mut entry).ok()?;
+        let start = u64::from(u32::from_le_bytes(entry[28..32].try_into().ok()?));
+        let table_end = INVERTED_HEADER_LEN as u64 + terms * SPLIT_INVERTED_TABLE_ENTRY_LEN as u64;
+        if start < table_end {
+            return None;
+        }
+        let metadata_bytes = toc.metadata().ok()?.len().checked_sub(start)?;
+        let frontier_bytes = metadata_bytes.checked_sub(terms * TIER_TERM_HEADER_LEN as u64)?;
+        Some(terms * std::mem::size_of::<TierTerm>() as u64 + frontier_bytes)
+    }
+
+    fs::File::open(segment_dir.join("inverted.idx"))
+        .ok()
+        .and_then(measure)
+        .unwrap_or(0)
 }
 
 /// Shards actually referenced by a split index's TOC. Empty shard files
@@ -4748,7 +5978,7 @@ pub fn posting_term_spans(
         .collect())
 }
 
-/// Byte breakdown of one skip-split (v5/v6) segment's postings, for the
+/// Byte breakdown of one skip-split (v5–v7) segment's postings, for the
 /// #386 bit-packing experiment. Diagnostics only: nothing on the query or
 /// write path calls it.
 #[doc(hidden)]
@@ -4786,10 +6016,13 @@ pub fn postings_section_stats(segment_dir: &Path) -> Result<PostingsSectionStats
         |msg: String| KoshaError::CorruptSegment(format!("{}: {msg}", segment_dir.display()));
     let data = read_inverted_payload(fs::read(segment_dir.join("inverted.idx"))?)?;
     let index = SplitInvertedIndex::from_bytes(data, segment_dir.to_path_buf(), None)?;
+    if index.tier_terms.is_some() {
+        return Err(corrupt("postings are already tiered".into()));
+    }
     let inverted_version = u32::from_le_bytes(index.data[4..8].try_into().unwrap());
-    let Some(bitpacked) = index.encoding.skip_split() else {
+    let Some(version) = index.encoding.skip_split() else {
         return Err(corrupt(format!(
-            "inverted version {inverted_version} is not skip-split (v5/v6)"
+            "inverted version {inverted_version} is not skip-split (v5/v6/v7)"
         )));
     };
     let mut by_blob: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
@@ -4814,7 +6047,7 @@ pub fn postings_section_stats(segment_dir: &Path) -> Result<PostingsSectionStats
                 .checked_add(len)
                 .and_then(|end| blob.get(off..end))
                 .ok_or_else(|| corrupt(format!("span out of shard {blob_id} bounds")))?;
-            let parsed = BlockedTermPostings::parse_with(Arc::new(bytes.to_vec()), bitpacked)
+            let parsed = BlockedTermPostings::parse(Arc::new(bytes.to_vec()), version)
                 .ok_or_else(|| corrupt(format!("span in shard {blob_id} does not parse")))?;
             stats.postings += parsed.doc_count() as u64;
             stats.skip_bytes += u64::from(parsed.scoring_base);
@@ -4930,6 +6163,7 @@ pub struct SplitInvertedIndex {
     data: Vec<u8>,
     segment_dir: PathBuf,
     term_count: usize,
+    tier_terms: Option<Vec<TierTerm>>,
     encoding: SplitPostingsEncoding,
     cache: PostingsCache<usize, Arc<Vec<Posting>>>,
     /// v5 (skip-split) only: per-term scoring views (skip table + raw
@@ -4951,6 +6185,13 @@ pub struct SplitInvertedIndex {
     /// (`postings-XX.bin.spans/`, see [`span_cache`]) that a query node
     /// fills with ranged GETs of just the query terms' spans (#245).
     posting_spans: bool,
+}
+
+struct TierTerm {
+    df: u32,
+    tail_start: u64,
+    tail_end: u64,
+    frontier: Vec<(u32, u32)>,
 }
 
 /// Where one shard's term spans are read from for a batch of terms.
@@ -4980,20 +6221,17 @@ impl BlobSource {
 enum SplitPostingsEncoding {
     Fixed32,
     VarintDelta,
-    /// v5: `[skip table][scoring (doc,tf)][positions]` per term span — see
+    /// v5–v7: `[skip table][scoring (doc,tf)][positions]` per term span — see
     /// [`BlockedTermPostings`] and [`write_postings_skip_split`].
-    SkipSplit,
-    /// v6: the v5 span with bit-packed full scoring blocks (#386).
-    BitPackedSkipSplit,
+    SkipSplit(u32),
 }
 
 impl SplitPostingsEncoding {
-    /// `Some(bitpacked)` when term spans are skip-split (v5/v6) and so
+    /// The version when term spans are skip-split (v5–v7) and so
     /// parse into a [`BlockedTermPostings`]; `None` for v3/v4.
-    fn skip_split(self) -> Option<bool> {
+    fn skip_split(self) -> Option<u32> {
         match self {
-            Self::SkipSplit => Some(false),
-            Self::BitPackedSkipSplit => Some(true),
+            Self::SkipSplit(version) => Some(version),
             Self::Fixed32 | Self::VarintDelta => None,
         }
     }
@@ -5984,7 +7222,7 @@ pub fn scoring_blocks_decoded() -> u64 {
     SCORING_BLOCKS_DECODED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// One term's parsed v5 span: skip table in memory, scoring/position bytes
+/// One term's parsed skip-split span: skip table in memory, scoring/position bytes
 /// shared, blocks decoded strictly on demand — a block the WAND pruning or
 /// the leapfrog gallop steps over is never varint-decoded at all.
 pub struct BlockedTermPostings {
@@ -5994,25 +7232,13 @@ pub struct BlockedTermPostings {
     span: Arc<Vec<u8>>,
     scoring_base: u32,
     positions_base: u32,
-    /// v6: full blocks are bit-packed ([`bitpack`]); partial blocks and
-    /// all of v5 are varint pairs.
-    bitpacked: bool,
+    version: u32,
 }
 
 impl BlockedTermPostings {
-    /// Parse a v5 term span. Validates the skip table against the span
+    /// Parse a skip-split term span. Validates the skip table against the span
     /// bounds once, so per-block decode can't walk off the buffer.
-    fn parse(span: Arc<Vec<u8>>) -> Option<Self> {
-        Self::parse_with(span, false)
-    }
-
-    /// Parse a v6 ([`BITPACKED_SKIP_SPLIT_INVERTED_VERSION`]) term span —
-    /// same skip table as v5.
-    fn parse_v6(span: Arc<Vec<u8>>) -> Option<Self> {
-        Self::parse_with(span, true)
-    }
-
-    fn parse_with(span: Arc<Vec<u8>>, bitpacked: bool) -> Option<Self> {
+    fn parse(span: Arc<Vec<u8>>, version: u32) -> Option<Self> {
         let mut buf: &[u8] = &span;
         let doc_count = take_var_u32(&mut buf)?;
         let n_blocks = (doc_count as usize).div_ceil(SCORING_BLOCK_LEN);
@@ -6047,7 +7273,7 @@ impl BlockedTermPostings {
             scoring_base: u32::try_from(scoring_base).ok()?,
             positions_base: u32::try_from(positions_base).ok()?,
             span,
-            bitpacked,
+            version,
         })
     }
 
@@ -6096,7 +7322,19 @@ impl BlockedTermPostings {
         } else {
             self.blocks[block - 1].last_doc_id
         };
-        let decoded = if self.bitpacked && in_block == SCORING_BLOCK_LEN {
+        if self.version == PACKED_POSITIONS_INVERTED_VERSION && in_block == 1 {
+            if !buf.is_empty() {
+                return false;
+            }
+            out.push(ScoringPosting {
+                doc_id: summary.last_doc_id,
+                term_frequency: summary.max_tf,
+            });
+            return true;
+        }
+        let decoded = if self.version >= BITPACKED_SKIP_SPLIT_INVERTED_VERSION
+            && in_block == SCORING_BLOCK_LEN
+        {
             let next_min = if block == 0 {
                 0
             } else {
@@ -6125,16 +7363,60 @@ impl BlockedTermPostings {
     /// Full decode — scoring and positions sections zipped by ordinal into
     /// the classic `Vec<Posting>`. This is the phrase-query / compat path;
     /// scoring never calls it.
-    fn decode_full(&self) -> Option<(Vec<Posting>, usize)> {
+    fn decode_full(&self, term: &str) -> Option<(Vec<Posting>, usize)> {
         let mut postings: Vec<Posting> = Vec::with_capacity(self.doc_count as usize);
         let mut block_buf: Vec<ScoringPosting> = Vec::with_capacity(SCORING_BLOCK_LEN);
         let mut positions_buf = self.span.get(self.positions_base as usize..)?;
-        let mut position_count = 0usize;
+        let v7 = self.version == PACKED_POSITIONS_INVERTED_VERSION;
+        let allow_position_markers = v7 && is_field_norms_key(term);
+        let mut packed = v7;
+        if allow_position_markers {
+            if let Some(rest) = positions_buf.strip_prefix(&[EXPLICIT_POSITION_COUNTS_MARKER]) {
+                positions_buf = rest;
+                packed = false;
+            }
+        }
+        let positionless =
+            packed && allow_position_markers && positions_buf == [NO_POSITIONS_MARKER];
+        if positionless {
+            positions_buf = &[];
+        }
+        let mut deltas = [0u32; bitpack::BP_BLOCK];
+        let mut position_capacity = 0usize;
         for block in 0..self.blocks.len() {
             if !self.read_block(block, &mut block_buf) {
                 return None;
             }
+            let mut deltas_left = if packed && !positionless {
+                block_buf.iter().map(|p| u64::from(p.term_frequency)).sum()
+            } else {
+                0
+            };
+            let mut group = [].iter();
             for sp in &block_buf {
+                if packed {
+                    let mut positions = Vec::new();
+                    if !positionless {
+                        let mut prev_pos = 0u32;
+                        for _ in 0..sp.term_frequency {
+                            if group.len() == 0 {
+                                let n = deltas_left.min(bitpack::BP_BLOCK as u64) as usize;
+                                bitpack::decode_position_group(&mut positions_buf, n, &mut deltas)?;
+                                deltas_left -= n as u64;
+                                group = deltas[..n].iter();
+                            }
+                            prev_pos = prev_pos.wrapping_add(*group.next()?);
+                            positions.push(prev_pos);
+                        }
+                    }
+                    position_capacity += positions.capacity();
+                    postings.push(Posting {
+                        doc_id: sp.doc_id,
+                        term_frequency: sp.term_frequency,
+                        positions,
+                    });
+                    continue;
+                }
                 let npos = take_var_u32(&mut positions_buf)? as usize;
                 // Untrusted count: every position takes at least one byte,
                 // so a valid `npos` can never exceed the remaining buffer.
@@ -6152,7 +7434,7 @@ impl BlockedTermPostings {
                     prev_pos = pos;
                     positions.push(pos);
                 }
-                position_count += npos;
+                position_capacity += positions.capacity();
                 postings.push(Posting {
                     doc_id: sp.doc_id,
                     term_frequency: sp.term_frequency,
@@ -6160,7 +7442,11 @@ impl BlockedTermPostings {
                 });
             }
         }
-        let approx_bytes = postings.len() * std::mem::size_of::<Posting>() + position_count * 4;
+        if v7 && !positions_buf.is_empty() {
+            return None;
+        }
+        let approx_bytes = postings.len() * std::mem::size_of::<Posting>()
+            + position_capacity * std::mem::size_of::<u32>();
         Some((postings, approx_bytes))
     }
 
@@ -6197,12 +7483,18 @@ impl SplitInvertedIndex {
         if !Self::detect(&data) {
             return Err(corrupt("missing split v3 header"));
         }
-        let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        let toc_version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        let version = if toc_version == TIERED_SPLIT_INVERTED_VERSION {
+            SKIP_SPLIT_INVERTED_VERSION
+        } else {
+            toc_version
+        };
         let encoding = match version {
             FIXED_SPLIT_INVERTED_VERSION => SplitPostingsEncoding::Fixed32,
             SPLIT_INVERTED_VERSION => SplitPostingsEncoding::VarintDelta,
-            SKIP_SPLIT_INVERTED_VERSION => SplitPostingsEncoding::SkipSplit,
-            BITPACKED_SKIP_SPLIT_INVERTED_VERSION => SplitPostingsEncoding::BitPackedSkipSplit,
+            SKIP_SPLIT_INVERTED_VERSION
+            | BITPACKED_SKIP_SPLIT_INVERTED_VERSION
+            | PACKED_POSITIONS_INVERTED_VERSION => SplitPostingsEncoding::SkipSplit(version),
             _ => return Err(corrupt(&format!("unsupported version {version}"))),
         };
         let term_count = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
@@ -6220,10 +7512,11 @@ impl SplitInvertedIndex {
         if table_end > data.len() {
             return Err(corrupt("term table extends past end of file"));
         }
-        let index = Self {
+        let mut index = Self {
             data,
             segment_dir,
             term_count,
+            tier_terms: None,
             encoding,
             cache: PostingsCache::new(
                 postings_cache_max_bytes(),
@@ -6252,6 +7545,65 @@ impl SplitInvertedIndex {
             if std::str::from_utf8(&index.data[term_off..term_end]).is_err() {
                 return Err(corrupt(&format!("table entry {i} term is not UTF-8")));
             }
+        }
+        if toc_version == TIERED_SPLIT_INVERTED_VERSION {
+            let mut terms = Vec::with_capacity(term_count);
+            let mut offset = (0..term_count)
+                .map(|i| {
+                    let (start, len, ..) = index.raw_entry(i);
+                    start + len
+                })
+                .max()
+                .unwrap_or(table_end);
+            let mut tail_end = 0u64;
+            for i in 0..term_count {
+                let slot = INVERTED_HEADER_LEN + i * SPLIT_INVERTED_TABLE_ENTRY_LEN + 28;
+                if u32::from_le_bytes(index.data[slot..slot + 4].try_into().unwrap()) as usize
+                    != offset
+                {
+                    return Err(corrupt("invalid tier metadata offset"));
+                }
+                let metadata = index
+                    .data
+                    .get(offset..)
+                    .ok_or_else(|| corrupt("invalid tier metadata"))?;
+                let mut cursor = Checked::new(metadata, "tier metadata");
+                let df = cursor.u32()?;
+                let start = cursor.array().map(u64::from_le_bytes)?;
+                let len = cursor.u32()?;
+                let count = cursor.u32()? as usize;
+                let record_len = count
+                    .checked_mul(8)
+                    .and_then(|n| n.checked_add(TIER_TERM_HEADER_LEN))
+                    .filter(|&n| n <= metadata.len())
+                    .ok_or_else(|| corrupt("truncated tier metadata"))?;
+                if start != tail_end || df == 0 || (len == 0) != (count == 0) {
+                    return Err(corrupt("invalid tier span"));
+                }
+                tail_end = start
+                    .checked_add(u64::from(len))
+                    .ok_or_else(|| corrupt("tier span overflow"))?;
+                let mut frontier = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let dl = cursor.u32()?;
+                    let tf = cursor.u32()?;
+                    if tf == 0 || frontier.last().is_some_and(|&(d, t)| d >= dl || t >= tf) {
+                        return Err(corrupt("invalid tier frontier"));
+                    }
+                    frontier.push((dl, tf));
+                }
+                terms.push(TierTerm {
+                    df,
+                    tail_start: start,
+                    tail_end,
+                    frontier,
+                });
+                offset += record_len;
+            }
+            if offset != index.data.len() {
+                return Err(corrupt("trailing tier metadata"));
+            }
+            index.tier_terms = Some(terms);
         }
         Ok(index)
     }
@@ -6297,11 +7649,19 @@ impl SplitInvertedIndex {
 
     fn postings(&self, term: &str) -> Option<Arc<Vec<Posting>>> {
         let i = self.find(term)?;
+        let postings = self.postings_at(i);
+        if postings.is_none() {
+            self.note_blob_read_failure();
+        }
+        postings
+    }
+
+    fn postings_at(&self, i: usize) -> Option<Arc<Vec<Posting>>> {
         if let Some(hit) = self.cache.get(i) {
             return Some(hit);
         }
         let admit = self.cache.admit_on_miss(i);
-        let (postings, approx_bytes) = self.decode_postings(i)?;
+        let (postings, approx_bytes) = self.decode_postings_inner(i)?;
         let arc = Arc::new(postings);
         if admit {
             self.cache.insert(i, Arc::clone(&arc), approx_bytes);
@@ -6310,6 +7670,12 @@ impl SplitInvertedIndex {
     }
 
     fn postings_for_terms<'a>(&'a self, terms: &'a [String]) -> Vec<(&'a str, Arc<Vec<Posting>>)> {
+        if self.tier_terms.is_some() {
+            return terms
+                .iter()
+                .filter_map(|term| self.postings(term).map(|p| (term.as_str(), p)))
+                .collect();
+        }
         // The output is emitted strictly in the requested `terms` order.
         // That order is load-bearing: both the general scoring path and the
         // WAND join sum per-term float scores in whatever order this
@@ -6350,7 +7716,7 @@ impl SplitInvertedIndex {
                     self.note_blob_read_failure();
                     continue;
                 };
-                let Some((postings, approx_bytes)) = self.decode_term(&bytes) else {
+                let Some((postings, approx_bytes)) = self.decode_term(term, &bytes) else {
                     self.note_blob_read_failure();
                     continue;
                 };
@@ -6365,36 +7731,47 @@ impl SplitInvertedIndex {
         slots.into_iter().flatten().collect()
     }
 
-    fn decode_postings(&self, i: usize) -> Option<(Vec<Posting>, usize)> {
-        let decoded = self.decode_postings_inner(i);
-        if decoded.is_none() {
-            // The TOC contains this term (callers only reach here after
-            // `find` succeeded) but its blob shard couldn't serve it —
-            // evicted, truncated, or corrupt. Flag it so the query layer
-            // can error instead of silently treating the term as absent.
-            self.note_blob_read_failure();
+    fn decode_postings_inner(&self, i: usize) -> Option<(Vec<Posting>, usize)> {
+        let (mut head, mut bytes) = self.decode_head(i)?;
+        if let Some(tier) = self.tier_terms.as_ref().map(|terms| &terms[i]) {
+            if tier.tail_start != tier.tail_end {
+                let tail = span_cache::read_local_range(
+                    &self.segment_dir,
+                    TIER_TAIL_FILE,
+                    tier.tail_end,
+                    tier.tail_start,
+                    tier.tail_end - tier.tail_start,
+                )?;
+                let (tail, tail_bytes) = self.decode_term(self.term_at(i), &tail)?;
+                head.extend(tail);
+                bytes += tail_bytes;
+                head.sort_unstable_by_key(|p| p.doc_id);
+                if head.windows(2).any(|w| w[0].doc_id == w[1].doc_id) {
+                    return None;
+                }
+            }
+            if head.len() != tier.df as usize {
+                return None;
+            }
         }
-        decoded
+        Some((head, bytes))
     }
 
-    fn decode_postings_inner(&self, i: usize) -> Option<(Vec<Posting>, usize)> {
+    fn decode_head(&self, i: usize) -> Option<(Vec<Posting>, usize)> {
         let (_, _, blob_id, p_off, p_len) = self.raw_entry(i);
         let blob = self.open_posting_blob(blob_id)?;
         let bytes = self.term_bytes(&blob, blob_id, p_off, p_len)?;
-        self.decode_term(&bytes)
+        self.decode_term(self.term_at(i), &bytes)
     }
 
     /// Full decode of one term's span, in this index's encoding.
-    fn decode_term(&self, bytes: &[u8]) -> Option<(Vec<Posting>, usize)> {
+    fn decode_term(&self, term: &str, bytes: &[u8]) -> Option<(Vec<Posting>, usize)> {
         match self.encoding {
             SplitPostingsEncoding::Fixed32 => decode_postings_bytes(bytes),
             SplitPostingsEncoding::VarintDelta => decode_postings_varint_delta_bytes(bytes),
-            SplitPostingsEncoding::SkipSplit => {
-                BlockedTermPostings::parse(Arc::new(bytes.to_vec())).and_then(|b| b.decode_full())
-            }
-            SplitPostingsEncoding::BitPackedSkipSplit => {
-                BlockedTermPostings::parse_v6(Arc::new(bytes.to_vec()))
-                    .and_then(|b| b.decode_full())
+            SplitPostingsEncoding::SkipSplit(version) => {
+                BlockedTermPostings::parse(Arc::new(bytes.to_vec()), version)
+                    .and_then(|b| b.decode_full(term))
             }
         }
     }
@@ -6421,7 +7798,7 @@ impl SplitInvertedIndex {
         &'a self,
         terms: &'a [String],
     ) -> Option<Vec<(&'a str, Arc<BlockedTermPostings>)>> {
-        let bitpacked = self.encoding.skip_split()?;
+        let version = self.encoding.skip_split()?;
         // Slot-assembled in requested-term order — same load-bearing
         // reason as `postings_for_terms`: the WAND leapfrog join sums
         // per-term float scores in whatever order this returns, and a
@@ -6462,7 +7839,7 @@ impl SplitInvertedIndex {
                     continue;
                 };
                 let Some(parsed) =
-                    BlockedTermPostings::parse_with(Arc::new(bytes.into_owned()), bitpacked)
+                    BlockedTermPostings::parse(Arc::new(bytes.into_owned()), version)
                 else {
                     self.note_blob_read_failure();
                     continue;
@@ -6961,6 +8338,8 @@ struct LazyVectorIndex {
     /// degrades ranking exactly to raw centroid distance — see
     /// `RADIUS_AWARE_VECTOR_INDEX_VERSION`.
     radii: Vec<f32>,
+    radius_quantiles: Option<[Vec<f32>; 2]>,
+    probe_radius: KnnProbeRadius,
     /// Stored vectors and centroids are unit-L2 (on-disk header version is
     /// [`UNIT_NORM_VECTOR_INDEX_VERSION`]) — scoring uses the dot-only fast
     /// path: normalize the query once, then `1 - dot` *is* cosine distance.
@@ -6992,6 +8371,12 @@ impl LazyVectorIndex {
         let mut centroids = Vec::with_capacity(parsed.len() * dim);
         let mut ranges = Vec::with_capacity(parsed.len());
         let mut radii = Vec::with_capacity(parsed.len());
+        let mut radius_quantiles = has_radius_quantiles(version).then(|| {
+            [
+                Vec::with_capacity(parsed.len()),
+                Vec::with_capacity(parsed.len()),
+            ]
+        });
         for p in parsed {
             // `parse_vector_offsets` reads exactly `dim` floats per
             // posting; anything else would shift every later row.
@@ -6999,6 +8384,12 @@ impl LazyVectorIndex {
             centroids.extend_from_slice(&p.centroid);
             ranges.push((p.offset, p.length));
             radii.push(p.radius);
+            if let (Some([p50s, p90s]), Some([p50, p90])) =
+                (&mut radius_quantiles, p.radius_quantiles)
+            {
+                p50s.push(p50);
+                p90s.push(p90);
+            }
         }
         let unit_norm = is_unit_norm_vector_index_version(version);
         let centroid_codes = (unit_norm && knn_plan_i8_from_env())
@@ -7020,11 +8411,25 @@ impl LazyVectorIndex {
             centroid_cap,
             ranges,
             radii,
+            radius_quantiles,
+            probe_radius: KnnProbeRadius::from_env(),
             unit_norm,
             version,
             quantized: is_quantized_vector_index_version(version),
             rabitq: is_rabitq_vector_index_version(version),
             field,
+        }
+    }
+
+    fn probe_radii(&self) -> &[f32] {
+        self.selected_radius_quantiles().unwrap_or(&self.radii)
+    }
+
+    fn selected_radius_quantiles(&self) -> Option<&[f32]> {
+        match (self.probe_radius, &self.radius_quantiles) {
+            (KnnProbeRadius::P50, Some([p50, _])) => Some(p50),
+            (KnnProbeRadius::P90, Some([_, p90])) => Some(p90),
+            _ => None,
         }
     }
 
@@ -7431,6 +8836,7 @@ impl KnnCentroidMatrix {
                 offset: 0,
                 length: 0,
                 radius,
+                radius_quantiles: None,
             })
             .collect();
         Self(LazyVectorIndex::from_parsed(
@@ -7619,6 +9025,26 @@ pub enum KnnProbeBudget<'a> {
 /// same `max_distance` and `max_probes`: ascending score, equal scores in
 /// posting order, the first `max_probes` of those at or under
 /// `max_distance`.
+/// One vector column's read costs, from its resident `vector.offsets`:
+/// see [`SegmentReader::knn_column_cost`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnnColumnCost {
+    /// Postings in the column.
+    pub postings: usize,
+    /// Live entries over all postings.
+    pub entries: u64,
+    /// Bytes of one `vector.idx` entry, id included: what a probe reads and
+    /// scores per vector (f32, i8 or RaBitQ).
+    pub entry_bytes: usize,
+    /// Entries are quantized, so a probe also rescores a shortlist from
+    /// `doc_vectors.bin`.
+    pub quantized: bool,
+    /// Bytes an exact scan reads per passing document from
+    /// `doc_vectors.bin`; `None` without that file, when an exact scan reads
+    /// every posting instead.
+    pub exact_vector_bytes: Option<usize>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct KnnSegmentRanking {
     /// One rank score per posting, in posting order. `None` when the plan
@@ -7833,8 +9259,7 @@ struct ProbedCandidates {
     postings: usize,
 }
 
-/// Where the time of a kNN probe's posting scans went (#435), summed over
-/// the postings scanned inside one [`with_knn_scan_stats`] scope.
+/// kNN probe metrics collected inside one [`with_knn_scan_stats`] scope.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct KnnScanStats {
     /// Reading posting bytes from local disk (idx file or span cache).
@@ -7858,6 +9283,10 @@ pub struct KnnScanStats {
     /// (in place from the read buffer on little-endian targets), without
     /// building a posting.
     pub postings_scanned: usize,
+    /// Budgeted postings `KOSHA_KNN_BOUND_STOP_ALPHA` skipped (#384).
+    pub bound_skips: usize,
+    /// Quantized candidates successfully rescored from the local sidecar.
+    pub rescored: usize,
 }
 
 impl KnnScanStats {
@@ -7869,6 +9298,7 @@ impl KnnScanStats {
         self.postings_cached += other.postings_cached;
         self.postings_decoded += other.postings_decoded;
         self.postings_scanned += other.postings_scanned;
+        self.bound_skips += other.bound_skips;
     }
 }
 
@@ -8022,9 +9452,37 @@ impl Ord for TopKEntry {
 struct CandidateSink {
     k: usize,
     top: Option<std::collections::BinaryHeap<TopKEntry>>,
+    /// A quantized column's `k` largest `estimate - error`, kept only for
+    /// [`Self::kth_lower`] (the #384 bound stop).
+    lower: Option<std::collections::BinaryHeap<LowerBound>>,
     scored: Vec<(u32, f64)>,
     errors: Vec<f32>,
     count: usize,
+}
+
+/// A candidate's lowest possible score, ordered so that a `BinaryHeap`
+/// keeps the smallest on top.
+#[derive(Debug, Clone, Copy)]
+struct LowerBound(f64);
+
+impl PartialEq for LowerBound {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for LowerBound {}
+
+impl PartialOrd for LowerBound {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for LowerBound {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other.0.total_cmp(&self.0)
+    }
 }
 
 impl CandidateSink {
@@ -8037,6 +9495,7 @@ impl CandidateSink {
             k,
             // Not `with_capacity(k)`: `k` is caller-supplied.
             top: running.then(std::collections::BinaryHeap::new),
+            lower: None,
             scored: Vec::new(),
             errors: Vec::new(),
             count: 0,
@@ -8055,6 +9514,16 @@ impl CandidateSink {
         let Some(top) = self.top.as_mut() else {
             self.scored.push((id, score));
             self.errors.push(error);
+            if let Some(lower) = self.lower.as_mut() {
+                let bound = LowerBound(score - error as f64);
+                if lower.len() < self.k {
+                    lower.push(bound);
+                } else if let Some(mut worst) = lower.peek_mut() {
+                    if bound.0 > worst.0 {
+                        *worst = bound;
+                    }
+                }
+            }
             return;
         };
         Self::offer(top, self.k, TopKEntry { score, seq, id });
@@ -8070,6 +9539,31 @@ impl CandidateSink {
             if entry.score > worst.score {
                 *worst = entry;
             }
+        }
+    }
+
+    /// Also track what [`Self::kth_lower`] needs on a quantized column (an
+    /// f32 column's running top-`k` already holds it).
+    fn tracking_kth_lower(mut self) -> Self {
+        if self.top.is_none() {
+            self.lower = Some(std::collections::BinaryHeap::new());
+        }
+        self
+    }
+
+    /// The `k`-th largest score a candidate is guaranteed to have so far:
+    /// the exact `k`-th score of an f32 column, the `k`-th largest
+    /// `estimate - error` of a quantized one tracked by
+    /// [`Self::tracking_kth_lower`]. `None` until `k` candidates are in,
+    /// and for `k == 0`.
+    fn kth_lower(&self) -> Option<f64> {
+        if self.k == 0 {
+            return None;
+        }
+        match (&self.top, &self.lower) {
+            (Some(top), _) if top.len() >= self.k => top.peek().map(|e| e.score),
+            (None, Some(lower)) if lower.len() >= self.k => lower.peek().map(|b| b.0),
+            _ => None,
         }
     }
 
@@ -8210,6 +9704,12 @@ pub struct ExactKnnResult {
     /// Postings hydrated (zero when served from the sidecar).
     pub postings_hydrated: usize,
     pub source: ExactKnnSource,
+}
+
+pub struct TierHead<'a> {
+    pub postings: Vec<Posting>,
+    pub df: u32,
+    pub frontier: &'a [(u32, u32)],
 }
 
 pub struct SegmentReader {
@@ -9367,7 +10867,7 @@ impl SegmentReader {
     }
 
     /// kNN search over the lazy v2 posting index of the segment's first
-    /// vector column: probe `nprobe` nearest centroids (all resident, no
+    /// vector column: probe `nprobe` top-ranked centroids (all resident, no
     /// I/O), hydrate just those candidate postings from disk, score by
     /// cosine similarity, return the top `k`. `None` if that column has no
     /// lazy vector index — the caller (see `kosha-query`'s KNN block) falls
@@ -9486,22 +10986,10 @@ impl SegmentReader {
         )))
     }
 
-    /// Triangle-inequality lower bound on `query`'s distance to *any*
-    /// possible member of `centroids[i]`'s posting: `(distance(query,
-    /// centroid) - radius).max(0.0)`, where `radius` is the max distance
-    /// from that centroid to any of its own live members. For every actual
-    /// member `m`, `distance(query, m) >= distance(query, centroid) -
-    /// distance(centroid, m) >= distance(query, centroid) - radius` — so
-    /// this bound can never overestimate how close the posting's best
-    /// member could be, only underestimate (safe to rank/admit by; never
-    /// wrongly excludes a posting that might contain a close match).
-    /// `radius == 0.0` (pre-radius-aware segments) collapses this to plain
-    /// centroid distance — today's exact behavior, unaffected.
-    ///
-    /// With `KOSHA_KNN_PROBE_RADIUS_ALPHA` set (#384, experimental) the
-    /// radius is scaled first — see [`centroid_probe_score`]. At any alpha
-    /// other than the default 1.0 the result is a ranking score, no longer
-    /// a guaranteed lower bound.
+    /// Rank score for each posting using the selected radius and
+    /// `KOSHA_KNN_PROBE_RADIUS_ALPHA` (see [`centroid_probe_score`]).
+    /// Missing quantiles fall back to max radius; pre-radius segments use
+    /// radius zero, yielding raw centroid distance.
     ///
     /// One score per posting of `vi`, in posting order. On a unit-norm
     /// column the centroids are unit vectors too (the writer renormalizes
@@ -9516,8 +11004,12 @@ impl SegmentReader {
     /// [`Self::centroid_lower_bounds`] at an explicit radius weight.
     fn centroid_scores(vi: &LazyVectorIndex, query: &[f32], alpha: f32) -> Vec<f32> {
         let unit = Self::unit_query(vi, query);
-        (0..vi.ranges.len())
-            .map(|i| Self::centroid_score(vi, unit.as_deref(), query, i, alpha))
+        vi.probe_radii()
+            .iter()
+            .enumerate()
+            .map(|(i, &radius)| {
+                Self::centroid_score(vi.centroid(i), unit.as_deref(), query, radius, alpha)
+            })
             .collect()
     }
 
@@ -9525,18 +11017,17 @@ impl SegmentReader {
     /// score comes from, whether the whole column is scored or a few of
     /// its postings, so the two are the same f32 bit for bit.
     fn centroid_score(
-        vi: &LazyVectorIndex,
+        centroid: &[f32],
         unit: Option<&[f32]>,
         query: &[f32],
-        i: usize,
+        radius: f32,
         alpha: f32,
     ) -> f32 {
-        let c = vi.centroid(i);
         let distance = match unit {
-            Some(unit) => 1.0 - kosha_vector_spfresh::dot(unit, c).clamp(-1.0, 1.0),
-            None => kosha_vector_spfresh::cosine_distance(query, c),
+            Some(unit) => 1.0 - kosha_vector_spfresh::dot(unit, centroid).clamp(-1.0, 1.0),
+            None => kosha_vector_spfresh::cosine_distance(query, centroid),
         };
-        centroid_probe_score(distance, vi.radii[i], alpha)
+        centroid_probe_score(distance, radius, alpha)
     }
 
     /// [`Self::centroid_score`] of each of `postings` (all in range), in
@@ -9548,9 +11039,13 @@ impl SegmentReader {
         alpha: f32,
     ) -> Vec<f32> {
         let unit = Self::unit_query(vi, query);
+        let radii = vi.probe_radii();
         postings
             .iter()
-            .map(|&i| Self::centroid_score(vi, unit.as_deref(), query, i as usize, alpha))
+            .map(|&i| {
+                let i = i as usize;
+                Self::centroid_score(vi.centroid(i), unit.as_deref(), query, radii[i], alpha)
+            })
             .collect()
     }
 
@@ -9632,13 +11127,12 @@ impl SegmentReader {
             upper: Vec::with_capacity(n),
         };
         let mut finite = true;
-        for i in 0..n {
+        for (i, &r) in vi.probe_radii().iter().enumerate() {
             let sum = kosha_vector_spfresh::dot_i16_i8(&query_codes, codes.row(i, vi.dim));
             let estimate = sum as f32 * (query_scale * codes.scales[i]);
             let e = (codes.err_l2[i] * l2).min(codes.err_linf[i] * l1) + query_err + PAD;
             finite &= estimate.is_finite() && e.is_finite();
             let distance = 1.0 - estimate.clamp(-1.0, 1.0);
-            let r = vi.radii[i];
             bounds
                 .lower
                 .push(centroid_probe_score(distance - e, r, alpha));
@@ -9677,7 +11171,7 @@ impl SegmentReader {
         }
     }
 
-    /// Lower-bound distance from `query` to every posting of `field`'s
+    /// Rank score from `query` for every posting of `field`'s
     /// column (#204; see [`Self::centroid_lower_bounds`]) — **pure CPU,
     /// zero posting I/O**: centroids and radii are resident in
     /// [`LazyVectorIndex`], loaded from the column's offsets sidecar.
@@ -9689,7 +11183,7 @@ impl SegmentReader {
     /// see [`Self::knn_search_within`]. Without that split, `num_candidates`
     /// is applied per segment and total probe depth scales with segment
     /// count (200 segments x 100 = 20,000 posting reads for one top-10).
-    /// Ranking by the lower bound rather than raw centroid distance is what
+    /// Ranking by the radius-adjusted score rather than raw centroid distance is what
     /// lets a "diffuse" posting (mediocre centroid pull, but a genuinely
     /// close member buried inside it) still qualify — see
     /// `RADIUS_AWARE_VECTOR_INDEX_VERSION`. Only `field`'s centroids count:
@@ -9725,6 +11219,24 @@ impl SegmentReader {
     /// computing them; `None` exactly when it returns `None`.
     pub fn knn_centroid_count(&self, field: &str, dim: usize) -> Option<usize> {
         self.with_knn_plan_index(field, dim, |vi| Some(vi.ranges.len()))
+    }
+
+    /// What a probe and an exact scan of `field`'s column read, for the
+    /// filtered-kNN cost model (#465); `None` exactly when
+    /// [`Self::knn_centroid_count`] is `None`.
+    pub fn knn_column_cost(&self, field: &str, dim: usize) -> Option<KnnColumnCost> {
+        let doc_vectors = self.footer.doc_vectors;
+        self.with_knn_plan_index(field, dim, |vi| {
+            let entry_bytes = vector_entry_size(vi.dim as u32, vi.version);
+            let bytes: u64 = vi.ranges.iter().map(|&(_, length)| length as u64).sum();
+            Some(KnnColumnCost {
+                postings: vi.ranges.len(),
+                entries: bytes / entry_bytes as u64,
+                entry_bytes,
+                quantized: vi.quantized,
+                exact_vector_bytes: doc_vectors.then_some(4 * vi.dim),
+            })
+        })
     }
 
     /// [`Self::knn_centroid_distances`] at an explicit radius weight
@@ -10500,10 +12012,10 @@ impl SegmentReader {
         planned: Option<&KnnSegmentRanking>,
     ) -> Result<ProbedCandidates, KoshaError> {
         // This segment's postings inside the budget, nearest-first (by
-        // lower bound, not raw centroid distance — see
+        // rank score, not raw centroid distance — see
         // `centroid_lower_bounds`), so the `max_probes` cap keeps the
         // *best* candidates when it bites. `max_distance` is itself a
-        // lower-bound cutoff (computed from the same bound across all
+        // rank cutoff (computed from the same scores across all
         // segments — see `Searcher::knn_plan`), so both sides of the
         // comparison are in the same units.
         let own;
@@ -10529,15 +12041,57 @@ impl SegmentReader {
         let mut held =
             self.prefetch_vector_postings(vi, ranking.budgeted.iter().map(|&i| i as usize), fetch);
 
+        // Only where the posting ceiling and `theta` are sound: stored radii
+        // (older sidecars read them as 0), and a quantized column only when
+        // it has error bounds and its shortlist is rescored exactly.
+        let stop_alpha = knn_bound_stop_alpha().filter(|_| {
+            vi.version >= RADIUS_AWARE_VECTOR_INDEX_VERSION
+                && (!vi.quantized || (vi.rabitq && self.rescores_quantized_locally()))
+        });
         let mut sink = CandidateSink::new(vi, k);
+        if stop_alpha.is_some() {
+            sink = sink.tracking_kth_lower();
+        }
         let lanes = DotLanes::from_env();
         let unit = Self::unit_query(vi, query);
         let similarity = |v: &[f32]| Self::f32_similarity(lanes, unit.as_deref(), query, v);
         let probe = Self::probe_query(vi, query);
         let mut scan = PostingScan::new(&self.segment_dir, vi, &probe, accept);
         scan.stats.rank_nanos += rank_nanos;
-        self.scan_budgeted_postings(&mut scan, &held, &mut sink, &ranking.budgeted, &similarity)?;
-        let mut probes = budgeted;
+        // The bound stop needs the running k-th score after every posting,
+        // so it scans in order; otherwise the budget may run in parallel.
+        let mut probes = if let Some(alpha) = stop_alpha {
+            let mut probes = 0usize;
+            for &range_idx in &ranking.budgeted {
+                if let Some(theta) = sink.kth_lower() {
+                    let i = range_idx as usize;
+                    let distance =
+                        Self::centroid_score(vi.centroid(i), unit.as_deref(), query, 0.0, 0.0);
+                    if bound_stop(theta, distance, vi.radii[i], alpha) {
+                        scan.stats.bound_skips += 1;
+                        continue;
+                    }
+                }
+                probes += 1;
+                self.scan_posting(
+                    &mut scan,
+                    &held,
+                    range_idx as usize,
+                    similarity,
+                    |id, sim, err| sink.push(id, sim, err),
+                )?;
+            }
+            probes
+        } else {
+            self.scan_budgeted_postings(
+                &mut scan,
+                &held,
+                &mut sink,
+                &ranking.budgeted,
+                &similarity,
+            )?;
+            budgeted
+        };
         // Past the budget. Without a restriction this is where the probe
         // ends. With one, keep going only while the page is still short
         // (see the doc comment on the public wrapper), and, when the
@@ -10596,13 +12150,6 @@ impl SegmentReader {
         })
     }
 
-    // Deliberately NOT radius-aware: this is the per-segment `nprobe`
-    // fallback used only when `KOSHA_KNN_GLOBAL_BUDGET=0` disables global
-    // budgeting entirely (an escape hatch, not the default query path).
-    // `kosha_vector_spfresh::nearest_centroids`/`nearest_centroids_dot`
-    // rank by raw distance and don't take a radius parameter — extending
-    // them is separate, lower-priority scope than the global-budget path
-    // this fix targets.
     fn knn_search_lazy(
         &self,
         vi: &LazyVectorIndex,
@@ -10648,7 +12195,22 @@ impl SegmentReader {
         } else {
             nprobe
         };
-        let candidates = if vi.dim == 0 {
+        let candidates = if let Some(radii) = vi.selected_radius_quantiles() {
+            let alpha = knn_probe_radius_alpha();
+            let unit = vi.unit_norm.then_some(query);
+            let scores = radii
+                .iter()
+                .enumerate()
+                .map(|(i, &radius)| {
+                    Self::centroid_score(vi.centroid(i), unit, query, radius, alpha)
+                })
+                .collect();
+            KnnSegmentRanking::new(scores, f32::INFINITY, rank)
+                .budgeted
+                .into_iter()
+                .map(|i| i as usize)
+                .collect()
+        } else if vi.dim == 0 {
             // A zero-dimension column (no writer produces one, but the
             // parsers accept it) has a centroid per posting and nothing in
             // the matrix to tell them apart by: rank the empty rows.
@@ -10776,7 +12338,15 @@ impl SegmentReader {
         };
         let mut shortlist = top_k_by_score(scored, shortlist_len);
         if let Some(field) = vi.field.as_deref() {
-            self.rescore_exact(field, query, &mut shortlist);
+            let rescored = self.rescore_exact(field, query, &mut shortlist);
+            if rescored > 0 {
+                KNN_SCAN_STATS.with(|stats| {
+                    if let Some(mut total) = stats.get() {
+                        total.rescored += rescored;
+                        stats.set(Some(total));
+                    }
+                });
+            }
         }
         shortlist.sort_by(by_score_desc);
         shortlist.truncate(k);
@@ -10975,6 +12545,44 @@ impl SegmentReader {
         self.inverted.postings(term)
     }
 
+    /// Read a term without reporting a v8 read failure on the shared reader.
+    pub fn read_postings(&self, term: &str) -> Result<Option<PostingsRef<'_>>, KoshaError> {
+        if let InvertedAccess::Split(index) = &self.inverted {
+            if index.tier_terms.is_some() {
+                return index
+                    .find(term)
+                    .map(|i| {
+                        index.postings_at(i).map(PostingsRef::Shared).ok_or_else(|| {
+                            KoshaError::CorruptSegment(format!(
+                                "segment {:?}: posting blob unreadable for {term:?} (evicted or corrupt) — retry after rehydration",
+                                self.segment_dir
+                            ))
+                        })
+                    })
+                    .transpose();
+            }
+        }
+        Ok(self.postings(term))
+    }
+
+    /// Batch read with the same per-call v8 failure semantics as `read_postings`.
+    pub fn read_postings_for_terms<'a>(
+        &'a self,
+        terms: &'a [String],
+    ) -> Result<Vec<(&'a str, PostingsRef<'a>)>, KoshaError> {
+        if !self.is_tiered() {
+            return Ok(self.postings_for_terms(terms));
+        }
+        terms
+            .iter()
+            .filter_map(|term| {
+                self.read_postings(term)
+                    .transpose()
+                    .map(|p| p.map(|p| (term.as_str(), p)))
+            })
+            .collect()
+    }
+
     /// Fetch postings for a batch of terms. Split-postings segments group
     /// the batch by posting shard so wildcard expansions read/decompress
     /// each shard once instead of once per matching term.
@@ -11018,18 +12626,105 @@ impl SegmentReader {
         &'a self,
         terms: &'a [String],
     ) -> Vec<(&'a str, ScoringPostingsRef<'a>)> {
-        if let InvertedAccess::Split(split) = &self.inverted {
-            if let Some(blocked) = split.scoring_postings_for_terms(terms) {
-                return blocked
-                    .into_iter()
-                    .map(|(t, b)| (t, ScoringPostingsRef::Blocked(b)))
-                    .collect();
+        let blocked = match &self.inverted {
+            InvertedAccess::Split(split) if split.tier_terms.is_none() => {
+                split.scoring_postings_for_terms(terms)
             }
+            _ => None,
+        };
+        if let Some(blocked) = blocked {
+            return blocked
+                .into_iter()
+                .map(|(t, b)| (t, ScoringPostingsRef::Blocked(b)))
+                .collect();
         }
         self.postings_for_terms(terms)
             .into_iter()
             .map(|(t, p)| (t, ScoringPostingsRef::Decoded(p)))
             .collect()
+    }
+
+    pub fn read_scoring_postings_for_terms<'a>(
+        &'a self,
+        terms: &'a [String],
+    ) -> Result<Vec<(&'a str, ScoringPostingsRef<'a>)>, KoshaError> {
+        if !self.is_tiered() {
+            return Ok(self.scoring_postings_for_terms(terms));
+        }
+        Ok(self
+            .read_postings_for_terms(terms)?
+            .into_iter()
+            .map(|(term, postings)| (term, ScoringPostingsRef::Decoded(postings)))
+            .collect())
+    }
+
+    pub fn is_tiered(&self) -> bool {
+        matches!(&self.inverted, InvertedAccess::Split(index) if index.tier_terms.is_some())
+    }
+
+    /// The head plus full document frequency and the tail's (dl, tf) frontier.
+    pub fn tier_head(&self, term: &str) -> Result<Option<TierHead<'_>>, KoshaError> {
+        let InvertedAccess::Split(index) = &self.inverted else {
+            return Ok(None);
+        };
+        let (Some(terms), Some(i)) = (&index.tier_terms, index.find(term)) else {
+            return Ok(None);
+        };
+        let tier = &terms[i];
+        let (postings, _) = index.decode_head(i).ok_or_else(|| {
+            KoshaError::CorruptSegment(format!(
+                "{}: unreadable head for {term:?}",
+                self.segment_dir.display()
+            ))
+        })?;
+        let count = postings.len();
+        if count == 0
+            || count > tier.df as usize
+            || (count == tier.df as usize) != tier.frontier.is_empty()
+            || postings.iter().any(|p| p.doc_id >= self.doc_count())
+            || postings.windows(2).any(|p| p[0].doc_id >= p[1].doc_id)
+        {
+            return Err(KoshaError::CorruptSegment(format!(
+                "invalid tier head for {term:?}"
+            )));
+        }
+        Ok(Some(TierHead {
+            postings,
+            df: tier.df,
+            frontier: &tier.frontier,
+        }))
+    }
+
+    /// Hold missing tail spans for a full-postings read. The callback is the
+    /// same ranged cache used by vector postings; full files already local
+    /// to the segment need no callback.
+    pub fn fetch_tier_tails<'a>(
+        &self,
+        terms: impl IntoIterator<Item = &'a str>,
+        fetch: Option<VectorSpanFetch<'_>>,
+    ) -> span_cache::SpanHolds {
+        let (InvertedAccess::Split(index), Some(fetch)) = (&self.inverted, fetch) else {
+            return span_cache::SpanHolds::new();
+        };
+        let Some(metadata) = &index.tier_terms else {
+            return span_cache::SpanHolds::new();
+        };
+        let local_len = fs::metadata(self.segment_dir.join(TIER_TAIL_FILE)).map_or(0, |m| m.len());
+        let mut ranges: Vec<_> = terms
+            .into_iter()
+            .filter_map(|term| {
+                let entry = &metadata[index.find(term)?];
+                (entry.tail_end > entry.tail_start && entry.tail_end > local_len)
+                    .then_some((entry.tail_start, entry.tail_end))
+            })
+            .collect();
+        ranges.sort_unstable();
+        ranges.dedup();
+        if ranges.is_empty() {
+            span_cache::SpanHolds::new()
+        } else {
+            fetch(&self.segment_dir, TIER_TAIL_FILE, &ranges)
+        }
     }
 
     /// Document frequency of each of `terms` that this segment contains,
@@ -11040,6 +12735,16 @@ impl SegmentReader {
     /// `None` when a TOC-present term's posting blob could not be read —
     /// a partial answer would silently understate `df`.
     pub fn doc_frequencies(&self, terms: &[String]) -> Option<Vec<(String, u32)>> {
+        if let InvertedAccess::Split(index) = &self.inverted {
+            if let Some(tier) = &index.tier_terms {
+                return Some(
+                    terms
+                        .iter()
+                        .filter_map(|term| Some((term.clone(), tier[index.find(term)?].df)))
+                        .collect(),
+                );
+            }
+        }
         let dfs: Vec<(String, u32)> = self
             .scoring_postings_for_terms(terms)
             .into_iter()
@@ -11437,14 +13142,14 @@ impl SegmentReader {
             return Ok(Some(Arc::clone(found)));
         }
         let mut lengths = vec![0u32; self.doc_count() as usize];
-        if let Some(postings) = self.postings(&kosha_core::fields::field_norms_key(field)) {
+        if let Some(postings) = self.read_postings(&kosha_core::fields::field_norms_key(field))? {
             for posting in postings.iter() {
                 if let Some(slot) = lengths.get_mut(posting.doc_id as usize) {
                     *slot = posting.term_frequency;
                 }
             }
         }
-        if self.take_blob_read_failure() {
+        if !self.is_tiered() && self.take_blob_read_failure() {
             return Err(KoshaError::CorruptSegment(format!(
                 "segment {:?}: norms of field {field:?} unreadable (evicted or corrupt) — \
                  retry after rehydration",
@@ -11635,6 +13340,11 @@ impl SegmentReader {
             return Ok(InvertedAccess::Lazy(LazyInvertedIndex::from_bytes(
                 data, account,
             )?));
+        }
+        if data.starts_with(&INVERTED_MAGIC.to_le_bytes()) {
+            return Err(KoshaError::CorruptSegment(
+                "unsupported inverted.idx version".into(),
+            ));
         }
         Ok(InvertedAccess::Eager(Self::parse_legacy_inverted(&data)?))
     }
@@ -12789,17 +14499,23 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
 
-        let clean = BlockedTermPostings::parse(Arc::new(span.clone())).unwrap();
+        let clean = BlockedTermPostings::parse(Arc::new(span.clone()), SKIP_SPLIT_INVERTED_VERSION)
+            .unwrap();
         let mut buf = Vec::new();
         assert!(clean.read_block(0, &mut buf), "clean block must decode");
-        assert!(clean.decode_full().is_some(), "clean span must full-decode");
+        assert!(
+            clean.decode_full("term").is_some(),
+            "clean span must full-decode"
+        );
 
         // Corrupt one byte in the middle of block 0's scoring bytes. The
         // skip table still parses; only the decoded doc chain breaks.
         let scoring_mid = span.len() / 2;
         let mut corrupted = span.clone();
         corrupted[scoring_mid] ^= 0x01;
-        if let Some(parsed) = BlockedTermPostings::parse(Arc::new(corrupted)) {
+        if let Some(parsed) =
+            BlockedTermPostings::parse(Arc::new(corrupted), SKIP_SPLIT_INVERTED_VERSION)
+        {
             let mut any_block_failed = false;
             let mut buf = Vec::new();
             for b in 0..parsed.block_count() {
@@ -12808,7 +14524,7 @@ mod tests {
                 }
             }
             assert!(
-                any_block_failed || parsed.decode_full().is_none(),
+                any_block_failed || parsed.decode_full("term").is_none(),
                 "a corrupted span must fail some decode closed, never \
                  return shifted doc_ids as success"
             );
@@ -12847,8 +14563,9 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
 
-        let clean = BlockedTermPostings::parse(Arc::new(span.clone())).unwrap();
-        let (decoded, _) = clean.decode_full().unwrap();
+        let clean = BlockedTermPostings::parse(Arc::new(span.clone()), SKIP_SPLIT_INVERTED_VERSION)
+            .unwrap();
+        let (decoded, _) = clean.decode_full("term").unwrap();
         assert_eq!(decoded.len(), 4);
 
         // The positions section trails the span; overwrite its first
@@ -12864,10 +14581,10 @@ mod tests {
         let mut corrupted = span.clone();
         corrupted.truncate(positions_start);
         corrupted.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
-        let parsed = BlockedTermPostings::parse(Arc::new(corrupted))
+        let parsed = BlockedTermPostings::parse(Arc::new(corrupted), SKIP_SPLIT_INVERTED_VERSION)
             .expect("skip table untouched — parse must still succeed");
         assert!(
-            parsed.decode_full().is_none(),
+            parsed.decode_full("term").is_none(),
             "oversized position count must fail closed, not allocate"
         );
     }
@@ -14439,7 +16156,8 @@ mod tests {
                 .map(|r| r.field_length)
                 .collect::<Vec<_>>(),
         );
-        let parsed = BlockedTermPostings::parse(Arc::new(span)).expect("span must parse");
+        let parsed = BlockedTermPostings::parse(Arc::new(span), SKIP_SPLIT_INVERTED_VERSION)
+            .expect("span must parse");
 
         assert_eq!(parsed.doc_count(), 300);
         assert_eq!(parsed.block_count(), 3);
@@ -14471,7 +16189,7 @@ mod tests {
             assert_eq!(buf, expected, "block {b} scoring mismatch");
         }
 
-        let (full, _) = parsed.decode_full().expect("full decode");
+        let (full, _) = parsed.decode_full("term").expect("full decode");
         assert_eq!(full, postings, "positions must survive the round trip");
 
         // find_block: exact hits, between-blocks targets, and past-the-end.
@@ -14509,7 +16227,10 @@ mod tests {
         );
 
         for cut in 0..span.len() {
-            let Some(parsed) = BlockedTermPostings::parse(Arc::new(span[..cut].to_vec())) else {
+            let Some(parsed) = BlockedTermPostings::parse(
+                Arc::new(span[..cut].to_vec()),
+                SKIP_SPLIT_INVERTED_VERSION,
+            ) else {
                 continue; // clean parse rejection
             };
             // Parse can succeed on a truncated scoring/positions section —
@@ -14518,7 +16239,7 @@ mod tests {
             for b in 0..parsed.block_count() {
                 let _ = parsed.read_block(b, &mut buf); // must not panic
             }
-            let _ = parsed.decode_full(); // must not panic
+            let _ = parsed.decode_full("term"); // must not panic
         }
     }
 
@@ -15045,6 +16766,39 @@ mod doc_vectors_tests {
 mod bounded_build_tests {
     use super::*;
 
+    #[test]
+    fn pre_v8_inverted_dispatch_rejects_a_tiered_toc() {
+        let dir = std::env::temp_dir().join(format!("kosha-tiered-toc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut writer = SegmentWriter::new(SegmentId("test".into()), dir.clone())
+            .with_two_tier_head_fraction(0.25);
+        writer.add_document(DocumentId("d".into()), vec![Field::text("t", "test")]);
+        writer.finalize(Bm25Params::default()).unwrap();
+        let toc = fs::read(dir.join("inverted.idx")).unwrap();
+        let version = u32::from_le_bytes(toc[4..8].try_into().unwrap());
+        assert_eq!(version, TIERED_SPLIT_INVERTED_VERSION);
+        assert!(!(3..=7).contains(&version));
+        // A reader through v7 skips its split parser and instead sees the
+        // shared magic in the inline-format detector, then rejects v8.
+        assert!(LazyInvertedIndex::detect(&toc));
+        assert!(matches!(
+            LazyInvertedIndex::from_bytes(toc, None),
+            Err(KoshaError::CorruptSegment(message)) if message.contains("unsupported version 8")
+        ));
+        let reader = SegmentReader::open(dir.clone()).unwrap();
+        assert_eq!(reader.postings("test").unwrap().len(), 1);
+        let InvertedAccess::Split(index) = &reader.inverted else {
+            panic!("expected a split reader");
+        };
+        let terms = index.tier_terms.as_ref().unwrap();
+        assert_eq!(
+            tier_metadata_heap_bytes(&dir),
+            (terms.capacity() * std::mem::size_of::<TierTerm>()) as u64,
+        );
+        assert!(!dir.join(TIER_TAIL_FILE).exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     fn scratch(name: &str) -> PathBuf {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -15308,6 +17062,195 @@ mod bounded_build_tests {
             .sum()
     }
 
+    #[test]
+    fn v7_review_preserves_tokens_colliding_with_field_norms() {
+        let key = kosha_core::fields::field_norms_key("body");
+        let analysis = AnalysisConfig {
+            default: kosha_core::analysis::AnalyzerSpec::legacy(),
+            ..AnalysisConfig::default()
+        };
+        let mut expected = None;
+        for (i, version) in [
+            SKIP_SPLIT_INVERTED_VERSION,
+            BITPACKED_SKIP_SPLIT_INVERTED_VERSION,
+            PACKED_POSITIONS_INVERTED_VERSION,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dir = scratch(&format!("colliding-norms-{version}"));
+            let mut writer = SegmentWriter::new(SegmentId("collision".into()), dir.clone())
+                .with_field_index(true)
+                .with_analysis(&analysis)
+                .with_postings_write_version(version);
+            writer.add_document(DocumentId("0".into()), vec![Field::text("body", &key)]);
+            writer.add_document(DocumentId("1".into()), vec![Field::text("body", "foo bar")]);
+            writer.finalize(Bm25Params::default()).unwrap();
+            let reader = SegmentReader::open(dir.clone()).unwrap();
+            let postings = reader.postings(&key).unwrap().to_vec();
+            if i == 0 {
+                assert!(postings.iter().any(|p| !p.positions.is_empty()));
+                assert!(postings.iter().any(|p| p.positions.is_empty()));
+                expected = Some(postings);
+            } else {
+                assert_eq!(Some(postings), expected);
+            }
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn v7_review_cache_charge_counts_allocated_positions() {
+        let dir = scratch("positions-cache-charge");
+        for version in [
+            SKIP_SPLIT_INVERTED_VERSION,
+            BITPACKED_SKIP_SPLIT_INVERTED_VERSION,
+            PACKED_POSITIONS_INVERTED_VERSION,
+        ] {
+            let mut encoder = TermEncoder::new(version, &dir, 4096);
+            encoder.push(0, 3, &[1, 2, 3], &[]).unwrap();
+            let mut bytes = Vec::new();
+            encoder.finish(&mut bytes).unwrap();
+            let parsed = BlockedTermPostings::parse(Arc::new(bytes), version).unwrap();
+            let (postings, charged) = parsed.decode_full("term").unwrap();
+            assert_eq!(
+                charged,
+                std::mem::size_of::<Posting>()
+                    + postings[0].positions.capacity() * std::mem::size_of::<u32>(),
+                "v{version}",
+            );
+        }
+    }
+
+    #[test]
+    fn v7_position_groups_round_trip_and_reject_truncation() {
+        let dir = scratch("v7groups");
+        fs::create_dir_all(&dir).unwrap();
+        let mut encoder = TermEncoder::new(PACKED_POSITIONS_INVERTED_VERSION, &dir, 64);
+        let mut postings = Vec::new();
+        // A singleton term, then full scoring blocks plus a singleton tail.
+        // Include zero-width, wide, and wrapping deltas, and a posting
+        // spanning multiple groups with very different widths.
+        for n in [1, SCORING_BLOCK_LEN * 2 + 1] {
+            postings.clear();
+            for i in 0..n as u32 {
+                let positions = match i {
+                    0 => vec![0; 256],
+                    1 => (0..260).map(|j| j * 31).collect(),
+                    2 => vec![u32::MAX, 42, 1],
+                    _ => vec![i * 5, i * 5 + 1],
+                };
+                postings.push(Posting {
+                    doc_id: 600 + i * 2,
+                    term_frequency: positions.len() as u32,
+                    positions,
+                });
+            }
+            for p in &postings {
+                encoder
+                    .push(p.doc_id, p.term_frequency, &p.positions, &[])
+                    .unwrap();
+            }
+            let mut bytes = Vec::new();
+            encoder.finish(&mut bytes).unwrap();
+            let parsed = BlockedTermPostings::parse(
+                Arc::new(bytes.clone()),
+                PACKED_POSITIONS_INVERTED_VERSION,
+            )
+            .unwrap();
+            assert_eq!(parsed.decode_full("term").unwrap().0, postings);
+            assert_eq!(
+                parsed.blocks.last().unwrap().scoring_start,
+                parsed.blocks.last().unwrap().scoring_end
+            );
+            for cut in [parsed.positions_base as usize, bytes.len() - 1] {
+                let corrupt = BlockedTermPostings::parse(
+                    Arc::new(bytes[..cut].to_vec()),
+                    PACKED_POSITIONS_INVERTED_VERSION,
+                )
+                .unwrap();
+                assert!(corrupt.decode_full("term").is_none());
+            }
+        }
+        assert!(encoder.spilled_total() > 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn v7_rejects_explicit_position_marker_on_ordinary_term() {
+        let dir = scratch("v7corrupt-position-mode");
+        let version = PACKED_POSITIONS_INVERTED_VERSION;
+        let mut encoder = TermEncoder::new(version, &dir, 4096);
+        let positions = [3, 4, 5, 2053];
+        encoder.push(0, 4, &positions, &[]).unwrap();
+        let mut bytes = Vec::new();
+        encoder.finish(&mut bytes).unwrap();
+        let clean = BlockedTermPostings::parse(Arc::new(bytes.clone()), version).unwrap();
+        assert_eq!(clean.decode_full("term").unwrap().0[0].positions, positions);
+        let marker = &mut bytes[clean.positions_base as usize];
+        assert_eq!(*marker, 33);
+        *marker = EXPLICIT_POSITION_COUNTS_MARKER;
+        let corrupt = BlockedTermPostings::parse(Arc::new(bytes), version).unwrap();
+        assert!(corrupt.decode_full("term").is_none());
+    }
+
+    #[test]
+    fn v7_compaction_preserves_positions_and_field_norms_across_versions() {
+        let docs = corpus(257);
+        let (v6, v7, v5) = (scratch("v7cmp6"), scratch("v7cmp7"), scratch("v7cmp5"));
+        let writer = |dir: &Path, version| {
+            SegmentWriter::new(SegmentId("v7compact".into()), dir.to_path_buf())
+                .with_field_index(true)
+                .with_build_memory_bytes(64 * 1024)
+                .with_postings_write_version(version)
+        };
+        let mut w = writer(&v6, BITPACKED_SKIP_SPLIT_INVERTED_VERSION);
+        for (id, fields) in docs {
+            w.add_document(id, fields);
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+        for (src, dst, version) in [
+            (&v6, &v7, PACKED_POSITIONS_INVERTED_VERSION),
+            (&v7, &v5, SKIP_SPLIT_INVERTED_VERSION),
+        ] {
+            let reader = SegmentReader::open(src.clone()).unwrap();
+            let mut w = writer(dst, version);
+            for raw in reader.iter_doc_records_raw() {
+                let raw = raw.unwrap();
+                w.add_document_with_vectors(raw.record.doc_id, raw.record.fields, raw.vectors);
+            }
+            w.finalize(Bm25Params::default()).unwrap();
+            let stats = postings_section_stats(dst).unwrap();
+            assert_eq!(stats.inverted_version, version);
+            assert!(inverted_uses_posting_blobs(dst));
+            assert_eq!(
+                stats.skip_bytes + stats.scoring_bytes + stats.positions_bytes,
+                stats.shard_logical_bytes
+            );
+            let merged = SegmentReader::open(dst.clone()).unwrap();
+            let terms = reader.inverted.all_terms();
+            assert_eq!(terms, merged.inverted.all_terms());
+            let norms = kosha_core::fields::field_norms_key("body");
+            assert!(terms.contains(&norms.as_str()));
+            assert!(merged
+                .postings(&norms)
+                .unwrap()
+                .iter()
+                .all(|p| p.positions.is_empty()));
+            for term in terms {
+                assert_eq!(
+                    &*reader.postings(term).unwrap(),
+                    &*merged.postings(term).unwrap(),
+                    "{term}"
+                );
+            }
+        }
+        assert!(postings_bytes(&v7) < postings_bytes(&v6));
+        for dir in [v6, v7, v5] {
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
     /// v6 (#386): spilled and in-memory builds are byte-identical, the TOC
     /// says v6, and every term reads back exactly as from a v5 build of the
     /// same documents — full postings, skip table and every scoring block.
@@ -15364,7 +17307,8 @@ mod bounded_build_tests {
             else {
                 panic!("v5 and v6 must both take the blocked scoring path");
             };
-            assert!(!p5.bitpacked && p6.bitpacked);
+            assert_eq!(p5.version, SKIP_SPLIT_INVERTED_VERSION);
+            assert_eq!(p6.version, BITPACKED_SKIP_SPLIT_INVERTED_VERSION);
             assert_eq!(p5.doc_count(), p6.doc_count());
             assert_eq!(p5.block_count(), p6.block_count());
             for blk in 0..p5.block_count() {
@@ -15514,7 +17458,11 @@ mod bounded_build_tests {
         let field_lengths = vec![10u32; 2_000];
         let mut span = Vec::new();
         write_postings_skip_split_v6(&mut span, &postings, &field_lengths);
-        let clean = BlockedTermPostings::parse_v6(Arc::new(span.clone())).unwrap();
+        let clean = BlockedTermPostings::parse(
+            Arc::new(span.clone()),
+            BITPACKED_SKIP_SPLIT_INVERTED_VERSION,
+        )
+        .unwrap();
         let mut reference = Vec::new();
         let mut expect = Vec::new();
         for blk in 0..clean.block_count() {
@@ -15527,7 +17475,10 @@ mod bounded_build_tests {
             for bit in [0u8, 3, 7] {
                 let mut bad = span.clone();
                 bad[i] ^= 1 << bit;
-                let Some(parsed) = BlockedTermPostings::parse_v6(Arc::new(bad)) else {
+                let Some(parsed) = BlockedTermPostings::parse(
+                    Arc::new(bad),
+                    BITPACKED_SKIP_SPLIT_INVERTED_VERSION,
+                ) else {
                     continue;
                 };
                 for (blk, want) in expect.iter().enumerate() {

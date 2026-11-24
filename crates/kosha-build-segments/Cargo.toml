@@ -20,6 +20,22 @@ path = "src/bin/vector_quant_eval.rs"
 name = "kosha-cluster-eval"
 path = "src/bin/cluster_eval.rs"
 
+# Measures posting-ordered doc_seqs (--doc-reorder posting, #456): posting
+# contiguity and the per-entry doc_seq bytes a range would replace.
+[[bin]]
+name = "kosha-posting-order-eval"
+path = "src/bin/posting_order_eval.rs"
+
+# Predicate-aware posting ranking for filtered kNN (#465): postings fetched
+# at matched filtered recall, baseline vs ranking only passing postings.
+[[bin]]
+name = "kosha-filter-knn-eval"
+path = "src/bin/filter_knn_eval.rs"
+
+[[bin]]
+name = "kosha-boundary-replication-eval"
+path = "src/bin/boundary_replication_eval.rs"
+
 # Recall / nDCG of late-interaction retrieval (#205) on a token-embedding
 # corpus with qrels, against exact MaxSim and mean-pooled single vectors.
 [[bin]]
@@ -32,6 +48,7 @@ workspace = true
 [dependencies]
 kosha-core = { path = "../kosha-core" }
 kosha-segment = { path = "../kosha-segment" }
+kosha-vector-spfresh = { path = "../kosha-vector-spfresh" }
 clap = { version = "4", features = ["derive"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

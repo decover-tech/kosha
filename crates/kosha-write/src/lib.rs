@@ -8,6 +8,7 @@ pub use compaction::{
 };
 
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -2099,12 +2100,21 @@ impl Indexer {
         });
         let mut writer = kosha_segment::SegmentWriter::new(seg_id.clone(), seg_dir)
             .with_analysis(&analysis)
-            .inherit_doc_store_compression(any_input_compressed);
+            .inherit_doc_store_compression(any_input_compressed)
+            .with_vector_radius_reference(true);
         let mut any_docs = false;
         let old_segment_ids = plan.input_ids();
         let seed_vectors = vector_index
             .unwrap_or_else(kosha_segment::VectorCompactionMode::from_env)
             == kosha_segment::VectorCompactionMode::Lire;
+        let vector_profile = if seed_vectors
+            && std::env::var("KOSHA_VECTOR_COMPACTION_PROFILE").as_deref() == Ok("1")
+        {
+            writer = writer.with_vector_compaction_profile();
+            Some(writer.vector_index_builds())
+        } else {
+            None
+        };
         // (old segment_id, old doc_seq) → the doc's doc_seq in the merged
         // output, for every doc actually copied. `SegmentWriter::add_document`
         // assigns doc_seq as `self.doc_records.len()` at call time (strictly
@@ -2258,7 +2268,18 @@ impl Indexer {
             return Ok(CompactResult::unchanged(segments_before));
         }
 
+        let vector_builds = writer.vector_index_builds();
         let footer = writer.finalize(bm25_params)?;
+        // Staleness signals of every seeded column (#464), one line each:
+        // what a KOSHA_VECTOR_REBUILD_* threshold is tuned from.
+        for build in vector_builds.lock().unwrap().iter() {
+            if build.lire || build.rebuild.is_some() {
+                eprintln!(
+                    "INFO: compaction {}/{} vector field '{}': {build}",
+                    namespace.0, seg_id.0, build.field
+                );
+            }
+        }
         let output_segment_id = seg_id.clone();
         // Crash-point seam (#257): the merged segment is on disk, the
         // manifest still lists its inputs.
@@ -2347,6 +2368,22 @@ impl Indexer {
             .manifest_cloned(namespace)
             .map(|m| m.segments.len())
             .unwrap_or(0);
+
+        if let Some(builds) = vector_profile {
+            let mut stderr = std::io::stderr().lock();
+            for build in builds.lock().unwrap().iter() {
+                if let Some(profile) = &build.rewrite_profile {
+                    let event = serde_json::json!({
+                        "namespace": namespace.0,
+                        "segment": output_segment_id.0,
+                        "field": build.field,
+                        "lire": build.lire,
+                        "rewrite": profile,
+                    });
+                    let _ = writeln!(stderr, "vector_compaction_profile {event}");
+                }
+            }
+        }
 
         Ok(CompactResult {
             merged: true,
@@ -4097,11 +4134,11 @@ fn seed_merged_vector_index(
                 .collect();
             kosha_segment::VectorSeedPosting {
                 centroid: p.centroid,
-                dropped: doc_seqs.len() != before,
+                dropped: before - doc_seqs.len(),
                 doc_seqs,
             }
         });
-        writer.seed_vector_postings(&meta.name, seeds);
+        writer.seed_vector_postings_with_reference(&meta.name, seeds, meta.radius_reference);
     }
 }
 
