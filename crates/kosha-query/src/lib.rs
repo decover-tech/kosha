@@ -3650,9 +3650,9 @@ pub struct SearchPhaseStats {
     /// Of the postings scanned, how many came from a decoded-posting
     /// cache.
     pub knn_postings_cached: usize,
-    /// Segment probes the experimental `KOSHA_KNN_BOUND_STOP_ALPHA` ended
-    /// before their last budgeted posting (#384). Zero with it off.
-    pub knn_bound_stops: usize,
+    /// Budgeted postings the experimental `KOSHA_KNN_BOUND_STOP_ALPHA`
+    /// skipped (#384). Zero with it off.
+    pub knn_bound_skips: usize,
     /// Wall time of `knn_plan` (segment opens plus the centroid scan and
     /// budget cutoff), the part of a kNN query that is paid per segment
     /// before any posting is read. Zero for non-kNN queries. Disjoint
@@ -3788,8 +3788,8 @@ impl OpenStatsCollector {
             .fetch_add(scan.rank_nanos, Ordering::Relaxed);
         self.knn_postings_cached
             .fetch_add(scan.postings_cached, Ordering::Relaxed);
-        self.knn_bound_stops
-            .fetch_add(scan.bound_stops, Ordering::Relaxed);
+        self.knn_bound_skips
+            .fetch_add(scan.bound_skips, Ordering::Relaxed);
     }
 }
 
@@ -3815,7 +3815,7 @@ struct OpenStatsCollector {
     knn_dot_nanos: AtomicU64,
     knn_rank_nanos: AtomicU64,
     knn_postings_cached: AtomicUsize,
-    knn_bound_stops: AtomicUsize,
+    knn_bound_skips: AtomicUsize,
     /// See [`SearchPhaseStats::wand_docs_scored`].
     wand_docs_scored: AtomicUsize,
     /// See [`SearchPhaseStats::wand_segments_skipped`].
@@ -7891,7 +7891,7 @@ impl Searcher {
         phase_stats.knn_dot_ms = open_stats.knn_dot_nanos.load(Ordering::Relaxed) as f64 / 1e6;
         phase_stats.knn_rank_ms = open_stats.knn_rank_nanos.load(Ordering::Relaxed) as f64 / 1e6;
         phase_stats.knn_postings_cached = open_stats.knn_postings_cached.load(Ordering::Relaxed);
-        phase_stats.knn_bound_stops = open_stats.knn_bound_stops.load(Ordering::Relaxed);
+        phase_stats.knn_bound_skips = open_stats.knn_bound_skips.load(Ordering::Relaxed);
         phase_stats.knn_exact_vectors = open_stats.knn_exact_vectors.load(Ordering::Relaxed);
         if query.knn.is_some() && self.knn_rescore_stats_on() {
             phase_stats.knn_rescore_stats = true;

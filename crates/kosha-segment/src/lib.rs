@@ -3178,8 +3178,8 @@ fn parse_probe_radius_alpha(raw: Option<&str>) -> f32 {
     }
 }
 
-/// `KOSHA_KNN_BOUND_STOP_ALPHA` (#384, experimental; unset = off): stop a
-/// segment's budgeted kNN probe at the first posting where [`bound_stop`]
+/// `KOSHA_KNN_BOUND_STOP_ALPHA` (#384, experimental; unset = off): a
+/// segment's budgeted kNN probe skips every posting where [`bound_stop`]
 /// holds, instead of always probing every budgeted posting. Accepts a
 /// finite value `> 0`; unset, empty or anything else is off (with a
 /// warning for a bad value). Read once per process.
@@ -3194,9 +3194,9 @@ pub fn knn_bound_stop_alpha() -> Option<f32> {
         let alpha = parse_bound_stop_alpha(raw.as_deref());
         match (raw.as_deref().map(str::trim), alpha) {
             (_, Some(alpha)) => eprintln!(
-                "INFO: KOSHA_KNN_BOUND_STOP_ALPHA={alpha}: a segment's kNN probe stops \
-                 once its k-th guaranteed similarity reaches {alpha} x the next \
-                 posting's similarity bound (#384, experimental)"
+                "INFO: KOSHA_KNN_BOUND_STOP_ALPHA={alpha}: a segment's kNN probe skips \
+                 postings once its k-th guaranteed similarity reaches {alpha} x \
+                 their similarity ceiling (#384, experimental)"
             ),
             (Some(raw), None) if !raw.is_empty() => {
                 eprintln!("WARN: KOSHA_KNN_BOUND_STOP_ALPHA={raw} is not a finite number > 0; off")
@@ -3231,24 +3231,23 @@ fn parse_bound_stop_alpha(raw: Option<&str>) -> Option<f32> {
         .filter(|a| a.is_finite() && *a > 0.0)
 }
 
-/// The α-scaled bound stop (#384; Block-Max Pruning, SIGIR'24): a probe
-/// whose `k`-th guaranteed similarity is `theta` skips a posting of rank
-/// score `rank_score` ([`centroid_probe_score`]), and every posting ranked
-/// after it, when `theta >= alpha x (1 - rank_score)`. `1 - rank_score` is
-/// the best similarity the rank score allows a member of the posting, and
-/// a probe visits postings in ascending rank score, so the bound only
-/// falls from there.
+/// Whether a posting can be skipped: the `k` candidates found so far
+/// already score at least `alpha` times the best cosine similarity any
+/// member of the posting can have.
 ///
-/// - `alpha = 1`: stop when no later posting can beat the current `k`-th,
-///   as far as the rank score bounds it (only at the default
-///   `KOSHA_KNN_PROBE_RADIUS_ALPHA = 1` is it a radius bound at all).
-/// - `alpha < 1`: stop earlier, trading recall for postings.
+/// That ceiling comes from angles, which obey the triangle inequality
+/// (cosine distance does not): a member is at most `radius` (a cosine
+/// distance) from the centroid, so its angle to the query is at least
+/// `acos(1 - distance) - acos(1 - radius)`.
 ///
-/// For an f32 column `theta` is the exact `k`-th score; for a quantized one
-/// it is the `k`-th largest `estimate - error` (the RaBitQ-bound stop:
-/// the next posting's best case is below the `k`-th candidate's worst).
-fn bound_stop(theta: f64, rank_score: f32, alpha: f32) -> bool {
-    theta >= alpha as f64 * (1.0 - rank_score as f64)
+/// For an f32 column `theta` is the exact `k`-th score; for a RaBitQ one
+/// it is the `k`-th largest `estimate - error` (the posting's best case is
+/// below the `k`-th candidate's worst). `alpha = 1` skips only postings
+/// that cannot change the top `k`; `alpha < 1` trades recall for postings.
+fn bound_stop(theta: f64, distance: f32, radius: f32, alpha: f32) -> bool {
+    let angle = |d: f32| (1.0 - d as f64).clamp(-1.0, 1.0).acos();
+    let ceiling = (angle(distance) - angle(radius)).max(0.0).cos();
+    theta >= alpha as f64 * ceiling
 }
 
 /// Whether `SegmentWriter` leaves `postings-*.bin` shards raw —
@@ -7562,9 +7561,8 @@ pub struct KnnScanStats {
     /// f32 postings read and scored from the probe's reused buffers,
     /// without building a posting.
     pub postings_scanned: usize,
-    /// Budgeted probes that `KOSHA_KNN_BOUND_STOP_ALPHA` ended before their
-    /// last budgeted posting (#384).
-    pub bound_stops: usize,
+    /// Budgeted postings `KOSHA_KNN_BOUND_STOP_ALPHA` skipped (#384).
+    pub bound_skips: usize,
 }
 
 impl KnnScanStats {
@@ -7576,7 +7574,7 @@ impl KnnScanStats {
         self.postings_cached += other.postings_cached;
         self.postings_decoded += other.postings_decoded;
         self.postings_scanned += other.postings_scanned;
-        self.bound_stops += other.bound_stops;
+        self.bound_skips += other.bound_skips;
     }
 }
 
@@ -9956,7 +9954,13 @@ impl SegmentReader {
             self.prefetch_vector_postings(vi, ranking.budgeted.iter().map(|&i| i as usize), fetch);
 
         let mut probes = 0usize;
-        let stop_alpha = knn_bound_stop_alpha();
+        // Only where the posting ceiling and `theta` are sound: stored radii
+        // (older sidecars read them as 0), and a quantized column only when
+        // it has error bounds and its shortlist is rescored exactly.
+        let stop_alpha = knn_bound_stop_alpha().filter(|_| {
+            vi.version >= RADIUS_AWARE_VECTOR_INDEX_VERSION
+                && (!vi.quantized || (vi.rabitq && self.rescores_quantized_locally()))
+        });
         let mut sink = CandidateSink::new(vi, k);
         if stop_alpha.is_some() {
             sink = sink.tracking_kth_lower();
@@ -9968,21 +9972,11 @@ impl SegmentReader {
         scan.stats.rank_nanos += rank_nanos;
         for &range_idx in &ranking.budgeted {
             if let (Some(alpha), Some(theta)) = (stop_alpha, sink.kth_lower()) {
-                // A plan built from candidates only kept no scores: this
-                // is the expression its scores came from.
-                let rank_score = match &ranking.bounds {
-                    Some(bounds) => bounds[range_idx as usize],
-                    None => Self::centroid_score(
-                        vi,
-                        unit.as_deref(),
-                        query,
-                        range_idx as usize,
-                        knn_probe_radius_alpha(),
-                    ),
-                };
-                if bound_stop(theta, rank_score, alpha) {
-                    scan.stats.bound_stops += 1;
-                    break;
+                let i = range_idx as usize;
+                let distance = Self::centroid_score(vi, unit.as_deref(), query, i, 0.0);
+                if bound_stop(theta, distance, vi.radii[i], alpha) {
+                    scan.stats.bound_skips += 1;
+                    continue;
                 }
             }
             probes += 1;

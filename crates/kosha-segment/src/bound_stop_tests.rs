@@ -87,13 +87,21 @@ fn bound_stop_alpha_parse_accepts_only_positive_finite_values() {
 }
 
 #[test]
-fn bound_stop_compares_theta_with_the_scaled_similarity_bound() {
-    // Rank score 0.4: no member is more similar than 0.6.
-    assert!(bound_stop(0.6, 0.4, 1.0));
-    assert!(!bound_stop(0.59, 0.4, 1.0));
-    // alpha < 1 stops earlier.
-    assert!(bound_stop(0.52, 0.4, 0.85));
-    assert!(!bound_stop(0.5, 0.4, 0.85));
+fn bound_stop_uses_the_angular_ceiling() {
+    // Query at 60 degrees from the centroid, members within 30 degrees:
+    // no member is closer than 30 degrees, similarity <= cos 30.
+    let d60 = 1.0 - 60f32.to_radians().cos();
+    let d30 = 1.0 - 30f32.to_radians().cos();
+    let cos30 = 30f64.to_radians().cos();
+    assert!(bound_stop(cos30 + 1e-4, d60, d30, 1.0));
+    assert!(!bound_stop(cos30 - 1e-4, d60, d30, 1.0));
+    // Cosine distance alone (1 - (d60 - d30) = 0.634) would be lower than
+    // the true ceiling (0.866): the bound must not use it.
+    assert!(!bound_stop(0.7, d60, d30, 1.0));
+    // A query inside the radius: any similarity up to 1 is possible.
+    assert!(!bound_stop(0.999, d30, d60, 1.0));
+    // alpha < 1 skips earlier.
+    assert!(bound_stop(cos30 * 0.9, d60, d30, 0.85));
 }
 
 #[test]

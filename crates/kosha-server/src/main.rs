@@ -12750,7 +12750,7 @@ fn log_search_timing(
     }
     // Only while the experimental #384 bound stop is on.
     if phases.knn_mode.is_some() && kosha_segment::knn_bound_stop_alpha().is_some() {
-        knn_rescore.push_str(&format!(" knn_bound_stops={}", phases.knn_bound_stops));
+        knn_rescore.push_str(&format!(" knn_bound_skips={}", phases.knn_bound_skips));
     }
     println!(
         "search timing: ns={} total_ms={:.1} wall_ms={:.1} hydrate_ms={:.1} hydrate_files={} \

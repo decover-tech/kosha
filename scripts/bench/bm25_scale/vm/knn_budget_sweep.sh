@@ -25,11 +25,11 @@
 #                    KOSHA_KNN_RELATIVE_MIN_PROBES 500 / 1000 (default floor is
 #                    num_candidates = 100, ~0.56 recall at 10M)
 # The shorthand "bound" is the alpha-scaled bound stop
-# (KOSHA_KNN_BOUND_STOP_ALPHA, default OFF) at the default ranking:
+# (KOSHA_KNN_BOUND_STOP_ALPHA, default OFF):
 #   f0.05            baseline
 #   b1, b0.95, b0.9, b0.85
-#                    stop a segment's probe once its k-th score reaches
-#                    alpha x the next posting's similarity bound (Block-Max
+#                    skip a posting once the segment's k-th score reaches
+#                    alpha x the posting's similarity ceiling (Block-Max
 #                    Pruning reports alpha=0.85 near-lossless on its index)
 # Each recall query reports which rule set its cutoff
 # (timings.knn_cutoff_rule: budget / eps / floor / zero_best), and the
