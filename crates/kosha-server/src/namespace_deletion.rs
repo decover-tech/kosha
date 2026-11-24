@@ -44,9 +44,16 @@ pub(crate) trait RemotePrefixStore: Send + Sync {
     /// Delete every object under the logical directory `prefix`,
     /// recursively. Returns how many went.
     fn delete_prefix(&self, prefix: &str) -> Result<usize, KoshaError>;
-    /// Count remaining storage entries under `prefix`; only zero certifies
-    /// that there are no objects, versions, delete markers or uploads.
+    /// How many current objects are under the logical directory `prefix`.
     fn count_prefix(&self, prefix: &str) -> Result<usize, KoshaError>;
+
+    fn erase_prefix(&self, prefix: &str) -> Result<usize, KoshaError> {
+        self.delete_prefix(prefix)
+    }
+
+    fn count_erasure_entries(&self, prefix: &str) -> Result<usize, KoshaError> {
+        self.count_prefix(prefix)
+    }
 }
 
 #[cfg(feature = "s3")]
@@ -56,6 +63,17 @@ impl RemotePrefixStore for s3_storage::S3Storage {
     }
 
     fn count_prefix(&self, prefix: &str) -> Result<usize, KoshaError> {
+        // The trailing slash keeps a sibling (`acme/docs2`) out of the count
+        // for `acme/docs`.
+        let dir = format!("{}/", prefix.trim_matches('/'));
+        Ok(self.list_objects_remote(&dir)?.len())
+    }
+
+    fn erase_prefix(&self, prefix: &str) -> Result<usize, KoshaError> {
+        s3_storage::S3Storage::erase_prefix(self, prefix)
+    }
+
+    fn count_erasure_entries(&self, prefix: &str) -> Result<usize, KoshaError> {
         self.count_erasure_page(prefix)
     }
 }
@@ -125,11 +143,17 @@ impl AppState {
     /// Erase remote data under `prefix`, then verify the prefix is empty.
     /// Returns how many objects or versions were deleted and, when the
     /// prefix is not verified empty, why.
-    fn reclaim_remote_prefix(&self, prefix: &str) -> (u64, Option<String>) {
+    fn reclaim_remote_prefix(&self, prefix: &str, scope: DeletionScope) -> (u64, Option<String>) {
         let Some(store) = self.remote_prefix_store() else {
             return (0, None);
         };
-        let deleted = match store.delete_prefix(prefix) {
+        let erasure = scope == DeletionScope::Namespace;
+        let deletion = if erasure {
+            store.erase_prefix(prefix)
+        } else {
+            store.delete_prefix(prefix)
+        };
+        let deleted = match deletion {
             Ok(deleted) => deleted as u64,
             Err(e) => {
                 return (
@@ -138,7 +162,12 @@ impl AppState {
                 )
             }
         };
-        match store.count_prefix(prefix) {
+        let remaining = if erasure {
+            store.count_erasure_entries(prefix)
+        } else {
+            store.count_prefix(prefix)
+        };
+        match remaining {
             Ok(0) => (deleted, None),
             Ok(left) => (
                 deleted,
@@ -370,7 +399,7 @@ impl AppState {
             );
             storage_error = Some(format!("local segment cleanup failed: {e}"));
         }
-        let (objects, remote_error) = self.reclaim_remote_prefix(&id.0);
+        let (objects, remote_error) = self.reclaim_remote_prefix(&id.0, DeletionScope::Namespace);
         if let Some(e) = &remote_error {
             eprintln!("WARN: namespace {} deleted, but {e}", id.0);
         }
@@ -483,7 +512,7 @@ impl AppState {
         if let Err(e) = local_cleanup {
             error.get_or_insert(format!("local segment cleanup failed: {e}"));
         }
-        let (objects, remote_error) = self.reclaim_remote_prefix(&id.0);
+        let (objects, remote_error) = self.reclaim_remote_prefix(&id.0, DeletionScope::Namespace);
         let exports = self.erase_exports_for(record, || self.delete_namespace_exports(id));
         (
             objects,
@@ -636,7 +665,8 @@ impl AppState {
                 {
                     errors.push(format!("deleting the tenant's exports failed: {e}"));
                 }
-                let (deleted, remote_error) = self.reclaim_remote_prefix(tenant);
+                let (deleted, remote_error) =
+                    self.reclaim_remote_prefix(tenant, DeletionScope::Tenant);
                 objects = deleted;
                 errors.extend(remote_error);
                 // The sweep holds no namespace lock, so a write with a key
