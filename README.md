@@ -101,8 +101,9 @@ the retrievers, weights, and window unchanged. Cursor paging assumes an
 unchanged namespace snapshot. This variant does not use the response cache.
 
 To rerank the fused top `top_n`, add the regular `rerank` object with an
-explicit `rerank.query` and page with `from` / `max_results`. This variant
-does not accept top-level retrieval clauses, legacy `rank` / `mode`,
+explicit `rerank.query` and page with `from` / `max_results`. The default
+`top_n` is fixed at 100, regardless of the page offset. This variant does
+not accept top-level retrieval clauses, legacy `rank` / `mode`,
 aggregations, highlighting, `collapse`, or `limit_per`. The existing
 two-retriever hybrid and `rank_by.functions` score modifiers are unchanged.
 

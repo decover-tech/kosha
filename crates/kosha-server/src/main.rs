@@ -16390,6 +16390,11 @@ mod tests {
         assert_eq!(reranked.results[0].fields[0].name, "tag");
         assert_eq!(provider.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
 
+        body["rerank"].as_object_mut().unwrap().remove("top_n");
+        assert_eq!(ids(&search(&body)), ["d"]);
+        body["from"] = serde_json::json!(1);
+        assert_eq!(ids(&search(&body)), ["b"]);
+
         body["rank_by"]["rrf"]["weights"] = serde_json::json!([1.0]);
         let response = post(&body);
         assert!(response.starts_with("HTTP/1.1 400"), "{response}");

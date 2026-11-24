@@ -3657,6 +3657,7 @@ pub const DEFAULT_RERANK_TIMEOUT_MS: u64 = 2_000;
 pub const MAX_RERANK_TIMEOUT_MS: u64 = 60_000;
 /// Upper bound on `rerank.top_n` (Cohere's per-request document limit).
 pub const MAX_RERANK_TOP_N: usize = 1_000;
+const DEFAULT_MULTI_RRF_RERANK_TOP_N: usize = 100;
 
 /// Proto `RetrievalMode`, as the JSON API spells it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -4082,15 +4083,16 @@ impl SearchQuery {
         Ok(())
     }
 
-    /// Resolved `rerank.top_n` (default `from + max_results`), or `None`
-    /// when the request does not rerank.
+    /// The fixed weighted RRF default keeps offset pages in the same rerank window.
     pub fn rerank_top_n(&self) -> Option<usize> {
         let rerank = self.rerank.as_ref()?;
-        Some(
-            rerank
-                .top_n
-                .unwrap_or_else(|| self.from.saturating_add(self.max_results)),
-        )
+        Some(rerank.top_n.unwrap_or_else(|| {
+            if self.multi_rrf().is_some() {
+                DEFAULT_MULTI_RRF_RERANK_TOP_N
+            } else {
+                self.from.saturating_add(self.max_results)
+            }
+        }))
     }
 
     /// The text a reranker scores candidates against: `rerank.query`,
