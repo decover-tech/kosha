@@ -45,6 +45,7 @@ fn index(dim: usize, centroids: Vec<Vec<f32>>, radii: &[f32]) -> LazyVectorIndex
             offset: 0,
             length: 0,
             radius,
+            radius_quantiles: None,
         })
         .collect();
     LazyVectorIndex::from_parsed(
@@ -262,6 +263,7 @@ fn no_bounds_without_a_guarantee() {
         offset: 0,
         length: 0,
         radius: 0.0,
+        radius_quantiles: None,
     }];
     let legacy = LazyVectorIndex::from_parsed(
         Path::new("vector.idx"),
