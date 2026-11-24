@@ -20,6 +20,12 @@ path = "src/bin/vector_quant_eval.rs"
 name = "kosha-cluster-eval"
 path = "src/bin/cluster_eval.rs"
 
+# Measures posting-ordered doc_seqs (--doc-reorder posting, #456): posting
+# contiguity and the per-entry doc_seq bytes a range would replace.
+[[bin]]
+name = "kosha-posting-order-eval"
+path = "src/bin/posting_order_eval.rs"
+
 [lints]
 workspace = true
 

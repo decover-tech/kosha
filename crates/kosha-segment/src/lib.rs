@@ -495,6 +495,69 @@ impl SegmentWriter {
         forward.bp_order(config)
     }
 
+    /// Posting order (#456, research) for `docs`, documents about to be
+    /// added to this writer: clusters their `field` vectors exactly as
+    /// `finalize` would, then numbers documents posting by posting, so each
+    /// posting covers one contiguous `doc_seq` range. Documents without a
+    /// usable `field` vector (absent, empty, or of another dimension than
+    /// the first) go last, in their input order.
+    ///
+    /// Add `docs` in [`PostingOrder::order`] and pass
+    /// [`PostingOrder::seeds`] to [`Self::seed_vector_postings`] for
+    /// `field`: `finalize` then adopts these postings instead of
+    /// clustering a second time (an input order change would give
+    /// different postings). Its rebalance may still split or merge a few,
+    /// which then cover more than one range. Other vector columns are
+    /// clustered as usual and gain nothing: one segment has one order.
+    /// The segment format is unchanged. `None` when no document has a
+    /// usable vector or clustering fails; keep the input order then.
+    pub fn posting_order<'a, I>(&self, docs: I, field: &str) -> Option<PostingOrder>
+    where
+        I: IntoIterator<Item = &'a [Field]>,
+    {
+        let mut dim = None;
+        let mut vectors: Vec<(u32, Vec<f32>)> = Vec::new();
+        let mut rest: Vec<u32> = Vec::new();
+        for (i, fields) in docs.into_iter().enumerate() {
+            let vector = fields
+                .iter()
+                .filter(|f| f.field_type == FieldType::Vector && f.name == field)
+                .find_map(|f| serde_json::from_str::<Vec<f32>>(&f.value).ok())
+                .filter(|v| !v.is_empty() && *dim.get_or_insert(v.len()) == v.len());
+            match vector {
+                Some(mut v) => {
+                    if vector_write_version() >= 3 {
+                        kosha_vector_spfresh::normalize_in_place(&mut v);
+                    }
+                    vectors.push((i as u32, v));
+                }
+                None => rest.push(i as u32),
+            }
+        }
+        let dim = dim?;
+        if vectors.is_empty() {
+            return None;
+        }
+        let index =
+            kosha_vector_spfresh::ClusterIndex::build(&vectors, vector_cluster_config(dim)).ok()?;
+        let base = self.field_lengths.len() as u32;
+        let mut order = Vec::with_capacity(vectors.len() + rest.len());
+        let mut seeds = Vec::new();
+        for posting in index.snapshot() {
+            let mut members: Vec<u32> = posting.entries.iter().map(|(id, _)| *id).collect();
+            members.sort_unstable();
+            let first = base + order.len() as u32;
+            order.extend_from_slice(&members);
+            seeds.push(VectorSeedPosting {
+                centroid: posting.centroid,
+                doc_seqs: (first..first + members.len() as u32).collect(),
+                dropped: false,
+            });
+        }
+        order.extend(rest);
+        Some(PostingOrder { order, seeds })
+    }
+
     /// [`Self::add_document`] with some `Vector` fields' values supplied
     /// already parsed, as `(index into fields, vector)`. Compaction uses
     /// this with [`SegmentReader::iter_doc_records_raw`] so sidecar vectors
@@ -1321,10 +1384,7 @@ impl SegmentWriter {
         } else {
             column
         };
-        let mut config = kosha_vector_spfresh::ClusterIndexConfig::new(dim);
-        if !vector_build_refine() {
-            config.build_refine_rounds = 0;
-        }
+        let config = vector_cluster_config(dim);
         let seeded = match seeds {
             Some(seeds) if !seeds.is_empty() => seed_cluster_index(vectors, seeds, config.clone()),
             _ => None,
@@ -1460,6 +1520,16 @@ pub struct VectorSeedPosting {
     /// Whether any member was dropped (deleted or tombstoned) on the way:
     /// the centroid is then recomputed from the survivors.
     pub dropped: bool,
+}
+
+/// [`SegmentWriter::posting_order`]'s result (#456).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PostingOrder {
+    /// `order[new] = old`, `old` indexing the documents passed in.
+    pub order: Vec<u32>,
+    /// The column's postings in the new numbering, for
+    /// [`SegmentWriter::seed_vector_postings`].
+    pub seeds: Vec<VectorSeedPosting>,
 }
 
 /// How [`SegmentWriter::finalize`] built one vector column's index.
@@ -4553,6 +4623,15 @@ impl DocVectors {
 /// Reads the local `footer.json`; `false` if it can't be read.
 pub fn segment_uses_doc_vectors(segment_dir: &Path) -> bool {
     SegmentReader::read_footer(segment_dir).is_ok_and(|footer| footer.doc_vectors)
+}
+
+/// The clustering config every vector column's index is built with.
+fn vector_cluster_config(dim: usize) -> kosha_vector_spfresh::ClusterIndexConfig {
+    let mut config = kosha_vector_spfresh::ClusterIndexConfig::new(dim);
+    if !vector_build_refine() {
+        config.build_refine_rounds = 0;
+    }
+    config
 }
 
 /// `KOSHA_VECTOR_BUILD_REFINE`, read once: whether a from-scratch vector
