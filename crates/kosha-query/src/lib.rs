@@ -5667,7 +5667,7 @@ impl Searcher {
         // below and answers from its combined index instead.
         let field_query = analysis
             .fields()
-            .filter(|_| analysis.has_text() && !is_wildcard_mode && reader.field_index().is_some());
+            .filter(|_| has_query && !is_wildcard_mode && reader.field_index().is_some());
         if let Some(ref fuzzy) = query.fuzzy {
             let scored = score_fuzzy_query(
                 &reader,
@@ -22219,6 +22219,43 @@ mod field_tests {
                 &query("running daily", &["title", "content"])
             ),
             ["title_runs"]
+        );
+    }
+
+    #[test]
+    fn field_query_keeps_restrictions_for_punctuation_only_keywords() {
+        let root = temp_root("keyword-punctuation");
+        let config = NamespaceSchema {
+            default_analyzer: vec!["keyword".into()],
+            ..Default::default()
+        }
+        .resolve()
+        .unwrap();
+        let mut manifest = empty_manifest();
+        add_segment(
+            &root,
+            &mut manifest,
+            Seg {
+                name: "s1",
+                field_index: true,
+                config: Some(&config),
+            },
+            vec![
+                doc("in_title", "...", "other"),
+                doc("in_content", "other", "..."),
+            ],
+        );
+        assert_eq!(
+            hits(&root, &manifest, &query("...", &[])),
+            ["in_content", "in_title"]
+        );
+        assert_eq!(
+            hits(&root, &manifest, &query("...", &["title"])),
+            ["in_title"]
+        );
+        assert_eq!(
+            hits(&root, &manifest, &query("...", &["content"])),
+            ["in_content"]
         );
     }
 
