@@ -409,6 +409,24 @@ def test_upgrade_refuses_reader_older_than_writer(kubectl, capsys):
     assert "mixed images" in capsys.readouterr().err
 
 
+def test_upgrade_updates_cronjobs_across_a_registry_switch(kubectl):
+    invoke, calls, responses, _ = kubectl
+    moved = "mirror.example/kosha/kosha:1.3.0"
+    prime(responses)
+    assert invoke("upgrade", "--image", moved) == 0
+    assert ["set", "image", "cronjob/kosha-usage-reconcile", f"reconcile={moved}"] in calls
+
+
+def test_failed_fix_forward_query_rollout_keeps_indexer_stopped(kubectl):
+    invoke, calls, responses, _ = kubectl
+    fixed = "registry.example:5000/kosha:1.3.1"
+    prime(responses, query=NEW, ingest=NEW, ready=False, indexer_replicas=0)
+    responses[tuple(rollout("kosha-query"))] = 1
+    assert invoke("upgrade", "--image", fixed) == 1
+    assert ["rollout", "undo", "deployment/kosha-query"] in calls
+    assert scale(1) not in calls
+
+
 def test_upgrade_takes_one_context(monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", [
         "kosha_cluster.py", "--context", "a", "--context", "b", "upgrade", "--image", NEW,
