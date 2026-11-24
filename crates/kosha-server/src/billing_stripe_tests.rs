@@ -615,7 +615,7 @@ fn a_customer_is_charged_for_a_month_through_webhooks_end_to_end() {
     k.set_clock(issued);
     let first = k.tick();
     assert!(first.leader);
-    let closed = first.closed.expect("October closed");
+    let closed = first.closed.into_iter().next().expect("October closed");
     assert_eq!(closed.created, vec!["dev/2030-10"]);
     assert_eq!(closed.submitted, 1);
     // Rated: $25 base + 488,000 queries over the 1M included ($1.95) +
@@ -633,7 +633,7 @@ fn a_customer_is_charged_for_a_month_through_webhooks_end_to_end() {
     }
     // The next tick does not close the month again.
     k.set_clock(issued + HOUR_MS);
-    assert!(k.tick().closed.is_none());
+    assert!(k.tick().closed.is_empty());
     assert_eq!(stripe.stripe().invoices.len(), 1);
 
     // Stripe reports the finalization and the declined charge.
@@ -864,4 +864,125 @@ fn the_plan_catalog_reloads_only_when_valid() {
         2
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Review finding 4: a reload may not drop a plan an open invoice was
+/// rated on, or one a plan change in a month not invoiced yet names (the
+/// close prorates over it), even when no account is on it any more.
+#[test]
+fn a_reload_keeps_plans_open_invoices_and_unclosed_changes_need() {
+    let dir = std::env::temp_dir().join(format!(
+        "kosha-test-catalog-use-{}-{}",
+        std::process::id(),
+        unix_millis()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("plans.json");
+    let with = |extra: &[&str]| {
+        let plans: String = extra
+            .iter()
+            .map(|p| format!(r#""{p}": {{"kind": "usage"}}, "#))
+            .collect();
+        CATALOG.replace(r#""payg": {"#, &format!(r#"{plans}"payg": {{"#))
+    };
+    let oct = BillingPeriod::parse("2030-10").unwrap();
+    let now = oct.start_ms() + 15 * DAY_MS;
+    let ledger = Arc::new(MemoryBillingLedger::new());
+    let billing = Billing::new(
+        Catalog::parse(&with(&["gold", "silver", "bronze"])).unwrap(),
+        Arc::new(kosha_control::billing::MemoryBillingStore::new()),
+        Arc::new(MemoryUsageStore::new()),
+        None,
+        Arc::new(move || now),
+    )
+    .with_ledger(ledger.clone())
+    .with_plans_file(path.clone(), false);
+    // beta left gold for payg this month (not invoiced yet).
+    kosha_control::billing_ledger::change_plan(
+        billing.store.as_ref(),
+        ledger.as_ref(),
+        "beta",
+        "gold",
+        None,
+        "admin",
+        oct.start_ms() - DAY_MS,
+    )
+    .unwrap();
+    kosha_control::billing_ledger::change_plan(
+        billing.store.as_ref(),
+        ledger.as_ref(),
+        "beta",
+        "payg",
+        None,
+        "admin",
+        oct.start_ms() + DAY_MS,
+    )
+    .unwrap();
+    // September's invoice was rated on silver and is still open.
+    billing
+        .store
+        .insert_invoice(&kosha_control::billing::Invoice {
+            id: "beta/2030-09".into(),
+            tenant: "beta".into(),
+            period: "2030-09".into(),
+            period_start_ms: 0,
+            period_end_ms: 1,
+            plan: "silver".into(),
+            lines: Vec::new(),
+            total_cents: 100,
+            issued_at_ms: 0,
+            due_at_ms: 0,
+            status: InvoiceStatus::Open,
+            paid_at_ms: None,
+            provider_invoice_id: None,
+        })
+        .unwrap();
+    for (kept, missing) in [
+        (["silver", "bronze"], "gold"),
+        (["gold", "bronze"], "silver"),
+    ] {
+        std::fs::write(&path, with(&kept)).unwrap();
+        let refused = billing.reload_catalog().unwrap_err();
+        assert!(refused.contains(missing), "{refused}");
+        assert!(billing.catalog().plan(missing).is_some());
+    }
+    // A plan nothing uses can go.
+    std::fs::write(&path, with(&["gold", "silver"])).unwrap();
+    assert_eq!(billing.reload_catalog(), Ok(true));
+    assert!(billing.catalog().plan("bronze").is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Review finding 3: a month left unclosed (the scheduler was down) is
+/// closed late, oldest first; the scheduler's first run does not invoice
+/// history.
+#[test]
+fn the_scheduler_closes_months_it_missed() {
+    let oct = BillingPeriod::parse("2030-10").unwrap();
+    let clock = Arc::new(AtomicU64::new(oct.end_ms() + 3 * HOUR_MS));
+    let stripe = FakeStripe::start(clock.clone());
+    let k = kosha(&stripe.base, clock);
+    let periods = |report: billing_scheduler::TickReport| -> Vec<String> {
+        report.closed.into_iter().map(|c| c.period).collect()
+    };
+    assert_eq!(periods(k.tick()), vec!["2030-10"]);
+    assert!(periods(k.tick()).is_empty());
+    // Down for three months.
+    let feb = BillingPeriod::parse("2031-02").unwrap();
+    k.set_clock(feb.start_ms() + 3 * HOUR_MS);
+    assert_eq!(periods(k.tick()), vec!["2030-11", "2030-12", "2031-01"]);
+    assert!(periods(k.tick()).is_empty());
+    // Before the close delay, last month waits; an older gap does not.
+    let fresh_clock = Arc::new(AtomicU64::new(feb.start_ms() + 3 * HOUR_MS));
+    let fresh = kosha(&stripe.base, fresh_clock);
+    assert_eq!(
+        periods(fresh.tick()),
+        vec!["2031-01"],
+        "first run: no backfill"
+    );
+    let apr = BillingPeriod::parse("2031-04").unwrap();
+    fresh.set_clock(apr.start_ms() + 60_000);
+    assert_eq!(periods(fresh.tick()), vec!["2031-02"]);
+    fresh.set_clock(apr.start_ms() + 3 * HOUR_MS);
+    assert_eq!(periods(fresh.tick()), vec!["2031-03"]);
 }

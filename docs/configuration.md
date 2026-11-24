@@ -479,7 +479,8 @@ restart; local development only).
 below are an example. It is read at startup and reloaded by `POST /v1/admin/billing/catalog/reload`
 (on the pod that serves it) or, with `KOSHA_BILLING_PLANS_WATCH=on`, by every pod when the file's
 modification time or size changes (checked at each standings refresh). A reload is applied only
-when the file parses, validates and still has every plan an account is on; otherwise the pod keeps
+when the file parses, validates and still has every plan in use (one an account is on, one an open
+invoice was rated on, or one a plan change in a month not invoiced yet names); otherwise the pod keeps
 the catalog it has, logs why, and shows it as `catalog_error` in `GET /v1/admin/billing/accounts`.
 A catalog that uses the fields added in #349's second part (`upgrade_plan`,
 `dunning.retry_after_days`, the `vector_dimensions` meter) is refused by older binaries: roll the
@@ -615,8 +616,11 @@ last month once `KOSHA_BILLING_CLOSE_DELAY_SECS` have passed since it ended (unl
 `kosha.billing_jobs` records it closed without errors), syncs payments from the provider every
 `KOSHA_BILLING_SYNC_INTERVAL_SECS`, runs a dunning pass and refreshes its standings. Every step is
 idempotent, so two pods running a tick at once (clocks that disagree about the lease) do no harm.
-Without Postgres the lease is per pod. Only last month is closed automatically: a month missed
-while the scheduler was off is closed with `close-period`.
+Without Postgres the lease is per pod. A month whose close had errors, or that passed while the
+scheduler was down, is closed at the next tick: the scheduler closes every month of the last twelve
+after the earliest one it recorded closed, oldest first. On its first run (nothing recorded) it
+closes only last month, so turning it on does not invoice history; close older months with
+`close-period`.
 
 **Enforcement.** A refused request gets `402 Payment Required` with a JSON body
 `{error, reason, plan, state}`:
