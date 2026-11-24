@@ -2,7 +2,9 @@
 
 Status: feasibility study, research track (#260). Nothing in this document changes Kosha's
 behaviour. The PR that adds it also adds an offline simulator,
-`scripts/bench/bm25_scale/repr_recall_sim.py`, and contains no Rust change.
+`scripts/bench/bm25_scale/repr_recall_sim.py`, and contains no Rust change. A follow-up adds
+the simulator's two-stage mode (`--rescore`) and its results (section 3d), also with no Rust
+change.
 
 ## Experiment spec
 
@@ -41,7 +43,8 @@ behaviour. The PR that adds it also adds an offline simulator,
    total. At 1536 dims, today's layout is 6144 + 6144 = 12,288 B per document. A 384-dim
    prefix makes it 1536 + 6144 = 7680 B (**1.6× smaller**, not 4×). Sign bits make it
    192 + 6144 = 6336 B (1.94×). Getting to 4× in total needs a smaller rescore store as
-   well (section 3c), which is not measured here.
+   well (section 3c). Section 3d measures that offline: an **int8** rescore store meets the
+   bar on representation loss, a **Matryoshka prefix** rescore store does not.
 4. **Offline simulation** (brute force, about 100k-doc samples, Apple M5). The
    `text-embedding-3-small` numbers come from **document-to-document neighbours on DBpedia
    entities** (held-out documents used as queries), not from short queries over passages.
@@ -68,6 +71,19 @@ behaviour. The PR that adds it also adds an offline simulator,
      it by range from S3 as #381 plans (section 3c). Matryoshka could help with the first of
      these and with centroid scoring.
    - All of this needs measurement on Sage-like query-to-passage data first (plan below).
+6. **Two-stage simulation (section 3d, measured offline).**
+   - A 768-dim prefix **as the rescore store** caps recall@10 at 0.829 on te3-small, whatever
+     the shortlist size. A 512- or 384-dim prefix is worse (0.767, 0.697). Matryoshka cannot
+     shrink `doc_vectors.bin` within the 0.01 bar. The earlier reading of trunc768's 0.9988
+     as rescore quality was wrong: that number is trunc768 as a search representation
+     followed by an exact f32 rescore.
+   - Sign bits for search plus an **int8 rescore store** is 7.09× smaller in total and
+     reaches 0.996 at R=40 per 50k shard on te3-small (doc-to-doc), and 0.971 at R=40 /
+     0.991 at R=100 per 50k shard on Cohere v3 (query-to-passage). Its ceiling is int8's own
+     loss, 0.996 and 0.994.
+   - So the 4× bar does not need Matryoshka on either sample. It needs #381's bits (or v4
+     int8) for search and an int8 `doc_vectors.bin`, which is a format change of its own.
+     Matryoshka's remaining use is centroid scoring (section 5).
 
 ## 1. What produces `contentEmbedding`
 
@@ -234,17 +250,15 @@ beat a 4× prefix while being 8× smaller.
 | sign bits + 768-dim f32 prefix as rescore store | 192 | 3072 | 3264 | 3.76× |
 | sign bits + int8 rescore store | 192 | 1540 | 1732 | 7.1× |
 
-Doc ids, posting replication and the doc store are left out. The last two rows are
-arithmetic only: the simulator does not model a reduced rescore store after a reduced search
-representation, so their recall is **not measured**. Their single-stage numbers (trunc768
-0.9988 at global R=40 on te3-small doc→doc, int8 0.996 at R=10) suggest they are worth
-simulating next (plan step 1).
+Doc ids, posting replication and the doc store are left out. The recall of the last two rows
+is measured in section 3d: the 768-dim prefix rescore store fails (0.83), the int8 one passes
+(0.996 on te3-small doc→doc).
 
-So the 4× bar can be met in two ways, and this document has not shown either:
+So the 4× bar can be met in two ways:
 
-- **Shrink the rescore store too.** For example, sign bits for search plus a 768-dim prefix
-  (Matryoshka models only) or int8 for rescoring. This needs the two-stage simulation, and
-  rescoring would no longer be exact.
+- **Shrink the rescore store too.** Sign bits for search plus int8 for rescoring is 7.1× in
+  total and passes on representation loss (section 3d). A 768-dim prefix as the rescore store
+  does not. Rescoring is then no longer exact, and `doc_vectors.bin` needs an int8 format.
 - **Narrow the bar to local probe bytes.** Keep `doc_vectors.bin` cold in S3 and read only
   the shortlist by range at query time, as #381 plans. Local bytes then are the search
   representation (4× for trunc384, 32× for bits), and S3 storage stays at about 1.6× to
@@ -268,6 +282,72 @@ So the 4× bar can be met in two ways, and this document has not shown either:
 - **Representation loss is small compared with the bench recall gap.** The bench baseline
   recall@10 of ≈0.95 cannot come from int8 representation loss alone (int8 reaches 0.994 at
   global R=10 here). That suggests IVF probing, but it was not measured on the engine.
+
+### 3d. Two-stage: reduced search representation, then a reduced rescore store
+
+`repr_recall_sim.py --rescore` rescores each shortlist with a reduced rescore store instead of
+the exact f32 vector, then compares the resulting top-10 with the exact full-dim top-10. The
+query stays f32 in both stages. Total bytes are search representation plus rescore store.
+
+Same samples and splits as 3a and 3b. Machine: Intel Xeon, 8 vCPU, Linux, numpy 2.2.6
+(OpenBLAS). The single-stage rows reproduce 3a to 3c within 0.002. Commands:
+
+```
+python3 repr_recall_sim.py --docs te3s_docs.npy --queries te3s_queries.npy \
+    --truncate 768,384 --search bin-asym,int8,trunc384,trunc768-bin \
+    --rescore full,trunc768,trunc512,trunc384,int8,trunc768-int8 \
+    --shortlist 10,20,40,100,200 --segments 1,2,10
+python3 repr_recall_sim.py --docs cohere_docs.npy --queries cohere_queries.npy \
+    --queries-limit 2000 --truncate 512 --search bin-asym,int8 \
+    --rescore full,int8,trunc512 --shortlist 10,20,40,100,200 --segments 1,2,10
+```
+
+`te3s_*.npy` come from `fetch_te3s_dbpedia.py`. `cohere_docs.npy` is the first 100,000 rows of
+`passages_npy/msmarco_v2.1_doc_segmented_00.npy` widened to f32, and `cohere_queries.npy` is
+the `emb` column of `queries_parquet/queries.parquet` (1677 queries), as in 3b. Run time was
+about 23 s for te3-small and 12 s for Cohere.
+
+**te3-small, 1536-d (doc→doc).** Total × is against 12,288 B per document. "Ceiling" is
+R=200 per shard with 10 shards, where the shortlist almost always holds the true top-10, so
+it is the rescore store's own loss.
+
+| search | rescore store | total B | total × | global R=40 | global R=100 | 2×~50k R=40 | 2×~50k R=100 | 10×~10k R=40 | ceiling |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| bin-asym | f32 (today) | 6336 | 1.94 | 0.9949 | 1.0000 | 0.9999 | 1.0000 | 1.0000 | 1.0000 |
+| **bin-asym** | **int8** | 1732 | **7.09** | 0.9912 | 0.9960 | **0.9959** | 0.9960 | 0.9960 | 0.9960 |
+| trunc384 | int8 | 3076 | 3.99 | 0.9619 | 0.9908 | 0.9871 | 0.9946 | 0.9956 | 0.9960 |
+| trunc768-bin | int8 | 1636 | 7.51 | 0.8729 | 0.9580 | 0.9442 | 0.9830 | 0.9928 | 0.9960 |
+| bin-asym | trunc768 | 3264 | 3.76 | 0.8354 | 0.8299 | 0.8305 | 0.8290 | 0.8287 | 0.8287 |
+| bin-asym | trunc768-int8 | 964 | 12.75 | 0.8357 | 0.8302 | 0.8309 | 0.8293 | 0.8290 | 0.8290 |
+| bin-asym | trunc512 | 2240 | 5.49 | 0.7816 | 0.7697 | 0.7712 | 0.7675 | 0.7667 | 0.7667 |
+| bin-asym | trunc384 | 1728 | 7.11 | 0.7245 | 0.7033 | 0.7063 | 0.6990 | 0.6974 | 0.6972 |
+
+**Cohere v3, 1024-d (query→passage).** Total × is against 8,192 B per document.
+
+| search | rescore store | total B | total × | global R=40 | global R=100 | 2×~50k R=40 | 2×~50k R=100 | 10×~10k R=40 | ceiling |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| bin-asym | f32 (today) | 4224 | 1.94 | 0.9419 | 0.9883 | 0.9754 | 0.9962 | 0.9937 | 0.9998 |
+| **bin-asym** | **int8** | 1156 | **7.09** | 0.9391 | 0.9833 | 0.9709 | **0.9906** | 0.9884 | 0.9939 |
+| bin-asym | trunc512 (negative control) | 2176 | 3.76 | 0.6413 | 0.5963 | 0.6099 | 0.5789 | 0.5756 | 0.5605 |
+
+**Reading the numbers.**
+
+- **A prefix rescore store has a hard ceiling.** Once the final order comes from the first d
+  dims, recall@10 can be no better than the prefix's own top-10 overlap with the full-dim
+  top-10: 0.8287 for trunc768 (3a, R=10). A larger shortlist does not help and makes it
+  slightly worse, because more near-misses compete under the prefix score. Quantizing the
+  prefix to int8 costs almost nothing more (0.8290), so the prefix is the loss.
+- **An int8 rescore store loses about 0.004 to 0.006.** That is int8's own single-stage loss
+  (0.9960 te3-small, 0.9941 Cohere), well inside the 0.01 bar. Sign-bit search plus int8
+  rescoring reaches it at R=40 per 50k shard on te3-small. On Cohere it needs R=100 per 50k
+  shard (0.9906) or about 10k-doc segments at R=40 (0.9884, just short).
+- **int8 alone is 7.98× with no rescore at all.** An int8 search column with no f32 sidecar
+  (1540 B at 1536-d) has the same recall as the int8 ceiling above: 0.9960 and 0.9941. That
+  is the simplest layout that passes the bar on representation loss. Its search bytes are 8×
+  those of sign bits, so local probe cost is higher than bits + int8; IVF probing loss is
+  not modelled for either.
+- **None of this needs Matryoshka.** Neither passing layout truncates, so both work on the
+  bench corpus, and #381's Cohere bench runs can measure them in the engine.
 
 ## 4. What Kosha would need
 
@@ -367,12 +447,10 @@ need the float to rescore, so callers would send both representations. **Do not 
 - **Where Matryoshka could still help next to #381:**
   - Centroid scoring: IVF centroids are f32 and resident. Every kNN scores the centroids of all about 200 bench
     segments; a 384-dim centroid probe cuts that dot cost about 4× (arithmetic, not measured).
-  - Rescore bytes: on Sage's model (doc-to-doc), `trunc768` alone recovers the full-dim
-    top-10 almost exactly (0.9988 at global R=40). Used **as the rescore vector** it would
-    halve `doc_vectors.bin` and the ranged S3 rescore reads #381 plans (6 KB → 3 KB per
-    vector). This is the main way Matryoshka could help reach the 4× total bar (section 3c:
-    sign bits + 768-dim rescore store is 3.76× by arithmetic). The two-stage recall is not
-    measured.
+  - Rescore bytes: **measured, does not work.** A 768-dim prefix as the rescore vector caps
+    recall@10 at 0.829 on Sage's model (section 3d). An int8 `doc_vectors.bin` gives the
+    rescore-byte saving instead (6 KB → 1.5 KB per vector at 1536-d, 4×, for #381's ranged
+    S3 rescore reads too) at 0.996, and does not depend on the model.
 - **#382** (popcount kernels and an x86-64-v3 build) speeds up any 1-bit search representation.
   It does not depend on this issue.
 
@@ -386,9 +464,9 @@ Ordered from cheapest to most expensive. Steps 1 and 2 need no engine change.
      strings.
    - Run `repr_recall_sim.py --truncate 768,512,384,256 --shortlist 10,20,40,100,200
      --segments 1,4` (4 shards of 50k is about one bench segment each).
-   - Extend the simulator with a two-stage mode (reduced search representation, then a
-     reduced rescore store: 768-dim prefix or int8) to measure the layouts in section 3c
-     that could reach 4× in total.
+   - Also run the two-stage mode (`--rescore full,int8,trunc768`, done on public data in
+     section 3d) to check that bits + int8 still passes and that the prefix rescore store
+     still fails on Sage's queries.
    - Pass for Matryoshka as a search representation: `trunc384` at or above 0.99 at R=40 per
      shard. Pass for the 4× total bar: some two-stage layout at or above 0.99 at R=40 per
      shard with total bytes at least 4× smaller. Otherwise Matryoshka is dropped.
@@ -423,9 +501,11 @@ Ordered from cheapest to most expensive. Steps 1 and 2 need no engine change.
    - If the bar is instead narrowed to **local probe bytes** (with `doc_vectors.bin` kept in
      S3 and read by range for the shortlist), say so explicitly, and add #381's measurement of
      ranged rescore latency at p99 as a condition.
-5. **Rescore-prefix variant (with #381).** Store a 768-dim prefix in `doc_vectors.bin` and
-   rescore with it. Measure recall@10 against full-dim ground truth and the rescore bytes per
-   query.
+5. **Rescore-store variant (with #381).** ~~Store a 768-dim prefix in `doc_vectors.bin`~~:
+   dropped, it fails offline (section 3d). Store int8 codes in `doc_vectors.bin` instead,
+   rescore a RaBitQ (v5) shortlist with them, and measure recall@10 against full-dim ground
+   truth, rescore bytes per query and p50/p99 on the Cohere bench corpus. This needs no
+   Matryoshka model and no re-embedding.
 
 ## 7. Risks and open questions
 
