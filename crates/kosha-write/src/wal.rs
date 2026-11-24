@@ -329,6 +329,83 @@ pub struct WalWriter {
 /// Records recovered when a [`WalWriter`] opens, with their LSNs, in order.
 pub type RecoveredRecords = Vec<(u64, WalRecord)>;
 
+/// Read a durable WAL stream without opening a writer, repairing files, or
+/// updating checkpoints.
+pub struct WalReader {
+    store: Arc<dyn WalStore>,
+    origin: String,
+}
+
+impl WalReader {
+    /// Attach to an existing stream. An ingest process creates the origin
+    /// before its first append, so a reader may have to retry an empty stream.
+    pub fn open(store: Arc<dyn WalStore>) -> Result<Option<Self>, KoshaError> {
+        Ok(read_origin(store.as_ref())?.map(|origin| Self { store, origin }))
+    }
+
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    /// Read this namespace's records in `(after, through]`, in LSN order.
+    /// Only use a manifest checkpoint as `after` if its origin matches
+    /// [`Self::origin`]. A missing file during replay is an error: reclamation
+    /// may have won the race, so refresh the manifest before retrying.
+    ///
+    /// This is not a publication fence. The caller must still coordinate
+    /// with competing indexers and namespace deletion before committing.
+    pub fn read_namespace(
+        &self,
+        namespace: &NamespaceId,
+        after: u64,
+        through: u64,
+    ) -> Result<RecoveredRecords, KoshaError> {
+        if through <= after {
+            return Ok(Vec::new());
+        }
+        let files = self.store.list()?;
+        let discarded = read_discarded(self.store.as_ref())?;
+        let after = after.max(discarded.get(&namespace.0).copied().unwrap_or(0));
+        if through <= after {
+            return Ok(Vec::new());
+        }
+
+        // The file that starts at or immediately before `after` can still
+        // contain later records if the checkpoint falls inside a group.
+        let start = files.partition_point(|key| *key <= after).saturating_sub(1);
+        let mut records = Vec::new();
+        for (i, &key) in files.iter().enumerate().skip(start) {
+            if key > through {
+                break;
+            }
+            let file = decode_frames(&self.store.read(key)?, key)?;
+            if file.torn {
+                return Err(torn());
+            }
+            if let (Some((last, _)), Some(next_key)) = (file.records.last(), files.get(i + 1)) {
+                if last >= next_key {
+                    return Err(invalid("overlapping WAL groups"));
+                }
+            }
+            records.extend(file.records.into_iter().filter(|(lsn, record)| {
+                *lsn > after && *lsn <= through && &record.namespace == namespace
+            }));
+        }
+        Ok(records)
+    }
+}
+
+fn read_origin(store: &dyn WalStore) -> Result<Option<String>, KoshaError> {
+    store
+        .read_meta("origin")?
+        .map(|bytes| {
+            let origin = String::from_utf8(bytes).map_err(|_| invalid("invalid WAL origin"))?;
+            uuid::Uuid::parse_str(&origin).map_err(|_| invalid("invalid WAL origin"))?;
+            Ok(origin)
+        })
+        .transpose()
+}
+
 impl WalWriter {
     /// Local-disk WAL in `wal_dir`, group commit configured from the
     /// environment.
@@ -357,11 +434,8 @@ impl WalWriter {
         }
         // Read back: a concurrent opener of a shared stream may have
         // created it first.
-        let origin = store
-            .read_meta("origin")?
+        let origin = read_origin(store.as_ref())?
             .ok_or_else(|| invalid("WAL origin missing after creation"))?;
-        let origin = String::from_utf8(origin).map_err(|_| invalid("invalid WAL origin"))?;
-        uuid::Uuid::parse_str(&origin).map_err(|_| invalid("invalid WAL origin"))?;
         let mut recovered = recover_from(store.as_ref())?;
         if let Some((file, complete_len)) = recovered.torn_tail {
             // A discarded tail must not become a corrupt middle record after

@@ -923,8 +923,13 @@ impl SegmentCache {
     }
 
     /// Drop every cached reader of the namespaces `matches` selects,
-    /// pinned or not. Returns how many went.
-    fn remove_namespaces(&self, matches: &dyn Fn(&str) -> bool) -> usize {
+    /// pinned or not. Returns each removed reader with its
+    /// `(namespace, segment)`, for the caller to drop outside the cache
+    /// locks (dropping one takes the ledger lock).
+    fn remove_namespaces(
+        &self,
+        matches: &dyn Fn(&str) -> bool,
+    ) -> Vec<((String, String), Arc<TrackedSegment>)> {
         let mut entries = self.entries.lock().unwrap();
         let mut tenants = self.tenants.lock().unwrap();
         let doomed: Vec<_> = entries
@@ -937,14 +942,12 @@ impl SegmentCache {
             if let Some((reader, size)) = entries.remove(&key) {
                 self.total_bytes.fetch_sub(size, Ordering::Relaxed);
                 tenants.sub_bytes(tenant_of_namespace(&key.0), size);
-                removed.push(reader);
+                removed.push(((key.0, key.1), reader));
             }
         }
         drop(tenants);
         drop(entries);
-        // The readers drop here, outside the cache locks (dropping one
-        // takes the ledger lock).
-        removed.len()
+        removed
     }
 
     /// Per-tenant bytes, hits, misses and evictions.
@@ -1168,12 +1171,14 @@ pub fn approx_segment_bytes(seg_dir: &std::path::Path, load_vectors: bool) -> u6
             let offsets_file = kosha_core::vector_offsets_file(slot);
             let vec_offsets = size(&offsets_file);
             total = total.saturating_add(if vec_offsets > 0 {
-                // Plus the i8 centroid codes the open derives from the
-                // sidecar (two-stage kNN planning): resident like the
-                // centroids, but in no file, so no size above covers them.
-                vec_offsets.saturating_add(kosha_segment::vector_centroid_code_bytes(
-                    &seg_dir.join(&offsets_file),
-                ))
+                // Plus the i8 centroid codes (two-stage kNN planning) and
+                // the centroid cap (segment pruning) the open derives from
+                // the sidecar: resident like the centroids, but in no file,
+                // so no size above covers them.
+                let offsets_path = seg_dir.join(&offsets_file);
+                vec_offsets
+                    .saturating_add(kosha_segment::vector_centroid_code_bytes(&offsets_path))
+                    .saturating_add(kosha_segment::vector_centroid_cap_bytes(&offsets_path))
             } else {
                 size(&kosha_core::vector_idx_file(slot))
             });
@@ -2826,6 +2831,20 @@ pub fn segment_embedding_model_mismatch(footer: &Footer, knn: &kosha_core::KnnQu
         .any(|recorded| recorded != model)
 }
 
+/// Whether `query` reads the segments' single-vector columns
+/// (`vector[.n].idx`, `vector[.n].offsets`, and `doc_vectors.bin` for a
+/// legacy footer): a kNN scored by cosine. A late-interaction kNN (#205)
+/// reads only its field's `multivec.{i}` files, so it opens segments as a
+/// lexical query does (sharing their cache entries, and charging no vector
+/// bytes at admission), and the server hydrates no vector column for it.
+pub fn query_reads_vector_columns(query: &SearchQuery) -> bool {
+    leg_reads_vector_columns(&query.knn)
+}
+
+fn leg_reads_vector_columns(knn: &Option<kosha_core::KnnQuery>) -> bool {
+    knn.as_ref().is_some_and(|knn| !knn.is_late_interaction())
+}
+
 fn late_interaction_params(knn: &kosha_core::KnnQuery) -> kosha_segment::LateInteractionParams {
     kosha_segment::LateInteractionParams {
         nprobe: late_interaction_nprobe(),
@@ -3057,6 +3076,20 @@ fn knn_budget_cutoff_of(
 /// selective filter hydrates whole postings of documents it then rejects.
 pub const DEFAULT_KNN_EXACT_THRESHOLD: usize = 50_000;
 
+/// `KOSHA_KNN_SEGMENT_PRUNE`: `0`, `false` or `off` plans every segment's
+/// centroids even when a segment's score floor shows it cannot hold a
+/// posting inside the probe budget. Default on; see
+/// [`Searcher::with_knn_segment_prune`].
+fn knn_segment_prune_from_env() -> bool {
+    !matches!(
+        std::env::var("KOSHA_KNN_SEGMENT_PRUNE")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("0") | Some("false") | Some("off")
+    )
+}
+
 fn knn_exact_threshold_from_env() -> usize {
     std::env::var("KOSHA_KNN_EXACT_THRESHOLD")
         .ok()
@@ -3203,6 +3236,13 @@ trait KnnPlanSource: Sync {
     /// `lower[i] <= scores()[i] <= upper[i]` for every posting, or `None`
     /// when the segment can only be scored exactly.
     fn score_bounds(&self) -> Option<kosha_segment::KnnCentroidScoreBounds>;
+    /// A value no score in [`Self::scores`] is below, or `None` when the
+    /// segment has no cheap guarantee. Lets the plan leave out a segment
+    /// none of whose postings can be inside the budget without scoring
+    /// it (see [`knn_rank_postings_pruned`]).
+    fn score_floor(&self) -> Option<f32> {
+        None
+    }
 }
 
 /// [`KnnPlanSource`] over an open segment's column.
@@ -3263,6 +3303,11 @@ impl KnnPlanSource for ColumnPlanSource<'_> {
     fn score_bounds(&self) -> Option<kosha_segment::KnnCentroidScoreBounds> {
         self.reader
             .knn_centroid_score_bounds(self.field, self.query, self.alpha)
+    }
+
+    fn score_floor(&self) -> Option<f32> {
+        self.reader
+            .knn_centroid_score_floor(self.field, self.query, self.alpha)
     }
 }
 
@@ -3404,16 +3449,56 @@ fn knn_rank_postings<S: KnnPlanSource>(
     relative: Option<RelativeCutoff>,
     two_stage: bool,
 ) -> KnnRankedPostings {
+    knn_rank_postings_of(sources, None, budget, relative, two_stage)
+}
+
+/// [`knn_rank_postings`], first leaving out, when `prune` is on, every
+/// segment whose score floor shows none of its postings can be inside the
+/// budget ([`knn_rank_postings_pruned`]). The plan is the same either way.
+fn knn_rank_postings_with<S: KnnPlanSource>(
+    sources: &[S],
+    budget: usize,
+    relative: Option<RelativeCutoff>,
+    two_stage: bool,
+    prune: bool,
+) -> KnnRankedPostings {
+    if prune {
+        if let Some(ranked) = knn_rank_postings_pruned(sources, budget, relative, two_stage) {
+            return ranked;
+        }
+    }
+    knn_rank_postings(sources, budget, relative, two_stage)
+}
+
+/// [`knn_rank_postings`] over `sources`, which are all of the query's
+/// postings unless `cutoff_total` says how many there are in all; then
+/// `sources` must hold every posting scoring at or under the `budget`-th
+/// smallest score of all of them (see [`knn_budget_cutoff_of`]), with
+/// `cutoff_total > budget >= 1`.
+fn knn_rank_postings_of<S: KnnPlanSource>(
+    sources: &[S],
+    cutoff_total: Option<usize>,
+    budget: usize,
+    relative: Option<RelativeCutoff>,
+    two_stage: bool,
+) -> KnnRankedPostings {
     let total: usize = sources.iter().map(|s| s.postings()).sum();
-    if two_stage && budget >= 1 && total > budget {
-        if let Some(ranked) = knn_rank_postings_two_stage(sources, total, budget, relative) {
+    if two_stage && budget >= 1 && total >= budget && cutoff_total.unwrap_or(total) > budget {
+        if let Some(ranked) = knn_rank_postings_two_stage(
+            sources,
+            total,
+            cutoff_total.unwrap_or(total),
+            budget,
+            relative,
+        ) {
             return ranked;
         }
     }
     let scores: Vec<Option<Vec<f32>>> = sources.par_iter().map(|s| s.scores()).collect();
     let mut all: Vec<f32> = scores.iter().flatten().flatten().copied().collect();
     let scored = all.len();
-    let (cutoff, rule) = knn_budget_cutoff_of(&mut all, scored, budget, relative);
+    let (cutoff, rule) =
+        knn_budget_cutoff_of(&mut all, cutoff_total.unwrap_or(scored), budget, relative);
     // Hand every probed segment its postings inside the cutoff, ranked
     // (#436). The scores are the ones the cutoff was just picked from, so
     // the segment's ranking and the cutoff cannot drift apart, and the
@@ -3435,11 +3520,14 @@ fn knn_rank_postings<S: KnnPlanSource>(
 }
 
 /// The two-stage half of [`knn_rank_postings`], which holds the proof.
-/// Requires `total > budget >= 1`. `None` when a NaN turned up or a source
-/// could not be scored.
+/// Requires `cutoff_total > budget >= 1` and `total >= budget`, where
+/// `total` is how many postings `sources` have and `cutoff_total` is as
+/// for [`knn_rank_postings_of`] (`total` when `sources` are all of them).
+/// `None` when a NaN turned up or a source could not be scored.
 fn knn_rank_postings_two_stage<S: KnnPlanSource>(
     sources: &[S],
     total: usize,
+    cutoff_total: usize,
     budget: usize,
     relative: Option<RelativeCutoff>,
 ) -> Option<KnnRankedPostings> {
@@ -3543,7 +3631,7 @@ fn knn_rank_postings_two_stage<S: KnnPlanSource>(
     if all.iter().any(|x| x.is_nan()) {
         return None;
     }
-    let (cutoff, rule) = knn_budget_cutoff_of(&mut all, total, budget, relative);
+    let (cutoff, rule) = knn_budget_cutoff_of(&mut all, cutoff_total, budget, relative);
     let rankings = sources
         .par_iter()
         .zip(stage2)
@@ -3569,6 +3657,176 @@ fn knn_rank_postings_two_stage<S: KnnPlanSource>(
         rankings,
         exact_centroids,
     })
+}
+
+/// [`knn_rank_postings`] without scoring the segments that cannot hold a
+/// posting inside the budget. `None` when there is nothing to leave out
+/// or the shortcut cannot be taken; the caller then plans every segment.
+///
+/// # Why the plan is the same
+///
+/// With `s(B)` the `B`-th smallest exact score over all `N > B >= 1`
+/// postings, as in [`knn_rank_postings`]:
+///
+/// 1. Seed: the segments with the smallest floors, until they hold at
+///    least `B` postings. `t`, the `B`-th smallest of their exact scores
+///    (or of their guaranteed upper bounds, with `two_stage`), is
+///    `>= s(B)`: at least `B` scores are `<= t`.
+/// 2. A segment whose floor is `> t` has every score `> s(B)`, so the
+///    segments kept (floor `<= t`, the seed among them) hold every
+///    posting scoring `<= s(B)`, which is what [`knn_rank_postings_of`]
+///    needs to give the cutoff and rule of all `N` postings.
+/// 3. The cutoff is never above `s(B)`, so a segment left out has no
+///    posting inside it and its ranking is empty, as it would be.
+///
+/// A floor that is not a finite positive number is treated as `0`, which
+/// never leaves a segment out. A seed that cannot be scored, or a kept
+/// segment that turns out unscorable, sends the query back to the full
+/// plan, which handles that case.
+fn knn_rank_postings_pruned<S: KnnPlanSource>(
+    sources: &[S],
+    budget: usize,
+    relative: Option<RelativeCutoff>,
+    two_stage: bool,
+) -> Option<KnnRankedPostings> {
+    let total: usize = sources.iter().map(|s| s.postings()).sum();
+    if budget == 0 || total <= budget {
+        return None;
+    }
+    let floors: Vec<f32> = sources
+        .par_iter()
+        .map(|s| {
+            s.score_floor()
+                .filter(|f| f.is_finite() && *f > 0.0)
+                .unwrap_or(0.0)
+        })
+        .collect();
+    if floors.iter().all(|&f| f == 0.0) {
+        return None;
+    }
+    let mut order: Vec<usize> = (0..sources.len()).collect();
+    order.sort_by(|&a, &b| floors[a].total_cmp(&floors[b]).then(a.cmp(&b)));
+    let mut seeds = 0;
+    let mut seeded = 0;
+    while seeded < budget {
+        seeded += sources[order[seeds]].postings();
+        seeds += 1;
+    }
+
+    let mut cached: Vec<Prescored> = (0..sources.len()).map(|_| Prescored::None).collect();
+    let seed_scores: Vec<Prescored> = order[..seeds]
+        .par_iter()
+        .map(|&i| {
+            let source = &sources[i];
+            let n = source.postings();
+            if two_stage {
+                if let Some(bounds) = source
+                    .score_bounds()
+                    .filter(|b| b.lower.len() == n && b.upper.len() == n)
+                {
+                    return Some(Prescored::Bounds(bounds));
+                }
+            }
+            source
+                .scores()
+                .filter(|s| s.len() == n)
+                .map(Prescored::Scores)
+        })
+        .collect::<Option<_>>()?;
+    let mut upper: Vec<f32> = Vec::with_capacity(seeded);
+    for (&i, pre) in order[..seeds].iter().zip(seed_scores) {
+        match &pre {
+            Prescored::Scores(scores) => upper.extend_from_slice(scores),
+            Prescored::Bounds(bounds) => upper.extend_from_slice(&bounds.upper),
+            Prescored::None => {}
+        }
+        cached[i] = pre;
+    }
+    if upper.len() != seeded || upper.iter().any(|x| x.is_nan()) {
+        return None;
+    }
+    let t = *upper.select_nth_unstable_by(budget - 1, f32::total_cmp).1;
+    drop(upper);
+
+    let kept: Vec<usize> = (0..sources.len()).filter(|&i| floors[i] <= t).collect();
+    let kept_sources: Vec<PrescoredSource<'_, S>> = kept
+        .iter()
+        .map(|&i| PrescoredSource {
+            inner: &sources[i],
+            pre: std::mem::replace(&mut cached[i], Prescored::None),
+        })
+        .collect();
+    let ranked = knn_rank_postings_of(&kept_sources, Some(total), budget, relative, two_stage);
+    if ranked.rankings.iter().any(Option::is_none) {
+        return None;
+    }
+    let mut kept_rankings = kept.iter().copied().zip(ranked.rankings).peekable();
+    let rankings = (0..sources.len())
+        .map(|i| match kept_rankings.peek() {
+            Some(&(k, _)) if k == i => kept_rankings.next().and_then(|(_, r)| r),
+            _ => Some(kosha_segment::KnnSegmentRanking::from_candidates(
+                sources[i].postings(),
+                &[],
+                ranked.cutoff,
+                budget,
+            )),
+        })
+        .collect();
+    Some(KnnRankedPostings {
+        cutoff: ranked.cutoff,
+        rule: ranked.rule,
+        rankings,
+        exact_centroids: ranked.exact_centroids,
+    })
+}
+
+/// What [`knn_rank_postings_pruned`] already computed for a seed segment.
+enum Prescored {
+    None,
+    Scores(Vec<f32>),
+    Bounds(kosha_segment::KnnCentroidScoreBounds),
+}
+
+/// A [`KnnPlanSource`] that answers from what was [`Prescored`] for it.
+struct PrescoredSource<'a, S> {
+    inner: &'a S,
+    pre: Prescored,
+}
+
+impl<S: KnnPlanSource> KnnPlanSource for PrescoredSource<'_, S> {
+    fn postings(&self) -> usize {
+        self.inner.postings()
+    }
+
+    fn scores(&self) -> Option<Vec<f32>> {
+        match &self.pre {
+            Prescored::Scores(scores) => Some(scores.clone()),
+            _ => self.inner.scores(),
+        }
+    }
+
+    fn scores_for(&self, postings: &[u32]) -> Option<Vec<f32>> {
+        match &self.pre {
+            Prescored::Scores(scores) => postings
+                .iter()
+                .map(|&p| scores.get(p as usize).copied())
+                .collect(),
+            _ => self.inner.scores_for(postings),
+        }
+    }
+
+    fn score_bounds(&self) -> Option<kosha_segment::KnnCentroidScoreBounds> {
+        match &self.pre {
+            // Exact already: the plan should use the scores, not bounds.
+            Prescored::Scores(_) => None,
+            Prescored::Bounds(bounds) => Some(bounds.clone()),
+            Prescored::None => self.inner.score_bounds(),
+        }
+    }
+
+    fn score_floor(&self) -> Option<f32> {
+        self.inner.score_floor()
+    }
 }
 
 /// Flat kNN search: compute cosine similarity against all stored vectors,
@@ -3732,12 +3990,25 @@ pub struct SearchPhaseStats {
     /// `score_wall_ms`. Microseconds once the query's terms are cached for
     /// the manifest version; zero when the floor was not used.
     pub wand_bounds_ms: f64,
+    /// Segments whose capped multi-term AND join stopped early: the summed
+    /// per-term suffix-max ceilings fell below the page floor once the
+    /// segment's count budget was met (#103). Zero in exact counting mode.
+    pub and_join_early_exits: usize,
+    /// Intersection members the capped AND join walked after its segment's
+    /// count budget was already met, summed over segments: the work the
+    /// early exit exists to save. Postings are in ingestion order, so a
+    /// term's best remaining block usually sits late in its list and the
+    /// exit rarely fires (#114); this counter is then close to `total_hits
+    /// - cap` per segment. Zero in exact counting mode.
+    pub and_join_members_past_cap: usize,
     /// Segments whose kNN search failed and contributed no vector hits:
     /// the subset of `SearchResult::knn_degraded_segments` lost to an
     /// error rather than skipped by design (another embedding model). The
     /// page is missing their nearest neighbours, so the server answers 503
     /// instead of a partial 200. Empty for a non-kNN query.
     pub knn_failed_segments: Vec<kosha_core::SegmentId>,
+    /// Distinct degraded segments, including intentional embedding-model skips.
+    pub knn_degraded_segments: HashSet<kosha_core::SegmentId>,
     /// Of `knn_failed_segments`, those whose loaded vector column has a
     /// valid header but a corrupt body (no usable `vector.offsets`, and the
     /// whole `vector.idx` does not parse). The flag is fixed when the
@@ -3814,6 +4085,10 @@ struct OpenStatsCollector {
     wand_docs_scored: AtomicUsize,
     /// See [`SearchPhaseStats::wand_segments_skipped`].
     wand_segments_skipped: AtomicUsize,
+    /// See [`SearchPhaseStats::and_join_early_exits`].
+    and_join_early_exits: AtomicUsize,
+    /// See [`SearchPhaseStats::and_join_members_past_cap`].
+    and_join_members_past_cap: AtomicUsize,
     /// Vectors scored by exact filtered kNN — see
     /// [`SearchPhaseStats::knn_exact_vectors`].
     knn_exact_vectors: AtomicUsize,
@@ -3854,6 +4129,13 @@ pub struct Searcher {
     /// Two-stage kNN planning over i8 centroid codes; see
     /// [`Searcher::with_knn_plan_i8`]. Default from `KOSHA_KNN_PLAN_I8`.
     knn_plan_i8: bool,
+    knn_namespace_centroids: bool,
+    namespace_centroids: Mutex<Option<CachedNamespaceCentroids>>,
+    namespace_centroid_source: Option<Box<NamespaceCentroidSource>>,
+    /// Leaving segments out of the kNN plan by their score floors; see
+    /// [`Searcher::with_knn_segment_prune`]. Default from
+    /// `KOSHA_KNN_SEGMENT_PRUNE`.
+    knn_segment_prune: bool,
     /// Per-segment rescoring counters (#381): see
     /// [`Searcher::with_knn_rescore_stats`]. Default from
     /// `KOSHA_KNN_RESCORE_STATS`, off.
@@ -3862,6 +4144,14 @@ pub struct Searcher {
 
 /// Weak handles to the readers of one released segment.
 type DrainingReaders = Vec<std::sync::Weak<TrackedSegment>>;
+type NamespaceCentroidSource = dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync;
+
+struct CachedNamespaceCentroids {
+    namespace: NamespaceId,
+    version: u64,
+    loaded_at: Instant,
+    snapshot: Option<Arc<kosha_segment::namespace_centroids::Snapshot>>,
+}
 
 /// Result of a [`Searcher::warm_segments`] pass — how many segments were
 /// newly opened/cached vs. already resident, and the estimated bytes
@@ -3979,6 +4269,10 @@ impl Searcher {
             knn_global_rescore: knn_global_rescore_from_env(),
             knn_global_rescore_max: knn_global_rescore_max_from_env(),
             knn_plan_i8: kosha_segment::knn_plan_i8_from_env(),
+            knn_namespace_centroids: kosha_segment::namespace_centroids::enabled(),
+            namespace_centroids: Mutex::new(None),
+            namespace_centroid_source: None,
+            knn_segment_prune: knn_segment_prune_from_env(),
             knn_rescore_stats: knn_rescore_stats_from_env(),
         }
     }
@@ -4010,8 +4304,37 @@ impl Searcher {
     /// A search already running keeps the readers it holds until it ends;
     /// nothing here waits for it. Forgetting a namespace that still exists
     /// only costs its next search a reload.
+    ///
+    /// The `draining` map is never cleared here: it is how
+    /// [`Self::release_segment`] tells the local GC (#239) that an
+    /// in-flight search still reads a retired segment, and `matches` can
+    /// select live namespaces too (a re-created namespace, every namespace
+    /// of a tenant with a deletion record). A removed reader that a search
+    /// still holds is registered there instead, as `release_segment` would
+    /// do, so a later `release_segment` of that segment still answers
+    /// "busy" until the search lets go.
     pub fn forget_namespaces(&self, matches: impl Fn(&str) -> bool) -> usize {
         let removed = self.segment_cache.remove_namespaces(&matches);
+        let count = removed.len();
+        let weak: Vec<((String, String), std::sync::Weak<TrackedSegment>)> = removed
+            .iter()
+            .map(|(key, reader)| (key.clone(), Arc::downgrade(reader)))
+            .collect();
+        // The cache's own references go first, outside every lock.
+        drop(removed);
+        {
+            let mut draining = self.draining.lock().unwrap();
+            for (key, reader) in weak {
+                if reader.strong_count() > 0 {
+                    let list = draining.entry(key).or_default();
+                    // Readers that ended since are dropped here, so a
+                    // segment forgotten again and again does not grow its
+                    // list (release_segment prunes the same way).
+                    list.retain(|w| w.strong_count() > 0);
+                    list.push(reader);
+                }
+            }
+        }
         self.corpus_stats
             .entries
             .lock()
@@ -4022,11 +4345,7 @@ impl Searcher {
             .lock()
             .unwrap()
             .retain(|key, _| !matches(&key.0));
-        self.draining
-            .lock()
-            .unwrap()
-            .retain(|(namespace, _), _| !matches(namespace));
-        removed
+        count
     }
 
     /// Stop caching a retired segment and report whether any reader of it
@@ -4101,6 +4420,73 @@ impl Searcher {
     /// scored exactly whatever this says.
     pub fn with_knn_plan_i8(mut self, on: bool) -> Self {
         self.knn_plan_i8 = on;
+        self
+    }
+
+    pub fn with_knn_namespace_centroids(mut self, on: bool) -> Self {
+        self.knn_namespace_centroids = on;
+        self
+    }
+
+    pub fn with_namespace_centroid_source(
+        mut self,
+        source: impl Fn(&str) -> Option<Vec<u8>> + Send + Sync + 'static,
+    ) -> Self {
+        self.namespace_centroid_source = Some(Box::new(source));
+        self
+    }
+
+    fn namespace_centroid_snapshot(
+        &self,
+        namespace: &NamespaceId,
+        manifest: &Manifest,
+    ) -> Option<Arc<kosha_segment::namespace_centroids::Snapshot>> {
+        use kosha_segment::namespace_centroids::{Snapshot, FILE_NAME};
+        let matches = |snapshot: &Snapshot| {
+            snapshot.matches(
+                manifest.version,
+                manifest.segments.iter().map(|s| s.segment_id.0.as_str()),
+            )
+        };
+        {
+            let cache = self.namespace_centroids.lock().unwrap();
+            if let Some(cached) = cache
+                .as_ref()
+                .filter(|c| c.namespace == *namespace && c.version == manifest.version)
+            {
+                match &cached.snapshot {
+                    Some(snapshot) if matches(snapshot) => return Some(Arc::clone(snapshot)),
+                    None if cached.loaded_at.elapsed() < Duration::from_secs(1) => return None,
+                    _ => {}
+                }
+            }
+        }
+        let path = format!("{}/{FILE_NAME}", namespace.0);
+        let decode = |bytes: Vec<u8>| {
+            serde_json::from_slice::<Snapshot>(&bytes)
+                .ok()
+                .filter(matches)
+        };
+        let snapshot = std::fs::read(self.data_dir.join(&path))
+            .ok()
+            .and_then(decode)
+            .or_else(|| self.namespace_centroid_source.as_ref()?(&path).and_then(decode))
+            .map(Arc::new);
+        *self.namespace_centroids.lock().unwrap() = Some(CachedNamespaceCentroids {
+            namespace: namespace.clone(),
+            version: manifest.version,
+            loaded_at: Instant::now(),
+            snapshot: snapshot.clone(),
+        });
+        snapshot
+    }
+
+    /// Whether kNN planning leaves out, unscored, every segment whose
+    /// centroids all lie so far from the query that none of its postings
+    /// can be inside the probe budget (`KOSHA_KNN_SEGMENT_PRUNE`, default
+    /// on). The plan, and so every result, is the same either way.
+    pub fn with_knn_segment_prune(mut self, on: bool) -> Self {
+        self.knn_segment_prune = on;
         self
     }
 
@@ -4200,7 +4586,7 @@ impl Searcher {
         &self,
         namespace: &NamespaceId,
         manifest: &Manifest,
-        load_vectors: bool,
+        load_modes: &[bool],
         estimate: u64,
         needed: u64,
         what: AdmissionEvict,
@@ -4216,7 +4602,9 @@ impl Searcher {
             estimate,
             what,
             |key| {
-                key.0 == namespace.0 && key.2 == load_vectors && segments.contains(key.1.as_str())
+                key.0 == namespace.0
+                    && load_modes.contains(&key.2)
+                    && segments.contains(key.1.as_str())
             },
         );
     }
@@ -4288,7 +4676,7 @@ impl Searcher {
 
         let tenant = tenant_of_namespace(&namespace.0);
         let permit = self.ledger.admit(tenant, estimate, |needed, what| {
-            self.evict_for_admission(namespace, manifest, load_vectors, estimate, needed, what);
+            self.evict_for_admission(namespace, manifest, &[load_vectors], estimate, needed, what);
         })?;
 
         let mut pinned = Vec::with_capacity(present.len());
@@ -4498,7 +4886,7 @@ impl Searcher {
                     .and_then(|t| t.get(&entry.segment_id))
                     .filter(|seqs| !seqs.is_empty());
                 let accept = |doc_seq: u32| dead.is_none_or(|seqs| !seqs.contains(&doc_seq));
-                let accept_dyn: Option<&dyn Fn(u32) -> bool> =
+                let accept_dyn: Option<kosha_segment::KnnAccept<'_>> =
                     if dead.is_some() { Some(&accept) } else { None };
                 let (found, scan) = kosha_segment::with_knn_scan_stats(|| {
                     reader.knn_candidates_fetching(
@@ -4782,11 +5170,6 @@ impl Searcher {
                 })
             })
             .collect();
-        open_stats.knn_centroids.fetch_add(
-            per_segment.iter().filter_map(|info| info.centroids).sum(),
-            Ordering::Relaxed,
-        );
-
         check_knn_field(namespace, knn, per_segment.iter().map(|info| &info.status))?;
 
         // ── exact or probed, per segment ──
@@ -4865,6 +5248,60 @@ impl Searcher {
             }
         });
         let alpha = kosha_segment::knn_probe_radius_alpha();
+        // Restricted searches may refill outside the posting budget and
+        // legacy columns have no stable posting ids. Keep their existing
+        // planner rather than silently dropping any of their candidates.
+        if self.knn_namespace_centroids
+            && !restricted
+            && !prunable
+            && knn.vector.iter().all(|x| x.is_finite())
+            && tombstones.is_none_or(|t| t.values().all(HashSet::is_empty))
+            && knn_relative_cutoff_eps().is_none()
+            && !probed.is_empty()
+            && per_segment.iter().all(|info| {
+                matches!(info.status, VectorFieldStatus::Absent)
+                    || matches!(info.status, VectorFieldStatus::Indexed { dim } if dim != knn.vector.len())
+                    || info.centroids.is_some()
+            })
+        {
+            if let Some(snapshot) = self.namespace_centroid_snapshot(namespace, manifest) {
+                let eligible: HashMap<_, _> = probed
+                    .iter()
+                    .map(|info| (info.segment_id.0.as_str(), info.centroids.unwrap()))
+                    .collect();
+                let directory = &snapshot.directory;
+                if eligible.iter().all(|(&id, &count)| {
+                    directory.posting_count(id, &knn.field, knn.vector.len()) == count
+                }) {
+                    let (hits, scored) = directory.lookup(
+                        &knn.field, &knn.vector, alpha, requested, |id| eligible.contains_key(id),
+                    );
+                    if let Some(last) = hits.last() {
+                        let cutoff = last.score;
+                        let mut selected = HashMap::<&str, Vec<_>>::new();
+                        for hit in hits {
+                            selected.entry(hit.segment).or_default().push((hit.posting, hit.score));
+                        }
+                        plan.rankings = probed.iter().map(|info| {
+                            let id = info.segment_id;
+                            let postings = eligible[id.0.as_str()];
+                            let candidates = selected.get(id.0.as_str()).map_or(&[][..], Vec::as_slice);
+                            (id.clone(), kosha_segment::KnnSegmentRanking::from_candidates(
+                                postings, candidates, cutoff, requested,
+                            ))
+                        }).collect();
+                        plan.cutoff = Some((cutoff, requested));
+                        plan.exact_centroids = scored;
+                        open_stats.knn_centroids.fetch_add(scored, Ordering::Relaxed);
+                        return Ok(plan);
+                    }
+                }
+            }
+        }
+        open_stats.knn_centroids.fetch_add(
+            per_segment.iter().filter_map(|info| info.centroids).sum(),
+            Ordering::Relaxed,
+        );
         let sources: Vec<ColumnPlanSource<'_>> = probed
             .iter()
             .filter_map(|info| {
@@ -4898,7 +5335,13 @@ impl Searcher {
         };
         // Score the centroids, pick the cutoff and rank every probed
         // segment's postings inside it: see `knn_rank_postings`.
-        let ranked = knn_rank_postings(&sources, budget, relative, self.knn_plan_i8);
+        let ranked = knn_rank_postings_with(
+            &sources,
+            budget,
+            relative,
+            self.knn_plan_i8,
+            self.knn_segment_prune,
+        );
         // A segment that could not be scored gets no ranking and ranks its
         // own postings under the cutoff; when none could, there is no
         // cutoff either (as when nothing is probeable).
@@ -5045,7 +5488,7 @@ impl Searcher {
                     // use for this segment, so the two passes share one
                     // cache entry. A segment the filter prunes is never
                     // opened by the scoring pass, so it is opened lexical-only.
-                    let load_vectors = query.knn.is_some()
+                    let load_vectors = query_reads_vector_columns(query)
                         && query.segment_may_match_filters(footer.filter_blooms.as_ref());
                     let reader = self
                         .open_segment(
@@ -5451,6 +5894,7 @@ impl Searcher {
         // Fetches the probed vector postings a segment does not hold
         // locally (#245); see `Searcher::search_with_hydrators`.
         vector_fetch: Option<VectorSpanFetch<'_>>,
+        fused_leg: bool,
         // Namespace-level BM25 statistics (issue #246); `None` scores this
         // segment with its own `N` / `df` / `avgdl`.
         corpus: Option<&Arc<CorpusStats>>,
@@ -5495,12 +5939,14 @@ impl Searcher {
 
         // Lexical/BM25 queries (no query.knn) never touch vectors or the
         // HNSW graph — skip loading both so keyword search latency stops
-        // scaling with embedding volume/segment count.
+        // scaling with embedding volume/segment count. Neither does a
+        // late-interaction kNN (#205): it reads the multivec files, which
+        // need no vector columns (see `query_reads_vector_columns`).
         let reader = self.open_segment(
             &namespace.0,
             &entry.segment_id.0,
             seg_dir,
-            query.knn.is_some(),
+            query_reads_vector_columns(query),
             manifest_footer,
             Some(permit),
             Some(open_stats),
@@ -5561,9 +6007,11 @@ impl Searcher {
 
         // Columnar segments (#244) aggregate and sort straight from their
         // columns; only `filters.bin` segments need the row-shaped store.
+        let pure_knn = query.is_pure_knn();
+        let aggregate_in_segment = !query.aggs.is_empty() && !pure_knn;
         let columnar_filters = reader.has_filter_columns();
         let needs_filter_store =
-            !columnar_filters && (!sort_value_fields.is_empty() || !query.aggs.is_empty());
+            !columnar_filters && (!sort_value_fields.is_empty() || aggregate_in_segment);
         let filter_store = if needs_filter_store {
             // Only the columns this query names (#244). A damaged column
             // fails the request closed.
@@ -5665,9 +6113,11 @@ impl Searcher {
         // A multi-field query (#249) on a segment with per-field indexes.
         // A segment without them (written before #249) takes the paths
         // below and answers from its combined index instead.
-        let field_query = analysis
-            .fields()
-            .filter(|_| analysis.has_text() && !is_wildcard_mode && reader.field_index().is_some());
+        let field_query = analysis.fields().filter(|fields| {
+            (analysis.has_text() || (has_query && fields.iter().all(|field| !field.is_all())))
+                && !is_wildcard_mode
+                && reader.field_index().is_some()
+        });
         if let Some(ref fuzzy) = query.fuzzy {
             let scored = score_fuzzy_query(
                 &reader,
@@ -5776,11 +6226,12 @@ impl Searcher {
             // OpenSearch-style capped/`gte` reporting callers actually see
             // is applied once, centrally, in `search_inner` after these
             // exact per-segment totals are already summed — see
-            // `resolve_total_hits`. This v1 caps only the *reported*
-            // number; the join above still walks to completion regardless
-            // of the cap, since safely stopping the walk itself needs a
-            // per-term suffix-max upper bound the postings v5 skip table
-            // doesn't carry yet (tracked as follow-up work).
+            // `resolve_total_hits`. The one exception is the capped
+            // multi-term joins below: the AND join may stop once its own
+            // count reaches the budget and the per-term suffix-max bounds
+            // (built from the v5 skip table) prove the page is settled, and
+            // the OR join may skip candidates past the budget; either sets
+            // `hits_capped`, which turns the relation into `gte`.
             // True when some document of the segment may be ruled out, by
             // the filter or by a tombstone. The single-term arm then has to
             // count the accepted postings instead of taking the term's
@@ -5829,6 +6280,10 @@ impl Searcher {
                 let published = std::cell::Cell::new(false);
                 let docs_scored = std::cell::Cell::new(0usize);
                 let count_scored = || docs_scored.set(docs_scored.get() + 1);
+                // The capped AND join's early-exit outcome (#114), reported
+                // only when the WAND attempt's output is used.
+                let and_join_exited = std::cell::Cell::new(false);
+                let and_join_past_cap = std::cell::Cell::new(0usize);
                 let wand_attempt = || -> Option<SegmentOutput> {
                     // Required AND terms were verified in the TOC above;
                     // absent optional OR terms can be omitted here.
@@ -5865,7 +6320,7 @@ impl Searcher {
                             aggs: HashMap::new(),
                             total_hits: 0,
                             hits_capped: false,
-                            knn_segment_degraded: false,
+                            knn_segment_degraded: None,
                             knn_failed_segment: None,
                         });
                     }
@@ -5918,7 +6373,7 @@ impl Searcher {
                                 aggs: HashMap::new(),
                                 total_hits,
                                 hits_capped: false,
-                                knn_segment_degraded: false,
+                                knn_segment_degraded: None,
                                 knn_failed_segment: None,
                             });
                         }
@@ -5937,7 +6392,7 @@ impl Searcher {
                                 aggs: HashMap::new(),
                                 total_hits,
                                 hits_capped: false,
-                                knn_segment_degraded: false,
+                                knn_segment_degraded: None,
                                 knn_failed_segment: None,
                             });
                         }
@@ -6024,7 +6479,7 @@ impl Searcher {
                             aggs: HashMap::new(),
                             total_hits,
                             hits_capped: false,
-                            knn_segment_degraded: false,
+                            knn_segment_degraded: None,
                             knn_failed_segment: None,
                         });
                     }
@@ -6271,7 +6726,7 @@ impl Searcher {
                             aggs: HashMap::new(),
                             total_hits,
                             hits_capped,
-                            knn_segment_degraded: false,
+                            knn_segment_degraded: None,
                             knn_failed_segment: None,
                         });
                     }
@@ -6322,6 +6777,16 @@ impl Searcher {
                     // skip table already in memory; a term without stored
                     // summaries (legacy format) disables the exit and the
                     // walk stays exact, v1-style.
+                    //
+                    // Postings are in doc_seq (ingestion) order, so a
+                    // term's suffix max stays at its best block until the
+                    // walk passes that block, usually late in the list:
+                    // the exit only fires when the competitive documents
+                    // are front-loaded (#114). Checking the bound before
+                    // the budget is met would not change that, and every
+                    // early stop marks the count `gte`, so the gate stays
+                    // `total_hits >= cap`. `and_join_members_past_cap` in
+                    // `SearchPhaseStats` measures the walk the exit missed.
                     let mut early_exit_enabled = count_budget.is_some();
                     let mut hits_capped = false;
                     'join: loop {
@@ -6367,6 +6832,9 @@ impl Searcher {
                             continue 'join;
                         }
                         total_hits += 1;
+                        if count_budget.is_some_and(|cap| total_hits > cap) {
+                            and_join_past_cap.set(and_join_past_cap.get() + 1);
+                        }
                         if effective_k > 0 {
                             if let Some(meta) = reader.doc_meta(candidate) {
                                 let threshold = topk.threshold(global);
@@ -6424,6 +6892,7 @@ impl Searcher {
                                 // doc_id). total_hits is now a lower
                                 // bound >= the budget.
                                 hits_capped = true;
+                                and_join_exited.set(true);
                                 break;
                             }
                         }
@@ -6449,7 +6918,7 @@ impl Searcher {
                         aggs: HashMap::new(),
                         total_hits,
                         hits_capped,
-                        knn_segment_degraded: false,
+                        knn_segment_degraded: None,
                         knn_failed_segment: None,
                     })
                 };
@@ -6457,6 +6926,16 @@ impl Searcher {
                 open_stats
                     .wand_docs_scored
                     .fetch_add(docs_scored.get(), Ordering::Relaxed);
+                if attempt.is_some() {
+                    if and_join_exited.get() {
+                        open_stats
+                            .and_join_early_exits
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    open_stats
+                        .and_join_members_past_cap
+                        .fetch_add(and_join_past_cap.get(), Ordering::Relaxed);
+                }
                 if let Some(output) = attempt {
                     return Ok(Some(output));
                 }
@@ -6846,7 +7325,7 @@ impl Searcher {
             } else {
                 kosha_segment::KnnRefill::BudgetedSegments
             };
-            let knn_accept_dyn: Option<&dyn Fn(u32) -> bool> = if knn_restricted {
+            let knn_accept_dyn: Option<kosha_segment::KnnAccept<'_>> = if knn_restricted {
                 Some(&knn_accept)
             } else {
                 None
@@ -6972,6 +7451,16 @@ impl Searcher {
                     });
                     open_stats.add_knn_scan(&scan);
                     match exact {
+                        Some(Ok(exact))
+                            if fused_leg
+                                && index.is_quantized()
+                                && reader.footer().doc_vectors
+                                && exact.source == kosha_segment::ExactKnnSource::Postings =>
+                        {
+                            knn_segment_degraded = true;
+                            knn_segment_failed = true;
+                            Vec::new()
+                        }
                         Some(Ok(exact)) => {
                             open_stats
                                 .knn_postings
@@ -7012,6 +7501,44 @@ impl Searcher {
                         }
                     }
                     let (probe, scan) = kosha_segment::with_knn_scan_stats(|| match knn_cutoff {
+                        _ if fused_leg && index.is_quantized() && reader.footer().doc_vectors => {
+                            let budget = match (knn_cutoff, knn_ranking) {
+                                (_, Some(ranking)) => kosha_segment::KnnProbeBudget::Planned {
+                                    ranking,
+                                    refill: knn_refill,
+                                },
+                                (Some((max_distance, max_probes)), None) => {
+                                    kosha_segment::KnnProbeBudget::Within {
+                                        max_distance,
+                                        max_probes,
+                                        refill: knn_refill,
+                                    }
+                                }
+                                (None, None) => {
+                                    kosha_segment::KnnProbeBudget::Nprobe(knn.num_candidates)
+                                }
+                            };
+                            reader
+                                .knn_rescore_shortlist_fetching(
+                                    &knn.field,
+                                    &knn.vector,
+                                    fetch_k,
+                                    budget,
+                                    knn_accept_dyn,
+                                    vector_fetch,
+                                )
+                                .map(|r| {
+                                    r.map(|(hits, probes)| {
+                                        open_stats
+                                            .knn_postings
+                                            .fetch_add(probes, Ordering::Relaxed);
+                                        if probes > 0 {
+                                            open_stats.knn_segments.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        hits
+                                    })
+                                })
+                        }
                         Some((cutoff, effective_budget)) => match knn_ranking {
                             // The plan already ranked this segment's
                             // postings inside the cutoff (#436).
@@ -7156,7 +7683,7 @@ impl Searcher {
         // docs in this segment — decoupled from the (possibly truncated)
         // candidate list built below, mirroring the WAND paths'
         // total_hits/candidates split (see `SegmentOutput`).
-        let aggs = if query.aggs.is_empty() {
+        let aggs = if !aggregate_in_segment {
             HashMap::new()
         } else {
             if columnar_filters {
@@ -7219,7 +7746,9 @@ impl Searcher {
             .map(|(doc_seq, score)| (doc_seq, score, seg_hits.contains_key(&doc_seq)))
             .collect();
         let mut ranked: Vec<(f64, u32)> = seg_hits.into_iter().map(|(d, s)| (s, d)).collect();
-        if score_ranked && !diversified_rrf {
+        // Pure kNN needs its namespace-wide top k before sorting or paging.
+        // Keep the vector probe's candidates for that merge.
+        if !pure_knn && score_ranked && !diversified_rrf {
             // Cut to this segment's top `effective_k` by score *before*
             // paying the `DocumentId` allocation — the same discipline
             // `BoundedTopK` applies on the WAND paths.
@@ -7332,7 +7861,7 @@ impl Searcher {
         // only has to hand back its own first `k` under that order. These
         // requests used to hand back every hit they had, and the reduce
         // step sorted the whole lot to keep one page.
-        if !score_ranked && rrf.is_none() {
+        if !pure_knn && !score_ranked && rrf.is_none() {
             let rank = |a: &HitCandidate, b: &HitCandidate| {
                 compare_candidates(a, b, &query.sort, sort_value_fields)
             };
@@ -7386,7 +7915,7 @@ impl Searcher {
             aggs,
             total_hits,
             hits_capped: false,
-            knn_segment_degraded,
+            knn_segment_degraded: knn_segment_degraded.then(|| entry.segment_id.clone()),
             knn_failed_segment: knn_segment_failed.then(|| KnnSegmentFailure {
                 segment: entry.segment_id.clone(),
                 corrupt_index: knn_segment_corrupt,
@@ -7522,6 +8051,204 @@ impl Searcher {
                     .into(),
             ));
         }
+        let t_admit = Instant::now();
+        let permit = if manifest.segments.is_empty() {
+            None
+        } else {
+            let load_modes: &[bool] = match query.multi_rrf() {
+                Some(rrf) => match (
+                    rrf.queries.iter().any(|q| leg_reads_vector_columns(&q.knn)),
+                    rrf.queries
+                        .iter()
+                        .any(|q| !leg_reads_vector_columns(&q.knn)),
+                ) {
+                    (true, true) => &[false, true],
+                    (true, false) => &[true],
+                    _ => &[false],
+                },
+                None => &[query_reads_vector_columns(query)],
+            };
+            Some(self.admit_search(namespace, manifest, load_modes)?)
+        };
+        let admit_wall_ms = permit
+            .as_ref()
+            .map_or(0.0, |_| t_admit.elapsed().as_secs_f64() * 1e3);
+        let (page, mut result, mut stats) = self.rank_inner(
+            namespace,
+            manifest,
+            query,
+            tombstones,
+            vector_fetch,
+            false,
+            permit.as_ref(),
+        )?;
+        stats.admit_wall_ms = admit_wall_ms;
+        let started = Instant::now();
+        result.results = Self::materialize_page(&page, query, doc_store_hydrator, &mut stats)?;
+        stats.materialize_wall_ms += started.elapsed().as_secs_f64() * 1e3;
+        Ok((result, stats))
+    }
+
+    fn admit_search(
+        &self,
+        namespace: &NamespaceId,
+        manifest: &Manifest,
+        load_modes: &[bool],
+    ) -> Result<AdmissionPermit, KoshaError> {
+        self.segment_cache.enforce_budget();
+        // Reserve for the union of reader cache keys so fusion never
+        // waits on a permit held by one of its own retrievers.
+        let estimate = manifest
+            .segments
+            .iter()
+            .map(|entry| {
+                let seg_dir = manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id);
+                if !seg_dir.exists() {
+                    return 0;
+                }
+                load_modes
+                    .iter()
+                    .filter_map(|&load_vectors| {
+                        let key = (
+                            namespace.0.clone(),
+                            entry.segment_id.0.clone(),
+                            load_vectors,
+                        );
+                        (!self.segment_cache.contains(&key))
+                            .then(|| approx_segment_bytes(&seg_dir, load_vectors))
+                    })
+                    .sum::<u64>()
+            })
+            .sum();
+        self.ledger.admit(
+            tenant_of_namespace(&namespace.0),
+            estimate,
+            |needed, what| {
+                self.evict_for_admission(namespace, manifest, load_modes, estimate, needed, what);
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rank_inner(
+        &self,
+        namespace: &NamespaceId,
+        manifest: &Manifest,
+        query: &SearchQuery,
+        tombstones: Option<&HashMap<kosha_core::SegmentId, HashSet<u32>>>,
+        vector_fetch: Option<VectorSpanFetch<'_>>,
+        fused_leg: bool,
+        permit: Option<&AdmissionPermit>,
+    ) -> Result<(Vec<HitCandidate>, SearchResult, SearchPhaseStats), KoshaError> {
+        if let Some(subqueries) = query.rrf_subqueries() {
+            let rrf = query
+                .multi_rrf()
+                .expect("rrf subqueries have a fusion spec");
+            let mut fused = HashMap::new();
+            let mut stats = SearchPhaseStats::default();
+            let mut vector_searched = false;
+            for (i, subquery) in subqueries.enumerate() {
+                let (page, result, phase) = self.rank_inner(
+                    namespace,
+                    manifest,
+                    &subquery,
+                    tombstones,
+                    vector_fetch,
+                    true,
+                    permit,
+                )?;
+                let weight = rrf.weights.as_ref().map_or(1.0, |weights| weights[i]);
+                fuse_ranked_hits(
+                    &mut fused,
+                    page.into_iter().map(|hit| (hit.doc_id.clone(), hit)),
+                    rrf.k,
+                    weight,
+                );
+                vector_searched |= result.knn_degraded_segments.is_some();
+                stats
+                    .knn_degraded_segments
+                    .extend(phase.knn_degraded_segments);
+                stats.score_wall_ms += phase.score_wall_ms;
+                stats.materialize_wall_ms += phase.materialize_wall_ms;
+                stats.open_total_ms += phase.open_total_ms;
+                stats.open_cold += phase.open_cold;
+                stats.open_cached += phase.open_cached;
+                stats.bm25_stats_ms += phase.bm25_stats_ms;
+                stats.knn_failed_segments.extend(phase.knn_failed_segments);
+                stats
+                    .knn_corrupt_segments
+                    .extend(phase.knn_corrupt_segments);
+            }
+            stats
+                .knn_failed_segments
+                .sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            stats.knn_failed_segments.dedup();
+            stats
+                .knn_corrupt_segments
+                .sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            stats.knn_corrupt_segments.dedup();
+            let (total_hits, total_hits_relation) = resolve_total_hits(
+                fused.len(),
+                query
+                    .exact_total_hits
+                    .unwrap_or_else(exact_total_hits_engine_default),
+                query
+                    .total_hits_cap
+                    .unwrap_or_else(total_hits_cap_engine_default),
+                false,
+            );
+            let mut ranked: Vec<_> = fused
+                .into_values()
+                .map(|(score, mut hit)| {
+                    hit.score = score;
+                    hit
+                })
+                .collect();
+            let sort_by_id = query.multi_rrf_sorts_by_id();
+            ranked.sort_unstable_by(|a, b| {
+                if sort_by_id {
+                    a.doc_id.0.cmp(&b.doc_id.0)
+                } else {
+                    b.score
+                        .total_cmp(&a.score)
+                        .then_with(|| a.doc_id.0.cmp(&b.doc_id.0))
+                }
+            });
+            let start = if let Some(after) = &query.search_after {
+                if sort_by_id {
+                    ranked.partition_point(|hit| hit.doc_id.0 <= after[0])
+                } else {
+                    let score: f64 = after[0].parse().expect("validated RRF cursor score");
+                    ranked.partition_point(|hit| {
+                        hit.score > score || (hit.score == score && hit.doc_id.0 <= after[1])
+                    })
+                }
+            } else {
+                query.from
+            };
+            return Ok((
+                ranked
+                    .into_iter()
+                    .skip(start)
+                    .take(query.max_results)
+                    .collect(),
+                SearchResult {
+                    results: Vec::new(),
+                    total_hits,
+                    total_hits_relation,
+                    aggregations: None,
+                    knn_degraded_segments: vector_searched
+                        .then_some(stats.knn_degraded_segments.len() as u32),
+                    rerank_degraded: None,
+                    rerank_degraded_reason: None,
+                    knn_mode: None,
+                    knn_filtered_candidates: None,
+                    exhaustive_search_count: 0,
+                    consistency_fallback: None,
+                },
+                stats,
+            ));
+        }
         let mut hydrated;
         let manifest = if manifest
             .deletion_vectors
@@ -7542,6 +8269,7 @@ impl Searcher {
         let mut phase_stats = SearchPhaseStats::default();
         if manifest.segments.is_empty() {
             return Ok((
+                Vec::new(),
                 SearchResult {
                     results: Vec::new(),
                     total_hits: 0,
@@ -7560,50 +8288,8 @@ impl Searcher {
                 phase_stats,
             ));
         }
-        let t_admit = Instant::now();
+        let permit = permit.expect("non-empty search is admitted before ranking");
 
-        // Lazy budget enforcement: segments that were pinned by in-flight
-        // requests at insert time (and so skipped by eviction — see
-        // `SegmentCache::evict_idle_until`) get another look now that those
-        // requests may have finished. Cheap when already under budget.
-        self.segment_cache.enforce_budget();
-
-        // ── Admission (see `MemoryLedger`) ──
-        // Estimate the incremental live bytes this search can add: the
-        // on-disk footprint of every manifest segment that's present
-        // locally but not already in the in-memory cache. Deliberately
-        // conservative — bloom pruning may skip some of these without ever
-        // opening them; the unconsumed reservation is returned when the
-        // permit drops at the end of this search. The broad, unfiltered
-        // queries this gate exists for prune nothing, so for exactly the
-        // dangerous case the estimate is accurate.
-        let load_vectors = query.knn.is_some();
-        let estimate: u64 = manifest
-            .segments
-            .iter()
-            .map(|entry| {
-                let seg_dir = manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id);
-                let key = (
-                    namespace.0.clone(),
-                    entry.segment_id.0.clone(),
-                    load_vectors,
-                );
-                if seg_dir.exists() && !self.segment_cache.contains(&key) {
-                    approx_segment_bytes(&seg_dir, load_vectors)
-                } else {
-                    0
-                }
-            })
-            .sum();
-        let tenant = tenant_of_namespace(&namespace.0);
-        let permit = self.ledger.admit(tenant, estimate, |needed, what| {
-            self.evict_for_admission(namespace, manifest, load_vectors, estimate, needed, what);
-        })?;
-        phase_stats.admit_wall_ms = t_admit.elapsed().as_secs_f64() * 1e3;
-
-        // Legacy reading, for highlighting only: scoring analyzes the
-        // query per segment (`QueryAnalysis`, #220).
-        let query_terms = tokenize(&query.query_text);
         let query_analysis = QueryAnalysis::new(query);
         let term_prune = term_bloom_prune_mode(query);
 
@@ -7685,7 +8371,7 @@ impl Searcher {
                     knn,
                     &filter_keys,
                     tombstones,
-                    &permit,
+                    permit,
                     &open_stats,
                 )?;
                 phase_stats.knn_plan_ms = t_knn_plan.elapsed().as_secs_f64() * 1e3;
@@ -7707,7 +8393,8 @@ impl Searcher {
         // the cap far fewer groups (a dominant group can fill all of it).
         let knn_global: Option<GlobalKnnOutcome> = match query.knn {
             Some(ref knn)
-                if self.knn_global_rescore
+                if !fused_leg
+                    && self.knn_global_rescore
                     && !knn.is_late_interaction()
                     && knn.filter.is_none()
                     && query.filter.is_none()
@@ -7723,7 +8410,7 @@ impl Searcher {
                     knn_plan.cutoff,
                     &knn_plan.rankings,
                     tombstones,
-                    &permit,
+                    permit,
                     &open_stats,
                     vector_fetch,
                 );
@@ -7759,7 +8446,7 @@ impl Searcher {
                     manifest,
                     query,
                     &query_analysis,
-                    &permit,
+                    permit,
                     &stats_open_stats,
                 );
                 phase_stats.bm25_stats = if corpus.is_some() {
@@ -7784,7 +8471,7 @@ impl Searcher {
                 &sort_value_fields,
                 tombstones,
                 manifest,
-                &permit,
+                permit,
                 &open_stats,
                 knn_plan.cutoff,
                 knn_plan.rankings.get(&entry.segment_id),
@@ -7794,6 +8481,7 @@ impl Searcher {
                     .and_then(|global| global.segments.get(&entry.segment_id)),
                 &filter_keys,
                 vector_fetch,
+                fused_leg,
                 corpus.as_ref(),
                 shared_wand,
             )
@@ -7820,7 +8508,7 @@ impl Searcher {
                 manifest,
                 query,
                 &query_analysis,
-                &permit,
+                permit,
                 &bound_open_stats,
                 corpus.as_ref(),
                 &floor,
@@ -7835,6 +8523,10 @@ impl Searcher {
                 phase_stats.wand_global_threshold = false;
                 open_stats.wand_docs_scored.store(0, Ordering::Relaxed);
                 open_stats.wand_segments_skipped.store(0, Ordering::Relaxed);
+                open_stats.and_join_early_exits.store(0, Ordering::Relaxed);
+                open_stats
+                    .and_join_members_past_cap
+                    .store(0, Ordering::Relaxed);
             } else {
                 shared_outputs = Some(outputs);
             }
@@ -7860,6 +8552,9 @@ impl Searcher {
         phase_stats.wand_docs_scored = open_stats.wand_docs_scored.load(Ordering::Relaxed);
         phase_stats.wand_segments_skipped =
             open_stats.wand_segments_skipped.load(Ordering::Relaxed);
+        phase_stats.and_join_early_exits = open_stats.and_join_early_exits.load(Ordering::Relaxed);
+        phase_stats.and_join_members_past_cap =
+            open_stats.and_join_members_past_cap.load(Ordering::Relaxed);
         phase_stats.score_wall_ms = t_score.elapsed().as_secs_f64() * 1e3;
         // A segment the `df` pass or the ceiling pass opened cold, and the
         // scoring pass then found cached, is reported once, as cold; their
@@ -7907,15 +8602,14 @@ impl Searcher {
         // doesn't take the early-termination fast path.
         let mut total_hits: usize = 0;
         let mut any_capped = false;
-        let mut knn_degraded_segments: u32 = 0;
         let mut vector_candidates: Vec<(HitCandidate, bool)> = Vec::new();
         for output in segment_outputs {
             candidates.extend(output.candidates);
             vector_candidates.extend(output.vector_candidates);
             total_hits += output.total_hits;
             any_capped |= output.hits_capped;
-            if output.knn_segment_degraded {
-                knn_degraded_segments += 1;
+            if let Some(segment) = output.knn_segment_degraded {
+                phase_stats.knn_degraded_segments.insert(segment);
             }
             if let Some(failure) = output.knn_failed_segment {
                 if failure.corrupt_index {
@@ -7950,26 +8644,18 @@ impl Searcher {
             // vector retriever's window: lexical matches are already
             // counted, so only vector-only window members are added.
             total_hits += fused.vector_only.len();
-            if !query.aggs.is_empty() && !fused.vector_only.is_empty() {
-                for (name, state) in aggregate_vector_only(query, &fused.vector_only)? {
-                    all_aggs.entry(name).or_default().merge(state);
-                }
+            if !query.aggs.is_empty() {
+                merge_vector_aggregations(
+                    query,
+                    fused.vector_only.iter().map(|(reader, seq)| (reader, *seq)),
+                    &mut all_aggs,
+                )?;
             }
         }
 
-        // ── total_hits capping (OpenSearch-style, opt out per query) ──
-        // Every segment above counted its intersection exactly (see the
-        // `can_block_max_wand` doc comment) — this is the one place that
-        // number is turned into what callers actually see. Default: capped
-        // at `total_hits_cap` with `relation: gte` beyond it, because exact
-        // AND total_hits forces the join to visit every intersection member
-        // even long after the top-k page is settled — for a broad query
-        // intersecting millions of docs that's the difference between
-        // walking ~10⁶ candidates and reporting "at least 10,000" for free.
-        // `exact_total_hits: true` (per query, or `KOSHA_EXACT_TOTAL_HITS`
-        // engine-wide) restores the old unconditional-exact behavior.
-        let (mut total_hits, total_hits_relation) =
-            resolve_total_hits(total_hits, exact, cap, any_capped);
+        let sort_cmp = |a: &HitCandidate, b: &HitCandidate| {
+            compare_candidates(a, b, &query.sort, &sort_value_fields)
+        };
 
         // A vector-only query asks for the `k` nearest documents. Each
         // segment answers with its own nearest `k`, so the union holds up
@@ -7977,21 +8663,37 @@ impl Searcher {
         // many. The sum of the per-segment counts (`k` times the number of
         // segments) said nothing about the query.
         //
-        // Under `limit_per` that is the nearest `k` with at most `max` per
-        // group: segments probed deeper than `k` for this (see
-        // `score_segment`), and the cap is taken before the cut so the set
-        // stays `k` long when the probe found enough groups.
-        if let Some(knn) = query.knn.as_ref().filter(|_| query.is_pure_knn()) {
-            if let Some(cap) = pre_rescore_cap {
-                candidates.sort_by(by_score_then_id);
-                cap.apply(&mut candidates, |c| c);
-            }
-            if candidates.len() > knn.k {
-                candidates.sort_by(by_score_then_id);
+        // Diversify before the cut so duplicate group members do not
+        // crowd out another group the probe found. A field sort can choose
+        // a different representative for a selected group but cannot
+        // change which groups are nearest. With rank_by, the group cap
+        // instead applies after rescoring.
+        let (total_hits, total_hits_relation) =
+            if let Some(knn) = query.knn.as_ref().filter(|_| query.is_pure_knn()) {
+                if let Some(cap) = group_cap.filter(|_| rank_by.is_none()) {
+                    candidates.sort_by(by_score_then_id);
+                    if query.collapse.is_some() && !sort_is_default_ranking(&query.sort) {
+                        cap.retain_top_groups(&mut candidates, knn.k);
+                        candidates.sort_by(sort_cmp);
+                    }
+                    cap.apply(&mut candidates, |c| c);
+                } else if candidates.len() > knn.k {
+                    candidates.sort_by(by_score_then_id);
+                }
                 candidates.truncate(knn.k);
-            }
-            total_hits = candidates.len();
-        }
+                if !query.aggs.is_empty() {
+                    merge_vector_aggregations(
+                        query,
+                        candidates.iter().map(|hit| (&hit.reader, hit.doc_seq)),
+                        &mut all_aggs,
+                    )?;
+                }
+                (candidates.len(), TotalHitsRelation::Eq)
+            } else {
+                // Lexical totals may be capped, with relation `gte` if
+                // counting stopped early or the match count exceeded the cap.
+                resolve_total_hits(total_hits, exact, cap, any_capped)
+            };
 
         // ── rank_by: rescore the window (issue #212) ──
         // Everything above ranked by the query's own score (BM25, fused
@@ -8005,11 +8707,6 @@ impl Searcher {
             candidates.truncate(rank_by.window);
             rescore_candidates(rank_by, &query.filter_column_fields(), &mut candidates)?;
         }
-
-        // ── Sort (score-only / sort-key candidates — no full field payloads) ──
-        let sort_cmp = |a: &HitCandidate, b: &HitCandidate| -> std::cmp::Ordering {
-            compare_candidates(a, b, &query.sort, &sort_value_fields)
-        };
 
         // ── collapse / limit_per: at most `max` hits per group ──
         // Each segment already capped its own hits; the same group can
@@ -8057,7 +8754,7 @@ impl Searcher {
         }
 
         let from = page_start.min(candidates.len());
-        let to = (from + query.max_results).min(candidates.len());
+        let to = from.saturating_add(query.max_results).min(candidates.len());
 
         // Bounded top-k (#37): when we haven't already fully sorted for
         // search_after, partition so the top `to` candidates are correctly
@@ -8074,13 +8771,50 @@ impl Searcher {
             }
         }
 
+        let merged_aggs = finish_aggregations(query, all_aggs)?;
+        phase_stats.materialize_wall_ms = t_materialize.elapsed().as_secs_f64() * 1e3;
+        candidates.truncate(to);
+        candidates.drain(..from);
+
+        Ok((
+            candidates,
+            SearchResult {
+                results: Vec::new(),
+                total_hits,
+                total_hits_relation,
+                aggregations: merged_aggs,
+                knn_degraded_segments: query
+                    .knn
+                    .as_ref()
+                    .map(|_| phase_stats.knn_degraded_segments.len() as u32),
+                rerank_degraded: None,
+                rerank_degraded_reason: None,
+                knn_mode: phase_stats.knn_mode.map(|mode| mode.as_str().to_string()),
+                knn_filtered_candidates: phase_stats.knn_filtered_candidates,
+                exhaustive_search_count: 0,
+                consistency_fallback: None,
+            },
+            phase_stats,
+        ))
+    }
+
+    fn materialize_page(
+        candidates: &[HitCandidate],
+        query: &SearchQuery,
+        doc_store_hydrator: DocStoreHydrator<'_>,
+        phase_stats: &mut SearchPhaseStats,
+    ) -> Result<Vec<ScoredDocument>, KoshaError> {
+        let query_terms = query
+            .highlight
+            .as_ref()
+            .map(|_| tokenize(&query.query_text));
         // On-demand page bytes: a cold search hydrated just the offsets
         // sidecar for Lazy segments, so the page's records are not local
         // yet. Group the page's non-local documents by segment and ask the
         // hydrator for them once (ranged spans or whole files — its call,
         // see `DocStoreHydrator`). Whatever it fetched is persisted, so a
         // warm repeat finds every document local and never gets here.
-        for cand in &candidates[from..to] {
+        for cand in candidates {
             let dir = cand.reader.segment_dir();
             if !phase_stats.page_segments.iter().any(|d| d == dir) {
                 phase_stats.page_segments.push(dir.to_path_buf());
@@ -8091,8 +8825,8 @@ impl Searcher {
         // document (see `kosha_segment::PageSpans`).
         let mut page_readers: Vec<(&Arc<TrackedSegment>, bool, kosha_segment::PageSpans)> =
             Vec::new();
-        let mut page_idx: Vec<usize> = Vec::with_capacity(to.saturating_sub(from));
-        for cand in &candidates[from..to] {
+        let mut page_idx: Vec<usize> = Vec::with_capacity(candidates.len());
+        for cand in candidates {
             let reader = &cand.reader;
             let i = match page_readers
                 .iter()
@@ -8109,7 +8843,7 @@ impl Searcher {
         }
         if let Some(ensure_doc_store) = doc_store_hydrator {
             let mut page_segs: Vec<(usize, Vec<u32>)> = Vec::new();
-            for (cand, &i) in candidates[from..to].iter().zip(&page_idx) {
+            for (cand, &i) in candidates.iter().zip(&page_idx) {
                 let (reader, vectors, spans) = &mut page_readers[i];
                 if reader.page_doc_is_local(cand.doc_seq, *vectors, spans) {
                     continue;
@@ -8149,8 +8883,8 @@ impl Searcher {
         // from disk (one seek+read per document, not the whole segment).
         // Every page document is now local — whole file or cached span —
         // so reading it needs no further S3 round trip.
-        let mut page = Vec::with_capacity(to - from);
-        for (cand, &i) in candidates[from..to].iter().zip(&page_idx) {
+        let mut page = Vec::with_capacity(candidates.len());
+        for (cand, &i) in candidates.iter().zip(&page_idx) {
             let (reader, vectors, spans) = &mut page_readers[i];
             // A hit's `doc_seq` came from this segment's own postings or
             // vectors, so a record that is not there is a damaged segment,
@@ -8172,9 +8906,9 @@ impl Searcher {
                 fused_score: None,
                 rerank_score: None,
             };
-            if let Some(ref highlight) = query.highlight {
+            if let (Some(highlight), Some(query_terms)) = (&query.highlight, &query_terms) {
                 if !query_terms.is_empty() {
-                    apply_highlights(&mut doc, highlight, &query_terms);
+                    apply_highlights(&mut doc, highlight, query_terms);
                 }
             }
             // After highlighting, which reads the field it marks up even
@@ -8185,26 +8919,7 @@ impl Searcher {
             page.push(doc);
         }
 
-        let merged_aggs = finish_aggregations(query, all_aggs)?;
-
-        phase_stats.materialize_wall_ms = t_materialize.elapsed().as_secs_f64() * 1e3;
-
-        Ok((
-            SearchResult {
-                results: page,
-                total_hits,
-                total_hits_relation,
-                aggregations: merged_aggs,
-                knn_degraded_segments: query.knn.as_ref().map(|_| knn_degraded_segments),
-                rerank_degraded: None,
-                rerank_degraded_reason: None,
-                knn_mode: phase_stats.knn_mode.map(|mode| mode.as_str().to_string()),
-                knn_filtered_candidates: phase_stats.knn_filtered_candidates,
-                exhaustive_search_count: 0,
-                consistency_fallback: None,
-            },
-            phase_stats,
-        ))
+        Ok(page)
     }
 }
 
@@ -8895,7 +9610,7 @@ struct SegmentOutput {
     /// vector candidates (see `SearchResult::knn_degraded_segments`).
     /// Always `false` on every fast path below except the general path,
     /// which is the only one that runs kNN at all.
-    knn_segment_degraded: bool,
+    knn_segment_degraded: Option<kosha_core::SegmentId>,
     /// This segment, when it is degraded because its kNN search failed (an
     /// unreadable or unfetched vector posting, vector field or exact vector,
     /// a corrupt `vector.idx` body). `None` for a segment skipped by design
@@ -8960,8 +9675,7 @@ fn rrf_fuse(
     }
     vector.truncate(window.min(knn_k));
 
-    let constant = f64::from(params.rank_constant);
-    let contribution = |rank: usize| 1.0 / (constant + rank as f64);
+    let contribution = |rank: usize| rrf_contribution(params.rank_constant, rank - 1, 1.0);
     let mut fused: Vec<HitCandidate> = Vec::with_capacity(lexical.len() + vector.len());
     let mut position: HashMap<String, usize> = HashMap::with_capacity(lexical.len());
     for (i, mut cand) in lexical.into_iter().enumerate() {
@@ -9008,51 +9722,77 @@ fn rrf_fuse(
     }
 }
 
-/// Aggregations over the vector-only members of a hybrid request's vector
-/// window, grouped by segment: a hybrid request aggregates over the same
-/// documents its `total_hits` counts (lexical matches plus the vector
-/// window), and the per-segment pass only saw the lexical matches.
+fn rrf_contribution(k: u32, rank_index: usize, weight: f64) -> f64 {
+    weight / (f64::from(k) + (rank_index + 1) as f64)
+}
+
+fn fuse_ranked_hits<T>(
+    fused: &mut HashMap<DocumentId, (f64, T)>,
+    hits: impl Iterator<Item = (DocumentId, T)>,
+    k: u32,
+    weight: f64,
+) {
+    let mut seen = HashSet::new();
+    for (id, hit) in hits {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        let contribution = rrf_contribution(k, seen.len() - 1, weight);
+        match fused.entry(id) {
+            std::collections::hash_map::Entry::Occupied(mut existing) => {
+                existing.get_mut().0 += contribution;
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert((contribution, hit));
+            }
+        }
+    }
+}
+
+/// Aggregate vector matches selected at the namespace merge: the nearest
+/// k for pure kNN, or the hybrid vector window's non-lexical members.
 ///
 /// Reads each segment the way the per-segment pass does: a columnar
 /// segment (#244) from its columns, a `filters.bin` segment from the
 /// columns of the row store this query names. A damaged column fails the
 /// request closed instead of silently dropping these documents from the
 /// buckets (issue #215).
-fn aggregate_vector_only(
+fn merge_vector_aggregations<'a>(
     query: &SearchQuery,
-    vector_only: &[(Arc<TrackedSegment>, u32)],
-) -> Result<Vec<(String, AggregationState)>, KoshaError> {
+    matches: impl Iterator<Item = (&'a Arc<TrackedSegment>, u32)>,
+    aggs: &mut HashMap<String, AggregationState>,
+) -> Result<(), KoshaError> {
     let mut by_segment: Vec<(&Arc<TrackedSegment>, HashSet<u32>)> = Vec::new();
-    for (reader, doc_seq) in vector_only {
+    for (reader, doc_seq) in matches {
         match by_segment
             .iter_mut()
             .find(|(seen, _)| Arc::ptr_eq(seen, reader))
         {
             Some((_, seqs)) => {
-                seqs.insert(*doc_seq);
+                seqs.insert(doc_seq);
             }
-            None => by_segment.push((reader, HashSet::from([*doc_seq]))),
+            None => by_segment.push((reader, HashSet::from([doc_seq]))),
         }
     }
-    let mut out = Vec::new();
     for (reader, wanted) in by_segment {
         if reader.has_filter_columns() {
             let mut wanted: Vec<u32> = wanted.into_iter().collect();
             wanted.sort_unstable();
             for (name, agg) in &query.aggs {
-                out.push((
-                    name.clone(),
-                    aggregate_matches_columnar(reader, &wanted, agg)?,
-                ));
+                aggs.entry(name.clone())
+                    .or_default()
+                    .merge(aggregate_matches_columnar(reader, &wanted, agg)?);
             }
         } else {
             let store = reader.filter_store_for(&query.filter_column_fields())?;
             for (name, agg) in &query.aggs {
-                out.push((name.clone(), aggregate_matches(&store, &wanted, agg)));
+                aggs.entry(name.clone())
+                    .or_default()
+                    .merge(aggregate_matches(&store, &wanted, agg));
             }
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 fn sort_fields_needing_values(sort: &[SortSpec]) -> Vec<String> {
@@ -9382,6 +10122,13 @@ struct GroupCap {
     cap_missing: bool,
 }
 
+#[derive(PartialEq, Eq, Hash)]
+enum GroupValue {
+    Text(String),
+    Number(u64),
+    Missing,
+}
+
 impl GroupCap {
     /// The request's cap, if any. `sort_value_fields` must already include
     /// the group field (see `search_inner`).
@@ -9399,22 +10146,34 @@ impl GroupCap {
         })
     }
 
+    fn group_value(&self, candidate: &HitCandidate) -> Option<GroupValue> {
+        match candidate.sort_values.get(self.index) {
+            Some(SortValue::Text(value)) => Some(GroupValue::Text(value.clone())),
+            Some(SortValue::Number(value)) => Some(GroupValue::Number(value.to_bits())),
+            Some(SortValue::Missing) | None if self.cap_missing => Some(GroupValue::Missing),
+            Some(SortValue::Missing) | None => None,
+        }
+    }
+
+    /// Keep all members of the first `k` collapse groups in score order
+    /// so field sorting can still choose their representatives.
+    fn retain_top_groups(&self, candidates: &mut Vec<HitCandidate>, k: usize) {
+        let mut groups = HashSet::new();
+        candidates.retain(|candidate| {
+            let group = self
+                .group_value(candidate)
+                .expect("collapse includes the missing-value group");
+            groups.contains(&group) || (groups.len() < k && groups.insert(group))
+        });
+    }
+
     /// Drop every item that has `max` items of its group ahead of it.
     /// `items` must already be in result order.
     fn apply<T>(&self, items: &mut Vec<T>, candidate: impl Fn(&T) -> &HitCandidate) {
-        #[derive(PartialEq, Eq, Hash)]
-        enum Group {
-            Text(String),
-            Number(u64),
-            Missing,
-        }
-        let mut seen: HashMap<Group, usize> = HashMap::new();
+        let mut seen: HashMap<GroupValue, usize> = HashMap::new();
         items.retain(|item| {
-            let group = match candidate(item).sort_values.get(self.index) {
-                Some(SortValue::Text(value)) => Group::Text(value.clone()),
-                Some(SortValue::Number(value)) => Group::Number(value.to_bits()),
-                Some(SortValue::Missing) | None if !self.cap_missing => return true,
-                Some(SortValue::Missing) | None => Group::Missing,
+            let Some(group) = self.group_value(candidate(item)) else {
+                return true;
             };
             let count = seen.entry(group).or_insert(0);
             *count += 1;
@@ -11031,6 +11790,7 @@ mod tests {
     use kosha_core::{DocumentId, Field, ManifestEntry, SegmentId, SortOrder};
     use kosha_segment::SegmentWriter;
 
+    mod knn_plan_prune;
     mod knn_plan_two_stage;
 
     /// #195: each requested field is marked up with its own tags; a
@@ -11400,14 +12160,26 @@ mod tests {
 
         let mut exact_q = mk_query("alpha beta", 10);
         exact_q.exact_total_hits = Some(true);
-        let exact = searcher.search(&ns, &manifest, &exact_q, None).unwrap();
+        let (exact, exact_stats) = searcher
+            .search_with_stats(&ns, &manifest, &exact_q, None)
+            .unwrap();
         assert_eq!(exact.total_hits, 600);
         assert_eq!(exact.total_hits_relation, TotalHitsRelation::Eq);
+        assert_eq!(exact_stats.and_join_early_exits, 0);
+        assert_eq!(exact_stats.and_join_members_past_cap, 0);
 
         let mut capped_q = mk_query("alpha beta", 10);
         capped_q.exact_total_hits = Some(false);
         capped_q.total_hits_cap = Some(50);
-        let capped = searcher.search(&ns, &manifest, &capped_q, None).unwrap();
+        let (capped, capped_stats) = searcher
+            .search_with_stats(&ns, &manifest, &capped_q, None)
+            .unwrap();
+        assert_eq!(capped_stats.and_join_early_exits, 1);
+        assert!(
+            capped_stats.and_join_members_past_cap < 550,
+            "the exit must stop the walk before the last member: {}",
+            capped_stats.and_join_members_past_cap
+        );
         assert_eq!(
             page_ids(&capped),
             page_ids(&exact),
@@ -11445,6 +12217,80 @@ mod tests {
         assert_eq!(roomy.total_hits, 600);
         assert_eq!(roomy.total_hits_relation, TotalHitsRelation::Eq);
         assert_eq!(page_ids(&roomy), page_ids(&exact));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capped_mode_early_exit_does_not_fire_on_late_competitive_docs() {
+        // #114: postings are in ingestion order, and the AND join's exit
+        // bound is each term's suffix max over its remaining blocks. One
+        // competitive document late in the list keeps that bound above the
+        // floor until the walk passes it, so the whole intersection is
+        // walked. Same corpus shape as the test above, but the strong
+        // documents are spread through the list (every 100th doc) instead
+        // of leading it — the last one sits in the final block.
+        let dir = std::env::temp_dir().join("kosha-test-cap-early-exit-late");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir);
+        for i in 0..600 {
+            let tf = if i % 100 == 99 { 7 } else { 1 };
+            let text = format!("{} beta{}", "alpha ".repeat(tf), " pad".repeat(4 + i % 7));
+            w.add_document(
+                DocumentId(format!("doc-{i:04}")),
+                vec![Field::text("t", text)],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 600,
+            }],
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            branch: None,
+            schema: None,
+            retired: Default::default(),
+            shards: None,
+        };
+        let searcher = Searcher::new(dir.clone());
+
+        let mut exact_q = mk_query("alpha beta", 5);
+        exact_q.exact_total_hits = Some(true);
+        let exact = searcher.search(&ns, &manifest, &exact_q, None).unwrap();
+        assert_eq!(exact.total_hits, 600);
+        let top: Vec<String> = (0..6).map(|j| format!("doc-{:04}", j * 100 + 99)).collect();
+        assert!(
+            page_ids(&exact).iter().all(|id| top.contains(id)),
+            "the page is the tf=7 docs: {:?}",
+            page_ids(&exact)
+        );
+
+        let mut capped_q = mk_query("alpha beta", 5);
+        capped_q.exact_total_hits = Some(false);
+        capped_q.total_hits_cap = Some(50);
+        let (capped, stats) = searcher
+            .search_with_stats(&ns, &manifest, &capped_q, None)
+            .unwrap();
+        assert_eq!(page_ids(&capped), page_ids(&exact));
+        assert_eq!(capped.total_hits, 50);
+        assert_eq!(capped.total_hits_relation, TotalHitsRelation::Gte);
+        assert_eq!(
+            stats.and_join_early_exits, 0,
+            "the last strong doc is in the final block, so the bound never drops"
+        );
+        assert_eq!(
+            stats.and_join_members_past_cap, 550,
+            "every member past the budget is walked"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -11734,6 +12580,44 @@ mod tests {
         assert_eq!(held.doc_count(), 1);
         drop(held);
         assert!(!searcher.release_segment("test", "s1"));
+        assert!(searcher.draining.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #347 review nit: forgetting a namespace (a deletion purge pass can
+    /// select a live, re-created one) must not hide from the local GC that
+    /// a search still reads one of its retired segments.
+    #[test]
+    fn forget_namespaces_keeps_inflight_readers_visible_to_release_segment() {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-forget-namespaces-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s1_dir = mk_segment(&dir, "acme/docs", "s1", "alpha");
+        let s2_dir = mk_segment(&dir, "acme/docs", "s2", "beta");
+        let searcher = Searcher::with_segment_cache_limits(dir.clone(), 10, u64::MAX);
+
+        // s1: retired while a search holds a reader, and the GC already
+        // asked once, so `draining` knows the reader.
+        let held = searcher
+            .open_segment("acme/docs", "s1", s1_dir, false, None, None, None)
+            .unwrap();
+        assert!(searcher.release_segment("acme/docs", "s1"));
+        // s2: cached and held by a search, never released yet.
+        let held2 = searcher
+            .open_segment("acme/docs", "s2", s2_dir, false, None, None, None)
+            .unwrap();
+
+        assert_eq!(searcher.forget_namespaces(|ns| ns == "acme/docs"), 1);
+        // Both stay busy for the GC while their searches run.
+        assert!(searcher.release_segment("acme/docs", "s1"), "s1 still read");
+        assert!(searcher.release_segment("acme/docs", "s2"), "s2 still read");
+        assert_eq!(held.doc_count(), 1);
+        drop(held);
+        drop(held2);
+        assert!(!searcher.release_segment("acme/docs", "s1"));
+        assert!(!searcher.release_segment("acme/docs", "s2"));
         assert!(searcher.draining.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -12129,11 +13013,13 @@ mod tests {
                     .map(|f| on_disk(d, f))
                     .sum::<u64>();
             if load_vectors {
-                // The sidecar's centroids, and the i8 codes of them that
-                // the open derives (resident, but in no file; their size
-                // is checked against a loaded column in kosha-segment).
+                // The sidecar's centroids, and the i8 codes and centroid
+                // cap the open derives from them (resident, but in no file;
+                // their sizes are checked against a loaded column in
+                // kosha-segment).
                 t += on_disk(d, "vector.offsets")
-                    + kosha_segment::vector_centroid_code_bytes(&d.join("vector.offsets"));
+                    + kosha_segment::vector_centroid_code_bytes(&d.join("vector.offsets"))
+                    + kosha_segment::vector_centroid_cap_bytes(&d.join("vector.offsets"));
             }
             t
         };
@@ -15815,17 +16701,40 @@ mod tests {
 
         let requested: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
         let requested_clone = Arc::clone(&requested);
+        let ledger = Arc::clone(&searcher.ledger);
         // Test-side stand-in for an S3 whole-file fetch of `doc_store.bin`:
         // restore the backed-up file to its on-disk path so the segment's
         // local `doc_record_full` seek+read succeeds, exactly as it would
         // after the real hydrator's `ensure_files_local` lands the file.
         let ensure_doc_store = move |segs: &[PageSegment<'_>]| {
+            assert_eq!(ledger.state.lock().unwrap().active, 1);
             for seg in segs {
                 let seg = seg.segment_dir;
                 requested_clone.lock().unwrap().push(seg.to_path_buf());
                 let _ = std::fs::copy(seg.join("doc_store.bin.bak"), seg.join("doc_store.bin"));
             }
         };
+
+        let mut fused: SearchQuery = serde_json::from_value(serde_json::json!({
+            "query_text": "",
+            "rank_by": {"rrf": {"queries": [{"query_text": "hello"}, {"query_text": "moon"}]}},
+            "max_results": 0
+        }))
+        .unwrap();
+        let run_fused = |q: &SearchQuery| {
+            searcher
+                .search_with_doc_store_hydrator(&ns, &manifest, q, None, Some(&ensure_doc_store))
+                .unwrap()
+                .0
+        };
+        assert_eq!(run_fused(&fused).total_hits, 2);
+        assert!(requested.lock().unwrap().is_empty());
+        fused.max_results = 1;
+        assert_eq!(run_fused(&fused).results[0].doc_id.0, "d2");
+        assert_eq!(ledger_snapshot(&searcher).2, 0);
+        assert_eq!(*requested.lock().unwrap(), [dir.join("test/s2")]);
+        std::fs::remove_file(dir.join("test/s2/doc_store.bin")).unwrap();
+        requested.lock().unwrap().clear();
 
         let q = mk_query("hello", 5);
         let r = searcher
@@ -19712,6 +20621,73 @@ mod corpus_stats_tests {
         r.results.iter().map(|d| d.doc_id.0.clone()).collect()
     }
 
+    #[test]
+    fn capped_and_early_exit_preserves_top_k_in_both_posting_orders() {
+        const DOCS: usize = 2_560;
+        const CAP: usize = 100;
+        const TOP_K: usize = 10;
+        let ns = NamespaceId("ns".into());
+        let dir = scratch("capped-and-posting-order");
+        let mut docs: Vec<_> = (0..DOCS)
+            .map(|i| Doc {
+                id: format!("doc-{i:04}"),
+                content: if i < DOCS / 20 {
+                    "alpha beta ".repeat(8 + i % 16)
+                } else {
+                    format!("alpha beta {}", "pad ".repeat(20 + i % 24))
+                },
+                matter: "m0".into(),
+            })
+            .collect();
+        let (clustered, _) =
+            write_segments(&dir, &ns.0, "clustered", std::slice::from_ref(&docs), 1);
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for i in (1..docs.len()).rev() {
+            docs.swap(i, rng.below(i + 1));
+        }
+        let (shuffled, _) = write_segments(&dir, &ns.0, "shuffled", &[docs], 1);
+        let searcher = Searcher::new(dir.clone());
+        let mut exact_query = query("alpha beta", TOP_K);
+        exact_query.operator = Some(kosha_core::QueryOperator::And);
+        let mut capped_query = exact_query.clone();
+        capped_query.exact_total_hits = Some(false);
+        capped_query.total_hits_cap = Some(CAP);
+
+        for (label, manifest) in [("clustered", clustered), ("shuffled", shuffled)] {
+            let (exact, exact_stats) = searcher
+                .search_with_stats(&ns, &manifest, &exact_query, None)
+                .unwrap();
+            let (capped, capped_stats) = searcher
+                .search_with_stats(&ns, &manifest, &capped_query, None)
+                .unwrap();
+            assert_eq!(exact_stats.and_join_early_exits, 0, "{label}");
+            assert_eq!(exact_stats.and_join_members_past_cap, 0, "{label}");
+            assert_eq!(exact.total_hits, DOCS, "{label}");
+            assert_eq!(exact.total_hits_relation, TotalHitsRelation::Eq, "{label}");
+            assert_eq!(capped.total_hits, CAP, "{label}");
+            assert_eq!(
+                capped.total_hits_relation,
+                TotalHitsRelation::Gte,
+                "{label}"
+            );
+            assert_eq!(exact.results.len(), TOP_K, "{label}");
+            assert_eq!(page_ids(&capped), page_ids(&exact), "{label}");
+            for (c, e) in capped.results.iter().zip(&exact.results) {
+                assert_eq!(c.score, e.score, "{label}: {}", c.doc_id.0);
+            }
+            if label == "clustered" {
+                // The response's cap alone doesn't distinguish early exit from clamping.
+                assert_eq!(capped_stats.and_join_early_exits, 1, "{label}");
+                assert!(
+                    capped_stats.and_join_members_past_cap < DOCS - CAP,
+                    "expected the clustered walk to stop early, walked {} past the cap",
+                    capped_stats.and_join_members_past_cap
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `N`, `avgdl` and `df` must equal the hand-computed namespace sums.
     #[test]
     fn corpus_scores_match_hand_computed_bm25() {
@@ -20505,6 +21481,34 @@ mod rrf_tests {
         });
         q.rank = rank.map(|rrf| RankSpec { rrf: Some(rrf) });
         q
+    }
+
+    #[test]
+    fn multi_rrf_matches_fixed_reference_rankings() {
+        let lists = [["a", "b", "c"], ["c", "b", "d"], ["d", "a", "b"]];
+        for weights in [[1.0; 3], [0.5, 3.0, 2.0]] {
+            let mut actual = HashMap::new();
+            for (list, weight) in lists.iter().zip(weights) {
+                fuse_ranked_hits(
+                    &mut actual,
+                    list.iter().map(|id| (DocumentId((*id).into()), ())),
+                    60,
+                    weight,
+                );
+            }
+            assert_eq!(actual.len(), 4);
+            for id in ["a", "b", "c", "d"] {
+                let expected: f64 = lists
+                    .iter()
+                    .zip(weights)
+                    .filter_map(|(list, weight)| {
+                        let rank = list.iter().position(|doc| *doc == id)? + 1;
+                        Some(weight / (60 + rank) as f64)
+                    })
+                    .sum();
+                assert!((actual[&DocumentId(id.into())].0 - expected).abs() < 1e-14);
+            }
+        }
     }
 
     fn rrf(window: Option<usize>, constant: Option<u32>) -> Option<RrfSpec> {
@@ -22220,6 +23224,80 @@ mod field_tests {
             ),
             ["title_runs"]
         );
+    }
+
+    #[test]
+    fn field_query_keeps_restrictions_for_punctuation_only_keywords() {
+        let root = temp_root("keyword-punctuation");
+        let config = NamespaceSchema {
+            default_analyzer: vec!["keyword".into()],
+            ..Default::default()
+        }
+        .resolve()
+        .unwrap();
+        let mut manifest = empty_manifest();
+        add_segment(
+            &root,
+            &mut manifest,
+            Seg {
+                name: "s1",
+                field_index: true,
+                config: Some(&config),
+            },
+            vec![
+                doc("in_title", "...", "other"),
+                doc("in_content", "other", "..."),
+            ],
+        );
+        assert_eq!(
+            hits(&root, &manifest, &query("...", &[])),
+            ["in_content", "in_title"]
+        );
+        assert_eq!(
+            hits(&root, &manifest, &query("...", &["title"])),
+            ["in_title"]
+        );
+        assert_eq!(
+            hits(&root, &manifest, &query("...", &["content"])),
+            ["in_content"]
+        );
+    }
+
+    #[test]
+    fn boosted_all_keeps_combined_keyword_matches() {
+        let root = temp_root("boosted-all-keyword");
+        let config = NamespaceSchema {
+            fields: [(
+                "title".into(),
+                FieldSchema {
+                    analyzer: vec!["keyword".into()],
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        }
+        .resolve()
+        .unwrap();
+        let mut manifest = empty_manifest();
+        add_segment(
+            &root,
+            &mut manifest,
+            Seg {
+                name: "s1",
+                field_index: true,
+                config: Some(&config),
+            },
+            vec![doc("keyword", "...", "ordinary text")],
+        );
+        for fields in [&[][..], &["_all"], &["_all^2"], &["_all", "content"]] {
+            assert_eq!(
+                hits(&root, &manifest, &query("...", fields)),
+                ["keyword"],
+                "{fields:?}"
+            );
+        }
     }
 
     #[test]

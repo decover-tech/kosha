@@ -64,6 +64,12 @@ impl OrgBackend {
         }
     }
 
+    /// Every audit row of the in-memory store, oldest first (tests).
+    #[cfg(test)]
+    pub(crate) fn audit_rows(&self) -> Vec<kosha_control::orgs::AuditEvent> {
+        self.memory.audit_log()
+    }
+
     pub(crate) fn from_env() -> Self {
         #[allow(unused_mut)]
         let mut backend = Self::in_memory();
@@ -74,7 +80,9 @@ impl OrgBackend {
         backend
     }
 
-    fn store(&self) -> Result<Arc<dyn OrgStore>, String> {
+    /// The organization store: Postgres when configured, else this
+    /// process's memory. Also where `admin_audit` writes its rows.
+    pub(crate) fn store(&self) -> Result<Arc<dyn OrgStore>, String> {
         #[cfg(feature = "postgres")]
         if let Some(url) = &self.database_url {
             // One pool per process: the key store's, when there is one.
@@ -93,6 +101,36 @@ impl OrgBackend {
                 return Ok(pg);
             }
         }
+        Ok(self.memory.clone())
+    }
+}
+
+impl OrgBackend {
+    /// The same store as [`Self::store`], as the console's identity store
+    /// (#345 part 2). `auth` is the server's key table, whose Postgres pool
+    /// is shared when there is one.
+    pub(crate) fn identity_store(
+        &self,
+        auth: &crate::auth::Auth,
+    ) -> Result<Arc<dyn kosha_control::identity::IdentityStore>, String> {
+        #[cfg(feature = "postgres")]
+        if let Some(url) = &self.database_url {
+            if let crate::auth::Auth::Keys(keys) = auth {
+                if let Some(pg) = keys.pg() {
+                    return Ok(pg);
+                }
+            }
+            let mut own = self.pg.lock().unwrap_or_else(|e| e.into_inner());
+            if own.is_none() {
+                let store = kosha_control::PgStore::new(url)
+                    .map_err(|e| format!("failed to connect to postgres: {e}"))?;
+                *own = Some(Arc::new(store));
+            }
+            if let Some(pg) = own.clone() {
+                return Ok(pg);
+            }
+        }
+        let _ = auth;
         Ok(self.memory.clone())
     }
 }

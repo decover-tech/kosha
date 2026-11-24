@@ -24,6 +24,13 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"], optiona
 
 # Ids for organizations, users, projects and API keys (in-memory and Postgres).
 uuid = { version = "1", features = ["v4"] }
+# Console passwords (identity.rs, #345): argon2id, the memory-hard KDF
+# OWASP recommends. Pure Rust (RustCrypto); PHC strings via `password-hash`,
+# salts from our own `getrandom` call, so no `rand` feature.
+argon2 = { version = "=0.5.3", default-features = false, features = ["alloc", "password-hash"] }
+# Random session, verification, reset and invite tokens (identity.rs).
+# Already in the tree (uuid, ring); the OS CSPRNG, nothing else.
+getrandom = "0.2"
 
 [features]
 default = []

@@ -279,7 +279,14 @@ pub(crate) struct CacheTenantSample {
 }
 
 /// The caches `kosha_cache_*` reports, in exposition order.
-const CACHES: [&str; 5] = ["nvme", "segment", "result", "corpus_stats", "ceiling"];
+const CACHES: [&str; 6] = [
+    "nvme",
+    "segment",
+    "result",
+    "corpus_stats",
+    "ceiling",
+    "posting_blob_presence",
+];
 
 /// Caches bounded by entry count, whose bytes are not tracked: they report
 /// hits, misses and evictions but no `kosha_cache_bytes` series.
@@ -288,6 +295,12 @@ const ENTRY_BOUNDED_CACHES: [&str; 2] = ["corpus_stats", "ceiling"];
 /// The decoded-postings caches, process-wide and not split by tenant: their
 /// `kosha_cache_*` series carry only the `cache` label (#197).
 const DECODED_CACHES: [&str; 2] = ["postings", "vector_postings"];
+
+/// Caches that report only hits and misses: the posting-blob presence
+/// cache holds one entry per namespace, replaced rather than evicted when
+/// the manifest version or eviction generation moves, and its bytes are
+/// not tracked.
+const LOOKUP_ONLY_CACHES: [&str; 1] = ["posting_blob_presence"];
 
 /// Point-in-time values read from the server's own atomics at scrape time.
 #[derive(Clone, Debug, Default)]
@@ -418,6 +431,11 @@ impl Collector for ScrapeCollector {
                 if name == "kosha_cache_bytes" && ENTRY_BOUNDED_CACHES.contains(&cache) {
                     continue;
                 }
+                if matches!(name, "kosha_cache_bytes" | "kosha_cache_evictions")
+                    && LOOKUP_ONLY_CACHES.contains(&cache)
+                {
+                    continue;
+                }
                 if self.tenant_labels {
                     for t in tenants.iter().filter(|t| t.cache == cache) {
                         let set = [("cache", cache), ("tenant", t.stats.tenant.as_str())];
@@ -541,7 +559,7 @@ pub(crate) struct Metrics {
     lease_outcomes: [Counter; 3],
     knn_degraded_segments: Counter,
     tenant_rejections: Family<Labels, Counter>,
-    tenant_rejection_reasons: [Counter; 8],
+    tenant_rejection_reasons: [Counter; crate::tenant_limits::RejectReason::ALL.len()],
     legacy_requests: Family<Labels, Counter>,
 }
 
@@ -803,6 +821,12 @@ impl Metrics {
         self.lease_outcomes[outcome as usize].inc();
     }
 
+    /// Add a collector read at scrape time: the usage pipeline's and
+    /// billing's families (`pipeline_metrics.rs`, #348/#349).
+    pub(crate) fn register_collector(&mut self, collector: Box<dyn Collector>) {
+        self.registry.register_collector(collector);
+    }
+
     /// The registry in Prometheus text format (0.0.4), with `scrape` as
     /// the current value of every scrape-time series.
     pub(crate) fn render(&self, scrape: &Scrape) -> String {
@@ -946,6 +970,8 @@ pub(crate) mod tests {
                 cache_sample("result", "beta", 100, 2, 3, 1),
                 cache_sample("corpus_stats", "acme", 0, 8, 2, 1),
                 cache_sample("ceiling", "beta", 0, 4, 1, 0),
+                cache_sample("posting_blob_presence", "acme", 0, 6, 2, 0),
+                cache_sample("posting_blob_presence", "beta", 0, 3, 1, 0),
             ],
             decoded_caches: [
                 kosha_segment::PostingsCacheStats {
@@ -1070,6 +1096,11 @@ pub(crate) mod tests {
         assert_eq!(get(&samples, "kosha_cache_hits_total", &vectors), 6.0);
         assert_eq!(get(&samples, "kosha_cache_misses_total", &vectors), 4.0);
         assert_eq!(get(&samples, "kosha_cache_bytes", &vectors), 2048.0);
+        let presence = [("cache", "posting_blob_presence")];
+        assert_eq!(get(&samples, "kosha_cache_hits_total", &presence), 9.0);
+        assert_eq!(get(&samples, "kosha_cache_misses_total", &presence), 3.0);
+        assert!(value(&samples, "kosha_cache_bytes", &presence).is_none());
+        assert!(value(&samples, "kosha_cache_evictions_total", &presence).is_none());
 
         let labelled = Metrics::new(MetricsConfig {
             tenant_labels: true,
@@ -1083,6 +1114,9 @@ pub(crate) mod tests {
         assert_eq!(get(&samples, "kosha_cache_evictions_total", &acme), 4.0);
         let beta = [("cache", "result"), ("tenant", "beta")];
         assert_eq!(get(&samples, "kosha_cache_misses_total", &beta), 3.0);
+        let presence = [("cache", "posting_blob_presence"), ("tenant", "beta")];
+        assert_eq!(get(&samples, "kosha_cache_hits_total", &presence), 3.0);
+        assert_eq!(get(&samples, "kosha_cache_misses_total", &presence), 1.0);
         assert!(samples
             .iter()
             .filter(|s| s.name.starts_with("kosha_cache_"))
