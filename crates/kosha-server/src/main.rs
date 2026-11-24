@@ -13160,12 +13160,18 @@ mod tests {
     #[derive(Clone)]
     pub(crate) struct SharedManifestStore {
         inner: Arc<Mutex<kosha_control::Controller>>,
-        branch_commit_failure: Arc<Mutex<Option<(NamespaceId, BranchCommitFailure)>>>,
+        branch_commit_failure: Arc<Mutex<Option<InjectedBranchCommitFailure>>>,
         lose_next_commit_reply: Arc<std::sync::atomic::AtomicBool>,
         /// Commit this manifest (over the stored version) right after the
         /// next `manifest_version` read: a writer racing the reader.
         commit_on_next_version_read: Arc<Mutex<Option<kosha_core::Manifest>>>,
     }
+    struct InjectedBranchCommitFailure {
+        namespace: NamespaceId,
+        expected_version: u64,
+        failure: BranchCommitFailure,
+    }
+
     enum BranchCommitFailure {
         BeforeCommit,
         LostReply,
@@ -13215,8 +13221,10 @@ mod tests {
         ) -> Result<(), KoshaError> {
             let failure = {
                 let mut failure = self.branch_commit_failure.lock().unwrap();
-                if failure.as_ref().is_some_and(|(ns, _)| ns == id) {
-                    failure.take().map(|(_, failure)| failure)
+                if failure.as_ref().is_some_and(|injected| {
+                    &injected.namespace == id && injected.expected_version == expected
+                }) {
+                    failure.take().map(|injected| injected.failure)
                 } else {
                     None
                 }
@@ -14884,10 +14892,11 @@ mod tests {
                 .unwrap()
         };
 
-        *store.branch_commit_failure.lock().unwrap() = Some((
-            NamespaceId("tenant/refused".into()),
-            BranchCommitFailure::BeforeCommit,
-        ));
+        *store.branch_commit_failure.lock().unwrap() = Some(InjectedBranchCommitFailure {
+            namespace: NamespaceId("tenant/refused".into()),
+            expected_version: 0,
+            failure: BranchCommitFailure::BeforeCommit,
+        });
         let refused = branch("refused");
         assert_eq!(status_of(&refused), 503, "{refused}");
         assert_eq!(body_of(&refused)["retryable"], true);
@@ -14897,16 +14906,42 @@ mod tests {
         assert_eq!(status_of(&retried), 200, "{retried}");
         assert_eq!(version("refused"), Some(1));
 
-        *store.branch_commit_failure.lock().unwrap() = Some((
-            NamespaceId("tenant/ambiguous".into()),
-            BranchCommitFailure::LostReply,
-        ));
+        *store.branch_commit_failure.lock().unwrap() = Some(InjectedBranchCommitFailure {
+            namespace: NamespaceId("tenant/ambiguous".into()),
+            expected_version: 0,
+            failure: BranchCommitFailure::LostReply,
+        });
         let ambiguous = branch("ambiguous");
         assert_eq!(status_of(&ambiguous), 503, "{ambiguous}");
         assert_eq!(body_of(&ambiguous)["retryable"], false);
         assert_eq!(body_of(&ambiguous)["details"]["outcome"], "unknown");
         assert_eq!(header_of(&ambiguous, "retry-after"), None);
         assert_eq!(version("ambiguous"), Some(1));
+
+        let retired = NamespaceId("tenant/retired".into());
+        {
+            let mut controller = store.inner.lock().unwrap();
+            controller.ensure_namespace(retired.clone());
+            controller.delete_namespace(&retired, 7).unwrap();
+        }
+        assert_eq!(version("retired"), None);
+        *store.branch_commit_failure.lock().unwrap() = Some(InjectedBranchCommitFailure {
+            namespace: retired.clone(),
+            expected_version: 8,
+            failure: BranchCommitFailure::BeforeCommit,
+        });
+        let partial = branch("retired");
+        assert_eq!(status_of(&partial), 503, "{partial}");
+        let body = body_of(&partial);
+        assert_eq!(body["retryable"], false);
+        assert_eq!(header_of(&partial, "retry-after"), None);
+        assert_eq!(body["details"]["outcome"], "branch_not_created");
+        assert_eq!(body["details"]["placeholder_version"], 8);
+        let placeholder = store.manifest_cloned(&retired).unwrap();
+        assert_eq!(placeholder.version, 8);
+        assert!(placeholder.branch.is_none() && placeholder.segments.is_empty());
+        let replay = branch("retired");
+        assert_eq!(status_of(&replay), 409, "{replay}");
     }
 
     /// `KOSHA_MANIFEST_REFRESH_MS=0`: no refresher, so every search checks

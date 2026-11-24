@@ -65,9 +65,12 @@ blindly replay it. Manifest reads and SQL failures before CAS commit can
 retry an eligible transient error twice with backoff. CAS retries retain
 the original version, snapshot and fencing token; an ambiguous commit is
 not replayed by the SQL retry loop. A branch whose manifest CAS failed
-before attempting to commit returns a retryable 503. A failed publication
-for an already staged document mutation may still apply later, so its
-response remains non-retryable.
+before attempting to commit returns a retryable 503 if the name is still
+free. If creating a branch under a previously deleted name already left
+an empty namespace, the response is a non-retryable 503 with
+`details.outcome: "branch_not_created"`: replaying would conflict with
+that namespace. A failed publication for an already staged document
+mutation may still apply later, so its response remains non-retryable.
 
 ## Pre-production failover test
 
