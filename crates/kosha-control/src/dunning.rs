@@ -208,6 +208,12 @@ pub fn run_dunning(
 ) -> Result<DunningReport, KoshaError> {
     let mut report = DunningReport::default();
     let invoices = ctx.store.invoices(None)?;
+    let accounts: BTreeMap<String, crate::billing::BillingAccount> = ctx
+        .store
+        .accounts()?
+        .into_iter()
+        .map(|a| (a.tenant.clone(), a))
+        .collect();
     let failures: BTreeMap<String, PaymentFailure> = ctx
         .ledger
         .payment_failures()?
@@ -247,10 +253,18 @@ pub fn run_dunning(
                 continue;
             }
             let attempt = failure.retries.saturating_add(1);
-            let result = provider.retry_payment(provider_id, attempt);
-            if let Err(e) = ctx.ledger.record_payment_retry(&invoice.id, now_ms) {
-                report.errors.push((invoice.id.clone(), e.to_string()));
+            // Claimed before the provider is asked: a second pass running
+            // at the same time (the scheduler and the admin route) loses
+            // the claim and does not charge again.
+            match ctx.ledger.claim_payment_retry(&invoice.id, attempt, now_ms) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    report.errors.push((invoice.id.clone(), e.to_string()));
+                    continue;
+                }
             }
+            let result = provider.retry_payment(provider_id, attempt);
             match result {
                 Ok(ProviderInvoiceStatus::Paid) => {
                     match ctx.store.set_invoice_status(
@@ -376,10 +390,14 @@ pub fn run_dunning(
             continue;
         }
         report.open_invoices += 1;
+        // The plan the account is on now, as the standings that enforce
+        // the state use; a tenant on no known plan is not restricted, so
+        // it gets no restriction notice (treated like enterprise).
         let kind = ctx
             .catalog
-            .plan(&invoice.plan)
-            .map_or(PlanKind::Usage, |p| p.kind);
+            .plan_name_for(accounts.get(&invoice.tenant))
+            .and_then(|name| ctx.catalog.plan(name))
+            .map_or(PlanKind::Enterprise, |p| p.kind);
         let state = account_state(kind, Some(invoice.due_at_ms), now_ms, policy);
         let failure = failures.get(&invoice.id);
         let mut reached = Vec::new();
@@ -654,5 +672,81 @@ mod tests {
             run_dunning(&ctx, &notifier, day * DAY_MS).unwrap();
         }
         assert_eq!(notifier.kinds(), vec![NoticeKind::Overdue]);
+    }
+
+    /// Review finding 6: restriction notices follow the plan the account
+    /// is on now (what the standings enforce), not the plan the invoice was
+    /// rated on.
+    #[test]
+    fn notices_follow_the_accounts_current_plan() {
+        let catalog = catalog();
+        let store = MemoryBillingStore::new();
+        let ledger = MemoryBillingLedger::new();
+        let provider = FakeBillingProvider::new();
+        let notifier = Recorder::default();
+        let ctx = BillingContext {
+            catalog: &catalog,
+            store: &store,
+            ledger: &ledger,
+            provider: None,
+        };
+        // Rated on payg, then moved to enterprise: never restricted.
+        submitted(&store, &provider, "payg");
+        store
+            .put_account(&BillingAccount {
+                tenant: "acme".into(),
+                plan: "ent".into(),
+                provider_customer_id: None,
+                created_at_ms: 0,
+            })
+            .unwrap();
+        for day in [15, 30, 60] {
+            run_dunning(&ctx, &notifier, day * DAY_MS).unwrap();
+        }
+        assert_eq!(notifier.kinds(), vec![NoticeKind::Overdue]);
+    }
+
+    /// Review finding 7: a retry is claimed before the provider is asked,
+    /// so two passes at once (scheduler and admin route) charge once.
+    #[test]
+    fn a_retry_is_claimed_once() {
+        let ledger = MemoryBillingLedger::new();
+        assert!(
+            !ledger.claim_payment_retry("inv", 1, 5).unwrap(),
+            "no failure yet"
+        );
+        ledger
+            .record_payment_failure("inv", "acme", 1, None)
+            .unwrap();
+        assert!(ledger.claim_payment_retry("inv", 1, 5).unwrap());
+        assert!(!ledger.claim_payment_retry("inv", 1, 6).unwrap());
+        assert!(ledger.claim_payment_retry("inv", 2, 7).unwrap());
+        let failure = ledger.payment_failures().unwrap().pop().unwrap();
+        assert_eq!((failure.retries, failure.last_retry_at_ms), (2, Some(7)));
+
+        // Two passes racing over one due retry: the provider is asked once.
+        let catalog = catalog();
+        let store = MemoryBillingStore::new();
+        let provider = FakeBillingProvider::new();
+        let notifier = Recorder::default();
+        let invoice = submitted(&store, &provider, "payg");
+        let ledger = MemoryBillingLedger::new();
+        ledger.set_payment_method("acme", Some("pm"), 0).unwrap();
+        ledger
+            .record_payment_failure(&invoice.id, "acme", DAY_MS, None)
+            .unwrap();
+        provider.set_declining("cus_fake_acme", true);
+        let ctx = BillingContext {
+            catalog: &catalog,
+            store: &store,
+            ledger: &ledger,
+            provider: Some(&provider),
+        };
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| run_dunning(&ctx, &notifier, 5 * DAY_MS).unwrap());
+            }
+        });
+        assert_eq!(provider.retries(), 1);
     }
 }

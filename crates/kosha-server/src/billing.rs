@@ -448,29 +448,81 @@ impl Billing {
         Ok(report)
     }
 
+    /// Every plan billing still needs, with what needs it: the plan each
+    /// account is on, the plans open invoices were rated on (dunning reads
+    /// them), and both sides of every plan change in a month not invoiced
+    /// yet (the close prorates over them). Months are looked at back to
+    /// the scheduler's lookback.
+    fn plans_in_use(&self) -> Result<BTreeMap<String, Vec<String>>, KoshaError> {
+        let mut in_use: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut add = |plan: &str, why: String| {
+            let uses = in_use.entry(plan.to_string()).or_default();
+            if uses.len() < 5 {
+                uses.push(why);
+            }
+        };
+        let accounts = self.store.accounts()?;
+        let invoices = self.store.invoices(None)?;
+        let invoiced: std::collections::BTreeSet<&str> =
+            invoices.iter().map(|i| i.id.as_str()).collect();
+        for account in &accounts {
+            add(&account.plan, format!("tenant {} is on it", account.tenant));
+        }
+        for invoice in invoices.iter().filter(|i| i.status == InvoiceStatus::Open) {
+            add(&invoice.plan, format!("open invoice {}", invoice.id));
+            for line in &invoice.lines {
+                if let Some(plan) = &line.plan {
+                    add(plan, format!("open invoice {}", invoice.id));
+                }
+            }
+        }
+        let mut since = BillingPeriod::containing(self.now_ms());
+        for _ in 0..crate::billing_scheduler::CLOSE_LOOKBACK_MONTHS {
+            since = since.previous();
+        }
+        for account in &accounts {
+            for change in self
+                .ledger
+                .plan_changes(&account.tenant, since.start_ms(), u64::MAX)?
+            {
+                let period = BillingPeriod::containing(change.at_ms);
+                let id = kosha_control::billing::invoice_id(&account.tenant, period);
+                if invoiced.contains(id.as_str()) {
+                    continue;
+                }
+                let why = format!("plan change of {} in unclosed {period}", account.tenant);
+                if let Some(from) = &change.from_plan {
+                    add(from, why.clone());
+                }
+                add(&change.to_plan, why);
+            }
+        }
+        Ok(in_use)
+    }
+
     /// Re-read the plans file and swap the catalog in if it is valid and
-    /// keeps every plan an account is on. `Ok(false)` when there is no
-    /// file to read; on `Err` the catalog in force is kept.
+    /// keeps every plan still in use ([`Self::plans_in_use`]). `Ok(false)`
+    /// when there is no file to read; on `Err` the catalog in force is
+    /// kept.
     pub(crate) fn reload_catalog(&self) -> Result<bool, String> {
         let Some(path) = &self.plans_file else {
             return Ok(false);
         };
         let stamp = file_stamp(path);
         let result = read_catalog(path).and_then(|catalog| {
-            let accounts = self
-                .store
-                .accounts()
-                .map_err(|e| format!("cannot check the accounts against it: {e}"))?;
-            let orphaned: Vec<String> = accounts
+            let in_use = self
+                .plans_in_use()
+                .map_err(|e| format!("cannot check the plans in use against it: {e}"))?;
+            let orphaned: Vec<String> = in_use
                 .iter()
-                .filter(|a| catalog.plan(&a.plan).is_none())
-                .map(|a| format!("{} ({})", a.tenant, a.plan))
+                .filter(|(plan, _)| catalog.plan(plan).is_none())
+                .map(|(plan, uses)| format!("{plan} ({})", uses.join(", ")))
                 .collect();
             if !orphaned.is_empty() {
                 return Err(format!(
-                    "{}: plans in use are missing; move these tenants first: {}",
+                    "{}: plans still in use are missing: {}",
                     path.display(),
-                    orphaned.join(", ")
+                    orphaned.join("; ")
                 ));
             }
             Ok(catalog)
@@ -1536,7 +1588,12 @@ impl BillingProvider for StripeProvider {
         )?;
         let stripe_id = Self::id_of(what, &draft)?;
         let stripe_id = Self::path_id(what, &stripe_id)?;
-        for line in invoice.lines.iter().filter(|line| line.amount_cents > 0) {
+        for (index, line) in invoice
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.amount_cents > 0)
+        {
             self.post(
                 "create invoice item",
                 "/v1/invoiceitems",
@@ -1554,11 +1611,7 @@ impl BillingProvider for StripeProvider {
                     ),
                     ("metadata[kosha_meter]", line.meter.clone()),
                 ],
-                // A prorated invoice has one line per meter and plan.
-                &match &line.plan {
-                    None => format!("{key}-line-{}", line.meter),
-                    Some(plan) => format!("{key}-line-{plan}-{}", line.meter),
-                },
+                &line_idempotency_key(&key, index, line),
             )?;
         }
         self.post(
@@ -1670,6 +1723,22 @@ impl BillingProvider for StripeProvider {
             &format!("kosha-default-pm-{customer_id}-{method}"),
         )?;
         Ok(Some(method))
+    }
+}
+
+/// The idempotency key of one invoice item. A line rated on one plan for
+/// the whole month keeps the key it always had (`<key>-line-<meter>`). A
+/// prorated invoice can hold the same plan and meter more than once (two
+/// stretches on one plan: free, payg, free, payg), so its keys carry the
+/// line's position, fixed once the invoice is stored.
+pub(crate) fn line_idempotency_key(
+    key: &str,
+    index: usize,
+    line: &kosha_control::billing::LineItem,
+) -> String {
+    match &line.plan {
+        None => format!("{key}-line-{}", line.meter),
+        Some(plan) => format!("{key}-line-{index}-{plan}-{}", line.meter),
     }
 }
 

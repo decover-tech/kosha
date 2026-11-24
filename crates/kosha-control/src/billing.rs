@@ -1588,10 +1588,14 @@ impl Biller<'_> {
             .map(|a| a.tenant.as_str())
             .collect();
         if self.catalog.default_plan.is_some() {
+            // Tenants that used the period on the default plan, including
+            // one whose account was created after the period ended (a
+            // checkout started before the month was closed): the month is
+            // still theirs to pay, on the plan in force during it.
             tenants.extend(
                 usage
                     .keys()
-                    .filter(|t| !accounts.contains_key(*t))
+                    .filter(|t| accounts.get(*t).is_none_or(|a| a.created_at_ms >= end_ms))
                     .map(String::as_str),
             );
         }
@@ -1633,7 +1637,15 @@ impl Biller<'_> {
             }
             None => {
                 let (plan_name, lines) =
-                    self.rate_period(tenant, account, usage, period, now_ms)?;
+                    // An account created after the period did not exist
+                    // during it: the period was on the default plan.
+                    self.rate_period(
+                        tenant,
+                        account.filter(|a| a.created_at_ms < period.end_ms()),
+                        usage,
+                        period,
+                        now_ms,
+                    )?;
                 let plan_name = plan_name.as_str();
                 let total = total_cents(&lines);
                 let invoice = Invoice {
@@ -3184,6 +3196,38 @@ mod tests {
         let invoice = store.invoice("acme/2026-10").unwrap().unwrap();
         assert_eq!(invoice.plan, "payg");
         assert!(invoice.lines.iter().any(|l| l.meter == "queries"));
+    }
+
+    /// Review finding 5: an account created after the period ended (a
+    /// checkout between the month's end and its close) does not drop the
+    /// month: it is invoiced on the plan in force during it, the default.
+    #[test]
+    fn an_account_created_after_the_period_does_not_drop_its_usage() {
+        let catalog = catalog();
+        let oct = BillingPeriod::parse("2026-10").unwrap();
+        let usage = MemoryUsageStore::new();
+        usage.record(&synthetic_month("acme", oct)).unwrap();
+        let after = oct.end_ms() + HOUR_MS;
+        for with_history in [true, false] {
+            let store = MemoryBillingStore::new();
+            let history = crate::billing_ledger::MemoryBillingLedger::new();
+            crate::billing_ledger::change_plan(
+                &store, &history, "acme", "payg", None, "checkout", after,
+            )
+            .unwrap();
+            let biller = Biller {
+                catalog: &catalog,
+                store: &store,
+                usage: &usage,
+                provider: None,
+                plan_changes: with_history.then_some(&history as &dyn PlanHistory),
+            };
+            let report = biller.close_period(oct, after + HOUR_MS).unwrap();
+            assert_eq!(report.created, vec!["acme/2026-10"], "{report:?}");
+            let invoice = store.invoice("acme/2026-10").unwrap().unwrap();
+            assert_eq!(invoice.plan, "free", "history: {with_history}");
+            assert_eq!(invoice.total_cents, 0);
+        }
     }
 
     #[test]

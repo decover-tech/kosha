@@ -10,15 +10,16 @@
 //!
 //! # Webhook idempotency
 //!
-//! An event is applied, then its id is recorded; a delivery whose id is
-//! already recorded is acknowledged and not applied again. Applying is
-//! itself idempotent (an invoice is only moved out of `open`, a plan change
-//! to the plan the tenant is already on records nothing, a payment method
-//! is set to a value), so the window between applying and recording (a
-//! crash, or the same event delivered to two pods at once) at worst
-//! applies an event twice to the same effect. Recording first would lose
-//! an event whose processing crashed: Stripe retries it, and the retry
-//! would be skipped as a duplicate.
+//! A delivery first claims its event id (an insert that only one caller
+//! wins); only the winner applies the event, then records what it did.
+//! Another delivery of the same event, concurrent or later, finds the
+//! claim and is acknowledged as a duplicate. When applying fails the claim
+//! is released, so Stripe's redelivery applies it. A claim left behind by
+//! a process that died while applying is taken over after
+//! [`WEBHOOK_CLAIM_STALE_MS`]. Applying is idempotent as well (an invoice
+//! only leaves `open`, a plan change to the current plan records nothing,
+//! a payment method is set to a value), so a takeover of a claim whose
+//! work did complete does no harm.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -72,18 +73,28 @@ pub struct PaymentMethodRecord {
 pub trait BillingLedger: PlanHistory {
     fn record_plan_change(&self, change: &PlanChange) -> Result<(), KoshaError>;
 
-    /// Whether a webhook event with this id was already processed.
-    fn webhook_event_seen(&self, event_id: &str) -> Result<bool, KoshaError>;
-
-    /// Record a processed webhook event. `false` when it was already
-    /// recorded.
-    fn record_webhook_event(
+    /// Claim a webhook event for processing at `now_ms`. `true`: this
+    /// caller applies it. `false`: it was processed, or another delivery
+    /// holds a claim on it younger than `stale_ms`.
+    fn claim_webhook_event(
         &self,
         event_id: &str,
         event_type: &str,
+        now_ms: u64,
+        stale_ms: u64,
+    ) -> Result<bool, KoshaError>;
+
+    /// Record what a claimed event did.
+    fn finish_webhook_event(
+        &self,
+        event_id: &str,
         outcome: &str,
         at_ms: u64,
-    ) -> Result<bool, KoshaError>;
+    ) -> Result<(), KoshaError>;
+
+    /// Give back the claim of an event that could not be applied, so a
+    /// redelivery applies it. A finished event is left alone.
+    fn release_webhook_event(&self, event_id: &str) -> Result<(), KoshaError>;
 
     /// Count a failed collection of `invoice_id`.
     fn record_payment_failure(
@@ -94,9 +105,16 @@ pub trait BillingLedger: PlanHistory {
         reason: Option<&str>,
     ) -> Result<(), KoshaError>;
 
-    /// Count one of Kosha's own retries of `invoice_id`. Nothing happens
-    /// for an invoice with no failure recorded.
-    fn record_payment_retry(&self, invoice_id: &str, at_ms: u64) -> Result<(), KoshaError>;
+    /// Claim Kosha's retry number `attempt` (from 1) of `invoice_id`:
+    /// `true` for the one caller that moves the count from `attempt - 1`
+    /// to `attempt`, so two dunning passes never retry one invoice twice.
+    /// `false` for an invoice with no failure recorded.
+    fn claim_payment_retry(
+        &self,
+        invoice_id: &str,
+        attempt: u32,
+        at_ms: u64,
+    ) -> Result<bool, KoshaError>;
 
     /// The failure records of invoices that are still open.
     fn payment_failures(&self) -> Result<Vec<PaymentFailure>, KoshaError>;
@@ -202,31 +220,50 @@ impl BillingLedger for MemoryBillingLedger {
         Ok(())
     }
 
-    fn webhook_event_seen(&self, event_id: &str) -> Result<bool, KoshaError> {
-        Ok(self
-            .inner
-            .lock()
-            .unwrap()
-            .webhook_events
-            .contains_key(event_id))
-    }
-
-    fn record_webhook_event(
+    fn claim_webhook_event(
         &self,
         event_id: &str,
         event_type: &str,
-        outcome: &str,
-        at_ms: u64,
+        now_ms: u64,
+        stale_ms: u64,
     ) -> Result<bool, KoshaError> {
         let mut inner = self.inner.lock().unwrap();
-        if inner.webhook_events.contains_key(event_id) {
-            return Ok(false);
+        if let Some((_, outcome, at)) = inner.webhook_events.get(event_id) {
+            let stale = outcome == PROCESSING && at.saturating_add(stale_ms) < now_ms;
+            if !stale {
+                return Ok(false);
+            }
         }
         inner.webhook_events.insert(
             event_id.to_string(),
-            (event_type.to_string(), outcome.to_string(), at_ms),
+            (event_type.to_string(), PROCESSING.to_string(), now_ms),
         );
         Ok(true)
+    }
+
+    fn finish_webhook_event(
+        &self,
+        event_id: &str,
+        outcome: &str,
+        at_ms: u64,
+    ) -> Result<(), KoshaError> {
+        if let Some(entry) = self.inner.lock().unwrap().webhook_events.get_mut(event_id) {
+            entry.1 = outcome.to_string();
+            entry.2 = at_ms;
+        }
+        Ok(())
+    }
+
+    fn release_webhook_event(&self, event_id: &str) -> Result<(), KoshaError> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner
+            .webhook_events
+            .get(event_id)
+            .is_some_and(|(_, outcome, _)| outcome == PROCESSING)
+        {
+            inner.webhook_events.remove(event_id);
+        }
+        Ok(())
     }
 
     fn record_payment_failure(
@@ -258,12 +295,21 @@ impl BillingLedger for MemoryBillingLedger {
         Ok(())
     }
 
-    fn record_payment_retry(&self, invoice_id: &str, at_ms: u64) -> Result<(), KoshaError> {
-        if let Some(record) = self.inner.lock().unwrap().failures.get_mut(invoice_id) {
-            record.retries = record.retries.saturating_add(1);
-            record.last_retry_at_ms = Some(at_ms);
+    fn claim_payment_retry(
+        &self,
+        invoice_id: &str,
+        attempt: u32,
+        at_ms: u64,
+    ) -> Result<bool, KoshaError> {
+        let mut inner = self.inner.lock().unwrap();
+        match inner.failures.get_mut(invoice_id) {
+            Some(record) if attempt >= 1 && record.retries == attempt - 1 => {
+                record.retries = attempt;
+                record.last_retry_at_ms = Some(at_ms);
+                Ok(true)
+            }
+            _ => Ok(false),
         }
-        Ok(())
     }
 
     fn payment_failures(&self) -> Result<Vec<PaymentFailure>, KoshaError> {
@@ -373,9 +419,31 @@ impl BillingLedger for MemoryBillingLedger {
 
 // ─── Operations ─────────────────────────────────────────────────────────────
 
+/// How long a webhook claim may stay unfinished before another delivery
+/// takes it over (its processor is presumed dead).
+pub const WEBHOOK_CLAIM_STALE_MS: u64 = 5 * 60_000;
+
+/// The `outcome` of a claimed, not yet finished webhook event.
+const PROCESSING: &str = "processing";
+
 /// Put `tenant` on `plan`, keeping (or setting) its provider customer,
 /// and record the change for proration when the plan is different. The
 /// caller has checked that the plan is in the catalog.
+///
+/// The account and the plan history are separate writes (different
+/// tables, possibly different stores), so they cannot share a
+/// transaction. The change is recorded first and the account written
+/// second, and the call is safe to retry:
+///
+/// - The record fails: nothing changed; the caller (an operator, or Stripe
+///   redelivering the checkout event) retries from scratch.
+/// - The account write fails after the record: the retry finds the
+///   history's latest change already going from the account's plan to
+///   `plan` and only writes the account; the change keeps the time it was
+///   asked for.
+/// - An account already on `plan` whose history ends elsewhere (written
+///   by an older build that recorded after the account) gets the missing
+///   change recorded now.
 pub fn change_plan(
     store: &dyn BillingStore,
     ledger: &dyn BillingLedger,
@@ -386,6 +454,30 @@ pub fn change_plan(
     now_ms: u64,
 ) -> Result<Option<BillingAccount>, KoshaError> {
     let existing = store.account(tenant)?;
+    let before = existing.as_ref().map(|a| a.plan.clone());
+    let latest = ledger.plan_changes(tenant, 0, u64::MAX)?.pop();
+    let from_plan = if before.as_deref() != Some(plan) {
+        // A change recorded by an earlier attempt whose account write
+        // failed is not recorded twice.
+        let pending = latest
+            .as_ref()
+            .is_some_and(|c| c.to_plan == plan && c.from_plan == before);
+        (!pending).then_some(before)
+    } else {
+        match latest {
+            Some(change) if change.to_plan != plan => Some(Some(change.to_plan)),
+            _ => None,
+        }
+    };
+    if let Some(from_plan) = from_plan {
+        ledger.record_plan_change(&PlanChange {
+            tenant: tenant.to_string(),
+            at_ms: now_ms,
+            from_plan,
+            to_plan: plan.to_string(),
+            source: source.to_string(),
+        })?;
+    }
     store.put_account(&BillingAccount {
         tenant: tenant.to_string(),
         plan: plan.to_string(),
@@ -396,15 +488,6 @@ pub fn change_plan(
         }),
         created_at_ms: now_ms,
     })?;
-    if existing.as_ref().map(|a| a.plan.as_str()) != Some(plan) {
-        ledger.record_plan_change(&PlanChange {
-            tenant: tenant.to_string(),
-            at_ms: now_ms,
-            from_plan: existing.map(|a| a.plan),
-            to_plan: plan.to_string(),
-            source: source.to_string(),
-        })?;
-    }
     store.account(tenant)
 }
 
@@ -444,12 +527,25 @@ pub fn handle_webhook_event(
         tenant: None,
         duplicate: true,
     };
-    if ctx.ledger.webhook_event_seen(&event.id)? {
+    if !ctx.ledger.claim_webhook_event(
+        &event.id,
+        &event.event_type,
+        now_ms,
+        WEBHOOK_CLAIM_STALE_MS,
+    )? {
         return Ok(outcome);
     }
-    let (done, tenant) = apply_webhook(ctx, &crate::stripe_webhook::action_of(event), now_ms)?;
-    ctx.ledger
-        .record_webhook_event(&event.id, &event.event_type, &done, now_ms)?;
+    let (done, tenant) = match apply_webhook(ctx, &crate::stripe_webhook::action_of(event), now_ms)
+    {
+        Ok(applied) => applied,
+        Err(e) => {
+            // A redelivery must apply it. If the release fails too, the
+            // claim goes stale and is taken over.
+            let _ = ctx.ledger.release_webhook_event(&event.id);
+            return Err(e);
+        }
+    };
+    ctx.ledger.finish_webhook_event(&event.id, &done, now_ms)?;
     outcome.outcome = done;
     outcome.tenant = tenant;
     outcome.duplicate = false;
@@ -797,37 +893,60 @@ mod pg {
             Ok(())
         }
 
-        fn webhook_event_seen(&self, event_id: &str) -> Result<bool, KoshaError> {
-            self.rt.block_on(async {
-                let row: Option<(String,)> = sqlx::query_as(
-                    "SELECT event_id FROM kosha.billing_webhook_events WHERE event_id = $1",
-                )
-                .bind(event_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(control_plane_error)?;
-                Ok(row.is_some())
-            })
-        }
-
-        fn record_webhook_event(
+        fn claim_webhook_event(
             &self,
             event_id: &str,
             event_type: &str,
-            outcome: &str,
-            at_ms: u64,
+            now_ms: u64,
+            stale_ms: u64,
         ) -> Result<bool, KoshaError> {
+            // One statement: insert the claim, or take over a claim whose
+            // processor died; a finished or live claim is left alone and
+            // no row is affected.
             Ok(self.execute(
                 sqlx::query(
                     "INSERT INTO kosha.billing_webhook_events \
-                     (event_id, event_type, outcome, processed_at_ms) VALUES ($1, $2, $3, $4) \
-                     ON CONFLICT (event_id) DO NOTHING",
+                     (event_id, event_type, outcome, processed_at_ms) \
+                     VALUES ($1, $2, 'processing', $3) \
+                     ON CONFLICT (event_id) DO UPDATE SET \
+                         processed_at_ms = EXCLUDED.processed_at_ms \
+                     WHERE kosha.billing_webhook_events.outcome = 'processing' \
+                       AND kosha.billing_webhook_events.processed_at_ms < $4",
                 )
                 .bind(event_id)
                 .bind(event_type)
+                .bind(to_i64(now_ms))
+                .bind(to_i64(now_ms.saturating_sub(stale_ms))),
+            )? == 1)
+        }
+
+        fn finish_webhook_event(
+            &self,
+            event_id: &str,
+            outcome: &str,
+            at_ms: u64,
+        ) -> Result<(), KoshaError> {
+            self.execute(
+                sqlx::query(
+                    "UPDATE kosha.billing_webhook_events \
+                     SET outcome = $2, processed_at_ms = $3 WHERE event_id = $1",
+                )
+                .bind(event_id)
                 .bind(outcome)
                 .bind(to_i64(at_ms)),
-            )? == 1)
+            )?;
+            Ok(())
+        }
+
+        fn release_webhook_event(&self, event_id: &str) -> Result<(), KoshaError> {
+            self.execute(
+                sqlx::query(
+                    "DELETE FROM kosha.billing_webhook_events \
+                     WHERE event_id = $1 AND outcome = 'processing'",
+                )
+                .bind(event_id),
+            )?;
+            Ok(())
         }
 
         fn record_payment_failure(
@@ -858,16 +977,27 @@ mod pg {
             Ok(())
         }
 
-        fn record_payment_retry(&self, invoice_id: &str, at_ms: u64) -> Result<(), KoshaError> {
-            self.execute(
+        fn claim_payment_retry(
+            &self,
+            invoice_id: &str,
+            attempt: u32,
+            at_ms: u64,
+        ) -> Result<bool, KoshaError> {
+            if attempt == 0 {
+                return Ok(false);
+            }
+            // Compare-and-set on the retry count: one winner per attempt.
+            Ok(self.execute(
                 sqlx::query(
                     "UPDATE kosha.billing_payment_failures \
-                     SET retries = retries + 1, last_retry_at_ms = $2 WHERE invoice_id = $1",
+                     SET retries = $2, last_retry_at_ms = $3 \
+                     WHERE invoice_id = $1 AND retries = $4",
                 )
                 .bind(invoice_id)
-                .bind(to_i64(at_ms)),
-            )?;
-            Ok(())
+                .bind(i32::try_from(attempt).unwrap_or(i32::MAX))
+                .bind(to_i64(at_ms))
+                .bind(i32::try_from(attempt - 1).unwrap_or(i32::MAX)),
+            )? == 1)
         }
 
         fn payment_failures(&self) -> Result<Vec<PaymentFailure>, KoshaError> {
@@ -1341,5 +1471,284 @@ mod tests {
         assert!(!ledger.try_lease("billing", "pod-b", 159, 100).unwrap());
         assert!(ledger.try_lease("billing", "pod-b", 160, 100).unwrap());
         assert!(!ledger.try_lease("billing", "pod-a", 200, 100).unwrap());
+    }
+
+    /// A memory ledger whose next `fail_plan_changes` plan-change writes
+    /// fail.
+    #[derive(Default)]
+    struct FailingLedger {
+        inner: MemoryBillingLedger,
+        fail_plan_changes: Mutex<u32>,
+    }
+
+    impl PlanHistory for FailingLedger {
+        fn plan_changes(&self, t: &str, f: u64, to: u64) -> Result<Vec<PlanChange>, KoshaError> {
+            self.inner.plan_changes(t, f, to)
+        }
+    }
+
+    impl BillingLedger for FailingLedger {
+        fn record_plan_change(&self, change: &PlanChange) -> Result<(), KoshaError> {
+            let mut fail = self.fail_plan_changes.lock().unwrap();
+            if *fail > 0 {
+                *fail -= 1;
+                return Err(KoshaError::ControlPlane("injected: ledger down".into()));
+            }
+            self.inner.record_plan_change(change)
+        }
+        fn claim_webhook_event(
+            &self,
+            a: &str,
+            b: &str,
+            c: u64,
+            d: u64,
+        ) -> Result<bool, KoshaError> {
+            self.inner.claim_webhook_event(a, b, c, d)
+        }
+        fn finish_webhook_event(&self, a: &str, b: &str, c: u64) -> Result<(), KoshaError> {
+            self.inner.finish_webhook_event(a, b, c)
+        }
+        fn release_webhook_event(&self, a: &str) -> Result<(), KoshaError> {
+            self.inner.release_webhook_event(a)
+        }
+        fn record_payment_failure(
+            &self,
+            a: &str,
+            b: &str,
+            c: u64,
+            d: Option<&str>,
+        ) -> Result<(), KoshaError> {
+            self.inner.record_payment_failure(a, b, c, d)
+        }
+        fn claim_payment_retry(&self, a: &str, b: u32, c: u64) -> Result<bool, KoshaError> {
+            self.inner.claim_payment_retry(a, b, c)
+        }
+        fn payment_failures(&self) -> Result<Vec<PaymentFailure>, KoshaError> {
+            self.inner.payment_failures()
+        }
+        fn claim_notice(&self, n: &NoticeRecord) -> Result<bool, KoshaError> {
+            self.inner.claim_notice(n)
+        }
+        fn release_notice(&self, id: &str) -> Result<(), KoshaError> {
+            self.inner.release_notice(id)
+        }
+        fn notices(&self, since: u64) -> Result<Vec<NoticeRecord>, KoshaError> {
+            self.inner.notices(since)
+        }
+        fn set_payment_method(&self, t: &str, m: Option<&str>, at: u64) -> Result<(), KoshaError> {
+            self.inner.set_payment_method(t, m, at)
+        }
+        fn payment_method(&self, t: &str) -> Result<Option<PaymentMethodRecord>, KoshaError> {
+            self.inner.payment_method(t)
+        }
+        fn job_done(&self, j: &str) -> Result<bool, KoshaError> {
+            self.inner.job_done(j)
+        }
+        fn mark_job_done(&self, j: &str, at: u64, d: &str) -> Result<(), KoshaError> {
+            self.inner.mark_job_done(j, at, d)
+        }
+        fn try_lease(&self, n: &str, h: &str, now: u64, ttl: u64) -> Result<bool, KoshaError> {
+            self.inner.try_lease(n, h, now, ttl)
+        }
+    }
+
+    /// Review finding 2: a plan change whose history write failed after
+    /// the account was written is recorded by the retry, so the month is
+    /// still prorated.
+    #[test]
+    fn a_failed_plan_change_record_is_repaired_by_the_retry() {
+        let store = MemoryBillingStore::new();
+        let ledger = FailingLedger::default();
+        change_plan(&store, &ledger, "acme", "free", None, "admin", 10).unwrap();
+        *ledger.fail_plan_changes.lock().unwrap() = 1;
+        assert!(change_plan(&store, &ledger, "acme", "payg", None, "admin", 20).is_err());
+        // Nothing half-done: the change is recorded before the account.
+        assert_eq!(store.account("acme").unwrap().unwrap().plan, "free");
+        assert_eq!(ledger.plan_changes("acme", 0, u64::MAX).unwrap().len(), 1);
+        change_plan(&store, &ledger, "acme", "payg", None, "admin", 30).unwrap();
+        let changes = ledger.plan_changes("acme", 0, u64::MAX).unwrap();
+        assert_eq!(changes.len(), 2);
+        assert_eq!(
+            (
+                changes[1].from_plan.as_deref(),
+                changes[1].to_plan.as_str(),
+                changes[1].at_ms
+            ),
+            (Some("free"), "payg", 30)
+        );
+        // A real no-op records nothing.
+        change_plan(&store, &ledger, "acme", "payg", None, "admin", 40).unwrap();
+        assert_eq!(ledger.plan_changes("acme", 0, u64::MAX).unwrap().len(), 2);
+
+        // The account write fails after the change was recorded: the retry
+        // writes the account and does not record the change again.
+        let flaky = FlakyAccounts::default();
+        change_plan(&flaky, &ledger, "beta", "free", None, "admin", 10).unwrap();
+        *flaky.fail_puts.lock().unwrap() = 1;
+        assert!(change_plan(&flaky, &ledger, "beta", "payg", None, "admin", 20).is_err());
+        assert_eq!(flaky.account("beta").unwrap().unwrap().plan, "free");
+        change_plan(&flaky, &ledger, "beta", "payg", None, "admin", 25).unwrap();
+        assert_eq!(flaky.account("beta").unwrap().unwrap().plan, "payg");
+        let changes = ledger.plan_changes("beta", 0, u64::MAX).unwrap();
+        assert_eq!(
+            changes
+                .iter()
+                .map(|c| (c.to_plan.as_str(), c.at_ms))
+                .collect::<Vec<_>>(),
+            vec![("free", 10), ("payg", 20)]
+        );
+
+        // An account left on the new plan without its record (an older
+        // build wrote the account first) is repaired.
+        store
+            .put_account(&BillingAccount {
+                tenant: "acme".into(),
+                plan: "free".into(),
+                provider_customer_id: None,
+                created_at_ms: 0,
+            })
+            .unwrap();
+        change_plan(&store, &ledger, "acme", "free", None, "admin", 50).unwrap();
+        let changes = ledger.plan_changes("acme", 0, u64::MAX).unwrap();
+        assert_eq!(
+            (
+                changes.len(),
+                changes[2].from_plan.as_deref(),
+                changes[2].to_plan.as_str()
+            ),
+            (3, Some("payg"), "free")
+        );
+    }
+
+    /// A memory store whose next `fail_puts` account writes fail.
+    #[derive(Default)]
+    struct FlakyAccounts {
+        inner: MemoryBillingStore,
+        fail_puts: Mutex<u32>,
+    }
+
+    impl BillingStore for FlakyAccounts {
+        fn account(&self, t: &str) -> Result<Option<BillingAccount>, KoshaError> {
+            self.inner.account(t)
+        }
+        fn accounts(&self) -> Result<Vec<BillingAccount>, KoshaError> {
+            self.inner.accounts()
+        }
+        fn put_account(&self, a: &BillingAccount) -> Result<(), KoshaError> {
+            let mut fail = self.fail_puts.lock().unwrap();
+            if *fail > 0 {
+                *fail -= 1;
+                return Err(KoshaError::ControlPlane("injected: store down".into()));
+            }
+            self.inner.put_account(a)
+        }
+        fn set_provider_customer(
+            &self,
+            t: &str,
+            p: &str,
+            c: &str,
+            n: u64,
+        ) -> Result<(), KoshaError> {
+            self.inner.set_provider_customer(t, p, c, n)
+        }
+        fn insert_invoice(&self, i: &crate::billing::Invoice) -> Result<bool, KoshaError> {
+            self.inner.insert_invoice(i)
+        }
+        fn invoice(&self, id: &str) -> Result<Option<crate::billing::Invoice>, KoshaError> {
+            self.inner.invoice(id)
+        }
+        fn invoices(&self, t: Option<&str>) -> Result<Vec<crate::billing::Invoice>, KoshaError> {
+            self.inner.invoices(t)
+        }
+        fn set_provider_invoice(&self, id: &str, p: &str) -> Result<bool, KoshaError> {
+            self.inner.set_provider_invoice(id, p)
+        }
+        fn set_invoice_status(
+            &self,
+            id: &str,
+            st: InvoiceStatus,
+            at: Option<u64>,
+        ) -> Result<bool, KoshaError> {
+            self.inner.set_invoice_status(id, st, at)
+        }
+    }
+
+    /// Review finding 7: a webhook event is claimed before it is applied.
+    /// A concurrent or later delivery is a duplicate; a failed apply
+    /// releases the claim so the redelivery applies it; a claim whose
+    /// processor died is taken over once stale.
+    #[test]
+    fn webhook_events_are_claimed_before_they_are_applied() {
+        let ledger = MemoryBillingLedger::new();
+        assert!(ledger
+            .claim_webhook_event("evt_1", "invoice.paid", 100, 1_000)
+            .unwrap());
+        // In flight: another delivery does not apply it.
+        assert!(!ledger
+            .claim_webhook_event("evt_1", "invoice.paid", 200, 1_000)
+            .unwrap());
+        ledger.release_webhook_event("evt_1").unwrap();
+        assert!(ledger
+            .claim_webhook_event("evt_1", "invoice.paid", 300, 1_000)
+            .unwrap());
+        ledger.finish_webhook_event("evt_1", "paid", 310).unwrap();
+        // Finished: never again, however old, and a release is a no-op.
+        ledger.release_webhook_event("evt_1").unwrap();
+        assert!(!ledger
+            .claim_webhook_event("evt_1", "invoice.paid", 99_999, 1_000)
+            .unwrap());
+        // A dead processor's claim is taken over once stale.
+        assert!(ledger
+            .claim_webhook_event("evt_2", "invoice.paid", 0, 1_000)
+            .unwrap());
+        assert!(!ledger
+            .claim_webhook_event("evt_2", "invoice.paid", 1_000, 1_000)
+            .unwrap());
+        assert!(ledger
+            .claim_webhook_event("evt_2", "invoice.paid", 1_001, 1_000)
+            .unwrap());
+
+        // Through `handle_webhook_event`: concurrent deliveries apply once.
+        let catalog = catalog();
+        let store = MemoryBillingStore::new();
+        let ledger = FailingLedger::default();
+        store
+            .insert_invoice(&invoice("acme/2026-10", "acme", Some("in_1")))
+            .unwrap();
+        let ctx = BillingContext {
+            catalog: &catalog,
+            store: &store,
+            ledger: &ledger,
+            provider: None,
+        };
+        let failed = event(
+            "evt_f",
+            "invoice.payment_failed",
+            serde_json::json!({"id": "in_1", "metadata": {"kosha_invoice_id": "acme/2026-10"}}),
+        );
+        let applied: Vec<bool> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| !handle_webhook_event(&ctx, &failed, 10).unwrap().duplicate)
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(applied.iter().filter(|a| **a).count(), 1);
+        assert_eq!(ledger.payment_failures().unwrap()[0].failures, 1);
+
+        // A checkout whose plan change cannot be recorded: an error (503
+        // to Stripe), the claim released, and the redelivery applies it.
+        let checkout = event(
+            "evt_c",
+            "checkout.session.completed",
+            serde_json::json!({"id": "cs_1", "mode": "setup", "customer": "cus_a",
+                "metadata": {"kosha_tenant": "acme", "kosha_plan": "payg"}}),
+        );
+        *ledger.fail_plan_changes.lock().unwrap() = 1;
+        assert!(handle_webhook_event(&ctx, &checkout, 20).is_err());
+        let retried = handle_webhook_event(&ctx, &checkout, 30).unwrap();
+        assert!(!retried.duplicate);
+        assert_eq!(ledger.plan_changes("acme", 0, u64::MAX).unwrap().len(), 1);
     }
 }

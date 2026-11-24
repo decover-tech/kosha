@@ -1159,3 +1159,98 @@ fn stripe_provider_sends_the_invoice_as_items_in_cents() {
     let stripe = StripeProvider::new("http://127.0.0.1:1", "sk_test_stub", 14).unwrap();
     assert!(stripe.invoice_status("in_stub1").is_err());
 }
+
+/// Review finding 1: a month on free, payg, free, payg has two payg
+/// stretches, so its invoice holds the same plan and meter twice. Every
+/// item still gets its own idempotency key, so Stripe neither refuses the
+/// second nor replays the first.
+#[test]
+fn every_invoice_item_of_a_prorated_invoice_has_its_own_key() {
+    use kosha_control::billing::{Biller, PlanChange};
+    use kosha_control::billing_ledger::{BillingLedger, MemoryBillingLedger};
+    let catalog = Catalog::parse(CATALOG).unwrap();
+    let oct = oct();
+    let usage = MemoryUsageStore::new();
+    let store = MemoryBillingStore::new();
+    let history = MemoryBillingLedger::new();
+    for hour in 0..oct.hours() {
+        let at = oct.start_ms() + hour * HOUR_MS;
+        usage
+            .record(&[UsageEvent {
+                id: format!("q/{hour}"),
+                tenant: "acme".into(),
+                namespace: "docs".into(),
+                at_ms: at,
+                meters: [(meter::QUERIES.to_string(), 10_000)].into(),
+            }])
+            .unwrap();
+    }
+    store
+        .put_account(&BillingAccount {
+            tenant: "acme".into(),
+            plan: "payg".into(),
+            provider_customer_id: None,
+            created_at_ms: 0,
+        })
+        .unwrap();
+    for (day, from, to) in [
+        (5, "free", "payg"),
+        (12, "payg", "free"),
+        (20, "free", "payg"),
+    ] {
+        history
+            .record_plan_change(&PlanChange {
+                tenant: "acme".into(),
+                at_ms: oct.start_ms() + day * DAY_MS,
+                from_plan: Some(from.into()),
+                to_plan: to.into(),
+                source: "admin".into(),
+            })
+            .unwrap();
+    }
+    let biller = Biller {
+        catalog: &catalog,
+        store: &store,
+        usage: &usage,
+        provider: None,
+        plan_changes: Some(&history),
+    };
+    biller.close_period(oct, oct.end_ms()).unwrap();
+    let invoice = store.invoice("acme/2026-10").unwrap().unwrap();
+    let charged_payg_queries = invoice
+        .lines
+        .iter()
+        .filter(|l| l.plan.as_deref() == Some("payg") && l.meter == "queries")
+        .count();
+    assert_eq!(charged_payg_queries, 2, "{:#?}", invoice.lines);
+
+    let (base, requests) = stripe_stub("open");
+    let stripe = StripeProvider::new(&base, "sk_test_stub", 14).unwrap();
+    stripe.create_invoice("cus_stub1", &invoice).unwrap();
+    let keys: Vec<String> = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.path == "/v1/invoiceitems")
+        .map(|r| r.idempotency_key.clone())
+        .collect();
+    let charged = invoice.lines.iter().filter(|l| l.amount_cents > 0).count();
+    assert_eq!(keys.len(), charged);
+    let unique: std::collections::BTreeSet<&String> = keys.iter().collect();
+    assert_eq!(unique.len(), keys.len(), "{keys:?}");
+    // A line rated on one plan keeps its old key.
+    let flat = LineItem {
+        meter: "queries".into(),
+        quantity: 1,
+        included: 0,
+        billable: 1,
+        unit: 1,
+        unit_price_cents: 1,
+        amount_cents: 1,
+        plan: None,
+    };
+    assert_eq!(
+        billing::line_idempotency_key("k", 3, &flat),
+        "k-line-queries"
+    );
+}

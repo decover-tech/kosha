@@ -280,21 +280,31 @@ fn postgres_ledger_behaves_like_the_memory_ledger() {
         assert_eq!(ledger.plan_changes(&tenant, 11, 30).unwrap(), vec![]);
 
         let event = format!("evt_{tenant}");
-        assert!(!ledger.webhook_event_seen(&event).unwrap());
         assert!(ledger
-            .record_webhook_event(&event, "invoice.paid", "paid", 5)
+            .claim_webhook_event(&event, "invoice.paid", 5, 100)
             .unwrap());
         assert!(!ledger
-            .record_webhook_event(&event, "invoice.paid", "paid", 6)
+            .claim_webhook_event(&event, "invoice.paid", 6, 100)
             .unwrap());
-        assert!(ledger.webhook_event_seen(&event).unwrap());
+        ledger.release_webhook_event(&event).unwrap();
+        assert!(ledger
+            .claim_webhook_event(&event, "invoice.paid", 7, 100)
+            .unwrap());
+        ledger.finish_webhook_event(&event, "paid", 8).unwrap();
+        assert!(!ledger
+            .claim_webhook_event(&event, "invoice.paid", 10_000, 100)
+            .unwrap());
+        let stale = format!("evt_stale_{tenant}");
+        assert!(ledger.claim_webhook_event(&stale, "x", 0, 100).unwrap());
+        assert!(ledger.claim_webhook_event(&stale, "x", 101, 100).unwrap());
 
         for (invoice, at) in [(&open.id, 100), (&open.id, 200), (&paid.id, 50)] {
             ledger
                 .record_payment_failure(invoice, &tenant, at, Some("declined"))
                 .unwrap();
         }
-        ledger.record_payment_retry(&open.id, 300).unwrap();
+        assert!(ledger.claim_payment_retry(&open.id, 1, 300).unwrap());
+        assert!(!ledger.claim_payment_retry(&open.id, 1, 301).unwrap());
         let failure = ledger
             .payment_failures()
             .unwrap()

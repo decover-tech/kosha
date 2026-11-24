@@ -13,8 +13,10 @@
 //! 1. delivers this pod's spooled usage;
 //! 2. closes last month once `KOSHA_BILLING_CLOSE_DELAY_SECS` have passed
 //!    since it ended (time for every pod to deliver its usage), unless the
-//!    ledger records that month closed with no errors. A close with
-//!    errors is run again next tick;
+//!    ledger records that month closed with no errors, and every earlier
+//!    month of the last twelve left unclosed since the earliest one closed
+//!    ([`months_to_close`]). A close with errors, or a month missed while
+//!    the scheduler was down, is run again at the next tick;
 //! 3. syncs payments from the provider every
 //!    `KOSHA_BILLING_SYNC_INTERVAL_SECS` (the fallback for a missed
 //!    webhook);
@@ -102,10 +104,57 @@ impl SchedulerConfig {
 pub(crate) struct TickReport {
     /// Whether this pod held the lease and ran the tick.
     pub leader: bool,
-    pub closed: Option<CloseReport>,
+    /// Months closed (or retried) by this tick, oldest first.
+    pub closed: Vec<CloseReport>,
     pub synced: Option<SyncReport>,
     pub dunning: Option<DunningReport>,
     pub errors: Vec<String>,
+}
+
+/// How many months back the scheduler looks for one left unclosed.
+pub(crate) const CLOSE_LOOKBACK_MONTHS: usize = 12;
+
+/// The months a tick closes, oldest first: every month after the earliest
+/// one the ledger records closed (within the last
+/// [`CLOSE_LOOKBACK_MONTHS`]) that is not closed yet, so a month whose
+/// close failed, or that passed while the scheduler was down, is closed
+/// late rather than never. Last month is included once `close_delay_ms`
+/// has passed since it ended. With no month closed in the window (the
+/// scheduler's first run) only last month is: turning the scheduler on
+/// does not invoice a year of history.
+pub(crate) fn months_to_close(
+    billing: &Billing,
+    now_ms: u64,
+    close_delay_ms: u64,
+) -> Result<Vec<BillingPeriod>, kosha_core::KoshaError> {
+    let last = BillingPeriod::containing(now_ms).previous();
+    let mut window = vec![last];
+    while window.len() < CLOSE_LOOKBACK_MONTHS {
+        let oldest = *window.last().unwrap();
+        let earlier = oldest.previous();
+        if earlier == oldest {
+            break;
+        }
+        window.push(earlier);
+    }
+    window.reverse();
+    let mut done = Vec::with_capacity(window.len());
+    for period in &window {
+        done.push(billing.ledger.job_done(&format!("close-period/{period}"))?);
+    }
+    let anchor = done.iter().position(|d| *d);
+    let last_due = now_ms >= last.end_ms().saturating_add(close_delay_ms);
+    Ok(window
+        .iter()
+        .zip(&done)
+        .enumerate()
+        .filter(|(i, (period, done))| {
+            !**done
+                && (**period != last || last_due)
+                && (anchor.is_some_and(|a| *i > a) || **period == last)
+        })
+        .map(|(_, (period, _))| *period)
+        .collect())
 }
 
 /// One scheduler tick at `billing`'s clock. See the module doc.
@@ -132,35 +181,36 @@ pub(crate) fn tick(state: &AppState, billing: &Billing, config: &SchedulerConfig
         let _ = meter.flush();
     }
 
-    // 2. Last month, once the delay has passed.
+    // 2. Unclosed months, oldest first.
     let catalog = billing.catalog();
-    let period = BillingPeriod::containing(now_ms).previous();
-    let job = format!("close-period/{period}");
-    let due = now_ms >= period.end_ms().saturating_add(config.close_delay_ms);
-    match billing.ledger.job_done(&job) {
-        Ok(false) if due => match billing.biller(&catalog).close_period(period, now_ms) {
-            Ok(closed) => {
-                if closed.errors.is_empty() {
-                    let detail = serde_json::json!({
-                        "created": closed.created.len(),
-                        "existing": closed.existing,
-                        "submitted": closed.submitted,
-                    })
-                    .to_string();
-                    if let Err(e) = billing.ledger.mark_job_done(&job, now_ms, &detail) {
-                        report.errors.push(format!("{job}: {e}"));
+    match months_to_close(billing, now_ms, config.close_delay_ms) {
+        Ok(periods) => {
+            for period in periods {
+                let job = format!("close-period/{period}");
+                match billing.biller(&catalog).close_period(period, now_ms) {
+                    Ok(closed) => {
+                        if closed.errors.is_empty() {
+                            let detail = serde_json::json!({
+                                "created": closed.created.len(),
+                                "existing": closed.existing,
+                                "submitted": closed.submitted,
+                            })
+                            .to_string();
+                            if let Err(e) = billing.ledger.mark_job_done(&job, now_ms, &detail) {
+                                report.errors.push(format!("{job}: {e}"));
+                            }
+                        } else {
+                            report
+                                .errors
+                                .push(format!("{job}: {} tenant(s) failed", closed.errors.len()));
+                        }
+                        report.closed.push(closed);
                     }
-                } else {
-                    report
-                        .errors
-                        .push(format!("{job}: {} tenant(s) failed", closed.errors.len()));
+                    Err(e) => report.errors.push(format!("{job}: {e}")),
                 }
-                report.closed = Some(closed);
             }
-            Err(e) => report.errors.push(format!("{job}: {e}")),
-        },
-        Ok(_) => {}
-        Err(e) => report.errors.push(format!("{job}: {e}")),
+        }
+        Err(e) => report.errors.push(format!("close-period: {e}")),
     }
 
     // 3. Polling fallback for missed webhooks.
