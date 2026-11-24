@@ -106,6 +106,18 @@ pub(crate) static ROUTES: &[Route] = &[
     ),
     public(
         "POST",
+        "/v1/namespaces/{namespace}/hard-delete",
+        "KoshaService_HardDeleteNamespace",
+        Write,
+    ),
+    public(
+        "POST",
+        "/v1/namespaces/{namespace}/export",
+        "KoshaService_ExportNamespace",
+        Write,
+    ),
+    public(
+        "POST",
         "/v1/namespaces/{namespace}/documents",
         "KoshaService_IndexDocuments",
         Write,
@@ -569,6 +581,8 @@ mod tests {
         ("POST /v1/namespaces HTTP/1.1", true, false),
         ("GET /v1/namespaces HTTP/1.1", false, false),
         ("DELETE /v1/namespaces/docs HTTP/1.1", true, false),
+        ("POST /v1/namespaces/docs/hard-delete HTTP/1.1", true, false),
+        ("POST /v1/namespaces/docs/export HTTP/1.1", true, false),
         ("POST /v1/namespaces/docs/documents HTTP/1.1", true, false),
         ("POST /v1/namespaces/docs/search HTTP/1.1", false, true),
         ("POST /v1/namespaces/docs/exists HTTP/1.1", false, false),

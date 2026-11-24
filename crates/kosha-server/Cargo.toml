@@ -10,7 +10,7 @@ workspace = true
 
 [features]
 default = []
-s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
+s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:tempfile"]
 postgres = ["kosha-control/postgres"]
 migrate = [
     "s3",
@@ -35,6 +35,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 aws-sdk-s3 = { version = "1", optional = true }
 aws-config = { version = "1", optional = true }
+tempfile = { version = "3", optional = true }
 # The HTTP server (http.rs) runs on its own tokio runtime, so tokio is not
 # optional. `io-util` also provides `AsyncWriteExt`, used to stream S3
 # response bodies chunk-by-chunk into the local cache instead of buffering

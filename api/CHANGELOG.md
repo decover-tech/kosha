@@ -7,6 +7,21 @@ independent of the server's crate version; see `docs/api/versioning.md`.
 
 Sections: Added, Changed, Deprecated, Removed.
 
+## [1.1.0]
+
+### Added
+
+- `POST /v1/namespaces/{namespace}/hard-delete` requires the namespace name
+  as confirmation and returns the durable deletion record. Existing v1
+  DELETE clients remain compatible.
+- `POST /v1/namespaces/{namespace}/export` gives tenant administrators a
+  signed URL to the namespace's complete live document snapshot as JSONL.
+
+### Changed
+
+- In-place changes to populated namespaces' declared field types are
+  rejected with `409 conflict` and `details.reason: "reindex_required"`.
+
 ## [1.0.0]
 
 v1 is GA (#350, ADR-350 §a, §d). From this revision on, a breaking change

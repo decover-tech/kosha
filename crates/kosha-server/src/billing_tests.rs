@@ -770,6 +770,8 @@ fn requests_are_classified_for_the_gate() {
         ("POST /v1/namespaces/a/delete", Operation::Delete),
         ("POST /delete", Operation::Delete),
         ("DELETE /v1/namespaces/a", Operation::Delete),
+        ("POST /v1/namespaces/a/hard-delete", Operation::Delete),
+        ("POST /v1/namespaces/a/export", Operation::Write),
         ("DELETE /v1/namespaces/a/branch", Operation::Delete),
         ("GET /v1/namespaces", Operation::Other),
         ("POST /v1/namespaces/a/exists", Operation::Other),

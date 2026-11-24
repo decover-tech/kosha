@@ -320,7 +320,8 @@ pub(crate) fn operation(request_line: &str) -> Operation {
     }
     let deletes = method == "DELETE"
         || path == "/delete"
-        || (path.starts_with("/v1/namespaces/") && path.ends_with("/delete"));
+        || (path.starts_with("/v1/namespaces/")
+            && (path.ends_with("/delete") || path.ends_with("/hard-delete")));
     if deletes {
         Operation::Delete
     } else {

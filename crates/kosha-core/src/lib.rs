@@ -4329,6 +4329,7 @@ pub enum KoshaError {
     /// The request itself is malformed or out of range (e.g. BM25 `b`
     /// outside `[0, 1]`). A client error: maps to HTTP 400.
     InvalidQuery(String),
+    SchemaReindexRequired(String),
     /// This writer no longer owns the namespace (#254): another writer
     /// holds its writer lease under a newer fencing token. Nothing was
     /// published. The fenced writer stops accepting writes for the
@@ -4359,6 +4360,7 @@ impl std::fmt::Display for KoshaError {
             Self::Overloaded(msg) => write!(f, "overloaded: {msg}"),
             Self::ControlPlane(msg) => write!(f, "control plane unavailable: {msg}"),
             Self::InvalidQuery(msg) => write!(f, "invalid query: {msg}"),
+            Self::SchemaReindexRequired(msg) => f.write_str(msg),
             Self::Fenced { namespace, token, current } => write!(f,
                 "writer fenced for {}: presented fencing token {token}, current token {current}; \
                  another writer owns this namespace", namespace.0),

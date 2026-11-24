@@ -60,6 +60,7 @@ mod metrics;
 #[cfg(feature = "migrate")]
 mod migrate;
 mod namespace_deletion;
+mod namespace_export;
 #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
 mod namespace_migrate;
 mod operator_admin;
@@ -7691,7 +7692,7 @@ fn forward_to_ingest(
 }
 
 /// Response headers a query pod relays from the ingest pod.
-const RELAYED_HEADERS: [&str; 8] = [
+const RELAYED_HEADERS: [&str; 9] = [
     "retry-after",
     "x-request-id",
     "allow",
@@ -7700,6 +7701,7 @@ const RELAYED_HEADERS: [&str; 8] = [
     "link",
     "kosha-api-version",
     "www-authenticate",
+    "cache-control",
 ];
 
 /// Parse `"METHOD /path HTTP/1.1\r\n"` into `("METHOD", "/path")`.
@@ -8069,6 +8071,12 @@ fn route_inner(
     if let Some(ns) = bare_namespace(request_line, "DELETE") {
         return handle_delete_namespace(&ns, tenant, state);
     }
+    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/hard-delete") {
+        return handle_confirmed_namespace_delete(&ns, tenant, body, state);
+    }
+    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/export") {
+        return namespace_export::handle(&ns, tenant, body, state);
+    }
 
     if is_list_namespaces_route(request_line) {
         return handle_list_namespaces(tenant, state);
@@ -8307,19 +8315,6 @@ fn bare_namespace(request_line: &str, method: &str) -> Option<String> {
 
 // ─── POST /v1/namespaces, DELETE /v1/namespaces/{ns} ────────────────────────
 
-/// Canonical schema field type names (`FieldSchema.type` in
-/// `proto/kosha/v1/kosha.proto`), by their historical enum number.
-const SCHEMA_FIELD_TYPES: [&str; 8] = [
-    "FIELD_TYPE_UNSPECIFIED",
-    "FIELD_TYPE_TEXT",
-    "FIELD_TYPE_KEYWORD",
-    "FIELD_TYPE_INTEGER",
-    "FIELD_TYPE_FLOAT",
-    "FIELD_TYPE_DATE",
-    "FIELD_TYPE_BOOLEAN",
-    "FIELD_TYPE_VECTOR",
-];
-
 /// Validate a `NamespaceSchema` from a `CreateNamespaceRequest` and return
 /// it in canonical proto-JSON form: every field has `type` (the
 /// `FIELD_TYPE_*` name), `indexed`, `stored` and `analyzer`. A field type
@@ -8330,6 +8325,7 @@ const SCHEMA_FIELD_TYPES: [&str; 8] = [
 /// (`default_analyzer`, `default_stopwords`, and a field's `stopwords`)
 /// pass through unchanged.
 fn parse_namespace_schema(value: &serde_json::Value) -> Result<serde_json::Value, String> {
+    use kosha_core::analysis::{canonical_schema_field_type, SCHEMA_FIELD_TYPES};
     const EXTENSIONS: [&str; 2] = ["default_analyzer", "default_stopwords"];
     let obj = value
         .as_object()
@@ -8363,21 +8359,8 @@ fn parse_namespace_schema(value: &serde_json::Value) -> Result<serde_json::Value
                         return Err(format!("schema field '{name}' names its type twice"));
                     }
                     seen_type = true;
-                    field_type = match v {
-                        serde_json::Value::Number(n) => n
-                            .as_u64()
-                            .and_then(|i| SCHEMA_FIELD_TYPES.get(i as usize).copied()),
-                        serde_json::Value::String(t) => {
-                            let upper = t.trim().to_ascii_uppercase();
-                            let bare = upper.strip_prefix("FIELD_TYPE_").unwrap_or(&upper);
-                            SCHEMA_FIELD_TYPES
-                                .iter()
-                                .copied()
-                                .find(|known| known.strip_prefix("FIELD_TYPE_") == Some(bare))
-                        }
-                        _ => None,
-                    }
-                    .ok_or_else(|| format!("schema field '{name}' has unknown type {v}"))?;
+                    field_type = canonical_schema_field_type(v)
+                        .ok_or_else(|| format!("schema field '{name}' has unknown type {v}"))?;
                 }
                 "indexed" | "stored" => {
                     let flag = v
@@ -8537,6 +8520,9 @@ fn handle_create_namespace(body: &[u8], tenant: &str, state: &AppState) -> Strin
             Err(KoshaError::InvalidQuery(message)) => {
                 return api_error(ErrorCode::InvalidArgument, &message)
             }
+            Err(KoshaError::SchemaReindexRequired(message)) => {
+                return schema_conflict_response(&message)
+            }
             Err(e) => return api_error(ErrorCode::Internal, &format!("schema update failed: {e}")),
         }
     }
@@ -8591,6 +8577,23 @@ fn branches_referencing(
         }
     }
     Ok(out)
+}
+
+fn handle_confirmed_namespace_delete(
+    name: &str,
+    tenant: &str,
+    body: &[u8],
+    state: &AppState,
+) -> String {
+    let confirmed = serde_json::from_slice::<serde_json::Value>(body)
+        .is_ok_and(|value| value.get("confirm").and_then(serde_json::Value::as_str) == Some(name));
+    if !confirmed {
+        return api_error(
+            ErrorCode::InvalidArgument,
+            "hard delete is permanent: send the namespace name in 'confirm'",
+        );
+    }
+    handle_delete_namespace(name, tenant, state)
 }
 
 /// `DELETE /v1/namespaces/{ns}` — `DeleteNamespaceResponse`. 404 if the
@@ -10656,22 +10659,34 @@ fn handle_put_schema_with_ns(
     if let Err(e) = schema.validate_embeddings() {
         return api_error(ErrorCode::InvalidArgument, &format!("invalid schema: {e}"));
     }
-    // Model pinning (#209): a field's embedding model cannot change while
-    // vectors of the old one are indexed. Checked on every shard before
-    // any manifest changes, so a refused change leaves none half-applied.
+    for (name, field) in &schema.fields {
+        if let Some(value) = field
+            .field_type
+            .as_ref()
+            .filter(|value| kosha_core::analysis::canonical_schema_field_type(value).is_none())
+        {
+            return api_error(
+                ErrorCode::InvalidArgument,
+                &format!("schema field '{name}' has unknown type {value}"),
+            );
+        }
+    }
     let mut pinned = vec![ns.clone()];
     if let Some(shards) = state.indexer.shard_count(&ns) {
         pinned.extend(kosha_core::sharding::shard_namespaces(&ns, shards));
     }
     for target in &pinned {
-        if let Some(conflict) = state.indexer.embedding_conflict(target, &schema) {
-            return api_error(ErrorCode::Conflict, &conflict);
+        if let Some(conflict) = state.indexer.schema_reindex_reason(target, &schema) {
+            return schema_conflict_response(&conflict);
         }
     }
     let changed = match state.indexer.set_schema(&ns, schema.clone()) {
         Ok(changed) => changed,
         Err(KoshaError::InvalidQuery(message)) => {
             return api_error(ErrorCode::InvalidArgument, &message)
+        }
+        Err(KoshaError::SchemaReindexRequired(message)) => {
+            return schema_conflict_response(&message)
         }
         Err(e) => return api_error(ErrorCode::Internal, &format!("schema update failed: {e}")),
     };
@@ -10695,6 +10710,12 @@ fn handle_put_schema_with_ns(
     }))
 }
 
+fn schema_conflict_response(reason: &str) -> String {
+    ApiError::new(ErrorCode::Conflict, reason)
+        .detail("reason", "reindex_required")
+        .into_raw()
+}
+
 /// Set `schema` on every shard of sharded root `ns` and publish the shards
 /// it changed. `Err` carries a ready-to-send error response.
 fn propagate_schema_to_shards(
@@ -10707,7 +10728,10 @@ fn propagate_schema_to_shards(
         let changed = state
             .indexer
             .set_schema(&shard, schema.clone())
-            .map_err(|e| api_error(ErrorCode::Internal, &format!("schema update failed: {e}")))?;
+            .map_err(|e| match e {
+                KoshaError::SchemaReindexRequired(message) => schema_conflict_response(&message),
+                e => api_error(ErrorCode::Internal, &format!("schema update failed: {e}")),
+            })?;
         if changed {
             state
                 .publish_namespace(&shard)
@@ -12853,6 +12877,7 @@ fn search_error_response(e: &KoshaError) -> String {
         // does not exist (never created, or deleted).
         KoshaError::NamespaceNotFound(ns) => namespace_not_found(&ns.0),
         KoshaError::NamespaceExists(_) => api_error(ErrorCode::AlreadyExists, &e.to_string()),
+        KoshaError::SchemaReindexRequired(message) => schema_conflict_response(message),
         KoshaError::ManifestConflict { .. } => {
             ApiError::new(ErrorCode::WriteConflict, format!("search error: {e}"))
                 .redact("search error: a concurrent write won; retry")
@@ -21766,6 +21791,69 @@ mod tests {
             "search response: {search_resp}"
         );
         assert!(search_resp.contains("\"total_hits\":1"));
+    }
+
+    #[test]
+    fn schema_type_changes_require_reindex_only_when_data_exists() {
+        let state = test_state();
+        let call = |action: &str, body: serde_json::Value| {
+            route(
+                &format!("POST /v1/namespaces/shop/{action} HTTP/1.1"),
+                &HashMap::new(),
+                &serde_json::to_vec(&body).unwrap(),
+                "acme",
+                &state,
+            )
+        };
+        for schema in [
+            serde_json::json!({"fields": {"price": {"type": "text"}}}),
+            serde_json::json!({"fields": {"price": {"type": "integer"}}}),
+        ] {
+            let response = call("schema", schema);
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        }
+        let response = call(
+            "documents",
+            serde_json::json!({"documents": [{"id": "1", "fields": [
+                {"name": "price", "field_type": "Integer", "value": "42"}
+            ]}]}),
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let response = call(
+            "schema",
+            serde_json::json!({"fields": {
+                "price": {"field_type": 3}, "brand": {"type": "Keyword"}
+            }}),
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        for schema in [
+            serde_json::json!({"fields": {"price": {"type": "float"}, "brand": {"type": "Keyword"}}}),
+            serde_json::json!({"fields": {"brand": {"type": "Keyword"}}}),
+        ] {
+            let response = call("schema", schema);
+            assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+            assert_eq!(
+                response_body_json(&response)["details"]["reason"],
+                "reindex_required"
+            );
+            assert!(response.contains("price"), "{response}");
+        }
+        let response = route(
+            "GET /v1/namespaces/shop/schema HTTP/1.1",
+            &HashMap::new(),
+            b"",
+            "acme",
+            &state,
+        );
+        assert_eq!(
+            response_body_json(&response)["schema"]["fields"]["price"]["type"],
+            3
+        );
+        assert_eq!(
+            response_body_json(&response)["schema"]["fields"]["brand"]["type"],
+            "Keyword"
+        );
+        fs::remove_dir_all(&state.data_dir).unwrap();
     }
 
     #[test]

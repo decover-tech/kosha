@@ -504,6 +504,7 @@ The public routes in brief:
 | Routes | Notes |
 |---|---|
 | `POST`/`GET /v1/namespaces`, `DELETE /v1/namespaces/{ns}` | Create (*write*), list, delete (*write*; see below). |
+| `POST /v1/namespaces/{ns}/hard-delete`, `POST .../export` | Confirmed hard delete and signed JSONL export. Both require the tenant key's admin scope for the namespace. |
 | `POST /v1/namespaces/{ns}/documents`, `/replace`, `/flush`, `/delete` | *write*. Upsert by id; replace by id merging partial documents; make buffered writes searchable; delete by query. |
 | `POST /v1/namespaces/{ns}/search`, `/exists`, `GET .../stats` | Reads. |
 | `POST`/`GET /v1/namespaces/{ns}/schema`, `POST .../shards` | Schema (see [Analyzers](#analyzers)); sharding ([Namespace sharding](#namespace-sharding)). |
@@ -517,7 +518,10 @@ and `GET /readyz` (unauthenticated probes, also served as `/v1/healthz` and
 `/v1/readyz`), `GET /metrics` ([docs/metrics.md](docs/metrics.md)) and
 `GET /dashboard` ([docs/dashboard.md](docs/dashboard.md)).
 
-**Deleting a namespace** (`DELETE /v1/namespaces/{ns}`) runs on the ingest pod
+**Deleting a namespace**: send `{"confirm":"docs"}` to
+`POST /v1/namespaces/docs/hard-delete`; missing or mismatched confirmation
+is rejected before the delete. The original `DELETE /v1/namespaces/{ns}`
+remains available for v1 clients. Both run on the ingest pod
 under the namespace's publication lock:
 
 1. The control store drops the namespace and its manifest. It keeps the highest
@@ -532,12 +536,35 @@ under the namespace's publication lock:
    the WAL stream (`discarded`), so recovery skips the deleted namespace's
    records in it.
 3. Its local segment directory and per-namespace caches are removed.
-4. With S3 configured, every object under the namespace's prefix
+4. With S3 configured, every object version and delete marker under the namespace's prefix
    (`{KOSHA_S3_PREFIX}/{tenant}/{ns}/`) is deleted before the response returns,
    and the prefix is then listed again. If the delete fails or the listing is
    not empty, the namespace is still deleted and the response says
    `"storage_reclaimed": false`; the leftover objects are unreferenced, and a
-   re-created namespace never reuses their keys.
+   re-created namespace never reuses their keys. The ingest role needs
+   `s3:ListBucketVersions` and `s3:DeleteObjectVersion` in addition to its
+   existing S3 permissions.
+
+**Exporting a namespace.** Send `{"format":"jsonl"}` (or `{}`) to
+`POST /v1/namespaces/{ns}/export`. With S3 configured, the ingest pod builds
+a snapshot of all live documents, including acknowledged unflushed writes,
+and returns `document_count` and a `download_url` signed for up to 15 minutes.
+Each line has the same `id` and typed `fields` as an ingest document, including
+stored vector values. Deleted documents and superseded versions are not
+exported. Treat the URL as a credential. The object is written in the
+namespace's `_exports/` prefix, with the namespace's normal S3 encryption
+settings. Hard delete removes these objects too; URL expiry does not delete
+the objects. Use a bucket lifecycle rule to expire the export prefix sooner
+if needed. Only JSONL is supported.
+
+**Evolving a schema.** `POST /v1/namespaces/{ns}/schema` accepts new field
+declarations on a live namespace. Changing or removing a previously
+declared type from a populated namespace requires reindexing, and returns
+`409 conflict` with `details.reason: "reindex_required"` and the field name.
+An empty namespace can change types. Analyzer updates keep their existing
+behavior: old segments are searched using their recorded analyzers; new
+segments use the new schema. [Embedding model changes](#native-embedding)
+still require reindexing when they would mix incompatible stored vectors.
 
 Query pods answer 404 for the namespace once they see the control store has no
 manifest for it: within one manifest refresh (`KOSHA_MANIFEST_REFRESH_MS`,

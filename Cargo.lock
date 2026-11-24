@@ -2228,6 +2228,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-rustls 0.26.4",
 ]

@@ -196,7 +196,12 @@ pub struct NamespaceSchema {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FieldSchema {
-    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "type",
+        alias = "field_type",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub field_type: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub indexed: Option<bool>,
@@ -213,6 +218,35 @@ pub struct FieldSchema {
     /// Absent = the client supplies vectors, as always.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<EmbeddingSpec>,
+}
+
+pub const SCHEMA_FIELD_TYPES: [&str; 8] = [
+    "FIELD_TYPE_UNSPECIFIED",
+    "FIELD_TYPE_TEXT",
+    "FIELD_TYPE_KEYWORD",
+    "FIELD_TYPE_INTEGER",
+    "FIELD_TYPE_FLOAT",
+    "FIELD_TYPE_DATE",
+    "FIELD_TYPE_BOOLEAN",
+    "FIELD_TYPE_VECTOR",
+];
+
+pub fn canonical_schema_field_type(value: &serde_json::Value) -> Option<&'static str> {
+    match value {
+        serde_json::Value::Number(n) => n
+            .as_u64()
+            .and_then(|i| usize::try_from(i).ok())
+            .and_then(|i| SCHEMA_FIELD_TYPES.get(i).copied()),
+        serde_json::Value::String(t) => {
+            let upper = t.trim().to_ascii_uppercase();
+            let bare = upper.strip_prefix("FIELD_TYPE_").unwrap_or(&upper);
+            SCHEMA_FIELD_TYPES
+                .iter()
+                .copied()
+                .find(|known| known.strip_prefix("FIELD_TYPE_") == Some(bare))
+        }
+        _ => None,
+    }
 }
 
 /// Largest `embedding.dims` a schema may declare.
@@ -254,6 +288,36 @@ impl EmbeddingSpec {
 }
 
 impl NamespaceSchema {
+    /// The first incompatible change to a previously declared field type.
+    /// A field with no declared type is schemaless and may be declared online.
+    pub fn field_type_conflict(&self, proposed: &Self) -> Option<String> {
+        for (name, field) in &self.fields {
+            let Some(old) = &field.field_type else {
+                continue;
+            };
+            let old_type = canonical_schema_field_type(old);
+            if old_type == Some(SCHEMA_FIELD_TYPES[0]) {
+                continue;
+            }
+            let new = proposed
+                .fields
+                .get(name)
+                .and_then(|f| f.field_type.as_ref());
+            if Some(old) == new
+                || old_type
+                    .is_some_and(|old| new.and_then(canonical_schema_field_type) == Some(old))
+            {
+                continue;
+            }
+            return Some(format!(
+                "changing or removing the declared type of field {name:?} requires a reindex; \
+                 export and re-ingest the documents into a namespace with the new schema, \
+                 or add a new field"
+            ));
+        }
+        None
+    }
+
     /// The fields that declare an embedding model. Empty for every schema
     /// that does not opt in.
     pub fn embedded_fields(&self) -> impl Iterator<Item = (&String, &EmbeddingSpec)> {

@@ -35,7 +35,7 @@ pub(crate) trait RemotePrefixStore: Send + Sync {
     /// Delete every object under the logical directory `prefix`,
     /// recursively. Returns how many went.
     fn delete_prefix(&self, prefix: &str) -> Result<usize, KoshaError>;
-    /// How many objects are under the logical directory `prefix` right now.
+    /// At least how many objects are under the logical directory `prefix` right now.
     fn count_prefix(&self, prefix: &str) -> Result<usize, KoshaError>;
 }
 
@@ -46,10 +46,7 @@ impl RemotePrefixStore for s3_storage::S3Storage {
     }
 
     fn count_prefix(&self, prefix: &str) -> Result<usize, KoshaError> {
-        // The trailing slash keeps a sibling (`acme/docs2`) out of the count
-        // for `acme/docs`.
-        let dir = format!("{}/", prefix.trim_matches('/'));
-        Ok(self.list_objects_remote(&dir)?.len())
+        self.count_erasure_page(prefix)
     }
 }
 
@@ -136,7 +133,7 @@ impl AppState {
             Ok(left) => (
                 deleted,
                 Some(format!(
-                    "{left} object(s) remain under {prefix}/ after the delete"
+                    "At least {left} object(s) remain under {prefix}/ after the delete"
                 )),
             ),
             Err(e) => (
@@ -1030,6 +1027,29 @@ mod tests {
 
     fn no_keys() -> auth::Auth {
         auth::Auth::Keys(auth::KeyStore::with_keys(HashMap::new()))
+    }
+
+    #[test]
+    fn confirmed_hard_delete_does_not_remove_anything_until_the_name_matches() {
+        let (state, remote) = state_with_remote();
+        index(&state, "acme", "docs", &["a"]);
+        remote.put("acme/docs/_exports/export.jsonl");
+        let path = "POST /v1/namespaces/docs/hard-delete";
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({"confirm": "other"}),
+        ] {
+            assert_eq!(call(&state, "acme", path, body).0, 400);
+            assert_eq!(search(&state, "acme", "docs").1, ["a"]);
+            assert_eq!(remote.under("acme/docs").len(), 1);
+            assert!(listed(&state, "").is_empty());
+        }
+        let (status, body) = call(&state, "acme", path, serde_json::json!({"confirm": "docs"}));
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["deletion"]["state"], "completed");
+        assert!(remote.under("acme/docs").is_empty());
+        assert!(!state.data_dir.join("acme/docs").exists());
+        std::fs::remove_dir_all(&state.data_dir).unwrap();
     }
 
     #[test]
