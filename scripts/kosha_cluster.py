@@ -441,6 +441,8 @@ def cluster_health(kubectl: list[str]) -> dict:
         })
         if not ready:
             problems.append(f"{ROLE[name]}: not ready")
+        elif name != "kosha-indexer" and deployment["spec"].get("replicas", 1) == 0:
+            problems.append(f"{ROLE[name]}: scaled to 0 replicas")
     images = sorted({role["image"] for role in roles})
     if len(images) > 1:
         problems.append("roles run different images (unfinished upgrade?)")
