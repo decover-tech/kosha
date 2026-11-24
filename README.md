@@ -1134,6 +1134,13 @@ transaction as the change, naming the admin credential that did it
 [docs/organizations.md](docs/organizations.md#audit-log). `last_used_at` is
 written about once per refresh interval, not per request.
 
+A revocation reaches the other pods only on their next successful key
+refresh. A pod that cannot reach Postgres keeps the keys it last loaded (and
+logs `api keys: refresh failed, keeping previous snapshot`), so a tenant key
+revoked during the outage keeps working on that pod until a refresh succeeds.
+Operator credentials are different: after ten failed intervals the pod
+refuses all of them until it can refresh.
+
 **A tenant managing its own keys.** A key with the `admin` scope can list,
 create, rotate and revoke its own tenant's registry keys without an operator
 (`kosha keys ...` wraps these; Postgres control plane only):
