@@ -755,6 +755,7 @@ pub struct S3Storage {
     local: LocalStorage,
     bucket: String,
     prefix: String,
+    custom_endpoint: bool,
     rt: tokio::runtime::Runtime,
     client: aws_sdk_s3::Client,
     sse: SseConfig,
@@ -803,6 +804,7 @@ impl S3Storage {
             local,
             bucket: config.bucket,
             prefix: config.prefix,
+            custom_endpoint: config.endpoint.is_some(),
             rt,
             client,
             sse: config.sse,
@@ -1559,28 +1561,56 @@ impl S3Storage {
         &self,
         prefix: &str,
     ) -> Result<Vec<(String, String)>, KoshaError> {
-        let page = self
-            .client
-            .list_multipart_uploads()
-            .bucket(&self.bucket)
-            .prefix(prefix)
-            .send()
-            .await
-            .map_err(|e| {
-                KoshaError::NotFound(format!(
-                    "S3 list_multipart_uploads: {}",
-                    log_s3_error("list_multipart_uploads", prefix, &e)
-                ))
-            })?;
-        page.uploads()
-            .iter()
-            .map(|upload| match (upload.key(), upload.upload_id()) {
-                (Some(key), Some(id)) if key.starts_with(prefix) => Ok((key.into(), id.into())),
-                _ => Err(KoshaError::NotFound(
-                    "S3 multipart listing returned an invalid key or upload ID".into(),
-                )),
-            })
-            .collect()
+        // MinIO's prefixed listing treats the prefix as an exact object key.
+        let list_prefix = (!self.custom_endpoint).then(|| prefix.to_owned());
+        let mut markers = (None, None);
+        loop {
+            let page = self
+                .client
+                .list_multipart_uploads()
+                .bucket(&self.bucket)
+                .set_prefix(list_prefix.clone())
+                .set_key_marker(markers.0.clone())
+                .set_upload_id_marker(markers.1.clone())
+                .send()
+                .await
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 list_multipart_uploads: {}",
+                        log_s3_error("list_multipart_uploads", prefix, &e)
+                    ))
+                })?;
+            let mut matches = Vec::new();
+            for upload in page.uploads() {
+                let Some(key) = upload.key() else {
+                    return Err(KoshaError::NotFound(
+                        "S3 multipart listing returned an upload without a key".into(),
+                    ));
+                };
+                if !key.starts_with(prefix) {
+                    continue;
+                }
+                let Some(id) = upload.upload_id() else {
+                    return Err(KoshaError::NotFound(
+                        "S3 multipart listing returned an upload without an ID".into(),
+                    ));
+                };
+                matches.push((key.into(), id.into()));
+            }
+            if !matches.is_empty() || !page.is_truncated().unwrap_or_default() {
+                return Ok(matches);
+            }
+            let next = (
+                page.next_key_marker().map(str::to_owned),
+                page.next_upload_id_marker().map(str::to_owned),
+            );
+            if next.0.is_none() || next == markers {
+                return Err(KoshaError::NotFound(
+                    "S3 multipart listing did not advance".into(),
+                ));
+            }
+            markers = next;
+        }
     }
 
     pub(crate) fn count_erasure_page(&self, path: &str) -> Result<usize, KoshaError> {
@@ -3751,6 +3781,7 @@ pub(crate) mod capture {
             local: kosha_core::LocalStorage::new(local_root),
             bucket: "bucket".into(),
             prefix: prefix.into(),
+            custom_endpoint: false,
             rt: tokio::runtime::Runtime::new().unwrap(),
             client,
             sse,
@@ -4165,6 +4196,53 @@ mod error_path_tests {
     }
 
     #[test]
+    fn custom_endpoint_erasure_finds_uploads_beyond_unrelated_keys() {
+        let mut aborted = false;
+        let endpoint = serve_requests(move |head, _| {
+            let request = head.lines().next().unwrap();
+            if request.starts_with("GET /bucket/?uploads") {
+                assert!(!request.contains("prefix="), "{request}");
+                if !request.contains("key-marker=") {
+                    return (
+                        "200 OK",
+                        "<ListMultipartUploadsResult><IsTruncated>true</IsTruncated>\
+                         <NextKeyMarker>before</NextKeyMarker><NextUploadIdMarker>skip</NextUploadIdMarker>\
+                         <Upload><Key>before</Key><UploadId>skip</UploadId></Upload>\
+                         </ListMultipartUploadsResult>",
+                    );
+                }
+                assert!(request.contains("key-marker=before"), "{request}");
+                assert!(request.contains("upload-id-marker=skip"), "{request}");
+                if aborted {
+                    return ("200 OK", "<ListMultipartUploadsResult/>");
+                }
+                return (
+                    "200 OK",
+                    "<ListMultipartUploadsResult>\
+                     <Upload><Key>secret-prefix/acme/docs/_exports/partial.jsonl</Key><UploadId>unfinished</UploadId></Upload>\
+                     <Upload><Key>secret-prefix/acme/docs2/report.jsonl</Key><UploadId>sibling</UploadId></Upload>\
+                     </ListMultipartUploadsResult>",
+                );
+            }
+            if request.starts_with("DELETE ") {
+                assert!(request
+                    .starts_with("DELETE /bucket/secret-prefix/acme/docs/_exports/partial.jsonl?"));
+                assert!(request.contains("uploadId=unfinished"));
+                aborted = true;
+                return ("204 No Content", "");
+            }
+            assert!(request.starts_with("GET /bucket/?versions"), "{request}");
+            ("200 OK", "<ListVersionsResult/>")
+        });
+        let (mut storage, root) = storage(&endpoint, "compatible-multipart");
+        storage.custom_endpoint = true;
+        assert_eq!(storage.count_erasure_page("acme/docs").unwrap(), 1);
+        assert_eq!(storage.delete_prefix("acme/docs").unwrap(), 0);
+        assert_eq!(storage.count_erasure_page("acme/docs").unwrap(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn erasure_removes_versions_but_fails_if_multipart_listing_is_denied() {
         let mut deleted = false;
         let endpoint = serve_requests(move |head, body| {
@@ -4242,6 +4320,7 @@ mod error_path_tests {
             local: LocalStorage::new(root.clone()),
             bucket: "bucket".into(),
             prefix: "secret-prefix".into(),
+            custom_endpoint: false,
             rt: tokio::runtime::Runtime::new().unwrap(),
             client: aws_sdk_s3::Client::from_conf(config),
             sse: SseConfig::default(),

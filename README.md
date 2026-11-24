@@ -547,6 +547,11 @@ under the namespace's publication lock:
    `s3:ListBucketMultipartUploads`, and `s3:AbortMultipartUpload` in addition
    to its existing S3 permissions.
 
+For a custom S3 endpoint, multipart erasure lists the bucket without a
+prefix and filters keys locally. Some MinIO versions list only uploads
+known to the running server this way, so a successful check does not
+certify erasure of uploads left by an earlier MinIO process.
+
 The S3 check covers the namespace or tenant prefix, not the separate
 `_wal/{writer_id}/` streams. Versioned S3 WAL objects can retain prior
 versions after reclamation, and shared WAL files can retain the deleted
