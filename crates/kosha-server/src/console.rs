@@ -97,7 +97,10 @@ fn is_loopback(url: &str) -> bool {
         Some(v6) => v6.split(']').next().unwrap_or(""),
         None => host.rsplit_once(':').map_or(host, |(h, _)| h),
     };
-    host.eq_ignore_ascii_case("localhost") || host.starts_with("127.") || host == "::1"
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 pub(crate) struct Console {
