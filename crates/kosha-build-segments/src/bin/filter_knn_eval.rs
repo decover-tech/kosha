@@ -314,6 +314,10 @@ fn run(
     let mut hits: Vec<(f64, usize)> = Vec::new();
     let (mut fetched, mut empty) = (0usize, 0usize);
     for ((seg, b), p) in segments.iter().zip(&bounds).zip(&passes) {
+        // Search skips a segment where the filter matches nothing.
+        if p.iter().all(|&n| n == 0) {
+            continue;
+        }
         let accept = |seq: u32| pass[seg.corpus_index[seq as usize]];
         let ranking = KnnSegmentRanking::new(b.clone(), cutoff, widened);
         let (seg_hits, probes) = seg
@@ -413,6 +417,7 @@ fn main() {
     for seg in &segments {
         seg.corpus_index.iter().for_each(|&i| indexed[i] = true);
     }
+    let n_indexed = indexed.iter().filter(|&&x| x).count();
     let random_pass = |s: f64, salt: u64| -> Vec<bool> {
         let mut pass = random_pass(s, salt);
         pass.iter_mut().zip(&indexed).for_each(|(p, &x)| *p &= x);
@@ -438,7 +443,7 @@ fn main() {
     let mut summary = Vec::new();
     for filter in &cli.filters {
         for &s in &cli.selectivities {
-            let count = ((s * n as f64).round() as usize).max(1);
+            let count = ((s * n_indexed as f64).round() as usize).clamp(1, n_indexed.max(1));
             let fixed = match filter.as_str() {
                 "random" => Some(random_pass(s, 0x51)),
                 "clustered" => Some(mask(top_n(&unindexed_low(&anchor_sims), count))),
