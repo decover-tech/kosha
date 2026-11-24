@@ -126,8 +126,9 @@ impl S3Config {
         }
     }
 
-    /// [`S3Config::from_env`] that returns an invalid encryption setting as
-    /// an error instead of exiting.
+    /// [`S3Config::from_env`] that returns an invalid encryption setting
+    /// (or a plain-HTTP endpoint under `KOSHA_INTERNAL_TLS=required`) as an
+    /// error instead of exiting.
     pub fn try_from_env() -> Result<Option<Self>, String> {
         let Ok(bucket) = std::env::var("KOSHA_S3_BUCKET") else {
             return Ok(None);
@@ -162,6 +163,9 @@ impl S3Config {
             });
 
         let sse = SseConfig::from_env()?;
+        // Encryption in transit to S3 (#343): `KOSHA_INTERNAL_TLS=required`
+        // refuses a plain-HTTP custom endpoint.
+        crate::internal_tls::check_s3_endpoint_env()?;
 
         Ok(Some(Self {
             bucket,
