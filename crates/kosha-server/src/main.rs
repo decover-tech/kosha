@@ -4474,8 +4474,12 @@ impl AppState {
         let mut fetch_from_s3: Vec<(String, u64)> = Vec::new();
         let mut owned_leases: Vec<String> = Vec::new();
 
-        for (path, size) in files {
+        for (index, (path, size)) in files.iter().enumerate() {
             match leases.try_claim(path, own_addr, LEASE_TTL) {
+                kosha_control::HydrationLease::Unavailable => {
+                    fetch_from_s3.extend_from_slice(&files[index..]);
+                    break;
+                }
                 kosha_control::HydrationLease::Owner => {
                     self.metrics.record_lease(metrics::LeaseOutcome::Won);
                     owned_leases.push(path.clone());
@@ -4516,7 +4520,9 @@ impl AppState {
         // failure) — releasing earlier could let a waiter's peer-fetch land
         // on us before the bytes actually exist locally.
         for path in &owned_leases {
-            leases.release(path, own_addr);
+            if !leases.release(path, own_addr) {
+                break;
+            }
         }
     }
 

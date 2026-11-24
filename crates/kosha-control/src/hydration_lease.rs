@@ -26,9 +26,8 @@
 //!      segment that's cold across the whole fleet now costs one S3 GET
 //!      total, not one per replica.
 //!
-//! Fails open throughout: any Postgres error is treated as `Owner`, so a
-//! coordination outage degrades to "every pod fetches its own copy" — i.e.
-//! exactly today's behavior — never to a stuck or failed request.
+//! Fails open throughout: any Postgres error skips coordination, so an
+//! outage degrades to every pod fetching its own copy.
 //!
 //! Deliberately runs its own small connection pool, separate from
 //! `PgStore`'s. `PgStore` sits behind `AppState::controller`'s single
@@ -39,6 +38,8 @@
 
 use std::time::Duration;
 
+const LEASE_OPERATION_TIMEOUT: Duration = Duration::from_millis(100);
+
 /// Outcome of [`HydrationLeaseStore::try_claim`].
 pub enum HydrationLease {
     /// This caller must fetch the segment itself — either a fresh claim, or
@@ -48,6 +49,8 @@ pub enum HydrationLease {
     /// Another replica already owns this fetch. Reachable at this address
     /// (`host:port`, as published via `try_claim`'s own `self_addr`).
     OwnedBy(String),
+    /// Coordination failed; fetch directly without claiming or releasing a lease.
+    Unavailable,
 }
 
 /// Postgres-backed cross-replica lease coordinator for segment hydration.
@@ -95,9 +98,11 @@ impl HydrationLeaseStore {
         let addr = self_addr.to_string();
         let ttl_secs = ttl.as_secs_f64();
 
-        let result: Result<Option<(String,)>, sqlx::Error> = self.rt.block_on(async {
-            sqlx::query_as(
-                "WITH upsert AS ( \
+        let result = self.rt.block_on(async {
+            tokio::time::timeout(
+                LEASE_OPERATION_TIMEOUT,
+                sqlx::query_as::<_, (String,)>(
+                    "WITH upsert AS ( \
                     INSERT INTO kosha.hydration_leases (segment_key, owner_addr, expires_at) \
                     VALUES ($1, $2, now() + ($3 * interval '1 second')) \
                     ON CONFLICT (segment_key) DO UPDATE \
@@ -112,27 +117,34 @@ impl HydrationLeaseStore {
                  SELECT owner_addr FROM kosha.hydration_leases \
                  WHERE segment_key = $1 AND NOT EXISTS (SELECT 1 FROM upsert) \
                  LIMIT 1",
+                )
+                .bind(&key)
+                .bind(&addr)
+                .bind(ttl_secs)
+                .fetch_optional(&self.pool),
             )
-            .bind(&key)
-            .bind(&addr)
-            .bind(ttl_secs)
-            .fetch_optional(&self.pool)
             .await
         });
 
         match result {
-            Ok(Some((owner,))) if owner == self_addr => HydrationLease::Owner,
-            Ok(Some((owner,))) => HydrationLease::OwnedBy(owner),
+            Ok(Ok(Some((owner,)))) if owner == self_addr => HydrationLease::Owner,
+            Ok(Ok(Some((owner,)))) => HydrationLease::OwnedBy(owner),
             // Reachable only via a race between the CTE's two branches (the
             // lease got deleted — i.e. released — between them):
             // vanishingly rare, and safe to treat as "nobody owns it right
             // now, so we do."
-            Ok(None) => HydrationLease::Owner,
-            Err(e) => {
+            Ok(Ok(None)) => HydrationLease::Owner,
+            Ok(Err(e)) => {
                 eprintln!(
                     "WARN: hydration lease claim failed for {segment_key}: {e}; fetching directly"
                 );
-                HydrationLease::Owner
+                HydrationLease::Unavailable
+            }
+            Err(_) => {
+                eprintln!(
+                    "WARN: hydration lease claim timed out for {segment_key}; fetching directly"
+                );
+                HydrationLease::Unavailable
             }
         }
     }
@@ -144,20 +156,29 @@ impl HydrationLeaseStore {
     /// still its recorded owner, so a lease that already expired and was
     /// reclaimed by someone else is never deleted out from under its new
     /// owner. A failure here just means the row expires naturally instead.
-    pub fn release(&self, segment_key: &str, self_addr: &str) {
+    pub fn release(&self, segment_key: &str, self_addr: &str) -> bool {
         let key = segment_key.to_string();
         let addr = self_addr.to_string();
-        let result = self.rt.block_on(async {
-            sqlx::query(
+        let result =
+            self.rt.block_on(async {
+                tokio::time::timeout(LEASE_OPERATION_TIMEOUT, sqlx::query(
                 "DELETE FROM kosha.hydration_leases WHERE segment_key = $1 AND owner_addr = $2",
             )
             .bind(&key)
             .bind(&addr)
-            .execute(&self.pool)
+            .execute(&self.pool))
             .await
-        });
-        if let Err(e) = result {
-            eprintln!("WARN: failed to release hydration lease for {segment_key}: {e}");
+            });
+        match result {
+            Ok(Ok(_)) => true,
+            Ok(Err(e)) => {
+                eprintln!("WARN: failed to release hydration lease for {segment_key}: {e}");
+                false
+            }
+            Err(_) => {
+                eprintln!("WARN: hydration lease release timed out for {segment_key}");
+                false
+            }
         }
     }
 }
