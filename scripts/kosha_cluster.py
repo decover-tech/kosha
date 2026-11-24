@@ -29,8 +29,21 @@ DEPLOYMENTS = ("deployment/kosha", "deployment/kosha-query", "deployment/kosha-i
 ROLLOUT_ORDER = ("kosha-query", "kosha", "kosha-indexer")
 ROLE = {"kosha": "ingest", "kosha-query": "query", "kosha-indexer": "indexer"}
 SAAS_SECRET_KEYS = (
-    "database-url", "bootstrap-api-key", "internal-api-key", "stripe-api-key",
+    "database-url", "bootstrap-api-key", "admin-api-key", "internal-api-key",
+    "stripe-api-key",
 )
+# Admin bootstrap credential (KOSHA_ADMIN_API_KEY) for /v1/admin/*. Required
+# by k8s/saas; a base install wires it when kosha-secret has the key.
+ADMIN_KEY_PATCH = [{
+    "op": "add",
+    "path": "/spec/template/spec/containers/0/env/-",
+    "value": {
+        "name": "KOSHA_ADMIN_API_KEY",
+        "valueFrom": {"secretKeyRef": {
+            "name": "kosha-secret", "key": "admin-api-key", "optional": True,
+        }},
+    },
+}]
 TLS_SECRET_KEYS = ("tls.crt", "tls.key", "ca.crt")
 KEY_NAMES = '{{range $k, $v := .data}}{{$k}}{{"\\n"}}{{end}}'
 UPGRADE_NOTE = "See README.md, \"S3 WAL\", for the manifest/WAL upgrade note."
@@ -130,6 +143,11 @@ def render_overlay(root: Path, args: argparse.Namespace) -> Path:
             for patch in (config, account, namespace, query)
         ],
     }
+    if not saas:
+        kustomization["patches"].append({
+            "patch": json.dumps(ADMIN_KEY_PATCH),
+            "target": {"kind": "Deployment", "name": "kosha(-query|-indexer)?"},
+        })
     (overlay / "kustomization.yaml").write_text(
         json.dumps(kustomization), encoding="utf-8",
     )

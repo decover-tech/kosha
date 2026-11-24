@@ -329,7 +329,10 @@ Use `scripts/kosha_cluster.py` from this checkout with Python 3.10+ and
   that service account to the installer.
 - In namespace `kosha`, provision the Secret `kosha-secret` with keys
   `database-url` and `bootstrap-api-key` using your usual secret tooling.
-  The installer neither creates nor overwrites that Secret.
+  Add `admin-api-key` too: the installer wires it into every Deployment as
+  `KOSHA_ADMIN_API_KEY`, the admin bootstrap credential for `/v1/admin/*`
+  (without it those routes stay disabled). The installer neither creates
+  nor overwrites that Secret.
 
 ```sh
 python3 scripts/kosha_cluster.py --context customer-eks install \
@@ -389,9 +392,16 @@ prerequisites](#fresh-install-on-an-existing-cluster):
 - `kosha-secret` must hold `database-url` (with `sslmode=verify-full`,
   see "Encryption in transit" above; put its CA in ConfigMap `kosha-pg-ca`,
   key `ca.crt`, which the overlay mounts at `/etc/kosha/pg` in the
-  Deployments and the reconcile CronJob), `bootstrap-api-key`, `internal-api-key` and
-  `stripe-api-key`. Optional: `admin-api-key` (operator onboarding),
+  Deployments and the reconcile CronJob), `bootstrap-api-key`,
+  `admin-api-key`, `internal-api-key` and `stripe-api-key`. Optional:
   `stripe-webhook-secret`, `console-secret-key` (organization OIDC secrets).
+- `admin-api-key` is the **admin bootstrap credential**: the overlay sets it
+  as `KOSHA_ADMIN_API_KEY` on every Deployment (the segment-GC CronJob
+  already reads it), and it is the only way into `/v1/admin/*` on a fresh
+  cell. Use it to create per-operator credentials
+  (`POST /v1/admin/operators`) for people and automation, then set
+  `KOSHA_ADMIN_BOOTSTRAP_KEY=disabled` in `kosha-config` and keep the shared
+  key only for break-glass (see `docs/configuration.md`).
 - `kosha-internal-tls` must hold `tls.crt`, `tls.key` and `ca.crt`
   (`base/certificate-internal-tls.example.yaml`).
 - The IRSA role needs `kms:GenerateDataKey` and `kms:Decrypt` on the default

@@ -11,7 +11,10 @@ bucket/prefix) deployed with the [`k8s/saas`](../k8s/saas) overlay.
 
 Customers are onboarded through the control-plane APIs (console sign-up or
 `POST /v1/admin/orgs`, then projects, tenants and scoped API keys; see
-[organizations](organizations.md)), never by installing a stack for them.
+[organizations](organizations.md)), never by installing a stack for them. A
+cell's first admin access is the admin bootstrap credential (`admin-api-key`
+in `kosha-secret`, set as `KOSHA_ADMIN_API_KEY`), which operators replace with
+per-operator credentials.
 BYOC and dedicated clusters are **deferred**, not rejected.
 
 ## Why now

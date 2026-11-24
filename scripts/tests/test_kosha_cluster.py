@@ -68,9 +68,14 @@ def test_install_configures_existing_base_and_waits_for_all_roles(kubectl):
     assert rendered["images"] == [{
         "name": "kosha", "newName": "registry.example:5000/kosha", "newTag": "1.2.3",
     }]
-    config, account, namespace, _ = [
+    config, account, namespace, _, admin = [
         json.loads(patch["patch"]) for patch in rendered["patches"]
     ]
+    assert rendered["patches"][4]["target"]["kind"] == "Deployment"
+    assert admin[0]["value"]["name"] == "KOSHA_ADMIN_API_KEY"
+    assert admin[0]["value"]["valueFrom"]["secretKeyRef"] == {
+        "name": "kosha-secret", "key": "admin-api-key", "optional": True,
+    }
     assert config["data"] == {
         "KOSHA_S3_BUCKET": "test-bucket",
         "KOSHA_S3_PREFIX": "test-prefix/",
@@ -158,6 +163,7 @@ def test_saas_install_uses_saas_overlay_and_checks_secret_keys(kubectl):
     assert calls[:4] == [LOOKUP, ACCOUNT, SAAS_SECRET, TLS_SECRET]
     assert calls[4][:2] == ["create", "-k"]
     assert rendered["resources"] == ["../saas"]
+    assert len(rendered["patches"]) == 4  # k8s/saas wires the admin key itself
     patches = [json.loads(patch["patch"]) for patch in rendered["patches"]]
     config = patches[0]["data"]
     assert config["KOSHA_CONSOLE_PUBLIC_URL"] == "https://console.example.com"
@@ -173,7 +179,7 @@ def test_saas_install_refuses_missing_secret_keys(kubectl, capsys):
     assert invoke(*SAAS_INSTALL) == 1
     assert calls == [LOOKUP, ACCOUNT, SAAS_SECRET]
     err = capsys.readouterr().err
-    assert "internal-api-key, stripe-api-key" in err
+    assert "admin-api-key, internal-api-key, stripe-api-key" in err
 
 
 def test_saas_install_requires_console_url(kubectl):
@@ -206,6 +212,8 @@ def test_saas_overlay_renders_with_kustomize(tmp_path):
     assert "KOSHA_CONSOLE_PUBLIC_URL: https://console.example.com" in out
     assert "https://kosha-ingest-service.kosha.svc:8080" in out
     assert "image: kosha:1.2.3" in out
+    assert out.count("key: admin-api-key") == 4  # 3 Deployments + segment GC
+    assert out.count("name: KOSHA_ADMIN_API_KEY") == 4  # 3 Deployments + segment GC
 
 
 # --- upgrade -------------------------------------------------------------

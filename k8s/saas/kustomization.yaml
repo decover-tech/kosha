@@ -15,8 +15,9 @@
 #
 # Prerequisites in namespace `kosha` (never committed):
 #   - Secret kosha-secret: database-url (sslmode=verify-full),
-#     bootstrap-api-key, internal-api-key, stripe-api-key; optional
-#     admin-api-key, stripe-webhook-secret, console-secret-key.
+#     bootstrap-api-key, admin-api-key (admin bootstrap, KOSHA_ADMIN_API_KEY),
+#     internal-api-key, stripe-api-key; optional stripe-webhook-secret,
+#     console-secret-key.
 #   - Secret kosha-internal-tls: tls.crt, tls.key, ca.crt
 #     (base/certificate-internal-tls.example.yaml).
 apiVersion: kustomize.config.k8s.io/v1beta1
