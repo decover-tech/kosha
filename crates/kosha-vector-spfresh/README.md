@@ -53,8 +53,9 @@ ANN structure when a segment is opened.
   `build_refine_rounds = 0` (kosha: `KOSHA_VECTOR_BUILD_REFINE=off`) is the
   plain bisection build, with undersized postings merged away, exactly as
   before. The same build serves `KOSHA_VECTOR_COMPACTION=rebuild` and the
-  compaction fallback. Late-interaction `.ivf` clustering keeps the plain
-  build.
+  compaction fallback. Late-interaction `.ivf` files do not use this index:
+  they assign tokens to a frozen ColBERTv2-style codebook of about
+  `16 * sqrt(n)` centroids (`kosha-segment/src/multivec/codebook.rs`).
 - **Compaction** (#253) does not re-cluster. Per vector column:
   1. The largest input whose column has at least 1,024 vectors and a clustered
      index has its postings adopted with [`ClusterIndex::from_postings`]:

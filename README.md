@@ -682,8 +682,10 @@ as for single-vector kNN. A query whose tokens differ in dimension from the fiel
 
 **How it runs.** Each segment keeps, per late-interaction field, `multivec.{i}.bags` (every
 token, unit-normalized f32, with a per-document offsets table so one bag is one ranged read) and
-`multivec.{i}.ivf` (the tokens clustered with the same balanced k-means as the single-vector
-index; each posting holds its tokens' doc ids and int8 codes). For every query token the
+`multivec.{i}.ivf` (each token assigned to the nearest centroid of a ColBERTv2-style codebook of
+about `16 * sqrt(tokens)` centroids, trained once by spherical k-means on a sample of at most 64
+tokens per centroid and then frozen, two-level above 256 centroids; each posting holds its
+tokens' doc ids and int8 codes; the file format is unchanged). For every query token the
 `KOSHA_LATE_INTERACTION_NPROBE` (default 16) nearest postings are scored from the int8 codes,
 the best `num_candidates` documents by that approximate MaxSim are re-scored exactly from their
 bags, and the top `k` are kept. Probed postings are kept decoded in a per-segment LRU
@@ -700,8 +702,11 @@ reads these segments normally, just without late-interaction hits, and its compa
 Apple M5). Per document, relative to its raw f32 tokens: `.bags` 1.00x, `.ivf` 0.28x, and the
 source JSON in the doc store 2.55x, so about 4.8x the raw token bytes in all. With 128-dim
 tokens, 64 per document, that is 32 KB raw, ~124 KB stored, against ~0.5 KB for one 128-dim
-vector; the index build is k-means over every token (7.6 s for 8,000 such documents, 512k
-tokens). Queries: 8,000 documents x 64 tokens, 32 query tokens: warm p50 15.3 ms, recall@10
+vector. Training the codebook on a sample instead of clustering every token cuts the
+token-index build (Linux VM, 128 dims): 2M tokens (32,000 such documents in one segment) build in
+29 s against 112 s with balanced k-means over every token, with warm p50 16.8 ms against 25.0 ms
+and recall@10 0.895 against 0.930 at the default 16 probes; 8,000 documents in 4 segments build in
+5.6 s against 13.9 s, recall 1.000 both. Queries: 8,000 documents x 64 tokens, 32 query tokens: warm p50 15.3 ms, recall@10
 against brute-force MaxSim 1.000 (single-vector kNN over mean-pooled tokens: 1.1 ms, but only
 0.40 of the MaxSim top 10). 4,000 x 32 tokens at 64 dim, 16 query tokens: 1.9 ms. Single-vector
 kNN is unchanged when the feature is unused (`knn_open_search` p50s identical to main).

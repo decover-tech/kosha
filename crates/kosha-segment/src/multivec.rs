@@ -24,8 +24,9 @@
 //! `doc_store.offsets` + `doc_store.bin`.
 //!
 //! `multivec.{i}.ivf` — the candidate generator: every token vector
-//! clustered with the same balanced k-means the single-vector index uses
-//! (`kosha_vector_spfresh::ClusterIndex`). Postings hold each token as its
+//! assigned to the nearest centroid of a frozen coarse codebook trained on
+//! a sample of the segment's tokens, about `16 * sqrt(n)` centroids as in
+//! ColBERTv2 (see [`codebook`]). Postings hold each token as its
 //! document's doc_seq plus an int8 code of the unit token vector (one
 //! scale per token), a quarter of the f32 size, so candidates can be ranked
 //! by near-exact token similarities without reading any bag:
@@ -64,6 +65,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use kosha_core::{Footer, KoshaError, MultiVectorField, StorageBackend};
+
+mod codebook;
 
 /// Magic prefix of `multivec.{i}.bags` ("KMVB").
 pub const MULTIVEC_BAGS_MAGIC: u32 = u32::from_le_bytes(*b"KMVB");
@@ -267,25 +270,19 @@ fn quantize(token: &[f32], out: &mut Vec<u8>) -> f32 {
 
 fn encode_ivf(field: &FieldBags) -> Result<Vec<u8>, KoshaError> {
     let dim = field.dim;
-    let points: Vec<(u32, Vec<f32>)> = field
-        .tokens
+    let codebook = codebook::Codebook::train(&field.tokens, dim);
+    let assignment = codebook.assign(&field.tokens);
+    let mut members: Vec<Vec<u32>> = vec![Vec::new(); codebook.centroids().len() / dim];
+    for (ordinal, &c) in assignment.iter().enumerate() {
+        members[c as usize].push(ordinal as u32);
+    }
+    drop(assignment);
+    let postings: Vec<(&[f32], Vec<u32>)> = codebook
+        .centroids()
         .chunks_exact(dim)
-        .enumerate()
-        .map(|(ordinal, t)| (ordinal as u32, t.to_vec()))
+        .zip(members)
+        .filter(|(_, m)| !m.is_empty())
         .collect();
-    // Late-interaction token clustering keeps the plain bisection build;
-    // the post-build refinement (#253) is tuned for the segment kNN index.
-    let mut config = kosha_vector_spfresh::ClusterIndexConfig::new(dim);
-    config.build_refine_rounds = 0;
-    let index = kosha_vector_spfresh::ClusterIndex::build(&points, config).map_err(|e| {
-        KoshaError::CorruptSegment(format!(
-            "failed to build the late-interaction index for field '{}': {e}",
-            field.name
-        ))
-    })?;
-    drop(points);
-    let postings = index.snapshot();
-    drop(index);
     let table_len = IVF_HEADER_LEN + postings.len() * (dim * 4 + 12);
     let mut table = Vec::with_capacity(table_len);
     for v in [
@@ -298,17 +295,13 @@ fn encode_ivf(field: &FieldBags) -> Result<Vec<u8>, KoshaError> {
     }
     let starts: Vec<u32> = field.docs.iter().map(|d| d.1).collect();
     let mut entries: Vec<u8> = Vec::with_capacity(field.token_count() * ivf_entry_len(dim));
-    for posting in postings {
-        let mut centroid = posting.centroid;
-        kosha_vector_spfresh::normalize_in_place(&mut centroid);
-        for x in &centroid {
+    for (centroid, members) in postings {
+        for x in centroid {
             table.extend_from_slice(&x.to_le_bytes());
         }
         let offset = (table_len + entries.len()) as u64;
         table.extend_from_slice(&offset.to_le_bytes());
-        table.extend_from_slice(&(posting.entries.len() as u32).to_le_bytes());
-        let mut members: Vec<u32> = posting.entries.iter().map(|(o, _)| *o).collect();
-        members.sort_unstable();
+        table.extend_from_slice(&(members.len() as u32).to_le_bytes());
         for ordinal in members {
             let doc_seq = field.docs[starts.partition_point(|&s| s <= ordinal) - 1].0;
             let at = ordinal as usize * dim;
