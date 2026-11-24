@@ -1224,6 +1224,9 @@ impl OrgTx for MemoryState {
     }
 
     fn insert_signin_token(&mut self, token: &SigninToken) -> Result<(), OrgError> {
+        // Expired links and ended sessions are never read again.
+        let now = token.created_at_ms;
+        self.signin_tokens.retain(|(t, _)| t.expires_at_ms > now);
         self.signin_tokens.push((token.clone(), false));
         Ok(())
     }
@@ -1254,6 +1257,9 @@ impl OrgTx for MemoryState {
     }
 
     fn insert_session(&mut self, session: &UserSession) -> Result<(), OrgError> {
+        let now = session.created_at_ms;
+        self.sessions
+            .retain(|(s, revoked)| !revoked && s.expires_at_ms > now);
         self.sessions.push((session.clone(), false));
         Ok(())
     }

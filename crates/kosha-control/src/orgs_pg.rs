@@ -539,6 +539,14 @@ impl OrgTx for PgTx<'_> {
     }
 
     fn insert_signin_token(&mut self, token: &SigninToken) -> Result<(), OrgError> {
+        // Expired links and ended sessions are never read again.
+        self.rt
+            .block_on(
+                sqlx::query("DELETE FROM kosha.signin_tokens WHERE expires_at <= to_timestamp($1)")
+                    .bind(seconds(token.created_at_ms))
+                    .execute(&mut *self.tx),
+            )
+            .map_err(store_error)?;
         self.rt
             .block_on(
                 sqlx::query(
@@ -605,6 +613,17 @@ impl OrgTx for PgTx<'_> {
     }
 
     fn insert_session(&mut self, session: &UserSession) -> Result<(), OrgError> {
+        // Expired links and ended sessions are never read again.
+        self.rt
+            .block_on(
+                sqlx::query(
+                    "DELETE FROM kosha.user_sessions \
+                     WHERE expires_at <= to_timestamp($1) OR revoked_at IS NOT NULL",
+                )
+                .bind(seconds(session.created_at_ms))
+                .execute(&mut *self.tx),
+            )
+            .map_err(store_error)?;
         self.rt
             .block_on(
                 sqlx::query(
