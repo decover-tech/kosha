@@ -16464,13 +16464,14 @@ mod tests {
         manifest
     }
 
-    /// Mixed v5/v6 namespace (#386): a namespace whose segments differ only
+    /// Mixed v5/v6/v7 namespace (#386): a namespace whose segments differ only
     /// in postings version returns exactly the all-v5 namespace's hits,
     /// totals and scores — AND/WAND, OR/WAND, single-term and phrase.
     #[test]
-    fn mixed_v5_v6_namespace_matches_all_v5() {
+    fn mixed_postings_versions_match_all_v5() {
         use kosha_segment::{
-            BITPACKED_SKIP_SPLIT_INVERTED_VERSION as V6, SKIP_SPLIT_INVERTED_VERSION as V5,
+            BITPACKED_SKIP_SPLIT_INVERTED_VERSION as V6, PACKED_POSITIONS_INVERTED_VERSION as V7,
+            SKIP_SPLIT_INVERTED_VERSION as V5,
         };
         let dir =
             std::env::temp_dir().join(format!("kosha-test-mixed-v5-v6-{}", std::process::id()));
@@ -16493,7 +16494,14 @@ mod tests {
             .unwrap(),
         );
         queries.push(phrase);
-        for (name, versions) in [("v5v6", [V5, V6]), ("v6v5", [V6, V5]), ("v6v6", [V6, V6])] {
+        for (name, versions) in [
+            ("v5v6", [V5, V6]),
+            ("v6v5", [V6, V5]),
+            ("v6v6", [V6, V6]),
+            ("v5v7", [V5, V7]),
+            ("v7v6", [V7, V6]),
+            ("v7v7", [V7, V7]),
+        ] {
             let ns = NamespaceId(name.into());
             let manifest = mk_versioned_namespace(&dir, name, versions);
             for q in &queries {

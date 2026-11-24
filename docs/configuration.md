@@ -768,13 +768,13 @@ See "Deleting a namespace" in the README for what a pass removes and when.
 
 ## Segment format (rollout and rollback gates)
 
-Writers emit the newest format by default. Pin an older version during a rolling deploy, or
+Writers emit the newest stable format by default. Pin an older version during a rolling deploy, or
 before rolling back, until every reader understands the newer one. Read once in
 `crates/kosha-segment/src/lib.rs`.
 
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
-| `KOSHA_POSTINGS_WRITE_VERSION` | Inverted-postings version written: `4`, `5` or `6`. `6` is experimental (#386): v5 with bit-packed 128-posting scoring blocks, readable only by builds that include #386, so set it only once every query pod does | `5` | version |
+| `KOSHA_POSTINGS_WRITE_VERSION` | Inverted-postings version written by indexing and compaction: `4`, `5`, `6` (experimental bit-packed full scoring blocks), or `7` (also packs positions and uses the skip entry for singleton scoring blocks). Enable an experimental version only once every reader supports it. Changing the setting affects new segments only; older binaries still cannot read segments already written in a newer format | `5` | version |
 | `KOSHA_VECTOR_WRITE_VERSION` | Vector-index write tier: `1` (flat), `2`–`4` (posting-based), or `5` (experimental #458, adds p50 and p90 alongside max in `vector.offsets`; on-disk headers 6–8 for f32/i8/RaBitQ). Enable tier 5 only after all readers support it. To roll back to older readers, restore tier 4 and rewrite tier 5 segments before downgrading | `4` | version |
 | `KOSHA_VECTOR_STORE` | Where vector field values are stored: `sidecar` (`doc_vectors.bin`) or `inline` (in `doc_store.bin`). Set `inline` before rolling back past #243 | `sidecar` | enum |
 | `KOSHA_DOC_STORE_COMPRESSION` | Experimental (research #388). `zstd`: new segments store each `doc_store.bin` record as its own zstd frame with a per-segment trained dictionary (kept in the `doc_store.offsets` trailer), and vectors always go to `doc_vectors.bin`. `auto`: fresh segments raw, merges keep their inputs' format. `none`: always raw (compact with this before rolling back past #388; older readers cannot read compressed segments) | `auto` | enum |
