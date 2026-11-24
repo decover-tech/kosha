@@ -23,13 +23,23 @@
 //! Brute force needs every corpus vector in memory: meant for synthetic or
 //! sampled corpora on a workstation, not the 10M bench corpus (use the
 //! server plus `recall_check.py` there).
+//!
+//! Add `--radius-study` to recompute p50, p90 and max from the supplied
+//! exact embeddings and the existing posting memberships (no rewrite).
+//! For example, add `--radius-study --fractions 0.01,0.02,0.03,0.05`
+//! to the invocation above.
+//! The study reports clamp-to-zero rates and matched-recall curves with
+//! absolute probe counts, including cutoff ties, and vectors scanned.
+//! It isolates ordering: no ANN entry quantization, latency, production
+//! budget floor, filters, or delete overlays are modeled.
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use clap::Parser;
-use kosha_segment::SegmentReader;
+use kosha_segment::{centroid_probe_score, KnnSegmentRanking, PostingRadii, SegmentReader};
 
 #[derive(Parser)]
 #[command(name = "kosha-cluster-eval")]
@@ -65,6 +75,10 @@ struct Cli {
     target_recall: f64,
     #[arg(long, default_value_t = 7)]
     seed: u64,
+    /// Compare max/p90/p50/raw probe ordering on existing posting layouts
+    /// with exact member scores, independently of index format and runtime flags
+    #[arg(long)]
+    radius_study: bool,
 }
 
 struct Rng(u64);
@@ -218,6 +232,10 @@ fn main() {
             q
         })
         .collect();
+    if cli.radius_study {
+        radius_study(&cli, &ids, &vectors, &queries);
+        return;
+    }
     let truth: Vec<Vec<String>> = queries
         .iter()
         .map(|q| {
@@ -340,5 +358,215 @@ fn main() {
             ),
             None => println!("| {name} | {segs} | {cents} | not reached | - | - | - |"),
         }
+    }
+}
+
+struct RadiusPosting {
+    members: Vec<usize>,
+    radii: PostingRadii,
+}
+
+type RadiusMode = (&'static str, fn(PostingRadii) -> f32);
+
+fn rank_cutoff(mut scores: Vec<f32>, budget: usize) -> f32 {
+    if scores.len() <= budget {
+        f32::INFINITY
+    } else {
+        *scores.select_nth_unstable_by(budget - 1, f32::total_cmp).1
+    }
+}
+
+fn keep_top_k(ids: &mut Vec<usize>, scores: &[f32], k: usize) {
+    if ids.len() > k {
+        ids.select_nth_unstable_by(k - 1, |&a, &b| {
+            scores[b].total_cmp(&scores[a]).then(a.cmp(&b))
+        });
+        ids.truncate(k);
+    }
+}
+
+fn radius_study(cli: &Cli, ids: &[String], vectors: &[Vec<f32>], queries: &[Vec<f32>]) {
+    assert!((1..=vectors.len()).contains(&cli.k) && !queries.is_empty());
+    assert!(cli.budgets.iter().all(|&b| b > 0));
+    let by_id: HashMap<&str, usize> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.as_str(), i))
+        .collect();
+    assert_eq!(by_id.len(), ids.len(), "duplicate embedding IDs");
+    for spec in &cli.layouts {
+        let (name, dir) = spec.split_once('=').expect("--layout expects name=dir");
+        let readers: Vec<_> = segment_dirs(Path::new(dir))
+            .into_iter()
+            .map(|dir| SegmentReader::open(dir).expect("open segment"))
+            .collect();
+        let mut seen = vec![false; ids.len()];
+        let postings: Vec<Vec<_>> = readers
+            .iter()
+            .map(|reader| {
+                let layout = reader
+                    .vector_posting_layout(&cli.field)
+                    .expect("read posting layout")
+                    .expect("segment has clustered postings for field");
+                assert_eq!(layout.dim, cli.dim);
+                layout
+                    .postings
+                    .into_iter()
+                    .map(|posting| {
+                        let members: Vec<_> = posting
+                            .doc_seqs
+                            .iter()
+                            .map(|&seq| {
+                                let id =
+                                    reader.doc_meta(seq).expect("posting member exists").doc_id;
+                                let i = by_id[id];
+                                assert!(
+                                    !std::mem::replace(&mut seen[i], true),
+                                    "duplicate posting member {id}"
+                                );
+                                i
+                            })
+                            .collect();
+                        let mut centroid = posting.centroid;
+                        normalize(&mut centroid);
+                        let mut distances: Vec<_> = members
+                            .iter()
+                            .map(|&i| 1.0 - dot(&centroid, &vectors[i]).clamp(-1.0, 1.0))
+                            .collect();
+                        RadiusPosting {
+                            members,
+                            radii: PostingRadii::from_distances(&mut distances),
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        assert!(
+            seen.into_iter().all(|present| present),
+            "layout is missing corpus vectors"
+        );
+        let total: usize = postings.iter().map(Vec::len).sum();
+        println!(
+            "\n## {name}: {} segments, {total} postings, {} queries",
+            readers.len(),
+            queries.len()
+        );
+        let modes: [RadiusMode; 4] = [
+            ("max", |r| r.max),
+            ("p90", |r| r.p90),
+            ("p50", |r| r.p50),
+            ("raw", |_| 0.0),
+        ];
+        for &(mode, radius) in &modes[..3] {
+            let mut values: Vec<_> = postings.iter().flatten().map(|p| radius(p.radii)).collect();
+            let spread = PostingRadii::from_distances(&mut values);
+            println!(
+                "{mode} radii across postings: p50={:.4} p90={:.4} max={:.4}",
+                spread.p50, spread.p90, spread.max
+            );
+        }
+        let mut budgets = cli.budgets.clone();
+        budgets.extend(
+            cli.fractions
+                .iter()
+                .map(|f| ((total as f64 * f).ceil() as usize).max(1)),
+        );
+        budgets.sort_unstable();
+        budgets.dedup();
+        let n = queries.len() as f64;
+        let mut zero_scores = [0; 4];
+        let mut scanned = vec![vec![(0usize, 0usize); budgets.len()]; modes.len()];
+        let mut recall = vec![vec![Vec::with_capacity(queries.len()); budgets.len()]; modes.len()];
+        for query in queries {
+            let candidate_scores: Vec<_> = vectors.iter().map(|v| dot(query, v)).collect();
+            let mut truth: Vec<_> = (0..vectors.len()).collect();
+            keep_top_k(&mut truth, &candidate_scores, cli.k);
+            let raw: Vec<_> = readers
+                .iter()
+                .map(|reader| {
+                    reader
+                        .knn_centroid_distances_with_alpha(&cli.field, query, 0.0)
+                        .expect("score centroids")
+                })
+                .collect();
+            for (m, &(_, radius)) in modes.iter().enumerate() {
+                let scores: Vec<Vec<_>> = postings
+                    .iter()
+                    .zip(&raw)
+                    .map(|(ps, ds)| {
+                        assert_eq!(ps.len(), ds.len());
+                        ps.iter()
+                            .zip(ds)
+                            .map(|(p, &d)| centroid_probe_score(d, radius(p.radii), 1.0))
+                            .collect()
+                    })
+                    .collect();
+                zero_scores[m] += scores.iter().flatten().filter(|&&s| s == 0.0).count();
+                for (b, &budget) in budgets.iter().enumerate() {
+                    let cutoff = rank_cutoff(scores.iter().flatten().copied().collect(), budget);
+                    let mut found = Vec::new();
+                    for (ps, ds) in postings.iter().zip(&scores) {
+                        let ranking = KnnSegmentRanking::new(ds.clone(), cutoff, budget);
+                        scanned[m][b].0 += ranking.budgeted().len();
+                        for &p in ranking.budgeted() {
+                            found.extend_from_slice(&ps[p as usize].members);
+                        }
+                    }
+                    scanned[m][b].1 += found.len();
+                    keep_top_k(&mut found, &candidate_scores, cli.k);
+                    let hits = found.iter().filter(|i| truth.contains(i)).count();
+                    recall[m][b].push(hits);
+                }
+            }
+        }
+        println!("| mode | zero scores | budget | mean recall@{} | p10 recall | postings/query | vectors/query |", cli.k);
+        println!("|---|---|---|---|---|---|---|");
+        for (m, &(mode, _)) in modes.iter().enumerate() {
+            let mut best: Option<f64> = None;
+            for (b, budget) in budgets.iter().enumerate() {
+                let zero = 100.0 * zero_scores[m] as f64 / (n * total as f64);
+                let hits = &mut recall[m][b];
+                hits.sort_unstable();
+                let mean = hits.iter().sum::<usize>() as f64 / (n * cli.k as f64);
+                let p10 = hits[hits.len().div_ceil(10) - 1] as f64 / cli.k as f64;
+                let (posts, members) = scanned[m][b];
+                let posts = posts as f64 / n;
+                let members = members as f64 / n;
+                println!("| {mode} | {zero:.2}% | {budget} | {mean:.4} | {p10:.2} | {posts:.1} | {members:.1} |");
+                if mean >= cli.target_recall {
+                    best = Some(best.map_or(posts, |prior| prior.min(posts)));
+                }
+            }
+            match best {
+                Some(posts) => println!(
+                    "{mode}: {posts:.1} postings/query at mean recall >= {}",
+                    cli.target_recall
+                ),
+                None => println!(
+                    "{mode}: target mean recall {} not reached",
+                    cli.target_recall
+                ),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn radius_study_counts_ties_and_ranks_exact_hits() {
+        let a = vec![0.0, 0.0];
+        let b = vec![0.0, 0.4, 0.7];
+        let cutoff = rank_cutoff(a.iter().chain(&b).copied().collect(), 1);
+        let a = KnnSegmentRanking::new(a, cutoff, 1);
+        let b = KnnSegmentRanking::new(b, cutoff, 1);
+        assert_eq!(a.budgeted(), &[0]);
+        assert_eq!(b.budgeted(), &[0]);
+        let mut found = vec![3, 1, 0];
+        keep_top_k(&mut found, &[0.5, 0.7, 1.0, 0.5], 2);
+        found.sort_unstable();
+        assert_eq!(found, [0, 1]);
     }
 }

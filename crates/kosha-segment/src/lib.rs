@@ -1244,6 +1244,7 @@ impl SegmentWriter {
     /// `vector.offsets` it always did, and further columns get
     /// `vector.<slot>.idx` + `vector.<slot>.offsets`.
     fn write_vectors_v2(&self) -> Result<Vec<VectorFieldMeta>, KoshaError> {
+        let write_version = vector_write_version();
         let mut metas = Vec::with_capacity(self.vector_columns.len());
         for (slot, column) in self.vector_columns.iter().enumerate() {
             if column.vectors.is_empty() {
@@ -1253,7 +1254,7 @@ impl SegmentWriter {
             // to an older `KOSHA_VECTOR_WRITE_VERSION` for a rolling deploy
             // keeps writing f32, which every reader of that version reads.
             let requested = self.vector_quantization.for_field(&column.name);
-            let quantization = if vector_write_version() >= 4 {
+            let quantization = if write_version >= 4 {
                 requested
             } else {
                 if !requested.is_f32() {
@@ -1272,7 +1273,7 @@ impl SegmentWriter {
             };
             let seeds = self.vector_seeds.get(&column.name);
             let (idx_bytes, offsets_bytes, build) =
-                Self::encode_vector_column(&column.vectors, seeds, quantization)?;
+                Self::encode_vector_column(&column.vectors, seeds, quantization, write_version)?;
             self.vector_index_builds
                 .lock()
                 .unwrap()
@@ -1297,6 +1298,7 @@ impl SegmentWriter {
         column: &[(u32, Vec<f32>)],
         seeds: Option<&Vec<Vec<VectorSeedPosting>>>,
         quantization: VectorQuantization,
+        write_version: u32,
     ) -> Result<(Vec<u8>, Vec<u8>, VectorIndexBuild), KoshaError> {
         let dim = column[0].1.len();
         // Unit-norm (write version 3, on-disk header version 2): normalize
@@ -1305,8 +1307,7 @@ impl SegmentWriter {
         // the geometry cosine actually ranks by), and snapshot centroids are
         // re-normalized afterwards because a mean of unit vectors is not
         // itself unit-length.
-        let unit_norm = vector_write_version() >= 3;
-        let radius_aware = vector_write_version() >= 4;
+        let unit_norm = write_version >= 3;
         let normalized: Vec<(u32, Vec<f32>)>;
         let vectors: &[(u32, Vec<f32>)] = if unit_norm {
             normalized = column
@@ -1347,7 +1348,7 @@ impl SegmentWriter {
         };
         let mut postings = index.snapshot();
         build.postings = postings.len();
-        let format_version = if unit_norm {
+        if unit_norm {
             for p in &mut postings {
                 kosha_vector_spfresh::normalize_in_place(&mut p.centroid);
                 // Renormalizing shifts both direction and magnitude (a mean
@@ -1358,7 +1359,7 @@ impl SegmentWriter {
                 // pass over this posting's already-small entry list, not
                 // the whole segment) and only when it'll actually be
                 // persisted.
-                if radius_aware {
+                if write_version == 4 {
                     p.radius = p
                         .entries
                         .iter()
@@ -1366,21 +1367,16 @@ impl SegmentWriter {
                         .fold(0.0f32, f32::max);
                 }
             }
-            if radius_aware && quantization == VectorQuantization::I8 {
-                // Radii were computed above from the exact vectors, so the
-                // probe's lower bound stays a bound on the true distance.
-                I8_VECTOR_INDEX_VERSION
-            } else if radius_aware && quantization == VectorQuantization::RaBitQ {
-                // Same: radii from exact vectors; codes are relative to the
-                // final (renormalized, on-disk) centroids.
-                RABITQ_VECTOR_INDEX_VERSION
-            } else if radius_aware {
-                RADIUS_AWARE_VECTOR_INDEX_VERSION
-            } else {
-                UNIT_NORM_VECTOR_INDEX_VERSION
-            }
-        } else {
-            VECTOR_INDEX_VERSION
+        }
+        let format_version = match (write_version, quantization) {
+            (5, VectorQuantization::F32) => QUANTILE_VECTOR_INDEX_VERSION,
+            (5, VectorQuantization::I8) => I8_QUANTILE_VECTOR_INDEX_VERSION,
+            (5, VectorQuantization::RaBitQ) => RABITQ_QUANTILE_VECTOR_INDEX_VERSION,
+            (4, VectorQuantization::F32) => RADIUS_AWARE_VECTOR_INDEX_VERSION,
+            (4, VectorQuantization::I8) => I8_VECTOR_INDEX_VERSION,
+            (4, VectorQuantization::RaBitQ) => RABITQ_VECTOR_INDEX_VERSION,
+            (3, _) => UNIT_NORM_VECTOR_INDEX_VERSION,
+            _ => VECTOR_INDEX_VERSION,
         };
         let (idx, offsets) = encode_vector_index_v2(dim as u32, &postings, format_version);
         Ok((idx, offsets, build))
@@ -1663,6 +1659,7 @@ pub struct VectorPostingMembers {
 //                    vector.idx, plus — version >= RADIUS_AWARE_VECTOR_INDEX_VERSION
 //                    only — [radius:f32] (max cosine distance from centroid
 //                    to any live member; see that constant's doc comment).
+//                    Versions 6–8 append [p50:f32][p90:f32] to each record.
 //                    Small — always resident once read (mirrors
 //                    `doc_store.offsets`/`DocStoreAccess::Lazy`).
 //
@@ -1780,9 +1777,8 @@ pub const UNIT_NORM_VECTOR_INDEX_VERSION: u32 = 2;
 /// Version 3: unit-norm (implies everything version 2 does — see
 /// `is_unit_norm_vector_index_version`) plus a `radius` field per posting in
 /// `vector.offsets`: the max cosine distance from that posting's centroid to
-/// any of its live members. Ranking/admitting postings by the
-/// triangle-inequality lower bound `(distance(query, centroid) -
-/// radius).max(0.0)` instead of raw centroid distance is what lets a
+/// any of its live members. Ranking postings by
+/// `(distance(query, centroid) - radius).max(0.0)` instead of raw centroid distance lets a
 /// "diffuse" posting (mediocre centroid, but a genuinely close member
 /// buried inside it) still get probed — see kosha-query's
 /// `thin_global_budget_can_bury_the_true_neighbour_in_a_diluted_centroid`
@@ -1823,6 +1819,12 @@ pub const I8_VECTOR_INDEX_VERSION: u32 = 4;
 /// override) asks for `rabitq`, which must stay off until every query pod
 /// reads this version.
 pub const RABITQ_VECTOR_INDEX_VERSION: u32 = 5;
+/// Posting radius quantiles, with the same f32 entry layout as version 3.
+pub const QUANTILE_VECTOR_INDEX_VERSION: u32 = 6;
+/// Posting radius quantiles, with the same i8 entry layout as version 4.
+pub const I8_QUANTILE_VECTOR_INDEX_VERSION: u32 = 7;
+/// Posting radius quantiles, with the same RaBitQ entry layout as version 5.
+pub const RABITQ_QUANTILE_VECTOR_INDEX_VERSION: u32 = 8;
 
 pub fn is_known_vector_index_version(version: u32) -> bool {
     version == VECTOR_INDEX_VERSION
@@ -1830,19 +1832,32 @@ pub fn is_known_vector_index_version(version: u32) -> bool {
         || version == RADIUS_AWARE_VECTOR_INDEX_VERSION
         || version == I8_VECTOR_INDEX_VERSION
         || version == RABITQ_VECTOR_INDEX_VERSION
+        || has_radius_quantiles(version)
 }
 
-/// Whether `version`'s `vector.idx` entries are i8-quantized (see
-/// [`I8_VECTOR_INDEX_VERSION`]). `==`, not `>=`: a later version is free to
-/// choose another entry encoding, and must say so here.
+fn has_radius_quantiles(version: u32) -> bool {
+    matches!(
+        version,
+        QUANTILE_VECTOR_INDEX_VERSION
+            | I8_QUANTILE_VECTOR_INDEX_VERSION
+            | RABITQ_QUANTILE_VECTOR_INDEX_VERSION
+    )
+}
+
+/// Whether `version`'s `vector.idx` entries are i8-quantized.
 pub fn is_i8_vector_index_version(version: u32) -> bool {
-    version == I8_VECTOR_INDEX_VERSION
+    matches!(
+        version,
+        I8_VECTOR_INDEX_VERSION | I8_QUANTILE_VECTOR_INDEX_VERSION
+    )
 }
 
-/// Whether `version`'s `vector.idx` entries are RaBitQ codes (see
-/// [`RABITQ_VECTOR_INDEX_VERSION`]). `==`, like the i8 check.
+/// Whether `version`'s `vector.idx` entries are RaBitQ codes.
 pub fn is_rabitq_vector_index_version(version: u32) -> bool {
-    version == RABITQ_VECTOR_INDEX_VERSION
+    matches!(
+        version,
+        RABITQ_VECTOR_INDEX_VERSION | RABITQ_QUANTILE_VECTOR_INDEX_VERSION
+    )
 }
 
 /// Whether `version`'s entries score approximately (i8 or RaBitQ), so the
@@ -1886,6 +1901,35 @@ struct VectorPostingIndex {
     offset: u64,
     length: u32,
     radius: f32,
+    radius_quantiles: Option<[f32; 2]>,
+}
+
+/// Nearest-rank cosine distance percentiles for a posting's members.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PostingRadii {
+    pub p50: f32,
+    pub p90: f32,
+    pub max: f32,
+}
+
+impl PostingRadii {
+    /// Sort the distances in place and summarize them. Empty postings have
+    /// radius zero at every percentile.
+    pub fn from_distances(distances: &mut [f32]) -> Self {
+        distances.sort_unstable_by(f32::total_cmp);
+        let at = |percent: usize| {
+            let rank = (distances.len() * percent).div_ceil(100);
+            distances
+                .get(rank.saturating_sub(1))
+                .copied()
+                .unwrap_or(0.0)
+        };
+        Self {
+            p50: at(50),
+            p90: at(90),
+            max: at(100),
+        }
+    }
 }
 
 /// Serializes posting snapshots (as produced by `ClusterIndex::snapshot`) to
@@ -1912,11 +1956,13 @@ fn encode_vector_index_v2(
     offsets_buf.extend_from_slice(&(postings.len() as u32).to_le_bytes());
 
     let radius_aware = version >= RADIUS_AWARE_VECTOR_INDEX_VERSION;
+    let quantile_aware = has_radius_quantiles(version);
     let quantized = is_i8_vector_index_version(version);
     let rabitq = is_rabitq_vector_index_version(version)
         .then(|| kosha_vector_spfresh::RaBitQRotation::new(dim as usize));
     let mut codes: Vec<i8> = Vec::with_capacity(dim as usize);
     let mut bits: Vec<u8> = Vec::new();
+    let mut distances = Vec::new();
     for p in postings {
         let offset = idx_buf.len() as u64;
         for (id, v) in &p.entries {
@@ -1943,7 +1989,18 @@ fn encode_vector_index_v2(
         }
         offsets_buf.extend_from_slice(&offset.to_le_bytes());
         offsets_buf.extend_from_slice(&length.to_le_bytes());
-        if radius_aware {
+        if quantile_aware {
+            distances.clear();
+            distances.extend(
+                p.entries
+                    .iter()
+                    .map(|(_, v)| kosha_vector_spfresh::cosine_distance(&p.centroid, v)),
+            );
+            let radii = PostingRadii::from_distances(&mut distances);
+            offsets_buf.extend_from_slice(&radii.max.to_le_bytes());
+            offsets_buf.extend_from_slice(&radii.p50.to_le_bytes());
+            offsets_buf.extend_from_slice(&radii.p90.to_le_bytes());
+        } else if radius_aware {
             offsets_buf.extend_from_slice(&p.radius.to_le_bytes());
         }
     }
@@ -2226,7 +2283,15 @@ fn parse_vector_offsets(
     }
     let posting_count = read_u32_le(&mut cursor);
     let radius_aware = version >= RADIUS_AWARE_VECTOR_INDEX_VERSION;
-    let record_size = 4 * dim as usize + 8 + 4 + if radius_aware { 4 } else { 0 };
+    let quantile_aware = has_radius_quantiles(version);
+    let radius_bytes = if quantile_aware {
+        12
+    } else if radius_aware {
+        4
+    } else {
+        0
+    };
+    let record_size = 4 * dim as usize + 8 + 4 + radius_bytes;
     // Checked, like `parse_vector_idx_eager`: overflow is corruption.
     let expected_len = (posting_count as usize)
         .checked_mul(record_size)
@@ -2247,11 +2312,22 @@ fn parse_vector_offsets(
         } else {
             0.0
         };
+        let radius_quantiles = if quantile_aware {
+            let p50 = read_f32_le(&mut cursor);
+            let p90 = read_f32_le(&mut cursor);
+            if !(0.0 <= p50 && p50 <= p90 && p90 <= radius && radius <= 2.0) {
+                return None;
+            }
+            Some([p50, p90])
+        } else {
+            None
+        };
         out.push(VectorPostingIndex {
             centroid,
             offset,
             length,
             radius,
+            radius_quantiles,
         });
     }
     Some(out)
@@ -2853,6 +2929,129 @@ mod vector_index_v2_tests {
     }
 
     #[test]
+    fn quantile_radius_changes_probe_order_without_changing_entry_encoding() {
+        let postings = [
+            kosha_vector_spfresh::PostingSnapshot {
+                centroid: vec![0.0, 1.0],
+                entries: (0..8)
+                    .map(|id| (id, vec![0.0, 1.0]))
+                    .chain([(8, vec![0.75f32.sqrt(), 0.5]), (9, vec![0.0, -1.0])])
+                    .collect(),
+                radius: 2.0,
+            },
+            kosha_vector_spfresh::PostingSnapshot {
+                centroid: vec![0.6, 0.8],
+                entries: vec![(10, vec![0.6, 0.8])],
+                radius: 0.0,
+            },
+        ];
+        assert_eq!(KnnProbeRadius::parse(None), KnnProbeRadius::Max);
+        assert_eq!(KnnProbeRadius::parse(Some("p50")), KnnProbeRadius::P50);
+        assert_eq!(KnnProbeRadius::parse(Some("p90")), KnnProbeRadius::P90);
+        assert_eq!(KnnProbeRadius::parse(Some("invalid")), KnnProbeRadius::Max);
+
+        for (old, new) in [
+            (
+                RADIUS_AWARE_VECTOR_INDEX_VERSION,
+                QUANTILE_VECTOR_INDEX_VERSION,
+            ),
+            (I8_VECTOR_INDEX_VERSION, I8_QUANTILE_VECTOR_INDEX_VERSION),
+            (
+                RABITQ_VECTOR_INDEX_VERSION,
+                RABITQ_QUANTILE_VECTOR_INDEX_VERSION,
+            ),
+        ] {
+            let (old_idx, old_offsets) = encode_vector_index_v2(2, &postings, old);
+            let (new_idx, new_offsets) = encode_vector_index_v2(2, &postings, new);
+            assert_eq!(parse_vector_idx_header(&new_idx), Some((2, 11, new)));
+            assert_eq!(
+                &new_idx[VECTOR_IDX_HEADER_LEN..],
+                &old_idx[VECTOR_IDX_HEADER_LEN..]
+            );
+            assert_eq!(new_offsets.len() - old_offsets.len(), 8 * postings.len());
+            assert!(parse_vector_offsets(&new_offsets, 2, old).is_none());
+            assert!(parse_vector_offsets(&new_offsets[..new_offsets.len() - 1], 2, new).is_none());
+            let parsed = parse_vector_offsets(&new_offsets, 2, new).unwrap();
+            assert_eq!(parsed[0].radius, 2.0);
+            assert_eq!(parsed[0].radius_quantiles, Some([0.0, 0.5]));
+            let mut corrupt = new_offsets;
+            let p50 = VECTOR_OFFSETS_HEADER_LEN + 8 + 8 + 4 + 4;
+            corrupt[p50..p50 + 4].copy_from_slice(&1.0f32.to_le_bytes());
+            assert!(parse_vector_offsets(&corrupt, 2, new).is_none());
+
+            let open = |records, version| {
+                LazyVectorIndex::from_parsed(
+                    Path::new(VECTOR_IDX_FILE),
+                    0,
+                    2,
+                    version,
+                    records,
+                    None,
+                )
+            };
+            let mut current = open(parsed, new);
+            let mut legacy = open(parse_vector_offsets(&old_offsets, 2, old).unwrap(), old);
+            let query = [1.0, 0.0];
+            for (mode, expected, first) in [
+                (KnnProbeRadius::Max, 0.0, 0),
+                (KnnProbeRadius::P50, 1.0, 1),
+                (KnnProbeRadius::P90, 0.5, 1),
+            ] {
+                current.probe_radius = mode;
+                legacy.probe_radius = mode;
+                assert_eq!(legacy.probe_radii(), &[2.0, 0.0]);
+                let scores = SegmentReader::centroid_scores(&current, &query, 1.0);
+                assert_eq!(scores[0], expected);
+                assert_eq!(KnnSegmentRanking::rank_all(&scores)[0].0, first);
+                assert_eq!(
+                    SegmentReader::centroid_scores_at(&current, &query, &[0, 1], 1.0),
+                    scores
+                );
+                if let Some(bounds) = SegmentReader::centroid_score_bounds(&current, &query, 1.0) {
+                    for (i, score) in scores.into_iter().enumerate() {
+                        assert!(bounds.lower[i] <= score && score <= bounds.upper[i]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quantile_write_tier_keeps_max_radii_from_exact_members() {
+        let column = vec![(0, vec![2.0, 0.0]), (1, vec![0.0, 3.0])];
+        for (quantization, older, newer) in [
+            (
+                VectorQuantization::F32,
+                RADIUS_AWARE_VECTOR_INDEX_VERSION,
+                QUANTILE_VECTOR_INDEX_VERSION,
+            ),
+            (
+                VectorQuantization::I8,
+                I8_VECTOR_INDEX_VERSION,
+                I8_QUANTILE_VECTOR_INDEX_VERSION,
+            ),
+            (
+                VectorQuantization::RaBitQ,
+                RABITQ_VECTOR_INDEX_VERSION,
+                RABITQ_QUANTILE_VECTOR_INDEX_VERSION,
+            ),
+        ] {
+            let (_, old_offsets, _) =
+                SegmentWriter::encode_vector_column(&column, None, quantization, 4).unwrap();
+            let (idx, new_offsets, _) =
+                SegmentWriter::encode_vector_column(&column, None, quantization, 5).unwrap();
+            assert_eq!(parse_vector_idx_header(&idx), Some((2, 2, newer)));
+            let old = parse_vector_offsets(&old_offsets, 2, older).unwrap();
+            let new = parse_vector_offsets(&new_offsets, 2, newer).unwrap();
+            assert_eq!(old.len(), new.len());
+            for (old, new) in old.iter().zip(&new) {
+                assert_eq!(old.radius, new.radius);
+                assert_eq!(new.radius_quantiles.unwrap()[1], new.radius);
+            }
+        }
+    }
+
+    #[test]
     fn eager_fallback_recovers_flat_vector_list_without_sidecar() {
         let postings = sample_postings();
         let (idx_bytes, _offsets_bytes) =
@@ -3116,21 +3315,21 @@ fn postings_write_version() -> u32 {
     })
 }
 
-/// Default weight of a posting's radius in its probe-ranking score: the
-/// full triangle-inequality lower bound `d(q, c) - radius`.
+/// Default weight of a posting's radius in its probe-ranking score.
 pub const DEFAULT_KNN_PROBE_RADIUS_ALPHA: f32 = 1.0;
 
 /// The score a kNN probe ranks and admits postings by (#384):
 /// `(distance - alpha * radius).max(0.0)`, where `distance` is the query's
-/// cosine distance to the posting's centroid and `radius` the posting's
-/// max member distance from it.
+/// cosine distance to the posting's centroid and `radius` the selected
+/// member-distance percentile. This is a ranking heuristic, not a bound
+/// on member distance: cosine distance is not a metric.
 ///
-/// - `alpha = 1.0` (default): the triangle-inequality lower bound on the
-///   distance to any member, bit-identical to the ranking before #384.
+/// - `alpha = 1.0` (default): full radius weight, bit-identical to the
+///   ranking before #384 when using the max radius.
 /// - `alpha = 0.0`: raw centroid distance, as SPANN and plain IVF rank.
 /// - in between: partial credit for spread. At 1024 dimensions a
 ///   posting's radius is close to typical centroid distances, so the full
-///   bound is loose and ranks many diffuse postings near zero; a smaller
+///   radius weight ranks many diffuse postings near zero; a smaller
 ///   alpha is the experiment.
 ///
 /// The global cutoff (kosha-query `knn_plan`) and each segment's own
@@ -3138,6 +3337,33 @@ pub const DEFAULT_KNN_PROBE_RADIUS_ALPHA: f32 = 1.0;
 /// the same units.
 pub fn centroid_probe_score(distance: f32, radius: f32, alpha: f32) -> f32 {
     (distance - alpha * radius).max(0.0)
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum KnnProbeRadius {
+    #[default]
+    Max,
+    P50,
+    P90,
+}
+
+impl KnnProbeRadius {
+    fn parse(raw: Option<&str>) -> Self {
+        match raw {
+            None | Some("max") => Self::Max,
+            Some("p50") => Self::P50,
+            Some("p90") => Self::P90,
+            Some(other) => {
+                eprintln!("WARN: KOSHA_KNN_PROBE_RADIUS={other} not supported (accepted: max, p50, p90) — using max");
+                Self::Max
+            }
+        }
+    }
+
+    fn from_env() -> Self {
+        static RADIUS: OnceLock<KnnProbeRadius> = OnceLock::new();
+        *RADIUS.get_or_init(|| Self::parse(std::env::var("KOSHA_KNN_PROBE_RADIUS").ok().as_deref()))
+    }
 }
 
 /// `KOSHA_KNN_PROBE_RADIUS_ALPHA` (#384, experimental; default 1.0, the
@@ -4583,8 +4809,9 @@ fn parse_vector_build_refine(raw: Option<&str>) -> bool {
 /// every open), `2` (posting-based, raw magnitudes), `3` (posting-based,
 /// unit-norm vectors + centroids → dot-only scoring; on-disk header
 /// [`UNIT_NORM_VECTOR_INDEX_VERSION`]), and `4` (posting-based, unit-norm,
-/// plus a per-posting radius for triangle-inequality-bounded probe ranking;
-/// on-disk header [`RADIUS_AWARE_VECTOR_INDEX_VERSION`]); default `4`. Same
+/// plus a per-posting max radius; on-disk header
+/// [`RADIUS_AWARE_VECTOR_INDEX_VERSION`]) and `5` (also adds p50 and p90
+/// radii; on-disk versions 6–8); default `4`. Same
 /// mixed-fleet rollout/rollback purpose as `postings_write_version`: during
 /// a rolling deploy (writer upgraded before every query replica understands
 /// the newest version) or ahead of a possible rollback, pin an older tier
@@ -4597,8 +4824,9 @@ fn vector_write_version() -> u32 {
         Some("2") => 2,
         Some("3") => 3,
         Some("4") | None => 4,
+        Some("5") => 5,
         Some(other) => {
-            eprintln!("WARN: KOSHA_VECTOR_WRITE_VERSION={other} not supported (accepted: 1, 2, 3, 4) — writing v4");
+            eprintln!("WARN: KOSHA_VECTOR_WRITE_VERSION={other} not supported (accepted: 1, 2, 3, 4, 5) — writing v4");
             4
         }
     })
@@ -6792,6 +7020,8 @@ struct LazyVectorIndex {
     /// degrades ranking exactly to raw centroid distance — see
     /// `RADIUS_AWARE_VECTOR_INDEX_VERSION`.
     radii: Vec<f32>,
+    radius_quantiles: Option<[Vec<f32>; 2]>,
+    probe_radius: KnnProbeRadius,
     /// Stored vectors and centroids are unit-L2 (on-disk header version is
     /// [`UNIT_NORM_VECTOR_INDEX_VERSION`]) — scoring uses the dot-only fast
     /// path: normalize the query once, then `1 - dot` *is* cosine distance.
@@ -6823,6 +7053,12 @@ impl LazyVectorIndex {
         let mut centroids = Vec::with_capacity(parsed.len() * dim);
         let mut ranges = Vec::with_capacity(parsed.len());
         let mut radii = Vec::with_capacity(parsed.len());
+        let mut radius_quantiles = has_radius_quantiles(version).then(|| {
+            [
+                Vec::with_capacity(parsed.len()),
+                Vec::with_capacity(parsed.len()),
+            ]
+        });
         for p in parsed {
             // `parse_vector_offsets` reads exactly `dim` floats per
             // posting; anything else would shift every later row.
@@ -6830,6 +7066,12 @@ impl LazyVectorIndex {
             centroids.extend_from_slice(&p.centroid);
             ranges.push((p.offset, p.length));
             radii.push(p.radius);
+            if let (Some([p50s, p90s]), Some([p50, p90])) =
+                (&mut radius_quantiles, p.radius_quantiles)
+            {
+                p50s.push(p50);
+                p90s.push(p90);
+            }
         }
         let unit_norm = is_unit_norm_vector_index_version(version);
         let centroid_codes = (unit_norm && knn_plan_i8_from_env())
@@ -6847,11 +7089,21 @@ impl LazyVectorIndex {
             centroid_codes,
             ranges,
             radii,
+            radius_quantiles,
+            probe_radius: KnnProbeRadius::from_env(),
             unit_norm,
             version,
             quantized: is_quantized_vector_index_version(version),
             rabitq: is_rabitq_vector_index_version(version),
             field,
+        }
+    }
+
+    fn probe_radii(&self) -> &[f32] {
+        match (self.probe_radius, &self.radius_quantiles) {
+            (KnnProbeRadius::P50, Some([p50, _])) => p50,
+            (KnnProbeRadius::P90, Some([_, p90])) => p90,
+            _ => &self.radii,
         }
     }
 
@@ -7066,6 +7318,7 @@ impl KnnCentroidMatrix {
                 offset: 0,
                 length: 0,
                 radius,
+                radius_quantiles: None,
             })
             .collect();
         Self(LazyVectorIndex::from_parsed(
@@ -8823,22 +9076,10 @@ impl SegmentReader {
         )))
     }
 
-    /// Triangle-inequality lower bound on `query`'s distance to *any*
-    /// possible member of `centroids[i]`'s posting: `(distance(query,
-    /// centroid) - radius).max(0.0)`, where `radius` is the max distance
-    /// from that centroid to any of its own live members. For every actual
-    /// member `m`, `distance(query, m) >= distance(query, centroid) -
-    /// distance(centroid, m) >= distance(query, centroid) - radius` — so
-    /// this bound can never overestimate how close the posting's best
-    /// member could be, only underestimate (safe to rank/admit by; never
-    /// wrongly excludes a posting that might contain a close match).
-    /// `radius == 0.0` (pre-radius-aware segments) collapses this to plain
-    /// centroid distance — today's exact behavior, unaffected.
-    ///
-    /// With `KOSHA_KNN_PROBE_RADIUS_ALPHA` set (#384, experimental) the
-    /// radius is scaled first — see [`centroid_probe_score`]. At any alpha
-    /// other than the default 1.0 the result is a ranking score, no longer
-    /// a guaranteed lower bound.
+    /// Rank score for each posting using the selected radius and
+    /// `KOSHA_KNN_PROBE_RADIUS_ALPHA` (see [`centroid_probe_score`]).
+    /// Missing quantiles fall back to max radius; pre-radius segments use
+    /// radius zero, yielding raw centroid distance.
     ///
     /// One score per posting of `vi`, in posting order. On a unit-norm
     /// column the centroids are unit vectors too (the writer renormalizes
@@ -8853,8 +9094,12 @@ impl SegmentReader {
     /// [`Self::centroid_lower_bounds`] at an explicit radius weight.
     fn centroid_scores(vi: &LazyVectorIndex, query: &[f32], alpha: f32) -> Vec<f32> {
         let unit = Self::unit_query(vi, query);
-        (0..vi.ranges.len())
-            .map(|i| Self::centroid_score(vi, unit.as_deref(), query, i, alpha))
+        vi.probe_radii()
+            .iter()
+            .enumerate()
+            .map(|(i, &radius)| {
+                Self::centroid_score(vi.centroid(i), unit.as_deref(), query, radius, alpha)
+            })
             .collect()
     }
 
@@ -8862,18 +9107,17 @@ impl SegmentReader {
     /// score comes from, whether the whole column is scored or a few of
     /// its postings, so the two are the same f32 bit for bit.
     fn centroid_score(
-        vi: &LazyVectorIndex,
+        centroid: &[f32],
         unit: Option<&[f32]>,
         query: &[f32],
-        i: usize,
+        radius: f32,
         alpha: f32,
     ) -> f32 {
-        let c = vi.centroid(i);
         let distance = match unit {
-            Some(unit) => 1.0 - kosha_vector_spfresh::dot(unit, c).clamp(-1.0, 1.0),
-            None => kosha_vector_spfresh::cosine_distance(query, c),
+            Some(unit) => 1.0 - kosha_vector_spfresh::dot(unit, centroid).clamp(-1.0, 1.0),
+            None => kosha_vector_spfresh::cosine_distance(query, centroid),
         };
-        centroid_probe_score(distance, vi.radii[i], alpha)
+        centroid_probe_score(distance, radius, alpha)
     }
 
     /// [`Self::centroid_score`] of each of `postings` (all in range), in
@@ -8885,9 +9129,13 @@ impl SegmentReader {
         alpha: f32,
     ) -> Vec<f32> {
         let unit = Self::unit_query(vi, query);
+        let radii = vi.probe_radii();
         postings
             .iter()
-            .map(|&i| Self::centroid_score(vi, unit.as_deref(), query, i as usize, alpha))
+            .map(|&i| {
+                let i = i as usize;
+                Self::centroid_score(vi.centroid(i), unit.as_deref(), query, radii[i], alpha)
+            })
             .collect()
     }
 
@@ -8969,13 +9217,12 @@ impl SegmentReader {
             upper: Vec::with_capacity(n),
         };
         let mut finite = true;
-        for i in 0..n {
+        for (i, &r) in vi.probe_radii().iter().enumerate() {
             let sum = kosha_vector_spfresh::dot_i16_i8(&query_codes, codes.row(i, vi.dim));
             let estimate = sum as f32 * (query_scale * codes.scales[i]);
             let e = (codes.err_l2[i] * l2).min(codes.err_linf[i] * l1) + query_err + PAD;
             finite &= estimate.is_finite() && e.is_finite();
             let distance = 1.0 - estimate.clamp(-1.0, 1.0);
-            let r = vi.radii[i];
             bounds
                 .lower
                 .push(centroid_probe_score(distance - e, r, alpha));
@@ -9008,7 +9255,7 @@ impl SegmentReader {
         }
     }
 
-    /// Lower-bound distance from `query` to every posting of `field`'s
+    /// Rank score from `query` for every posting of `field`'s
     /// column (#204; see [`Self::centroid_lower_bounds`]) — **pure CPU,
     /// zero posting I/O**: centroids and radii are resident in
     /// [`LazyVectorIndex`], loaded from the column's offsets sidecar.
@@ -9020,7 +9267,7 @@ impl SegmentReader {
     /// see [`Self::knn_search_within`]. Without that split, `num_candidates`
     /// is applied per segment and total probe depth scales with segment
     /// count (200 segments x 100 = 20,000 posting reads for one top-10).
-    /// Ranking by the lower bound rather than raw centroid distance is what
+    /// Ranking by the radius-adjusted score rather than raw centroid distance is what
     /// lets a "diffuse" posting (mediocre centroid pull, but a genuinely
     /// close member buried inside it) still qualify — see
     /// `RADIUS_AWARE_VECTOR_INDEX_VERSION`. Only `field`'s centroids count:
@@ -9782,10 +10029,10 @@ impl SegmentReader {
         planned: Option<&KnnSegmentRanking>,
     ) -> Result<ProbedCandidates, KoshaError> {
         // This segment's postings inside the budget, nearest-first (by
-        // lower bound, not raw centroid distance — see
+        // rank score, not raw centroid distance — see
         // `centroid_lower_bounds`), so the `max_probes` cap keeps the
         // *best* candidates when it bites. `max_distance` is itself a
-        // lower-bound cutoff (computed from the same bound across all
+        // rank cutoff (computed from the same scores across all
         // segments — see `Searcher::knn_plan`), so both sides of the
         // comparison are in the same units.
         let own;
