@@ -128,7 +128,7 @@ fn query_param(path: &str, name: &str) -> Option<String> {
 
 impl AppState {
     /// The object store deletions reclaim from, if this node has one.
-    fn remote_prefix_store(&self) -> Option<&dyn RemotePrefixStore> {
+    pub(crate) fn remote_prefix_store(&self) -> Option<&dyn RemotePrefixStore> {
         #[cfg(test)]
         if let Some(store) = &self.remote_prefix_override {
             return Some(store.as_ref());

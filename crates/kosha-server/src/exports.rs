@@ -1069,7 +1069,7 @@ impl AppState {
     /// Remove what one attempt wrote (`dir_logical`, its own prefix):
     /// local files and, on S3, its objects. Never another attempt's.
     fn discard_run_objects(&self, record: &ExportRecord, dir_logical: &str) {
-        if let Err(e) = self.remove_export_prefix(dir_logical) {
+        if let Err(e) = self.remove_export_prefix(dir_logical, false) {
             eprintln!(
                 "WARN: export {}: removing the objects of an abandoned run failed: {e}",
                 record.id
@@ -1081,41 +1081,37 @@ impl AppState {
     /// is left. Returns how many remote objects went.
     pub(crate) fn remove_export_objects(&self, record: &ExportRecord) -> Result<u64, String> {
         let dir = export_dir(&record.tenant_id, &record.id);
-        self.remove_export_prefix(&dir)
+        self.remove_export_prefix(&dir, false)
     }
 
     /// Delete everything under the logical export directory `dir`, locally
     /// and in object storage, then list it again: only an empty listing
     /// counts.
-    fn remove_export_prefix(&self, dir: &str) -> Result<u64, String> {
+    fn remove_export_prefix(&self, dir: &str, erase_versions: bool) -> Result<u64, String> {
         match std::fs::remove_dir_all(self.export_local_path(dir)) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(format!("removing {dir}/ locally: {e}")),
         }
-        #[cfg(test)]
-        if let Some(store) = &self.remote_prefix_override {
-            let deleted = store
-                .delete_prefix(dir)
-                .map_err(|e| format!("deleting {dir}/: {e}"))?;
-            return match store.count_prefix(dir) {
-                Ok(0) => Ok(deleted as u64),
-                Ok(left) => Err(format!("{left} object(s) remain under {dir}/")),
-                Err(e) => Err(format!("could not verify that {dir}/ is empty: {e}")),
-            };
+        let Some(store) = self.remote_prefix_store() else {
+            return Ok(0);
+        };
+        let deleted = if erase_versions {
+            store.erase_prefix(dir)
+        } else {
+            store.delete_prefix(dir)
         }
-        #[cfg(feature = "s3")]
-        if let Some(s3) = &self.s3_storage {
-            use namespace_deletion::RemotePrefixStore;
-            let deleted = RemotePrefixStore::delete_prefix(s3, dir)
-                .map_err(|e| format!("deleting {dir}/: {e}"))?;
-            return match RemotePrefixStore::count_prefix(s3, dir) {
-                Ok(0) => Ok(deleted as u64),
-                Ok(left) => Err(format!("{left} object(s) remain under {dir}/")),
-                Err(e) => Err(format!("could not verify that {dir}/ is empty: {e}")),
-            };
+        .map_err(|e| format!("deleting {dir}/: {e}"))?;
+        let remaining = if erase_versions {
+            store.count_erasure_entries(dir)
+        } else {
+            store.count_prefix(dir)
+        };
+        match remaining {
+            Ok(0) => Ok(deleted as u64),
+            Ok(left) => Err(format!("at least {left} object(s) remain under {dir}/")),
+            Err(e) => Err(format!("could not verify that {dir}/ is empty: {e}")),
         }
-        Ok(0)
     }
 
     /// Open a finished part for streaming: the local file, or (S3) a copy
@@ -1206,7 +1202,8 @@ impl AppState {
         }
         (
             deleted,
-            self.remove_export_prefix(&tenant_exports_dir(tenant)).err(),
+            self.remove_export_prefix(&tenant_exports_dir(tenant), true)
+                .err(),
         )
     }
 
@@ -1251,7 +1248,8 @@ impl AppState {
         let mut first_error = None;
         let mut gone = Vec::new();
         for record in &records {
-            match self.remove_export_objects(record) {
+            let dir = export_dir(&record.tenant_id, &record.id);
+            match self.remove_export_prefix(&dir, true) {
                 Ok(_) => gone.push(record.id.clone()),
                 Err(e) => {
                     first_error.get_or_insert(format!("export {}: {e}", record.id));

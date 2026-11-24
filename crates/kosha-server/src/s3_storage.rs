@@ -4378,6 +4378,76 @@ mod error_path_tests {
     }
 
     #[test]
+    fn namespace_erasure_removes_and_rechecks_historical_export_objects() {
+        use kosha_core::export::{export_dir, NewExport};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut state = crate::AppState::new(crate::tests::test_dir());
+        let ns = kosha_core::NamespaceId("acme/docs".into());
+        let record = state
+            .controller
+            .lock()
+            .unwrap()
+            .create_export(&NewExport {
+                tenant_id: "acme".into(),
+                namespace: ns.0.clone(),
+                include_vectors: false,
+                pins: vec![],
+                upload_url: None,
+                ttl_ms: 1,
+            })
+            .unwrap();
+        let key = format!(
+            "secret-prefix/{}/part.jsonl",
+            export_dir("acme", &record.id)
+        );
+        let versions = std::sync::Arc::new(AtomicUsize::new(0));
+        let lists = versions.clone();
+        let mut deleted = false;
+        let endpoint = serve_requests(move |head, body| {
+            let request = head.lines().next().unwrap();
+            if request.starts_with("GET /bucket/?uploads") {
+                return ("200 OK", "<ListMultipartUploadsResult/>".to_string());
+            }
+            if request.starts_with("POST /bucket/?delete") {
+                let body = std::str::from_utf8(body).unwrap();
+                assert!(body.contains(&format!("<Key>{key}</Key>")));
+                assert!(body.contains("<VersionId>old</VersionId>"));
+                assert!(body.contains("<VersionId>marker</VersionId>"));
+                deleted = true;
+                return ("200 OK", "<DeleteResult/>".into());
+            }
+            assert!(request.starts_with("GET /bucket/?versions"), "{request}");
+            lists.fetch_add(1, Ordering::Relaxed);
+            let entries = if deleted {
+                String::new()
+            } else {
+                format!(
+                    "<Version><Key>{key}</Key><VersionId>old</VersionId></Version>\
+                     <DeleteMarker><Key>{key}</Key><VersionId>marker</VersionId></DeleteMarker>"
+                )
+            };
+            (
+                "200 OK",
+                format!("<ListVersionsResult>{entries}</ListVersionsResult>"),
+            )
+        });
+        let (storage, root) = storage(&endpoint, "erase-export");
+        state.s3_storage = Some(storage);
+
+        assert_eq!(state.delete_namespace_exports(&ns), (1, None));
+        assert_eq!(versions.load(Ordering::Relaxed), 3);
+        assert!(state
+            .controller
+            .lock()
+            .unwrap()
+            .export(&record.id)
+            .unwrap()
+            .is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn erasure_removes_hidden_versions_and_delete_markers_before_verifying_empty() {
         let mut deleted = false;
         let endpoint = serve_requests(move |head, body| {
