@@ -3008,6 +3008,33 @@ impl Indexer {
         })
     }
 
+    /// Approximate bytes not yet represented by a segment, including WAL
+    /// records awaiting replay after recovery.
+    pub fn pending_storage_bytes(&self, namespace: &NamespaceId) -> u64 {
+        let Some(handle) = self.namespaces.lock().unwrap().get(namespace).cloned() else {
+            return 0;
+        };
+        let state = handle.state.lock().unwrap();
+        state
+            .flushing_docs
+            .iter()
+            .flat_map(|chunk| chunk.iter())
+            .chain(
+                state
+                    .buffer
+                    .iter()
+                    .flat_map(|buffer| buffer.documents.iter()),
+            )
+            .chain(
+                state
+                    .recovered
+                    .iter()
+                    .flat_map(|(_, record)| record.documents.iter()),
+            )
+            .map(approx_document_bytes)
+            .fold(0, u64::saturating_add)
+    }
+
     /// The namespace's unindexed tail (#255): every acknowledged write that
     /// is not in a segment of the current local manifest, with the indexed
     /// copies it supersedes. See [`UnindexedTail`].

@@ -204,15 +204,14 @@ each tenant before the queue is full.
 
 ## Tenant limits
 
-Per-tenant quotas and rate limits (#341, `tenant_limits.rs`). Without
-`KOSHA_TENANT_LIMITS_FILE` nothing is limited. Limits are enforced per pod: query limits on the
+Per-tenant quotas and rate limits (#341, `tenant_limits.rs`). Without a limits file or billing
+plan limits, nothing is limited. Limits are enforced per pod: query limits on the
 pod that serves the search, write limits on the pod that executes the write (the ingest pod; a
 query pod forwards writes first). Operator traffic (the admin and internal service credentials)
-is never limited. A request over a limit gets HTTP 429 with `Retry-After` and a JSON body
-`{"error", "reason", "limit", "retry_after_ms"}`, where `reason` is one of
-`tenant_qps_exceeded`, `tenant_concurrency_exceeded`, `tenant_write_rate_exceeded`,
-`namespace_quota_exceeded`, `doc_quota_exceeded`, `vector_dims_exceeded` or `body_too_large`.
-Rate limits give the time until the token bucket holds the request; quotas give 60 seconds.
+is never limited. Rate and concurrent-query limits return HTTP 429 with `Retry-After` and a
+machine-readable reason. Under the v1 API contract (#350), quotas return 403 and body limits
+return 413; neither is retryable. See [guarantees.md](guarantees.md#per-tenant-limits-opt-in)
+for the response details.
 Each refusal is counted in `kosha_tenant_rejections_total` (see `metrics.md`). A query pod
 relays a write refused by the ingest pod unchanged: the same status, `Retry-After` and body.
 A search shed by `KOSHA_SEARCH_QUEUE_DEPTH_PER_TENANT` is answered and counted the same way,
@@ -232,7 +231,8 @@ The file:
   "plans": {
     "standard": {"qps": 50, "concurrent_queries": 8, "write_docs_per_sec": 2000,
                  "write_bytes_per_sec": 16777216, "namespaces": 100,
-                 "docs_per_namespace": 10000000, "vector_dims": 4096,
+                 "docs_per_namespace": 10000000, "bytes_per_namespace": 10737418240,
+                 "vector_dims": 4096,
                  "max_body_bytes": 33554432, "weight": 1}
   },
   "tenants": {"acme": {"plan": "standard", "qps": 200, "weight": 4}}
@@ -250,14 +250,22 @@ startup it stops the pod, and a reload keeps the previous limits.
 | `concurrent_queries` | Searches in flight at once | each search |
 | `write_docs_per_sec` | Documents per second in index and replace requests. A batch bigger than one second's worth is admitted from a full bucket and paid for afterwards | each index or replace |
 | `write_bytes_per_sec` | Request body bytes per second on write routes | each write request |
-| `max_body_bytes` | Largest write request body, under the pod-wide `KOSHA_MAX_BODY_BYTES` | each write request |
+| `max_body_bytes` | Largest request body, under the pod-wide `KOSHA_MAX_BODY_BYTES` | each authenticated tenant request |
 | `namespaces` | Namespaces the tenant holds (shards not counted; a branch is a namespace and counts) | namespace creation, branch creation, and a write that would auto-create one |
 | `docs_per_namespace` | Documents in a namespace: committed and not deleted plus not yet flushed. An unflushed upsert of an existing id counts twice until flushed | each index or replace |
+| `bytes_per_namespace` | Estimated bytes of owned segments plus the unflushed tail and incoming documents (after embedding), summed across shards | each index or replace |
 | `vector_dims` | Widest vector a document may carry, supplied or produced by native embedding | each index or replace |
 | `weight` | Permits per round-robin turn in the search queue (default 1) | search admission |
 
-Limits stored in the control plane, cluster-wide rate limits across replicas and per-namespace
-storage quotas are not implemented yet (Phase H).
+Billing accounts in the control store select a tenant's billing plan defaults. Operator
+overrides remain in this file. Rate buckets are per pod, not shared across replicas.
+
+The storage quota is an admission estimate, not a hard cap on object-store usage. It counts
+live manifest segments owned by the namespace once (not segments inherited by a branch).
+It does not subtract deleted or replaced data until compaction reclaims it, and the actual
+segment storage after indexing can exceed the estimate. Enabling it requires looking up segment
+sizes at ingest, including listing the namespace's objects on S3; a size lookup failure returns
+503 rather than treating the namespace as empty.
 
 ## Query and relevance
 

@@ -154,7 +154,7 @@ sample. They are not production guarantees.
 | Item | Limit today | Tested to |
 | --- | --- | --- |
 | Docs per namespace | **Not enforced** by default. Opt-in per tenant: `docs_per_namespace` | 10M documents (BM25 and 1024-dim vector), see Latency |
-| Bytes per namespace | **Not enforced.** There is no per-namespace storage quota. A free billing plan can cap a tenant's average `stored_bytes` per month (HTTP 402) | about 249 GB (10M × 1024-dim vectors), see Latency |
+| Bytes per namespace | **Not enforced** by default. Opt-in per tenant: `bytes_per_namespace`, an ingest admission estimate. A free billing plan can separately cap a tenant's average `stored_bytes` per month (HTTP 402) | about 249 GB (10M × 1024-dim vectors), see Latency |
 | Namespaces per tenant | **Not enforced** by default. Opt-in per tenant: `namespaces` | not yet measured |
 | Max document size | **No per-document limit.** The request body cap bounds it: see "Request body" under [Hard limits](#hard-limits) | not yet measured |
 | Max vector dimensions | **No global limit** on vectors you supply. All vectors in one namespace field must have the same length. Server-side embedding is capped: see "Server-side embedding dimensions" under [Hard limits](#hard-limits). Opt-in per tenant: `vector_dims` | 1024 dims |
@@ -254,8 +254,9 @@ query replicas. Admin and internal credentials are never limited.
 | `write_docs_per_sec`, `write_bytes_per_sec` | write rate | 429 `tenant_write_rate_exceeded`, retryable, with `Retry-After` |
 | `namespaces` | namespaces held (branches count, shards do not) | 403 `namespace_quota_exceeded`, not retryable, no `Retry-After` |
 | `docs_per_namespace` | committed plus unflushed documents | 403 `doc_quota_exceeded`, not retryable, no `Retry-After` |
+| `bytes_per_namespace` | estimated owned segment and unflushed bytes plus the incoming write | 403 `permission_denied` with `details.reason: "storage_quota_exceeded"`, not retryable, no `Retry-After` |
 | `vector_dims` | widest vector, supplied or embedded | 403 `vector_dims_exceeded`, not retryable, no `Retry-After` |
-| `max_body_bytes` | write body, under the pod cap | 413 `payload_too_large`, not retryable, no `Retry-After` |
+| `max_body_bytes` | request body, under the pod cap | 413 `payload_too_large`, not retryable, no `Retry-After` |
 
 Every tenant refusal keeps the pre-#350 `reason` and `limit` fields as
 deprecated aliases (`reason` is still `body_too_large` for the body cap).
