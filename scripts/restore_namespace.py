@@ -116,7 +116,8 @@ class VersionedObjects:
         self.at = at
 
     def key(self, path):
-        return f"{self.prefix}/{path}" if self.prefix else path
+        path = path.lstrip("/")
+        return f"{self.prefix.rstrip('/')}/{path}" if self.prefix else path
 
     def versions(self, path):
         prefix = self.key(path)
@@ -360,8 +361,6 @@ def main(argv=None):
         validate_path(args.namespace, (2,))
         if SHARD_NAME.fullmatch(args.namespace.split("/")[-1]):
             raise RestoreError("specify the namespace root, not a shard")
-        for field in ("source_prefix", "destination_prefix"):
-            setattr(args, field, getattr(args, field).rstrip("/"))
         if args.recovered_db == args.ledger_db:
             raise RestoreError("recovered database and current ledger must use distinct services")
         if args.apply and (

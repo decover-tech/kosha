@@ -11,6 +11,7 @@ import zlib
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import restore_namespace  # noqa: E402
 from restore_namespace import (  # noqa: E402
     ManifestRow,
     RestoreError,
@@ -212,3 +213,29 @@ def test_current_ledger_blocks_post_target_or_pending_erasure():
     for record in (("later", "completed"), ("earlier", "pending")):
         with pytest.raises(RestoreError, match="erasure blocks"):
             check_deletion_ledger(old, Database([record]), ["tenant/index"])
+
+
+@pytest.mark.parametrize("prefix, expected", [
+    ("", "tenant/index"),
+    ("/", "/tenant/index"),
+    ("///", "/tenant/index"),
+    ("/live///", "/live/tenant/index"),
+    ("live/", "live/tenant/index"),
+])
+def test_cli_prefixes_follow_server_key_semantics(monkeypatch, prefix, expected):
+    def recover(args):
+        for bucket, value in (
+            (args.source_bucket, args.source_prefix),
+            (args.destination_bucket, args.destination_prefix),
+        ):
+            store = VersionedObjects(Bucket(), bucket, value, TARGET)
+            assert store.key("/tenant/index") == expected
+        return {}
+
+    monkeypatch.setattr(restore_namespace, "recover", recover)
+    assert restore_namespace.main([
+        "--namespace", "tenant/index", "--at", TARGET.isoformat(),
+        "--recovered-db", "pitr", "--ledger-db", "ledger",
+        "--source-bucket", "source", "--source-prefix", prefix,
+        "--destination-bucket", "destination", "--destination-prefix", prefix,
+    ]) == 0
