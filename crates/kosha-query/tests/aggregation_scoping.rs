@@ -646,6 +646,47 @@ fn vector_only_aggregations_cover_the_namespace_top_k_before_pagination() {
 }
 
 #[test]
+fn weighted_rrf_fuses_only_each_vector_legs_namespace_top_k() {
+    let docs = corpus();
+    let legs = [
+        ([1.0f32, 0.0, 0.3, 1.0], 7, 1.0f64),
+        ([1.0f32, 0.2, 0.2, 1.0], 4, 2.0),
+    ];
+    let mut scores = BTreeMap::new();
+    for (target, k, weight) in legs {
+        for (rank, doc) in brute_force_knn(&docs, &target, k, None)
+            .into_iter()
+            .enumerate()
+        {
+            *scores.entry(doc.id.as_str()).or_insert(0.0) += weight / (18 + rank) as f64;
+        }
+    }
+    let mut expected: Vec<_> = scores.into_iter().collect();
+    expected.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let request = json!({
+        "query_text": "",
+        "max_results": 20,
+        "rank_by": {"rrf": {
+            "k": 17,
+            "weights": legs.map(|(_, _, weight)| weight),
+            "queries": legs.map(|(vector, k, _)| json!({
+                "knn": {"field": "emb", "vector": vector, "k": k, "num_candidates": 200}
+            })),
+        }},
+    });
+    for layout in layouts(&docs) {
+        let result = search(&layout, &request, None);
+        assert_eq!(result.total_hits, expected.len(), "{}", layout.name);
+        assert_eq!(result.results.len(), expected.len(), "{}", layout.name);
+        for (hit, &(id, score)) in result.results.iter().zip(&expected) {
+            assert_eq!(hit.doc_id.0, id, "{}", layout.name);
+            assert!((hit.score - score).abs() < 1e-12, "{}", layout.name);
+        }
+        let _ = std::fs::remove_dir_all(layout.dir);
+    }
+}
+
+#[test]
 fn collapsed_vector_aggregations_keep_distinct_groups_in_the_top_k() {
     let mut docs = corpus();
     docs.truncate(3);

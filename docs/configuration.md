@@ -281,6 +281,7 @@ Read once in `crates/kosha-query/src/lib.rs`.
 | `KOSHA_BM25_STATS` | Server-wide BM25 statistics scope: `namespace` or `segment` (debugging). A request's `bm25_params.stats` overrides it | `namespace` | enum |
 | `KOSHA_EXACT_TOTAL_HITS` | Default for `exact_total_hits` when a request omits it | off | flag |
 | `KOSHA_TOTAL_HITS_CAP` | Default `total_hits` cap (`relation: gte` above it). `0` is treated as `1` | `10000` | hits |
+| `KOSHA_TWO_TIER_QUERY` | Set to `exact` to try head-only certification on eligible v8 BM25 queries (#387); when off or uncertified, read full postings | off | enum |
 
 ## kNN / vector search
 
@@ -289,19 +290,24 @@ Read once in `crates/kosha-query/src/lib.rs`.
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
 | `KOSHA_KNN_GLOBAL_BUDGET` | Treat `knn.num_candidates` as one probe budget for the whole query. `0`, `false` or `off` gives each segment its own budget (old behavior) | on | flag |
+| `KOSHA_KNN_SEGMENT_NPROBE` | Experimental coarse routing for unfiltered single-vector kNN. Probe the nearest N summarized segments plus all segments without usable summaries. `0` disables pruning. A smaller N can lower recall | `0` | segments |
 | `KOSHA_KNN_BUDGET_FRACTION` | Lower bound on the probe budget, as a fraction of the namespace's centroids. Must be > 0 | `0.05` | fraction |
 | `KOSHA_KNN_BUDGET_MAX_CAP` | Ceiling on that lower bound. A larger explicit `num_candidates` is still honored | `20000` | centroids |
 | `KOSHA_KNN_NAMESPACE_CENTROIDS` | Experimental (#253). `1`, `true` or `on`: enable on the indexer and query nodes (or standalone). The indexer updates the directory when it observes a committed flush or publishes a compaction. Eligible unfiltered single-vector queries probe at most `num_candidates` postings across the namespace, without the fraction floor. Missing or stale directories, legacy columns, filters, deletes, and the relative cutoff use the ordinary planner. | off | flag |
 | `KOSHA_KNN_EXACT_THRESHOLD` | A filtered kNN with at most this many filter-passing documents namespace-wide scores every passing document's vector exactly instead of probing (#252). `0` disables exact filtered kNN | `50000` | documents |
 | `KOSHA_KNN_EXACT_FRACTION` | A segment where at most this fraction of documents pass the filter is searched exactly too (#252) | `0.01` | fraction |
+| `KOSHA_KNN_EXACT_COST_MODEL` | Experimental (#465): pick exact or probed per segment by estimated bytes read instead of `KOSHA_KNN_EXACT_THRESHOLD` / `KOSHA_KNN_EXACT_FRACTION` (a threshold of `0` still disables exact) | off | `1` / `true` / `on` |
+| `KOSHA_KNN_COST_POSTING_OVERHEAD_BYTES` | Cost model's fixed cost of one posting fetch, in bytes of sequential read | `4096` | bytes |
 | `KOSHA_KNN_GLOBAL_RESCORE` | Experimental (#381). `1`, `true` or `on`: an unfiltered kNN collects every segment's candidates with their error bounds, computes the `k`-th lower bound across the namespace, and rescores only the quantized candidates whose upper bound reaches it, reading f32 vectors from `doc_vectors.bin` locally or by ranged read. Candidates with no readable exact vector keep their estimate and their segment is counted in `knn_degraded_segments` (the default path returns them silently). Filtered, `limit_per` and late-interaction kNN keep the default path. With it on, a kNN also hydrates the `doc_vectors.bin` header of every segment whose queried column is quantized (with the scoring files, by range), and a failed ranged read of `doc_vectors.bin` is never retried as the whole file | off | flag |
 | `KOSHA_KNN_GLOBAL_RESCORE_MAX` | Experimental. With `KOSHA_KNN_GLOBAL_RESCORE`, the most quantized candidates one query reads exact vectors for. Without it every candidate the error bounds cannot rule out is rescored, which can be a large share of all candidates when estimates are close together. With it only the best by estimate are rescored and the rest dropped, so the result is no longer guaranteed by the bounds. `0` or unset: no cap | unset | count |
-| `KOSHA_KNN_RESCORE_STATS` | Experimental (#381), observability only. `1`, `true` or `on`: a kNN counts the segments whose quantized column the default per-segment path probed, and how many of them returned unrescored estimates because `doc_vectors.bin` was not whole and local, and appends `knn_seg_quantized=` / `knn_seg_unrescored=` to the `search timing:` line (printed only for slow searches unless `KOSHA_SLOW_SEARCH_LOG_MS=0`). Results are unchanged. Implied by `KOSHA_KNN_GLOBAL_RESCORE` | off | flag |
+| `KOSHA_KNN_RESCORE_STATS` | Experimental (#381), observability only. `1`, `true` or `on`: log `knn_seg_quantized=` / `knn_seg_unrescored=` for the default per-segment path and, when the global pass did not run, `knn_rescored=` for candidates successfully rescored from the local `doc_vectors.bin`. The `search timing:` line is printed only for slow searches unless `KOSHA_SLOW_SEARCH_LOG_MS=0`. Results are unchanged. Implied by `KOSHA_KNN_GLOBAL_RESCORE`, whose global pass already logs its own `knn_rescored=` | off | flag |
 | `KOSHA_KNN_I8_BOUND` | Error bound of an i8 vector entry under `KOSHA_KNN_GLOBAL_RESCORE` (#381; read in `kosha-segment`): `strict` (`scale / 2 * ‖q‖₁`, guaranteed) or `probabilistic` (`1.9 * scale * ‖q‖₂ / √12`, not guaranteed, much tighter at high dimension) | `strict` | mode |
 | `KOSHA_KNN_FILTER_BUDGET_MAX_SCALE` | Most a filtered kNN widens the global probe budget by (`1 / selectivity`, #252) | `8` | multiplier |
 | `KOSHA_KNN_RELATIVE_CUTOFF_EPS` | Experimental (#384). Unfiltered kNN probes a posting only if its rank score is at most `(1 + eps)` times the best posting's score (SPANN's relative cutoff), never fewer than `KOSHA_KNN_RELATIVE_MIN_PROBES` postings and never more than the fixed budget. While on, each such search reports which rule set its cutoff (`timings.knn_cutoff_rule` and `knn_cutoff_rule=` on the `search timing:` line, which prints only for slow searches unless `KOSHA_SLOW_SEARCH_LOG_MS=0`: `budget`, `eps`, `floor` or `zero_best`). Unset, empty, negative or unparseable: off | unset (off) | ratio |
 | `KOSHA_KNN_RELATIVE_MIN_PROBES` | Experimental (#384). Fewest postings the relative cutoff may leave a query with | the query's `num_candidates` | postings |
-| `KOSHA_KNN_PROBE_RADIUS_ALPHA` | Experimental (#384). Weight of a posting's radius in its rank score `max(0, d(q, c) - alpha * radius)`, used by the global cutoff and each segment's probe order. `1` is the triangle-inequality lower bound (unchanged); `0` ranks by raw centroid distance. Read once in `crates/kosha-segment/src/lib.rs` | `1.0` | weight |
+| `KOSHA_KNN_PROBE_RADIUS_ALPHA` | Experimental (#384). Weight of a posting's selected radius in its rank score `max(0, d(q, c) - alpha * radius)`, used by the global cutoff and each segment's probe order. `1` keeps the full radius weight; `0` ranks by raw centroid distance | `1.0` | weight |
+| `KOSHA_KNN_BOUND_STOP_ALPHA` | Experimental (#384). Per-query early termination inside each segment's budgeted kNN probe: skip a posting when the segment's k-th guaranteed similarity so far (exact on f32 columns, `estimate - error` on RaBitQ ones) is at least `alpha x` the best cosine similarity any member of the posting can have, from the angle triangle inequality on its centroid distance and stored radius. `1` skips only postings that cannot change the segment's top k on f32 columns (on RaBitQ columns the `estimate - error` floor holds with ~94% confidence per estimate, so rare misses are possible); `< 1` trades recall for fewer postings. Off for pre-radius sidecars, i8 columns and quantized columns without local exact rescoring. The fixed budget stays the cap. Skipped postings count as `knn_bound_skips=` on the `search timing:` line. Unset, `0` or invalid = off. Read once in `crates/kosha-segment/src/lib.rs` | unset (off) | ratio |
+| `KOSHA_KNN_PROBE_RADIUS` | Experimental (#458). Selects `max`, `p90`, or `p50` member distance for probe ordering only, not for safe pruning. With `max` or missing quantiles, ordering is unchanged: max radius (zero on pre-radius versions) with global budgeting, raw centroid distance with per-segment budgeting | `max` | enum |
 | `KOSHA_KNN_PLAN_I8` | Two-stage kNN planning. A unit-norm vector column keeps i8 codes of its centroids in memory (built at load, about a quarter of the f32 centroids' bytes, no on-disk change); a query first bounds every centroid's rank score from the codes, then scores in f32 only the centroids that could be inside the probe budget. The bounds are guaranteed, so the plan (cutoff, postings probed, their order) and the results are identical to scoring every centroid. `0`, `false` or `off` loads no codes and scores every f32 centroid. `knn_plan_exact_centroids=` on the `search timing:` line counts the f32-scored centroids. Read once in `crates/kosha-segment/src/lib.rs` | `1` | flag |
 | `KOSHA_KNN_SEGMENT_PRUNE` | kNN segment pruning (#253). A unit-norm vector column keeps, in memory, a spherical cap holding all its centroids (built at load, no on-disk change); from it a query gets a guaranteed floor under every posting's rank score in that segment. The plan scores the segments with the lowest floors until they hold the probe budget, then leaves out unscored every segment whose floor is above the budget-th score found, since none of its postings can be probed. The plan (cutoff, postings probed, their order) and the results are identical to scoring every segment; it saves centroid scoring when segments hold spatially coherent vectors. `0`, `false` or `off` plans every segment. `knn_plan_exact_centroids=` on the `search timing:` line drops when segments are left out. Read once per searcher in `crates/kosha-query/src/lib.rs` | `1` | flag |
 | `KOSHA_LATE_INTERACTION_NPROBE` | Token-index postings probed per query token by a late-interaction (`knn.vectors`) search, before candidates are re-scored exactly (#205) | `16` | postings |
@@ -363,7 +369,10 @@ What is recorded:
   attribution, not billing.
 - An accepted document write (`/documents`, legacy `/index` and `/replace`): `bytes_written`
   (each document's id plus every field's name and value, as submitted) and `documents_written`.
-  Recorded on the pod that executes the write.
+  Recorded on the pod that executes the write. A write with vectors also records
+  `vector_dimensions_written`: each flat vector's dimension, plus dimension x tokens of each
+  late-interaction bag, counted after server-side embedding (so a field the server embeds counts
+  the vector it produced). A doc id repeated in one batch counts its last copy only.
 - An applied delete by query (`POST /v1/namespaces/{ns}/delete`, legacy `/delete`):
   `documents_deleted` and `bytes_deleted`, the deleted documents' records in the doc store as
   stored (compressed when the doc store is; 0 for documents in segments written before
@@ -388,7 +397,9 @@ adds `bytes_queried`, the billing meter for query volume: each search priced at 
 `stored_bytes` snapshot current at that hour. It does not depend on what the search read, so it is
 the same for whole-file, ranged and fully cached searches. `stored_byte_hours` is the sum of the
 hourly snapshots in the window; an hour with no writer running has no snapshot and contributes
-nothing (`stored_snapshots` counts the hours that did).
+nothing (`stored_snapshots` counts the hours that did). `vector_dimensions_written` is summed.
+With `KOSHA_DASHBOARD=on` the dashboard's **Usage** page shows the same summary for the pasted
+key's tenant.
 
 The summary also reports `documents_deleted` and `bytes_deleted`. The pipeline's own counters are
 on `/metrics` (`kosha_usage_*`, see [metrics.md](metrics.md)).
@@ -991,14 +1002,15 @@ See "Exports" in the README.
 
 ## Segment format (rollout and rollback gates)
 
-Writers emit the newest format by default. Pin an older version during a rolling deploy, or
+Writers emit the newest stable format by default. Pin an older version during a rolling deploy, or
 before rolling back, until every reader understands the newer one. Read once in
 `crates/kosha-segment/src/lib.rs`.
 
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
-| `KOSHA_POSTINGS_WRITE_VERSION` | Inverted-postings version written: `4`, `5` or `6`. `6` is experimental (#386): v5 with bit-packed 128-posting scoring blocks, readable only by builds that include #386, so set it only once every query pod does | `5` | version |
-| `KOSHA_VECTOR_WRITE_VERSION` | Vector-index version written: `1` (flat), `2`, `3` or `4` (posting-based) | `4` | version |
+| `KOSHA_POSTINGS_WRITE_VERSION` | Inverted-postings version written by indexing and compaction: `4`, `5`, `6` (experimental bit-packed full scoring blocks), or `7` (also packs positions and uses the skip entry for singleton scoring blocks). Enable an experimental version only once every reader supports it. Changing the setting affects new segments only; older binaries still cannot read segments already written in a newer format | `5` | version |
+| `KOSHA_VECTOR_WRITE_VERSION` | Vector-index write tier: `1` (flat), `2`–`4` (posting-based), or `5` (experimental #458, adds p50 and p90 alongside max in `vector.offsets`; on-disk headers 6–8 for f32/i8/RaBitQ). Enable tier 5 only after all readers support it. To roll back to older readers, restore tier 4 and rewrite tier 5 segments before downgrading | `4` | version |
+| `KOSHA_KNN_SEGMENT_SUMMARIES` | Set to `1` to write coarse vector centroids in segment footers during offline builds, flushes and compaction, for use by `KOSHA_KNN_SEGMENT_NPROBE`. Has no effect on flat vector indexes | off | flag |
 | `KOSHA_VECTOR_STORE` | Where vector field values are stored: `sidecar` (`doc_vectors.bin`) or `inline` (in `doc_store.bin`). Set `inline` before rolling back past #243 | `sidecar` | enum |
 | `KOSHA_DOC_STORE_COMPRESSION` | Experimental (research #388). `zstd`: new segments store each `doc_store.bin` record as its own zstd frame with a per-segment trained dictionary (kept in the `doc_store.offsets` trailer), and vectors always go to `doc_vectors.bin`. `auto`: fresh segments raw, merges keep their inputs' format. `none`: always raw (compact with this before rolling back past #388; older readers cannot read compressed segments) | `auto` | enum |
 | `KOSHA_DOC_STORE_ZSTD_LEVEL` | zstd level for a compressed doc store (1-22) | `3` | int |
@@ -1010,13 +1022,19 @@ before rolling back, until every reader understands the newer one. Read once in
 | `KOSHA_VECTOR_DOT_LANES` | Experimental (#382): accumulator lanes of the f32 dot that the SPFresh posting scans (exact restricted scan, `knn_search_within_lazy`, `knn_search_lazy`) score f32 posting entries with: `8`, `16`, `32` or `64`. Not covered: centroid ranking, quantized-column rescoring against `doc_vectors.bin`, sidecar/HNSW exact search. `8` is the existing kernel, bit for bit; wider ones differ in the last float bits. Meant to be measured together with an image built with `KOSHA_RUSTFLAGS` (Dockerfile build arg) | `8` | lanes |
 | `KOSHA_VECTOR_RABITQ_ESTIMATOR` | Experimental (#382): how a `rabitq` column's codes are scored at query time. `lut` reads a 256-entry f32 table per code byte (128 KiB per query at 1024 dims); `popcount` quantizes the rotated query to 4 bits and scores with AND + popcount (RaBitQ §3.3.2), with an error bound widened by the query rounding. Query-time only, same on-disk codes; unknown values fall back to `lut`. On the default baseline-x86-64 image there is no `popcnt` instruction, so the count is a software popcount; measure it with an image built with `KOSHA_RUSTFLAGS="-C target-cpu=x86-64-v3"` (or `+popcnt`). When either #382 variable is set, or the image is built above baseline x86-64, the server logs one `vector kernels (#382, experimental): ...` line at startup | `lut` | enum |
 | `KOSHA_VECTOR_BUILD_REFINE` | Whether a from-scratch vector index build (every flush, `KOSHA_VECTOR_COMPACTION=rebuild`, and compaction's fallback) refines balanced bisection's postings by nearest-centroid reassignment and a LIRE rebalance, tightening posting radii (#253). `off` builds exactly as before. Same on-disk format either way | `on` | enum |
-| `KOSHA_DOC_REORDER` | Experimental (#385). `bp` writes compaction outputs, and `kosha-build-segments` segments (unless `--doc-reorder` is given), with documents renumbered by recursive graph bisection so documents sharing terms get nearby `doc_seq`s. Same on-disk format; results are unchanged (ties break on `_id`). Compaction only reorders when `KOSHA_DOC_REORDER_COMPACTION_MAX_DOCS` also allows it. `off` writes in ingest order exactly as before | `off` | enum |
+| `KOSHA_DOC_REORDER` | Experimental (#385). `bp` writes compaction outputs, and `kosha-build-segments` segments (unless `--doc-reorder` is given), with documents renumbered by recursive graph bisection so documents sharing terms get nearby `doc_seq`s. Same on-disk format; results are unchanged (ties break on `_id`). Compaction only reorders when `KOSHA_DOC_REORDER_COMPACTION_MAX_DOCS` also allows it. `posting` (#456, research) applies to `kosha-build-segments` only: each segment's documents are numbered posting by posting of the `--vector-field` index, so every vector posting covers one contiguous `doc_seq` range; flush and compaction treat it as `off`. `off` writes in ingest order exactly as before | `off` | enum |
 | `KOSHA_DOC_REORDER_COMPACTION_MAX_DOCS` | Experimental (#385). With `KOSHA_DOC_REORDER=bp`, compaction reorders a merge only when its live documents (inputs minus pre-merge deletes) number at most this; BP compaction buffers the whole merged output (stored fields and sidecar vectors) in memory, so a larger merge streams in input order and logs a warning. `0` never reorders in compaction | `0` | documents |
 | `KOSHA_VECTOR_COMPACTION` | How compaction builds merged vector indexes: `lire` seeds each column from its largest input's postings and repairs them with SPFresh's LIRE split / merge / reassign; `rebuild` re-clusters every vector (#253) | `lire` | enum |
+| `KOSHA_VECTOR_COMPACTION_PROFILE` | `1` logs per-column posting membership and byte counts after LIRE-mode compaction for the [posting-indirection experiment](research/463-posting-indirection.md). Adds comparison work but does not change writes or queries | off | flag |
+| `KOSHA_VECTOR_REBUILD_TOMBSTONE_RATIO` | Experimental (#464). With `KOSHA_VECTOR_COMPACTION=lire`, a compaction discards a column's LIRE-repaired index and clusters it from scratch when at least this share of the seeded postings' members was deleted, tombstoned or upserted away. Each compaction logs one `INFO: compaction ... vector field ...` line per seeded column with every signal these thresholds read. Unset or `off` disables it | off | ratio |
+| `KOSHA_VECTOR_REBUILD_RADIUS_INFLATION` | Experimental (#464). Same, when the LIRE index's p90 posting radius is at least this multiple of the reference p90: the last from-scratch build's, carried in the column's footer metadata (`radius_reference`), else the adopted input's own | off | multiplier |
+| `KOSHA_VECTOR_REBUILD_NPA_VIOLATIONS` | Experimental (#464). Same, when at least this share of up to 256 sampled vectors has a nearer centroid than its own posting's | off | ratio |
+| `KOSHA_VECTOR_REBUILD_MIN_CHANGED` | Experimental (#464). The thresholds above fire only when at least this share of the column changed in the compaction (not in an untouched posting of the adopted input; O'Neil's batch-merge M) | `0` | ratio |
 | `KOSHA_TEXT_FILTER_IGNORE_ABOVE` | Longest `Text` value copied into filter columns, like Elasticsearch's `ignore_above`; `off` copies every value | `256` | characters |
 | `KOSHA_FIELD_INDEX` | Per-field inverted indexes (#249); `off` writes segments exactly as before. Set it and compact before rolling back past #249 | on | flag (default on) |
 | `KOSHA_FILTERS_WRITE_VERSION` | Filter index written: `1` (`filters.bin`) or `2` (columnar `filters.toc` + `filters-NNN.col`, #244) (`filter_columns.rs`) | `1` | version |
 | `KOSHA_POSTINGS_RAW_BLOBS` | Leave `postings-*.bin` shards uncompressed so a cold query can fetch term spans by range (#245); `0` keeps compressing them | on | flag |
+| `KOSHA_TWO_TIER_HEAD_FRACTION` | A fraction in `(0, 1)` opts new segment writers into v8 head/tail postings (#387), overriding the ordinary postings format. Enable only once every reader supports v8; disable and compact before rolling back | unset | fraction |
 
 ## Reranking
 
@@ -1111,7 +1129,19 @@ bench's header comment documents its own knobs. The common ones:
 | `KOSHA_RELEVANCE_JSON` | Write the `relevance` bench's report (used by the `relevance-compare` CI job and for `scripts/relevance/baseline.json`) |
 | `KOSHA_RELEVANCE_FIXTURE` | Fixture directory for the `relevance` bench when no argument is given (default `scripts/relevance/fixtures/synthetic`) |
 | `KOSHA_RELEVANCE_NUM_CANDIDATES` | kNN `num_candidates` in the `relevance` bench (default 1: the engine's `KOSHA_KNN_BUDGET_FRACTION` floor sets the probe budget) |
-| `KOSHA_PLAN_BENCH_SEGS`, `KOSHA_PLAN_BENCH_CENTROIDS`, `KOSHA_PLAN_BENCH_DIM`, `KOSHA_PLAN_BENCH_QUERIES`, `KOSHA_PLAN_BENCH_ITERS`, `KOSHA_PLAN_BENCH_NUM_CANDIDATES` | Size of the kNN planning microbench (`knn_plan_microbench`, an ignored test in `crates/kosha-query/src/tests/knn_plan_two_stage.rs`, run in release mode): segments, centroids per segment, dimensions, distinct queries, timed passes over them, and the query's `num_candidates`. Defaults 196, 582, 1024, 16, 20, 100: the 10M vector bench's centroid count |
+| `KOSHA_PLAN_BENCH_SEGS`, `KOSHA_PLAN_BENCH_CENTROIDS`, `KOSHA_PLAN_BENCH_DIM`, `KOSHA_PLAN_BENCH_QUERIES`, `KOSHA_PLAN_BENCH_ITERS`, `KOSHA_PLAN_BENCH_NUM_CANDIDATES` | Size of the kNN planning microbenches (`knn_plan_microbench`, `knn_plan_rabitq_microbench`, ignored tests run in release mode): segments, centroids per segment, dimensions, distinct queries, timed passes over them, and the query's `num_candidates`. Defaults 196, 582, 1024, 16, 20, 100: the 10M vector bench's centroid count |
+
+To compare 1-bit RaBitQ shortlists of 1k, 5k and 20k against the full f32 scan
+and the default i8 planner, run:
+
+```sh
+KOSHA_KNN_PLAN_I8=1 cargo test --release -p kosha-query --lib knn_plan_rabitq_microbench -- --ignored --nocapture
+```
+
+This measures scoring and ranking over synthetic centroids, not end-to-end search.
+Posting overlap is the fraction of the exact plan's selected postings retained
+after the 1-bit shortlist and f32 rerank. A shortlist smaller than the exact plan
+cannot reach full overlap. The RaBitQ confidence margin is not a guaranteed bound.
 | `KOSHA_BENCH_BATCH_SIZE`, `KOSHA_BENCH_BACKLOG_DOCS`, `KOSHA_BENCH_FLUSH_THRESHOLD`, `KOSHA_BENCH_MAX_CONCURRENT_FLUSH_WRITERS`, `KOSHA_BENCH_MIN_DOCS_PER_FLUSH_WRITER`, `KOSHA_BENCH_WAL_APPENDS`, `KOSHA_BENCH_WAL_ENABLED` | Write-path benches (`kosha-write`) |
 
 ## Other environment variables

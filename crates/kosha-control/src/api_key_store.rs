@@ -244,10 +244,12 @@ async fn rotate(
             kind.condition()
         ))
     );
+    // A zero-overlap deadline must not round up past the server's clock.
     let retire = format!(
         "UPDATE kosha.api_keys \
          SET expires_at = LEAST(COALESCE(expires_at, 'infinity'), \
-                                NOW() + make_interval(secs => $2::DOUBLE PRECISION)) \
+                                CASE WHEN $2::DOUBLE PRECISION = 0 THEN date_trunc('second', NOW()) \
+                                ELSE NOW() + make_interval(secs => $2::DOUBLE PRECISION) END) \
          WHERE {KEY_HASH} = $1 \
          RETURNING EXTRACT(EPOCH FROM expires_at)::BIGINT"
     );

@@ -5,8 +5,8 @@
 //! - scoring-section bytes per posting (v5 vs v6; v6 tails stay varint),
 //! - decode throughput in postings/s and integers/s (2 ints per posting)
 //!   for whole lists, block by block, exactly as `read_block` decodes,
-//! - for the Markdown corpus, whole `postings-*.bin` bytes of a real v5
-//!   and v6 segment build (skip table + scoring + positions).
+//! - for the corpus, whole `postings-*.bin` bytes and warm full-postings
+//!   fetch/decode throughput from real v5, v6 and v7 segment builds.
 //!
 //! Distributions: synthetic dense / medium / sparse doc gaps with a
 //! skewed tf, and real posting lists from the repository's Markdown files
@@ -27,14 +27,16 @@ use std::hint::black_box;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use kosha_core::fuzzy::SortedTerms;
 use kosha_core::{Bm25Params, DocumentId, Field, SegmentId};
 use kosha_segment::bitpack::{
     decode_bp_block, decode_varint_block, encode_bp_block, encode_varint_block, pack128, unpack128,
     BP_BLOCK,
 };
 use kosha_segment::{
-    postings_section_stats, PostingsSectionStats, ScoringPosting, SegmentWriter,
-    BITPACKED_SKIP_SPLIT_INVERTED_VERSION, SKIP_SPLIT_INVERTED_VERSION,
+    postings_section_stats, PostingsSectionStats, ScoringPosting, SegmentReader, SegmentWriter,
+    BITPACKED_SKIP_SPLIT_INVERTED_VERSION, PACKED_POSITIONS_INVERTED_VERSION,
+    SKIP_SPLIT_INVERTED_VERSION,
 };
 
 /// One term's scoring section in both encodings, with per-block byte
@@ -329,7 +331,7 @@ fn corpus_lists(docs: &[String]) -> Vec<Vec<ScoringPosting>> {
     terms.into_values().collect()
 }
 
-fn segment_postings_bytes(docs: &[String], version: u32) -> (u64, PostingsSectionStats) {
+fn segment_postings(docs: &[String], version: u32) -> (u64, PostingsSectionStats, Duration) {
     let dir = std::env::temp_dir().join(format!(
         "kosha-bench-postings-codec-v{version}-{}",
         std::process::id()
@@ -348,8 +350,25 @@ fn segment_postings_bytes(docs: &[String], version: u32) -> (u64, PostingsSectio
         .map(|e| e.metadata().unwrap().len())
         .sum();
     let stats = postings_section_stats(&dir).expect("section stats");
+    let mut best = Duration::MAX;
+    // Section stats warmed the shards. A new reader each pass prevents
+    // decoded postings cache hits, and opening it is not timed.
+    for _ in 0..7 {
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        let dictionary = r.term_dictionary();
+        let terms: Vec<String> = (0..dictionary.term_count())
+            .map(|i| dictionary.term(i).to_owned())
+            .collect();
+        let start = Instant::now();
+        let decoded = black_box(r.postings_for_terms(black_box(&terms)));
+        best = best.min(start.elapsed());
+        assert_eq!(
+            decoded.iter().map(|(_, p)| p.len() as u64).sum::<u64>(),
+            stats.postings
+        );
+    }
     let _ = std::fs::remove_dir_all(&dir);
-    (bytes, stats)
+    (bytes, stats, best)
 }
 
 fn main() {
@@ -429,15 +448,21 @@ fn main() {
     println!("{label} corpus: {} docs, {} terms", docs.len(), lists.len());
     report(&format!("{label} all terms"), &lists);
     report(&format!("{label} terms df>=128"), &long);
-    let ((b5, s5), (b6, s6)) = (
-        segment_postings_bytes(&docs, SKIP_SPLIT_INVERTED_VERSION),
-        segment_postings_bytes(&docs, BITPACKED_SKIP_SPLIT_INVERTED_VERSION),
-    );
-    println!(
-        "{label} segment postings-*.bin bytes (skip+scoring+positions): v5 {b5}  v6 {b6}  ({:+.1}%)",
-        100.0 * (b6 as f64 / b5 as f64 - 1.0)
-    );
-    for (v, s) in [(5, &s5), (6, &s6)] {
+    let results = [
+        SKIP_SPLIT_INVERTED_VERSION,
+        BITPACKED_SKIP_SPLIT_INVERTED_VERSION,
+        PACKED_POSITIONS_INVERTED_VERSION,
+    ]
+    .map(|v| segment_postings(&docs, v));
+    let base_bytes = results[0].0;
+    println!("{label} segment postings-*.bin (skip+scoring+positions):");
+    for (bytes, s, elapsed) in &results {
+        let v = s.inverted_version;
+        println!(
+            "  v{v} {bytes} B ({:+.1}% vs v5), full fetch/decode {:.1} Mpostings/s",
+            100.0 * (*bytes as f64 / base_bytes as f64 - 1.0),
+            s.postings as f64 / elapsed.as_secs_f64() / 1e6
+        );
         println!(
             "  v{v} sections: skip {} B, scoring {} B, positions {} B; postings in full blocks {:.1}%",
             s.skip_bytes,

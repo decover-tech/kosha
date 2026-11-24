@@ -9,6 +9,70 @@ kosha uses it to build every segment's vector index. The crate itself has no
 I/O and no dependency on the rest of the workspace; `kosha-segment` turns its
 postings into files and `kosha-query` probes them.
 
+## Churn stability experiment (#466)
+
+Run the ignored synthetic gate from the repository root:
+
+```sh
+cargo test --release --locked -p kosha-vector-spfresh --test churn_stability \
+  churn_cycle_recall_stability -- --ignored --exact --nocapture
+```
+
+Defaults: 8,000 live vectors, 50 cycles per workload, and 100 fixed queries.
+Override with `KOSHA_BENCH_CHURN_SIZE`, `KOSHA_BENCH_CHURN_CYCLES`, and
+`KOSHA_BENCH_CHURN_QUERIES`.
+Each workload starts with the same seed build and uses the smallest radius-aware
+posting budget reaching 95% initial recall@10 (rounded up to a whole posting).
+That absolute budget is held fixed for both methods, capped only by the number
+of available postings. Each of the 5%, 10%, and 50% workloads deletes a random
+subset and inserts the same number from an equally sized inactive reservoir.
+Stationary inserts are uniform; drifting inserts come from a window that moves
+from low to high along a fixed embedding projection. Queries stay fixed, and
+exact top-10 neighbours are determined for the current live set each cycle.
+
+The gate prints paired CSV rows for LIRE compaction and a fresh rebuild of the
+same live vectors: recall@10, mean vectors scanned per query, median and p90
+posting radius, and posting count. It reports every cycle before failing if any
+pair differs by more than 0.5 percentage points of recall or more than 10% of
+the rebuild scan count. This exercises the in-memory compaction algorithm
+(adopt/absorb/rebalance), not segment I/O, fallback to clustering, or end-to-end
+query latency.
+
+Reduced synthetic run (2,400 live vectors, 3 cycles per workload, 100 queries):
+the calibration chose two postings and reached 99.8% recall@10, scanning
+151.39 vectors/query; one posting did not reach 95%. The gate reported 16 of
+18 cycles outside the bar.
+
+| Inserts | Churn | Max absolute recall gap (pp) | Max relative scan gap | Outside bar |
+| --- | ---: | ---: | ---: | ---: |
+| Stationary | 5% | 1.60 | 27.80% | 3/3 |
+| Stationary | 10% | 3.20 | 7.66% | 2/3 |
+| Stationary | 50% | 1.00 | 14.60% | 2/3 |
+| Drifting | 5% | 3.40 | 13.67% | 3/3 |
+| Drifting | 10% | 2.80 | 13.20% | 3/3 |
+| Drifting | 50% | 21.50 | 21.56% | 3/3 |
+
+In the last 50%-drifting cycle, LIRE versus rebuild was 66.6% vs 88.1%
+recall@10, 190.51 vs 156.72 vectors/query, 0.756 vs 0.514 median radius,
+0.827 vs 0.743 p90 radius, and 26 vs 30 postings. These are smoke-run
+observations, not 50-cycle or MSMarco results.
+
+For the offline MSMarco experiment, prepare two million passage embeddings
+(one million live, one million replacement candidates) and the corresponding
+query embedding file with the existing fetcher, then pass the local directory
+to the runner:
+
+```sh
+python3 scripts/bench/bm25_scale/fetch_msmarco_embeddings.py \
+  --docs 2000000 --out-dir /data/msmarco-emb
+python3 scripts/bench/bm25_scale/run_msmarco_churn.py \
+  /data/msmarco-emb msmarco-churn.csv
+```
+
+The runner does not download data or contact a Kosha server. The default run
+needs substantial RAM and CPU; use `--size`, `--cycles`, and `--queries` for
+smaller runs. The CSV is retained even if the gate fails.
+
 ## What is wired into kosha
 
 ### Segment files (`kosha-segment`)
@@ -195,6 +259,16 @@ vectors, rewritten by compaction, which shapes these choices:
 billion-scale defaults (it uses `reassign_radius = 64`). `nprobe` applies only
 to this crate's own `search`; kosha-query uses the global budget above.
 
+`build_refine_anisotropic_eta` defaults to `None` (cosine assignment).
+Set it to `Some(4.0)` to try ScaNN's weighted residual loss against the
+unnormalized means in the cosine-generated refinement shortlist. The
+stray lookup still proposes a cosine neighbour; Split/Merge/Reassign and
+queries still use cosine. `enable_elkan_pruning` defaults to `false`.
+It skips comparisons in cosine refinement and LIRE reassignment using
+half the angular separation, not half the non-metric cosine distance.
+Faiss's posting-size imbalance factor is available in index stats and the
+offline segment build log, per vector field; it is not stored on disk.
+
 ## Tests and benchmarks
 
 - `tests/compaction_merge.rs`: compaction-shaped merges (one big input plus
@@ -207,6 +281,13 @@ to this crate's own `search`; kosha-query uses the global budget above.
   build time, median radius and recall with refinement off and on, and
   wall-clock rebuild vs lire times
   (`cargo test --release -p kosha-vector-spfresh --test compaction_merge -- --ignored --nocapture`).
+- Run the #459 sweep with
+  `cargo test --release -p kosha-vector-spfresh --test compaction_merge build_quality_sweep -- --ignored --nocapture`.
+  It compares the unchanged default with the radius/η grid using Elkan
+  pruning on 50k synthetic vectors and 1,000 held-out queries. Scan cost at
+  0.95 recall is mean vectors visited at the first shared posting budget
+  that reaches 0.95 mean recall. This is an in-memory probe simulation,
+  not the #384 MS MARCO baseline; it doesn't measure serving latency or I/O.
 - `tests/churn_ablation.rs`: the paper's Figure 10 ablation on one
   insert/delete/drift sequence.
 - `tests/invariants.rs`, `tests/recall.rs`: structural invariants and recall

@@ -750,6 +750,17 @@ mod tests {
     const SEC: u64 = 1_000_000_000;
 
     #[test]
+    fn saas_overlay_limits_file_parses_with_a_default_plan() {
+        let text = include_str!("../../../k8s/saas/tenant-limits.json");
+        let config = LimitsConfig::parse(text, None).expect("k8s/saas/tenant-limits.json");
+        let plan = config
+            .default_plan
+            .as_deref()
+            .expect("SaaS cells limit every tenant");
+        assert!(config.plans.contains_key(plan));
+    }
+
+    #[test]
     fn bucket_allows_a_burst_then_refills_at_the_rate() {
         let bucket = TokenBucket::default();
         let t0 = 10 * SEC;

@@ -160,6 +160,15 @@ jobs:
           python -m pip install -e . pytest pyyaml
       - name: Run unit tests
         run: python -m pytest tests/ -q
+      # Every overlay must render; scripts/tests also renders the SaaS install.
+      - name: Install kustomize and build k8s overlays
+        working-directory: .
+        run: |
+          curl -fsSL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz \
+            | sudo tar -xz -C /usr/local/bin kustomize
+          for overlay in k8s/base k8s/stage k8s/prod k8s/saas; do
+            kustomize build "$overlay" > /dev/null
+          done
       # The ES -> Kosha copy script against a stub Elasticsearch and a fake
       # Kosha, including every command in docs/migration/from-elasticsearch.md.
       - name: Copy script smoke test

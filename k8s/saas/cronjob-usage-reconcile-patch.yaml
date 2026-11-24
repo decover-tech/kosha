@@ -1,0 +1,25 @@
+# Metering is on from a cell's first boot, so the reconcile runs from day
+# one (base ships it suspended). A failed Job is the alert. It reads the same
+# DATABASE_URL as the Deployments, so it mounts the same Postgres CA.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: kosha-usage-reconcile
+  namespace: kosha
+spec:
+  suspend: false
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          volumes:
+            - name: pg-ca
+              configMap:
+                name: kosha-pg-ca
+                optional: true
+          containers:
+            - name: reconcile
+              volumeMounts:
+                - name: pg-ca
+                  mountPath: /etc/kosha/pg
+                  readOnly: true

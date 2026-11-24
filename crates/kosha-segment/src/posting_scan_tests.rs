@@ -1429,6 +1429,47 @@ fn a_planned_probe_inside_its_budget_reports_no_ranking_time() {
     assert!(ranked_here);
 }
 
+#[test]
+fn per_segment_probe_respects_opt_in_radius_quantiles() {
+    let mut fixture = Fixture::new("nprobe-quantiles");
+    fixture.set_cache_budget(0);
+    let postings = [
+        kosha_vector_spfresh::PostingSnapshot {
+            centroid: vec![0.6, 0.8],
+            entries: vec![(0, vec![0.6, 0.8])],
+            radius: 0.0,
+        },
+        kosha_vector_spfresh::PostingSnapshot {
+            centroid: vec![0.0, 1.0],
+            entries: vec![
+                (1, vec![1.0, 0.0]),
+                (2, vec![-1.0, 0.0]),
+                (3, vec![0.0, 1.0]),
+            ],
+            radius: 1.0,
+        },
+    ];
+    let path = fixture.dir.join(VECTOR_IDX_FILE);
+    let query = [1.0, 0.0];
+    for (version, mode, expected) in [
+        (QUANTILE_VECTOR_INDEX_VERSION, KnnProbeRadius::Max, 0),
+        (RADIUS_AWARE_VECTOR_INDEX_VERSION, KnnProbeRadius::P50, 0),
+        (QUANTILE_VECTOR_INDEX_VERSION, KnnProbeRadius::P50, 1),
+        (QUANTILE_VECTOR_INDEX_VERSION, KnnProbeRadius::P90, 1),
+    ] {
+        let (idx, offsets) = encode_vector_index_v2(2, &postings, version);
+        fs::write(&path, idx).unwrap();
+        let records = parse_vector_offsets(&offsets, 2, version).unwrap();
+        let mut vi = LazyVectorIndex::from_parsed(&path, 0, 2, version, records, None);
+        vi.probe_radius = mode;
+        let hits = fixture
+            .reader
+            .knn_search_lazy(&vi, &query, 1, 1, None, None)
+            .unwrap();
+        assert_eq!(hits[0].0, expected, "{version} {mode:?}");
+    }
+}
+
 /// A column whose header says dimension zero (no writer produces one, but
 /// neither parser rejects it) still has one, empty, centroid per posting:
 /// the per-segment `nprobe` probe ranks and scans those postings, as it

@@ -39,9 +39,20 @@ Representations (bytes/vector at dim D in parentheses):
   full                  exact baseline                         (4*D)
   trunc<d>              first d dims, re-normalized             (4*d)
   int8                  per-vector symmetric scale, as v4 i8    (D + 4)
+  trunc<d>-int8         int8 codes of the first d dims          (d + 4)
   bin                   sign bit per dim, Hamming (sym)         (D / 8)
   bin-asym              sign bits for docs, f32 query (asym)    (D / 8)
   trunc<d>-bin          sign bits of the first d dims           (d / 8)
+
+Two-stage mode (--rescore): by default the shortlist is rescored with the
+exact full vector ("full"), so the rescore store is 4*D bytes and total x
+cannot exceed 2. --rescore full,trunc768,int8 also rescores each shortlist
+with a *reduced rescore store* (any representation above except bin, bin-asym
+and trunc<d>-bin; f32 query against it), takes that top-k, and compares it
+with the exact full-dim top-k. Total bytes are then search repr + rescore
+repr. This is the layout question of docs/research/383-matryoshka-binary.md
+section 3c: whether some search + rescore pair is >= 4x smaller in total at
+recall within 0.01. --search restricts which search representations run.
 
 Truncation is only meaningful for a Matryoshka-trained model (e.g. OpenAI
 text-embedding-3-*). On a model that was not trained that way (Cohere
@@ -58,10 +69,16 @@ Usage (needs numpy only):
         --queries /data/queries_emb.f32 --dim 1024 --k 10 \\
         --truncate 512,256,128 --shortlist 10,40,100,200 \\
         --segments 1,2,10 --out sim.json
+
+    # Two-stage: sign-bit search, then a 768-dim prefix or int8 rescore store.
+    python3 repr_recall_sim.py --docs te3s_docs.npy --queries te3s_queries.npy \
+        --search bin-asym,trunc384 --truncate 768,384 \
+        --rescore full,trunc768,int8,trunc768-int8 --segments 1,2
 """
 
 import argparse
 import json
+import re
 import sys
 import time
 
@@ -118,6 +135,53 @@ def parse_ints(s):
     return [int(v) for v in s.split(",") if v.strip()]
 
 
+def parse_names(s):
+    return [v.strip() for v in s.split(",") if v.strip()]
+
+
+def make_rep(name, docs):
+    """(bytes/vector, doc matrix, query transform, per-doc scale or None) for
+    representation `name`, or None if the name is unknown or its prefix is
+    not shorter than the dimension."""
+    dim = docs.shape[1]
+    if name == "full":
+        return 4 * dim, docs, lambda q: q, None
+    m = re.fullmatch(r"trunc(\d+)(?:-(int8|bin))?", name)
+    if m:
+        d, enc = int(m.group(1)), m.group(2)
+        if not 0 < d < dim:
+            return None
+        src = unit(docs[:, :d])
+
+        def qd(q, d=d):
+            return unit(q[:, :d])
+
+    elif name in ("int8", "bin", "bin-asym"):
+        d, enc, src = dim, name, docs
+
+        def qd(q):
+            return q
+
+    else:
+        return None
+    if enc is None:
+        return 4 * d, src, qd, None
+    if enc == "int8":
+        codes, scale = int8_codes(src)
+        return d + 4, codes.astype(np.float32), qd, scale.ravel()
+    if enc == "bin":
+        return d // 8, sign_pm1(src), lambda q: sign_pm1(qd(q)), None
+    return d // 8, sign_pm1(src), qd, None  # bin-asym: sign bits for docs, f32 query
+
+
+def scores(rep, q):
+    _, mat, qf, sc = rep
+    out = qf(q) @ mat.T
+    if sc is not None:
+        out *= sc[None, :]
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--docs", action="append", required=True, help="doc embedding file (repeatable, concatenated in order)")
@@ -127,7 +191,19 @@ def main(argv=None):
     ap.add_argument("--dim", type=int, default=0, help="dimension, required for raw .f32 inputs")
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--truncate", default="512,256,128", help="prefix lengths to test (comma list, empty = none)")
-    ap.add_argument("--shortlist", default="10,40,100,200", help="candidates R rescored with full vectors (comma list)")
+    ap.add_argument(
+        "--search",
+        default="",
+        help="search representations to run (comma list); default int8, bin, bin-asym "
+        "and trunc<d>, trunc<d>-bin for each --truncate d",
+    )
+    ap.add_argument(
+        "--rescore",
+        default="full",
+        help="rescore representations (comma list): full (exact, today's doc_vectors.bin), "
+        "trunc<d>, int8, trunc<d>-int8",
+    )
+    ap.add_argument("--shortlist", default="10,40,100,200", help="candidates R rescored (comma list)")
     ap.add_argument(
         "--segments",
         default="1",
@@ -162,43 +238,69 @@ def main(argv=None):
     bounds = {c: np.linspace(0, n, c + 1).astype(int) for c in seg_counts}
     print(f"loaded {n} docs x {dim} dims, {queries.shape[0]} queries in {time.time() - t0:.1f}s", file=sys.stderr)
 
-    # Each representation: (name, bytes/vector, doc matrix, query transform, per-doc scale or None).
-    reps = []
-    codes, scale = int8_codes(docs)
-    reps.append(("int8", dim + 4, codes.astype(np.float32), lambda q: q, scale.ravel()))
-    del codes
-    bits = sign_pm1(docs)
-    reps.append(("bin", dim // 8, bits, sign_pm1, None))
-    reps.append(("bin-asym", dim // 8, bits, lambda q: q, None))
-    for d in truncs:
-        td = unit(docs[:, :d])
-        reps.append((f"trunc{d}", 4 * d, td, lambda q, d=d: unit(q[:, :d]), None))
-        reps.append((f"trunc{d}-bin", d // 8, sign_pm1(td), lambda q, d=d: sign_pm1(q[:, :d]), None))
+    search_names = parse_names(args.search) or (
+        ["int8", "bin", "bin-asym"] + [f"trunc{d}{e}" for d in truncs for e in ("", "-bin")]
+    )
+    rescore_names = parse_names(args.rescore)
+    for name in rescore_names:
+        if name.endswith("bin") or name.endswith("bin-asym"):
+            raise SystemExit(f"--rescore {name}: sign bits are a search representation, not a rescore store")
+    reps = {}
+    for name in dict.fromkeys(search_names + rescore_names):
+        if name == "full":
+            continue
+        rep = make_rep(name, docs)
+        if rep is None:
+            raise SystemExit(f"unknown representation or prefix not < {dim}: {name}")
+        reps[name] = rep
+    reps["full"] = make_rep("full", docs)
 
-    hits = {name: {c: {r: 0 for r in shortlists} for c in seg_counts} for name, *_ in reps}
+    def hits_table():
+        return {s: {c: {r: 0 for r in shortlists} for c in seg_counts} for s in search_names}
+
+    hits = {r: hits_table() for r in rescore_names}
     total = 0
     for s in range(0, queries.shape[0], args.batch):
         q = queries[s : s + args.batch]
-        exact = q @ docs.T
+        exact = scores(reps["full"], q)
         truth = topk_idx(exact, k)
-        for name, _, mat, qf, sc in reps:
-            approx = qf(q) @ mat.T
-            if sc is not None:
-                approx *= sc[None, :]
+        resc_scores = {r: exact if r == "full" else scores(reps[r], q) for r in rescore_names}
+        for name in search_names:
+            approx = exact if name == "full" else scores(reps[name], q)
             for segs in seg_counts:
                 b = bounds[segs]
                 # Per shard, best-first, so a prefix is that shard's top-R.
                 shard_short = [topk_idx(approx[:, b[i] : b[i + 1]], rmax) + b[i] for i in range(segs)]
                 for r in shortlists:
                     cand = np.concatenate([sh[:, :r] for sh in shard_short], axis=1)
-                    # Rescore the union of the shortlists with the exact full-dim score.
-                    resc = np.take_along_axis(exact, cand, axis=1)
                     kk = min(k, cand.shape[1])
-                    best = np.take_along_axis(cand, np.argsort(-resc, axis=1)[:, :kk], axis=1)
-                    for row in range(q.shape[0]):
-                        hits[name][segs][r] += len(set(best[row].tolist()) & set(truth[row].tolist()))
+                    for rname, rs in resc_scores.items():
+                        # Rescore the union of the shortlists with the rescore store's score.
+                        resc = np.take_along_axis(rs, cand, axis=1)
+                        best = np.take_along_axis(cand, np.argsort(-resc, axis=1)[:, :kk], axis=1)
+                        found = (best[:, :, None] == truth[:, None, :]).any(axis=2)
+                        hits[rname][name][segs][r] += int(found.sum())
         total += q.shape[0] * k
         print(f"  {s + q.shape[0]}/{queries.shape[0]} queries ({time.time() - t0:.0f}s)", file=sys.stderr)
+
+    def entry(name, rname):
+        b = reps[name][0]
+        rb = reps[rname][0]
+        e = {
+            "name": name,
+            "bytes_per_vector": b,
+            "size_vs_f32": round(4 * dim / b, 2),
+            "total_bytes_per_doc": b + rb,
+            "total_vs_today": round(8 * dim / (b + rb), 2),
+            # Keyed by shard count, then by R (per shard).
+            "recall_at_k_after_rescore": {
+                str(c): {str(r): round(hits[rname][name][c][r] / total, 4) for r in shortlists} for c in seg_counts
+            },
+        }
+        if rname != "full":
+            e["rescore"] = rname
+            e["rescore_bytes_per_vector"] = rb
+        return e
 
     result = {
         "docs": n,
@@ -210,32 +312,30 @@ def main(argv=None):
             "brute-force over an in-memory sample; not a bound on Kosha recall. "
             "R is per shard when segments > 1 (Kosha rescores k*rescore_factor per segment); "
             "bytes_per_vector is the search representation only, "
-            "total_bytes_per_doc adds the 4*dim f32 rescore store"
+            "total_bytes_per_doc adds the rescore store (4*dim f32 unless two_stage)"
         ),
-        "representations": [
-            {
-                "name": name,
-                "bytes_per_vector": b,
-                "size_vs_f32": round(4 * dim / b, 2),
-                "total_bytes_per_doc": b + 4 * dim,
-                "total_vs_today": round(8 * dim / (b + 4 * dim), 2),
-                # Keyed by shard count, then by R (per shard).
-                "recall_at_k_after_rescore": {
-                    str(c): {str(r): round(hits[name][c][r] / total, 4) for r in shortlists} for c in seg_counts
-                },
-            }
-            for name, b, *_ in reps
-        ],
+        "representations": [entry(name, "full") for name in search_names] if "full" in rescore_names else [],
+        "two_stage": [entry(name, r) for r in rescore_names if r != "full" for name in search_names],
     }
-    print(f"recall@{k} after full-dim rescore; {n} docs, {queries.shape[0]} queries, dim {dim}")
-    print("B/vec = search repr only; total x = vs today's 4*D vector.idx + 4*D doc_vectors.bin")
-    for c in seg_counts:
-        scope = "one global top-R" if c == 1 else f"{c} shards of ~{n // c} docs, top-R per shard"
-        print(f"segments={c} ({scope})")
-        print(f"{'repr':<14}{'B/vec':>7}{'x smaller':>10}{'total x':>9}" + "".join(f"{'R=' + str(r):>9}" for r in shortlists))
-        for rep in result["representations"]:
-            cells = "".join(f"{rep['recall_at_k_after_rescore'][str(c)][str(r)]:>9.4f}" for r in shortlists)
-            print(f"{rep['name']:<14}{rep['bytes_per_vector']:>7}{rep['size_vs_f32']:>10}{rep['total_vs_today']:>9}{cells}")
+    print(f"recall@{k} vs exact full-dim top-{k}; {n} docs, {queries.shape[0]} queries, dim {dim}")
+    print(f"B/vec = search repr only; total x = vs today's {4 * dim} B vector.idx + {4 * dim} B doc_vectors.bin")
+    groups = [("full", result["representations"])] if result["representations"] else []
+    groups += [(r, [e for e in result["two_stage"] if e["rescore"] == r]) for r in rescore_names if r != "full"]
+    for rname, rows in groups:
+        print(f"rescore store: {rname} ({reps[rname][0]} B/vec)")
+        for c in seg_counts:
+            scope = "one global top-R" if c == 1 else f"{c} shards of ~{n // c} docs, top-R per shard"
+            print(f"segments={c} ({scope})")
+            print(
+                f"{'repr':<14}{'B/vec':>7}{'x smaller':>10}{'total x':>9}"
+                + "".join(f"{'R=' + str(r):>9}" for r in shortlists)
+            )
+            for rep in rows:
+                cells = "".join(f"{rep['recall_at_k_after_rescore'][str(c)][str(r)]:>9.4f}" for r in shortlists)
+                print(
+                    f"{rep['name']:<14}{rep['bytes_per_vector']:>7}{rep['size_vs_f32']:>10}"
+                    f"{rep['total_vs_today']:>9}{cells}"
+                )
     if args.out:
         with open(args.out, "w") as f:
             json.dump(result, f, indent=2)

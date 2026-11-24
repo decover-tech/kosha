@@ -554,7 +554,11 @@ mod scoped_keys {
             status(port, "POST", "/flush", &docs_only, namespace("other")),
             403
         );
-        assert_eq!(status(port, "GET", "/v1/namespaces", &docs_only, None), 403);
+        let (code, listed) = call(port, "GET", "/v1/namespaces", &docs_only, None);
+        assert_eq!(code, 200, "{listed}");
+        let namespaces = listed["namespaces"].as_array().expect("namespaces array");
+        assert_eq!(namespaces.len(), 1, "{listed}");
+        assert_eq!(namespaces[0]["name"], "docs", "{listed}");
 
         // A tenant's own usage and billing are `read` routes (#426). Both
         // features are off on this pod, so a key that may read is answered

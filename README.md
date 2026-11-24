@@ -27,6 +27,16 @@ latency guarantees and the limits Kosha enforces.
 | Go SDK (preview) | `github.com/decover-tech/kosha/clients/go` ([clients/go](clients/go)) | `go get github.com/decover-tech/kosha/clients/go` |
 | CLI | not published to crates.io yet | `cargo install --path crates/kosha-cli` |
 
+### Deployment model
+
+Kosha runs as a **multi-tenant SaaS**: shared cells deployed with
+[`k8s/saas`](k8s/saas), customers onboarded as organizations through the
+control-plane APIs. See [docs/deployment-model.md](docs/deployment-model.md) and
+[k8s/README.md](k8s/README.md#multi-tenant-saas-cells) for installing, upgrading
+(`scripts/kosha_cluster.py upgrade` enforces the manifest/WAL upgrade order in
+"S3 WAL" below) and checking the health of a cell. A standalone single-customer
+stack still installs from `k8s/base`.
+
 ## Supported features
 
 ### Query
@@ -399,11 +409,11 @@ own document, or combine the two values into one leaf (`"name_org": "Ada|beta"`)
 - Backpressure controls: max concurrent searches, search queue depth and timeout, hydration concurrency, admission timeout.
 - `GET /healthz` (liveness), `GET /readyz` (readiness), `GET /v1/stats` and per-namespace stats.
 - `GET /metrics` in Prometheus text format: search outcomes and latency histograms, queue depth, cache bytes, hydrations and lease outcomes, degraded kNN segments. Unauthenticated by default (`KOSHA_METRICS_AUTH=admin` to require the admin key, `KOSHA_METRICS=off` to disable). See [docs/metrics.md](docs/metrics.md).
-- A built-in read-only dashboard at `/dashboard` (#214), off by default (`KOSHA_DASHBOARD=on`): the tenant's namespaces, per-namespace detail with a recent-latency sparkline, and a query console that shows hits, scores and the timing breakdown and flags `knn_degraded_segments` in red. It calls the normal API with the key pasted into the page. See [docs/dashboard.md](docs/dashboard.md).
+- A built-in read-only dashboard at `/dashboard` (#214), off by default (`KOSHA_DASHBOARD=on`): the tenant's namespaces, per-namespace detail with a recent-latency sparkline, the tenant's metered usage, and a query console that shows hits, scores and the timing breakdown and flags `knn_degraded_segments` in red. It calls the normal API with the key pasted into the page. See [docs/dashboard.md](docs/dashboard.md).
 - A self-service console (#345), off by default (`KOSHA_CONSOLE=enabled`): sign-up with email verification (`KOSHA_SIGNUP=enabled`), password login and reset, Google and GitHub sign-in, per-organization OIDC single sign-on, and a web UI at `/console` for organizations, members and invites, projects, tenants, API keys (shown once), namespaces with document counts and sizes, usage, plan, the audit log and SSO settings. Sessions are cookies that authenticate the console only; the data plane keeps using API keys. SAML is not supported yet. See [docs/organizations.md](docs/organizations.md#self-service-console).
 - Admin endpoints: create API key, rebuild filter blooms, backfill offset tables, compact a namespace (sync or async), compaction job and scheduler status, warmup status, import a namespace.
 - Schema migrations via `kosha-server migrate`.
-- Usage metering per tenant and namespace (#348), off by default (`KOSHA_USAGE_METERING=on`): searches, bytes returned and fetched, bytes and documents written, and an hourly stored-bytes snapshot, as idempotent raw events in `kosha.usage_events` (migration 005), read back with `GET /v1/usage`. See "Usage metering" in [docs/configuration.md](docs/configuration.md).
+- Usage metering per tenant and namespace (#348), off by default (`KOSHA_USAGE_METERING=on`): searches, bytes returned and fetched, bytes, documents and vector dimensions written, and an hourly snapshot of stored bytes and stored vector dimensions, as idempotent raw events in `kosha.usage_events` (migration 005), read back with `GET /v1/usage` and on the dashboard's Usage page. See "Usage metering" in [docs/configuration.md](docs/configuration.md).
 - Usage reconciliation (#348): `GET /v1/admin/usage/reconcile` and the one-shot `kosha-server reconcile-usage` compare each namespace's stored-bytes snapshot with the objects under its storage prefix (listings only), separate what the manifest references from retired, untracked and stray objects, and flag storage without snapshots and snapshots without storage, deleted namespaces included. The command prints JSON and exits non-zero when a namespace is out of tolerance; `k8s/base/cronjob-usage-reconcile.yaml` runs it daily, shipped suspended. See "Reconciling stored bytes with object storage" in [docs/configuration.md](docs/configuration.md).
 - Billing (#349), off by default (`KOSHA_BILLING=on`): free, usage-based and enterprise plans from a JSON catalog, a monthly job that rates usage into invoices (`kosha.billing_accounts`, `kosha.billing_invoices`, migration 007), free-tier limits and non-payment restrictions (read-only, then suspended) enforced with `402`, and an optional Stripe provider. See "Billing" in [docs/configuration.md](docs/configuration.md).
   Second part: signed Stripe webhooks (idempotent, polling `sync` kept as fallback), self-service
@@ -610,6 +620,21 @@ namespace, explicitly or by writing to it, starts it empty.
 With `KOSHA_NAMESPACE_DELETE_CONFIRM=on` (off by default, so existing callers
 keep working) the request must name the namespace again:
 `DELETE /v1/namespaces/docs?confirm=docs`; anything else is a 400.
+
+**S3 erasure.** Deletion aborts unfinished multipart uploads and permanently
+removes all object versions and delete markers under the namespace's S3
+prefix. It checks again for versions, markers, and uploads before reporting
+storage reclaimed. The S3 role needs `s3:ListBucketVersions`,
+`s3:DeleteObjectVersion`, `s3:ListBucketMultipartUploads`, and
+`s3:AbortMultipartUpload`. If multipart listing is denied, versions and
+markers are still removed, but the deletion record stays pending and the
+response reports `storage_reclaimed: false`.
+
+With a custom S3 endpoint, multipart listing scans the bucket and filters
+keys by the namespace prefix. Some MinIO versions only expose uploads known
+to the running server in this listing, so it cannot verify erasure of uploads
+left by an earlier MinIO process. Hard delete does not purge versioned S3 WAL
+objects under the separate `_wal/{writer_id}/` prefix.
 
 **Cached copies on every pod.** With `KOSHA_DELETION_PURGE_INTERVAL_MS` set
 (off by default), each pod of any role reads the deletion records it has not
@@ -1118,6 +1143,13 @@ transaction as the change, naming the admin credential that did it
 (`operator` or `operator:<name>`); see
 [docs/organizations.md](docs/organizations.md#audit-log). `last_used_at` is
 written about once per refresh interval, not per request.
+
+A revocation reaches the other pods only on their next successful key
+refresh. A pod that cannot reach Postgres keeps the keys it last loaded (and
+logs `api keys: refresh failed, keeping previous snapshot`), so a tenant key
+revoked during the outage keeps working on that pod until a refresh succeeds.
+Operator credentials are different: after ten failed intervals the pod
+refuses all of them until it can refresh.
 
 **A tenant managing its own keys.** A key with the `admin` scope can list,
 create, rotate and revoke its own tenant's registry keys without an operator

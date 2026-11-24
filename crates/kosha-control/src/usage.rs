@@ -38,6 +38,10 @@ pub mod meter {
     pub const BYTES_WRITTEN: &str = "bytes_written";
     /// Documents in an accepted write.
     pub const DOCUMENTS_WRITTEN: &str = "documents_written";
+    /// Vector dimensions in an accepted write: each flat vector's
+    /// dimension, plus dimension x tokens of each late-interaction bag,
+    /// counted after server-side embedding.
+    pub const VECTOR_DIMENSIONS_WRITTEN: &str = "vector_dimensions_written";
     /// Bytes of the objects of every segment the namespace's manifest
     /// references (segments a branch inherits are counted on the namespace
     /// that owns them). A gauge: one event per namespace per hour, with a
@@ -152,6 +156,7 @@ pub struct NamespaceUsage {
     pub stored_snapshots: u64,
     /// The latest snapshot in the window, if any.
     pub stored_bytes_latest: Option<u64>,
+    pub vector_dimensions_written: u64,
     pub documents_deleted: u64,
     pub bytes_deleted: u64,
     /// Sum of the hourly `vector_dimensions` snapshots in the window:
@@ -184,6 +189,9 @@ impl NamespaceUsage {
             self.stored_bytes_latest =
                 Some(self.stored_bytes_latest.unwrap_or(0).saturating_add(latest));
         }
+        self.vector_dimensions_written = self
+            .vector_dimensions_written
+            .saturating_add(other.vector_dimensions_written);
         self.documents_deleted = self
             .documents_deleted
             .saturating_add(other.documents_deleted);
@@ -245,6 +253,9 @@ pub fn summarize(buckets: &[UsageBucket], carry_in: &[UsageGauge]) -> Vec<Namesp
                 usage.stored_byte_hours = usage.stored_byte_hours.saturating_add(q);
                 usage.stored_snapshots += 1;
                 acc.hours.entry(bucket.hour_start_ms).or_default().stored = Some(q);
+            }
+            meter::VECTOR_DIMENSIONS_WRITTEN => {
+                usage.vector_dimensions_written = usage.vector_dimensions_written.saturating_add(q)
             }
             meter::DOCUMENTS_DELETED => {
                 usage.documents_deleted = usage.documents_deleted.saturating_add(q)
@@ -789,6 +800,34 @@ mod tests {
         assert_eq!(total.other.get("gpu_ms"), Some(&7));
         assert_eq!(total.stored_bytes_latest, Some(11));
         assert_eq!(total.stored_byte_hours, 11);
+    }
+
+    #[test]
+    fn vector_dimensions_written_are_summed() {
+        let store = MemoryUsageStore::new();
+        store
+            .record(&[
+                event("w1", "docs", 10, &[(meter::VECTOR_DIMENSIONS_WRITTEN, 768)]),
+                event(
+                    "w2",
+                    "docs",
+                    H + 10,
+                    &[(meter::VECTOR_DIMENSIONS_WRITTEN, 384)],
+                ),
+                event("w3", "logs", 10, &[(meter::VECTOR_DIMENSIONS_WRITTEN, 4)]),
+                // Before the meter: no vector field at all.
+                event("w4", "old", 10, &[(meter::DOCUMENTS_WRITTEN, 1)]),
+            ])
+            .unwrap();
+        let usage = usage_summary(&store, None, 0, 2 * H).unwrap();
+        assert_eq!(usage[0].vector_dimensions_written, 1_152);
+        assert_eq!(usage[2].vector_dimensions_written, 0);
+        let mut total = NamespaceUsage::default();
+        for namespace in &usage {
+            total.add(namespace);
+        }
+        assert_eq!(total.vector_dimensions_written, 1_156);
+        assert!(total.other.is_empty(), "{:?}", total.other);
     }
 
     #[test]

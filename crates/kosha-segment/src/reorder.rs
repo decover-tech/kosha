@@ -36,10 +36,16 @@ pub enum DocReorder {
     Off,
     /// Recursive graph bisection over the documents' analyzed terms.
     Bp,
+    /// Posting order of one vector column (#456, research): documents are
+    /// numbered posting by posting, so each posting of that column covers
+    /// one contiguous `doc_seq` range. See
+    /// [`crate::SegmentWriter::posting_order`]. Builder only
+    /// (`kosha-build-segments`); compaction keeps input order.
+    Posting,
 }
 
 impl DocReorder {
-    /// `KOSHA_DOC_REORDER` (`off` | `bp`), read once. Unset or unknown is
+    /// `KOSHA_DOC_REORDER` (`off` | `bp` | `posting`), read once. Unset or unknown is
     /// `off`.
     pub fn from_env() -> Self {
         static MODE: OnceLock<DocReorder> = OnceLock::new();
@@ -50,8 +56,9 @@ impl DocReorder {
         match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
             None | Some("") | Some("off") | Some("none") | Some("0") | Some("false") => Self::Off,
             Some("bp") => Self::Bp,
+            Some("posting") => Self::Posting,
             Some(other) => {
-                eprintln!("WARN: KOSHA_DOC_REORDER={other} not off|bp — using off");
+                eprintln!("WARN: KOSHA_DOC_REORDER={other} not off|bp|posting — using off");
                 Self::Off
             }
         }
@@ -61,6 +68,7 @@ impl DocReorder {
         match self {
             Self::Off => "off",
             Self::Bp => "bp",
+            Self::Posting => "posting",
         }
     }
 }
@@ -187,6 +195,22 @@ impl ForwardIndex {
     pub fn bp_order(self, config: &BpConfig) -> Vec<u32> {
         let num_terms = self.num_terms();
         bp_order(self.docs, num_terms, config)
+    }
+}
+
+/// The number of maximal contiguous `doc_seq` runs in `doc_seqs` once
+/// sorted: 1 when a posting's members are exactly one range
+/// `base..base + len` (what [`DocReorder::Posting`] aims for), up to
+/// `len` when they are scattered. This is also the number of ranged
+/// `doc_vectors.bin` reads it takes to rescore every member (#456).
+/// Duplicates count once; empty input is 0 runs.
+pub fn doc_seq_runs(doc_seqs: &[u32]) -> usize {
+    let mut sorted = doc_seqs.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    match sorted.first() {
+        None => 0,
+        Some(_) => 1 + sorted.windows(2).filter(|w| w[1] != w[0] + 1).count(),
     }
 }
 
@@ -387,6 +411,22 @@ fn partition(ctx: &Ctx<'_>, part: &mut [u32], left_deg: &mut [u32], right_deg: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doc_seq_runs_counts_contiguous_ranges() {
+        assert_eq!(doc_seq_runs(&[]), 0);
+        assert_eq!(doc_seq_runs(&[7]), 1);
+        assert_eq!(doc_seq_runs(&[5, 3, 4, 6]), 1);
+        assert_eq!(doc_seq_runs(&[1, 2, 4, 5, 9]), 3);
+        assert_eq!(doc_seq_runs(&[2, 2, 3]), 1);
+    }
+
+    #[test]
+    fn parse_posting() {
+        assert_eq!(DocReorder::parse(Some("posting")), DocReorder::Posting);
+        assert_eq!(DocReorder::parse(Some(" Posting ")), DocReorder::Posting);
+        assert_eq!(DocReorder::Posting.as_str(), "posting");
+    }
 
     #[test]
     fn parse_defaults_off() {

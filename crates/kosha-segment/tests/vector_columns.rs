@@ -146,6 +146,8 @@ fn single_column_segment_is_byte_identical_to_the_pre_columns_writer() {
                 offsets: true,
                 quantization: Default::default(),
                 embedding_model: None,
+                knn_segment_centroid: None,
+                radius_reference: None,
             }])
         );
         let expected = files(&fixture(name));
