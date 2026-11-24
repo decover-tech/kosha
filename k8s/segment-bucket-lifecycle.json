@@ -1,0 +1,11 @@
+{
+  "Rules": [
+    {
+      "ID": "kosha-retain-noncurrent-versions",
+      "Status": "Enabled",
+      "Filter": {},
+      "NoncurrentVersionExpiration": { "NoncurrentDays": 40 },
+      "Expiration": { "ExpiredObjectDeleteMarker": true }
+    }
+  ]
+}
