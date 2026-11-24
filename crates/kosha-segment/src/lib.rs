@@ -7189,19 +7189,38 @@ pub fn vector_centroid_code_bytes(offsets_path: &Path) -> u64 {
     if !knn_plan_i8_from_env() {
         return 0;
     }
+    unit_norm_offsets_shape(offsets_path).map_or(0, |(dim, postings)| {
+        postings.saturating_mul(dim + CENTROID_CODE_ROW_OVERHEAD as u64)
+    })
+}
+
+/// Resident bytes of the [`CentroidCap`] a segment open builds for the
+/// vector column whose `vector.offsets` sidecar is at `offsets_path`: its
+/// `f64` centre, or zero when the column is not unit-norm or has no
+/// readable sidecar header. Derived at load like the centroid codes, so
+/// `approx_segment_bytes` adds it too. A unit-norm column whose centroids
+/// give no cap is still charged, the conservative direction.
+pub fn vector_centroid_cap_bytes(offsets_path: &Path) -> u64 {
+    unit_norm_offsets_shape(offsets_path).map_or(0, |(dim, _)| {
+        dim.saturating_mul(std::mem::size_of::<f64>() as u64)
+    })
+}
+
+/// `(dim, postings)` from the header of a unit-norm column's
+/// `vector.offsets` sidecar; `None` for any other column or an unreadable
+/// header. Only the 16-byte header is read.
+fn unit_norm_offsets_shape(offsets_path: &Path) -> Option<(u64, u64)> {
     let mut header = [0u8; VECTOR_OFFSETS_HEADER_LEN];
     let read = fs::File::open(offsets_path).and_then(|mut f| f.read_exact(&mut header));
     if read.is_err() || header[0..4] != VECTOR_OFFSETS_MAGIC.to_le_bytes() {
-        return 0;
+        return None;
     }
     let mut cursor = &header[4..];
     let version = read_u32_le(&mut cursor);
     let dim = read_u32_le(&mut cursor) as u64;
     let postings = read_u32_le(&mut cursor) as u64;
-    if !is_known_vector_index_version(version) || !is_unit_norm_vector_index_version(version) {
-        return 0;
-    }
-    postings.saturating_mul(dim + CENTROID_CODE_ROW_OVERHEAD as u64)
+    (is_known_vector_index_version(version) && is_unit_norm_vector_index_version(version))
+        .then_some((dim, postings))
 }
 
 /// `KOSHA_KNN_PLAN_I8` (default on): `0`, `false` or `off` turns off the

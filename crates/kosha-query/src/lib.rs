@@ -1168,12 +1168,14 @@ pub fn approx_segment_bytes(seg_dir: &std::path::Path, load_vectors: bool) -> u6
             let offsets_file = kosha_core::vector_offsets_file(slot);
             let vec_offsets = size(&offsets_file);
             total = total.saturating_add(if vec_offsets > 0 {
-                // Plus the i8 centroid codes the open derives from the
-                // sidecar (two-stage kNN planning): resident like the
-                // centroids, but in no file, so no size above covers them.
-                vec_offsets.saturating_add(kosha_segment::vector_centroid_code_bytes(
-                    &seg_dir.join(&offsets_file),
-                ))
+                // Plus the i8 centroid codes (two-stage kNN planning) and
+                // the centroid cap (segment pruning) the open derives from
+                // the sidecar: resident like the centroids, but in no file,
+                // so no size above covers them.
+                let offsets_path = seg_dir.join(&offsets_file);
+                vec_offsets
+                    .saturating_add(kosha_segment::vector_centroid_code_bytes(&offsets_path))
+                    .saturating_add(kosha_segment::vector_centroid_cap_bytes(&offsets_path))
             } else {
                 size(&kosha_core::vector_idx_file(slot))
             });
@@ -12389,11 +12391,13 @@ mod tests {
                     .map(|f| on_disk(d, f))
                     .sum::<u64>();
             if load_vectors {
-                // The sidecar's centroids, and the i8 codes of them that
-                // the open derives (resident, but in no file; their size
-                // is checked against a loaded column in kosha-segment).
+                // The sidecar's centroids, and the i8 codes and centroid
+                // cap the open derives from them (resident, but in no file;
+                // their sizes are checked against a loaded column in
+                // kosha-segment).
                 t += on_disk(d, "vector.offsets")
-                    + kosha_segment::vector_centroid_code_bytes(&d.join("vector.offsets"));
+                    + kosha_segment::vector_centroid_code_bytes(&d.join("vector.offsets"))
+                    + kosha_segment::vector_centroid_cap_bytes(&d.join("vector.offsets"));
             }
             t
         };
