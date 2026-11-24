@@ -66,7 +66,20 @@ impl Snapshot {
     /// B-tree slots and node overhead. The snapshot itself is inline.
     pub fn estimated_heap_bytes(&self) -> usize {
         fn tree<K, V>(map: &BTreeMap<K, V>) -> usize {
-            map.len() * (2 * size_of::<(K, V)>() + 64)
+            // std's BTreeMap nodes allocate all 11 key/value slots up front.
+            // Non-root nodes hold at least five entries. Internal nodes also
+            // allocate 12 child pointers and have at least six children below the root.
+            const NODE_SLOTS: usize = 11;
+            const MIN_NON_ROOT_ENTRIES: usize = 5;
+            const NODE_OVERHEAD: usize = 64;
+            if map.is_empty() {
+                return 0;
+            }
+            let nodes = 1 + (map.len() - 1) / MIN_NON_ROOT_ENTRIES;
+            let internal = (nodes + 3) / (MIN_NON_ROOT_ENTRIES + 1);
+            let nodes = if internal == 0 { 1 } else { nodes };
+            nodes * (NODE_SLOTS * size_of::<(K, V)>() + NODE_OVERHEAD)
+                + internal * (NODE_SLOTS + 1) * size_of::<usize>()
         }
 
         let directory = &self.directory;
@@ -370,6 +383,27 @@ mod tests {
                 unit_norm: true,
             }],
         }
+    }
+
+    #[test]
+    fn snapshot_heap_estimate_counts_small_segment_map_allocations() {
+        let mut snapshot = Snapshot {
+            version: 1,
+            directory: Directory::default(),
+        };
+        let segments = 100;
+        for i in 0..segments {
+            snapshot.directory.insert_segment(&i.to_string(), Vec::new());
+        }
+        let without_vectors = snapshot.estimated_heap_bytes();
+        for i in 0..segments {
+            snapshot
+                .directory
+                .insert_segment(&i.to_string(), vec![column(1.0, 0.0)]);
+        }
+        let segment_map_slots =
+            11 * (size_of::<(String, Vec<u8>)>() + size_of::<(String, usize)>());
+        assert!(snapshot.estimated_heap_bytes() >= without_vectors + segments * segment_map_slots);
     }
 
     #[test]
