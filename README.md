@@ -98,7 +98,9 @@ and uses the usual capped `gte` relation unless exact counting is requested.
 To page in score-descending, ID-ascending order, use `from` / `max_results`
 or pass the last hit's `[score, doc_id]` as strings in `search_after`, keeping
 the retrievers, weights, and window unchanged. Cursor paging assumes an
-unchanged namespace snapshot. This variant does not use the response cache.
+unchanged namespace snapshot. Explicitly sorting by `_id asc` instead
+uses a one-value `[doc_id]` cursor, as the Go and TypeScript iterators do
+by default. This variant does not use the response cache.
 
 To rerank the fused top `top_n`, add the regular `rerank` object with an
 explicit `rerank.query` and page with `from` / `max_results`. The default

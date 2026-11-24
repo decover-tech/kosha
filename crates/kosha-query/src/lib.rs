@@ -7580,16 +7580,25 @@ impl Searcher {
                 false,
             );
             let mut ranked: Vec<_> = fused.into_values().collect();
+            let sort_by_id = query.multi_rrf_sorts_by_id();
             ranked.sort_unstable_by(|a, b| {
-                b.score
-                    .total_cmp(&a.score)
-                    .then_with(|| a.doc_id.0.cmp(&b.doc_id.0))
+                if sort_by_id {
+                    a.doc_id.0.cmp(&b.doc_id.0)
+                } else {
+                    b.score
+                        .total_cmp(&a.score)
+                        .then_with(|| a.doc_id.0.cmp(&b.doc_id.0))
+                }
             });
             let start = if let Some(after) = &query.search_after {
-                let score: f64 = after[0].parse().expect("validated RRF cursor score");
-                ranked.partition_point(|hit| {
-                    hit.score > score || (hit.score == score && hit.doc_id.0 <= after[1])
-                })
+                if sort_by_id {
+                    ranked.partition_point(|hit| hit.doc_id.0 <= after[0])
+                } else {
+                    let score: f64 = after[0].parse().expect("validated RRF cursor score");
+                    ranked.partition_point(|hit| {
+                        hit.score > score || (hit.score == score && hit.doc_id.0 <= after[1])
+                    })
+                }
             } else {
                 query.from
             };

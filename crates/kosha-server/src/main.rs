@@ -16371,6 +16371,15 @@ mod tests {
         assert_eq!(paged, ids(&full));
         assert!(search(&body).results.is_empty());
 
+        let mut by_id = body.clone();
+        by_id["sort"] = serde_json::json!([{"_id": {"order": "asc"}}]);
+        by_id.as_object_mut().unwrap().remove("search_after");
+        for id in ["a", "b", "c", "d"] {
+            assert_eq!(ids(&search(&by_id)), [id]);
+            by_id["search_after"] = serde_json::json!([id]);
+        }
+        assert!(search(&by_id).results.is_empty());
+
         body.as_object_mut().unwrap().remove("search_after");
         body["exact_total_hits"] = serde_json::json!(true);
         body["source_includes"] = serde_json::json!(["tag"]);

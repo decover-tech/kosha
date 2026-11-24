@@ -3821,13 +3821,18 @@ impl SearchQuery {
         {
             return Err(invalid("cannot be combined with outer retrievers, rank, mode, collapse, limit_per, highlight or aggs"));
         }
-        if !sort_is_by_score(&self.sort) {
+        let sort_by_id = self.multi_rrf_sorts_by_id();
+        if !sort_by_id && !sort_is_by_score(&self.sort) {
             return Err(invalid(
-                "only sorts by _score descending, then _id ascending",
+                "only sorts by _score descending then _id ascending, or by _id ascending alone",
             ));
         }
         if let Some(after) = &self.search_after {
-            if !matches!(after.as_slice(), [score, _] if score.parse::<f64>().is_ok_and(f64::is_finite))
+            if sort_by_id {
+                if after.len() != 1 {
+                    return Err(invalid("ID-only search_after requires [document ID]"));
+                }
+            } else if !matches!(after.as_slice(), [score, _] if score.parse::<f64>().is_ok_and(f64::is_finite))
             {
                 return Err(invalid("search_after requires [score, document ID]"));
             }
@@ -3844,6 +3849,11 @@ impl SearchQuery {
                 .map_err(|err| invalid(&format!("queries[{i}]: {err}")))?;
         }
         Ok(())
+    }
+
+    pub fn multi_rrf_sorts_by_id(&self) -> bool {
+        matches!(self.sort.as_slice(), [spec] if spec.fields.len() == 1
+            && spec.fields.get("_id").is_some_and(|order| order.order == "asc"))
     }
 
     /// Request-level checks that do not need any segment: currently the
