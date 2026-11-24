@@ -145,6 +145,7 @@ struct AppState {
     /// `KOSHA_COMPACTION_ON_INGEST` (#254): whether a writer pod also runs
     /// the compaction scheduler.
     compaction_on_ingest: bool,
+    namespace_centroids_enabled: bool,
     admin_auth_key: Option<String>,
     /// Organizations, users, projects and the audit log (#345), served
     /// under `/v1/admin/users` and `/v1/admin/orgs`.
@@ -1011,15 +1012,41 @@ fn exact_knn_wants_doc_vectors_header(footer: Option<&kosha_core::Footer>, field
 /// `None` without kNN.
 #[cfg_attr(not(feature = "s3"), allow(dead_code))]
 fn knn_verdict_key(query: &SearchQuery) -> Option<String> {
-    query.knn.as_ref().map(|knn| {
-        if knn.is_late_interaction() {
-            format!("late_interaction:{}", knn.field)
-        } else if query.needs_filter_columns() {
-            format!("filtered:{}", knn.field)
+    if let Some(field) = single_vector_knn_field(query) {
+        return Some(if query.needs_filter_columns() {
+            format!("filtered:{field}")
         } else {
-            knn.field.clone()
-        }
-    })
+            field.to_string()
+        });
+    }
+    late_interaction_knn_field(query).map(|field| format!("late_interaction:{field}"))
+}
+
+/// The single-vector column a search scores against: `knn.field` of a
+/// cosine kNN. Only then does its hydration pass fetch vector-column files
+/// (`vector[.n].idx`, `vector[.n].offsets`, a legacy footer's
+/// `doc_vectors.bin`). `None` for a query without kNN, and for late
+/// interaction (#205) — hybrid or not — which reads the field's multivec
+/// files instead (see [`late_interaction_knn_field`]). Mirrors the
+/// searcher's [`kosha_query::query_reads_vector_columns`], which opens such
+/// a query's segments without their vector columns.
+fn single_vector_knn_field(query: &SearchQuery) -> Option<&str> {
+    query
+        .knn
+        .as_ref()
+        .filter(|_| kosha_query::query_reads_vector_columns(query))
+        .map(|knn| knn.field.as_str())
+}
+
+/// The late-interaction field (#205) a search scores against, whose
+/// `multivec.{i}.bags` / `.ivf` its hydration pass fetches. `None` unless
+/// the query's kNN is scored with late interaction.
+fn late_interaction_knn_field(query: &SearchQuery) -> Option<&str> {
+    query
+        .knn
+        .as_ref()
+        .filter(|knn| knn.is_late_interaction())
+        .map(|knn| knn.field.as_str())
 }
 
 /// Filter column names a query reads (`SearchQuery::filter_column_fields`).
@@ -1746,6 +1773,12 @@ impl AppState {
             segment_live_max_bytes,
             admission_timeout,
         );
+        #[cfg(feature = "s3")]
+        let searcher = if let Some(s3) = &s3_storage {
+            searcher.with_namespace_centroid_source(s3.namespace_centroid_source())
+        } else {
+            searcher
+        };
 
         // ── Control plane: in-memory or Postgres ─────────────────────────
         #[cfg_attr(not(feature = "postgres"), allow(unused_mut))]
@@ -2154,6 +2187,7 @@ impl AppState {
             role,
             writer_leases,
             compaction_on_ingest,
+            namespace_centroids_enabled: kosha_segment::namespace_centroids::enabled(),
             // `None` when `KOSHA_ADMIN_BOOTSTRAP_KEY` switches it off (#346).
             admin_auth_key: auth::bootstrap_admin_key(),
             orgs: org_admin::OrgBackend::from_env(),
@@ -2684,6 +2718,7 @@ impl AppState {
                 synced.insert(synced_key(&remote, ns, &entry.segment_id));
             }
         }
+        self.maintain_namespace_centroids(ns, &remote);
         self.indexer.restore_manifest(ns.clone(), remote);
         Ok(())
     }
@@ -3316,6 +3351,7 @@ impl AppState {
                 synced.insert(synced_key(&manifest, ns, &entry.segment_id));
             }
         }
+        self.maintain_namespace_centroids(ns, &manifest);
         self.indexer.restore_manifest(ns.clone(), manifest);
         Ok(())
     }
@@ -3572,6 +3608,7 @@ impl AppState {
                     // acknowledged locally (WAL not reclaimed).
                     fail::fail_point!("publish.after_cas_before_ack");
                     self.indexer.acknowledge_manifest(ns, &manifest)?;
+                    self.maintain_namespace_centroids(ns, &manifest);
                     println!(
                         "manifest published: ns={} version={} segments={} ms={:.1}",
                         ns.0,
@@ -3618,6 +3655,51 @@ impl AppState {
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    fn bootstrap_namespace_centroids(&self) {
+        for ns in self.indexer.namespaces() {
+            let lock = self.publication_lock(&ns);
+            let _guard = lock.lock().unwrap();
+            if let Some((published, manifest)) = self.indexer.publication_snapshot(&ns) {
+                if published == manifest.version && !manifest.segments.is_empty() {
+                    self.maintain_namespace_centroids(&ns, &manifest);
+                }
+            }
+        }
+    }
+
+    fn maintain_namespace_centroids(&self, ns: &NamespaceId, manifest: &kosha_core::Manifest) {
+        if self.namespace_centroids_enabled {
+            if let Err(error) = self.update_namespace_centroids(ns, manifest) {
+                eprintln!("WARN: namespace centroid update for {}: {error}", ns.0);
+            }
+        }
+    }
+
+    fn update_namespace_centroids(
+        &self,
+        ns: &NamespaceId,
+        manifest: &kosha_core::Manifest,
+    ) -> Result<(), KoshaError> {
+        #[cfg(feature = "s3")]
+        if let Some(s3) = &self.s3_storage {
+            let path = format!("{}/{}", ns.0, kosha_segment::namespace_centroids::FILE_NAME);
+            let previous = s3.read_uncached(&path).ok();
+            let bytes = self.indexer.update_namespace_centroids(
+                ns,
+                manifest,
+                previous.as_deref(),
+                Some(&|file| s3.read_uncached(file)),
+            )?;
+            if let Some(bytes) = bytes {
+                s3.upload_namespace_centroids(&path, bytes)?;
+            }
+            return Ok(());
+        }
+        self.indexer
+            .update_namespace_centroids(ns, manifest, None, None)?;
+        Ok(())
     }
 
     /// Upload every segment in `ns`'s current manifest that this process
@@ -4746,12 +4828,9 @@ impl AppState {
         let needs_bloom_check =
             query.has_prunable_filter() || kosha_query::term_bloom_prune_mode(query).is_some();
         // Single-vector kNN reads its column's index; late interaction
-        // (#205) reads the field's multivec files instead (below).
-        let knn_field = query
-            .knn
-            .as_ref()
-            .filter(|knn| !knn.is_late_interaction())
-            .map(|knn| knn.field.as_str());
+        // (#205) reads the field's multivec files instead (below), and no
+        // vector column at all.
+        let knn_field = single_vector_knn_field(query);
         let filter_fields = query_filter_fields(query);
         let all_seg_paths: Vec<PathBuf> = manifest
             .segments
@@ -4861,7 +4940,7 @@ impl AppState {
         // Late interaction (#205) reads the queried field's bag store and
         // token index, which only some segments have (their footers say
         // which); single-vector kNN never fetches them.
-        if let Some(knn) = query.knn.as_ref().filter(|k| k.is_late_interaction()) {
+        if let Some(li_field) = late_interaction_knn_field(query) {
             let scoring: std::collections::HashSet<&PathBuf> = to_hydrate.iter().collect();
             let mut by_file: std::collections::BTreeMap<String, Vec<PathBuf>> = Default::default();
             for (entry, seg_path) in manifest.segments.iter().zip(&all_seg_paths) {
@@ -4869,7 +4948,7 @@ impl AppState {
                     continue;
                 }
                 let Some(i) = segment_footer(entry)
-                    .and_then(|f| f.multi_vectors.iter().position(|m| m.name == knn.field))
+                    .and_then(|f| f.multi_vectors.iter().position(|m| m.name == li_field))
                 else {
                     continue;
                 };
@@ -6724,6 +6803,15 @@ fn main() {
     state.spawn_posting_promoter();
     state.spawn_idle_flush_timer();
     state.spawn_compaction_scheduler();
+    if state.namespace_centroids_enabled
+        && matches!(state.role, role::Role::Indexer | role::Role::Standalone)
+    {
+        let state = Arc::clone(&state);
+        std::thread::Builder::new()
+            .name("kosha-namespace-centroid-bootstrap".into())
+            .spawn(move || state.bootstrap_namespace_centroids())
+            .expect("failed to spawn namespace centroid bootstrap thread");
+    }
     state.spawn_writer_lease_renewer();
     state.spawn_manifest_refresher();
     state.spawn_local_gc();
@@ -8320,6 +8408,42 @@ const SCHEMA_FIELD_TYPES: [&str; 8] = [
     "FIELD_TYPE_VECTOR",
 ];
 
+fn parse_schema_field_type(value: &serde_json::Value) -> Option<&'static str> {
+    match value {
+        serde_json::Value::Number(n) => n
+            .as_u64()
+            .and_then(|i| SCHEMA_FIELD_TYPES.get(i as usize).copied()),
+        serde_json::Value::String(t) => {
+            let upper = t.trim().to_ascii_uppercase();
+            let bare = upper.strip_prefix("FIELD_TYPE_").unwrap_or(&upper);
+            SCHEMA_FIELD_TYPES
+                .iter()
+                .copied()
+                .find(|known| known.strip_prefix("FIELD_TYPE_") == Some(bare))
+        }
+        _ => None,
+    }
+}
+
+fn validate_embedding_schema_field_types(schema: &serde_json::Value) -> Result<(), String> {
+    let Some(fields) = schema.get("fields").and_then(serde_json::Value::as_object) else {
+        return Ok(());
+    };
+    for (name, field) in fields {
+        if field.get("embedding").is_some_and(|value| !value.is_null())
+            && ["type", "field_type"]
+                .iter()
+                .filter_map(|key| field.get(*key))
+                .any(|value| parse_schema_field_type(value) != Some("FIELD_TYPE_VECTOR"))
+        {
+            return Err(format!(
+                "schema field '{name}': 'embedding' is only supported on vector fields"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Validate a `NamespaceSchema` from a `CreateNamespaceRequest` and return
 /// it in canonical proto-JSON form: every field has `type` (the
 /// `FIELD_TYPE_*` name), `indexed`, `stored` and `analyzer`. A field type
@@ -8328,7 +8452,7 @@ const SCHEMA_FIELD_TYPES: [&str; 8] = [
 /// Unknown keys and unknown types are rejected rather than ignored. The
 /// analysis extensions `POST /v1/namespaces/{ns}/schema` takes
 /// (`default_analyzer`, `default_stopwords`, and a field's `stopwords`)
-/// pass through unchanged.
+/// and embedding declarations pass through unchanged.
 fn parse_namespace_schema(value: &serde_json::Value) -> Result<serde_json::Value, String> {
     const EXTENSIONS: [&str; 2] = ["default_analyzer", "default_stopwords"];
     let obj = value
@@ -8345,6 +8469,7 @@ fn parse_namespace_schema(value: &serde_json::Value) -> Result<serde_json::Value
         Some(serde_json::Value::Object(map)) => map.clone(),
         Some(_) => return Err("schema.fields must be an object".into()),
     };
+    validate_embedding_schema_field_types(value)?;
     let mut out = serde_json::Map::new();
     for (name, field) in fields {
         if name.is_empty() {
@@ -8354,7 +8479,13 @@ fn parse_namespace_schema(value: &serde_json::Value) -> Result<serde_json::Value
             .as_object()
             .ok_or_else(|| format!("schema field '{name}' must be an object"))?;
         let mut canonical = serde_json::Map::new();
-        let mut field_type = SCHEMA_FIELD_TYPES[0];
+        // An embedding declaration implies a vector field, so the canonical
+        // schema can be saved back through `POST /v1/namespaces/{ns}/schema`.
+        let mut field_type = if field.get("embedding").is_some_and(|v| !v.is_null()) {
+            "FIELD_TYPE_VECTOR"
+        } else {
+            SCHEMA_FIELD_TYPES[0]
+        };
         let mut seen_type = false;
         for (key, v) in field {
             match key.as_str() {
@@ -8363,21 +8494,8 @@ fn parse_namespace_schema(value: &serde_json::Value) -> Result<serde_json::Value
                         return Err(format!("schema field '{name}' names its type twice"));
                     }
                     seen_type = true;
-                    field_type = match v {
-                        serde_json::Value::Number(n) => n
-                            .as_u64()
-                            .and_then(|i| SCHEMA_FIELD_TYPES.get(i as usize).copied()),
-                        serde_json::Value::String(t) => {
-                            let upper = t.trim().to_ascii_uppercase();
-                            let bare = upper.strip_prefix("FIELD_TYPE_").unwrap_or(&upper);
-                            SCHEMA_FIELD_TYPES
-                                .iter()
-                                .copied()
-                                .find(|known| known.strip_prefix("FIELD_TYPE_") == Some(bare))
-                        }
-                        _ => None,
-                    }
-                    .ok_or_else(|| format!("schema field '{name}' has unknown type {v}"))?;
+                    field_type = parse_schema_field_type(v)
+                        .ok_or_else(|| format!("schema field '{name}' has unknown type {v}"))?;
                 }
                 "indexed" | "stored" => {
                     let flag = v
@@ -8403,7 +8521,7 @@ fn parse_namespace_schema(value: &serde_json::Value) -> Result<serde_json::Value
                     };
                     canonical.insert("analyzer".into(), serde_json::json!(analyzers));
                 }
-                "stopwords" => {
+                "stopwords" | "embedding" => {
                     canonical.insert(key.clone(), v.clone());
                 }
                 other => return Err(format!("schema field '{name}' has unknown key '{other}'")),
@@ -10649,6 +10767,9 @@ fn handle_put_schema_with_ns(
         Some(inner) => inner.clone(),
         None => value,
     };
+    if let Err(e) = validate_embedding_schema_field_types(&value) {
+        return api_error(ErrorCode::InvalidArgument, &format!("invalid schema: {e}"));
+    }
     let schema: kosha_core::NamespaceSchema = match serde_json::from_value(value) {
         Ok(schema) => schema,
         Err(e) => return api_error(ErrorCode::InvalidArgument, &format!("invalid schema: {e}")),
@@ -14799,6 +14920,83 @@ mod tests {
         state.indexer.flush_namespace(ns).unwrap();
     }
 
+    #[test]
+    fn indexer_maintains_namespace_centroids_when_it_follows_an_ingest_flush() {
+        use kosha_segment::namespace_centroids::{Snapshot, FILE_NAME};
+
+        let shared = shared_store();
+        let ns = NamespaceId("routing".into());
+        let mut ingest = test_state();
+        ingest.role = role::Role::Ingest;
+        ingest.namespace_centroids_enabled = false;
+        let mut indexer = test_state();
+        indexer.role = role::Role::Indexer;
+        indexer.namespace_centroids_enabled = true;
+        for state in [&ingest, &indexer] {
+            *state.controller.lock().unwrap() = Box::new(shared.clone());
+        }
+        for i in 0..2 {
+            ingest
+                .indexer
+                .index_documents(
+                    ns.clone(),
+                    vec![Document {
+                        id: DocumentId(format!("doc-{i}")),
+                        fields: vec![Field::vector("emb", vec![1.0, i as f32])],
+                    }],
+                )
+                .unwrap();
+            ingest.indexer.flush_namespace(&ns).unwrap();
+            ingest.publish_namespace(&ns).unwrap();
+            let manifest = shared.manifest_cloned(&ns).unwrap();
+            let segment = &manifest.segments.last().unwrap().segment_id;
+            copy_dir(
+                &manifest.segment_dir(&ingest.data_dir, &ns, segment),
+                &manifest.segment_dir(&indexer.data_dir, &ns, segment),
+            );
+            indexer.indexer_follow_namespace(&ns).unwrap();
+            let path = indexer.data_dir.join(&ns.0).join(FILE_NAME);
+            let snapshot: Snapshot = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert!(snapshot.matches(
+                manifest.version,
+                manifest.segments.iter().map(|s| s.segment_id.0.as_str()),
+            ));
+            assert_eq!(snapshot.directory.posting_count(&segment.0, "emb", 2), 1);
+        }
+        assert!(!ingest.data_dir.join(&ns.0).join(FILE_NAME).exists());
+    }
+
+    #[test]
+    fn indexer_bootstraps_namespace_centroids_for_an_already_restored_manifest() {
+        use kosha_segment::namespace_centroids::{Snapshot, FILE_NAME};
+
+        let mut state = test_state();
+        state.role = role::Role::Indexer;
+        state.namespace_centroids_enabled = false;
+        let ns = NamespaceId("bootstrap-routing".into());
+        write_and_flush(&state, &ns, "before-startup");
+        state.publish_namespace(&ns).unwrap();
+        let manifest = state
+            .controller
+            .lock()
+            .unwrap()
+            .manifest_cloned(&ns)
+            .unwrap();
+        state.indexer.restore_manifest(ns.clone(), manifest.clone());
+        let path = state.data_dir.join(&ns.0).join(FILE_NAME);
+        assert!(!path.exists());
+
+        state.namespace_centroids_enabled = true;
+        state.indexer_follow_all();
+        assert!(!path.exists()); // the already-current manifest is skipped
+        state.bootstrap_namespace_centroids();
+        let snapshot: Snapshot = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(snapshot.matches(
+            manifest.version,
+            manifest.segments.iter().map(|s| s.segment_id.0.as_str()),
+        ));
+    }
+
     fn wal_is_empty(state: &AppState) -> bool {
         kosha_write::wal::WalWriter::recover(&state.data_dir.join("_wal"))
             .unwrap()
@@ -17393,6 +17591,115 @@ mod tests {
                 "{f} must always be fetched regardless of needs_vectors"
             );
         }
+    }
+
+    fn knn_query(json: serde_json::Value) -> SearchQuery {
+        let q: SearchQuery = serde_json::from_value(json).unwrap();
+        q.validate().unwrap();
+        q
+    }
+
+    /// #205: a late-interaction kNN — alone or hybrid — needs no
+    /// single-vector column, so its search pass hydrates none; a cosine
+    /// kNN (alone or hybrid) still names its column.
+    #[test]
+    fn late_interaction_knn_needs_no_vector_column() {
+        let li = knn_query(serde_json::json!({"query_text": "",
+            "knn": {"field": "tokens", "vectors": [[1.0, 0.0], [0.0, 1.0]]}}));
+        assert_eq!(single_vector_knn_field(&li), None);
+        assert_eq!(late_interaction_knn_field(&li), Some("tokens"));
+        assert_eq!(
+            knn_verdict_key(&li).as_deref(),
+            Some("late_interaction:tokens")
+        );
+
+        let hybrid_li = knn_query(serde_json::json!({"query_text": "breach",
+            "knn": {"field": "tokens", "vectors": [[1.0, 0.0]]}}));
+        assert_eq!(single_vector_knn_field(&hybrid_li), None);
+        assert_eq!(late_interaction_knn_field(&hybrid_li), Some("tokens"));
+
+        // `scoring: late_interaction` with a single `vector` is a one-token
+        // bag: still no vector column.
+        let one_token = knn_query(serde_json::json!({"query_text": "",
+            "knn": {"field": "tokens", "vector": [1.0, 0.0], "scoring": "late_interaction"}}));
+        assert_eq!(single_vector_knn_field(&one_token), None);
+        assert_eq!(late_interaction_knn_field(&one_token), Some("tokens"));
+
+        for text in ["", "breach"] {
+            let cosine = knn_query(serde_json::json!({"query_text": text,
+                "knn": {"field": "emb", "vector": [1.0, 0.0]}}));
+            assert_eq!(single_vector_knn_field(&cosine), Some("emb"), "{text:?}");
+            assert_eq!(late_interaction_knn_field(&cosine), None);
+            assert_eq!(knn_verdict_key(&cosine).as_deref(), Some("emb"));
+        }
+
+        let lexical = knn_query(serde_json::json!({"query_text": "breach"}));
+        assert_eq!(single_vector_knn_field(&lexical), None);
+        assert_eq!(late_interaction_knn_field(&lexical), None);
+        assert_eq!(knn_verdict_key(&lexical), None);
+
+        // A verdict earned by one kind of pass never covers the other.
+        let mut verdict = HydrationVerdict::default();
+        verdict.merge(None, knn_verdict_key(&li).as_deref());
+        assert!(verdict.covers(None, Some("late_interaction:tokens")));
+        assert!(!verdict.covers(None, Some("tokens")));
+        assert!(!verdict.covers(None, Some("emb")));
+    }
+
+    /// #205: a segment whose single-vector files were never hydrated is
+    /// scoring-complete for a late-interaction kNN (the pass checks the
+    /// multivec files separately), and not for a cosine kNN on its column.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn late_interaction_scoring_set_has_no_single_vector_files() {
+        let dir =
+            std::env::temp_dir().join(format!("kosha-test-li-scoring-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut w =
+            kosha_segment::SegmentWriter::new(kosha_core::SegmentId("s".into()), dir.clone());
+        for i in 0..4 {
+            w.add_document(
+                DocumentId(format!("d{i}")),
+                vec![
+                    Field::text("text", "x"),
+                    Field::vector("emb", vec![1.0, i as f32]),
+                    Field {
+                        name: "tokens".into(),
+                        field_type: kosha_core::FieldType::Vector,
+                        value: serde_json::to_string(&[[1.0, i as f32], [0.0, 1.0]]).unwrap(),
+                    },
+                ],
+            );
+        }
+        let footer = w.finalize(Default::default()).unwrap();
+        assert_eq!(footer.multi_vectors.len(), 1);
+        for f in kosha_segment::vector_index_files(&dir) {
+            fs::remove_file(dir.join(f)).unwrap();
+        }
+        let _ = fs::remove_file(dir.join(kosha_segment::DOC_VECTORS_FILE));
+        // The multivec files are still there; the full-segment hydration
+        // fetches them whatever `needs_vectors` says.
+        for f in kosha_segment::multivec::multivec_files(&footer) {
+            assert!(dir.join(&f).exists(), "{f}");
+            assert!(hydration_wants_file(&f, false), "{f}");
+        }
+
+        let li = knn_query(serde_json::json!({"query_text": "",
+            "knn": {"field": "tokens", "vectors": [[1.0, 0.0]]}}));
+        let hybrid_li = knn_query(serde_json::json!({"query_text": "x",
+            "knn": {"field": "tokens", "vectors": [[1.0, 0.0]]}}));
+        let cosine = knn_query(serde_json::json!({"query_text": "",
+            "knn": {"field": "emb", "vector": [1.0, 0.0]}}));
+        let complete = |q: &SearchQuery| {
+            AppState::segment_is_scoring_complete(&dir, single_vector_knn_field(q), false, None)
+        };
+        assert!(complete(&li));
+        assert!(complete(&hybrid_li));
+        assert!(
+            !complete(&cosine),
+            "a cosine kNN still needs its column's files"
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 
     /// Core regression for the presence-cache optimization: a
