@@ -778,9 +778,23 @@ fn webhook_and_self_service_routes_are_gated() {
     let portal = http(k.addr, "POST /v1/billing/portal", &[], b"{}");
     assert_eq!(status_of(&portal), 409, "{portal}");
     // Billing's gate never blocks paying.
+    // Nor getting data out or revoking a key (#347, #346).
+    for line in [
+        "POST /v1/billing/checkout HTTP/1.1\r\n",
+        "POST /v1/namespaces/docs/exports HTTP/1.1\r\n",
+        "GET /v1/namespaces/docs/exports/exp-1/download?part=0 HTTP/1.1\r\n",
+        "POST /v1/api-keys/revoke HTTP/1.1\r\n",
+    ] {
+        assert_eq!(
+            billing::operation(line),
+            kosha_control::billing::Operation::Account,
+            "{line}"
+        );
+    }
+    // Writes are still writes.
     assert_eq!(
-        billing::operation("POST /v1/billing/checkout HTTP/1.1\r\n"),
-        kosha_control::billing::Operation::Account
+        billing::operation("POST /v1/namespaces/docs/documents HTTP/1.1\r\n"),
+        kosha_control::billing::Operation::Write
     );
     // A query string or another method is not the webhook.
     assert!(billing::webhook_response(

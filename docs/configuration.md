@@ -628,7 +628,12 @@ while the scheduler was off is closed with `close-period`.
 - `billing_read_only`: an invoice is `read_only_after_days` past due. Writes are refused; searches
   and deletes are not.
 - `billing_suspended`: an invoice is `suspend_after_days` past due. Everything is refused except
-  `GET /v1/billing` and `GET /v1/usage`.
+  `GET /v1/billing`, `GET /v1/usage`, and the routes below.
+
+Never refused, in any state: `GET /v1/billing`, `GET /v1/usage`, `POST /v1/billing/checkout` and
+`/portal` (paying), the namespace export routes (`/v1/namespaces/{ns}/exports...`: a customer can
+always take out what it stored), and the tenant's own key routes (`/v1/api-keys...`: a leaked key
+can always be revoked).
 
 An invoice is due `payment_terms_days` after it is issued. The state follows the oldest unpaid
 invoice and is computed, not stored: once the invoice is paid or voided the account is `active`

@@ -643,6 +643,15 @@ pub(crate) fn operation(request_line: &str) -> Operation {
     if method == "POST" && (path == CHECKOUT_PATH || path == PORTAL_PATH) {
         return Operation::Account;
     }
+    // Nor is getting data out (#347: a customer can export everything it
+    // stored, whatever it owes) or managing its own keys (#346: a leaked
+    // key must be revocable while the account is suspended).
+    if crate::exports::parse_route(method, path).is_some()
+        || path == "/v1/api-keys"
+        || path.starts_with("/v1/api-keys/")
+    {
+        return Operation::Account;
+    }
     if is_search_route(request_line) {
         return Operation::Query;
     }
