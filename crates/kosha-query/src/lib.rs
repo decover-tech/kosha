@@ -5665,9 +5665,11 @@ impl Searcher {
         // A multi-field query (#249) on a segment with per-field indexes.
         // A segment without them (written before #249) takes the paths
         // below and answers from its combined index instead.
-        let field_query = analysis
-            .fields()
-            .filter(|_| has_query && !is_wildcard_mode && reader.field_index().is_some());
+        let field_query = analysis.fields().filter(|fields| {
+            (analysis.has_text() || (has_query && fields.iter().any(|field| !field.is_all())))
+                && !is_wildcard_mode
+                && reader.field_index().is_some()
+        });
         if let Some(ref fuzzy) = query.fuzzy {
             let scored = score_fuzzy_query(
                 &reader,
@@ -22257,6 +22259,43 @@ mod field_tests {
             hits(&root, &manifest, &query("...", &["content"])),
             ["in_content"]
         );
+    }
+
+    #[test]
+    fn boosted_all_keeps_combined_keyword_matches() {
+        let root = temp_root("boosted-all-keyword");
+        let config = NamespaceSchema {
+            fields: [(
+                "title".into(),
+                FieldSchema {
+                    analyzer: vec!["keyword".into()],
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        }
+        .resolve()
+        .unwrap();
+        let mut manifest = empty_manifest();
+        add_segment(
+            &root,
+            &mut manifest,
+            Seg {
+                name: "s1",
+                field_index: true,
+                config: Some(&config),
+            },
+            vec![doc("keyword", "...", "ordinary text")],
+        );
+        for fields in [&[][..], &["_all"], &["_all^2"]] {
+            assert_eq!(
+                hits(&root, &manifest, &query("...", fields)),
+                ["keyword"],
+                "{fields:?}"
+            );
+        }
     }
 
     #[test]
