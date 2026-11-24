@@ -177,8 +177,8 @@ impl AnalyzerSpec {
 }
 
 /// Proto `NamespaceSchema`. Kosha is otherwise schemaless (clients send
-/// typed fields with every document), so only the analysis settings are
-/// honored; the other `FieldSchema` members are accepted and stored.
+/// typed fields with every document), so only the analysis and embedding
+/// settings are honored; the other members are accepted and stored.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NamespaceSchema {
     #[serde(default)]
@@ -263,8 +263,12 @@ pub struct EmbeddingSpec {
     pub model: String,
     /// Dimension of the model's vectors.
     pub dims: u32,
-    /// Which configured provider serves the model (`mock`, `http`).
-    /// `None` = whichever provider this pod registered the model with.
+    /// The vector distance metric. Only cosine is supported; omission
+    /// preserves the cosine behavior of earlier schemas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distance_metric: Option<String>,
+    /// Which configured provider serves the model (`mock`, `http`, `onnx`).
+    /// Omit for the default HTTP/mock provider; ONNX must be explicit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
 }
@@ -280,6 +284,13 @@ impl EmbeddingSpec {
                 "embedding.dims must be in 1..={MAX_EMBEDDING_DIMS}, got {}",
                 self.dims
             ));
+        }
+        if self
+            .distance_metric
+            .as_deref()
+            .is_some_and(|metric| metric != "cosine")
+        {
+            return Err("embedding.distance_metric must be cosine".into());
         }
         Ok(())
     }

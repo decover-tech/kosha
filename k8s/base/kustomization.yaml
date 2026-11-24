@@ -9,6 +9,7 @@ resources:
   - service.yaml
   - service-ingest.yaml
   - deployment-query.yaml
+  - pdb-query.yaml
   # Compaction-only pod (#254); the ingest Deployment sets
   # KOSHA_COMPACTION_ON_INGEST=false.
   - deployment-indexer.yaml
