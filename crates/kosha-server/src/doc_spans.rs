@@ -305,6 +305,7 @@ impl SpanHydrator {
         pages: &[PageSegment<'_>],
         fetcher: &dyn RangeFetcher,
         writes: &SpanWriteQueue,
+        promote_hot: bool,
     ) -> SpanOutcome {
         let mut out = SpanOutcome::default();
         let mut fallback = vec![false; pages.len()];
@@ -466,7 +467,10 @@ impl SpanHydrator {
             // something: an f32 segment whose `doc_store.bin` is already
             // whole keeps reading its page vectors by range, and
             // re-promoting it would fetch nothing and drop nothing.
-            if seg_gets[i] == 0 || !promotion_would_fetch(page.segment_dir, page.reader) {
+            if !promote_hot
+                || seg_gets[i] == 0
+                || !promotion_would_fetch(page.segment_dir, page.reader)
+            {
                 continue;
             }
             let h = heat.entry(page.segment_dir.to_path_buf()).or_default();
@@ -919,7 +923,7 @@ mod tests {
             crate::span_writes::SPAN_WRITE_QUEUE_BYTES,
             crate::span_writes::SPAN_HELD_BYTES,
         );
-        let o = hydrator.hydrate(pages, store, &writes);
+        let o = hydrator.hydrate(pages, store, &writes, true);
         writes.drain(cache);
         o
     }

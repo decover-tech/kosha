@@ -4116,8 +4116,12 @@ impl AppState {
                 };
                 let outcome = {
                     let _permit = self.hydration_semaphore.acquire("page_docs");
-                    self.span_hydrator
-                        .hydrate(pages, &fetcher, &self.span_writes)
+                    self.span_hydrator.hydrate(
+                        pages,
+                        &fetcher,
+                        &self.span_writes,
+                        self.doc_read_mode == doc_spans::ReadMode::Ranged,
+                    )
                 };
                 request.hold_spans(outcome.held);
                 stats.rounds = outcome.rounds;
@@ -18553,6 +18557,14 @@ mod tests {
             },
         );
         state.doc_read_mode = doc_spans::ReadMode::Whole;
+        state.span_hydrator = doc_spans::SpanHydrator::new(
+            state.data_dir.clone(),
+            doc_spans::SpanConfig {
+                coalesce_gap: 0,
+                promote_after_gets: 1,
+                promote_after_bytes: 0,
+            },
+        );
         state.posting_read_mode = doc_spans::ReadMode::Whole;
         state.hydrate_request_max_bytes = 160 * 1024;
         state.searcher = Searcher::new(state.data_dir.clone()).with_knn_global_rescore(false);
@@ -18594,6 +18606,7 @@ mod tests {
             second.results[0].doc_id
         ]);
         assert!(search(&query).results.is_empty());
+        assert_eq!(state.doc_store_promotions.len(), 0);
     }
 
     /// A two-segment kNN node reading whole `vector.idx` files, with a
