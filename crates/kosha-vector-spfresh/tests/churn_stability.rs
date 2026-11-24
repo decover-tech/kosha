@@ -282,7 +282,7 @@ fn churn_cycle_recall_stability() {
     let exact = truth(&data, &queries, &prefixes, &live);
     let curve = probe_curve(&initial, &queries, &exact, &live, capacity);
     let nprobe = tune(&curve, query_count);
-    println!("scenario,churn_pct,cycle,method,nprobe,recall_at_10,mean_vectors_scanned,median_radius,p90_radius,postings");
+    println!("\nscenario,churn_pct,cycle,method,nprobe,recall_at_10,mean_vectors_scanned,median_radius,p90_radius,postings");
     report(
         ("initial", 0, 0, "build"),
         nprobe,
