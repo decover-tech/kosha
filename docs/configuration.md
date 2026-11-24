@@ -363,7 +363,10 @@ What is recorded:
   attribution, not billing.
 - An accepted document write (`/documents`, legacy `/index` and `/replace`): `bytes_written`
   (each document's id plus every field's name and value, as submitted) and `documents_written`.
-  Recorded on the pod that executes the write.
+  Recorded on the pod that executes the write. A write with vectors also records
+  `vector_dimensions_written`: each flat vector's dimension, plus dimension x tokens of each
+  late-interaction bag, counted after server-side embedding (so a field the server embeds counts
+  the vector it produced). A doc id repeated in one batch counts its last copy only.
 - An applied delete by query (`POST /v1/namespaces/{ns}/delete`, legacy `/delete`):
   `documents_deleted` and `bytes_deleted`, the deleted documents' records in the doc store as
   stored (compressed when the doc store is; 0 for documents in segments written before
@@ -388,7 +391,9 @@ adds `bytes_queried`, the billing meter for query volume: each search priced at 
 `stored_bytes` snapshot current at that hour. It does not depend on what the search read, so it is
 the same for whole-file, ranged and fully cached searches. `stored_byte_hours` is the sum of the
 hourly snapshots in the window; an hour with no writer running has no snapshot and contributes
-nothing (`stored_snapshots` counts the hours that did).
+nothing (`stored_snapshots` counts the hours that did). `vector_dimensions_written` is summed.
+With `KOSHA_DASHBOARD=on` the dashboard's **Usage** page shows the same summary for the pasted
+key's tenant.
 
 The summary also reports `documents_deleted` and `bytes_deleted`. The pipeline's own counters are
 on `/metrics` (`kosha_usage_*`, see [metrics.md](metrics.md)).

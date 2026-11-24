@@ -11,6 +11,7 @@
 //! - An accepted document write (`/documents`, legacy `/index` and
 //!   `/replace`) emits `bytes_written` and `documents_written`, on the pod
 //!   that executed it (a query pod forwards writes and emits nothing).
+//!   A write with vectors also emits `vector_dimensions_written`.
 //! - An applied delete by query emits `documents_deleted` and
 //!   `bytes_deleted` (the deleted records' bytes in the doc store), on the
 //!   pod that executed it.
@@ -484,18 +485,32 @@ impl UsageMeter {
         });
     }
 
-    /// An accepted write of `documents` documents to `ns`.
-    pub(crate) fn record_write(&self, ns: &NamespaceId, bytes_written: u64, documents: u64) {
+    /// An accepted write of `documents` documents to `ns`. A write without
+    /// vectors carries no `vector_dimensions_written` row.
+    pub(crate) fn record_write(
+        &self,
+        ns: &NamespaceId,
+        bytes_written: u64,
+        documents: u64,
+        vector_dimensions: u64,
+    ) {
         let (tenant, namespace) = usage_identity(ns);
+        let mut meters = BTreeMap::from([
+            (meter::BYTES_WRITTEN.to_string(), bytes_written),
+            (meter::DOCUMENTS_WRITTEN.to_string(), documents),
+        ]);
+        if vector_dimensions > 0 {
+            meters.insert(
+                meter::VECTOR_DIMENSIONS_WRITTEN.to_string(),
+                vector_dimensions,
+            );
+        }
         self.emit(&UsageEvent {
             id: self.next_event_id(),
             tenant,
             namespace,
             at_ms: unix_millis(),
-            meters: BTreeMap::from([
-                (meter::BYTES_WRITTEN.to_string(), bytes_written),
-                (meter::DOCUMENTS_WRITTEN.to_string(), documents),
-            ]),
+            meters,
         });
     }
 
@@ -656,6 +671,31 @@ pub(crate) fn documents_logical_bytes(documents: &[kosha_core::Document]) -> u64
                     .iter()
                     .map(|field| (field.name.len() + field.value.len()) as u64)
                     .sum::<u64>()
+        })
+        .sum()
+}
+
+/// Vector values in `documents` as they will be stored: each flat vector's
+/// dimension, and each late-interaction bag's dimension x tokens. A value
+/// that is not a JSON number array (or array of them) counts 0. A doc id
+/// repeated in the batch counts once, as its last copy: the writer keeps
+/// only that one.
+pub(crate) fn documents_vector_dimensions(documents: &[kosha_core::Document]) -> u64 {
+    let mut last: HashMap<&str, &kosha_core::Document> = HashMap::new();
+    for doc in documents {
+        last.insert(doc.id.0.as_str(), doc);
+    }
+    last.values()
+        .flat_map(|doc| doc.fields.iter())
+        .filter(|field| field.field_type == kosha_core::FieldType::Vector)
+        .map(|field| {
+            if let Ok(vector) = serde_json::from_str::<Vec<f32>>(&field.value) {
+                vector.len() as u64
+            } else if let Ok(bag) = serde_json::from_str::<Vec<Vec<f32>>>(&field.value) {
+                bag.iter().map(|token| token.len() as u64).sum()
+            } else {
+                0
+            }
         })
         .sum()
 }

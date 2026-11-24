@@ -20,6 +20,11 @@ Then open `http://<host>:8080/dashboard`, paste an API key into the box at the t
   timing breakdown, and a red banner when `knn_degraded_segments` is above 0 (a 200 that may be
   missing neighbors).
 
+- **Usage**: the key's tenant's metered usage over the last 24 hours, 7 days or 30 days (from
+  `GET /v1/usage`, #348): totals and a per-namespace table of queries, bytes queried, returned
+  and written, documents and vector dimensions written, and the latest stored bytes and stored
+  vector dimensions. Shows a notice when usage metering is off (`KOSHA_USAGE_METERING`).
+
 There are no admin actions.
 
 ![Query console](images/dashboard-console.png)
