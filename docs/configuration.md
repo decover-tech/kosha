@@ -753,6 +753,10 @@ seconds or a unit (`90s`, `5m`, `1h`).
 | `KOSHA_LOCAL_GC_GRACE` | How long a retired segment's local files stay after the publish that dropped it (and after every search that could read them ends) | `5m` | duration |
 | `KOSHA_LOCAL_GC_INTERVAL_MS` | How often each pod reclaims retired local segments; `0` disables | `60000` | milliseconds |
 
+GC deletes the objects an older manifest listed, so point-in-time restore depends on bucket
+versioning keeping them: keep noncurrent versions for at least the Postgres PITR retention plus
+`KOSHA_GC_GRACE`. See [operations/backup-restore.md](operations/backup-restore.md).
+
 ## Deleted namespaces (cache purge and retry)
 
 Read in `PurgeSettings::from_env` (`crates/kosha-server/src/deletion_purge.rs`). Both are off

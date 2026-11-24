@@ -81,7 +81,7 @@ mod billing;
 mod billing_tests;
 #[cfg(all(test, feature = "failpoints"))]
 mod crash_points_tests;
-#[cfg(any(feature = "s3", all(test, feature = "failpoints")))]
+mod restore;
 #[cfg_attr(not(feature = "s3"), allow(dead_code))]
 mod segment_commit;
 mod segment_gc;
@@ -8185,6 +8185,12 @@ fn route_inner(
 
     if request_line.starts_with("POST /v1/admin/import-namespace") {
         return handle_import_namespace(body, tenant, state);
+    }
+
+    if request_line.starts_with("POST /v1/admin/restore-namespace ")
+        || request_line.starts_with("POST /v1/admin/restore-namespace?")
+    {
+        return restore::handle_restore_namespace(body, state);
     }
 
     if request_line.starts_with("POST /v1/admin/gc ")

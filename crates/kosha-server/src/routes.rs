@@ -240,6 +240,12 @@ pub(crate) static ROUTES: &[Route] = &[
         "AdminService_ImportNamespace",
         Write,
     ),
+    admin(
+        "POST",
+        "/v1/admin/restore-namespace",
+        "AdminService_RestoreNamespace",
+        Write,
+    ),
     admin("POST", "/v1/admin/gc", "AdminService_CollectGarbage", Write),
     admin(
         "POST",
@@ -597,6 +603,7 @@ mod tests {
         ("GET /v1/admin/compaction-status HTTP/1.1", true, false),
         ("GET /v1/admin/compaction-jobs/j1 HTTP/1.1", true, false),
         ("POST /v1/admin/import-namespace HTTP/1.1", true, false),
+        ("POST /v1/admin/restore-namespace HTTP/1.1", true, false),
         ("POST /v1/admin/gc HTTP/1.1", true, false),
         ("POST /v1/admin/api-keys HTTP/1.1", true, false),
         ("GET /v1/admin/api-keys HTTP/1.1", false, false),

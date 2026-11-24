@@ -90,6 +90,18 @@ impl AppState {
                 ),
             ));
         }
+        self.commit_branch(parent, &source, child)
+    }
+
+    /// Commit `child` as a new branch of `source`, a manifest of `parent`,
+    /// and load it into the writer. The caller holds `branch_lock`. `Err`
+    /// is a ready-to-send JSON error response.
+    pub(crate) fn commit_branch(
+        &self,
+        parent: &NamespaceId,
+        source: &Manifest,
+        child: &NamespaceId,
+    ) -> Result<Manifest, String> {
         let child_exists = self
             .controller
             .lock()
