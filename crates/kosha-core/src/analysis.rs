@@ -301,26 +301,31 @@ impl EmbeddingSpec {
     }
 }
 
+impl FieldSchema {
+    fn effective_type(&self) -> Option<&'static str> {
+        match &self.field_type {
+            Some(declared) => canonical_schema_field_type(declared),
+            None => self.embedding.as_ref().map(|_| "FIELD_TYPE_VECTOR"),
+        }
+    }
+}
+
 impl NamespaceSchema {
     /// The first incompatible change to a previously declared field type.
-    /// A field with no declared type is schemaless and may be declared online.
+    /// An embedding implies a vector type. Other undeclared types may be
+    /// declared online.
     pub fn field_type_conflict(&self, proposed: &Self) -> Option<String> {
         for (name, field) in &self.fields {
-            let Some(old) = &field.field_type else {
-                continue;
+            let new = proposed.fields.get(name);
+            let compatible = match field.effective_type() {
+                Some(old) if old == SCHEMA_FIELD_TYPES[0] => true,
+                Some(old) => new.and_then(FieldSchema::effective_type) == Some(old),
+                None => {
+                    field.field_type.is_none()
+                        || new.and_then(|f| f.field_type.as_ref()) == field.field_type.as_ref()
+                }
             };
-            let old_type = canonical_schema_field_type(old);
-            if old_type == Some(SCHEMA_FIELD_TYPES[0]) {
-                continue;
-            }
-            let new = proposed
-                .fields
-                .get(name)
-                .and_then(|f| f.field_type.as_ref());
-            if Some(old) == new
-                || old_type
-                    .is_some_and(|old| new.and_then(canonical_schema_field_type) == Some(old))
-            {
+            if compatible {
                 continue;
             }
             return Some(format!(
