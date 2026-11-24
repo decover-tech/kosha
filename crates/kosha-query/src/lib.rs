@@ -4138,7 +4138,7 @@ impl Searcher {
             || query.collapse.is_some()
             || query.rank_by.is_some()
             || !query.sort.is_empty()
-            || query.exact_total_hits == Some(true)
+            || effective_exact_total_hits(query)
         {
             return HashSet::new();
         }
@@ -7768,9 +7768,7 @@ impl Searcher {
         // Resolved BEFORE scoring: capped mode lets the per-segment join
         // stop early (see `score_segment`'s `count_budget`), exact mode
         // keeps the v1 walk-to-completion.
-        let exact = query
-            .exact_total_hits
-            .unwrap_or_else(exact_total_hits_engine_default);
+        let exact = effective_exact_total_hits(query);
         let cap = query
             .total_hits_cap
             .unwrap_or_else(total_hits_cap_engine_default)
@@ -8521,6 +8519,12 @@ fn wand_probe_order() -> WandProbeOrder {
         WAND_PROBE_ORDER_QUERY_ORDER => WandProbeOrder::QueryOrder,
         _ => WandProbeOrder::RarestFirst,
     }
+}
+
+fn effective_exact_total_hits(query: &SearchQuery) -> bool {
+    query
+        .exact_total_hits
+        .unwrap_or_else(exact_total_hits_engine_default)
 }
 
 /// Engine-wide default for `SearchQuery.exact_total_hits` when a request
@@ -12100,6 +12104,48 @@ mod tests {
             .unwrap();
         assert_eq!(second_stats.knn_segments_pruned, 1);
         assert!(second.results.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn knn_segment_pruning_respects_inherited_exact_hit_counts() {
+        const CHILD: &str = "KOSHA_TEST_INHERITED_EXACT_HIT_COUNTS";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    concat!(
+                        module_path!(),
+                        "::knn_segment_pruning_respects_inherited_exact_hit_counts"
+                    )
+                    .split_once("::")
+                    .unwrap()
+                    .1,
+                ])
+                .env(CHILD, "1")
+                .env("KOSHA_EXACT_TOTAL_HITS", "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed; 0 failed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let (dir, ns, manifest, mut query) = knn_segment_pruning_corpus("exact");
+        let searcher = Searcher::new(dir.clone()).with_knn_segment_nprobe(1);
+        let (_, capped) = searcher
+            .search_with_stats(&ns, &manifest, &query, None)
+            .unwrap();
+        assert_eq!(capped.knn_segments_pruned, 1);
+        query.exact_total_hits = None;
+        let (_, exact) = searcher
+            .search_with_stats(&ns, &manifest, &query, None)
+            .unwrap();
+        assert_eq!(exact.knn_segments_pruned, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
