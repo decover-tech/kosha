@@ -653,7 +653,8 @@ fn searches_are_identical_with_the_i8_stage_on_and_off() {
     // End to end, in whatever mode the process's KOSHA_KNN_* variables
     // select. They are read once per process, so covering a mode means
     // running this test under it: KOSHA_KNN_PROBE_RADIUS_ALPHA,
-    // KOSHA_KNN_RELATIVE_CUTOFF_EPS, KOSHA_KNN_GLOBAL_BUDGET=0,
+    // KOSHA_KNN_RELATIVE_CUTOFF_EPS, KOSHA_KNN_BOUND_STOP_ALPHA,
+    // KOSHA_KNN_GLOBAL_BUDGET=0,
     // KOSHA_KNN_GLOBAL_RESCORE=1, KOSHA_VECTOR_QUANTIZATION. A plain
     // `cargo test` covers the defaults only.
     let mut rng = Lcg(0xE2E);

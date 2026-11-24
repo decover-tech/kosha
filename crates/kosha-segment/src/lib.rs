@@ -2753,6 +2753,9 @@ impl VectorPosting {
 mod posting_scan_tests;
 
 #[cfg(test)]
+mod bound_stop_tests;
+
+#[cfg(test)]
 mod centroid_codes_tests;
 
 #[cfg(test)]
@@ -3173,6 +3176,79 @@ fn parse_probe_radius_alpha(raw: Option<&str>) -> f32 {
             }
         },
     }
+}
+
+/// `KOSHA_KNN_BOUND_STOP_ALPHA` (#384, experimental; unset = off): stop a
+/// segment's budgeted kNN probe at the first posting where [`bound_stop`]
+/// holds, instead of always probing every budgeted posting. Accepts a
+/// finite value `> 0`; unset, empty or anything else is off (with a
+/// warning for a bad value). Read once per process.
+pub fn knn_bound_stop_alpha() -> Option<f32> {
+    #[cfg(test)]
+    if let Some(alpha) = BOUND_STOP_ALPHA_OVERRIDE.with(std::cell::Cell::get) {
+        return alpha;
+    }
+    static ALPHA: OnceLock<Option<f32>> = OnceLock::new();
+    *ALPHA.get_or_init(|| {
+        let raw = std::env::var("KOSHA_KNN_BOUND_STOP_ALPHA").ok();
+        let alpha = parse_bound_stop_alpha(raw.as_deref());
+        match (raw.as_deref().map(str::trim), alpha) {
+            (_, Some(alpha)) => eprintln!(
+                "INFO: KOSHA_KNN_BOUND_STOP_ALPHA={alpha}: a segment's kNN probe stops \
+                 once its k-th guaranteed similarity reaches {alpha} x the next \
+                 posting's similarity bound (#384, experimental)"
+            ),
+            (Some(raw), None) if !raw.is_empty() => {
+                eprintln!("WARN: KOSHA_KNN_BOUND_STOP_ALPHA={raw} is not a finite number > 0; off")
+            }
+            _ => {}
+        }
+        alpha
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only stand-in for `KOSHA_KNN_BOUND_STOP_ALPHA` on this thread:
+    /// `Some(setting)` replaces the process's value.
+    static BOUND_STOP_ALPHA_OVERRIDE: std::cell::Cell<Option<Option<f32>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with [`knn_bound_stop_alpha`] reading `alpha` on this thread.
+#[cfg(test)]
+fn with_bound_stop_alpha<T>(alpha: Option<f32>, f: impl FnOnce() -> T) -> T {
+    let previous = BOUND_STOP_ALPHA_OVERRIDE.with(|o| o.replace(Some(alpha)));
+    let out = f();
+    BOUND_STOP_ALPHA_OVERRIDE.with(|o| o.set(previous));
+    out
+}
+
+fn parse_bound_stop_alpha(raw: Option<&str>) -> Option<f32> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|a| a.is_finite() && *a > 0.0)
+}
+
+/// The α-scaled bound stop (#384; Block-Max Pruning, SIGIR'24): a probe
+/// whose `k`-th guaranteed similarity is `theta` skips a posting of rank
+/// score `rank_score` ([`centroid_probe_score`]), and every posting ranked
+/// after it, when `theta >= alpha x (1 - rank_score)`. `1 - rank_score` is
+/// the best similarity the rank score allows a member of the posting, and
+/// a probe visits postings in ascending rank score, so the bound only
+/// falls from there.
+///
+/// - `alpha = 1`: stop when no later posting can beat the current `k`-th,
+///   as far as the rank score bounds it (only at the default
+///   `KOSHA_KNN_PROBE_RADIUS_ALPHA = 1` is it a radius bound at all).
+/// - `alpha < 1`: stop earlier, trading recall for postings.
+///
+/// For an f32 column `theta` is the exact `k`-th score; for a quantized one
+/// it is the `k`-th largest `estimate - error` (the RaBitQ-bound stop:
+/// the next posting's best case is below the `k`-th candidate's worst).
+fn bound_stop(theta: f64, rank_score: f32, alpha: f32) -> bool {
+    theta >= alpha as f64 * (1.0 - rank_score as f64)
 }
 
 /// Whether `SegmentWriter` leaves `postings-*.bin` shards raw —
@@ -7486,6 +7562,9 @@ pub struct KnnScanStats {
     /// f32 postings read and scored from the probe's reused buffers,
     /// without building a posting.
     pub postings_scanned: usize,
+    /// Budgeted probes that `KOSHA_KNN_BOUND_STOP_ALPHA` ended before their
+    /// last budgeted posting (#384).
+    pub bound_stops: usize,
 }
 
 impl KnnScanStats {
@@ -7497,6 +7576,7 @@ impl KnnScanStats {
         self.postings_cached += other.postings_cached;
         self.postings_decoded += other.postings_decoded;
         self.postings_scanned += other.postings_scanned;
+        self.bound_stops += other.bound_stops;
     }
 }
 
@@ -7636,9 +7716,37 @@ impl Ord for TopKEntry {
 struct CandidateSink {
     k: usize,
     top: Option<std::collections::BinaryHeap<TopKEntry>>,
+    /// A quantized column's `k` largest `estimate - error`, kept only for
+    /// [`Self::kth_lower`] (the #384 bound stop).
+    lower: Option<std::collections::BinaryHeap<LowerBound>>,
     scored: Vec<(u32, f64)>,
     errors: Vec<f32>,
     count: usize,
+}
+
+/// A candidate's lowest possible score, ordered so that a `BinaryHeap`
+/// keeps the smallest on top.
+#[derive(Debug, Clone, Copy)]
+struct LowerBound(f64);
+
+impl PartialEq for LowerBound {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for LowerBound {}
+
+impl PartialOrd for LowerBound {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for LowerBound {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other.0.total_cmp(&self.0)
+    }
 }
 
 impl CandidateSink {
@@ -7651,6 +7759,7 @@ impl CandidateSink {
             k,
             // Not `with_capacity(k)`: `k` is caller-supplied.
             top: running.then(std::collections::BinaryHeap::new),
+            lower: None,
             scored: Vec::new(),
             errors: Vec::new(),
             count: 0,
@@ -7664,6 +7773,16 @@ impl CandidateSink {
         let Some(top) = self.top.as_mut() else {
             self.scored.push((id, score));
             self.errors.push(error);
+            if let Some(lower) = self.lower.as_mut() {
+                let bound = LowerBound(score - error as f64);
+                if lower.len() < self.k {
+                    lower.push(bound);
+                } else if let Some(mut worst) = lower.peek_mut() {
+                    if bound.0 > worst.0 {
+                        *worst = bound;
+                    }
+                }
+            }
             return;
         };
         if top.len() < self.k {
@@ -7672,6 +7791,31 @@ impl CandidateSink {
             if score > worst.score {
                 *worst = TopKEntry { score, seq, id };
             }
+        }
+    }
+
+    /// Also track what [`Self::kth_lower`] needs on a quantized column (an
+    /// f32 column's running top-`k` already holds it).
+    fn tracking_kth_lower(mut self) -> Self {
+        if self.top.is_none() {
+            self.lower = Some(std::collections::BinaryHeap::new());
+        }
+        self
+    }
+
+    /// The `k`-th largest score a candidate is guaranteed to have so far:
+    /// the exact `k`-th score of an f32 column, the `k`-th largest
+    /// `estimate - error` of a quantized one tracked by
+    /// [`Self::tracking_kth_lower`]. `None` until `k` candidates are in,
+    /// and for `k == 0`.
+    fn kth_lower(&self) -> Option<f64> {
+        if self.k == 0 {
+            return None;
+        }
+        match (&self.top, &self.lower) {
+            (Some(top), _) if top.len() >= self.k => top.peek().map(|e| e.score),
+            (None, Some(lower)) if lower.len() >= self.k => lower.peek().map(|b| b.0),
+            _ => None,
         }
     }
 
@@ -9812,13 +9956,35 @@ impl SegmentReader {
             self.prefetch_vector_postings(vi, ranking.budgeted.iter().map(|&i| i as usize), fetch);
 
         let mut probes = 0usize;
+        let stop_alpha = knn_bound_stop_alpha();
         let mut sink = CandidateSink::new(vi, k);
+        if stop_alpha.is_some() {
+            sink = sink.tracking_kth_lower();
+        }
         let lanes = DotLanes::from_env();
         let unit = Self::unit_query(vi, query);
         let mut scan =
             PostingScan::new(&self.segment_dir, vi, Self::probe_query(vi, query), accept);
         scan.stats.rank_nanos += rank_nanos;
         for &range_idx in &ranking.budgeted {
+            if let (Some(alpha), Some(theta)) = (stop_alpha, sink.kth_lower()) {
+                // A plan built from candidates only kept no scores: this
+                // is the expression its scores came from.
+                let rank_score = match &ranking.bounds {
+                    Some(bounds) => bounds[range_idx as usize],
+                    None => Self::centroid_score(
+                        vi,
+                        unit.as_deref(),
+                        query,
+                        range_idx as usize,
+                        knn_probe_radius_alpha(),
+                    ),
+                };
+                if bound_stop(theta, rank_score, alpha) {
+                    scan.stats.bound_stops += 1;
+                    break;
+                }
+            }
             probes += 1;
             self.scan_posting(
                 &mut scan,

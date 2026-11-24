@@ -24,6 +24,13 @@
 #   a0rel1m500, a0rel0.5m1000
 #                    KOSHA_KNN_RELATIVE_MIN_PROBES 500 / 1000 (default floor is
 #                    num_candidates = 100, ~0.56 recall at 10M)
+# The shorthand "bound" is the alpha-scaled bound stop
+# (KOSHA_KNN_BOUND_STOP_ALPHA, default OFF) at the default ranking:
+#   f0.05            baseline
+#   b1, b0.95, b0.9, b0.85
+#                    stop a segment's probe once its k-th score reaches
+#                    alpha x the next posting's similarity bound (Block-Max
+#                    Pruning reports alpha=0.85 near-lossless on its index)
 # Each recall query reports which rule set its cutoff
 # (timings.knn_cutoff_rule: budget / eps / floor / zero_best), and the
 # report tabulates the shares, so a point that misses the bar can be read.
@@ -59,7 +66,7 @@ BENCH_DIR="$(cd "$HERE/.." && pwd)"
 PY=~/venv311/bin/python3
 # The knobs a point may set. All are read once at server start, hence the
 # container recreate per point.
-KNOBS="KOSHA_KNN_BUDGET_FRACTION KOSHA_KNN_BUDGET_MAX_CAP KOSHA_KNN_RELATIVE_CUTOFF_EPS KOSHA_KNN_RELATIVE_MIN_PROBES KOSHA_KNN_PROBE_RADIUS_ALPHA"
+KNOBS="KOSHA_KNN_BUDGET_FRACTION KOSHA_KNN_BUDGET_MAX_CAP KOSHA_KNN_RELATIVE_CUTOFF_EPS KOSHA_KNN_RELATIVE_MIN_PROBES KOSHA_KNN_PROBE_RADIUS_ALPHA KOSHA_KNN_BOUND_STOP_ALPHA"
 
 if [ "$POINTS" = fractions ]; then
   POINTS="f0.05:KOSHA_KNN_BUDGET_FRACTION=0.05;f0.03:KOSHA_KNN_BUDGET_FRACTION=0.03;f0.02:KOSHA_KNN_BUDGET_FRACTION=0.02;f0.01:KOSHA_KNN_BUDGET_FRACTION=0.01"
@@ -71,6 +78,10 @@ if [ "$POINTS" = relative ]; then
   POINTS="f0.05:KOSHA_KNN_BUDGET_FRACTION=0.05;a0:$A0;a0.5:KOSHA_KNN_PROBE_RADIUS_ALPHA=0.5"
   POINTS="$POINTS;a0rel0.5:$A0,$EPS=0.5;a0rel1:$A0,$EPS=1.0;a0rel2:$A0,$EPS=2.0"
   POINTS="$POINTS;a0rel1m500:$A0,$EPS=1.0,$MIN=500;a0rel0.5m1000:$A0,$EPS=0.5,$MIN=1000"
+fi
+if [ "$POINTS" = bound ]; then
+  B=KOSHA_KNN_BOUND_STOP_ALPHA
+  POINTS="f0.05:KOSHA_KNN_BUDGET_FRACTION=0.05;b1:$B=1;b0.95:$B=0.95;b0.9:$B=0.9;b0.85:$B=0.85"
 fi
 case "$POINTS" in *[!A-Za-z0-9_.=:\;,-]*) echo "points may only contain [A-Za-z0-9_.=:;,-]: $POINTS"; exit 1 ;; esac
 
