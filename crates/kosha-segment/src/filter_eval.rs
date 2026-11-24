@@ -738,6 +738,64 @@ mod tests {
     }
 
     #[test]
+    fn exists_matches_indexed_values_and_must_not_matches_the_complement() {
+        use serde_json::json;
+
+        let dir = temp_dir("exists");
+        let docs = [
+            (
+                DocumentId("present".into()),
+                vec![
+                    Field::text("body", ""),
+                    Field::keyword("tag", ""),
+                    Field::integer("page", 0),
+                    Field::float_val("confidence", 0.0),
+                    Field::boolean("active", false),
+                    Field::date_val("sentAt", "2026-01-01"),
+                    Field::geo_point("location", 0.0, 0.0),
+                ],
+            ),
+            (
+                DocumentId("missing".into()),
+                vec![Field::keyword("other", "value")],
+            ),
+            (
+                DocumentId("empty_list".into()),
+                vec![Field::keyword("tag", "[]")],
+            ),
+        ];
+        for version in [1, 2] {
+            let reader = build(&dir.join(format!("v{version}")), version, &docs);
+            let matches = |filter| {
+                let clause = serde_json::from_value(filter).unwrap();
+                reader
+                    .evaluate_filter(&clause)
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>()
+            };
+            for field in [
+                "body",
+                "tag",
+                "page",
+                "confidence",
+                "active",
+                "sentAt",
+                "location",
+            ] {
+                let exists = json!({"exists": {"field": field}});
+                assert_eq!(matches(exists.clone()), [0], "v{version}, {field}");
+                assert_eq!(
+                    matches(json!({"bool": {"must_not": [exists]}})),
+                    [1, 2],
+                    "v{version}, {field}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn clauses_select_documents() {
         // Guard against a vacuous differential test: the corpus must make
         // the interesting clauses non-trivial.

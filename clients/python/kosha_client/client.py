@@ -533,8 +533,10 @@ class KoshaClient:
             return {"range": out}
 
         if kind == "exists":
-            field = (spec or {}).get("field")
-            if not field:
+            if not isinstance(spec, dict):
+                raise cls._unsupported(f"exists clause {clause!r}")
+            field = spec.get("field")
+            if not isinstance(field, str) or not field or spec.keys() - {"field", "boost"}:
                 raise cls._unsupported(f"exists clause {clause!r}")
             return {"exists": {"field": field}}
 

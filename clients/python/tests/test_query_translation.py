@@ -118,6 +118,33 @@ def test_exists_and_range_options():
     assert ranged == {"range": {"publishedAt": {"gte": "2024-01-01", "lte": "2024-12-31"}}}
 
 
+def test_exists_survives_search_translation_in_query_and_bool_context():
+    exists = {"exists": {"field": "sentAt"}}
+    missing = {"bool": {"must_not": [exists]}}
+    assert translate({"query": exists})["filter"] == exists
+    assert translate({"query": missing})["filter"] == missing
+    assert translate({"query": {"bool": {"filter": [exists]}}})["filter"] == {
+        "bool": {"must": [exists]}
+    }
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        None,
+        {},
+        "sentAt",
+        ["sentAt"],
+        {"field": ""},
+        {"field": 1},
+        {"field": "sentAt", "extra": True},
+    ],
+)
+def test_malformed_exists_is_refused(spec):
+    message = refused({"query": {"bool": {"must_not": [{"exists": spec}]}}})
+    assert "exists clause" in message
+
+
 def test_prefix_short_and_long_forms():
     assert KoshaClient._to_filter({"prefix": {"path": "/matters/2026/"}}) == {
         "prefix": {"path": "/matters/2026/"}

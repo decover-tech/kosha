@@ -915,9 +915,16 @@ impl<'de> Deserialize<'de> for FilterClause {
             "match_all" => Ok(FilterClause::MatchAll {
                 match_all: Some(inner),
             }),
-            "exists" => Ok(FilterClause::Exists {
-                exists: body(inner)?,
-            }),
+            "exists" => {
+                if !inner.is_object() {
+                    return Err(D::Error::custom("exists clause body must be an object"));
+                }
+                let exists: ExistsFilter = body(inner)?;
+                if exists.field.is_empty() {
+                    return Err(D::Error::custom("exists field must be non-empty"));
+                }
+                Ok(FilterClause::Exists { exists })
+            }
             "geo_distance" => Ok(FilterClause::GeoDistance {
                 geo_distance: body(inner)?,
             }),
@@ -4537,6 +4544,30 @@ mod filter_clause_parsing {
         assert!(parse("[]").is_err());
         assert!(parse("\"term\"").is_err());
         assert!(parse("null").is_err());
+    }
+
+    #[test]
+    fn exists_filter_round_trips() {
+        let source = serde_json::json!({"exists": {"field": "sentAt"}});
+        let clause = parse(&source.to_string()).unwrap();
+        assert!(matches!(&clause, FilterClause::Exists { exists } if exists.field == "sentAt"));
+        assert_eq!(serde_json::to_value(clause).unwrap(), source);
+    }
+
+    #[test]
+    fn malformed_exists_filters_are_rejected() {
+        for bad in [
+            r#"{"exists": null}"#,
+            r#"{"exists": "sentAt"}"#,
+            r#"{"exists": ["sentAt"]}"#,
+            r#"{"exists": {}}"#,
+            r#"{"exists": {"field": ""}}"#,
+            r#"{"exists": {"field": 1}}"#,
+            r#"{"exists": {"field": "sentAt", "extra": true}}"#,
+            r#"{"bool": {"must_not": [{"exists": {"field": null}}]}}"#,
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
