@@ -4098,10 +4098,11 @@ impl AppState {
         pages: &[PageSegment<'_>],
         request: &Arc<RequestHydration>,
         rid: &str,
+        mode: doc_spans::ReadMode,
     ) -> doc_spans::PageFetchStats {
         let mut stats = doc_spans::PageFetchStats::default();
         let mut fallback_error = None;
-        let whole: Vec<PathBuf> = match (self.doc_read_mode, &self.s3_storage) {
+        let whole: Vec<PathBuf> = match (mode, &self.s3_storage) {
             (_, None) => return stats,
             (doc_spans::ReadMode::Whole, Some(_)) => {
                 pages.iter().map(|p| p.segment_dir.to_path_buf()).collect()
@@ -4849,39 +4850,6 @@ impl AppState {
             request,
             true,
         );
-        if let Some(field) = knn_field.filter(|_| exact_quantized_vectors) {
-            // Whole-file page hydration can install exact vectors after the
-            // first ranking. Make them part of scoring instead, so every
-            // page ranks the same quantized shortlist with exact scores.
-            let vectors = kosha_segment::DOC_VECTORS_FILE;
-            let exact_paths: Vec<_> = to_hydrate
-                .iter()
-                .filter(|p| {
-                    manifest_footers.get(*p).is_some_and(|f| {
-                        f.doc_vectors
-                            && f.vector_fields.as_ref().is_some_and(|cols| {
-                                cols.iter()
-                                    .any(|c| c.name == field && !c.quantization.is_f32())
-                            })
-                    }) && !file_present_nonempty(&p.join(vectors))
-                })
-                .cloned()
-                .collect();
-            if !exact_paths.is_empty() && !request.is_shed() {
-                let _permit = self.hydration_semaphore.acquire("scoring_set");
-                let (files, bytes) = self.ensure_files_local(&exact_paths, vectors, request);
-                outcome.files_fetched += files;
-                outcome.bytes_fetched += bytes;
-                outcome.rounds += 1;
-                outcome.missing.extend(
-                    exact_paths
-                        .iter()
-                        .filter(|p| !file_present_nonempty(&p.join(vectors)))
-                        .filter_map(|p| p.strip_prefix(&self.data_dir).ok())
-                        .map(|p| p.to_string_lossy().into_owned()),
-                );
-            }
-        }
         let postings_outcome = self.ensure_query_postings(
             ns,
             manifest,
@@ -4890,13 +4858,16 @@ impl AppState {
             &posting_files,
             request,
         );
-        if let (Some(field), false) = (knn_field, filter_files.is_empty()) {
+        if let Some(field) =
+            knn_field.filter(|_| !filter_files.is_empty() || exact_quantized_vectors)
+        {
             self.fetch_exact_knn_headers(
                 &to_hydrate,
                 field,
                 &manifest_footers,
                 request,
                 &mut outcome,
+                filter_files.is_empty(),
             );
         }
         outcome.files_fetched += postings_outcome.files_fetched;
@@ -5115,6 +5086,7 @@ impl AppState {
         manifest_footers: &HashMap<PathBuf, &kosha_core::Footer>,
         request: &Arc<RequestHydration>,
         outcome: &mut HydrationOutcome,
+        quantized_only: bool,
     ) {
         let Some(ref s3) = self.s3_storage else {
             return;
@@ -5129,9 +5101,12 @@ impl AppState {
                     local_footer.as_ref()
                 }
             };
-            if !exact_knn_wants_doc_vectors_header(footer, field)
-                || doc_spans::doc_vectors_header_local(seg)
-            {
+            let needs_header = if quantized_only {
+                knn_wants_doc_vectors_header_with(footer, field, true)
+            } else {
+                exact_knn_wants_doc_vectors_header(footer, field)
+            };
+            if !needs_header || doc_spans::doc_vectors_header_local(seg) {
                 continue;
             }
             let (Some(footer), Ok(rel)) = (footer, seg.strip_prefix(&self.data_dir)) else {
@@ -5175,8 +5150,7 @@ impl AppState {
                 doc_spans::HeaderStatus::Failed => {
                     outcome.exact_knn_headers_missing += 1;
                     eprintln!(
-                        "WARN: doc_vectors.bin header of {} could not be fetched for a filtered \
-                         kNN on '{field}': its exact path scans the column's vector postings",
+                        "WARN: doc_vectors.bin header of {} could not be fetched for kNN on '{field}'",
                         dir.display()
                     );
                 }
@@ -9771,15 +9745,14 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
         let needs_filters = query_filter_fields(search_query);
         let exact_quantized_vectors = fused
             && state.s3_storage.is_some()
-            && state.doc_read_mode == doc_spans::ReadMode::Whole
             && search_query
                 .knn
                 .as_ref()
                 .is_some_and(|knn| !knn.is_late_interaction());
         let needs_vectors_key = knn_verdict_key(search_query);
         let needs_vectors = needs_vectors_key.as_deref();
-        // An evicted exact-vector sidecar silently changes the scores,
-        // so this path must recheck the scoring set on every request.
+        // Exact shortlist rescoring needs its header even if a previous
+        // non-fusion query marked the scoring set warm.
         let cached_covers = !exact_quantized_vectors
             && state
                 .completed_hydrations
@@ -9905,7 +9878,12 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     let ensure_doc_store = |pages: &[PageSegment<'_>]| {
         // Same accountant as the scoring-set fetch above: the request pays
         // for its page's bytes, so the request's ceiling has to cover them.
-        let stats = state.hydrate_page_docs(pages, &hydration_request, &rid);
+        let mode = if search_query.multi_rrf().is_some() && pages.iter().any(|page| page.vectors) {
+            doc_spans::ReadMode::Ranged
+        } else {
+            state.doc_read_mode
+        };
+        let stats = state.hydrate_page_docs(pages, &hydration_request, &rid, mode);
         page_fetch.lock().unwrap().add(&stats);
     };
     #[cfg(feature = "s3")]
@@ -10547,7 +10525,7 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
     let ensure_doc_store = |pages: &[PageSegment<'_>]| {
         // Same accountant as the scoring-set fetch above: the request pays
         // for its page's bytes, so the request's ceiling has to cover them.
-        let stats = state.hydrate_page_docs(pages, &hydration_request, &rid);
+        let stats = state.hydrate_page_docs(pages, &hydration_request, &rid, state.doc_read_mode);
         page_fetch.lock().unwrap().add(&stats);
     };
     #[cfg(feature = "s3")]
@@ -18554,7 +18532,7 @@ mod tests {
     #[test]
     fn weighted_rrf_quantized_cursor_is_stable_after_cold_whole_file_hydration() {
         const NS: &str = "weighted-rrf-cold-i8";
-        let (_s3, mut state, _, paths) = single_flight_node(
+        let (s3, mut state, _, paths) = single_flight_node(
             NS,
             |w| {
                 w.with_vector_store_mode(kosha_segment::VectorStoreMode::Sidecar)
@@ -18562,12 +18540,30 @@ mod tests {
                         kosha_core::VectorQuantization::I8,
                     ))
             },
-            |i| vec![Field::vector("emb", vec![1.0, i as f32 * 0.001, 0.0, 0.0])],
+            |i| {
+                if i == 0 {
+                    vec![
+                        Field::vector("emb", vec![-1.0, 0.0, 0.0, 0.0]),
+                        Field::vector("padding", vec![1.0; 24_000]),
+                        Field::vector("more_padding", vec![1.0; 24_000]),
+                    ]
+                } else {
+                    vec![Field::vector("emb", vec![1.0, i as f32 * 0.001, 0.0, 0.0])]
+                }
+            },
         );
         state.doc_read_mode = doc_spans::ReadMode::Whole;
         state.posting_read_mode = doc_spans::ReadMode::Whole;
+        state.hydrate_request_max_bytes = 160 * 1024;
         state.searcher = Searcher::new(state.data_dir.clone()).with_knn_global_rescore(false);
         let sidecar = kosha_segment::DOC_VECTORS_FILE;
+        for path in &paths {
+            let relative = path.strip_prefix(&state.data_dir).unwrap();
+            let len = fs::metadata(s3.root.join(relative).join(sidecar))
+                .unwrap()
+                .len();
+            assert!(len > state.hydrate_request_max_bytes);
+        }
         assert!(paths.iter().all(|p| !p.join(sidecar).exists()));
         let search = |query: &serde_json::Value| {
             let response = handle_search_post(query.to_string().as_bytes(), &state);
@@ -18581,14 +18577,14 @@ mod tests {
             "namespace": NS,
             "query_text": "",
             "max_results": 1,
-            "source_excludes": ["emb"],
             "rank_by": {"rrf": {"queries": [{"knn": {
                 "field": "emb", "vector": [1.0, 0.01, 0.0, 0.0], "k": 2
             }}]}}
         });
         let first = search(&query);
         assert_eq!(first.results[0].doc_id.0, "d0-5");
-        assert!(paths.iter().all(|p| p.join(sidecar).exists()));
+        assert_eq!(first.results[0].fields[0].name, "emb");
+        assert!(paths.iter().all(|p| !p.join(sidecar).exists()));
         query["search_after"] =
             serde_json::json!([first.results[0].score.to_string(), first.results[0].doc_id]);
         let second = search(&query);

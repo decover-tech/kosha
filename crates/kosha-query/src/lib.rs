@@ -5453,6 +5453,7 @@ impl Searcher {
         // Fetches the probed vector postings a segment does not hold
         // locally (#245); see `Searcher::search_with_hydrators`.
         vector_fetch: Option<VectorSpanFetch<'_>>,
+        fused_leg: bool,
         // Namespace-level BM25 statistics (issue #246); `None` scores this
         // segment with its own `N` / `df` / `avgdl`.
         corpus: Option<&Arc<CorpusStats>>,
@@ -6974,6 +6975,16 @@ impl Searcher {
                     });
                     open_stats.add_knn_scan(&scan);
                     match exact {
+                        Some(Ok(exact))
+                            if fused_leg
+                                && index.is_quantized()
+                                && reader.footer().doc_vectors
+                                && exact.source == kosha_segment::ExactKnnSource::Postings =>
+                        {
+                            knn_segment_degraded = true;
+                            knn_segment_failed = true;
+                            Vec::new()
+                        }
                         Some(Ok(exact)) => {
                             open_stats
                                 .knn_postings
@@ -7014,6 +7025,44 @@ impl Searcher {
                         }
                     }
                     let (probe, scan) = kosha_segment::with_knn_scan_stats(|| match knn_cutoff {
+                        _ if fused_leg && index.is_quantized() && reader.footer().doc_vectors => {
+                            let budget = match (knn_cutoff, knn_ranking) {
+                                (_, Some(ranking)) => kosha_segment::KnnProbeBudget::Planned {
+                                    ranking,
+                                    refill: knn_refill,
+                                },
+                                (Some((max_distance, max_probes)), None) => {
+                                    kosha_segment::KnnProbeBudget::Within {
+                                        max_distance,
+                                        max_probes,
+                                        refill: knn_refill,
+                                    }
+                                }
+                                (None, None) => {
+                                    kosha_segment::KnnProbeBudget::Nprobe(knn.num_candidates)
+                                }
+                            };
+                            reader
+                                .knn_rescore_shortlist_fetching(
+                                    &knn.field,
+                                    &knn.vector,
+                                    fetch_k,
+                                    budget,
+                                    knn_accept_dyn,
+                                    vector_fetch,
+                                )
+                                .map(|r| {
+                                    r.map(|(hits, probes)| {
+                                        open_stats
+                                            .knn_postings
+                                            .fetch_add(probes, Ordering::Relaxed);
+                                        if probes > 0 {
+                                            open_stats.knn_segments.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        hits
+                                    })
+                                })
+                        }
                         Some((cutoff, effective_budget)) => match knn_ranking {
                             // The plan already ranked this segment's
                             // postings inside the cutoff (#436).
@@ -7512,7 +7561,7 @@ impl Searcher {
         vector_fetch: Option<VectorSpanFetch<'_>>,
     ) -> Result<(SearchResult, SearchPhaseStats), KoshaError> {
         let (page, mut result, mut stats) =
-            self.rank_inner(namespace, manifest, query, tombstones, vector_fetch)?;
+            self.rank_inner(namespace, manifest, query, tombstones, vector_fetch, false)?;
         let started = Instant::now();
         result.results = Self::materialize_page(&page, query, doc_store_hydrator, &mut stats)?;
         stats.materialize_wall_ms += started.elapsed().as_secs_f64() * 1e3;
@@ -7526,6 +7575,7 @@ impl Searcher {
         query: &SearchQuery,
         tombstones: Option<&HashMap<kosha_core::SegmentId, HashSet<u32>>>,
         vector_fetch: Option<VectorSpanFetch<'_>>,
+        fused_leg: bool,
     ) -> Result<(Vec<HitCandidate>, SearchResult, SearchPhaseStats), KoshaError> {
         // Out-of-range BM25 parameters are a client error, not something
         // to clamp: every entry point funnels through here.
@@ -7548,8 +7598,14 @@ impl Searcher {
             let mut stats = SearchPhaseStats::default();
             let mut vector_searched = false;
             for (i, subquery) in subqueries.enumerate() {
-                let (page, result, phase) =
-                    self.rank_inner(namespace, manifest, &subquery, tombstones, vector_fetch)?;
+                let (page, result, phase) = self.rank_inner(
+                    namespace,
+                    manifest,
+                    &subquery,
+                    tombstones,
+                    vector_fetch,
+                    true,
+                )?;
                 let weight = rrf.weights.as_ref().map_or(1.0, |weights| weights[i]);
                 fuse_ranked_hits(
                     &mut fused,
@@ -7826,7 +7882,8 @@ impl Searcher {
         // the cap far fewer groups (a dominant group can fill all of it).
         let knn_global: Option<GlobalKnnOutcome> = match query.knn {
             Some(ref knn)
-                if self.knn_global_rescore
+                if !fused_leg
+                    && self.knn_global_rescore
                     && !knn.is_late_interaction()
                     && knn.filter.is_none()
                     && query.filter.is_none()
@@ -7913,6 +7970,7 @@ impl Searcher {
                     .and_then(|global| global.segments.get(&entry.segment_id)),
                 &filter_keys,
                 vector_fetch,
+                fused_leg,
                 corpus.as_ref(),
                 shared_wand,
             )
