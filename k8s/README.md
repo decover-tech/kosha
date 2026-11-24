@@ -203,7 +203,7 @@ reclaimPolicy: Delete
 ## Encryption in transit
 
 The reference for every setting is `docs/configuration.md`, "TLS between
-pods" and "TLS to Postgres". Neither is turned on by the stage or prod
+pods", "TLS to Postgres" and "TLS to S3". Neither is turned on by the stage or prod
 overlays; turning them on is a per-cluster step.
 
 **Between pods.** `components/internal-tls` is an opt-in kustomize

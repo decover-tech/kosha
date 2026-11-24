@@ -592,7 +592,7 @@ mode, a missing or unparsable file, half a client identity, or a TLS setting whi
 
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
-| `KOSHA_INTERNAL_TLS` | `off`: plain `http://` to peers, as before. `on`: peers are fetched over `https://` and verified against `KOSHA_INTERNAL_TLS_CA_PATH`, and an `https://` `KOSHA_INGEST_HOST` is verified the same way (an `http://` one logs a warning). `required`: as `on`, and the pod refuses to start with an `http://` `KOSHA_INGEST_HOST`, without `KOSHA_TLS_CERT_PATH`, or with a `DATABASE_URL` that does not force TLS (see "TLS to Postgres" below) | `off` | enum |
+| `KOSHA_INTERNAL_TLS` | `off`: plain `http://` to peers, as before. `on`: peers are fetched over `https://` and verified against `KOSHA_INTERNAL_TLS_CA_PATH`, and an `https://` `KOSHA_INGEST_HOST` is verified the same way (an `http://` one logs a warning). `required`: as `on`, and the pod refuses to start with an `http://` `KOSHA_INGEST_HOST`, without `KOSHA_TLS_CERT_PATH`, with a `DATABASE_URL` that does not force TLS (see "TLS to Postgres" below), or with a plain-HTTP custom S3 endpoint (see "TLS to S3" below) | `off` | enum |
 | `KOSHA_INTERNAL_TLS_CA_PATH` | PEM CA bundle peer certificates must chain to. Required unless `off`. Only this bundle is trusted for internal traffic, not the platform roots | unset | path |
 | `KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH` | PEM client certificate chain, presented to peers that ask for one (their `KOSHA_TLS_CLIENT_CA_PATH`). Set it together with `KOSHA_INTERNAL_TLS_CLIENT_KEY_PATH` or not at all | unset (no client certificate) | path |
 | `KOSHA_INTERNAL_TLS_CLIENT_KEY_PATH` | PEM private key for `KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH` | unset | path |
@@ -642,6 +642,11 @@ For example:
 postgres://kosha:<password>@<host>:5432/kosha?sslmode=verify-full&sslrootcert=/etc/kosha/pg/ca.crt
 ```
 
+Query parameters are read the way the client reads them: keys and values are percent-decoded
+(`%XX`, and `+` as a space), values are not trimmed, and the last `sslmode` or `ssl-mode` wins.
+So `?sslmode=require&ssl%2Dmode=disable` counts as `disable`, and `sslmode=require+` is not
+`require`.
+
 `PGSSLMODE` and `PGSSLROOTCERT` are read when the URL does not name the parameter. The client
 ignores a `PGSSLMODE` it cannot parse, surrounding whitespace or a trailing newline included
 (a Secret made with `echo` has one), and uses `prefer`; the check below does not accept such a value
@@ -653,6 +658,23 @@ server, `migrate` and `migrate-namespace` exit before opening a connection unles
 none) logs one `WARN:` line at startup. With `off` nothing is checked. Neither message prints
 the URL. The check reads only the mode, so `migrate` and `migrate-namespace` do not need the
 `KOSHA_INTERNAL_TLS_*` files mounted.
+
+#### TLS to S3
+
+Segment files, deletion vectors and S3 WAL group commits hold tenant data. With no custom
+endpoint, the AWS SDK talks to S3 over HTTPS. A custom endpoint (MinIO, an S3-compatible store,
+a VPC endpoint URL) is used as written, so `http://` sends that data in plaintext. The endpoint
+in effect is the first of `KOSHA_S3_ENDPOINT`, `AWS_ENDPOINT_URL` and `AWS_ENDPOINT_URL_S3`
+that is set (the SDK reads the last one itself when Kosha passes no endpoint).
+
+`KOSHA_INTERNAL_TLS` holds this hop to the same rule. With `required`, the server, `migrate`,
+`migrate-namespace` and `reconcile-usage` exit at startup (`FATAL: invalid S3 encryption config:
+KOSHA_S3_ENDPOINT must use https:// ...`) unless that endpoint is `https://`. With `on`, any
+other endpoint logs one `WARN:` line. With `off` nothing is checked. Neither message prints the
+endpoint. Like the Postgres check, it reads only the mode. A local MinIO over plain HTTP (the
+`docker compose` stack) keeps working with the default `off`. For an `https://` endpoint with a
+private CA, the SDK verifies against the platform roots (`SSL_CERT_FILE`), not
+`KOSHA_INTERNAL_TLS_CA_PATH`.
 
 `GET /internal/segment/...` streams the cached file as raw `application/octet-stream`. Peers on
 builds from before #259 send base64 with `x-kosha-encoding: base64`; the client still decodes

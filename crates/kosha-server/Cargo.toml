@@ -59,6 +59,9 @@ http = { version = "1.5.0", optional = true }
 # an older build answers with `x-kosha-encoding: base64`; `fetch_from_peer`
 # decodes that so a rolling upgrade with mixed peers keeps working.
 base64 = "0.22"
+# Decodes `DATABASE_URL` query parameters exactly as the Postgres client
+# (sqlx, through `url`) does, for the internal-TLS sslmode check.
+form_urlencoded = "1"
 # Per-file checksums in the segment `_COMMIT` marker (segment_commit.rs).
 crc32fast = "1"
 # `GET /metrics` (#223): Prometheus text exposition. Forbids unsafe code

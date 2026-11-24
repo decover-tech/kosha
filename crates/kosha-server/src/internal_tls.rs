@@ -377,17 +377,87 @@ fn check_database_url_lookup(get: impl Fn(&str) -> Option<String>) -> Result<(),
     Ok(())
 }
 
+/// The variables an S3 endpoint can come from, in the order they take
+/// effect: `S3Config::try_from_env` reads the first two and passes the
+/// value to the SDK, which reads `AWS_ENDPOINT_URL_S3` itself when no
+/// endpoint is passed.
+pub(crate) const S3_ENDPOINT_ENVS: [&str; 3] = [
+    "KOSHA_S3_ENDPOINT",
+    "AWS_ENDPOINT_URL",
+    "AWS_ENDPOINT_URL_S3",
+];
+
+/// Validate the S3 endpoint against the mode, like
+/// [`InternalTls::check_ingest_host`]. Segment files, deletion vectors and
+/// WAL group commits hold tenant data, so a custom endpoint (MinIO, an
+/// S3-compatible store, a VPC endpoint URL) must be `https://` under
+/// `required`; `on` allows anything else with a warning. No endpoint means
+/// the SDK's default, which is always HTTPS.
+///
+/// `source` names the variable the endpoint came from. No message quotes
+/// the endpoint itself: a URL can carry credentials.
+fn check_s3_endpoint_for(
+    mode: Mode,
+    source: &str,
+    endpoint: &str,
+) -> Result<Option<String>, String> {
+    let https = endpoint
+        .trim()
+        .get(..8)
+        .is_some_and(|s| s.eq_ignore_ascii_case("https://"));
+    match mode {
+        _ if https => Ok(None),
+        Mode::Off => Ok(None),
+        Mode::On => Ok(Some(format!(
+            "{source} is not https://: segment, deletion-vector and WAL objects cross the \
+             network unencrypted although {MODE_ENV}=on"
+        ))),
+        Mode::Required => Err(format!(
+            "{source} must use https:// with {MODE_ENV}=required"
+        )),
+    }
+}
+
+/// [`check_s3_endpoint_for`] for the process environment: the endpoint in
+/// effect is the first of [`S3_ENDPOINT_ENVS`] that is set and not empty.
+/// Prints a `WARN:` line for a warning; `Err` when the process must not
+/// talk to S3. Reads only the mode, like [`check_database_url_env`], so the
+/// `migrate` Jobs need no TLS files.
+#[cfg_attr(not(feature = "s3"), allow(dead_code))]
+pub(crate) fn check_s3_endpoint_env() -> Result<(), String> {
+    check_s3_endpoint_lookup(|name| std::env::var(name).ok())
+}
+
+/// [`check_s3_endpoint_env`] over any variable source (tests).
+#[cfg_attr(not(any(test, feature = "s3")), allow(dead_code))]
+fn check_s3_endpoint_lookup(get: impl Fn(&str) -> Option<String>) -> Result<(), String> {
+    let Some((source, endpoint)) = S3_ENDPOINT_ENVS
+        .iter()
+        .find_map(|name| get(name).filter(|v| !v.is_empty()).map(|v| (*name, v)))
+    else {
+        return Ok(());
+    };
+    let mode = Mode::parse(&get(MODE_ENV).unwrap_or_default())?;
+    if let Some(warning) = check_s3_endpoint_for(mode, source, &endpoint)? {
+        eprintln!("WARN: {warning}");
+    }
+    Ok(())
+}
+
 /// The `sslmode` (or `ssl-mode`) query parameter of a Postgres URL,
 /// lowercased; the last one wins, as in the client's own parser.
+///
+/// Keys and values are decoded the way the client decodes them
+/// (`application/x-www-form-urlencoded`: `%XX` and `+`), and values are not
+/// trimmed. Otherwise `?sslmode=require&ssl%2Dmode=disable` would pass the
+/// check as `require` while the client connects with `disable`.
 fn database_url_ssl_mode(url: &str) -> Option<String> {
     let (_, query) = url.split_once('?')?;
     let query = query.split('#').next().unwrap_or(query);
-    query
-        .split('&')
-        .filter_map(|pair| pair.split_once('='))
-        .filter(|(key, _)| matches!(*key, "sslmode" | "ssl-mode"))
-        .map(|(_, value)| value.trim().to_ascii_lowercase())
-        .next_back()
+    form_urlencoded::parse(query.as_bytes())
+        .filter(|(key, _)| matches!(key.as_ref(), "sslmode" | "ssl-mode"))
+        .map(|(_, value)| value.to_ascii_lowercase())
+        .last()
 }
 
 /// Checks the chain against the internal CA as usual, but matches the
@@ -747,6 +817,145 @@ mod tests {
             check_database_url_for(required.mode, &url("?sslmode=require"), Some("disable")),
             Ok(None)
         );
+    }
+
+    /// `sslmode=require&ssl%2Dmode=disable` connects with `disable`: the
+    /// client decodes the key, so the check must too.
+    #[test]
+    fn database_url_sslmode_is_decoded_like_the_client() {
+        const BASE: &str = "postgres://kosha:pw@pg.internal:5432/kosha";
+        let url = |query: &str| format!("{BASE}{query}");
+        for (query, expected) in [
+            ("?sslmode=require&ssl%2Dmode=disable", Some("disable")),
+            ("?sslmode=require&%73slmode=prefer", Some("prefer")),
+            (
+                "?sslmode=disable&ssl%2dmode=verify%2Dfull",
+                Some("verify-full"),
+            ),
+            ("?sslmode=%72equire", Some("require")),
+            // The client does not trim: `require ` is a parse error there.
+            ("?sslmode=require+", Some("require ")),
+            ("?sslmode=require%20", Some("require ")),
+            ("?sslmode=require#sslmode=disable", Some("require")),
+            ("?application_name=a%26sslmode%3Ddisable", None),
+        ] {
+            assert_eq!(
+                database_url_ssl_mode(&url(query)).as_deref(),
+                expected,
+                "{query}"
+            );
+        }
+        for query in [
+            "?sslmode=require&ssl%2Dmode=disable",
+            "?sslmode=verify-full&sslmode=require+",
+            "?sslmode=require%20",
+        ] {
+            let err = check_database_url_for(Mode::Required, &url(query), None).unwrap_err();
+            assert!(err.contains("required"), "{query}: {err}");
+        }
+        assert_eq!(
+            check_database_url_for(Mode::Required, &url("?ssl%2Dmode=verify-full"), None),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn required_mode_refuses_a_plain_http_s3_endpoint() {
+        for endpoint in [
+            "http://minio:9000",
+            "HTTP://minio:9000",
+            "minio:9000",
+            "http://user:s3cr3t@minio:9000",
+        ] {
+            let err =
+                check_s3_endpoint_for(Mode::Required, "KOSHA_S3_ENDPOINT", endpoint).unwrap_err();
+            assert!(
+                err.contains("KOSHA_S3_ENDPOINT") && err.contains("required"),
+                "{endpoint}: {err}"
+            );
+            let warning = check_s3_endpoint_for(Mode::On, "KOSHA_S3_ENDPOINT", endpoint)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                check_s3_endpoint_for(Mode::Off, "KOSHA_S3_ENDPOINT", endpoint),
+                Ok(None)
+            );
+            // An endpoint URL can carry credentials: never quote it.
+            for message in [err, warning] {
+                assert!(
+                    !message.contains("s3cr3t") && !message.contains("minio"),
+                    "{endpoint}: {message}"
+                );
+            }
+        }
+        for endpoint in ["https://minio:9000", "HTTPS://s3.example.com", " https://x"] {
+            for mode in [Mode::Required, Mode::On, Mode::Off] {
+                assert_eq!(
+                    check_s3_endpoint_for(mode, "KOSHA_S3_ENDPOINT", endpoint),
+                    Ok(None),
+                    "{endpoint}"
+                );
+            }
+        }
+    }
+
+    /// The endpoint in effect is checked: `KOSHA_S3_ENDPOINT`, then
+    /// `AWS_ENDPOINT_URL`, then the SDK's own `AWS_ENDPOINT_URL_S3`. Only
+    /// the mode is read, so the migrate Jobs need no TLS files.
+    #[test]
+    fn s3_endpoint_check_reads_the_endpoint_in_effect_and_only_the_mode() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                if name == CA_PATH_ENV {
+                    return Some("/nonexistent/kosha/tls/ca.crt".to_string());
+                }
+                vars.iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let plain = "http://minio:9000";
+        assert_eq!(
+            check_s3_endpoint_lookup(env(&[(MODE_ENV, "required")])),
+            Ok(())
+        );
+        for var in S3_ENDPOINT_ENVS {
+            let vars: &'static [(&str, &str)] =
+                Box::leak(vec![(MODE_ENV, "required"), (var, plain)].into_boxed_slice());
+            let err = check_s3_endpoint_lookup(env(vars)).unwrap_err();
+            assert!(err.contains(var), "{var}: {err}");
+        }
+        // The first variable that is set decides.
+        assert_eq!(
+            check_s3_endpoint_lookup(env(&[
+                (MODE_ENV, "required"),
+                ("KOSHA_S3_ENDPOINT", "https://minio:9000"),
+                ("AWS_ENDPOINT_URL_S3", "http://other:9000"),
+            ])),
+            Ok(())
+        );
+        assert!(check_s3_endpoint_lookup(env(&[
+            (MODE_ENV, "required"),
+            ("KOSHA_S3_ENDPOINT", ""),
+            ("AWS_ENDPOINT_URL", "http://minio:9000"),
+        ]))
+        .is_err());
+        assert_eq!(
+            check_s3_endpoint_lookup(env(&[
+                (MODE_ENV, "on"),
+                ("KOSHA_S3_ENDPOINT", "http://minio:9000"),
+            ])),
+            Ok(())
+        );
+        assert_eq!(
+            check_s3_endpoint_lookup(env(&[("KOSHA_S3_ENDPOINT", "http://minio:9000")])),
+            Ok(())
+        );
+        assert!(check_s3_endpoint_lookup(env(&[
+            (MODE_ENV, "bogus"),
+            ("KOSHA_S3_ENDPOINT", "https://minio:9000"),
+        ]))
+        .is_err());
     }
 
     /// The migrate Jobs take the pods' ConfigMap without the TLS Secret:
