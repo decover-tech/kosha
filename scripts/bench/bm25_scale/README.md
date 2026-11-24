@@ -399,7 +399,9 @@ python3 scripts/bench/bm25_scale/rescore_report.py runs/f32-off runs/i8-off \
     runs/i8-on runs/rabitq-off runs/rabitq-on
 ```
 
-Add `--json` for per-counter distributions and sample counts. Compare recall
+Add `--json` for per-counter distributions and sample counts. Format comes
+from vector column footers recorded in `vector/snapshot-build-info.json`;
+older archives without this metadata show an unknown format. Compare recall
 against warm p50/p99 at matched probe settings; compare each arm to the f32
 sidecar control for the 0.01 recall tolerance, 2× warm p50 reduction, and 10×
 local vector byte reduction. Warm-gate time means time for the workload to

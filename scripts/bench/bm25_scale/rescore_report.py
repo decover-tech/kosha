@@ -54,6 +54,8 @@ def local_bytes(path):
 def run_row(root, allow_whole_sidecar=False):
     vector = root / "vector"
     meta = load_json(root / "meta.json")
+    build_info = load_json(vector / "snapshot-build-info.json")
+    formats = build_info.get("vector_quantizations") or []
     recall = load_json(vector / "recall.json")
     phase = load_json(vector / f"{PHASE}.json")
     env_args = meta.get("server_env_args")
@@ -108,7 +110,7 @@ def run_row(root, allow_whole_sidecar=False):
         "label": root.name,
         "sha": meta.get("sha"),
         "snapshot": meta.get("vector_snapshot"),
-        "quantization": env.get("KOSHA_VECTOR_QUANTIZATION", "f32") if env_args is not None else None,
+        "quantization": ", ".join(formats) if formats else None,
         "global_rescore": global_rescore,
         "server_env_args": env_args,
         "recall_at_10": recall_at_10,
@@ -144,7 +146,7 @@ def markdown(runs):
         coverage = f" ({rescores['n']}/{fmt(run['requests'])})" if rescores is not None else ""
         values = [
             run["label"].replace("|", "\\|"),
-            fmt(run["quantization"]),
+            run["quantization"] or "unknown",
             fmt({True: "on", False: "off", None: None}[run["global_rescore"]]),
             fmt(run["recall_at_10"], ".4f"),
             fmt(run["recall_num_candidates"]),

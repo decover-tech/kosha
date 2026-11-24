@@ -22,6 +22,9 @@ def archive(tmp_path):
         (root / "meta.json").write_text(json.dumps({
             "sha": "test", "vector_snapshot": "rabitq-snapshot", "server_env_args": env,
         }))
+        (vector / "snapshot-build-info.json").write_text(json.dumps({
+            "snapshot": "rabitq-snapshot", "vector_quantizations": ["rabitq"],
+        }))
         (vector / "recall.json").write_text(json.dumps({
             "k": 10, "mean_recall_at_k": 0.95, "sample_size": 1000,
             "sampling": "random", "seed": 384, "num_candidates": 100,
@@ -90,6 +93,22 @@ def test_missing_and_partial_counts_are_not_zero(archive):
     assert partial_row["counters"]["knn_rescored"]["mean"] == 8
     assert partial_row["issues"] == ["partial exact rescore coverage"]
     assert "| missing | 2048.0 / 2.0 |" in report(missing)
+
+
+def test_restored_snapshot_format_does_not_depend_on_run_env(archive):
+    root = archive("restored")
+    meta = root / "meta.json"
+    config = json.loads(meta.read_text())
+    config["server_env_args"] = "-e KOSHA_KNN_RESCORE_STATS=1"
+    meta.write_text(json.dumps(config))
+    row, = json.loads(report("--json", root))
+    assert row["quantization"] == "rabitq"
+
+    build_info = root / "vector" / "snapshot-build-info.json"
+    build_info.write_text(json.dumps({"snapshot": "rabitq-snapshot"}))
+    row, = json.loads(report("--json", root))
+    assert row["quantization"] is None
+    assert "| restored | unknown | off |" in report(root)
 
 
 def test_whole_sidecar_is_not_codes_only(archive):
