@@ -29,6 +29,7 @@ EXCLUDED = {
     "KoshaService_DeleteBranch": "no typed SDK method in 0.x; reachable through request()",
     "KoshaService_ListBranches": "no typed SDK method in 0.x; reachable through request()",
     "KoshaService_PutShards": "no typed SDK method in 0.x; reachable through request()",
+    "KoshaService_ExportDocuments": "no typed SDK method in 0.x; reachable through request()",
 }
 
 

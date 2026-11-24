@@ -8,6 +8,12 @@ const (
 	BearerAuthScopes = "BearerAuth.Scopes"
 )
 
+// Defines values for KoshaServiceExportDocumentsBodyConsistency.
+const (
+	KoshaServiceExportDocumentsBodyConsistencyEventual KoshaServiceExportDocumentsBodyConsistency = "eventual"
+	KoshaServiceExportDocumentsBodyConsistencyStrong   KoshaServiceExportDocumentsBodyConsistency = "strong"
+)
+
 // Defines values for KoshaServiceSearchBodyConsistency.
 const (
 	KoshaServiceSearchBodyConsistencyEventual KoshaServiceSearchBodyConsistency = "eventual"
@@ -125,6 +131,21 @@ type KoshaServiceDeleteByQueryBody struct {
 type KoshaServiceExistsBody struct {
 	Ids []string `json:"ids"`
 }
+
+// KoshaServiceExportDocumentsBody defines model for KoshaServiceExportDocumentsBody.
+type KoshaServiceExportDocumentsBody struct {
+	// Consistency "strong" (default) includes acknowledged writes not yet flushed.
+	Consistency *KoshaServiceExportDocumentsBodyConsistency `json:"consistency,omitempty"`
+
+	// Cursor The previous page's next_cursor; absent or empty for the first page.
+	Cursor *string `json:"cursor,omitempty"`
+
+	// Limit Documents per page: default 1000, at most 10000.
+	Limit *int64 `json:"limit,omitempty"`
+}
+
+// KoshaServiceExportDocumentsBodyConsistency "strong" (default) includes acknowledged writes not yet flushed.
+type KoshaServiceExportDocumentsBodyConsistency string
 
 // KoshaServiceFlushBody defines model for KoshaServiceFlushBody.
 type KoshaServiceFlushBody = map[string]interface{}
@@ -436,6 +457,15 @@ type V1ExistsResponse struct {
 	Existing  *[]string `json:"existing,omitempty"`
 	Missing   *[]string `json:"missing,omitempty"`
 	Namespace *string   `json:"namespace,omitempty"`
+}
+
+// V1ExportDocumentsResponse defines model for v1ExportDocumentsResponse.
+type V1ExportDocumentsResponse struct {
+	Documents *[]V1Document `json:"documents,omitempty"`
+	Namespace *string       `json:"namespace,omitempty"`
+
+	// NextCursor The cursor for the next page; null once this page was the last.
+	NextCursor *string `json:"next_cursor,omitempty"`
 }
 
 // V1Field defines model for v1Field.
@@ -867,6 +897,9 @@ type KoshaServiceIndexDocumentsJSONRequestBody = KoshaServiceIndexDocumentsBody
 
 // KoshaServiceExistsJSONRequestBody defines body for KoshaServiceExists for application/json ContentType.
 type KoshaServiceExistsJSONRequestBody = KoshaServiceExistsBody
+
+// KoshaServiceExportDocumentsJSONRequestBody defines body for KoshaServiceExportDocuments for application/json ContentType.
+type KoshaServiceExportDocumentsJSONRequestBody = KoshaServiceExportDocumentsBody
 
 // KoshaServiceFlushJSONRequestBody defines body for KoshaServiceFlush for application/json ContentType.
 type KoshaServiceFlushJSONRequestBody = KoshaServiceFlushBody

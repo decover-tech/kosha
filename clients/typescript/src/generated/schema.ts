@@ -180,6 +180,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/namespaces/{namespace}/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Every live document of the namespace, a page at a time, sorted by id,
+         *     in the shape IndexDocuments accepts (#347). Pass a page's next_cursor
+         *     back as cursor until next_cursor is null.
+         */
+        post: operations["KoshaService_ExportDocuments"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/namespaces/{namespace}/flush": {
         parameters: {
             query?: never;
@@ -327,6 +348,20 @@ export interface components {
         };
         KoshaServiceExistsBody: {
             ids: string[];
+        };
+        KoshaServiceExportDocumentsBody: {
+            /**
+             * @description "strong" (default) includes acknowledged writes not yet flushed.
+             * @enum {string}
+             */
+            consistency?: "strong" | "eventual";
+            /** @description The previous page's next_cursor; absent or empty for the first page. */
+            cursor?: string;
+            /**
+             * Format: int64
+             * @description Documents per page: default 1000, at most 10000.
+             */
+            limit?: number;
         };
         KoshaServiceFlushBody: Record<string, unknown>;
         KoshaServiceIndexDocumentsBody: {
@@ -639,6 +674,12 @@ export interface components {
             existing?: string[];
             missing?: string[];
             namespace?: string;
+        };
+        v1ExportDocumentsResponse: {
+            documents?: components["schemas"]["v1Document"][];
+            namespace?: string;
+            /** @description The cursor for the next page; null once this page was the last. */
+            next_cursor?: string;
         };
         v1Field: {
             /**
@@ -2669,6 +2710,168 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["v1ExistsResponse"];
+                };
+            };
+            /** @description invalid_argument, invalid_query */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unauthenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payment_required (billing refuses the operation for the account's standing) */
+            402: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description permission_denied and quota codes */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_found, namespace_not_found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description method_not_allowed; the `Allow` header lists the methods the path takes */
+            405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds */
+            408: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds */
+            409: {
+                headers: {
+                    /** @description Seconds to wait before retrying; sent with write_conflict only. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payload_too_large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description overloaded and tenant rate limits; retry after `Retry-After` seconds */
+            429: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description internal */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds */
+            502: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unavailable; retry after `Retry-After` seconds */
+            503: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+        };
+    };
+    KoshaService_ExportDocuments: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                namespace: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["KoshaServiceExportDocumentsBody"];
+            };
+        };
+        responses: {
+            /** @description A successful response. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ExportDocumentsResponse"];
                 };
             };
             /** @description invalid_argument, invalid_query */
