@@ -48,6 +48,7 @@ services:
     image: kosha:latest
     environment: &boot-env
       KOSHA_ROLE: ingest
+      KOSHA_INTERNAL_TLS: "off"
       KOSHA_API_KEY: sk-kosha-dev
       KOSHA_ADMIN_API_KEY: sk-kosha-admin-dev
       KOSHA_INTERNAL_API_KEY: sk-kosha-internal-dev

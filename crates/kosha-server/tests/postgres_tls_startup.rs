@@ -1,5 +1,5 @@
 //! Process-level check of TLS to Postgres (#343): with
-//! `KOSHA_INTERNAL_TLS=required`, the real binary refuses a `DATABASE_URL`
+//! TLS required by default, the real binary refuses a `DATABASE_URL`
 //! that does not force TLS before it opens any connection, and never prints
 //! the URL.
 
@@ -66,11 +66,14 @@ fn assert_refused(out: &Output) {
 }
 
 #[test]
-fn required_refuses_a_database_url_without_sslmode() {
+fn default_refuses_a_database_url_without_sslmode() {
     // Port 1 is closed: a server that got as far as connecting would fail
     // with a connection error instead of the sslmode message.
     let url = format!("postgres://kosha:{PASSWORD}@127.0.0.1:1/kosha");
-    assert_refused(&run("unset", &[], "required", &url));
+    let (mut cmd, dir) = command("unset", &[], "required", &url);
+    let out = cmd.env_remove("KOSHA_INTERNAL_TLS").output().unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+    assert_refused(&out);
     assert_refused(&run(
         "prefer",
         &[],
@@ -93,35 +96,25 @@ fn required_refuses_migrate_namespace_over_plaintext_postgres() {
 }
 
 #[test]
-fn on_only_warns_about_a_plaintext_database_url() {
-    use std::io::{BufRead, BufReader};
-    use std::time::Duration;
-
+fn on_alias_also_refuses_a_plaintext_database_url() {
     let url = format!("postgres://kosha:{PASSWORD}@127.0.0.1:1/kosha?sslmode=disable");
-    let (mut cmd, dir) = command("on", &[], "on", &url);
-    let mut child = cmd
-        .stdout(Stdio::null())
-        .spawn()
-        .expect("spawn kosha-server");
-    // The check runs first thing in `main`, so the first stderr line is the
-    // warning. What the server does afterwards (retrying the closed port)
-    // is not this test's business: read one line and stop it.
-    let stderr = child.stderr.take().unwrap();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut line = String::new();
-        let _ = BufReader::new(stderr).read_line(&mut line);
-        let _ = tx.send(line);
-    });
-    let first = rx.recv_timeout(Duration::from_secs(60));
-    let _ = child.kill();
-    let _ = child.wait();
+    assert_refused(&run("on", &[], "on", &url));
+}
+
+#[test]
+fn default_refuses_to_serve_without_an_internal_ca() {
+    let (mut cmd, dir) = command("missing-ca", &[], "required", "");
+    let out = cmd
+        .env_remove("KOSHA_INTERNAL_TLS")
+        .env_remove("KOSHA_INTERNAL_TLS_CA_PATH")
+        .env_remove("DATABASE_URL")
+        .output()
+        .unwrap();
     let _ = std::fs::remove_dir_all(dir);
-    let first = first.expect("no stderr output from kosha-server");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
     assert!(
-        first.starts_with("WARN: DATABASE_URL sslmode=disable does not force TLS")
-            && first.contains("KOSHA_INTERNAL_TLS=on"),
-        "stderr: {first}"
+        stderr.contains("KOSHA_INTERNAL_TLS=required needs KOSHA_INTERNAL_TLS_CA_PATH"),
+        "stderr: {stderr}"
     );
-    assert!(!first.contains(PASSWORD), "stderr: {first}");
 }

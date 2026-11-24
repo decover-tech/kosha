@@ -60,9 +60,20 @@ spec:
       template:
         spec:
           restartPolicy: Never
+          volumes:
+            - name: internal-ca
+              secret:
+                secretName: kosha-internal-tls
+                items:
+                  - key: ca.crt
+                    path: ca.crt
           containers:
             - name: compact
               image: curlimages/curl:8.11.1
+              volumeMounts:
+                - name: internal-ca
+                  mountPath: /etc/kosha/tls
+                  readOnly: true
               env:
                 - name: KOSHA_API_KEY
                   valueFrom:
@@ -77,7 +88,7 @@ spec:
                   # Addresses the ingest Service directly. kosha-service
                   # routes to query pods, which would only forward this
                   # back to the ingest anyway.
-                  URL="http://kosha-ingest-service.kosha.svc.cluster.local:8080/v1/admin/compact-namespace"
+                  URL="https://kosha-ingest-service.kosha.svc.cluster.local:8080/v1/admin/compact-namespace"
                   for NS in paragraph_index_hnsw findings_index; do
                     echo "compacting ${NS}"
                     # --max-time is generous because the handler runs the
@@ -85,7 +96,7 @@ spec:
                     # exceeded the merge still continues server-side; the
                     # ingest pod log is the source of truth for the result,
                     # not this exit code.
-                    curl -sS --fail-with-body --max-time 9000 \
+                    curl -sS --fail-with-body --max-time 9000 --cacert /etc/kosha/tls/ca.crt \
                       -H "Authorization: Bearer ${KOSHA_API_KEY}" \
                       -H "Content-Type: application/json" \
                       -X POST -d "{\"namespace\":\"${NS}\",\"mode\":\"tiered\"}" \

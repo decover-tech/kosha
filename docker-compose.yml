@@ -67,6 +67,7 @@ services:
       # One pod that serves reads and writes and compacts (#254). `query`
       # now requires KOSHA_INGEST_HOST.
       KOSHA_ROLE: standalone
+      KOSHA_INTERNAL_TLS: "off" # local development only
       KOSHA_HTTP_PORT: "8080"
       KOSHA_DATA_DIR: /var/lib/kosha/data
       # S3 / MinIO — kosha-server reads these (and standard AWS_* aliases).

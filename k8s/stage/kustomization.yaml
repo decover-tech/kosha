@@ -16,6 +16,9 @@ resources:
   - ../base
   - cronjob-compaction.yaml
 
+components:
+  - ../components/internal-tls
+
 patches:
   - path: configmap-patch.yaml
   - path: serviceaccount-patch.yaml

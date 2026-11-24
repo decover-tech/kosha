@@ -63,6 +63,7 @@ S3_ENV = {
     # This harness sends no API key; the server refuses to start with no keys
     # unless auth is explicitly disabled.
     "KOSHA_AUTH": "disabled",
+    "KOSHA_INTERNAL_TLS": "off",
 }
 
 TIMING_RE = re.compile(r"search timing: .*")

@@ -191,6 +191,7 @@ def spawn(binary: str, port: int, api_key: str, admin_key: str) -> Tuple[subproc
     env.update(
         {
             "KOSHA_API_KEY": api_key,
+            "KOSHA_INTERNAL_TLS": "off",
             "KOSHA_ADMIN_API_KEY": admin_key,
             "KOSHA_HTTP_PORT": str(port),
             "KOSHA_DATA_DIR": os.path.join(workdir, "data"),

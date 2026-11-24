@@ -23,6 +23,7 @@ fn server(envs: &[(&str, &str)]) -> (Command, u16) {
     cmd.env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("KOSHA_HTTP_PORT", port.to_string())
+        .env("KOSHA_INTERNAL_TLS", "off")
         .env("KOSHA_DATA_DIR", dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

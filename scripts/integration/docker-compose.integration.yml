@@ -11,6 +11,7 @@
 # not start (and does not hold port 8080).
 
 x-kosha-env: &kosha-env
+  KOSHA_INTERNAL_TLS: "off"
   # Tenant keys: KOSHA_API_KEY is tenant `default`; the two extra tenants are
   # what the tenant-isolation scenario plays against each other. Dev-only.
   KOSHA_API_KEY: sk-kosha-dev

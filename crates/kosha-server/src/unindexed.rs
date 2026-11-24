@@ -41,6 +41,7 @@ use std::time::Duration;
 use kosha_core::{KoshaError, Manifest, ManifestEntry, NamespaceId, SegmentId};
 use kosha_write::UnindexedTail;
 
+use crate::internal_tls::InternalTls;
 use crate::AppState;
 
 /// Prefix of transient tail segment ids (and directories). Never published.
@@ -270,15 +271,15 @@ pub struct UnindexedState {
 }
 
 impl UnindexedState {
-    pub fn new(query_role: bool) -> Self {
+    pub fn new(query_role: bool, internal_tls: &InternalTls) -> Self {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
         let http = query_role.then(|| {
             // The ingest pod's tail route: internal traffic, so it trusts
-            // the internal CA when `KOSHA_INTERNAL_TLS` is on (#343).
-            crate::internal_tls::global()
+            // the internal CA when TLS is required (#343).
+            internal_tls
                 .client_builder()
                 .timeout(Duration::from_millis(
                     std::env::var("KOSHA_TAIL_FETCH_TIMEOUT_MS")

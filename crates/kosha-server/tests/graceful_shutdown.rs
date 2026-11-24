@@ -35,6 +35,7 @@ fn sigterm_drains_and_exits_cleanly() {
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("KOSHA_HTTP_PORT", port.to_string())
+        .env("KOSHA_INTERNAL_TLS", "off")
         .env("KOSHA_DATA_DIR", &dir)
         .env("KOSHA_AUTH", "disabled")
         .env("KOSHA_HTTP_SHUTDOWN_GRACE_SECS", "5")

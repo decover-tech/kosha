@@ -490,6 +490,7 @@ jobs:
             sudo docker create --name kosha --network host \
               -e DATABASE_URL=postgresql://postgres:bench@127.0.0.1:5432/kosha \
               -e KOSHA_API_KEY=sk-bench \
+              -e KOSHA_INTERNAL_TLS=off \
               -e KOSHA_S3_BUCKET=decoverai-bench-kosha-segments -e KOSHA_S3_PREFIX=segments/ \
               -e AWS_DEFAULT_REGION=us-east-1 -e KOSHA_FLUSH_THRESHOLD=50000 -e KOSHA_FLUSH_MAX_AGE_MS=0 -e KOSHA_COMPACTION_INTERVAL_MS=0 \
               -e KOSHA_HTTP_IO_TIMEOUT_SECS=1800 \

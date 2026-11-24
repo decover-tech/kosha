@@ -58,9 +58,20 @@ spec:
       template:
         spec:
           restartPolicy: Never
+          volumes:
+            - name: internal-ca
+              secret:
+                secretName: kosha-internal-tls
+                items:
+                  - key: ca.crt
+                    path: ca.crt
           containers:
             - name: gc
               image: curlimages/curl:8.11.1
+              volumeMounts:
+                - name: internal-ca
+                  mountPath: /etc/kosha/tls
+                  readOnly: true
               env:
                 # "true" lists what would be deleted; "false" deletes it.
                 - name: DRY_RUN
@@ -76,11 +87,11 @@ spec:
                 - |
                   set -eu
                   case "${DRY_RUN}" in true|false) ;; *) echo "DRY_RUN must be true or false"; exit 2;; esac
-                  URL="http://kosha-ingest-service.kosha.svc.cluster.local:8080/v1/admin/gc"
+                  URL="https://kosha-ingest-service.kosha.svc.cluster.local:8080/v1/admin/gc"
                   # No namespace: every namespace the control plane knows.
                   # The handler deletes object by object; --max-time is
                   # generous for a first run over a large backlog.
-                  curl -sS --fail-with-body --max-time 6600 \
+                  curl -sS --fail-with-body --max-time 6600 --cacert /etc/kosha/tls/ca.crt \
                     -H "Authorization: Bearer ${KOSHA_ADMIN_API_KEY}" \
                     -H "Content-Type: application/json" \
                     -X POST -d "{\"dry_run\":${DRY_RUN}}" \

@@ -70,7 +70,11 @@ Key ids are never logged.
 **Which key an object uses.** Every object under a namespace is
 `{namespace}/{segment}/{file}`, and a tenant-scoped namespace is `{tenant}/{name}` (branches
 and shards stay under the same tenant). The tenant is the namespace's first component, and its
-key comes from the tenant map, falling back to the default key. These objects have no tenant
+key comes, in SSE-KMS mode, from `kosha.tenants.kms_key_id` in the Postgres control plane.
+If the tenant has no record or its key is NULL, Kosha uses the configured tenant map, then
+the default key. A lookup error stops the write instead of silently using another key.
+Operators can set or clear `kms_key_id` on an existing tenant row; this is not a tenant-facing API.
+These objects have no tenant
 and always use the default key:
 
 - objects of a bare namespace, such as `migrate` without `--namespace`;
@@ -92,7 +96,9 @@ written with and stay readable (subject to the KMS permissions above).
 - **KMS automatic rotation** (recommended): enable rotation on the key in KMS. KMS keeps the
   old key material for decryption, so nothing is re-encrypted and no Kosha config changes.
 - **Switching to a different key** (a new `KOSHA_S3_SSE_KMS_KEY_ID` or a new tenant entry):
-  roll out the new value. New objects use the new key at once. Old objects keep the old key
+  give the pod role access to the new key, then update the tenant row's `kms_key_id` or roll out
+  the new configuration value. New writes resolve the control-plane key without a pod restart.
+  Old objects keep the old key
   and stay readable as long as the role can still `kms:Decrypt` with it, so keep the old key
   enabled and in the IAM policy. Compaction rewrites segments into new objects, so the old
   key's share of the data shrinks over time. The tenant map (including
@@ -588,11 +594,11 @@ ingest traffic (forwarded writes and the strong-consistency tail read, query pod
 (`InternalTls::from_lookup`), read once at startup. The settings **fail closed**: an unknown
 mode, a missing or unparsable file, half a client identity, or a TLS setting while the mode is
 `off` logs `FATAL: internal TLS: ...` and exits. The startup log prints
-`internal TLS: on (internal CA, client_cert=yes, server_name=kosha-internal)` or similar.
+`internal TLS: required (internal CA, client_cert=yes, server_name=kosha-internal)` or similar.
 
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
-| `KOSHA_INTERNAL_TLS` | `off`: plain `http://` to peers, as before. `on`: peers are fetched over `https://` and verified against `KOSHA_INTERNAL_TLS_CA_PATH`, and an `https://` `KOSHA_INGEST_HOST` is verified the same way (an `http://` one logs a warning). `required`: as `on`, and the pod refuses to start with an `http://` `KOSHA_INGEST_HOST`, without `KOSHA_TLS_CERT_PATH`, or with a `DATABASE_URL` that does not force TLS (see "TLS to Postgres" below) | `off` | enum |
+| `KOSHA_INTERNAL_TLS` | `required` (alias `on`): require verified HTTPS to peers and ingest, a server certificate and key, and TLS for Postgres if configured. `off`: explicitly allow plaintext for local development only | `required` | enum |
 | `KOSHA_INTERNAL_TLS_CA_PATH` | PEM CA bundle peer certificates must chain to. Required unless `off`. Only this bundle is trusted for internal traffic, not the platform roots | unset | path |
 | `KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH` | PEM client certificate chain, presented to peers that ask for one (their `KOSHA_TLS_CLIENT_CA_PATH`). Set it together with `KOSHA_INTERNAL_TLS_CLIENT_KEY_PATH` or not at all | unset (no client certificate) | path |
 | `KOSHA_INTERNAL_TLS_CLIENT_KEY_PATH` | PEM private key for `KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH` | unset | path |
@@ -604,19 +610,20 @@ To turn it on across a cluster:
    a fixed name such as `kosha-internal` (`k8s/base/certificate-internal-tls.example.yaml` is a
    cert-manager example). The same certificate can serve as the client identity.
 2. Mount it on every pod and set `KOSHA_TLS_CERT_PATH`/`KOSHA_TLS_KEY_PATH` (server side) and
-   `KOSHA_INTERNAL_TLS=on`, `KOSHA_INTERNAL_TLS_CA_PATH`, `KOSHA_INTERNAL_TLS_SERVER_NAME`
+   `KOSHA_INTERNAL_TLS_CA_PATH`, `KOSHA_INTERNAL_TLS_SERVER_NAME`
    (client side), and switch `KOSHA_INGEST_HOST` to `https://`. HTTPS is per port, so the
    kubelet probes need `scheme: HTTPS` too.
 3. Optionally require mTLS on `/internal/*` with `KOSHA_TLS_CLIENT_CA_PATH` and give every pod
    `KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH`/`KEY_PATH`. Roll the clients out first, then the
    server setting.
-4. Set `KOSHA_INTERNAL_TLS=required` once every pod is on TLS.
 
-During a rollout, a pod on `on` that reaches a peer still serving plain HTTP fails that peer
+During a rollout, a TLS-enabled pod that reaches a peer still serving plain HTTP fails that peer
 fetch and falls back to S3, so mixed pods cost extra S3 reads, not errors. Forwarded writes have
 no such fallback: switch `KOSHA_INGEST_HOST` to `https://` only after the ingest pod serves
 HTTPS. Certificates are
 read at startup; a renewed certificate takes effect when the pod restarts.
+For workloads without certificates, such as local Docker Compose and developer test harnesses,
+set `KOSHA_INTERNAL_TLS=off` explicitly.
 
 #### TLS to Postgres
 
@@ -649,9 +656,9 @@ as forcing TLS.
 
 `KOSHA_INTERNAL_TLS` holds this hop to the same rule as the others. With `required`, the
 server, `migrate` and `migrate-namespace` exit before opening a connection unless the
-`sslmode` in effect is `require`, `verify-ca` or `verify-full`. With `on`, any other value (or
-none) logs one `WARN:` line at startup. With `off` nothing is checked. Neither message prints
-the URL. The check reads only the mode, so `migrate` and `migrate-namespace` do not need the
+`sslmode` in effect is `require`, `verify-ca` or `verify-full`. With `off` nothing is checked.
+The error does not print the URL. The check reads only the mode, so `migrate` and
+`migrate-namespace` do not need the
 `KOSHA_INTERNAL_TLS_*` files mounted.
 
 `GET /internal/segment/...` streams the cached file as raw `application/octet-stream`. Peers on

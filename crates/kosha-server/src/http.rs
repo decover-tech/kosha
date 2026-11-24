@@ -1547,8 +1547,9 @@ mod tests {
                 })
                 .unwrap_or((None, None));
             InternalTls::from_lookup(|name| match name {
-                "KOSHA_INTERNAL_TLS" => Some("on".into()),
                 "KOSHA_INTERNAL_TLS_CA_PATH" => Some(ca.clone()),
+                "KOSHA_TLS_CERT_PATH" => Some(pki.server_cert.to_string_lossy().into_owned()),
+                "KOSHA_TLS_KEY_PATH" => Some(pki.server_key.to_string_lossy().into_owned()),
                 "KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH" => cert.clone(),
                 "KOSHA_INTERNAL_TLS_CLIENT_KEY_PATH" => key.clone(),
                 _ => None,

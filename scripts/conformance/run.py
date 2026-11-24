@@ -191,6 +191,7 @@ class Spawned:
         env.update(
             {
                 "KOSHA_API_KEY": self.api_key,
+                "KOSHA_INTERNAL_TLS": "off",
                 "KOSHA_ADMIN_API_KEY": self.admin_key,
                 "KOSHA_HTTP_PORT": str(self.port),
                 "KOSHA_DATA_DIR": os.path.join(self.dir, "data"),

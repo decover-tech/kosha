@@ -9,12 +9,11 @@
 //!
 //! Every client for that traffic is built from [`InternalTls`]:
 //!
-//! - `KOSHA_INTERNAL_TLS`: `off` (default; plain HTTP to peers, unchanged
-//!   behavior), `on` (HTTPS to peers, verified against the internal CA) or
-//!   `required` (as `on`, and the pod refuses to start with an `http://`
-//!   `KOSHA_INGEST_HOST` or without a server certificate of its own).
+//! - `KOSHA_INTERNAL_TLS`: `required` (default; verified HTTPS to peers and
+//!   the ingest host, with a server certificate of this pod's own), or
+//!   `off` (plain HTTP to peers for local development).
 //! - `KOSHA_INTERNAL_TLS_CA_PATH`: PEM CA bundle that peer certificates must
-//!   chain to. Required with `on`/`required`. Only this bundle is trusted for
+//!   chain to. Required unless mode is `off`. Only this bundle is trusted for
 //!   internal traffic, not the platform roots.
 //! - `KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH` / `KOSHA_INTERNAL_TLS_CLIENT_KEY_PATH`:
 //!   an optional client identity, presented when the peer asks for one
@@ -36,7 +35,9 @@
 //! the pod at startup instead of silently falling back to plain HTTP.
 
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+#[cfg(not(test))]
+use std::sync::OnceLock;
 
 use tokio_rustls::rustls;
 use tokio_rustls::rustls::client::danger::{
@@ -53,31 +54,29 @@ pub(crate) const CLIENT_KEY_ENV: &str = "KOSHA_INTERNAL_TLS_CLIENT_KEY_PATH";
 pub(crate) const SERVER_NAME_ENV: &str = "KOSHA_INTERNAL_TLS_SERVER_NAME";
 /// The pod's own server certificate (`http.rs`); `required` insists on it.
 const SERVER_CERT_ENV: &str = "KOSHA_TLS_CERT_PATH";
+const SERVER_KEY_ENV: &str = "KOSHA_TLS_KEY_PATH";
 
 /// `KOSHA_INTERNAL_TLS`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
     Off,
-    On,
     Required,
 }
 
 impl Mode {
     fn parse(raw: &str) -> Result<Self, String> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "" | "off" | "false" | "0" | "no" | "none" | "disabled" => Ok(Self::Off),
-            "on" | "true" | "1" | "yes" | "enabled" => Ok(Self::On),
-            "required" | "require" | "strict" => Ok(Self::Required),
-            _ => Err(format!(
-                "{MODE_ENV}={raw:?} is not one of off, on, required"
-            )),
+            "off" | "false" | "0" | "no" | "none" | "disabled" => Ok(Self::Off),
+            "" | "required" | "require" | "strict" | "on" | "true" | "1" | "yes" | "enabled" => {
+                Ok(Self::Required)
+            }
+            _ => Err(format!("{MODE_ENV}={raw:?} is not one of off, required")),
         }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
-            Self::On => "on",
             Self::Required => "required",
         }
     }
@@ -112,6 +111,7 @@ impl InternalTls {
     }
 
     /// Read and validate the `KOSHA_INTERNAL_TLS*` environment.
+    #[cfg_attr(test, allow(dead_code))]
     pub fn from_env() -> Result<Self, String> {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
@@ -138,7 +138,7 @@ impl InternalTls {
             ];
             if let Some((name, _)) = set.iter().find(|(_, set)| *set) {
                 return Err(format!(
-                    "{name} is set but {MODE_ENV} is off; set {MODE_ENV}=on or required \
+                    "{name} is set but {MODE_ENV} is off; set {MODE_ENV}=required \
                      (or unset {name})"
                 ));
             }
@@ -151,9 +151,9 @@ impl InternalTls {
                 mode.as_str()
             ));
         };
-        if mode == Mode::Required && get(SERVER_CERT_ENV).is_none() {
+        if get(SERVER_CERT_ENV).is_none() || get(SERVER_KEY_ENV).is_none() {
             return Err(format!(
-                "{MODE_ENV}=required needs {SERVER_CERT_ENV}/KOSHA_TLS_KEY_PATH: peers reach \
+                "{MODE_ENV}=required needs {SERVER_CERT_ENV}/{SERVER_KEY_ENV}: peers reach \
                  this pod's /internal/* routes over HTTPS only"
             ));
         }
@@ -225,25 +225,19 @@ impl InternalTls {
     pub fn peer_scheme(&self) -> &'static str {
         match self.mode {
             Mode::Off => "http",
-            Mode::On | Mode::Required => "https",
+            Mode::Required => "https",
         }
     }
 
-    /// Validate `KOSHA_INGEST_HOST` against the mode. `required` refuses
-    /// anything but `https://`; `on` allows `http://` with a warning
-    /// (returned as `Ok(Some(warning))`).
-    pub fn check_ingest_host(&self, host: &str) -> Result<Option<String>, String> {
+    /// Validate `KOSHA_INGEST_HOST` against the mode.
+    pub fn check_ingest_host(&self, host: &str) -> Result<(), String> {
         let https = host
             .trim()
             .get(..8)
             .is_some_and(|s| s.eq_ignore_ascii_case("https://"));
         match self.mode {
-            _ if https => Ok(None),
-            Mode::Off => Ok(None),
-            Mode::On => Ok(Some(format!(
-                "KOSHA_INGEST_HOST={host} is not https://: forwarded writes cross the network \
-                 unencrypted although {MODE_ENV}=on"
-            ))),
+            _ if https => Ok(()),
+            Mode::Off => Ok(()),
             Mode::Required => Err(format!(
                 "KOSHA_INGEST_HOST={host} must use https:// with {MODE_ENV}=required"
             )),
@@ -257,7 +251,9 @@ impl InternalTls {
         let builder = reqwest::blocking::Client::builder()
             .pool_idle_timeout(crate::http::INTERNAL_CLIENT_POOL_IDLE);
         match &self.client {
-            Some(config) => builder.tls_backend_preconfigured((**config).clone()),
+            Some(config) => builder
+                .https_only(true)
+                .tls_backend_preconfigured((**config).clone()),
             None => builder,
         }
     }
@@ -278,6 +274,7 @@ impl InternalTls {
 
 /// The process-wide settings, read from the environment on first use.
 /// Exits the process on an invalid configuration (fail closed).
+#[cfg(not(test))]
 pub(crate) fn global() -> &'static InternalTls {
     static GLOBAL: OnceLock<InternalTls> = OnceLock::new();
     GLOBAL.get_or_init(|| match InternalTls::from_env() {
@@ -291,8 +288,7 @@ pub(crate) fn global() -> &'static InternalTls {
 
 /// Validate the Postgres `DATABASE_URL` against the mode, like
 /// [`InternalTls::check_ingest_host`]: `required` refuses a URL whose
-/// `sslmode` is not `require`, `verify-ca` or `verify-full`; `on` allows
-/// it with a warning (`Ok(Some(warning))`); `off` accepts anything.
+/// `sslmode` is not `require`, `verify-ca` or `verify-full`; `off` accepts anything.
 ///
 /// `pg_ssl_mode` is the `PGSSLMODE` environment variable, which the
 /// Postgres client uses when the URL names no `sslmode`. The URL holds
@@ -302,13 +298,9 @@ pub(crate) fn global() -> &'static InternalTls {
 /// It takes the bare mode and nothing else, so `migrate` and
 /// `migrate-namespace` can run it without the internal CA and certificates a
 /// serving pod loads.
-fn check_database_url_for(
-    mode: Mode,
-    url: &str,
-    pg_ssl_mode: Option<&str>,
-) -> Result<Option<String>, String> {
+fn check_database_url_for(mode: Mode, url: &str, pg_ssl_mode: Option<&str>) -> Result<(), String> {
     if mode == Mode::Off {
-        return Ok(None);
+        return Ok(());
     }
     let (ssl_mode, source) = match database_url_ssl_mode(url) {
         Some(mode) => (Some(mode), "DATABASE_URL sslmode"),
@@ -324,7 +316,7 @@ fn check_database_url_for(
         ),
     };
     let problem = match ssl_mode.as_deref() {
-        Some("require" | "verify-ca" | "verify-full") => return Ok(None),
+        Some("require" | "verify-ca" | "verify-full") => return Ok(()),
         // The client's default is `prefer`, which falls back to
         // plaintext when the server (or anything in between) declines.
         None => "DATABASE_URL has no sslmode, so the Postgres connection may fall back to \
@@ -343,21 +335,15 @@ fn check_database_url_for(
         Some(_) => format!("{source} is not a known sslmode"),
     };
     let fix = "set sslmode=verify-full (with sslrootcert=), verify-ca or require in DATABASE_URL";
-    match mode {
-        Mode::Required => Err(format!("{problem}; {MODE_ENV}=required: {fix}")),
-        _ => Ok(Some(format!(
-            "{problem} although {MODE_ENV}={}; {fix}",
-            mode.as_str()
-        ))),
-    }
+    Err(format!("{problem}; {MODE_ENV}=required: {fix}"))
 }
 
 /// [`check_database_url_for`] for the process environment: a no-op
-/// without `DATABASE_URL`, a `WARN:` line for a warning, `Err` when the pod
+/// without `DATABASE_URL`, `Err` when the pod
 /// (or the `migrate` / `migrate-namespace` command) must not connect. Call it
 /// before the first Postgres connection.
 ///
-/// Reads only the mode (`KOSHA_INTERNAL_TLS`), not [`global`]: the migrate
+/// Reads only the mode (`KOSHA_INTERNAL_TLS`): the migrate
 /// Jobs share the pods' ConfigMap but do not mount the internal-TLS Secret,
 /// and they open no pod-to-pod connection, so a missing CA file must not
 /// stop them. A serving pod validates the rest of the settings in `global`.
@@ -371,10 +357,7 @@ fn check_database_url_lookup(get: impl Fn(&str) -> Option<String>) -> Result<(),
         return Ok(());
     };
     let mode = Mode::parse(&get(MODE_ENV).unwrap_or_default())?;
-    if let Some(warning) = check_database_url_for(mode, &url, get("PGSSLMODE").as_deref())? {
-        eprintln!("WARN: {warning}");
-    }
-    Ok(())
+    check_database_url_for(mode, &url, get("PGSSLMODE").as_deref())
 }
 
 /// The `sslmode` (or `ssl-mode`) query parameter of a Postgres URL,
@@ -556,11 +539,13 @@ mod tests {
     }
 
     #[test]
-    fn unset_is_off_and_keeps_plain_http() {
-        let tls = parse(&[]).unwrap();
+    fn only_an_explicit_opt_out_keeps_plain_http() {
+        assert!(parse(&[]).unwrap_err().contains(CA_PATH_ENV));
+        assert!(parse(&[(MODE_ENV, " ")]).unwrap_err().contains(CA_PATH_ENV));
+        let tls = parse(&[(MODE_ENV, "off")]).unwrap();
         assert_eq!(tls.mode(), Mode::Off);
         assert_eq!(tls.peer_scheme(), "http");
-        assert_eq!(tls.check_ingest_host("http://ingest:8080"), Ok(None));
+        assert_eq!(tls.check_ingest_host("http://ingest:8080"), Ok(()));
         assert_eq!(parse(&[(MODE_ENV, "OFF")]).unwrap().mode(), Mode::Off);
     }
 
@@ -570,17 +555,32 @@ mod tests {
         let ca = pki.ca.to_str().unwrap();
         let cert = pki.client_cert.to_str().unwrap();
         let server = pki.server_cert.to_str().unwrap();
+        let server_key = pki.server_key.to_str().unwrap();
         let cases: Vec<(Vec<(&str, &str)>, &str)> = vec![
             (vec![(MODE_ENV, "maybe")], "not one of"),
             (vec![(MODE_ENV, "on")], CA_PATH_ENV),
-            (vec![(CA_PATH_ENV, ca)], "is off"),
-            (vec![(SERVER_NAME_ENV, "kosha-internal")], "is off"),
+            (vec![(MODE_ENV, "off"), (CA_PATH_ENV, ca)], "is off"),
             (
-                vec![(MODE_ENV, "on"), (CA_PATH_ENV, "/nonexistent/ca.pem")],
+                vec![(MODE_ENV, "off"), (SERVER_NAME_ENV, "kosha-internal")],
+                "is off",
+            ),
+            (
+                vec![
+                    (MODE_ENV, "on"),
+                    (CA_PATH_ENV, "/nonexistent/ca.pem"),
+                    (SERVER_CERT_ENV, server),
+                    (SERVER_KEY_ENV, server_key),
+                ],
                 "read",
             ),
             (
-                vec![(MODE_ENV, "on"), (CA_PATH_ENV, ca), (CLIENT_CERT_ENV, cert)],
+                vec![
+                    (MODE_ENV, "on"),
+                    (CA_PATH_ENV, ca),
+                    (CLIENT_CERT_ENV, cert),
+                    (SERVER_CERT_ENV, server),
+                    (SERVER_KEY_ENV, server_key),
+                ],
                 "both",
             ),
             (
@@ -592,6 +592,8 @@ mod tests {
                     (MODE_ENV, "on"),
                     (CA_PATH_ENV, ca),
                     (SERVER_NAME_ENV, "not a name!"),
+                    (SERVER_CERT_ENV, server),
+                    (SERVER_KEY_ENV, server_key),
                 ],
                 SERVER_NAME_ENV,
             ),
@@ -606,14 +608,16 @@ mod tests {
             (CA_PATH_ENV, ca),
             (CLIENT_CERT_ENV, cert),
             (CLIENT_KEY_ENV, cert),
+            (SERVER_CERT_ENV, server),
+            (SERVER_KEY_ENV, server_key),
         ])
         .unwrap_err();
         assert!(err.contains("parse"), "{err}");
-        // A complete `required` configuration loads.
+        // A complete configuration loads in required mode by default.
         let tls = parse(&[
-            (MODE_ENV, "required"),
             (CA_PATH_ENV, ca),
             (SERVER_CERT_ENV, server),
+            (SERVER_KEY_ENV, server_key),
             (CLIENT_CERT_ENV, cert),
             (CLIENT_KEY_ENV, pki.client_key.to_str().unwrap()),
         ])
@@ -628,10 +632,11 @@ mod tests {
         let pki = test_pki::generate("ingest-host");
         let ca = pki.ca.to_str().unwrap();
         let server = pki.server_cert.to_str().unwrap();
+        let server_key = pki.server_key.to_str().unwrap();
         let required = parse(&[
-            (MODE_ENV, "required"),
             (CA_PATH_ENV, ca),
             (SERVER_CERT_ENV, server),
+            (SERVER_KEY_ENV, server_key),
         ])
         .unwrap();
         let err = required
@@ -640,30 +645,27 @@ mod tests {
         assert!(err.contains("https://"), "{err}");
         assert_eq!(
             required.check_ingest_host("HTTPS://kosha-ingest-service:8443"),
-            Ok(None)
+            Ok(())
         );
 
-        let on = parse(&[(MODE_ENV, "on"), (CA_PATH_ENV, ca)]).unwrap();
+        let on = parse(&[
+            (MODE_ENV, "on"),
+            (CA_PATH_ENV, ca),
+            (SERVER_CERT_ENV, server),
+            (SERVER_KEY_ENV, server_key),
+        ])
+        .unwrap();
         assert!(on
             .check_ingest_host("http://kosha-ingest-service:8080")
-            .unwrap()
-            .is_some());
-        assert_eq!(on.check_ingest_host("https://ingest"), Ok(None));
+            .is_err());
+        assert_eq!(on.check_ingest_host("https://ingest"), Ok(()));
     }
 
     #[test]
     fn required_mode_refuses_a_database_url_that_does_not_force_tls() {
-        let pki = test_pki::generate("database-url");
-        let ca = pki.ca.to_str().unwrap();
-        let server = pki.server_cert.to_str().unwrap();
-        let required = parse(&[
-            (MODE_ENV, "required"),
-            (CA_PATH_ENV, ca),
-            (SERVER_CERT_ENV, server),
-        ])
-        .unwrap();
-        let on = parse(&[(MODE_ENV, "on"), (CA_PATH_ENV, ca)]).unwrap();
-        let off = parse(&[]).unwrap();
+        let required = Mode::parse("").unwrap();
+        let on = Mode::parse("on").unwrap();
+        let off = Mode::Off;
 
         const BASE: &str = "postgres://kosha:s3cr3t-pw@pg.internal:5432/kosha";
         let url = |query: &str| format!("{BASE}{query}");
@@ -687,14 +689,12 @@ mod tests {
         ];
         for query in plaintext {
             let url = url(query);
-            let err = check_database_url_for(required.mode, &url, None).unwrap_err();
+            let err = check_database_url_for(required, &url, None).unwrap_err();
             assert!(err.contains("sslmode"), "{query}: {err}");
-            let warning = check_database_url_for(on.mode, &url, None)
-                .unwrap()
-                .unwrap();
-            assert_eq!(check_database_url_for(off.mode, &url, None), Ok(None));
+            let alias_err = check_database_url_for(on, &url, None).unwrap_err();
+            assert_eq!(check_database_url_for(off, &url, None), Ok(()));
             // The URL holds credentials: nothing of it may reach a log.
-            for message in [err, warning] {
+            for message in [err, alias_err] {
                 for secret in ["s3cr3t-pw", "kosha:", "pg.internal"] {
                     assert!(!message.contains(secret), "{query}: {message}");
                 }
@@ -702,21 +702,17 @@ mod tests {
         }
         for query in encrypted {
             let url = url(query);
-            for tls in [&required, &on, &off] {
-                assert_eq!(
-                    check_database_url_for(tls.mode, &url, None),
-                    Ok(None),
-                    "{query}"
-                );
+            for mode in [required, on, off] {
+                assert_eq!(check_database_url_for(mode, &url, None), Ok(()), "{query}");
             }
         }
 
         // PGSSLMODE applies only when the URL names no sslmode.
         assert_eq!(
-            check_database_url_for(required.mode, BASE, Some("verify-full")),
-            Ok(None)
+            check_database_url_for(required, BASE, Some("verify-full")),
+            Ok(())
         );
-        assert!(check_database_url_for(required.mode, BASE, Some("prefer")).is_err());
+        assert!(check_database_url_for(required, BASE, Some("prefer")).is_err());
         // The client does not trim PGSSLMODE: a value it cannot parse is
         // dropped for the default `prefer`, so it must not pass as TLS.
         for raw in [
@@ -726,26 +722,21 @@ mod tests {
             "verify-full\r\n",
             "",
         ] {
-            let err = check_database_url_for(required.mode, BASE, Some(raw)).unwrap_err();
+            let err = check_database_url_for(required, BASE, Some(raw)).unwrap_err();
             assert!(err.contains("required"), "{raw:?}: {err}");
-            assert!(check_database_url_for(on.mode, BASE, Some(raw))
-                .unwrap()
-                .is_some());
+            assert!(check_database_url_for(on, BASE, Some(raw)).is_err());
         }
         // Case is the one thing the client's parser forgives.
         assert_eq!(
-            check_database_url_for(required.mode, BASE, Some("REQUIRE")),
-            Ok(None)
+            check_database_url_for(required, BASE, Some("REQUIRE")),
+            Ok(())
         );
-        assert!(check_database_url_for(
-            required.mode,
-            &url("?sslmode=prefer"),
-            Some("verify-full")
-        )
-        .is_err());
+        assert!(
+            check_database_url_for(required, &url("?sslmode=prefer"), Some("verify-full")).is_err()
+        );
         assert_eq!(
-            check_database_url_for(required.mode, &url("?sslmode=require"), Some("disable")),
-            Ok(None)
+            check_database_url_for(required, &url("?sslmode=require"), Some("disable")),
+            Ok(())
         );
     }
 
@@ -768,7 +759,8 @@ mod tests {
         // The full settings cannot load here...
         assert!(InternalTls::from_lookup(env("on", PLAIN)).is_err());
         // ...but the check still runs, and still enforces the mode.
-        assert_eq!(check_database_url_lookup(env("on", PLAIN)), Ok(()));
+        assert!(check_database_url_lookup(env("on", PLAIN)).is_err());
+        assert_eq!(check_database_url_lookup(env("off", PLAIN)), Ok(()));
         assert_eq!(check_database_url_lookup(env("on", TLS)), Ok(()));
         assert_eq!(check_database_url_lookup(env("required", TLS)), Ok(()));
         assert!(check_database_url_lookup(env("required", PLAIN)).is_err());

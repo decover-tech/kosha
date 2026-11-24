@@ -137,7 +137,7 @@ fn component_sets_every_tls_setting_the_base_configmap_documents() {
     let base = read(&k8s.join("base/configmap.yaml"));
     assert!(
         code_lines(&base).iter().all(|l| tls_key(l).is_none()),
-        "base/configmap.yaml must leave TLS off"
+        "base/configmap.yaml must leave TLS configuration to the overlay"
     );
     let documented: BTreeSet<&str> = base
         .lines()
@@ -160,12 +160,10 @@ fn component_sets_every_tls_setting_the_base_configmap_documents() {
 }
 
 #[test]
-fn stage_and_prod_do_not_include_the_component() {
-    for overlay in ["stage", "prod"] {
-        let text = read(&k8s().join(overlay).join("kustomization.yaml"));
-        assert!(
-            !code_lines(&text).iter().any(|l| l.contains("components")),
-            "{overlay} must not turn TLS on by default"
-        );
-    }
+fn stage_includes_the_component_and_requires_tls() {
+    let root = k8s();
+    let stage = read(&root.join("stage/kustomization.yaml"));
+    assert!(code_lines(&stage).contains(&"- ../components/internal-tls"));
+    let patch = read(&root.join("components/internal-tls/configmap-patch.yaml"));
+    assert!(code_lines(&patch).contains(&"KOSHA_INTERNAL_TLS: \"required\""));
 }

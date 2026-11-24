@@ -1641,7 +1641,8 @@ impl AppState {
             .filter(|n| *n > 0)
             .unwrap_or(flush_threshold);
         #[cfg(feature = "s3")]
-        let s3_storage = {
+        #[cfg_attr(not(feature = "postgres"), allow(unused_mut))]
+        let mut s3_storage = {
             match s3_storage::S3Config::from_env() {
                 Some(cfg) => {
                     let bucket = cfg.bucket.clone();
@@ -1757,6 +1758,10 @@ impl AppState {
             match kosha_control::PgStore::connect_with_retry(&db_url) {
                 Ok(store) => {
                     control_plane_kind = "postgres";
+                    #[cfg(feature = "s3")]
+                    if let Some(s3) = s3_storage.as_mut() {
+                        s3.set_tenant_kms_key_store(store.clone());
+                    }
                     println!("control plane: postgres ({})", redact_database_url(&db_url));
                     Box::new(store)
                 }
@@ -1963,13 +1968,14 @@ impl AppState {
         let compaction_on_ingest =
             role::compaction_on_ingest(std::env::var("KOSHA_COMPACTION_ON_INGEST").ok().as_deref());
         // TLS between pods (#343). Fails closed on a bad configuration.
+        #[cfg(not(test))]
         let internal_tls = internal_tls::global();
+        #[cfg(test)]
+        let internal_tls = &internal_tls::InternalTls::off();
         println!("internal TLS: {}", internal_tls.describe());
         let write_http_client = ingest_host.as_ref().map(|h| {
-            match internal_tls.check_ingest_host(h) {
-                Ok(None) => {}
-                Ok(Some(warning)) => eprintln!("WARN: {warning}"),
-                Err(e) => fatal(&e),
+            if let Err(e) = internal_tls.check_ingest_host(h) {
+                fatal(&e);
             }
             println!("write-path requests will be forwarded to ingest at {h}");
             internal_tls
@@ -2314,7 +2320,7 @@ impl AppState {
             shard_views: Mutex::new(HashMap::new()),
             default_consistency: unindexed::Consistency::from_env(),
             unindexed_cap: unindexed::UnindexedCap::from_env(),
-            unindexed: unindexed::UnindexedState::new(query_role),
+            unindexed: unindexed::UnindexedState::new(query_role, internal_tls),
             dashboard: dashboard::Dashboard::from_env(),
         }
     }
@@ -25362,8 +25368,9 @@ mod internal_tls_tests {
     ) -> InternalTls {
         let path = |p: &std::path::Path| Some(p.to_str().unwrap().to_string());
         InternalTls::from_lookup(|name| match name {
-            "KOSHA_INTERNAL_TLS" => Some("on".into()),
             "KOSHA_INTERNAL_TLS_CA_PATH" => path(&pki.ca),
+            "KOSHA_TLS_CERT_PATH" => path(&pki.server_cert),
+            "KOSHA_TLS_KEY_PATH" => path(&pki.server_key),
             "KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH" if client_cert => path(&pki.client_cert),
             "KOSHA_INTERNAL_TLS_CLIENT_KEY_PATH" if client_cert => path(&pki.client_key),
             "KOSHA_INTERNAL_TLS_SERVER_NAME" => server_name.map(str::to_string),
@@ -25441,7 +25448,7 @@ mod internal_tls_tests {
 
         let tls = internal_tls(&pki, true, None);
         let ingest_host = format!("https://localhost:{}", ingest_addr.port());
-        assert_eq!(tls.check_ingest_host(&ingest_host), Ok(None));
+        assert_eq!(tls.check_ingest_host(&ingest_host), Ok(()));
         let mut query = AppState::new(ingest.data_dir.clone());
         *query.controller.lock().unwrap() = Box::new(SharedManifestStore::new(shared.clone()));
         query.ingest_host = Some(ingest_host);
