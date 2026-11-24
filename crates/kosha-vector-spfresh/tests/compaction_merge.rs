@@ -10,20 +10,19 @@
 //! clusterer noise, not the merge.
 
 mod common;
+#[path = "common/compaction.rs"]
+mod compaction;
 
 use std::collections::HashSet;
 
 use common::{brute_force_topk, recall_at_k};
+use compaction::{input_of, lire_merge, Input, ABSORB_CANDIDATES};
 use kosha_vector_spfresh::{
     cosine_distance, cosine_similarity, mean_vector, nearest_centroids, normalize_in_place,
     ClusterIndex, ClusterIndexConfig, DeterministicRng, PostingSnapshot, VectorIndexError,
 };
 
 const SEEDS: u64 = 5;
-/// Inputs with fewer vectors than this have their vectors inserted one by
-/// one instead of their postings adopted (mirrors kosha-segment's
-/// `LIRE_ADOPT_MIN_VECTORS`).
-const ADOPT_MIN: usize = 1024;
 
 /// `n` points of a mixture of `centers` random directions in `dim`
 /// dimensions, jittered. `drift` rotates every center a little (churn
@@ -69,86 +68,6 @@ fn config(dim: usize, seed: u64) -> ClusterIndexConfig {
     let mut cfg = ClusterIndexConfig::new(dim);
     cfg.seed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
     cfg
-}
-
-/// One compaction: `inputs` are the input segments' postings (a big input
-/// arrives as its snapshot, a flush-sized one as plain vectors).
-enum Input {
-    Postings(Vec<PostingSnapshot>),
-    Vectors(Vec<(u32, Vec<f32>)>),
-}
-
-fn input_of(vectors: Vec<(u32, Vec<f32>)>, cfg: &ClusterIndexConfig) -> Input {
-    if vectors.len() < ADOPT_MIN {
-        Input::Vectors(vectors)
-    } else {
-        Input::Postings(
-            ClusterIndex::build(&vectors, cfg.clone())
-                .unwrap()
-                .snapshot(),
-        )
-    }
-}
-
-/// Candidate postings per absorbed posting (mirrors kosha-segment).
-const ABSORB_CANDIDATES: usize = 8;
-
-/// What kosha-segment's compaction writer does with the inputs: the
-/// largest input's postings (minus deleted members, centroid recomputed
-/// where something was dropped) seed the index, every other input is
-/// absorbed into them — posting by posting, or vector by vector for an
-/// input too small to have adopted postings — and LIRE rebalances.
-fn lire_merge(
-    inputs: Vec<Input>,
-    deleted: &HashSet<u32>,
-    cfg: &ClusterIndexConfig,
-) -> ClusterIndex {
-    let mut groups: Vec<Vec<PostingSnapshot>> = Vec::new();
-    let mut loose = Vec::new();
-    for input in inputs {
-        match input {
-            Input::Vectors(vs) => {
-                loose.extend(vs.into_iter().filter(|(id, _)| !deleted.contains(id)).map(
-                    |(id, v)| PostingSnapshot {
-                        centroid: v.clone(),
-                        entries: vec![(id, v)],
-                        radius: 0.0,
-                    },
-                ))
-            }
-            Input::Postings(ps) => groups.push(
-                ps.into_iter()
-                    .map(|p| {
-                        let before = p.entries.len();
-                        let entries: Vec<(u32, Vec<f32>)> = p
-                            .entries
-                            .into_iter()
-                            .filter(|(id, _)| !deleted.contains(id))
-                            .collect();
-                        let centroid = if entries.len() == before {
-                            p.centroid
-                        } else {
-                            mean_vector(entries.iter().map(|(_, v)| v.as_slice()), cfg.dim)
-                        };
-                        PostingSnapshot {
-                            centroid,
-                            entries,
-                            radius: 0.0,
-                        }
-                    })
-                    .collect(),
-            ),
-        }
-    }
-    let size = |g: &Vec<PostingSnapshot>| g.iter().map(|p| p.entries.len()).sum::<usize>();
-    let base = (0..groups.len()).max_by_key(|&i| size(&groups[i])).unwrap();
-    let mut idx = ClusterIndex::from_postings(groups.swap_remove(base), cfg.clone()).unwrap();
-    for g in groups {
-        idx.absorb_postings(g, ABSORB_CANDIDATES).unwrap();
-    }
-    idx.absorb_postings(loose, ABSORB_CANDIDATES).unwrap();
-    idx.rebalance();
-    idx
 }
 
 /// Mean recall@10 probing `fraction` of the index's postings — how
