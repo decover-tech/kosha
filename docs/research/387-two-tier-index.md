@@ -236,11 +236,11 @@ MSMarco snapshot.
 
 ## Experimental format (default off)
 
-- Version 7 is allocated to tiering because #411 already assigned v6
-  to bit-packed scoring blocks (#386). Write v7 only with
+- Version 8 is allocated to tiering: #411 assigned v6 to bit-packed
+  scoring blocks, and #520 assigns v7 to bit-packed positions. Write v8 only with
   `KOSHA_TWO_TIER_HEAD_FRACTION` set to a fraction in `(0, 1)`. Keep
-  this flag off until every replica can read v7. With the flag off,
-  both v5 and v6 read and write as before. Mixed namespaces are supported.
+  this flag off until every replica can read v8. With the flag off,
+  the ordinary postings format is unchanged. Mixed namespaces are supported.
 - Each TOC entry gains:
   - a **head span**: a v5-layout span over the head postings in doc order,
     with positions, in the existing `postings-XX.bin` shards. This is what
@@ -248,7 +248,7 @@ MSMarco snapshot.
   - a **tail span**: the same layout in one raw `tail-00.bin` object per
     segment, excluded from warmup; the object is absent if no term splits;
   - **tail bound** metadata: the frontier step function `(dl, tf)*`.
-    The raw v7 TOC uses the old entry's reserved word to point into these
+    The raw v8 TOC uses the old entry's reserved word to point into these
     appended records.
 - `df` stays the full posting count (head + tail), so `doc_frequencies`
   (#246) and namespace statistics are unchanged. Head selection uses build
@@ -263,7 +263,7 @@ MSMarco snapshot.
 ## Exact query prototype (default off)
 
 `KOSHA_TWO_TIER_QUERY=exact` enables the head-only check for plain ranked
-BM25 OR and single-term queries on v7 segments. With it unset, v7 always
+BM25 OR and single-term queries on v8 segments. With it unset, v8 always
 reads full postings. Scores and document frequency use the same BM25
 statistics and parameters as the full path.
 
@@ -286,7 +286,7 @@ not part of the prototype.
 
 Interactions:
 - The head plays the role of the essential list in MaxScore. The
-  prototype scores v7 posts exhaustively after a tail fetch; it does not
+  prototype scores v8 postings exhaustively after a tail fetch; it does not
   prune within a fetched tail.
 - R6 (docid ordering): reordering makes heads denser in docid space, which
   shrinks head scoring bytes (the deltas get smaller).

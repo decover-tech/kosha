@@ -134,7 +134,7 @@ fn tiered_search_certifies_or_fetches_and_matches_full_postings() {
 
     let seg = tiered.join(&ns.0).join("seg0");
     let version = std::fs::read(seg.join("inverted.idx")).unwrap();
-    assert_eq!(&version[4..8], &7u32.to_le_bytes());
+    assert_eq!(&version[4..8], &8u32.to_le_bytes());
     assert!(kosha_segment::tier_files_present(&seg));
     let remote = std::fs::read(seg.join(TIER_TAIL_FILE)).unwrap();
     std::fs::remove_file(seg.join(TIER_TAIL_FILE)).unwrap();

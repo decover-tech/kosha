@@ -3185,21 +3185,6 @@ pub const SKIP_SPLIT_INVERTED_VERSION: u32 = 5;
 /// the positions section stay v5 varints. Written only when
 /// `KOSHA_POSTINGS_WRITE_VERSION=6`; never the default.
 pub const BITPACKED_SKIP_SPLIT_INVERTED_VERSION: u32 = 6;
-pub const TIERED_SPLIT_INVERTED_VERSION: u32 = 7;
-pub const TIER_TAIL_FILE: &str = "tail-00.bin";
-
-/// Strictly increasing (field length, term frequency) points not dominated
-/// by any shorter document with the same or higher frequency.
-pub fn tail_frontier(tail: &mut [(u32, u32)]) -> Vec<(u32, u32)> {
-    tail.sort_unstable_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)));
-    let mut steps: Vec<(u32, u32)> = Vec::new();
-    for &(tf, dl) in tail.iter() {
-        if steps.last().is_none_or(|&(_, best)| tf > best) {
-            steps.push((dl, tf));
-        }
-    }
-    steps
-}
 
 /// THE canonical "is this a split-format inverted TOC?" predicate. Every
 /// site that dispatches on split-ness (the server's posting-blob hydration
@@ -3209,11 +3194,11 @@ pub fn tail_frontier(tail: &mut [(u32, u32)]) -> Vec<(u32, u32)> {
 /// silent-zero-hits bug — the reader accepts the segment while hydration
 /// never fetches its blobs. Adding v6 must be a one-line change here.
 pub fn is_split_inverted_version(version: u32) -> bool {
-    version == FIXED_SPLIT_INVERTED_VERSION
+    version == TIERED_SPLIT_INVERTED_VERSION
+        || version == FIXED_SPLIT_INVERTED_VERSION
         || version == SPLIT_INVERTED_VERSION
         || version == SKIP_SPLIT_INVERTED_VERSION
         || version == BITPACKED_SKIP_SPLIT_INVERTED_VERSION
-        || version == TIERED_SPLIT_INVERTED_VERSION
 }
 
 /// The inverted-postings version the writer emits —
@@ -4752,6 +4737,23 @@ const INVERTED_TABLE_ENTRY_LEN: usize = 24;
 const SPLIT_INVERTED_TABLE_ENTRY_LEN: usize = 32;
 pub const POSTING_BLOB_SHARDS: usize = 256;
 
+/// Experimental split TOC with separate head and tail spans using v5 encoding.
+pub const TIERED_SPLIT_INVERTED_VERSION: u32 = 8;
+pub const TIER_TAIL_FILE: &str = "tail-00.bin";
+
+/// Strictly increasing (field length, term frequency) points not dominated
+/// by any shorter document with the same or higher frequency.
+pub fn tail_frontier(tail: &mut [(u32, u32)]) -> Vec<(u32, u32)> {
+    tail.sort_unstable_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)));
+    let mut steps: Vec<(u32, u32)> = Vec::new();
+    for &(tf, dl) in tail.iter() {
+        if steps.last().is_none_or(|&(_, best)| tf > best) {
+            steps.push((dl, tf));
+        }
+    }
+    steps
+}
+
 fn posting_blob_id_for_term(term: &str) -> usize {
     let mut hash: u32 = 2_166_136_261;
     for byte in term.as_bytes() {
@@ -4775,7 +4777,7 @@ pub fn all_posting_blob_files() -> Vec<String> {
         .collect()
 }
 
-/// Whether a segment has the complete v7 postings needed for publication.
+/// Whether a segment has the complete tiered postings needed for publication.
 /// Query hydration deliberately does not require the tail to be local.
 pub fn tier_files_present(segment_dir: &Path) -> bool {
     let path = segment_dir.join("inverted.idx");
@@ -4901,12 +4903,11 @@ pub fn postings_section_stats(segment_dir: &Path) -> Result<PostingsSectionStats
         |msg: String| KoshaError::CorruptSegment(format!("{}: {msg}", segment_dir.display()));
     let data = read_inverted_payload(fs::read(segment_dir.join("inverted.idx"))?)?;
     let index = SplitInvertedIndex::from_bytes(data, segment_dir.to_path_buf(), None)?;
+    if index.tier_terms.is_some() {
+        return Err(corrupt("postings are already tiered".into()));
+    }
     let inverted_version = u32::from_le_bytes(index.data[4..8].try_into().unwrap());
-    let Some(bitpacked) = index
-        .encoding
-        .skip_split()
-        .filter(|_| index.tier_terms.is_none())
-    else {
+    let Some(bitpacked) = index.encoding.skip_split() else {
         return Err(corrupt(format!(
             "inverted version {inverted_version} is not skip-split (v5/v6)"
         )));
@@ -6219,13 +6220,16 @@ impl SplitInvertedIndex {
         if !Self::detect(&data) {
             return Err(corrupt("missing split v3 header"));
         }
-        let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        let toc_version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        let version = if toc_version == TIERED_SPLIT_INVERTED_VERSION {
+            SKIP_SPLIT_INVERTED_VERSION
+        } else {
+            toc_version
+        };
         let encoding = match version {
             FIXED_SPLIT_INVERTED_VERSION => SplitPostingsEncoding::Fixed32,
             SPLIT_INVERTED_VERSION => SplitPostingsEncoding::VarintDelta,
-            SKIP_SPLIT_INVERTED_VERSION | TIERED_SPLIT_INVERTED_VERSION => {
-                SplitPostingsEncoding::SkipSplit
-            }
+            SKIP_SPLIT_INVERTED_VERSION => SplitPostingsEncoding::SkipSplit,
             BITPACKED_SKIP_SPLIT_INVERTED_VERSION => SplitPostingsEncoding::BitPackedSkipSplit,
             _ => return Err(corrupt(&format!("unsupported version {version}"))),
         };
@@ -6270,7 +6274,7 @@ impl SplitInvertedIndex {
                 return Err(corrupt(&format!("table entry {i} term is not UTF-8")));
             }
         }
-        if version == TIERED_SPLIT_INVERTED_VERSION {
+        if toc_version == TIERED_SPLIT_INVERTED_VERSION {
             let mut terms = Vec::with_capacity(term_count);
             let mut offset = (0..term_count)
                 .map(|i| {
@@ -6529,9 +6533,6 @@ impl SplitInvertedIndex {
         &'a self,
         terms: &'a [String],
     ) -> Option<Vec<(&'a str, Arc<BlockedTermPostings>)>> {
-        if self.tier_terms.is_some() {
-            return None;
-        }
         let bitpacked = self.encoding.skip_split()?;
         // Slot-assembled in requested-term order — same load-bearing
         // reason as `postings_for_terms`: the WAND leapfrog join sums
@@ -10590,13 +10591,17 @@ impl SegmentReader {
         &'a self,
         terms: &'a [String],
     ) -> Vec<(&'a str, ScoringPostingsRef<'a>)> {
-        if let InvertedAccess::Split(split) = &self.inverted {
-            if let Some(blocked) = split.scoring_postings_for_terms(terms) {
-                return blocked
-                    .into_iter()
-                    .map(|(t, b)| (t, ScoringPostingsRef::Blocked(b)))
-                    .collect();
+        let blocked = match &self.inverted {
+            InvertedAccess::Split(split) if split.tier_terms.is_none() => {
+                split.scoring_postings_for_terms(terms)
             }
+            _ => None,
+        };
+        if let Some(blocked) = blocked {
+            return blocked
+                .into_iter()
+                .map(|(t, b)| (t, ScoringPostingsRef::Blocked(b)))
+                .collect();
         }
         self.postings_for_terms(terms)
             .into_iter()
@@ -14689,7 +14694,7 @@ mod bounded_build_tests {
     use super::*;
 
     #[test]
-    fn pre_v7_inverted_dispatch_rejects_a_tiered_toc() {
+    fn pre_v8_inverted_dispatch_rejects_a_tiered_toc() {
         let dir = std::env::temp_dir().join(format!("kosha-tiered-toc-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let mut writer = SegmentWriter::new(SegmentId("test".into()), dir.clone())
@@ -14699,13 +14704,13 @@ mod bounded_build_tests {
         let toc = fs::read(dir.join("inverted.idx")).unwrap();
         let version = u32::from_le_bytes(toc[4..8].try_into().unwrap());
         assert_eq!(version, TIERED_SPLIT_INVERTED_VERSION);
-        assert!(!(3..=BITPACKED_SKIP_SPLIT_INVERTED_VERSION).contains(&version));
-        // A pre-v7 reader skips its split parser and instead sees the
-        // shared magic in the inline-format detector, then rejects v7.
+        assert!(!(3..=7).contains(&version));
+        // A reader through v7 skips its split parser and instead sees the
+        // shared magic in the inline-format detector, then rejects v8.
         assert!(LazyInvertedIndex::detect(&toc));
         assert!(matches!(
             LazyInvertedIndex::from_bytes(toc, None),
-            Err(KoshaError::CorruptSegment(message)) if message.contains("unsupported version 7")
+            Err(KoshaError::CorruptSegment(message)) if message.contains("unsupported version 8")
         ));
         let reader = SegmentReader::open(dir.clone()).unwrap();
         assert_eq!(reader.postings("test").unwrap().len(), 1);

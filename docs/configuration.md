@@ -268,7 +268,7 @@ Read once in `crates/kosha-query/src/lib.rs`.
 | `KOSHA_BM25_STATS` | Server-wide BM25 statistics scope: `namespace` or `segment` (debugging). A request's `bm25_params.stats` overrides it | `namespace` | enum |
 | `KOSHA_EXACT_TOTAL_HITS` | Default for `exact_total_hits` when a request omits it | off | flag |
 | `KOSHA_TOTAL_HITS_CAP` | Default `total_hits` cap (`relation: gte` above it). `0` is treated as `1` | `10000` | hits |
-| `KOSHA_TWO_TIER_QUERY` | Set to `exact` to try head-only certification on eligible v7 BM25 queries (#387); when off or uncertified, read full postings | off | enum |
+| `KOSHA_TWO_TIER_QUERY` | Set to `exact` to try head-only certification on eligible v8 BM25 queries (#387); when off or uncertified, read full postings | off | enum |
 
 ## kNN / vector search
 
@@ -774,7 +774,6 @@ before rolling back, until every reader understands the newer one. Read once in
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
 | `KOSHA_POSTINGS_WRITE_VERSION` | Inverted-postings version written: `4`, `5` or `6`. `6` is experimental (#386): v5 with bit-packed 128-posting scoring blocks, readable only by builds that include #386, so set it only once every query pod does | `5` | version |
-| `KOSHA_TWO_TIER_HEAD_FRACTION` | A fraction in `(0, 1)` opts new segment writers into v7 head/tail postings (#387), overriding the ordinary postings format. Enable only once every reader supports v7; disable and compact before rolling back | unset | fraction |
 | `KOSHA_VECTOR_WRITE_VERSION` | Vector-index version written: `1` (flat), `2`, `3` or `4` (posting-based) | `4` | version |
 | `KOSHA_VECTOR_STORE` | Where vector field values are stored: `sidecar` (`doc_vectors.bin`) or `inline` (in `doc_store.bin`). Set `inline` before rolling back past #243 | `sidecar` | enum |
 | `KOSHA_DOC_STORE_COMPRESSION` | Experimental (research #388). `zstd`: new segments store each `doc_store.bin` record as its own zstd frame with a per-segment trained dictionary (kept in the `doc_store.offsets` trailer), and vectors always go to `doc_vectors.bin`. `auto`: fresh segments raw, merges keep their inputs' format. `none`: always raw (compact with this before rolling back past #388; older readers cannot read compressed segments) | `auto` | enum |
@@ -794,6 +793,7 @@ before rolling back, until every reader understands the newer one. Read once in
 | `KOSHA_FIELD_INDEX` | Per-field inverted indexes (#249); `off` writes segments exactly as before. Set it and compact before rolling back past #249 | on | flag (default on) |
 | `KOSHA_FILTERS_WRITE_VERSION` | Filter index written: `1` (`filters.bin`) or `2` (columnar `filters.toc` + `filters-NNN.col`, #244) (`filter_columns.rs`) | `1` | version |
 | `KOSHA_POSTINGS_RAW_BLOBS` | Leave `postings-*.bin` shards uncompressed so a cold query can fetch term spans by range (#245); `0` keeps compressing them | on | flag |
+| `KOSHA_TWO_TIER_HEAD_FRACTION` | A fraction in `(0, 1)` opts new segment writers into v8 head/tail postings (#387), overriding the ordinary postings format. Enable only once every reader supports v8; disable and compact before rolling back | unset | fraction |
 
 ## Reranking
 
