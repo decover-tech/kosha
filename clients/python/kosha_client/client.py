@@ -533,8 +533,11 @@ class KoshaClient:
             return {"range": out}
 
         if kind == "exists":
-            field = (spec or {}).get("field")
-            if not field:
+            if not isinstance(spec, dict):
+                raise cls._unsupported(f"exists clause {clause!r}")
+            field = spec.get("field")
+            unknown = set(spec) - {"field"} - cls._IGNORED_EXISTS_KEYS
+            if not isinstance(field, str) or not field or unknown:
                 raise cls._unsupported(f"exists clause {clause!r}")
             return {"exists": {"field": field}}
 
@@ -573,6 +576,7 @@ class KoshaClient:
     # Options of OpenSearch's long-form ``prefix`` that only affect scoring
     # or query rewriting, never which documents match.
     _IGNORED_PREFIX_KEYS = frozenset({"boost", "rewrite"})
+    _IGNORED_EXISTS_KEYS = frozenset({"boost"})
 
     @classmethod
     def _prefix_filter(cls, clause: dict, spec: Any) -> dict:

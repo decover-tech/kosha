@@ -915,9 +915,19 @@ impl<'de> Deserialize<'de> for FilterClause {
             "match_all" => Ok(FilterClause::MatchAll {
                 match_all: Some(inner),
             }),
-            "exists" => Ok(FilterClause::Exists {
-                exists: body(inner)?,
-            }),
+            "exists" => {
+                // serde's derived struct visitor also takes a sequence, so
+                // `{"exists": ["tag"]}` would parse; only the object form
+                // is the wire shape.
+                if !inner.is_object() {
+                    return Err(D::Error::custom(
+                        "`exists` takes an object: {\"exists\": {\"field\": \"name\"}}",
+                    ));
+                }
+                Ok(FilterClause::Exists {
+                    exists: body(inner)?,
+                })
+            }
             "geo_distance" => Ok(FilterClause::GeoDistance {
                 geo_distance: body(inner)?,
             }),
@@ -4455,6 +4465,51 @@ mod filter_clause_parsing {
             err.to_string().contains("unknown filter clause `bogus`"),
             "{err}"
         );
+    }
+
+    /// Issue #194: an `exists` body that does not parse must be a 400,
+    /// never a match-all (the #170 failure mode) or a silently dropped
+    /// clause.
+    #[test]
+    fn malformed_exists_bodies_are_rejected() {
+        for body in [
+            r#"{"exists": {}}"#,
+            r#"{"exists": null}"#,
+            r#"{"exists": "tag"}"#,
+            r#"{"exists": ["tag"]}"#,
+            r#"{"exists": {"field": 7}}"#,
+            r#"{"exists": {"field": null}}"#,
+            r#"{"exists": {"field": ["a", "b"]}}"#,
+            r#"{"exists": {"field": "a", "boost": 2}}"#,
+            r#"{"exists": {"fields": ["a"]}}"#,
+            r#"{"bool": {"must_not": [{"exists": {}}]}}"#,
+        ] {
+            assert!(parse(body).is_err(), "{body} must be rejected");
+        }
+        let err = parse(r#"{"exists": {"field": "a", "boost": 2}}"#).unwrap_err();
+        assert!(err.to_string().contains("unknown field `boost`"), "{err}");
+        let err = parse(r#"{"exists": {}}"#).unwrap_err();
+        assert!(err.to_string().contains("missing field `field`"), "{err}");
+    }
+
+    #[test]
+    fn exists_round_trips_and_is_not_hinted_as_full_text() {
+        let json = r#"{"bool": {"must_not": [{"exists": {"field": "matterId"}}]}}"#;
+        let clause = parse(json).unwrap();
+        let again = parse(&serde_json::to_string(&clause).unwrap()).unwrap();
+        let FilterClause::Bool { bool } = again else {
+            panic!("expected Bool");
+        };
+        match &bool.must_not[..] {
+            [FilterClause::Exists { exists }] => assert_eq!(exists.field, "matterId"),
+            other => panic!("expected one Exists, got {other:?}"),
+        }
+        let err = parse(r#"{"match": {"a": "b"}}"#).unwrap_err().to_string();
+        assert!(
+            err.contains("exists"),
+            "exists is listed as a clause: {err}"
+        );
+        assert!(err.contains("use the query text"), "{err}");
     }
 
     #[test]
