@@ -90,10 +90,9 @@ pub fn boundary_replicas(postings: &[PostingSnapshot], assignment: Assignment) -
                     accepted.clear();
                     accepted.push(owner);
                     for &j in &candidates {
-                        if accepted
-                            .iter()
-                            .any(|&i| center_distances[i][j] < distances[j])
-                        {
+                        if accepted.iter().any(|&i| {
+                            distances[i] <= distances[j] && center_distances[i][j] < distances[j]
+                        }) {
                             continue;
                         }
                         accepted.push(j);
@@ -180,6 +179,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(8, 1)]
         );
+    }
+
+    #[test]
+    fn spann_owner_cannot_veto_a_nearer_posting() {
+        let at = |theta: f32| [theta.cos(), theta.sin()];
+        let postings = [posting(&at(0.4), Some(&at(0.0))), posting(&at(0.3), None)];
+        let spills = boundary_replicas(
+            &postings,
+            Assignment::Spann {
+                epsilon: 0.0,
+                max_copies: 2,
+            },
+        );
+        assert_eq!(spills.len(), 1);
+        assert_eq!(spills[0].posting, 1);
     }
 
     #[test]

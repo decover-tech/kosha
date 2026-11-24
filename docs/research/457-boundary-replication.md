@@ -85,11 +85,11 @@ MSMarco RaBitQ results (1,000 queries, up to 20% of postings probed):
 | Layout | Variant | Peak recall@10 | Entries scanned at ≥0.95 | Index growth |
 |---|---|---:|---:|---:|
 | Input order | One copy | 0.8894 | — | — |
-| Input order | SPANN, up to four copies | 0.9181 | — | +13.1% |
+| Input order | SPANN, up to four copies, uncapped | 0.9228 | — | +18.0% |
 | Input order | SOAR, 20% cap | 0.9144 | — | +14.7% |
 | Input order | SOAR, uncapped | 0.9594 | 295,534 | +73.5% |
 | Namespace | One copy | 0.9334 | — | — |
-| Namespace | SPANN, up to four copies | 0.9328 | — | +9.5% |
+| Namespace | SPANN, up to four copies, uncapped | 0.9401 | — | +17.0% |
 | Namespace | SOAR, 20% cap | 0.9474 | — | +14.7% |
 | Namespace | SOAR, uncapped | 0.9735 | 147,371 | +73.7% |
 
@@ -100,4 +100,4 @@ that target. On namespace f32, uncapped SOAR scanned 98,207 entries versus
 195,237 for the baseline (1.99× fewer), but p10 recall fell from 0.90 to
 0.80. Capped SOAR scanned 166,001 and kept p10 at 0.90. On the recall
 fixture, capped SOAR scanned more entries at the target than the baseline
-in both layouts; SPANN added at most 24 entries and made little difference.
+in both layouts; SPANN added at most 157 entries and made little difference.
