@@ -760,6 +760,10 @@ seconds or a unit (`90s`, `5m`, `1h`).
 | `KOSHA_LOCAL_GC_GRACE` | How long a retired segment's local files stay after the publish that dropped it (and after every search that could read them ends) | `5m` | duration |
 | `KOSHA_LOCAL_GC_INTERVAL_MS` | How often each pod reclaims retired local segments; `0` disables | `60000` | milliseconds |
 
+The Kubernetes `kosha-segment-gc` CronJob uses `KOSHA_GC_INGEST_SCHEME` as the URL scheme for
+`POST /v1/admin/gc`. The base manifest sets it to `http` for plaintext ingest; the
+`internal-tls` component sets it to `https` and mounts the CA for verification.
+
 ## Deleted namespaces (cache purge and retry)
 
 Read in `PurgeSettings::from_env` (`crates/kosha-server/src/deletion_purge.rs`). Both are off
