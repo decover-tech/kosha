@@ -20,6 +20,12 @@ path = "src/bin/vector_quant_eval.rs"
 name = "kosha-cluster-eval"
 path = "src/bin/cluster_eval.rs"
 
+# Predicate-aware posting ranking for filtered kNN (#465): postings fetched
+# at matched filtered recall, baseline vs ranking only passing postings.
+[[bin]]
+name = "kosha-filter-knn-eval"
+path = "src/bin/filter_knn_eval.rs"
+
 [lints]
 workspace = true
 
