@@ -217,37 +217,12 @@ class KoshaClient:
         action = self._V1_ACTIONS.get(path)
         if action is None:
             return self._transport.request(method, path, body, headers)
-        legacy_body = body
         body = dict(body or {})
         namespace = body.pop("namespace", None)
         if not namespace:
             raise ValueError("%s needs a namespace" % path)
-        if path == "replace" and getattr(self, "_legacy_replace", False):
-            return self._transport.request(method, "replace", legacy_body, headers)
         target = "v1/namespaces/%s/%s" % (urllib.parse.quote(str(namespace), safe=""), action)
-        try:
-            return self._transport.request(method, target, body, headers)
-        except KoshaRequestError as e:
-            # `POST /v1/namespaces/{ns}/replace` is new in contract 0.9.0.
-            # An older server does not know the route: it answers a bare
-            # 404, or, for an API key restricted by scopes or namespaces, a
-            # bare 403 ("cannot use this route") from its authorization
-            # check, which runs before routing. Neither carries a `code`
-            # (only servers with the error model send one), so partial
-            # updates go to its legacy `/replace`, which it still serves to
-            # the same key. A current server's 404/403 carries a `code`
-            # (`namespace_not_found`, `permission_denied`) and is raised.
-            if path != "replace" or e.status_code not in (403, 404) or e.code is not None:
-                raise
-            logger.warning(
-                "kosha server has no /v1/namespaces/{ns}/replace (older than API 0.9.0); "
-                "falling back to the deprecated POST /replace. Upgrade the server."
-            )
-            result = self._transport.request(method, "replace", legacy_body, headers)
-            # Only once the legacy route has served the request: a bare 403
-            # that was a real refusal is raised by it, and not remembered.
-            self._legacy_replace = True
-            return result
+        return self._transport.request(method, target, body, headers)
 
     def _v1_request(
         self, method: str, namespace: str, action: str, body: Any = None
@@ -533,8 +508,11 @@ class KoshaClient:
             return {"range": out}
 
         if kind == "exists":
-            field = (spec or {}).get("field")
-            if not field:
+            if not isinstance(spec, dict):
+                raise cls._unsupported(f"exists clause {clause!r}")
+            field = spec.get("field")
+            unknown = set(spec) - {"field"} - cls._IGNORED_EXISTS_KEYS
+            if not isinstance(field, str) or not field or unknown:
                 raise cls._unsupported(f"exists clause {clause!r}")
             return {"exists": {"field": field}}
 
@@ -573,6 +551,7 @@ class KoshaClient:
     # Options of OpenSearch's long-form ``prefix`` that only affect scoring
     # or query rewriting, never which documents match.
     _IGNORED_PREFIX_KEYS = frozenset({"boost", "rewrite"})
+    _IGNORED_EXISTS_KEYS = frozenset({"boost", "_name"})
 
     @classmethod
     def _prefix_filter(cls, clause: dict, spec: Any) -> dict:
@@ -1495,7 +1474,6 @@ class KoshaClient:
 
             # helpers.bulk update actions send {"doc": {...}} — unwrap + keep
             # Vector fields (contentEmbedding) that index() already supported.
-            # Partial updates are merged server-side by POST /replace.
             fields = self._source_to_fields(source if isinstance(source, dict) else {})
             doc = {
                 "id": doc_id or "",
@@ -1504,7 +1482,7 @@ class KoshaClient:
             actions.append((doc_index or default_ns, op_type or "index", doc))
 
         # Route each document to the namespace named by its action's _index.
-        # `index` upserts full docs via /index; partial `update` uses /replace.
+        # `index` upserts full docs; `update` merges partial docs.
         docs_by_ns: dict[str, list[dict]] = {}
         updates_by_ns: dict[str, list[dict]] = {}
         for doc_ns, op_type, doc in actions:

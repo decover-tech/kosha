@@ -497,6 +497,17 @@ impl Drop for WriterSlotGuard<'_> {
     }
 }
 
+/// What [`Indexer::delete_by_query_measured`] deleted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeleteOutcome {
+    /// Documents newly tombstoned.
+    pub documents: usize,
+    /// Their records' bytes in `doc_store.bin`, as stored (compressed when
+    /// the segment's doc store is). Zero for documents in legacy segments
+    /// written before `doc_store.offsets`.
+    pub stored_bytes: u64,
+}
+
 /// Thread-safe indexer with per-namespace isolation (DESIGN.md §7.1).
 ///
 /// Request handlers share one `Indexer` without a process-wide mutex: each
@@ -762,9 +773,23 @@ impl Indexer {
     pub fn delete_by_query(
         &self,
         namespace: &NamespaceId,
-        _manifest: &Manifest,
+        manifest: &Manifest,
         filter: &FilterClause,
     ) -> Result<usize, KoshaError> {
+        self.delete_by_query_measured(namespace, manifest, filter)
+            .map(|outcome| outcome.documents)
+    }
+
+    /// [`Self::delete_by_query`], also reporting the doc-store bytes of the
+    /// deleted documents (usage metering, #348). Measured from the
+    /// in-memory `doc_store.offsets` spans, so it reads nothing more than
+    /// the delete itself does.
+    pub fn delete_by_query_measured(
+        &self,
+        namespace: &NamespaceId,
+        _manifest: &Manifest,
+        filter: &FilterClause,
+    ) -> Result<DeleteOutcome, KoshaError> {
         let handle = self.ns_handle(namespace);
         let _writes = handle.writes.lock().unwrap();
         if self.needs_recovery_hydration(namespace) {
@@ -784,6 +809,7 @@ impl Indexer {
         // deletion in memory that the caller was told failed.
         let mut changes = Vec::new();
         let mut deleted_ids = HashSet::new();
+        let mut stored_bytes = 0u64;
         for entry in &state.manifest.segments {
             let seg_dir = state
                 .manifest
@@ -801,6 +827,10 @@ impl Indexer {
                     .doc_meta(*seq)
                     .ok_or_else(|| KoshaError::NotFound("delete doc metadata missing".into()))?;
                 deleted_ids.insert(DocumentId(meta.doc_id.to_owned()));
+                // `None` for a legacy segment without `doc_store.offsets`.
+                if let Some((_, length)) = reader.doc_span(*seq) {
+                    stored_bytes = stored_bytes.saturating_add(u64::from(length));
+                }
             }
             changes.push((entry.segment_id.clone(), matching));
         }
@@ -829,7 +859,10 @@ impl Indexer {
             state.manifest.version += 1;
         }
         state.manifest.tombstones = state.tombstones.clone();
-        Ok(total)
+        Ok(DeleteOutcome {
+            documents: total,
+            stored_bytes: if total > 0 { stored_bytes } else { 0 },
+        })
     }
 
     /// Get tombstoned doc_seqs for a namespace, keyed by segment.
@@ -1211,6 +1244,78 @@ impl Indexer {
         self.upsert_documents(namespace, documents, true)
     }
 
+    /// Estimate the complete documents a partial replacement would write.
+    /// This is a read-only preflight so a namespace-level quota can check
+    /// all shards before the first shard is written.
+    pub fn merged_replacement_bytes(
+        &self,
+        namespace: &NamespaceId,
+        documents: Vec<Document>,
+    ) -> Result<u64, KoshaError> {
+        let handle = self.ns_handle(namespace);
+        let _compact = handle.compact.lock().unwrap();
+        let _mutation = handle.mutation.lock().unwrap();
+        self.ensure_id_index(namespace, &handle)?;
+        let snapshot = handle.state.lock().unwrap().clone();
+        dedupe_documents_last_wins(documents)
+            .into_iter()
+            .try_fold(0u64, |bytes, mut doc| {
+                let latest = Self::live_upsert_locations(&snapshot, &doc.id)
+                    .next_back()
+                    .filter(|_| !snapshot.recovered_deletes.contains(&doc.id));
+                self.merge_replacement(namespace, &snapshot, &mut doc, latest)?;
+                Ok(bytes.saturating_add(approx_document_bytes(&doc)))
+            })
+    }
+
+    fn live_upsert_locations<'a>(
+        snapshot: &'a NamespaceState,
+        id: &DocumentId,
+    ) -> impl DoubleEndedIterator<Item = &'a (SegmentId, u32)> {
+        snapshot
+            .id_index
+            .as_ref()
+            .unwrap()
+            .get(id)
+            .into_iter()
+            .flatten()
+            .filter(|(seg, seq)| {
+                !snapshot
+                    .tombstones
+                    .get(seg)
+                    .is_some_and(|ids| ids.contains(seq))
+            })
+    }
+
+    fn merge_replacement(
+        &self,
+        namespace: &NamespaceId,
+        snapshot: &NamespaceState,
+        doc: &mut Document,
+        latest: Option<&(SegmentId, u32)>,
+    ) -> Result<(), KoshaError> {
+        let buffered = snapshot
+            .buffer
+            .as_ref()
+            .and_then(|b| b.documents.iter().rev().find(|d| d.id == doc.id));
+        let fields = if let Some(buffered) = buffered {
+            buffered.fields.clone()
+        } else if let Some((seg, seq)) = latest {
+            let path = snapshot
+                .manifest
+                .segment_dir(&self.data_dir, namespace, seg);
+            let reader = kosha_segment::SegmentReader::open_with_options(path, false)?;
+            reader
+                .doc_record_full(*seq)?
+                .ok_or_else(|| KoshaError::NotFound("replacement document missing".into()))?
+                .fields
+        } else {
+            return Ok(());
+        };
+        doc.fields = merge_fields(fields, std::mem::take(&mut doc.fields));
+        Ok(())
+    }
+
     /// Mark prior copies deleted and write only the incoming documents. When `merge` is true, patch fields onto the latest existing
     /// copy (`/replace`); when false, the incoming document fully replaces it
     /// (`/index` upsert).
@@ -1250,52 +1355,14 @@ impl Indexer {
         let snapshot = handle.state.lock().unwrap().clone();
         before_io();
         fail::fail_point!("upsert.before_io");
-        let index = snapshot.id_index.as_ref().unwrap();
         let mut locations = Vec::new();
         let mut replacements = Vec::with_capacity(count);
         for mut doc in documents {
-            let live: Vec<_> = index
-                .get(&doc.id)
-                .into_iter()
-                .flatten()
-                .filter(|(seg, seq)| {
-                    !snapshot
-                        .tombstones
-                        .get(seg)
-                        .is_some_and(|ids| ids.contains(seq))
-                })
-                .cloned()
-                .collect();
+            let from = locations.len();
+            locations.extend(Self::live_upsert_locations(&snapshot, &doc.id).cloned());
             if merge {
-                let buffered = snapshot
-                    .buffer
-                    .as_ref()
-                    .and_then(|b| b.documents.iter().rev().find(|d| d.id == doc.id));
-                let fields = if let Some(buffered) = buffered {
-                    Some(buffered.fields.clone())
-                } else if let Some((seg, seq)) = live.last() {
-                    let reader = kosha_segment::SegmentReader::open_with_options(
-                        snapshot
-                            .manifest
-                            .segment_dir(&self.data_dir, &namespace, seg),
-                        false,
-                    )?;
-                    Some(
-                        reader
-                            .doc_record_full(*seq)?
-                            .ok_or_else(|| {
-                                KoshaError::NotFound("replacement document missing".into())
-                            })?
-                            .fields,
-                    )
-                } else {
-                    None
-                };
-                if let Some(fields) = fields {
-                    doc.fields = merge_fields(fields, doc.fields);
-                }
+                self.merge_replacement(&namespace, &snapshot, &mut doc, locations[from..].last())?;
             }
-            locations.extend(live);
             replacements.push(doc);
         }
         // WAL fsync and segment I/O happen with state unlocked. The operation
@@ -2477,6 +2544,15 @@ impl Indexer {
         if let Some(conflict) = self.embedding_conflict_in(namespace, &handle, &schema) {
             return Err(KoshaError::InvalidQuery(conflict));
         }
+        // Schema evolution rules (#347), re-checked here for the same
+        // reason: every route that sets a schema comes through this.
+        let existing = self.schema_existing_data_in(namespace, &handle);
+        let current = handle.state.lock().unwrap().manifest.schema.clone();
+        if let Err(refused) =
+            kosha_core::schema_evolution::check(current.as_ref(), &schema, &existing)
+        {
+            return Err(KoshaError::InvalidQuery(refused.message));
+        }
         let mut state = handle.state.lock().unwrap();
         if state.known && state.manifest.schema.as_ref() == Some(&schema) {
             return Ok(false);
@@ -2502,6 +2578,79 @@ impl Indexer {
     ) -> Option<String> {
         let handle = self.ns_handle(namespace);
         self.embedding_conflict_in(namespace, &handle, schema)
+    }
+
+    /// What `namespace` holds, as the schema evolution rules (#347,
+    /// [`kosha_core::schema_evolution`]) need it: whether any document is
+    /// stored or buffered, and which vector fields hold vectors (with their
+    /// dimension, from the segment footers).
+    pub fn schema_existing_data(
+        &self,
+        namespace: &NamespaceId,
+    ) -> kosha_core::schema_evolution::ExistingData {
+        let handle = self.ns_handle(namespace);
+        self.schema_existing_data_in(namespace, &handle)
+    }
+
+    fn schema_existing_data_in(
+        &self,
+        namespace: &NamespaceId,
+        handle: &NamespaceHandle,
+    ) -> kosha_core::schema_evolution::ExistingData {
+        let state = handle.state.lock().unwrap().clone();
+        let mut data = kosha_core::schema_evolution::ExistingData::default();
+        let buffered = state
+            .buffer
+            .iter()
+            .flat_map(|buf| buf.documents.iter())
+            .chain(state.flushing_docs.iter().flat_map(|docs| docs.iter()));
+        // A buffered vector of a field the current schema embeds was
+        // embedded with that model (it is recorded when it is flushed).
+        let declared = state.manifest.schema.clone().unwrap_or_default();
+        for doc in buffered {
+            data.has_documents = true;
+            for field in &doc.fields {
+                if field.field_type == kosha_core::FieldType::Vector {
+                    data.vector_fields.entry(field.name.clone()).or_insert(None);
+                    if let Some(spec) = declared.embedding_for(&field.name) {
+                        data.vector_models
+                            .entry(field.name.clone())
+                            .or_default()
+                            .insert(spec.model.clone());
+                    }
+                }
+            }
+        }
+        for entry in &state.manifest.segments {
+            if entry.doc_count > 0 {
+                data.has_documents = true;
+            }
+            let fields = match state.manifest.segment_footer(&entry.segment_id) {
+                Some(footer) => footer.vector_fields.clone(),
+                None => {
+                    let seg_dir =
+                        state
+                            .manifest
+                            .segment_dir(&self.data_dir, namespace, &entry.segment_id);
+                    match kosha_segment::SegmentReader::read_footer(&seg_dir) {
+                        Ok(footer) => footer.vector_fields,
+                        // Unreadable here: assume it holds documents and
+                        // say nothing about its vectors.
+                        Err(_) => continue,
+                    }
+                }
+            };
+            for meta in fields.into_iter().flatten() {
+                if let Some(model) = meta.embedding_model {
+                    data.vector_models
+                        .entry(meta.name.clone())
+                        .or_default()
+                        .insert(model);
+                }
+                data.vector_fields.insert(meta.name, Some(meta.dim));
+            }
+        }
+        data
     }
 
     fn embedding_conflict_in(
@@ -2944,6 +3093,13 @@ impl Indexer {
         Some(manifest)
     }
 
+    /// The committed version the writer's local manifest is based on.
+    pub fn published_version(&self, namespace: &NamespaceId) -> Option<u64> {
+        let handle = self.namespaces.lock().unwrap().get(namespace).cloned()?;
+        let state = handle.state.lock().unwrap();
+        state.known.then_some(state.published_version)
+    }
+
     /// Capture the CAS anchor and candidate under one namespace lock. The
     /// anchor advances only after a successful control-store commit.
     pub fn publication_snapshot(&self, namespace: &NamespaceId) -> Option<(u64, Manifest)> {
@@ -3007,6 +3163,33 @@ impl Indexer {
         flushing.chain(buffered).fold((0, 0), |(docs, bytes), doc| {
             (docs + 1, bytes + approx_document_bytes(doc))
         })
+    }
+
+    /// Approximate bytes not yet represented by a segment, including WAL
+    /// records awaiting replay after recovery.
+    pub fn pending_storage_bytes(&self, namespace: &NamespaceId) -> u64 {
+        let Some(handle) = self.namespaces.lock().unwrap().get(namespace).cloned() else {
+            return 0;
+        };
+        let state = handle.state.lock().unwrap();
+        state
+            .flushing_docs
+            .iter()
+            .flat_map(|chunk| chunk.iter())
+            .chain(
+                state
+                    .buffer
+                    .iter()
+                    .flat_map(|buffer| buffer.documents.iter()),
+            )
+            .chain(
+                state
+                    .recovered
+                    .iter()
+                    .flat_map(|(_, record)| record.documents.iter()),
+            )
+            .map(approx_document_bytes)
+            .fold(0, u64::saturating_add)
     }
 
     /// The namespace's unindexed tail (#255): every acknowledged write that

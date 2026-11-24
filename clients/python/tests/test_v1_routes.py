@@ -1,6 +1,8 @@
 """The client calls only /v1 routes (#350): the unversioned Phase 1 routes
 are deprecated and can be turned off server-side."""
 
+import pytest
+
 from kosha_client import KoshaClient
 from kosha_client.transport import KoshaRequestError
 
@@ -57,25 +59,29 @@ def test_namespace_is_escaped_in_the_path():
 
 
 class OldServerTransport(RecordingTransport):
-    """A server older than API 0.9.0: no /v1/.../replace (a bare 404 with
-    no error code), legacy /replace still served."""
+    """A server without /v1/.../replace: bare 404 or 403 with a restricted key."""
+
+    def __init__(self, status):
+        super().__init__()
+        self.status = status
 
     def request(self, method, path, body=None, headers=None):  # noqa: ANN001
         if path.startswith("v1/") and path.endswith("/replace"):
             self.calls.append((method, path, body))
-            raise KoshaRequestError(404, "not found", {"error": "not found"})
+            raise KoshaRequestError(self.status, "unknown route", {"error": "unknown route"})
         return super().request(method, path, body, headers)
 
 
-def test_partial_updates_fall_back_to_legacy_replace_on_an_older_server():
+@pytest.mark.parametrize("status", [403, 404])
+def test_partial_updates_do_not_fall_back_to_legacy_replace(status):
     c = KoshaClient("http://kosha.test", api_key="k", namespace="docs")
-    c._transport = OldServerTransport()
-    c.update(index="docs", id="1", body={"doc": {"title": "bye"}})
-    c.update(index="docs", id="2", body={"doc": {"title": "again"}})
+    c._transport = OldServerTransport(status)
+    for doc_id in ["1", "2"]:
+        with pytest.raises(KoshaRequestError) as error:
+            c.update(index="docs", id=doc_id, body={"doc": {"title": "bye"}})
+        assert error.value.status_code == status
     paths = [path for _, path, _ in c._transport.calls]
-    # One probe of the /v1 route, then legacy /replace from then on.
-    assert paths == ["v1/namespaces/docs/replace", "replace", "replace"], paths
-    assert c._transport.calls[1][2]["namespace"] == "docs"
+    assert paths == ["v1/namespaces/docs/replace"] * 2
 
 
 class MissingNamespaceTransport(RecordingTransport):
@@ -102,28 +108,6 @@ def test_a_current_servers_404_is_raised_not_sent_to_legacy():
     assert [path for _, path, _ in c._transport.calls] == ["v1/namespaces/docs/replace"]
 
 
-class OldServerRestrictedKeyTransport(RecordingTransport):
-    """A server older than API 0.9.0 with a scope- or namespace-restricted
-    key: its authorization check refuses the unknown /v1/.../replace with a
-    bare 403 before routing, while legacy /replace serves the same key."""
-
-    def request(self, method, path, body=None, headers=None):  # noqa: ANN001
-        if path.startswith("v1/") and path.endswith("/replace"):
-            self.calls.append((method, path, body))
-            msg = "this API key is restricted (scopes or namespaces) and cannot use this route"
-            raise KoshaRequestError(403, msg, {"error": msg})
-        return super().request(method, path, body, headers)
-
-
-def test_partial_updates_fall_back_on_an_older_servers_bare_403():
-    c = KoshaClient("http://kosha.test", api_key="k", namespace="docs")
-    c._transport = OldServerRestrictedKeyTransport()
-    c.update(index="docs", id="1", body={"doc": {"title": "bye"}})
-    c.update(index="docs", id="2", body={"doc": {"title": "again"}})
-    paths = [path for _, path, _ in c._transport.calls]
-    assert paths == ["v1/namespaces/docs/replace", "replace", "replace"], paths
-
-
 class DeniedTransport(RecordingTransport):
     """A current server refusing the key: its 403 carries `permission_denied`."""
 
@@ -142,4 +126,3 @@ def test_a_current_servers_403_is_raised_not_sent_to_legacy():
     else:
         raise AssertionError("expected KoshaRequestError")
     assert [path for _, path, _ in c._transport.calls] == ["v1/namespaces/docs/replace"]
-    assert not getattr(c, "_legacy_replace", False)

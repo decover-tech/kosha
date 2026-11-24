@@ -70,8 +70,11 @@ Key ids are never logged.
 **Which key an object uses.** Every object under a namespace is
 `{namespace}/{segment}/{file}`, and a tenant-scoped namespace is `{tenant}/{name}` (branches
 and shards stay under the same tenant). The tenant is the namespace's first component, and its
-key comes from the tenant map, falling back to the default key. These objects have no tenant
-and always use the default key:
+key comes, in SSE-KMS mode, from `kosha.tenants.kms_key_id` in the Postgres control plane.
+If the tenant has no record or its key is NULL, Kosha uses the configured tenant map, then
+the default key. A lookup error stops the write instead of silently using another key.
+Operators can set or clear `kms_key_id` on an existing tenant row; this is not a tenant-facing API.
+These objects have no tenant and always use the default key:
 
 - objects of a bare namespace, such as `migrate` without `--namespace`;
 - **WAL objects** (`{prefix}/_wal/{writer_id}/...`). A WAL stream belongs to one ingest writer,
@@ -92,7 +95,9 @@ written with and stay readable (subject to the KMS permissions above).
 - **KMS automatic rotation** (recommended): enable rotation on the key in KMS. KMS keeps the
   old key material for decryption, so nothing is re-encrypted and no Kosha config changes.
 - **Switching to a different key** (a new `KOSHA_S3_SSE_KMS_KEY_ID` or a new tenant entry):
-  roll out the new value. New objects use the new key at once. Old objects keep the old key
+  give the pod role access to the new key, then update the tenant row's `kms_key_id` or roll out
+  the new configuration value. New writes resolve the control-plane key without a pod restart.
+  Old objects keep the old key
   and stay readable as long as the role can still `kms:Decrypt` with it, so keep the old key
   enabled and in the IAM policy. Compaction rewrites segments into new objects, so the old
   key's share of the data shrinks over time. The tenant map (including
@@ -204,15 +209,14 @@ each tenant before the queue is full.
 
 ## Tenant limits
 
-Per-tenant quotas and rate limits (#341, `tenant_limits.rs`). Without
-`KOSHA_TENANT_LIMITS_FILE` nothing is limited. Limits are enforced per pod: query limits on the
+Per-tenant quotas and rate limits (#341, `tenant_limits.rs`). Without a limits file or billing
+plan limits, nothing is limited. Limits are enforced per pod: query limits on the
 pod that serves the search, write limits on the pod that executes the write (the ingest pod; a
 query pod forwards writes first). Operator traffic (the admin and internal service credentials)
-is never limited. A request over a limit gets HTTP 429 with `Retry-After` and a JSON body
-`{"error", "reason", "limit", "retry_after_ms"}`, where `reason` is one of
-`tenant_qps_exceeded`, `tenant_concurrency_exceeded`, `tenant_write_rate_exceeded`,
-`namespace_quota_exceeded`, `doc_quota_exceeded`, `vector_dims_exceeded` or `body_too_large`.
-Rate limits give the time until the token bucket holds the request; quotas give 60 seconds.
+is never limited. Rate and concurrent-query limits return HTTP 429 with `Retry-After` and a
+machine-readable reason. Under the v1 API contract (#350), quotas return 403 and body limits
+return 413; neither is retryable. See [guarantees.md](guarantees.md#per-tenant-limits-opt-in)
+for the response details.
 Each refusal is counted in `kosha_tenant_rejections_total` (see `metrics.md`). A query pod
 relays a write refused by the ingest pod unchanged: the same status, `Retry-After` and body.
 A search shed by `KOSHA_SEARCH_QUEUE_DEPTH_PER_TENANT` is answered and counted the same way,
@@ -232,7 +236,8 @@ The file:
   "plans": {
     "standard": {"qps": 50, "concurrent_queries": 8, "write_docs_per_sec": 2000,
                  "write_bytes_per_sec": 16777216, "namespaces": 100,
-                 "docs_per_namespace": 10000000, "vector_dims": 4096,
+                 "docs_per_namespace": 10000000, "bytes_per_namespace": 10737418240,
+                 "vector_dims": 4096,
                  "max_body_bytes": 33554432, "weight": 1}
   },
   "tenants": {"acme": {"plan": "standard", "qps": 200, "weight": 4}}
@@ -250,14 +255,22 @@ startup it stops the pod, and a reload keeps the previous limits.
 | `concurrent_queries` | Searches in flight at once | each search |
 | `write_docs_per_sec` | Documents per second in index and replace requests. A batch bigger than one second's worth is admitted from a full bucket and paid for afterwards | each index or replace |
 | `write_bytes_per_sec` | Request body bytes per second on write routes | each write request |
-| `max_body_bytes` | Largest write request body, under the pod-wide `KOSHA_MAX_BODY_BYTES` | each write request |
+| `max_body_bytes` | Largest request body, under the pod-wide `KOSHA_MAX_BODY_BYTES` | each authenticated tenant request |
 | `namespaces` | Namespaces the tenant holds (shards not counted; a branch is a namespace and counts) | namespace creation, branch creation, and a write that would auto-create one |
 | `docs_per_namespace` | Documents in a namespace: committed and not deleted plus not yet flushed. An unflushed upsert of an existing id counts twice until flushed | each index or replace |
+| `bytes_per_namespace` | Estimated bytes of owned segments plus the unflushed tail and incoming documents (after embedding), summed across shards | each index or replace |
 | `vector_dims` | Widest vector a document may carry, supplied or produced by native embedding | each index or replace |
 | `weight` | Permits per round-robin turn in the search queue (default 1) | search admission |
 
-Limits stored in the control plane, cluster-wide rate limits across replicas and per-namespace
-storage quotas are not implemented yet (Phase H).
+Billing accounts in the control store select a tenant's billing plan defaults. Operator
+overrides remain in this file. Rate buckets are per pod, not shared across replicas.
+
+The storage quota is an admission estimate, not a hard cap on object-store usage. It counts
+live manifest segments owned by the namespace once (not segments inherited by a branch).
+It does not subtract deleted or replaced data until compaction reclaims it, and the actual
+segment storage after indexing can exceed the estimate. Enabling it requires looking up segment
+sizes at ingest, including listing the namespace's objects on S3; a size lookup failure returns
+503 rather than treating the namespace as empty.
 
 ## Query and relevance
 
@@ -327,7 +340,7 @@ The control plane is in memory unless `DATABASE_URL` is set in a binary built wi
 | --- | --- | --- | --- |
 | `KOSHA_POSTGRES_FALLBACK_ON_ERROR` | When `DATABASE_URL` is set but Postgres is unreachable at boot, fall back to the in-memory store instead of exiting. Emergency use only | off (exit) | flag |
 | `KOSHA_MANIFEST_REFRESH_MS` | How often query pods poll for new manifest versions; `0` disables the refresher and pods check before every search (`manifest_follow.rs`) | `500` | milliseconds |
-| `KOSHA_API_KEY_REFRESH_SECS` | How often API keys are reloaded from Postgres (`auth.rs`) | `30` | seconds |
+| `KOSHA_API_KEY_REFRESH_SECS` | How often API keys are reloaded from Postgres (`auth.rs`). Revocations made on another pod arrive with the next successful reload. A pod whose reloads keep failing refuses operator admin credentials once its snapshot is ten intervals old, until a reload succeeds; tenant keys keep working from the last snapshot | `30` | seconds |
 
 Namespaces written before tenant scoping (#262) have bare ids that no tenant can reach; the
 server lists them in a `WARN` at boot. `kosha-server migrate-namespace --from <bare> --to
@@ -350,11 +363,24 @@ What is recorded:
   attribution, not billing.
 - An accepted document write (`/documents`, legacy `/index` and `/replace`): `bytes_written`
   (each document's id plus every field's name and value, as submitted) and `documents_written`.
-  Recorded on the pod that executes the write. Deletes are not metered.
+  Recorded on the pod that executes the write.
+- An applied delete by query (`POST /v1/namespaces/{ns}/delete`, legacy `/delete`):
+  `documents_deleted` and `bytes_deleted`, the deleted documents' records in the doc store as
+  stored (compressed when the doc store is; 0 for documents in segments written before
+  `doc_store.offsets`). Nothing for a delete that matched nothing. The space itself comes back in
+  `stored_bytes` once compaction rewrites the segments. Deleting a whole namespace or tenant is not
+  a usage event: its deletion record (#347) and the end of its snapshots account for it.
 - Once an hour, on a pod that accepts writes: `stored_bytes`, the object bytes of every segment
   the namespace's manifest references. Shards are added up under their root namespace; a segment
   a branch inherits is counted on the namespace that owns it. The WAL and superseded segments not
   yet garbage-collected are not included.
+- With it, `vector_dimensions`: dimensions times vectors stored, `dim x count` over every vector
+  column plus `dim x tokens` over every late-interaction field of the same segments. The numbers
+  come from each segment's footer, read once per segment (from memory, the local disk or object
+  storage) and kept for as long as a manifest lists the segment, so a snapshot reads nothing more.
+  No format changed. A segment written before vector columns existed (#204) counts 0 until
+  compaction rewrites it. The summary reports `vector_dimension_hours` and
+  `vector_dimensions_latest`, like the stored-bytes fields.
 
 `GET /v1/usage` (the caller's tenant) and `GET /v1/admin/usage[?tenant=]` (admin key) summarize the
 raw events over `?from=&to=` (Unix seconds, `to` exclusive; default the last 30 days). The summary
@@ -363,6 +389,9 @@ adds `bytes_queried`, the billing meter for query volume: each search priced at 
 the same for whole-file, ranged and fully cached searches. `stored_byte_hours` is the sum of the
 hourly snapshots in the window; an hour with no writer running has no snapshot and contributes
 nothing (`stored_snapshots` counts the hours that did).
+
+The summary also reports `documents_deleted` and `bytes_deleted`. The pipeline's own counters are
+on `/metrics` (`kosha_usage_*`, see [metrics.md](metrics.md)).
 
 Delivery: a request appends its event to a spool file and returns; a background thread sends
 sealed spool files to the store and deletes each one after the store accepted it. The store ignores
@@ -426,7 +455,11 @@ plane does not list are found by listing the storage root and each tenant's dire
 `_usage`, `_warmset`) are named in `skipped_prefixes` and not listed.
 
 A difference is within tolerance when it is at most the larger of `tolerance` x the larger of the
-two numbers and `tolerance_bytes`. The snapshot of an hour is taken in the first minutes of that
+two numbers and `tolerance_bytes`. The byte floor never passes a non-zero snapshot against no
+referenced bytes at all: an `unknown` prefix whose objects no manifest covers reads `mismatch`, and
+a live namespace with an empty prefix reads `snapshot_without_storage`, however small the
+snapshot. The snapshot window starts at the top of the hour `max_snapshot_age` before now, so a
+one-hour window still sees the previous hour's snapshot before the current one is taken. The snapshot of an hour is taken in the first minutes of that
 hour and the listing is taken now, so a namespace that was written to or compacted in between
 differs by that much: run the job a few minutes past the hour, or allow for an hour of growth. On
 a node with S3, a segment flushed but not uploaded yet is in the snapshot (from local disk) and
@@ -459,12 +492,22 @@ and free-tier limits are computed from the usage events. Accounts and invoices a
 restart; local development only).
 
 **Plans.** `KOSHA_BILLING_PLANS_FILE` is a JSON price list. No prices are built in; the numbers
-below are an example. It is read at startup only: restart the pods to change it.
+below are an example. It is read at startup and reloaded by `POST /v1/admin/billing/catalog/reload`
+(on the pod that serves it) or, with `KOSHA_BILLING_PLANS_WATCH=on`, by every pod when the file's
+modification time or size changes (checked at each standings refresh). A reload is applied only
+when the file parses, validates and still has every plan in use (one an account is on, one an open
+invoice was rated on, or one a plan change in a month not invoiced yet names); otherwise the pod keeps
+the catalog it has, logs why, and shows it as `catalog_error` in `GET /v1/admin/billing/accounts`.
+A catalog that uses the fields added in #349's second part (`upgrade_plan`,
+`dunning.retry_after_days`, the `vector_dimensions` meter) is refused by older binaries: roll the
+binary out before the file.
 
 ```json
 {
   "default_plan": "free",
-  "dunning": {"payment_terms_days": 14, "read_only_after_days": 7, "suspend_after_days": 21},
+  "upgrade_plan": "payg",
+  "dunning": {"payment_terms_days": 14, "read_only_after_days": 7, "suspend_after_days": 21,
+              "retry_after_days": [3, 5, 7]},
   "plans": {
     "free": {
       "kind": "free",
@@ -490,12 +533,15 @@ below are an example. It is read at startup only: restart the pods to change it.
   included amount is charged) or `enterprise` (rated like `usage`, never restricted automatically
   for non-payment).
 - `meters` prices the billable meters: `queries`, `bytes_queried`, `bytes_written` (see "Usage
-  metering") and `stored_bytes`, the average bytes stored over the month (byte-hours divided by the
-  hours in the month). The first `included` are free; the rest cost `unit_price_cents` per `unit`.
+  metering"), `stored_bytes`, the average bytes stored over the month (byte-hours divided by the
+  hours in the month), and `vector_dimensions`, the average vector dimensions stored, likewise. On
+  a free plan `stored_bytes` and `vector_dimensions` are compared with what is stored now. The first `included` are free; the rest cost `unit_price_cents` per `unit`.
   A meter a plan does not list is neither charged nor limited.
 - `limits` are the plan's tenant quota defaults, with the fields of a plan in
   `KOSHA_TENANT_LIMITS_FILE` ("Tenant limits"). Where that file also gives the tenant a limit, the
   file wins, field by field.
+- `upgrade_plan` is the plan a tenant moves to by completing a self-service checkout (below). It
+  must not be a free plan. Without it checkout is off.
 - `default_plan` is the plan of a tenant nobody put on one. Without it such a tenant is not
   billed, limited or restricted, which is what happens to every existing tenant when billing is
   first turned on.
@@ -505,16 +551,92 @@ rounded half up and the invoice total is the sum of its lines. `POST /v1/admin/b
 (`{"period": "YYYY-MM"}`, default last month) is the monthly job: one invoice per tenant, id
 `<tenant>/<YYYY-MM>`. It is safe to run again: an existing invoice is never re-rated, and one that
 could not be handed to the payment provider is handed over by the next run. Nothing schedules it;
-call it from a CronJob once every pod has delivered its usage for the month (usage that arrives
-after a period is closed is not on the invoice). An invoice is rated on the plan the tenant is on
-when the period is closed; plan changes inside a month are not prorated. An invoice that totals
-zero is recorded as paid.
+the scheduler below runs it, or call it from a CronJob once every pod has delivered its usage
+for the month (usage that arrives after a period is closed is not on the invoice). An invoice that
+totals zero is recorded as paid.
+
+**Proration.** A plan change made through `POST /v1/admin/billing/accounts` or a completed checkout
+is recorded (`kosha.billing_plan_changes`, migration 011). A month with recorded changes is cut at
+each change, and each stretch is rated on the plan in force during it: the usage recorded inside
+the stretch, with the plan's base fee and every meter's included amount multiplied by the
+stretch's share of the month (milliseconds) and rounded half up. Storage and vector dimensions are
+the stretch's byte-hours (dimension-hours) divided by the hours of the whole month, so a constant
+size costs the same however the month is cut. A free stretch charges nothing. Each line of such an
+invoice names its plan (`lines[].plan`). The invoice is issued on the plan in force at the end of
+the month, even when it is closed after a later change. A month without a recorded change is rated
+on one plan, exactly as before; so is every month of a tenant whose plan was changed before
+migration 011, or by an older binary. An account created inside the month was on the default plan
+(if any) before it. The free-tier limits and the `accrued` charge of `GET /v1/billing` use the
+current plan for the whole month to date.
 
 **Payment provider.** With `KOSHA_BILLING_PROVIDER=stripe` an invoice is sent to Stripe (a
-customer per tenant, an invoice with one item per charged line, `collection_method=send_invoice`),
-and `POST /v1/admin/billing/sync` copies paid and void results back. Without a provider invoices
-are only recorded, and a payment collected elsewhere is recorded with
-`POST /v1/admin/billing/invoices/mark-paid` (`{"invoice_id": ...}`).
+customer per tenant, an invoice with one item per charged line). A customer with a default payment
+method is charged automatically (`collection_method=charge_automatically`); anyone else is sent the
+invoice to pay on Stripe's hosted page (`send_invoice`, due when Kosha's invoice is). Without a
+provider invoices are only recorded, and a payment collected elsewhere is recorded with
+`POST /v1/admin/billing/invoices/mark-paid` (`{"invoice_id": ...}`). Amounts are US dollars;
+other currencies and tax are not supported (Stripe Tax is not used, and no tax line is added).
+
+**Webhooks.** With `KOSHA_STRIPE_WEBHOOK_SECRET` set, `POST /v1/billing/webhooks/stripe` takes
+Stripe's event deliveries. Point a Stripe webhook endpoint at it (at least `invoice.paid`,
+`invoice.payment_failed`, `invoice.finalized`, `invoice.voided`, `checkout.session.completed`,
+`customer.updated` and `payment_method.detached`). It needs no API key; each delivery must carry a
+`Stripe-Signature` whose `v1` HMAC-SHA256 of `"<t>.<body>"` matches one of the configured secrets
+(compared in constant time), with `t` within `KOSHA_STRIPE_WEBHOOK_TOLERANCE_SECS` of the pod's
+clock. To roll the endpoint secret, set both secrets (comma-separated) on the pods, roll it in
+Stripe, then remove the old one. Every event id is recorded once applied
+(`kosha.billing_webhook_events`), so a redelivery is acknowledged and changes nothing. A refused
+signature answers 400; an event that could not be applied (store down) answers 503 and Stripe
+delivers it again. Events: `invoice.paid` marks the invoice paid, `invoice.voided` void,
+`invoice.payment_failed` records a failure for dunning, `invoice.finalized` records Stripe's
+invoice id if the submission did not get to; `checkout.session.completed` completes a self-service
+upgrade; `customer.updated` and `payment_method.detached` keep the payment method on file
+current. Subscription events and anything else are acknowledged and ignored: Kosha rates and
+invoices usage itself and does not use Stripe subscriptions. `POST /v1/admin/billing/sync`
+(polling) stays as the fallback for a missed delivery. The route is answered by whichever pod
+receives it, never forwarded.
+
+**Self-service upgrade.** With a provider, `KOSHA_BILLING_RETURN_URL` and `upgrade_plan` in the
+catalog, `POST /v1/billing/checkout` (`{"success_url"?, "cancel_url"?}`, a tenant key with the
+`admin` scope) answers `{"id", "url"}`: a Stripe Checkout page in setup mode where the user enters
+a card. When it completes, the `checkout.session.completed` webhook makes the card the customer's
+default and moves the tenant to `upgrade_plan` (an enterprise tenant keeps its plan). From then on
+its invoices are charged automatically. `POST /v1/billing/portal` (`{"return_url"?}`, `admin`
+scope) opens Stripe's customer portal for changing the card and seeing invoices; it answers 409
+before the tenant has a Stripe customer. Redirect URLs default to `KOSHA_BILLING_RETURN_URL` (with
+`?checkout=success` / `?checkout=cancel`) and must be on its origin. Both routes stay open to a
+read-only or suspended tenant. `GET /v1/billing` adds `payment_method_on_file` and
+`upgrade_plan`.
+
+**Dunning.** A failed payment (the webhook, or a failed retry) is recorded per invoice. When the
+tenant has a payment method on file, the invoice is retried on the `retry_after_days` schedule
+(days after the first failure, each entry after the previous retry; `[3, 5, 7]` retries on days 3,
+8 and 15) and at once after a new payment method is put on file. Set `"retry_after_days": []` when
+Stripe's own automatic retries (Smart Retries) are on, or both will retry. Each open invoice gets a
+notice at each stage it reaches: `payment_failed`, `overdue` (past due), `read_only` and
+`suspended` (enterprise plans are never restricted and get neither), and `recovered` once a dunned
+invoice is paid. A notice goes out once per invoice (claimed in `kosha.billing_notices` before it
+is sent, released if sending fails); a pass that finds several new stages sends only the most
+severe one. Notices go to the log, or as a JSON `POST` to `KOSHA_BILLING_NOTIFY_URL` with
+`x-kosha-notice-id` and, with `KOSHA_BILLING_NOTIFY_SECRET`, an `x-kosha-signature` in Stripe's
+scheme; any 2xx answer is delivery. With the console on (`KOSHA_CONSOLE`), each delivered notice
+is also emailed through the console's mailer to the owners and admins of the organization the
+tenant belongs to; a failed email is logged and does not hold the notice back. `POST /v1/admin/billing/dunning` runs a pass now. The account
+state itself still follows the oldest unpaid invoice's due date (below); dunning collects and
+tells, it does not change the clock.
+
+**Scheduler.** `KOSHA_BILLING_SCHEDULER=on` runs the jobs in the server. Every
+`KOSHA_BILLING_SCHEDULER_INTERVAL_SECS` each pod with it on tries to take the `billing-scheduler`
+lease (`kosha.billing_leases`, three intervals long); the holder flushes its usage spool, closes
+last month once `KOSHA_BILLING_CLOSE_DELAY_SECS` have passed since it ended (unless
+`kosha.billing_jobs` records it closed without errors), syncs payments from the provider every
+`KOSHA_BILLING_SYNC_INTERVAL_SECS`, runs a dunning pass and refreshes its standings. Every step is
+idempotent, so two pods running a tick at once (clocks that disagree about the lease) do no harm.
+Without Postgres the lease is per pod. A month whose close had errors, or that passed while the
+scheduler was down, is closed at the next tick: the scheduler closes every month of the last twelve
+after the earliest one it recorded closed, oldest first. On its first run (nothing recorded) it
+closes only last month, so turning it on does not invoice history; close older months with
+`close-period`.
 
 **Enforcement.** A refused request gets `402 Payment Required` with a JSON body
 `{error, reason, plan, state}`:
@@ -526,7 +648,12 @@ are only recorded, and a payment collected elsewhere is recorded with
 - `billing_read_only`: an invoice is `read_only_after_days` past due. Writes are refused; searches
   and deletes are not.
 - `billing_suspended`: an invoice is `suspend_after_days` past due. Everything is refused except
-  `GET /v1/billing` and `GET /v1/usage`.
+  `GET /v1/billing`, `GET /v1/usage`, and the routes below.
+
+Never refused, in any state: `GET /v1/billing`, `GET /v1/usage`, `POST /v1/billing/checkout` and
+`/portal` (paying), the namespace export routes (`/v1/namespaces/{ns}/exports...`: a customer can
+always take out what it stored), and the tenant's own key routes (`/v1/api-keys...`: a leaked key
+can always be revoked).
 
 An invoice is due `payment_terms_days` after it is issued. The state follows the oldest unpaid
 invoice and is computed, not stored: once the invoice is paid or voided the account is `active`
@@ -550,6 +677,16 @@ far, and its invoices. `GET /v1/admin/billing/accounts` and
 | `KOSHA_BILLING_REFRESH_SECS` | How often a pod rebuilds its snapshot of tenant standings | `60` | seconds |
 | `KOSHA_BILLING_PROVIDER` | `stripe`, or `none` to only record invoices | `none` | name |
 | `KOSHA_STRIPE_API_KEY` | Stripe secret key. Required with `KOSHA_BILLING_PROVIDER=stripe`; keep it in a secret, never in a tracked file | unset | secret |
+| `KOSHA_BILLING_PLANS_WATCH` | `on` makes every pod reload the plans file when its modification time or size changes (checked every `KOSHA_BILLING_REFRESH_SECS`) | off | flag |
+| `KOSHA_STRIPE_WEBHOOK_SECRET` | Stripe webhook signing secret(s) (`whsec_...`), comma-separated while rolling one. Turns `POST /v1/billing/webhooks/stripe` on; keep it in a secret | unset (route off) | secret |
+| `KOSHA_STRIPE_WEBHOOK_TOLERANCE_SECS` | How far a delivery's signed timestamp may be from the pod's clock | `300` | seconds |
+| `KOSHA_BILLING_RETURN_URL` | Where Stripe sends users back after checkout or the portal (`https://`, or `http://` for localhost). Turns `POST /v1/billing/checkout` and `POST /v1/billing/portal` on; redirect URLs a tenant passes must share its origin | unset (routes off) | URL |
+| `KOSHA_BILLING_NOTIFY_URL` | HTTP endpoint that receives dunning notices as JSON (`https://`, or `http://` for localhost). Unset: notices are logged | unset (log) | URL |
+| `KOSHA_BILLING_NOTIFY_SECRET` | Signs each notice (`x-kosha-signature`, HMAC-SHA256 in Stripe's scheme) | unset (unsigned) | secret |
+| `KOSHA_BILLING_SCHEDULER` | `on` runs close-period, sync and dunning in the server, one pod at a time | off | flag |
+| `KOSHA_BILLING_SCHEDULER_INTERVAL_SECS` | How often each pod tries to run a scheduler tick. Minimum 10 | `900` | seconds |
+| `KOSHA_BILLING_CLOSE_DELAY_SECS` | How long after a month ends the scheduler closes it, for every pod to deliver its usage | `7200` | seconds |
+| `KOSHA_BILLING_SYNC_INTERVAL_SECS` | How often the scheduler polls the provider for payments (the webhook fallback) | `3600` | seconds |
 | `KOSHA_STRIPE_API_BASE` | Base URL of the Stripe API. Must be `https://`; plain `http://` is accepted for `localhost`, `127.0.0.1` and `[::1]` only (the secret key is sent to it), and startup fails otherwise | `https://api.stripe.com` | URL |
 
 ## HTTP server and auth
@@ -567,11 +704,13 @@ far, and its invoices. `GET /v1/admin/billing/accounts` and
 | `KOSHA_TLS_CLIENT_CA_PATH` | PEM CA bundle for client certificates (mTLS, #343). A presented certificate must chain to it or the handshake fails, and `/internal/*` answers 403 on a connection that presented none. Other routes still accept clients without a certificate. Needs `KOSHA_TLS_CERT_PATH`/`KOSHA_TLS_KEY_PATH`, or the server refuses to start | unset (no client certificates) | path |
 | `KOSHA_AUTH` | `disabled` (or `off`, `false`, `0`, `none`) turns authentication off; every request becomes tenant `dev`. Local development only | enabled | flag |
 | `KOSHA_API_KEY` | One tenant API key, mapped to tenant `default` | unset | string |
-| `KOSHA_API_KEYS` | Comma-separated `key=tenant` pairs | unset | list |
+| `KOSHA_API_KEYS` | Comma-separated `key=tenant` pairs. An entry may add `;`-separated attributes (#346): `scopes=read+write` (`+`-separated subset of `read`, `write`, `admin`), `namespaces=docs+wiki` (the only namespaces the key may touch) and `expires_at=<unix seconds>`, e.g. `sk-ci=acme;scopes=read;namespaces=docs`. An entry without attributes has every scope, every namespace and no expiry, as before. A malformed attribute is a startup error that names the entry by position and tenant, never by key | unset | list |
+| `KOSHA_API_KEY_AUTO_SCRUB` | `off` (or `disabled`, `false`, `0`) stops the server removing, by itself, the plaintext that API keys created before hashed keys still hold in `kosha.api_keys` (#346). On, every server with Postgres runs a scrub round on each key refresh; it rewrites those rows `KOSHA_API_KEY_SCRUB_GRACE_SECS` after the last sign of a server build from before hashed keys (one that could still read the plaintext). Off, run `kosha admin scrub-plaintext-api-keys` by hand once every pod is upgraded. Any other value is a startup error | `on` | `on` \| `off` |
+| `KOSHA_API_KEY_SCRUB_GRACE_SECS` | How long the automatic scrub waits after the database last showed a sign of a pre-hashed-keys server: the first start of a server with the automatic scrub, or a key row such a server inserted. Longer than your slowest rolling deploy; `0` scrubs on the next round | `86400` | seconds |
 | `KOSHA_ADMIN_API_KEY` | Key for `/v1/admin/*` and global `/stats`. Unset disables those routes | unset | string |
-| `KOSHA_ADMIN_BOOTSTRAP_KEY` | `disabled` (or `off`, `false`, `0`) makes the server refuse `KOSHA_ADMIN_API_KEY` everywhere, so only per-operator credentials (`POST /v1/admin/operators`, Postgres) reach `/v1/admin/*`, global `/stats` and an admin-gated `/metrics`. Set it once every person and every automated caller of the shared key (the segment-GC CronJob, CI, scrapers) has its own operator credential: anything still sending the shared key gets `401`. Set it back to `enabled` to break glass. Any other value is a startup error. With it disabled and no usable operator credential the server warns at startup and has no admin access; a disabled key also no longer counts as a configured credential for the fail-closed startup check | `enabled` | `enabled` \| `disabled` |
+| `KOSHA_ADMIN_BOOTSTRAP_KEY` | `disabled` (or `off`, `false`, `0`) makes the server refuse `KOSHA_ADMIN_API_KEY` everywhere, so only per-operator credentials (`POST /v1/admin/operators`, Postgres) reach `/v1/admin/*`, global `/stats` and an admin-gated `/metrics`. Set it once every person and every automated caller of the shared key (the segment-GC CronJob, CI, scrapers) has its own operator credential: anything still sending the shared key gets `401`. Set it back to `enabled` to break glass. Any other value is a startup error (the value is not printed, in case it is a key). While the shared key is off (disabled here, or `KOSHA_ADMIN_API_KEY` unset), revoking or rotating operator credentials so that none stays usable, or the last one lapses within a day, is refused with `409` unless the request says `"force": true`. With it disabled the server warns at startup, and about hourly, when no operator credential is usable or the last one expires within a week; a disabled key also no longer counts as a configured credential for the fail-closed startup check | `enabled` | `enabled` \| `disabled` |
 | `KOSHA_INTERNAL_API_KEY` | Key peers use for `GET /internal/segment/...` hydration. Unset disables peer-file access | unset | string |
-| `KOSHA_LEGACY_ROUTES` | `off` (or `disabled`, `false`, `0`, `none`) makes the unversioned Phase 1 routes (`/index`, `/search`, ...) return 410 `legacy_route_disabled` (#350; see docs/api/versioning.md). While on, every legacy response carries `Deprecation`/`Sunset` headers and is counted in `kosha_legacy_requests_total` | on | flag |
+| `KOSHA_LEGACY_ROUTES` | Set to `on` (or `enabled`, `true`, `1`) to serve the deprecated unversioned Phase 1 routes (`/index`, `/search`, ...) for all tenants. Otherwise, non-allowlisted callers get 410 `legacy_route_disabled`. Served legacy requests are counted in `kosha_legacy_requests_total` (#350; see docs/api/versioning.md) | off | flag |
 | `KOSHA_LEGACY_ROUTES_TENANTS` | Comma-separated tenant ids that keep the legacy routes while `KOSHA_LEGACY_ROUTES=off` (a managed deployment turns the default off and lists only tenants still migrating). Read at startup | empty | list |
 | `KOSHA_DASHBOARD` | `on` (or `true`, `1`, `yes`, `enabled`) serves the read-only web UI at `/dashboard`, adds `recent_queries` to `GET /v1/namespaces/{ns}/stats`, and honors `"timings": true` on searches. See [dashboard.md](dashboard.md). `dashboard.rs`, `Dashboard::from_env` | off | flag |
 
@@ -582,6 +721,40 @@ The server speaks HTTP/1.1 with keep-alive (#259): responses carry a `content-le
 connection stays open for the next request. `KOSHA_TLS_CERT_PATH` turns HTTPS on for every
 route on the port, client-facing and `/internal/*` alike. The clients that call other pods are
 configured separately, in the next section.
+
+### Self-service console
+
+Sign-up, sessions, OAuth/OIDC sign-in and the web console at `/console` (#345); see
+[organizations.md](organizations.md#self-service-console). All of it is off unless
+`KOSHA_CONSOLE` is on. Flags here accept `enabled`/`on`/`true`/`1`/`yes` and
+`disabled`/`off`/`false`/`0`/`no`; any other value, and any other configuration error while
+the console is on, stops the server at startup (`console.rs`, `Console::from_env`). Use
+Postgres in production: without it accounts live in one process's memory.
+
+| Variable | Purpose | Default | Units |
+| --- | --- | --- | --- |
+| `KOSHA_CONSOLE` | Serve the console API (`/v1/console/*`) and web UI (`/console`). Off: both are 404 | off | flag |
+| `KOSHA_CONSOLE_PUBLIC_URL` | The origin users reach the console at, e.g. `https://kosha.example.com` (no path). Required with `KOSHA_CONSOLE`. Email links and OAuth redirect URIs are built from it, and a state-changing request whose `Origin` differs is refused. `http://` only for `localhost`/`127.0.0.1` | unset | URL |
+| `KOSHA_SIGNUP` | Open self-serve sign-up (email + password, and account creation through Google/GitHub). Off: accounts come from invites, SSO or the operator | off | flag |
+| `KOSHA_SIGNUP_EMAIL_DOMAINS` | Comma-separated domains open sign-up is limited to (`example.com,example.org`). Empty: any domain | unset | list |
+| `KOSHA_SESSION_TTL_HOURS` | Absolute lifetime of a console session | `24` | hours |
+| `KOSHA_SESSION_IDLE_MINUTES` | A session unused for this long ends | `120` | minutes |
+| `KOSHA_CONSOLE_SECRET_KEY` | 32 bytes (64 hex characters or base64) that seal organizations' OIDC client secrets in Postgres (AES-256-GCM). Unset: organization SSO is off. Keep it in a secret; changing it makes stored client secrets unreadable (owners re-enter them) | unset | key |
+| `KOSHA_CONSOLE_CLIENT_IP_HEADER` | Header a trusted proxy puts the client address in (e.g. `x-forwarded-for`; the right-most entry is used), for the per-IP attempt limits. Unset: the TCP peer address. Set it only behind a proxy that overwrites the header | unset (peer address) | header name |
+| `KOSHA_MAILER` | `log` prints mails (with their links) to the server log, for development; `smtp` sends through `KOSHA_SMTP_*` (`mailer.rs`) | `log` | `log` \| `smtp` |
+| `KOSHA_SMTP_HOST` | SMTP relay host. Required with `KOSHA_MAILER=smtp` | unset | host |
+| `KOSHA_SMTP_PORT` | SMTP relay port | `587` (`465` with `KOSHA_SMTP_TLS=tls`) | port |
+| `KOSHA_SMTP_TLS` | `starttls` (required, never falls back to plain text), `tls` (implicit TLS) or `none` (plain text, no credentials allowed: a relay on the same host). Certificates are verified against the OS trust store | `starttls` | mode |
+| `KOSHA_SMTP_USERNAME` | SMTP `AUTH PLAIN` user; set with `KOSHA_SMTP_PASSWORD` or not at all | unset | string |
+| `KOSHA_SMTP_PASSWORD` | SMTP password | unset | string |
+| `KOSHA_MAIL_FROM` | Sender address of console mails. Required with `KOSHA_MAILER=smtp` | unset | address |
+| `KOSHA_OAUTH_GOOGLE_CLIENT_ID` | Google OAuth client (web application). With the secret, turns on "Continue with Google". Redirect URI to register: `<public URL>/v1/console/oauth/google/callback` | unset (off) | string |
+| `KOSHA_OAUTH_GOOGLE_CLIENT_SECRET` | Its client secret | unset | string |
+| `KOSHA_OAUTH_GITHUB_CLIENT_ID` | GitHub OAuth app. With the secret, turns on "Continue with GitHub". Callback URL: `<public URL>/v1/console/oauth/github/callback` | unset (off) | string |
+| `KOSHA_OAUTH_GITHUB_CLIENT_SECRET` | Its client secret | unset | string |
+
+Organization SSO (OIDC) is configured per organization in the console, not here; its
+redirect URI is `<public URL>/v1/console/sso/callback`. SAML is not supported yet.
 
 ### TLS between pods
 
@@ -595,7 +768,7 @@ mode, a missing or unparsable file, half a client identity, or a TLS setting whi
 
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
-| `KOSHA_INTERNAL_TLS` | `off`: plain `http://` to peers, as before. `on`: peers are fetched over `https://` and verified against `KOSHA_INTERNAL_TLS_CA_PATH`, and an `https://` `KOSHA_INGEST_HOST` is verified the same way (an `http://` one logs a warning). `required`: as `on`, and the pod refuses to start with an `http://` `KOSHA_INGEST_HOST`, without `KOSHA_TLS_CERT_PATH`, or with a `DATABASE_URL` that does not force TLS (see "TLS to Postgres" below) | `off` | enum |
+| `KOSHA_INTERNAL_TLS` | `off`: plain `http://` to peers, as before. `on`: peers are fetched over `https://` and verified against `KOSHA_INTERNAL_TLS_CA_PATH`, and an `https://` `KOSHA_INGEST_HOST` is verified the same way (an `http://` one logs a warning). `required`: as `on`, and the pod refuses to start with an `http://` `KOSHA_INGEST_HOST`, without `KOSHA_TLS_CERT_PATH`, with a `DATABASE_URL` that does not force TLS (see "TLS to Postgres" below), or with a plain-HTTP custom S3 endpoint (see "TLS to S3" below) | `off` | enum |
 | `KOSHA_INTERNAL_TLS_CA_PATH` | PEM CA bundle peer certificates must chain to. Required unless `off`. Only this bundle is trusted for internal traffic, not the platform roots | unset | path |
 | `KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH` | PEM client certificate chain, presented to peers that ask for one (their `KOSHA_TLS_CLIENT_CA_PATH`). Set it together with `KOSHA_INTERNAL_TLS_CLIENT_KEY_PATH` or not at all | unset (no client certificate) | path |
 | `KOSHA_INTERNAL_TLS_CLIENT_KEY_PATH` | PEM private key for `KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH` | unset | path |
@@ -645,6 +818,11 @@ For example:
 postgres://kosha:<password>@<host>:5432/kosha?sslmode=verify-full&sslrootcert=/etc/kosha/pg/ca.crt
 ```
 
+Query parameters are read the way the client reads them: keys and values are percent-decoded
+(`%XX`, and `+` as a space), values are not trimmed, and the last `sslmode` or `ssl-mode` wins.
+So `?sslmode=require&ssl%2Dmode=disable` counts as `disable`, and `sslmode=require+` is not
+`require`.
+
 `PGSSLMODE` and `PGSSLROOTCERT` are read when the URL does not name the parameter. The client
 ignores a `PGSSLMODE` it cannot parse, surrounding whitespace or a trailing newline included
 (a Secret made with `echo` has one), and uses `prefer`; the check below does not accept such a value
@@ -656,6 +834,25 @@ server, `migrate` and `migrate-namespace` exit before opening a connection unles
 none) logs one `WARN:` line at startup. With `off` nothing is checked. Neither message prints
 the URL. The check reads only the mode, so `migrate` and `migrate-namespace` do not need the
 `KOSHA_INTERNAL_TLS_*` files mounted.
+
+#### TLS to S3
+
+Segment files, deletion vectors and S3 WAL group commits hold tenant data. With no custom
+endpoint, the AWS SDK talks to S3 over HTTPS. A custom endpoint (MinIO, an S3-compatible store,
+a VPC endpoint URL) is used as written, so `http://` sends that data in plaintext. Kosha passes
+`KOSHA_S3_ENDPOINT` to the SDK, or `AWS_ENDPOINT_URL` when `KOSHA_S3_ENDPOINT` is unset; when the
+value passed is empty, the SDK picks `AWS_ENDPOINT_URL_S3`, then `AWS_ENDPOINT_URL`. The check
+below applies to whichever of these is in effect. An `endpoint_url` set only in an AWS
+config-file profile is not checked.
+
+`KOSHA_INTERNAL_TLS` holds this hop to the same rule. With `required`, the server, `migrate`,
+`migrate-namespace` and `reconcile-usage` exit at startup (`FATAL: invalid S3 encryption config:
+KOSHA_S3_ENDPOINT must use https:// ...`) unless that endpoint is `https://`. With `on`, any
+other endpoint logs one `WARN:` line. With `off` nothing is checked. Neither message prints the
+endpoint. Like the Postgres check, it reads only the mode. A local MinIO over plain HTTP (the
+`docker compose` stack) keeps working with the default `off`. For an `https://` endpoint with a
+private CA, the SDK verifies against the platform roots (`SSL_CERT_FILE`), not
+`KOSHA_INTERNAL_TLS_CA_PATH`.
 
 `GET /internal/segment/...` streams the cached file as raw `application/octet-stream`. Peers on
 builds from before #259 send base64 with `x-kosha-encoding: base64`; the client still decodes
@@ -756,16 +953,41 @@ seconds or a unit (`90s`, `5m`, `1h`).
 | `KOSHA_LOCAL_GC_GRACE` | How long a retired segment's local files stay after the publish that dropped it (and after every search that could read them ends) | `5m` | duration |
 | `KOSHA_LOCAL_GC_INTERVAL_MS` | How often each pod reclaims retired local segments; `0` disables | `60000` | milliseconds |
 
-## Deleted namespaces (cache purge and retry)
+The Kubernetes `kosha-segment-gc` CronJob uses `KOSHA_GC_INGEST_SCHEME` as the URL scheme for
+`POST /v1/admin/gc`. The base manifest sets it to `http` for plaintext ingest; the
+`internal-tls` component sets it to `https` and mounts the CA for verification.
 
-Read in `PurgeSettings::from_env` (`crates/kosha-server/src/deletion_purge.rs`). Both are off
-unless set. A value that is not a whole number of milliseconds stops the server at startup.
+## Deleted namespaces (cache purge, acknowledgements and retry)
+
+Read in `PurgeSettings::from_env` (`crates/kosha-server/src/deletion_purge.rs`). All are off
+unless set. A value that is not a whole number of milliseconds (or `on`/`off` for the switches)
+stops the server at startup, and so does `KOSHA_DELETION_REQUIRE_ACKS=on` without a purge
+interval, or with a liveness window shorter than three intervals.
 See "Deleting a namespace" in the README for what a pass removes and when.
 
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
 | `KOSHA_DELETION_PURGE_INTERVAL_MS` | How often this pod (any role) reads the deletion records it has not handled and removes the deleted namespaces' and tenants' cached copies from its memory and local disk. The first pass runs at boot and reads every record. Unset or `0`: off, and cached copies leave only by eviction | unset (off) | milliseconds |
-| `KOSHA_DELETION_RESUME_INTERVAL_MS` | How often a writer pod (`ingest` or `standalone`) retries the storage reclaim of pending namespace deletion records, starting at boot. A record that stays pending waits twice as long before each further try, up to one hour. Tenant records are not retried. Each retry takes the namespace's writer lease first and is skipped while another writer holds it; with `KOSHA_WRITER_LEASE=off` there is no such guard, so do not set this where two writer pods can overlap. Ignored on `query` and `indexer` pods. Unset or `0`: off | unset (off) | milliseconds |
+| `KOSHA_DELETION_RESUME_INTERVAL_MS` | How often a writer pod (`ingest` or `standalone`) retries the storage reclaim of pending deletion records (namespaces, branches and tenants; namespaces first), starting at boot. A record that stays pending waits twice as long before each further try, up to one hour. A namespace or branch retry takes the namespace's writer lease first and is skipped while another writer holds it; with `KOSHA_WRITER_LEASE=off` there is no such guard, so do not set this where two writer pods can overlap. A tenant retry deletes whatever keys and namespaces the tenant id has when it runs. Records of `migrate-namespace` sources are finished by that tool, not retried. Ignored on `query` and `indexer` pods. Unset or `0`: off | unset (off) | milliseconds |
+| `KOSHA_DELETION_REQUIRE_ACKS` | `on`: a deletion recorded on this pod completes only once every live pod that runs the purge has acknowledged that it removed its cached copies (`acks_required` on the record). Needs `KOSHA_DELETION_PURGE_INTERVAL_MS` on this pod. Set it on the writer pods; every pod with the purge on registers and acknowledges regardless | `off` | switch |
+| `KOSHA_POD_LIVENESS_MS` | A pod whose last heartbeat (one per purge pass) is older than this is not waited for: the bound on how long a pod that died can hold a record pending. Must be at least three purge intervals | `300000` (5 min) | milliseconds |
+| `KOSHA_POD_ID` | This pod's id in the pod registry and on its acknowledgements and export claims. Keep it stable across restarts of the same pod | `HOSTNAME`, else a random id per process | string |
+| `KOSHA_NAMESPACE_DELETE_CONFIRM` | `on`: `DELETE /v1/namespaces/{ns}` must carry `?confirm=<ns>` (the unqualified name), else 400. Off keeps every existing caller working | `off` | switch |
+
+## Namespace exports
+
+Read in `ExportSettings::from_env` (`crates/kosha-server/src/exports.rs`). Exports are off
+unless `KOSHA_EXPORTS=on`; a malformed value stops the server at startup. Set the same values on
+every pod: writer pods run and expire exports, any pod serves the status and download routes.
+See "Exports" in the README.
+
+| Variable | Purpose | Default | Units |
+| --- | --- | --- | --- |
+| `KOSHA_EXPORTS` | `on` lets tenants start exports (`POST /v1/namespaces/{ns}/exports`) and runs the export sweep on writer pods. Off: starting one answers 404, existing exports can still be read, downloaded and deleted, and a writer pod fails any export still pending or running at boot (releasing its pins) | `off` | switch |
+| `KOSHA_EXPORT_TTL_SECS` | How long a completed export stays downloadable before the sweep deletes its objects (state `expired`). At least 60 | `604800` (7 days) | seconds |
+| `KOSHA_EXPORT_PART_BYTES` | JSON bytes per part before a new part starts (each part is read whole into memory for its upload). At least 1 MiB | `268435456` (256 MiB) | bytes |
+| `KOSHA_EXPORT_PRESIGN_SECS` | Lifetime of the presigned S3 `GET` URLs the status route returns (capped at 7 days) | `900` | seconds |
+| `KOSHA_EXPORT_MAX_ACTIVE` | Pending or running exports one tenant may have at once; more is a 429 | `2` | count |
 
 ## Segment format (rollout and rollback gates)
 
