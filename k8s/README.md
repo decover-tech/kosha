@@ -294,6 +294,47 @@ than `require`, `verify-ca` or `verify-full` stops the pod at startup.
 
 ## Deploying
 
+### Fresh install on an existing cluster
+
+Use `scripts/kosha_cluster.py` from this checkout with Python 3.10+ and
+`kubectl`. Before installing:
+
+- Set up a kubeconfig context and permissions to deploy the base manifests.
+  The cluster needs the [Kosha NVMe node pool](#the-kosha-node-pool-karpenter-nvme-instance-store)
+  for ingest.
+- Provision an empty Postgres database and an unused S3 bucket/prefix.
+  Give the Kosha service account access to S3 (and KMS if required). On
+  EKS with IRSA, pass the role ARN below; the role must trust
+  `system:serviceaccount:kosha:kosha` in this cluster.
+- In namespace `kosha`, provision the Secret `kosha-secret` with keys
+  `database-url` and `bootstrap-api-key` using your usual secret tooling.
+  The installer neither creates nor overwrites that Secret.
+
+```sh
+python3 scripts/kosha_cluster.py --context customer-eks install \
+  --image "ravidecoverai/kosha:${KOSHA_RELEASE_TAG}" \
+  --s3-bucket customer-kosha --s3-prefix segments/ --aws-region us-east-1 \
+  --irsa-role-arn arn:aws:iam::123456789012:role/kosha \
+  --confirm-empty-storage
+python3 scripts/kosha_cluster.py --context customer-eks status
+```
+
+Set `KOSHA_RELEASE_TAG` to a published tag or specify the image by digest.
+The installer creates the `k8s/base` workloads and supporting resources
+with cluster-specific S3, image, and optional IRSA settings, then waits
+for ingest, query, and indexer to roll out. `status` is a read-only snapshot
+of the three Deployments' images and readiness counts.
+
+**Install only.** The command refuses to run if any Kosha Deployment
+already exists, including after a partial install. Do not use it with
+storage from a previous installation, even on a new Kubernetes cluster:
+`--confirm-empty-storage` is your confirmation, not a storage check. For
+upgrades or rollbacks, follow the [manifest and WAL compatibility
+rules](../README.md#s3-wal-kosha_wal_modes3) in the main README before
+resuming writes; old binaries cannot read the new formats.
+
+### Stage and production workflows
+
 `.github/workflows/release.yml` / `deploy.yml` call
 `.github/actions/deploy-eks`, which:
 
