@@ -7963,20 +7963,27 @@ impl Searcher {
             }
         }
 
+        let sort_cmp = |a: &HitCandidate, b: &HitCandidate| {
+            compare_candidates(a, b, &query.sort, &sort_value_fields)
+        };
+
         // A vector-only query asks for the `k` nearest documents. Each
         // segment answers with its own nearest `k`, so the union holds up
         // to `k` per segment: keep the nearest `k` overall and report that
         // many. The sum of the per-segment counts (`k` times the number of
         // segments) said nothing about the query.
         //
-        // Under `limit_per` that is the nearest `k` with at most `max` per
-        // group: segments probed deeper than `k` for this (see
-        // `score_segment`), and the cap is taken before the cut so the set
-        // stays `k` long when the probe found enough groups.
+        // Diversify before the cut so duplicate group members do not
+        // crowd out another group the probe found. With rank_by, the
+        // group cap instead applies after rescoring.
         let (total_hits, total_hits_relation) =
             if let Some(knn) = query.knn.as_ref().filter(|_| query.is_pure_knn()) {
-                if let Some(cap) = pre_rescore_cap {
-                    candidates.sort_by(by_score_then_id);
+                if let Some(cap) = group_cap.filter(|_| rank_by.is_none()) {
+                    if query.collapse.is_some() {
+                        candidates.sort_by(sort_cmp);
+                    } else {
+                        candidates.sort_by(by_score_then_id);
+                    }
                     cap.apply(&mut candidates, |c| c);
                 }
                 if candidates.len() > knn.k {
@@ -8009,11 +8016,6 @@ impl Searcher {
             candidates.truncate(rank_by.window);
             rescore_candidates(rank_by, &query.filter_column_fields(), &mut candidates)?;
         }
-
-        // ── Sort (score-only / sort-key candidates — no full field payloads) ──
-        let sort_cmp = |a: &HitCandidate, b: &HitCandidate| -> std::cmp::Ordering {
-            compare_candidates(a, b, &query.sort, &sort_value_fields)
-        };
 
         // ── collapse / limit_per: at most `max` hits per group ──
         // Each segment already capped its own hits; the same group can

@@ -645,6 +645,50 @@ fn vector_only_aggregations_cover_the_namespace_top_k_before_pagination() {
     }
 }
 
+#[test]
+fn collapsed_vector_aggregations_keep_distinct_groups_in_the_top_k() {
+    let mut docs = corpus();
+    docs.truncate(3);
+    // The two closest vectors share an owner; the other group is in
+    // a different segment and must not be crowded out of the top two.
+    for (i, doc) in docs.iter_mut().enumerate() {
+        doc.vector = vec![1.0, i as f32 * 0.1, 0.0, 0.0];
+    }
+    let dir = temp_dir("collapsed");
+    let layout = Layout {
+        name: "collapsed",
+        manifest: build(&dir, &docs, &[1, 2], |doc| usize::from(doc.owner == "bo")),
+        dir,
+    };
+    let mut request = json!({
+        "query_text": "",
+        "max_results": 2,
+        "knn": {"field": "emb", "vector": [1.0, 0.0, 0.0, 0.0], "k": 2, "num_candidates": 20},
+        "collapse": {"field": "owner"},
+        "aggs": aggs(),
+    });
+    for (representative, sort) in [(0, None), (1, Some(json!([{"status": {"order": "asc"}}])))] {
+        if let Some(sort) = sort {
+            request["sort"] = sort;
+        }
+        let result = search(&layout, &request, None);
+        assert_eq!(result.total_hits, 2);
+        assert_eq!(
+            result
+                .results
+                .iter()
+                .map(|hit| &hit.doc_id.0)
+                .collect::<Vec<_>>(),
+            vec![&docs[representative].id, &docs[2].id]
+        );
+        assert_eq!(
+            normalize(&result),
+            round_floats(brute_force(&[&docs[representative], &docs[2]]))
+        );
+    }
+    std::fs::remove_dir_all(layout.dir).unwrap();
+}
+
 /// A hybrid request aggregates over what its `total_hits` counts: the
 /// lexical matches plus the vector window's other members, on row and
 /// columnar segments alike, with a page smaller than either.

@@ -86,8 +86,8 @@ request and response shapes:
 - Each aggregation object has exactly one type key. An unknown or misspelled
   type (`stats`, `averag`) is a 400 that lists the supported types.
 - For `knn` without a lexical query or top-level `filter`, aggregations and
-  `total_hits` use the namespace's nearest `knn.k` documents before sorting
-  and pagination.
+  `total_hits` use the same namespace-wide neighbor set (up to `knn.k`
+  documents) regardless of page size.
 - `min`, `max`, `sum` and `avg` read `Integer` and `Float` fields, and `Date`
   fields as epoch milliseconds (`value_as_string` is added for `min` / `max` /
   `avg` over dates). Date text is parsed as `YYYY-MM-DD[THH:MM[:SS[.fff]]][Z|±HH:MM]`;
