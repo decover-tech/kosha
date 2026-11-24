@@ -32,6 +32,22 @@ pub(crate) fn check(
     targets: &[NamespaceId],
     schema: &kosha_core::NamespaceSchema,
 ) -> Result<Vec<SchemaChange>, String> {
+    // A segment records the embedding model of its vectors from the schema
+    // in force when it is flushed. Before an embedding declaration changes,
+    // buffered vectors are flushed under the current one, so the rules (and
+    // every later change) see the model they were embedded with: dropping a
+    // declaration and adding another one cannot slip past them.
+    if let Some(root) = targets.first() {
+        let current = state
+            .indexer
+            .manifest_cloned(root)
+            .and_then(|manifest| manifest.schema);
+        let buffered =
+            state.indexer.pending_doc_count(root) > 0 || state.indexer.shard_count(root).is_some();
+        if buffered && schema_evolution::changes_embeddings(current.as_ref(), schema) {
+            flush_and_publish_namespace(state, root)?;
+        }
+    }
     let mut first = None;
     for target in targets {
         let current = state
@@ -79,70 +95,100 @@ mod tests {
         serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap()
     }
 
-    #[test]
-    fn schema_route_applies_online_changes_and_refuses_reindex_ones() {
-        let state = state();
-        let ns = NamespaceId("acme/docs".into());
-        // Empty namespace: any valid schema applies.
-        let first = put(
-            &state,
-            serde_json::json!({"fields": {"price": {"type": "FIELD_TYPE_FLOAT"}}}),
-        );
-        assert_eq!(status(&first), 200, "{first}");
-        // Changing the declared type of an empty namespace is still fine.
-        let retyped = put(
-            &state,
-            serde_json::json!({"fields": {"price": {"type": "FIELD_TYPE_INTEGER"}}}),
-        );
-        assert_eq!(status(&retyped), 200, "{retyped}");
-
+    fn index_vector(state: &AppState, ns: &NamespaceId, dims: usize) {
+        let vector: Vec<f32> = (0..dims).map(|i| i as f32).collect();
         state
             .indexer
             .index_documents(
                 ns.clone(),
                 vec![kosha_core::Document {
                     id: kosha_core::DocumentId("d1".into()),
-                    fields: vec![kosha_core::Field::text("title", "hello")],
+                    fields: vec![
+                        kosha_core::Field::text("title", "hello"),
+                        kosha_core::Field {
+                            name: "emb".into(),
+                            field_type: kosha_core::FieldType::Vector,
+                            value: serde_json::to_string(&vector).unwrap(),
+                        },
+                    ],
                 }],
             )
             .unwrap();
+    }
 
-        // With a document: a type change is a 409 naming field and rule.
-        let refused = put(
+    /// Declarative settings change online and are reported; only rules the
+    /// engine depends on (embeddings against stored vectors) answer 409.
+    #[test]
+    fn schema_route_applies_online_changes_and_refuses_reindex_ones() {
+        let state = state();
+        let ns = NamespaceId("acme/docs".into());
+        let first = put(
             &state,
-            serde_json::json!({"fields": {"price": {"type": "FIELD_TYPE_KEYWORD"}}}),
+            serde_json::json!({"fields": {"price": {"type": "FIELD_TYPE_FLOAT"}}}),
         );
-        assert_eq!(status(&refused), 409, "{refused}");
-        let refused = body(&refused);
-        assert_eq!(refused["field"], "price");
-        assert_eq!(refused["rule"], "type_change");
-        assert_eq!(refused["reindex_required"], true);
-        // Nothing was applied.
-        let current = state.indexer.manifest_cloned(&ns).unwrap().schema.unwrap();
+        assert_eq!(status(&first), 200, "{first}");
+        index_vector(&state, &ns, 3);
+
+        // With documents, `type` / `stored` changes are declarative.
+        let retyped = put(
+            &state,
+            serde_json::json!({"fields": {"price": {"type": "FIELD_TYPE_KEYWORD", "stored": false}}}),
+        );
+        assert_eq!(status(&retyped), 200, "{retyped}");
         assert_eq!(
-            current.fields["price"].field_type,
-            Some(serde_json::json!("FIELD_TYPE_INTEGER"))
+            body(&retyped)["changes"][0]["change"],
+            "declarative_changed"
         );
 
         // Adding a field and changing an analyzer stay online.
         let added = put(
             &state,
             serde_json::json!({"fields": {
-                "price": {"type": "FIELD_TYPE_INTEGER"},
+                "price": {"type": "FIELD_TYPE_KEYWORD", "stored": false},
                 "title": {"analyzer": ["standard@2"]}}}),
         );
         assert_eq!(status(&added), 200, "{added}");
-        let changes = body(&added)["changes"].clone();
-        assert_eq!(changes[0]["field"], "title");
-        assert_eq!(changes[0]["change"], "field_added");
+        assert_eq!(body(&added)["changes"][0]["change"], "field_added");
 
-        let stored = put(
+        // An embedding whose dims differ from the stored vectors: 409.
+        let refused = put(
             &state,
             serde_json::json!({"fields": {
-                "price": {"type": "FIELD_TYPE_INTEGER", "stored": false},
-                "title": {"analyzer": ["standard@2"]}}}),
+                "emb": {"embedding": {"model": "m", "dims": 4}}}}),
         );
-        assert_eq!(status(&stored), 409, "{stored}");
-        assert_eq!(body(&stored)["rule"], "stored_change");
+        assert_eq!(status(&refused), 409, "{refused}");
+        let refused = body(&refused);
+        assert_eq!(refused["field"], "emb");
+        assert_eq!(refused["rule"], "vector_dims_change");
+        assert_eq!(refused["reindex_required"], true);
+        // Nothing was applied.
+        let current = state.indexer.manifest_cloned(&ns).unwrap().schema.unwrap();
+        assert!(!current.fields.contains_key("emb"));
+    }
+
+    /// Declaring model `a`, dropping the declaration, then declaring model
+    /// `b` over the same vectors is refused: the model is read from what the
+    /// segments recorded, and the buffered vectors are flushed (recording
+    /// `a`) before the declaration changes.
+    #[test]
+    fn removing_then_re_adding_an_embedding_cannot_change_the_model() {
+        let state = state();
+        let ns = NamespaceId("acme/docs".into());
+        let declare = |model: &str| {
+            put(
+                &state,
+                serde_json::json!({"fields": {
+                    "emb": {"embedding": {"model": model, "dims": 3}}}}),
+            )
+        };
+        assert_eq!(status(&declare("a")), 200);
+        // Vectors arrive (as if embedded with `a`), still buffered.
+        index_vector(&state, &ns, 3);
+        let dropped = put(&state, serde_json::json!({"fields": {}}));
+        assert_eq!(status(&dropped), 200, "{dropped}");
+        let refused = declare("b");
+        assert_eq!(status(&refused), 409, "{refused}");
+        assert_eq!(body(&refused)["rule"], "embedding_change");
+        assert_eq!(status(&declare("a")), 200);
     }
 }

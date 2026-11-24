@@ -2569,11 +2569,20 @@ impl Indexer {
             .iter()
             .flat_map(|buf| buf.documents.iter())
             .chain(state.flushing_docs.iter().flat_map(|docs| docs.iter()));
+        // A buffered vector of a field the current schema embeds was
+        // embedded with that model (it is recorded when it is flushed).
+        let declared = state.manifest.schema.clone().unwrap_or_default();
         for doc in buffered {
             data.has_documents = true;
             for field in &doc.fields {
                 if field.field_type == kosha_core::FieldType::Vector {
                     data.vector_fields.entry(field.name.clone()).or_insert(None);
+                    if let Some(spec) = declared.embedding_for(&field.name) {
+                        data.vector_models
+                            .entry(field.name.clone())
+                            .or_default()
+                            .insert(spec.model.clone());
+                    }
                 }
             }
         }
@@ -2597,6 +2606,12 @@ impl Indexer {
                 }
             };
             for meta in fields.into_iter().flatten() {
+                if let Some(model) = meta.embedding_model {
+                    data.vector_models
+                        .entry(meta.name.clone())
+                        .or_default()
+                        .insert(model);
+                }
                 data.vector_fields.insert(meta.name, Some(meta.dim));
             }
         }

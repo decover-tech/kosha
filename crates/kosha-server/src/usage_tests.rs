@@ -608,6 +608,39 @@ fn deletes_and_vector_dimensions_are_metered() {
     assert_eq!(docs.vector_dimension_hours, 2 * 3 * 8);
 }
 
+/// Deletes are metered once applied, even when the publish after them
+/// fails: the documents are gone from the writer either way (#348 review).
+#[test]
+fn applied_deletes_are_metered_even_when_the_publish_fails() {
+    let (state, store) = metered_state();
+    ok(call(
+        &state,
+        "acme",
+        "POST /v1/namespaces/docs/documents",
+        serde_json::json!({"documents": [doc("a", "x"), doc("b", "y")]}),
+    ));
+    ok(call(
+        &state,
+        "acme",
+        "POST /v1/namespaces/docs/flush",
+        serde_json::json!({}),
+    ));
+    *state.controller.lock().unwrap() = Box::new(crate::tests::FailingManifestStore(
+        kosha_control::Controller::new(),
+    ));
+    let response = call(
+        &state,
+        "acme",
+        "POST /v1/namespaces/docs/delete",
+        serde_json::json!({"filter": {"match_all": {}}}),
+    );
+    assert_eq!(status_of(&response), 500, "{response}");
+    flush(&state);
+    let usage = stored_usage(&store, "acme");
+    let docs = usage.iter().find(|u| u.namespace == "docs").unwrap();
+    assert_eq!(docs.documents_deleted, 2, "{docs:?}");
+}
+
 #[test]
 fn footer_vector_dimensions_counts_columns_and_bags() {
     let mut footer: kosha_core::Footer = serde_json::from_value(serde_json::json!({

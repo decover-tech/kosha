@@ -737,3 +737,303 @@ fn settings_parse_and_refuse_typos() {
     assert!(ExportSettings::from_lookup(lookup(&[("KOSHA_EXPORTS", "yes please")])).is_err());
     assert!(ExportSettings::from_lookup(lookup(&[("KOSHA_EXPORT_PART_BYTES", "10")])).is_err());
 }
+
+// ── #347 review fixes ────────────────────────────────────────────────────
+
+/// Object storage whose deletes under `_exports/` can be made to fail.
+#[derive(Default)]
+struct ExportRemote {
+    fail_exports: std::sync::atomic::AtomicBool,
+}
+
+impl namespace_deletion::RemotePrefixStore for ExportRemote {
+    fn delete_prefix(&self, prefix: &str) -> Result<usize, KoshaError> {
+        if prefix.starts_with("_exports") && self.fail_exports.load(Ordering::SeqCst) {
+            return Err(KoshaError::NotFound("injected S3 outage".into()));
+        }
+        Ok(0)
+    }
+
+    fn count_prefix(&self, _prefix: &str) -> Result<usize, KoshaError> {
+        Ok(0)
+    }
+}
+
+/// Finding 1: when an export's files cannot be deleted, its row is kept
+/// (expired, no pins) so the deletion retry finds it, and the record stays
+/// pending until the files are confirmed gone.
+#[test]
+fn an_export_whose_files_cannot_be_deleted_keeps_its_row_until_they_are() {
+    let mut state = AppState::new(test_dir());
+    let remote = Arc::new(ExportRemote::default());
+    state.remote_prefix_override = Some(remote.clone());
+    enabled(&state);
+    index(&state, "acme", "docs", &["a"]);
+    let record = export(&state, "acme", "docs", serde_json::json!({}));
+    let id = record["id"].as_str().unwrap().to_string();
+
+    remote.fail_exports.store(true, Ordering::SeqCst);
+    let (status, body) = call(
+        &state,
+        "acme",
+        "DELETE /v1/namespaces/docs",
+        serde_json::json!({}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["deletion"]["state"], "pending", "{body}");
+    assert!(body["deletion"]["last_error"]
+        .as_str()
+        .unwrap()
+        .contains("export"));
+    let kept = state
+        .controller
+        .lock()
+        .unwrap()
+        .export(&id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(kept.state, ExportState::Expired);
+    assert!(kept.pins.is_empty());
+
+    // The retry finds the row, deletes the files, then the row.
+    remote.fail_exports.store(false, Ordering::SeqCst);
+    let pending = state
+        .controller
+        .lock()
+        .unwrap()
+        .deletion(body["deletion"]["id"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    let done = state.resume_namespace_deletion(&pending);
+    assert!(done.is_completed(), "{done:?}");
+    assert_eq!(done.exports_deleted, 1);
+    assert!(state
+        .controller
+        .lock()
+        .unwrap()
+        .export(&id)
+        .unwrap()
+        .is_none());
+}
+
+/// Finding 2: the claim is refreshed on a timer while a slow delivery runs,
+/// so another writer cannot take a live export over; and each attempt
+/// writes under its own prefix, so discarding one never touches another.
+#[test]
+fn a_slow_delivery_keeps_its_claim_and_attempts_never_share_files() {
+    let state = exporting_state();
+    state.exports.configure(ExportSettings {
+        enabled: true,
+        allow_insecure_upload: true,
+        claim_refresh: Duration::from_millis(50),
+        claim_timeout: Duration::from_millis(400),
+        ..ExportSettings::default()
+    });
+    index(&state, "acme", "docs", &["a", "b"]);
+    let listener = StdListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let receiver = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut buf = [0u8; 65536];
+        let _ = stream.read(&mut buf);
+        // Slower than the claim timeout.
+        std::thread::sleep(Duration::from_millis(1200));
+        use std::io::Write as _;
+        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n");
+    });
+    let intruder_won = std::thread::scope(|scope| {
+        let intruder = scope.spawn(|| {
+            std::thread::sleep(Duration::from_millis(700));
+            let active = state
+                .controller
+                .lock()
+                .unwrap()
+                .exports(&ExportFilter::active())
+                .unwrap();
+            active.iter().any(|e| {
+                state
+                    .controller
+                    .lock()
+                    .unwrap()
+                    .claim_export(&e.id, "intruder", 400)
+                    .unwrap()
+                    .is_some()
+            })
+        });
+        let record = export(
+            &state,
+            "acme",
+            "docs",
+            serde_json::json!({"upload_url": format!("http://127.0.0.1:{port}/x")}),
+        );
+        assert_eq!(record["state"], "completed", "{record}");
+        assert_eq!(record["delivery_state"], "delivered", "{record}");
+        intruder.join().unwrap()
+    });
+    receiver.join().unwrap();
+    assert!(!intruder_won, "the claim went stale during the delivery");
+
+    let id = state
+        .controller
+        .lock()
+        .unwrap()
+        .exports(&ExportFilter::default())
+        .unwrap()[0]
+        .id
+        .clone();
+    let record = state
+        .controller
+        .lock()
+        .unwrap()
+        .export(&id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        record.parts[0].path.contains("/attempt-1/"),
+        "{:?}",
+        record.parts
+    );
+    // An abandoned attempt removes its own prefix only.
+    let other = format!("{}/attempt-2", kosha_core::export::export_dir("acme", &id));
+    state.discard_run_objects(&record, &other);
+    let (status, bytes) = download(&state, "acme", "docs", &id, 0);
+    assert_eq!(status, 200);
+    assert_eq!(ids_of(&gunzip_lines(&bytes)), vec!["a", "b"]);
+}
+
+/// Finding 6: with exports off, active exports are failed (their pins go)
+/// and the routes that read or delete exports still answer; and pins are
+/// read for every active export, past the first thousand.
+#[test]
+fn exports_off_releases_pins_and_every_active_pin_is_read() {
+    let state = exporting_state();
+    index(&state, "acme", "docs", &["a"]);
+    let ns = NamespaceId("acme/docs".into());
+    let manifest = state
+        .controller
+        .lock()
+        .unwrap()
+        .manifest_cloned(&ns)
+        .unwrap();
+    let rel = format!("{}/{}", ns.0, manifest.segments[0].segment_id.0);
+    let other = NamespaceId("acme/other".into());
+    for _ in 0..1000 {
+        state
+            .controller
+            .lock()
+            .unwrap()
+            .create_export(&NewExport {
+                tenant_id: "acme".into(),
+                namespace: other.0.clone(),
+                include_vectors: true,
+                pins: vec![(other.clone(), kosha_core::Manifest::empty(1))],
+                upload_url: None,
+                ttl_ms: 1000,
+            })
+            .unwrap();
+    }
+    let newest = state
+        .controller
+        .lock()
+        .unwrap()
+        .create_export(&NewExport {
+            tenant_id: "acme".into(),
+            namespace: ns.0.clone(),
+            include_vectors: true,
+            pins: vec![(ns.clone(), manifest)],
+            upload_url: None,
+            ttl_ms: 1000,
+        })
+        .unwrap();
+    let mut refs = kosha_core::branch::References::default();
+    state.pin_export_references(&mut refs).unwrap();
+    assert!(
+        refs.holds_segment_dir(&rel),
+        "the 1001st export's pin is read"
+    );
+
+    // Turned off: what nothing will run is failed and unpinned.
+    state.exports.configure(ExportSettings::default());
+    assert_eq!(state.fail_active_exports("exports were turned off"), 1001);
+    let mut refs = kosha_core::branch::References::default();
+    state.pin_export_references(&mut refs).unwrap();
+    assert!(!refs.holds_segment_dir(&rel));
+    let (status, body) = call(
+        &state,
+        "acme",
+        &format!("GET /v1/namespaces/docs/exports/{}", newest.id),
+        serde_json::json!(null),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["state"], "failed");
+    let (status, body) = call(
+        &state,
+        "acme",
+        &format!("DELETE /v1/namespaces/docs/exports/{}", newest.id),
+        serde_json::json!(null),
+    );
+    assert_eq!(status, 200, "{body}");
+    let (status, _) = call(
+        &state,
+        "acme",
+        "POST /v1/namespaces/docs/exports",
+        serde_json::json!({}),
+    );
+    assert_eq!(status, 404, "starting one stays refused");
+}
+
+/// Finding 7: the list is newest first and paginated; old failed and
+/// expired rows are pruned.
+#[test]
+fn the_export_list_pages_newest_first_and_old_rows_are_pruned() {
+    let state = exporting_state();
+    state.exports.configure(ExportSettings {
+        enabled: true,
+        max_active: 10,
+        ..ExportSettings::default()
+    });
+    index(&state, "acme", "docs", &["a"]);
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        ids.push(export(&state, "acme", "docs", serde_json::json!({}))["id"].clone());
+        std::thread::sleep(Duration::from_millis(3));
+    }
+    let (status, page) = call(
+        &state,
+        "acme",
+        "GET /v1/namespaces/docs/exports?limit=2",
+        serde_json::json!(null),
+    );
+    assert_eq!(status, 200, "{page}");
+    let listed: Vec<serde_json::Value> = page["exports"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].clone())
+        .collect();
+    assert_eq!(listed, vec![ids[2].clone(), ids[1].clone()]);
+    let next = page["next"].as_str().unwrap();
+    let (_, rest) = call(
+        &state,
+        "acme",
+        &format!("GET /v1/namespaces/docs/exports?limit=2&before={next}"),
+        serde_json::json!(null),
+    );
+    assert_eq!(rest["exports"][0]["id"], ids[0]);
+    assert!(rest["next"].is_null());
+
+    // Expire them all, then let the retention pass.
+    let far = unix_millis() + 365 * 24 * 3600 * 1000;
+    state.run_export_sweep(far);
+    state.run_export_sweep(far + RETENTION.as_millis() as u64 + 1);
+    assert!(state
+        .controller
+        .lock()
+        .unwrap()
+        .exports(&ExportFilter::default())
+        .unwrap()
+        .is_empty());
+}

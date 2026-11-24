@@ -118,12 +118,18 @@ impl ExportLog {
     }
 
     pub(crate) fn list(&self, filter: &ExportFilter) -> Vec<ExportRecord> {
-        self.records
+        let mut found: Vec<ExportRecord> = self
+            .records
             .iter()
             .filter(|r| filter.matches(r))
-            .take(filter.effective_limit() as usize)
             .cloned()
-            .collect()
+            .collect();
+        found.sort_by_key(ExportFilter::position);
+        if filter.newest_first {
+            found.reverse();
+        }
+        found.truncate(filter.effective_limit() as usize);
+        found
     }
 
     pub(crate) fn update(&mut self, id: &str, update: &ExportUpdate) -> Option<ExportRecord> {
@@ -319,12 +325,17 @@ mod pg {
              WHERE ($1::TEXT IS NULL OR tenant_id = $1) \
                AND ($2::TEXT IS NULL OR namespace = $2) \
                AND (cardinality($3::TEXT[]) = 0 OR state = ANY($3)) \
-             ORDER BY created_at, id LIMIT $4"
+               AND ($5::BIGINT IS NULL OR \
+                    ((EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT, id) < ($5, $6::TEXT)) \
+             ORDER BY created_ms {order}, id {order} LIMIT $4",
+            order = if filter.newest_first { "DESC" } else { "ASC" }
         ))
         .bind(&filter.tenant_id)
         .bind(&filter.namespace)
         .bind(states)
         .bind(i64::from(filter.effective_limit()))
+        .bind(filter.before.as_ref().map(|(ms, _)| *ms as i64))
+        .bind(filter.before.as_ref().map_or("", |(_, id)| id.as_str()))
         .fetch_all(pool)
         .await
         .map_err(io_error)?;

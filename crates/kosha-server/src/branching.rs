@@ -310,19 +310,8 @@ impl AppState {
         // pod (#347); other pods purge theirs from the record.
         self.forget_namespace_caches(ns);
         self.purge_deleted_from_memory(&ns.0);
-        let exports = match self.delete_namespace_exports(ns) {
-            Ok(count) => count,
-            Err(e) => {
-                reclaimed.errors.push(format!("exports: {e}"));
-                0
-            }
-        };
-        if exports > 0 {
-            let _ = self
-                .controller
-                .lock()
-                .unwrap()
-                .note_deletion_exports(&record.id, exports);
+        if let Some(e) = self.erase_exports_for(&record, || self.delete_namespace_exports(ns)) {
+            reclaimed.errors.push(format!("exports: {e}"));
         }
         let error = (!reclaimed.errors.is_empty()).then(|| reclaimed.errors.join("; "));
         let record =
@@ -393,7 +382,7 @@ impl AppState {
             );
         }
         let mut reclaimed = self.reclaim_namespace_objects(&ns, &refs);
-        if let Err(e) = self.delete_namespace_exports(&ns) {
+        if let Some(e) = self.erase_exports_for(record, || self.delete_namespace_exports(&ns)) {
             reclaimed.errors.push(format!("exports: {e}"));
         }
         let error = (!reclaimed.errors.is_empty()).then(|| reclaimed.errors.join("; "));

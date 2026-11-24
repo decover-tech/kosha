@@ -997,7 +997,15 @@ fn a_record_completes_only_once_every_live_pod_acknowledged() {
     assert_eq!(body["deletion"]["storage_verified"], true);
     assert_eq!(body["deletion"]["acks_required"], true);
 
-    // The writer purges and acknowledges; the query pod has not yet.
+    // A recent deletion is acknowledged only after the settle sweep: the
+    // first pass sweeps, the next one (settle is zero here) acknowledges.
+    pass(&writer);
+    let record = record_of(&writer, &id);
+    assert!(record.awaiting_acks(), "{record:?}");
+    assert_eq!(
+        writer.deletion_json(&record)["acks"]["missing"],
+        serde_json::json!(["query-0", "writer-0"])
+    );
     pass(&writer);
     let record = record_of(&writer, &id);
     assert!(record.awaiting_acks(), "{record:?}");
@@ -1009,10 +1017,13 @@ fn a_record_completes_only_once_every_live_pod_acknowledged() {
     );
     assert_eq!(shown["acks"]["complete"], false);
 
-    // The query pod's pass removes its copy, acknowledges and completes it.
+    // The query pod's first pass removes its copy, its settle sweep
+    // acknowledges and completes the record.
     assert!(follower.data_dir.join("acme/docs").exists());
     pass(&follower);
     assert!(!follower.data_dir.join("acme/docs").exists());
+    assert!(record_of(&writer, &id).awaiting_acks());
+    pass(&follower);
     let record = record_of(&writer, &id);
     assert!(record.is_completed(), "{record:?}");
     let shown = writer.deletion_json(&record);
@@ -1059,7 +1070,7 @@ fn a_dead_pod_holds_a_record_only_for_the_liveness_window() {
     assert!(status.expired.contains(&"gone-0".to_string()), "{status:?}");
     // ...but the writer's own heartbeat too; refresh it and finalize.
     pass(&writer);
-    let done = writer.finalize_deletion_if_acked(&id, 10).unwrap();
+    let done = writer.finalize_deletion_if_acked(&id, 40).unwrap();
     assert!(done.is_completed(), "{done:?}");
 }
 
@@ -1162,4 +1173,56 @@ fn namespace_delete_confirmation_is_opt_in() {
         serde_json::json!({}),
     );
     assert_eq!(status, 200, "{body}");
+}
+
+/// A pod vouches for a namespace record only once the writer verified its
+/// storage, as for a tenant: an acknowledgement before that would sit on a
+/// record whose objects may still be in the bucket (#347 review).
+#[test]
+fn a_namespace_is_acknowledged_only_after_its_storage_is_verified() {
+    let (mut writer, follower, _) = pods();
+    let remote = Arc::new(FlakyRemote::default());
+    writer.remote_prefix_override = Some(remote.clone());
+    requiring_acks(&writer, "writer-0");
+    requiring_acks(&follower, "query-0");
+    index(&writer, "acme", "docs", &["a"]);
+    remote
+        .objects
+        .lock()
+        .unwrap()
+        .insert("acme/docs/seg/footer.json".into());
+    pass(&writer);
+    pass(&follower);
+    remote.failing.store(true, Ordering::Relaxed);
+    let (status, body) = call(
+        &writer,
+        "acme",
+        "DELETE /v1/namespaces/docs",
+        serde_json::json!({}),
+    );
+    assert_eq!(status, 200, "{body}");
+    let id = body["deletion"]["id"].as_str().unwrap().to_string();
+    assert_eq!(body["deletion"]["storage_verified"], false);
+
+    // Swept, settled, swept again: no acknowledgement while storage fails.
+    for _ in 0..3 {
+        pass(&writer);
+        pass(&follower);
+    }
+    let record = record_of(&writer, &id);
+    let shown = writer.deletion_json(&record);
+    assert_eq!(
+        shown["acks"]["acknowledged"],
+        serde_json::json!([]),
+        "{shown}"
+    );
+
+    // The retry verifies storage; the next sweeps acknowledge and complete.
+    remote.failing.store(false, Ordering::Relaxed);
+    writer.run_deletion_resume_pass(Duration::from_secs(3600));
+    assert!(record_of(&writer, &id).awaiting_acks());
+    pass(&writer);
+    pass(&follower);
+    let record = record_of(&writer, &id);
+    assert!(record.is_completed(), "{record:?}");
 }

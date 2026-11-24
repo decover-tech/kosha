@@ -938,7 +938,7 @@ See "Exports" in the README.
 
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
-| `KOSHA_EXPORTS` | `on` serves `/v1/namespaces/{ns}/exports...` and runs the export sweep on writer pods. Off: those routes answer 404 | `off` | switch |
+| `KOSHA_EXPORTS` | `on` lets tenants start exports (`POST /v1/namespaces/{ns}/exports`) and runs the export sweep on writer pods. Off: starting one answers 404, existing exports can still be read, downloaded and deleted, and a writer pod fails any export still pending or running at boot (releasing its pins) | `off` | switch |
 | `KOSHA_EXPORT_TTL_SECS` | How long a completed export stays downloadable before the sweep deletes its objects (state `expired`). At least 60 | `604800` (7 days) | seconds |
 | `KOSHA_EXPORT_PART_BYTES` | JSON bytes per part before a new part starts (each part is read whole into memory for its upload). At least 1 MiB | `268435456` (256 MiB) | bytes |
 | `KOSHA_EXPORT_PRESIGN_SECS` | Lifetime of the presigned S3 `GET` URLs the status route returns (capped at 7 days) | `900` | seconds |

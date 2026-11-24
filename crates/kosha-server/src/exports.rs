@@ -31,15 +31,21 @@
 //! export reads exactly the pinned versions, deletes applied.
 //!
 //! **Jobs.** The record is durable (`kosha.exports`). A writer pod claims
-//! it and runs it, refreshing the claim; if the pod dies, another writer
-//! claims it after [`CLAIM_TIMEOUT`] and runs it again from the start
-//! against the same pins (restartable, not resumable). A writer pod also
-//! expires completed exports after `KOSHA_EXPORT_TTL_SECS` (objects deleted,
-//! state `expired`).
+//! it and runs it, refreshing the claim every 30 s on a timer of its own
+//! (writing and delivery alike); if the pod dies, another writer claims it
+//! after 10 minutes and runs it again from the start against the same pins
+//! (restartable, not resumable). Each attempt writes under its own prefix
+//! (`attempt-{n}/`), and a run that lost its claim removes only its own
+//! files. A writer pod also expires completed exports after
+//! `KOSHA_EXPORT_TTL_SECS` (objects deleted, state `expired`), and removes
+//! failed and expired rows after 30 days. With `KOSHA_EXPORTS` off, a
+//! writer pod fails the exports still pending or running at boot (their
+//! pins go); reading, downloading and deleting exports keep working, only
+//! starting one is refused.
 //!
 //! **Where it goes.** Parts live in object storage under
-//! `_exports/{tenant}/{id}/` (on a pod without S3, under the data
-//! directory), never under a namespace's prefix. An optional
+//! `_exports/{tenant}/{id}/attempt-{n}/` (on a pod without S3, under the
+//! data directory), never under a namespace's prefix. An optional
 //! customer-supplied presigned PUT URL receives the whole export: it must
 //! be `https`, and every address its host resolves to must be public (no
 //! loopback, private, link-local, CGNAT, multicast or reserved ranges, IPv4
@@ -60,21 +66,19 @@ use kosha_core::export::{
     ExportState, ExportUpdate, NewExport,
 };
 use std::io::Write as _;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::RwLock;
 
-/// A running export's claim is refreshed this often...
-const CLAIM_REFRESH: Duration = Duration::from_secs(30);
-/// ...and taken over by another writer once this old.
-const CLAIM_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// How often a writer pod looks for expired and orphaned exports.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// Exports one pod runs at once.
 const MAX_RUNNING: usize = 2;
-/// Upper bound on an upload URL's length.
-const MAX_URL_LEN: usize = 8192;
+/// How long failed and expired export rows are kept (their objects are
+/// already gone) before the sweep removes them.
+const RETENTION: Duration = Duration::from_secs(30 * 24 * 3600);
+/// Largest page of `GET /v1/namespaces/{ns}/exports`.
+const MAX_PAGE: u32 = 100;
 
 /// `KOSHA_EXPORTS`, `KOSHA_EXPORT_TTL_SECS`, `KOSHA_EXPORT_PART_BYTES`,
 /// `KOSHA_EXPORT_PRESIGN_SECS`, `KOSHA_EXPORT_MAX_ACTIVE`.
@@ -89,6 +93,12 @@ pub(crate) struct ExportSettings {
     /// Tests only: allow `http://` and loopback upload URLs (a fake
     /// receiver on 127.0.0.1). Never set from the environment.
     pub allow_insecure_upload: bool,
+    /// A running export's claim is refreshed this often, on a timer of its
+    /// own (writing and delivery alike)...
+    pub claim_refresh: Duration,
+    /// ...and taken over by another writer once this old. Fixed in
+    /// production; shortened in tests.
+    pub claim_timeout: Duration,
 }
 
 impl Default for ExportSettings {
@@ -100,6 +110,8 @@ impl Default for ExportSettings {
             presign: Duration::from_secs(900),
             max_active: 2,
             allow_insecure_upload: false,
+            claim_refresh: Duration::from_secs(30),
+            claim_timeout: Duration::from_secs(10 * 60),
         }
     }
 }
@@ -204,110 +216,15 @@ impl ExportRuntime {
 
 // ─── Upload URL validation (SSRF) ─────────────────────────────────────────
 
-/// A customer upload URL that passed validation, with the address the
-/// upload must connect to.
-#[derive(Debug, Clone)]
-pub(crate) struct UploadTarget {
-    pub url: reqwest::Url,
-    pub host: String,
-    pub addr: SocketAddr,
-}
+/// A customer upload URL that passed validation (see [`crate::public_url`]).
+pub(crate) type UploadTarget = crate::public_url::PublicUrl;
 
-/// Whether `ip` is a public unicast address an upload may reach.
-pub(crate) fn is_public_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            let [a, b, c, _] = v4.octets();
-            !(v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.is_multicast()
-                || v4.is_documentation()
-                || a == 0
-                || a >= 240
-                // 100.64.0.0/10 carrier-grade NAT
-                || (a == 100 && (64..128).contains(&b))
-                // 192.0.0.0/24 IETF protocol assignments
-                || (a == 192 && b == 0 && c == 0)
-                // 198.18.0.0/15 benchmarking
-                || (a == 198 && (b == 18 || b == 19)))
-        }
-        IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_public_ip(IpAddr::V4(v4));
-            }
-            let segments = v6.segments();
-            // NAT64 (64:ff9b::/96) reaches the embedded IPv4 address.
-            if segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
-                let [a, b] = segments[6].to_be_bytes();
-                let [c, d] = segments[7].to_be_bytes();
-                return is_public_ip(IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, d)));
-            }
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                // fc00::/7 unique local
-                || (segments[0] & 0xfe00) == 0xfc00
-                // fe80::/10 link-local, fec0::/10 site-local
-                || (segments[0] & 0xffc0) == 0xfe80
-                || (segments[0] & 0xffc0) == 0xfec0
-                // 2001:db8::/32 documentation
-                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
-                // ::/96 IPv4-compatible (deprecated)
-                || segments[..6] == [0, 0, 0, 0, 0, 0])
-        }
-    }
-}
-
-/// Validate a customer-supplied presigned PUT URL: `https` only, no
-/// credentials in it, and every address its host resolves to public. The
-/// first resolved address is the one the upload will use. `allow_insecure`
-/// (tests only) admits `http` and loopback.
+/// Validate a customer-supplied presigned PUT URL with
+/// [`crate::public_url::validate_public_url`]: `https` only, no
+/// credentials, every resolved address public. `allow_insecure` (tests
+/// only) admits `http` and loopback.
 pub(crate) fn validate_upload_url(raw: &str, allow_insecure: bool) -> Result<UploadTarget, String> {
-    if raw.len() > MAX_URL_LEN {
-        return Err(format!("upload_url is longer than {MAX_URL_LEN} bytes"));
-    }
-    let url = reqwest::Url::parse(raw).map_err(|e| format!("upload_url is not a URL: {e}"))?;
-    match url.scheme() {
-        "https" => {}
-        "http" if allow_insecure => {}
-        other => return Err(format!("upload_url must use https, not {other}")),
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err("upload_url must not carry credentials before the host".into());
-    }
-    let host = url
-        .host_str()
-        .filter(|h| !h.is_empty())
-        .ok_or("upload_url has no host")?
-        .to_string();
-    let port = url
-        .port_or_known_default()
-        .ok_or("upload_url has no port")?;
-    let lookup = host.trim_start_matches('[').trim_end_matches(']');
-    let addrs: Vec<SocketAddr> = (lookup, port)
-        .to_socket_addrs()
-        .map_err(|e| format!("upload_url host {host:?} does not resolve: {e}"))?
-        .collect();
-    let Some(first) = addrs.first().copied() else {
-        return Err(format!("upload_url host {host:?} does not resolve"));
-    };
-    for addr in &addrs {
-        let ip = addr.ip();
-        let allowed = is_public_ip(ip) || (allow_insecure && ip.is_loopback());
-        if !allowed {
-            return Err(format!(
-                "upload_url host {host:?} resolves to {ip}, which is not a public address"
-            ));
-        }
-    }
-    Ok(UploadTarget {
-        url,
-        host: lookup.to_string(),
-        addr: first,
-    })
+    crate::public_url::validate_public_url(raw, "upload_url", allow_insecure)
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────
@@ -376,7 +293,9 @@ pub(crate) fn route(
     state: &AppState,
 ) -> Option<String> {
     let found = route_of(request_line)?;
-    if !state.exports.settings().enabled {
+    // Off, only starting an export is refused: what exists stays readable
+    // and, above all, deletable.
+    if !state.exports.settings().enabled && matches!(found, ExportRoute::Create(_)) {
         return Some(json_error(
             404,
             "exports are not enabled on this deployment (KOSHA_EXPORTS)",
@@ -386,7 +305,7 @@ pub(crate) fn route(
         // `POST /v1/namespaces/{ns}/exports`
         ExportRoute::Create(ns) => handle_create(&ns, tenant, body, state),
         // `GET /v1/namespaces/{ns}/exports`
-        ExportRoute::List(ns) => handle_list(&ns, tenant, state),
+        ExportRoute::List(ns) => handle_list(&ns, request_line, tenant, state),
         // `GET /v1/namespaces/{ns}/exports/{id}`
         ExportRoute::Get(ns, id) => handle_get(&ns, &id, tenant, state),
         // `DELETE /v1/namespaces/{ns}/exports/{id}`
@@ -605,21 +524,48 @@ fn handle_create(name: &str, tenant: &str, body: &[u8], state: &AppState) -> Str
     accepted(&state.export_json(&created, name))
 }
 
-fn handle_list(name: &str, tenant: &str, state: &AppState) -> String {
+/// `GET /v1/namespaces/{ns}/exports[?limit=N&before=<id>]`: newest first,
+/// at most `limit` (default and cap [`MAX_PAGE`]); `next` is the `before`
+/// of the following page, `null` on the last.
+fn handle_list(name: &str, request_line: &str, tenant: &str, state: &AppState) -> String {
     let ns = NamespaceId(tenant_namespace(tenant, name));
+    let path = parse_method_and_path(request_line).map_or("", |(_, path)| path);
+    let limit = match namespace_deletion_query_param(path, "limit") {
+        None => MAX_PAGE,
+        Some(raw) => match raw.parse::<u32>() {
+            Ok(n) if n > 0 => n.min(MAX_PAGE),
+            _ => return json_error(400, "invalid 'limit' (a positive integer)"),
+        },
+    };
+    let before = match namespace_deletion_query_param(path, "before") {
+        None => None,
+        Some(id) => match owned_export(state, tenant, &ns, &id) {
+            Ok(record) => Some(ExportFilter::position(&record)),
+            Err(response) => return response,
+        },
+    };
     let listed = state.controller.lock().unwrap().exports(&ExportFilter {
         tenant_id: Some(tenant.to_string()),
         namespace: Some(ns.0.clone()),
+        limit: Some(limit),
+        newest_first: true,
+        before,
         ..ExportFilter::default()
     });
     match listed {
-        Ok(records) => json_ok(&serde_json::json!({
-            "namespace": name,
-            "exports": records
-                .iter()
-                .map(|record| state.export_json(record, name))
-                .collect::<Vec<_>>(),
-        })),
+        Ok(records) => {
+            let next = (records.len() == limit as usize)
+                .then(|| records.last().map(|r| r.id.clone()))
+                .flatten();
+            json_ok(&serde_json::json!({
+                "namespace": name,
+                "exports": records
+                    .iter()
+                    .map(|record| state.export_json(record, name))
+                    .collect::<Vec<_>>(),
+                "next": next,
+            }))
+        }
         Err(e) => json_error(503, &format!("control store: {e}")),
     }
 }
@@ -667,12 +613,6 @@ pub(crate) fn download_response(
     state: &AppState,
 ) -> http::Response {
     let error = |status: u16, message: &str| http::Response::from_raw(json_error(status, message));
-    if !state.exports.settings().enabled {
-        return error(
-            404,
-            "exports are not enabled on this deployment (KOSHA_EXPORTS)",
-        );
-    }
     let Some(ExportRoute::Download(name, id)) = route_of(request_line) else {
         return error(404, "not found");
     };
@@ -844,10 +784,11 @@ impl AppState {
     /// another pod holds (the claim is refused) or that is finished.
     pub(crate) fn run_export(&self, id: &str) -> Option<ExportRecord> {
         let holder = &self.pod_id();
+        let settings = self.exports.settings();
         let claimed = self.controller.lock().unwrap().claim_export(
             id,
             holder,
-            CLAIM_TIMEOUT.as_millis() as u64,
+            settings.claim_timeout.as_millis() as u64,
         );
         let record = match claimed {
             Ok(Some(record)) => record,
@@ -857,8 +798,31 @@ impl AppState {
                 return None;
             }
         };
-        let dir_logical = export_dir(&record.tenant_id, &record.id);
-        let outcome = self.write_export(&record, &dir_logical, holder);
+        // Each attempt writes under a prefix of its own, so a run that lost
+        // its claim (and a pod that took it over) never share files: what
+        // one discards is only ever its own.
+        let dir_logical = format!(
+            "{}/attempt-{}",
+            export_dir(&record.tenant_id, &record.id),
+            record.attempts
+        );
+        // The claim is refreshed on a timer of its own for the whole run,
+        // writing and delivery alike, so a slow segment or a slow customer
+        // endpoint never lets another writer take a live export over.
+        let lost = AtomicBool::new(false);
+        let finished_run = AtomicBool::new(false);
+        let (outcome, delivery) = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                self.keep_export_claim(&record.id, holder, &settings, &lost, &finished_run)
+            });
+            let outcome = self.write_export(&record, &dir_logical, holder, &lost);
+            let delivery = match (&outcome, record.upload_url.as_deref()) {
+                (Ok(parts), Some(url)) => Some(self.deliver_export(url, parts)),
+                _ => None,
+            };
+            finished_run.store(true, Ordering::SeqCst);
+            (outcome, delivery)
+        });
         let guarded = |update: ExportUpdate| ExportUpdate {
             holder: Some(holder.to_string()),
             ..update
@@ -867,10 +831,6 @@ impl AppState {
             Ok(parts) => {
                 let documents = parts.iter().map(|(p, _)| p.documents).sum();
                 let bytes = parts.iter().map(|(p, _)| p.bytes).sum();
-                let delivery = record
-                    .upload_url
-                    .as_deref()
-                    .map(|url| self.deliver_export(url, &parts));
                 let now = unix_millis();
                 let update = guarded(ExportUpdate {
                     state: Some(ExportState::Completed),
@@ -954,14 +914,41 @@ impl AppState {
         remote
     }
 
+    /// Refresh the claim of export `id` every `claim_refresh` until `done`;
+    /// set `lost` (and stop) once the export is gone or another pod holds
+    /// it.
+    fn keep_export_claim(
+        &self,
+        id: &str,
+        holder: &str,
+        settings: &ExportSettings,
+        lost: &AtomicBool,
+        done: &AtomicBool,
+    ) {
+        let step = settings.claim_refresh.min(Duration::from_millis(50));
+        let mut last = Instant::now();
+        while !done.load(Ordering::SeqCst) {
+            std::thread::sleep(step);
+            if last.elapsed() < settings.claim_refresh {
+                continue;
+            }
+            last = Instant::now();
+            if self.refresh_export_claim(id, holder).is_err() {
+                lost.store(true, Ordering::SeqCst);
+                return;
+            }
+        }
+    }
+
     /// Refresh this pod's claim; `Err(Stop::Lost)` once the export is gone
     /// or held by another pod.
     fn refresh_export_claim(&self, id: &str, holder: &str) -> Result<(), Stop> {
-        let claimed = self.controller.lock().unwrap().claim_export(
-            id,
-            holder,
-            CLAIM_TIMEOUT.as_millis() as u64,
-        );
+        let timeout = self.exports.settings().claim_timeout;
+        let claimed =
+            self.controller
+                .lock()
+                .unwrap()
+                .claim_export(id, holder, timeout.as_millis() as u64);
         match claimed {
             Ok(Some(record)) if record.claimed_by.as_deref() == Some(holder) => Ok(()),
             Ok(_) => Err(Stop::Lost),
@@ -977,6 +964,7 @@ impl AppState {
         record: &ExportRecord,
         dir_logical: &str,
         holder: &str,
+        lost: &AtomicBool,
     ) -> Result<Vec<(ExportPart, PathBuf)>, Stop> {
         if record.pins.is_empty() {
             return Err(Stop::Failed("the export lost its pinned manifests".into()));
@@ -984,15 +972,13 @@ impl AppState {
         let settings = self.exports.settings();
         let mut writer =
             PartWriter::new(&self.data_dir, dir_logical.to_string(), settings.part_bytes)?;
-        let mut last_refresh = Instant::now();
         for (ns, pinned) in &record.pins {
             let mut manifest = pinned.clone();
             self.hydrate_deletes(ns, &mut manifest)
                 .map_err(|e| Stop::Failed(format!("reading the deletes of {}: {e}", ns.0)))?;
             for entry in &manifest.segments {
-                if last_refresh.elapsed() >= CLAIM_REFRESH {
-                    self.refresh_export_claim(&record.id, holder)?;
-                    last_refresh = Instant::now();
+                if lost.load(Ordering::SeqCst) {
+                    return Err(Stop::Lost);
                 }
                 let dir = manifest.segment_dir(&self.data_dir, ns, &entry.segment_id);
                 #[cfg(feature = "s3")]
@@ -1084,15 +1070,15 @@ impl AppState {
         self.refresh_export_claim(&record.id, holder)
     }
 
-    /// Remove what a run wrote: local files and, on S3, its objects.
+    /// Remove what one attempt wrote (`dir_logical`, its own prefix):
+    /// local files and, on S3, its objects. Never another attempt's.
     fn discard_run_objects(&self, record: &ExportRecord, dir_logical: &str) {
-        if let Err(e) = self.remove_export_objects(record) {
+        if let Err(e) = self.remove_export_prefix(dir_logical) {
             eprintln!(
                 "WARN: export {}: removing the objects of an abandoned run failed: {e}",
                 record.id
             );
         }
-        let _ = std::fs::remove_dir_all(self.export_local_path(dir_logical));
     }
 
     /// Delete export `record`'s objects (local and remote) and verify none
@@ -1179,13 +1165,8 @@ impl AppState {
             );
         }
         let body = Concat(readers.into_iter().collect());
-        let client = reqwest::blocking::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .resolve(&target.host, target.addr)
-            .timeout(Duration::from_secs(3600))
-            .connect_timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|e| format!("upload client: {e}"))?;
+        // No proxy, no redirect, the checked address only.
+        let client = crate::public_url::pinned_client(&target, Duration::from_secs(3600))?;
         let response = client
             .put(target.url.clone())
             .body(reqwest::blocking::Body::sized(body, len))
@@ -1201,11 +1182,12 @@ impl AppState {
 
     // ── Hard delete (#347) ───────────────────────────────────────────────
 
-    /// Delete every export of namespace `ns` (objects, then rows). Returns
-    /// how many exports went.
-    pub(crate) fn delete_namespace_exports(&self, ns: &NamespaceId) -> Result<u64, String> {
+    /// Delete every export of namespace `ns` (see
+    /// [`Self::delete_exports_where`]). Returns how many went for good, and
+    /// why any is left.
+    pub(crate) fn delete_namespace_exports(&self, ns: &NamespaceId) -> (u64, Option<String>) {
         let Some(tenant) = namespace_tenant(&ns.0) else {
-            return Ok(0);
+            return (0, None);
         };
         self.delete_exports_where(ExportFilter {
             tenant_id: Some(tenant.to_string()),
@@ -1217,37 +1199,102 @@ impl AppState {
 
     /// Delete every export of `tenant`, then the whole `_exports/{tenant}/`
     /// prefix (whatever an interrupted run left), verified empty.
-    pub(crate) fn delete_tenant_exports(&self, tenant: &str) -> Result<u64, String> {
-        let deleted = self.delete_exports_where(ExportFilter {
+    pub(crate) fn delete_tenant_exports(&self, tenant: &str) -> (u64, Option<String>) {
+        let (deleted, error) = self.delete_exports_where(ExportFilter {
             tenant_id: Some(tenant.to_string()),
             limit: Some(u32::MAX),
             ..ExportFilter::default()
-        })?;
-        self.remove_export_prefix(&tenant_exports_dir(tenant))?;
-        Ok(deleted)
+        });
+        if error.is_some() {
+            return (deleted, error);
+        }
+        (
+            deleted,
+            self.remove_export_prefix(&tenant_exports_dir(tenant)).err(),
+        )
     }
 
-    fn delete_exports_where(&self, filter: ExportFilter) -> Result<u64, String> {
+    /// Delete the exports `filter` selects for good. In this order, so a
+    /// failure never leaves files without a row to find them by:
+    ///
+    /// 1. every row is marked `expired` with its pins and upload URL
+    ///    cleared (a run still writing sees its claim gone and removes
+    ///    what it wrote itself);
+    /// 2. each export's objects are deleted and the prefix listed empty;
+    /// 3. only the rows whose objects are confirmed gone are deleted.
+    ///
+    /// A row whose objects could not be removed stays (expired), so the
+    /// next attempt (a deletion retry) finds it again. Returns how many
+    /// exports went for good, and the first reason one is left.
+    fn delete_exports_where(&self, filter: ExportFilter) -> (u64, Option<String>) {
         let listed = self.controller.lock().unwrap().exports(&filter);
-        let records = listed.map_err(|e| format!("control store: {e}"))?;
+        let records = match listed {
+            Ok(records) => records,
+            Err(e) => return (0, Some(format!("control store: {e}"))),
+        };
         if records.is_empty() {
-            return Ok(0);
+            return (0, None);
         }
-        // Rows first: a run still writing notices its export is gone at its
-        // next part and removes what it wrote itself.
-        let ids: Vec<String> = records.iter().map(|r| r.id.clone()).collect();
-        let removed = self.controller.lock().unwrap().delete_exports(&ids);
-        let removed = removed.map_err(|e| format!("control store: {e}"))?;
-        let mut first_error = None;
+        let stop = ExportUpdate {
+            state: Some(ExportState::Expired),
+            parts: Some(Vec::new()),
+            clear_pins: true,
+            clear_upload_url: true,
+            ..ExportUpdate::default()
+        };
         for record in &records {
-            if let Err(e) = self.remove_export_objects(record) {
-                first_error.get_or_insert(format!("export {}: {e}", record.id));
+            let stopped = self
+                .controller
+                .lock()
+                .unwrap()
+                .update_export(&record.id, &stop);
+            if let Err(e) = stopped {
+                return (0, Some(format!("control store: {e}")));
             }
         }
+        let mut first_error = None;
+        let mut gone = Vec::new();
+        for record in &records {
+            match self.remove_export_objects(record) {
+                Ok(_) => gone.push(record.id.clone()),
+                Err(e) => {
+                    first_error.get_or_insert(format!("export {}: {e}", record.id));
+                }
+            }
+        }
+        let removed = match self.controller.lock().unwrap().delete_exports(&gone) {
+            Ok(removed) => removed,
+            Err(e) => return (0, Some(format!("control store: {e}"))),
+        };
         self.exports.deleted.fetch_add(removed, Ordering::Relaxed);
-        match first_error {
-            Some(e) => Err(e),
-            None => Ok(removed),
+        (removed, first_error)
+    }
+
+    /// Remove failed and expired export rows not updated for [`RETENTION`].
+    /// Their objects were deleted when they failed or expired; deleted
+    /// again here in case that did not finish.
+    fn prune_export_rows(&self, now_ms: u64) -> usize {
+        let listed = self.controller.lock().unwrap().exports(&ExportFilter {
+            states: vec![ExportState::Failed, ExportState::Expired],
+            limit: Some(10_000),
+            ..ExportFilter::default()
+        });
+        let Ok(records) = listed else {
+            return 0;
+        };
+        let cutoff = now_ms.saturating_sub(RETENTION.as_millis() as u64);
+        let old: Vec<String> = records
+            .iter()
+            .filter(|r| r.updated_at_ms < cutoff)
+            .filter(|r| self.remove_export_objects(r).is_ok())
+            .map(|r| r.id.clone())
+            .collect();
+        match self.controller.lock().unwrap().delete_exports(&old) {
+            Ok(n) => n as usize,
+            Err(e) => {
+                eprintln!("WARN: export sweep: pruning old rows: {e}");
+                0
+            }
         }
     }
 
@@ -1258,10 +1305,16 @@ impl AppState {
     pub(crate) fn spawn_exports(self: &Arc<Self>, settings: ExportSettings) {
         let enabled = settings.enabled;
         self.exports.configure(settings);
+        let writer = !(self.follows_only() || self.role == role::Role::Indexer);
         if !enabled {
+            // Nothing will run what is still pending or running: end it, so
+            // its pins stop holding segments against GC for good.
+            if writer {
+                self.fail_active_exports("exports were turned off (KOSHA_EXPORTS)");
+            }
             return;
         }
-        if self.follows_only() || self.role == role::Role::Indexer {
+        if !writer {
             println!("exports: served here, run by the writer pod");
             return;
         }
@@ -1281,10 +1334,59 @@ impl AppState {
             .expect("failed to spawn export sweep thread");
     }
 
-    /// One sweep: expire what is past `expires_at_ms`, remove the objects
-    /// of failed exports, and run active exports nobody is running.
-    /// Returns how many exports expired.
+    /// Fail every pending or running export with `reason`: its objects are
+    /// deleted and its pins dropped. Returns how many it failed.
+    pub(crate) fn fail_active_exports(&self, reason: &str) -> usize {
+        let active = self
+            .controller
+            .lock()
+            .unwrap()
+            .exports(&ExportFilter::active());
+        let active = match active {
+            Ok(active) => active,
+            Err(e) => {
+                eprintln!("WARN: exports: reading active exports: {e}");
+                return 0;
+            }
+        };
+        let mut failed = 0;
+        for record in active {
+            let update = ExportUpdate {
+                state: Some(ExportState::Failed),
+                error: Some(Some(reason.to_string())),
+                parts: Some(Vec::new()),
+                clear_pins: true,
+                clear_upload_url: true,
+                delivery_state: record.upload_url.as_ref().map(|_| DeliveryState::Failed),
+                ..ExportUpdate::default()
+            };
+            let updated = self
+                .controller
+                .lock()
+                .unwrap()
+                .update_export(&record.id, &update);
+            if let Ok(Some(_)) = updated {
+                failed += 1;
+                if let Err(e) = self.remove_export_objects(&record) {
+                    eprintln!(
+                        "WARN: export {}: removing its objects failed: {e}",
+                        record.id
+                    );
+                }
+            }
+        }
+        if failed > 0 {
+            println!("exports: {failed} pending or running export(s) failed: {reason}");
+        }
+        failed
+    }
+
+    /// One sweep: expire what is past `expires_at_ms`, run active exports
+    /// nobody is running, and remove failed and expired rows older than
+    /// [`RETENTION`] (their objects are already gone). Returns how many
+    /// exports expired.
     pub(crate) fn run_export_sweep(&self, now_ms: u64) -> usize {
+        self.prune_export_rows(now_ms);
         let listed = self.controller.lock().unwrap().exports(&ExportFilter {
             states: vec![
                 ExportState::Completed,
