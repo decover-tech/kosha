@@ -479,7 +479,7 @@ mod pg {
                 .map_err(|e| format!("failed to create tokio runtime: {e}"))?;
             let pool = {
                 let _guard = rt.enter();
-                sqlx::postgres::PgPoolOptions::new()
+                crate::postgres::writer_pool_options()
                     .max_connections(2)
                     .acquire_timeout(Duration::from_secs(5))
                     .connect_lazy(database_url)
