@@ -88,7 +88,8 @@ the planner instead picks per segment by estimated bytes read
 
 - probe: `n × (avg_posting_entries × entry_bytes + overhead)` where `n` is the
   segment's share of the global budget widened as `filtered_knn_budget` widens
-  it, at least `k / (selectivity × avg_posting_entries)` (to see `k` passing
+  it (without global budgeting, `num_candidates` unwidened, as the per-segment
+  probe reads), at least `k / (selectivity × avg_posting_entries)` (to see `k` passing
   entries), at most every posting; plus `k × KOSHA_VECTOR_RESCORE_FACTOR`
   exact vectors for a quantized column.
 - exact: `passing × 4·dim` from `doc_vectors.bin`, or every posting without it.
