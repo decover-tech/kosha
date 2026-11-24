@@ -7024,6 +7024,10 @@ fn handle_metrics(state: &AppState, headers: &HashMap<String, String>) -> String
         nvme_evictions: state.cache.eviction_generation(),
         segment_checksum_failures,
         cache_tenants: cache_tenant_samples(state),
+        decoded_caches: [
+            kosha_segment::text_postings_cache_stats(),
+            kosha_segment::vector_postings_cache_stats(),
+        ],
         span_writes: state.span_writes.stats(),
     });
     format!(

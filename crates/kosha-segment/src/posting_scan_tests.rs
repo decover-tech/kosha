@@ -12,6 +12,8 @@ use kosha_core::{Bm25Params, DocumentId, Field, SegmentId};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+static TEST_POSTINGS_COUNTERS: PostingsCacheCounters = PostingsCacheCounters::new();
+
 const DIM: usize = 24;
 const DOCS: usize = 900;
 const FIELD: &str = "emb";
@@ -109,7 +111,8 @@ impl Fixture {
     /// Give the reader a cache of its own with this budget (the shared
     /// one is process-wide and other tests use it concurrently).
     fn set_cache_budget(&mut self, max_bytes: usize) {
-        self.reader.vector_cache = Arc::new(PostingsCache::new(max_bytes, None));
+        self.reader.vector_cache =
+            Arc::new(PostingsCache::new(max_bytes, None, &TEST_POSTINGS_COUNTERS));
     }
 
     /// Move `vector.idx` into the span cache: `per_span` consecutive
@@ -1459,7 +1462,11 @@ impl CountingAccount {
 fn a_probe_of_more_postings_than_the_text_ring_is_admitted_on_its_second_run() {
     let dir = write_vector_segment("wide", 60_000, 4);
     let mut reader = SegmentReader::open_with_options(dir.clone(), true).unwrap();
-    reader.vector_cache = Arc::new(PostingsCache::new(usize::MAX / 2, None));
+    reader.vector_cache = Arc::new(PostingsCache::new(
+        usize::MAX / 2,
+        None,
+        &TEST_POSTINGS_COUNTERS,
+    ));
     let postings = {
         let index = reader.vector_field(FIELD).unwrap().unwrap();
         index.lazy.as_ref().unwrap().ranges.len()
@@ -1504,7 +1511,11 @@ fn a_probe_larger_than_the_cache_reach_passes_through() {
         )
     };
     // Room for at most 128 postings, far fewer than one probe touches.
-    reader.vector_cache = Arc::new(PostingsCache::new(largest * 128, None));
+    reader.vector_cache = Arc::new(PostingsCache::new(
+        largest * 128,
+        None,
+        &TEST_POSTINGS_COUNTERS,
+    ));
     assert!(postings > 4 * 128, "{postings} postings");
     let query = [0.25f32, -0.5, 0.75, 0.1];
     for _ in 0..3 {
@@ -1550,7 +1561,7 @@ fn vector_postings_of_all_segments_stay_under_one_budget() {
     // …here a private one, about one segment's worth: four segments'
     // working sets cannot all fit.
     let budget = largest * 60;
-    let cache = Arc::new(PostingsCache::new(budget, None));
+    let cache = Arc::new(PostingsCache::new(budget, None, &TEST_POSTINGS_COUNTERS));
     let accounts: Vec<Arc<CountingAccount>> = (0..dirs.len()).map(|_| Arc::default()).collect();
     let mut readers: Vec<SegmentReader> = dirs
         .iter()
@@ -1609,7 +1620,7 @@ fn vector_postings_of_all_segments_stay_under_one_budget() {
 #[test]
 fn postings_cache_evicts_in_exact_lru_order() {
     const CAP: usize = 40;
-    let cache = PostingsCache::<usize, usize>::new(CAP, None);
+    let cache = PostingsCache::<usize, usize>::new(CAP, None, &TEST_POSTINGS_COUNTERS);
     let mut model: VecDeque<usize> = VecDeque::new();
     let mut rng = Lcg(42);
     for step in 0..200_000 {
@@ -1651,7 +1662,7 @@ fn postings_cache_evicts_in_exact_lru_order() {
 /// not.
 #[test]
 fn text_second_touch_ring_is_unchanged() {
-    let cache = PostingsCache::<usize, u8>::new(usize::MAX, None);
+    let cache = PostingsCache::<usize, u8>::new(usize::MAX, None, &TEST_POSTINGS_COUNTERS);
     for k in 0..POSTINGS_CACHE_MISS_RING {
         assert!(!cache.admit_on_miss(k));
     }
@@ -1675,7 +1686,7 @@ fn text_second_touch_ring_is_unchanged() {
 fn per_hit_cost_at_five_thousand_entries() {
     const N: usize = 5_000;
     const HITS: usize = 2_000_000;
-    let cache = PostingsCache::<usize, Arc<u8>>::new(usize::MAX / 2, None);
+    let cache = PostingsCache::<usize, Arc<u8>>::new(usize::MAX / 2, None, &TEST_POSTINGS_COUNTERS);
     let value = Arc::new(0u8);
     for k in 0..N {
         cache.insert(k, Arc::clone(&value), 1);
@@ -1730,7 +1741,7 @@ fn evicted_and_removed_entries_are_freed_outside_the_cache_lock() {
             }
         }
     }
-    let cache = CACHE.get_or_init(|| PostingsCache::new(4, None));
+    let cache = CACHE.get_or_init(|| PostingsCache::new(4, None, &TEST_POSTINGS_COUNTERS));
     let account: Arc<CountingAccount> = Arc::default();
     let shared: SharedAccount = Arc::clone(&account) as SharedAccount;
     // Evictions: each insert past four entries evicts the oldest.
