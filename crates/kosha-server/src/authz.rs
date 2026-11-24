@@ -363,12 +363,12 @@ mod tests {
         ("POST", "/v1/api-keys/revoke"),
     ];
 
-    /// The body of `route_inner` in main.rs, after its signature.
+    /// The body of the HTTP route dispatcher, after its signature.
     fn route_inner_body() -> &'static str {
-        let source = include_str!("main.rs");
+        let source = include_str!("http_routes.rs");
         let start = source
-            .find("\nfn route_inner(")
-            .expect("route_inner in main.rs");
+            .find("\npub(super) fn route_inner(")
+            .expect("route_inner in http_routes.rs");
         let body = &source[start..];
         let body = &body[..body.find("\n}\n").expect("the end of route_inner")];
         let open = ") -> String {\n";

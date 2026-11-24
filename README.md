@@ -562,7 +562,7 @@ The public routes in brief:
 |---|---|
 | `POST`/`GET /v1/namespaces`, `DELETE /v1/namespaces/{ns}` | Create (*write*), list, delete (*write*; see below). |
 | `POST /v1/namespaces/{ns}/documents`, `/replace`, `/flush`, `/delete` | *write*. Upsert by id; replace by id merging partial documents; make buffered writes searchable; delete by query. |
-| `POST /v1/namespaces/{ns}/search`, `/exists`, `GET .../stats` | Reads. |
+| `POST /v1/namespaces/{ns}/search`, `/exists`, `GET .../stats` | Reads. In a split deployment, ingest serves existence checks so they include buffered writes. |
 | `POST`/`GET /v1/namespaces/{ns}/schema`, `POST .../shards` | Schema (see [Analyzers](#analyzers)); sharding ([Namespace sharding](#namespace-sharding)). |
 | `POST .../branch`, `GET .../branches`, `DELETE .../branch` | Copy-on-write branches (#208). |
 | `GET /v1/usage`, `GET /v1/billing` | Usage metering and billing, when enabled. |
