@@ -12109,20 +12109,12 @@ mod tests {
 
     #[test]
     fn knn_segment_pruning_respects_inherited_exact_hit_counts() {
-        const CHILD: &str = "KOSHA_TEST_INHERITED_EXACT_HIT_COUNTS";
-        if std::env::var_os(CHILD).is_none() {
+        if std::env::var("KOSHA_EXACT_TOTAL_HITS").as_deref() != Ok("1") {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    concat!(
-                        module_path!(),
-                        "::knn_segment_pruning_respects_inherited_exact_hit_counts"
-                    )
-                    .split_once("::")
-                    .unwrap()
-                    .1,
+                    "tests::knn_segment_pruning_respects_inherited_exact_hit_counts",
                 ])
-                .env(CHILD, "1")
                 .env("KOSHA_EXACT_TOTAL_HITS", "1")
                 .output()
                 .unwrap();
