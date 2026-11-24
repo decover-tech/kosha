@@ -702,6 +702,8 @@ fn pending_namespace_deletions_are_retried_with_a_growing_pause() {
         2,
         "the delete's own attempt plus one retry"
     );
+    // Tenant records are retried too (#347), after the namespaces.
+    assert_eq!(record(&tenant_record.id).attempts, 1);
     // Storage works again, but the record waits out its pause: a pass
     // straight after does not touch it.
     remote.failing.store(false, Ordering::Relaxed);
@@ -716,14 +718,14 @@ fn pending_namespace_deletions_are_retried_with_a_growing_pause() {
         .unwrap()
         .resume_backoff
         .clear();
-    assert_eq!(writer.run_deletion_resume_pass(interval), 1);
+    assert_eq!(writer.run_deletion_resume_pass(interval), 2);
     assert!(record(&id).is_completed());
     assert!(remote.objects.lock().unwrap().is_empty());
-    let untouched = record(&tenant_record.id);
-    assert_eq!((untouched.attempts, untouched.is_completed()), (0, false));
+    let tenant = record(&tenant_record.id);
+    assert_eq!((tenant.attempts, tenant.is_completed()), (2, true));
     let stats = writer.deletion_purge.to_json();
-    assert_eq!(stats["kosha_deletion_resume_attempts_total"], 2, "{stats}");
-    assert_eq!(stats["kosha_deletion_resume_completed_total"], 1, "{stats}");
+    assert_eq!(stats["kosha_deletion_resume_attempts_total"], 4, "{stats}");
+    assert_eq!(stats["kosha_deletion_resume_completed_total"], 2, "{stats}");
 }
 
 /// The sweep lists the control store once, before it takes any namespace's
@@ -945,4 +947,282 @@ fn the_automatic_retry_does_not_run_while_another_writer_holds_the_lease() {
         .acquire_writer_lease(&ns, "ingest-b", ttl)
         .unwrap()
         .is_some());
+}
+
+// ── #347 part 2 ──────────────────────────────────────────────────────────
+
+fn record_of(state: &AppState, id: &str) -> kosha_core::deletion::DeletionRecord {
+    state
+        .controller
+        .lock()
+        .unwrap()
+        .deletion(id)
+        .unwrap()
+        .unwrap()
+}
+
+fn requiring_acks(state: &AppState, pod: &str) {
+    state.configure_deletion_purge(&PurgeSettings {
+        interval: Some(Duration::from_millis(100)),
+        require_acks: true,
+        liveness: Duration::from_secs(60),
+        ..PurgeSettings::default()
+    });
+    *state.deletion_purge.pod_id.lock().unwrap() = Some(pod.into());
+}
+
+/// With `KOSHA_DELETION_REQUIRE_ACKS`, a record whose storage is verified
+/// stays pending until every live purge pod has acknowledged it, and says
+/// who is missing.
+#[test]
+fn a_record_completes_only_once_every_live_pod_acknowledged() {
+    let (writer, follower, _) = pods();
+    requiring_acks(&writer, "writer-0");
+    requiring_acks(&follower, "query-0");
+    index(&writer, "acme", "docs", &["a"]);
+    hydrate(&writer, &follower, "acme");
+    // Both pods register in their first passes.
+    pass(&writer);
+    pass(&follower);
+
+    let (status, body) = call(
+        &writer,
+        "acme",
+        "DELETE /v1/namespaces/docs",
+        serde_json::json!({}),
+    );
+    assert_eq!(status, 200, "{body}");
+    let id = body["deletion"]["id"].as_str().unwrap().to_string();
+    assert_eq!(body["deletion"]["state"], "pending");
+    assert_eq!(body["deletion"]["storage_verified"], true);
+    assert_eq!(body["deletion"]["acks_required"], true);
+
+    // A recent deletion is acknowledged only after the settle sweep: the
+    // first pass sweeps, the next one (settle is zero here) acknowledges.
+    pass(&writer);
+    let record = record_of(&writer, &id);
+    assert!(record.awaiting_acks(), "{record:?}");
+    assert_eq!(
+        writer.deletion_json(&record)["acks"]["missing"],
+        serde_json::json!(["query-0", "writer-0"])
+    );
+    pass(&writer);
+    let record = record_of(&writer, &id);
+    assert!(record.awaiting_acks(), "{record:?}");
+    let shown = writer.deletion_json(&record);
+    assert_eq!(
+        shown["acks"]["missing"],
+        serde_json::json!(["query-0"]),
+        "{shown}"
+    );
+    assert_eq!(shown["acks"]["complete"], false);
+
+    // The query pod's first pass removes its copy, its settle sweep
+    // acknowledges and completes the record.
+    assert!(follower.data_dir.join("acme/docs").exists());
+    pass(&follower);
+    assert!(!follower.data_dir.join("acme/docs").exists());
+    assert!(record_of(&writer, &id).awaiting_acks());
+    pass(&follower);
+    let record = record_of(&writer, &id);
+    assert!(record.is_completed(), "{record:?}");
+    let shown = writer.deletion_json(&record);
+    assert_eq!(shown["acks"]["complete"], true, "{shown}");
+    let acked: Vec<&str> = shown["acks"]["acknowledged"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["pod"].as_str().unwrap())
+        .collect();
+    assert_eq!(acked, ["query-0", "writer-0"]);
+}
+
+/// A pod that stopped heartbeating stops being waited for once the
+/// liveness window passes, and is reported as expired.
+#[test]
+fn a_dead_pod_holds_a_record_only_for_the_liveness_window() {
+    let (writer, _, control) = pods();
+    requiring_acks(&writer, "writer-0");
+    index(&writer, "acme", "docs", &["a"]);
+    // A pod that registered and then died.
+    ControlStore::heartbeat_pod(
+        &mut *control.lock().unwrap(),
+        &kosha_core::deletion::PodHeartbeat {
+            pod_id: "gone-0".into(),
+            role: "query".into(),
+            purge_enabled: true,
+        },
+    )
+    .unwrap();
+    pass(&writer);
+    let (_, body) = call(
+        &writer,
+        "acme",
+        "DELETE /v1/namespaces/docs",
+        serde_json::json!({}),
+    );
+    let id = body["deletion"]["id"].as_str().unwrap().to_string();
+    pass(&writer);
+    assert!(record_of(&writer, &id).awaiting_acks());
+    // With a short window the dead pod's heartbeat is already too old...
+    std::thread::sleep(Duration::from_millis(30));
+    let status = ControlStore::deletion_ack_status(&*control.lock().unwrap(), &id, 10).unwrap();
+    assert!(status.expired.contains(&"gone-0".to_string()), "{status:?}");
+    // ...but the writer's own heartbeat too; refresh it and finalize.
+    pass(&writer);
+    let done = writer.finalize_deletion_if_acked(&id, 40).unwrap();
+    assert!(done.is_completed(), "{done:?}");
+}
+
+#[test]
+fn requiring_acks_needs_the_purge_and_a_wide_enough_window() {
+    let mut settings = PurgeSettings {
+        require_acks: true,
+        ..PurgeSettings::default()
+    };
+    assert!(settings
+        .check()
+        .unwrap_err()
+        .contains("KOSHA_DELETION_PURGE_INTERVAL_MS"));
+    settings.interval = Some(Duration::from_secs(120));
+    assert!(settings
+        .check()
+        .unwrap_err()
+        .contains("KOSHA_POD_LIVENESS_MS"));
+    settings.interval = Some(Duration::from_secs(10));
+    assert!(settings.check().is_ok());
+}
+
+/// A branch deleted on its own leaves a record (scope `branch`), and other
+/// pods purge its cached copies from it.
+#[test]
+fn a_branch_deleted_on_its_own_is_recorded_and_purged_everywhere() {
+    let (writer, follower, _) = pods();
+    index(&writer, "acme", "docs", &["a"]);
+    let (status, body) = call(
+        &writer,
+        "acme",
+        "POST /v1/namespaces/docs/branch",
+        serde_json::json!({"name": "exp"}),
+    );
+    assert_eq!(status, 200, "{body}");
+    index(&writer, "acme", "exp", &["b"]);
+    hydrate(&writer, &follower, "acme");
+    assert!(!dirs(&follower, "acme/exp").is_empty());
+
+    let (status, body) = call(
+        &writer,
+        "acme",
+        "DELETE /v1/namespaces/exp/branch",
+        serde_json::json!({}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["deletion"]["scope"], "branch", "{body}");
+    assert_eq!(body["deletion"]["subject"], "acme/exp");
+    assert_eq!(body["deletion"]["state"], "completed");
+
+    let report = pass(&follower);
+    assert_eq!(report.records, 1, "{report:?}");
+    assert!(dirs(&follower, "acme/exp").is_empty());
+    // The parent, whose segments the branch listed, is whole.
+    assert_eq!(search(&follower, "acme", "docs"), (200, vec!["a".into()]));
+}
+
+/// The delete handler drops the deleting pod's parsed segments, corpus
+/// statistics and ceilings itself, not at its next purge pass.
+#[test]
+fn the_delete_handler_drops_parsed_segments_at_once() {
+    let writer = AppState::new(test_dir());
+    index(&writer, "acme", "docs", &["a", "b"]);
+    assert_eq!(search(&writer, "acme", "docs").0, 200);
+    assert!(writer.searcher.segment_cache_bytes() > 0);
+    delete_ns(&writer, "acme", "docs");
+    assert_eq!(writer.searcher.segment_cache_bytes(), 0);
+    assert_eq!(writer.searcher.forget_namespaces(|ns| ns == "acme/docs"), 0);
+}
+
+/// `KOSHA_NAMESPACE_DELETE_CONFIRM`: off, nothing changes; on, the name
+/// must be confirmed.
+#[test]
+fn namespace_delete_confirmation_is_opt_in() {
+    let writer = AppState::new(test_dir());
+    index(&writer, "acme", "docs", &["a"]);
+    index(&writer, "acme", "two", &["a"]);
+    delete_ns(&writer, "acme", "two");
+    writer.configure_deletion_purge(&PurgeSettings {
+        confirm_deletes: true,
+        ..PurgeSettings::default()
+    });
+    for line in [
+        "DELETE /v1/namespaces/docs",
+        "DELETE /v1/namespaces/docs?confirm=other",
+    ] {
+        let (status, body) = call(&writer, "acme", line, serde_json::json!({}));
+        assert_eq!(status, 400, "{line}: {body}");
+        assert!(body["error"].as_str().unwrap().contains("?confirm=docs"));
+    }
+    assert_eq!(
+        search(&writer, "acme", "docs").0,
+        200,
+        "nothing was deleted"
+    );
+    let (status, body) = call(
+        &writer,
+        "acme",
+        "DELETE /v1/namespaces/docs?confirm=docs",
+        serde_json::json!({}),
+    );
+    assert_eq!(status, 200, "{body}");
+}
+
+/// A pod vouches for a namespace record only once the writer verified its
+/// storage, as for a tenant: an acknowledgement before that would sit on a
+/// record whose objects may still be in the bucket (#347 review).
+#[test]
+fn a_namespace_is_acknowledged_only_after_its_storage_is_verified() {
+    let (mut writer, follower, _) = pods();
+    let remote = Arc::new(FlakyRemote::default());
+    writer.remote_prefix_override = Some(remote.clone());
+    requiring_acks(&writer, "writer-0");
+    requiring_acks(&follower, "query-0");
+    index(&writer, "acme", "docs", &["a"]);
+    remote
+        .objects
+        .lock()
+        .unwrap()
+        .insert("acme/docs/seg/footer.json".into());
+    pass(&writer);
+    pass(&follower);
+    remote.failing.store(true, Ordering::Relaxed);
+    let (status, body) = call(
+        &writer,
+        "acme",
+        "DELETE /v1/namespaces/docs",
+        serde_json::json!({}),
+    );
+    assert_eq!(status, 200, "{body}");
+    let id = body["deletion"]["id"].as_str().unwrap().to_string();
+    assert_eq!(body["deletion"]["storage_verified"], false);
+
+    // Swept, settled, swept again: no acknowledgement while storage fails.
+    for _ in 0..3 {
+        pass(&writer);
+        pass(&follower);
+    }
+    let record = record_of(&writer, &id);
+    let shown = writer.deletion_json(&record);
+    assert_eq!(
+        shown["acks"]["acknowledged"],
+        serde_json::json!([]),
+        "{shown}"
+    );
+
+    // The retry verifies storage; the next sweeps acknowledge and complete.
+    remote.failing.store(false, Ordering::Relaxed);
+    writer.run_deletion_resume_pass(Duration::from_secs(3600));
+    assert!(record_of(&writer, &id).awaiting_acks());
+    pass(&writer);
+    pass(&follower);
+    let record = record_of(&writer, &id);
+    assert!(record.is_completed(), "{record:?}");
 }

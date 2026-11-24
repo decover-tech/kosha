@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use instant_distance::{Builder, HnswMap, Point, Search};
@@ -1693,6 +1694,19 @@ pub const VECTOR_IDX_FILE: &str = "vector.idx";
 pub type VectorSpanFetch<'a> =
     &'a (dyn Fn(&Path, &str, &[(u64, u64)]) -> span_cache::SpanHolds + Sync);
 
+/// A kNN probe's restriction (filter, tombstones or both): `true` for a
+/// document that may be a hit. `Sync` because one probe's postings are
+/// scored on several threads (see [`KNN_PARALLEL_MIN_POSTINGS`]).
+pub type KnnAccept<'a> = &'a (dyn Fn(u32) -> bool + Sync);
+
+/// The fewest postings one task of a budgeted kNN probe scans; a probe
+/// with fewer than twice this many is scanned serially on its caller's
+/// thread. A 1536-d f32 posting of ~90 vectors scores in ~50 µs (staging,
+/// `evalruns/exp-knn-groups-segments`), so a task is at least ~0.8 ms of
+/// work: far above rayon's per-task cost, and small enough that a
+/// 1,600-posting probe splits across every core of the pool.
+const KNN_PARALLEL_MIN_POSTINGS: usize = 16;
+
 /// Postings fetched per call when a restricted kNN probe runs past its
 /// budget (see `knn_search_within_filtered`).
 const VECTOR_PREFETCH_CHUNK: usize = 8;
@@ -2378,7 +2392,7 @@ fn f32_entries_in_place(bytes: &[u8], dim: usize) -> Option<&[f32]> {
 fn for_each_f32_similarity_in_place(
     words: &[f32],
     dim: usize,
-    accept: Option<&dyn Fn(u32) -> bool>,
+    accept: Option<KnnAccept<'_>>,
     f32_similarity: impl Fn(&[f32]) -> f32,
     mut emit: impl FnMut(u32, f32, f32),
 ) {
@@ -2398,7 +2412,7 @@ fn for_each_f32_similarity(
     ids: &[u32],
     vectors: &[f32],
     dim: usize,
-    accept: Option<&dyn Fn(u32) -> bool>,
+    accept: Option<KnnAccept<'_>>,
     f32_similarity: impl Fn(&[f32]) -> f32,
     mut emit: impl FnMut(u32, f32, f32),
 ) {
@@ -2455,7 +2469,7 @@ struct ProbeQuery<'q> {
     /// score against a unit query); the raw query otherwise, unused there.
     unit: std::borrow::Cow<'q, [f32]>,
     /// The rotated query lookup table, for a RaBitQ column.
-    rabitq: Option<std::rc::Rc<kosha_vector_spfresh::RaBitQQuery>>,
+    rabitq: Option<std::sync::Arc<kosha_vector_spfresh::RaBitQQuery>>,
     /// An i8 entry's error bound per unit of its `scale` (#381): the
     /// estimate `scale * <q, code>` is off from the exact `<q, x>` by at
     /// most `scale * i8_error_per_scale`. See [`i8_error_per_scale`].
@@ -2653,8 +2667,8 @@ fn format_vector_kernels_summary(
 /// the same rotation), so each thread keeps the last one it built: a query
 /// probing many segments builds its lookup table once per scoring thread,
 /// not once per segment.
-fn rabitq_query_for(unit_query: &[f32]) -> std::rc::Rc<kosha_vector_spfresh::RaBitQQuery> {
-    type Last = Option<(Vec<f32>, std::rc::Rc<kosha_vector_spfresh::RaBitQQuery>)>;
+fn rabitq_query_for(unit_query: &[f32]) -> std::sync::Arc<kosha_vector_spfresh::RaBitQQuery> {
+    type Last = Option<(Vec<f32>, std::sync::Arc<kosha_vector_spfresh::RaBitQQuery>)>;
     thread_local! {
         static LAST: std::cell::RefCell<Last> = const { std::cell::RefCell::new(None) };
     }
@@ -2662,16 +2676,16 @@ fn rabitq_query_for(unit_query: &[f32]) -> std::rc::Rc<kosha_vector_spfresh::RaB
         let mut last = last.borrow_mut();
         if let Some((query, built)) = last.as_ref() {
             if query.as_slice() == unit_query {
-                return std::rc::Rc::clone(built);
+                return std::sync::Arc::clone(built);
             }
         }
         let rotation = kosha_vector_spfresh::RaBitQRotation::new(unit_query.len());
-        let built = std::rc::Rc::new(kosha_vector_spfresh::RaBitQQuery::with_estimator(
+        let built = std::sync::Arc::new(kosha_vector_spfresh::RaBitQQuery::with_estimator(
             &rotation,
             unit_query,
             rabitq_estimator(),
         ));
-        *last = Some((unit_query.to_vec(), std::rc::Rc::clone(&built)));
+        *last = Some((unit_query.to_vec(), std::sync::Arc::clone(&built)));
         built
     })
 }
@@ -2706,7 +2720,7 @@ impl VectorPosting {
     /// report a bound of `0`.
     fn for_each_similarity(
         &self,
-        accept: Option<&dyn Fn(u32) -> bool>,
+        accept: Option<KnnAccept<'_>>,
         f32_similarity: impl Fn(&[f32]) -> f32,
         probe: &ProbeQuery<'_>,
         centroid: &[f32],
@@ -5134,6 +5148,70 @@ pub trait PostingsMemoryAccount: Send + Sync {
 
 type SharedAccount = Arc<dyn PostingsMemoryAccount + Send + Sync>;
 
+/// Process-wide figures of one kind of decoded-postings cache, summed over
+/// every cache of that kind (the text caches are per segment), for
+/// `kosha_cache_*` on `GET /metrics`.
+struct PostingsCacheCounters {
+    hits: AtomicU64,
+    misses: AtomicU64,
+    evictions: AtomicU64,
+    bytes: AtomicU64,
+}
+
+impl PostingsCacheCounters {
+    const fn new() -> Self {
+        Self {
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+        }
+    }
+
+    fn snapshot(&self) -> PostingsCacheStats {
+        let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        PostingsCacheStats {
+            hits: load(&self.hits),
+            misses: load(&self.misses),
+            evictions: load(&self.evictions),
+            bytes: load(&self.bytes),
+        }
+    }
+
+    fn release_bytes(&self, bytes: usize) {
+        if bytes > 0 {
+            self.bytes.fetch_sub(bytes as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+static TEXT_POSTINGS_COUNTERS: PostingsCacheCounters = PostingsCacheCounters::new();
+static VECTOR_POSTINGS_COUNTERS: PostingsCacheCounters = PostingsCacheCounters::new();
+/// Kept apart from the text and vector figures; not exported yet.
+static LATE_INTERACTION_POSTINGS_COUNTERS: PostingsCacheCounters = PostingsCacheCounters::new();
+
+/// Lookups, budget evictions and resident bytes of one kind of decoded
+/// postings cache since the process started. A hit is a lookup that found
+/// its entry; a miss is one that went on to read and decode the posting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PostingsCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    /// Entries evicted to stay within the cache's byte budget.
+    pub evictions: u64,
+    pub bytes: u64,
+}
+
+/// [`PostingsCacheStats`] of the per-segment text postings caches, summed.
+pub fn text_postings_cache_stats() -> PostingsCacheStats {
+    TEXT_POSTINGS_COUNTERS.snapshot()
+}
+
+/// [`PostingsCacheStats`] of the process-wide vector postings cache.
+pub fn vector_postings_cache_stats() -> PostingsCacheStats {
+    VECTOR_POSTINGS_COUNTERS.snapshot()
+}
+
 /// Small LRU of decoded postings.
 ///
 /// The lazy v2 format trades resident memory for a per-query decode — the
@@ -5167,6 +5245,8 @@ struct PostingsCache<K, V> {
     /// Account for [`Self::insert`]; the shared vector cache has none and
     /// takes each segment's account per entry ([`Self::insert_for`]).
     account: Option<SharedAccount>,
+    /// Where this cache's hits, misses, evictions and bytes are summed.
+    counters: &'static PostingsCacheCounters,
 }
 
 struct CacheEntry<V> {
@@ -5247,7 +5327,11 @@ const POSTINGS_CACHE_MISS_RING: usize = 256;
 const VECTOR_MISS_WINDOW_MAX: usize = 1 << 18;
 
 impl<K: Copy + Eq + std::hash::Hash, V: Clone> PostingsCache<K, V> {
-    fn new(max_bytes: usize, account: Option<SharedAccount>) -> Self {
+    fn new(
+        max_bytes: usize,
+        account: Option<SharedAccount>,
+        counters: &'static PostingsCacheCounters,
+    ) -> Self {
         Self {
             max_bytes,
             state: Box::new(Mutex::new(PostingsCacheState {
@@ -5258,6 +5342,7 @@ impl<K: Copy + Eq + std::hash::Hash, V: Clone> PostingsCache<K, V> {
                 miss_order: StampedFifo::new(),
             })),
             account,
+            counters,
         }
     }
 
@@ -5269,6 +5354,7 @@ impl<K: Copy + Eq + std::hash::Hash, V: Clone> PostingsCache<K, V> {
         let mut guard = self.state.lock().unwrap();
         let st = &mut *guard;
         let entry = st.entries.get_mut(&key)?;
+        self.counters.hits.fetch_add(1, Ordering::Relaxed);
         entry.stamp = st.recency.stamp(key);
         let hit = entry.value.clone();
         let entries = &st.entries;
@@ -5306,6 +5392,7 @@ impl<K: Copy + Eq + std::hash::Hash, V: Clone> PostingsCache<K, V> {
     /// admitted on their second lookup; one-shot ones age out of the
     /// history without disturbing anything.
     fn admit_on_miss_within(&self, key: K, window: usize) -> bool {
+        self.counters.misses.fetch_add(1, Ordering::Relaxed);
         let mut guard = self.state.lock().unwrap();
         let st = &mut *guard;
         if st.misses.remove(&key).is_some() {
@@ -5383,6 +5470,7 @@ impl<K: Copy + Eq + std::hash::Hash, V: Clone> PostingsCache<K, V> {
         // insert can evict many postings, and every kNN worker of every
         // segment waits on this lock.
         let mut gone: Vec<CacheEntry<V>> = Vec::new();
+        let mut evictions = 0u64;
         {
             let mut guard = self.state.lock().unwrap();
             let st = &mut *guard;
@@ -5408,11 +5496,22 @@ impl<K: Copy + Eq + std::hash::Hash, V: Clone> PostingsCache<K, V> {
                 if let Some(evicted) = st.entries.remove(&oldest) {
                     st.total_bytes -= evicted.bytes;
                     gone.push(evicted);
+                    evictions += 1;
                 }
             }
             let entries = &st.entries;
             st.recency
                 .compact(entries.len(), |k| entries.get(k).map(|e| e.stamp));
+        }
+        self.counters
+            .bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        self.counters
+            .release_bytes(gone.iter().map(|entry| entry.bytes).sum());
+        if evictions > 0 {
+            self.counters
+                .evictions
+                .fetch_add(evictions, Ordering::Relaxed);
         }
         release_and_free(gone);
         if let Some(account) = account {
@@ -5442,6 +5541,8 @@ impl<K: Copy + Eq + std::hash::Hash, V: Clone> PostingsCache<K, V> {
                 .compact(entries.len(), |k| entries.get(k).map(|e| e.stamp));
             removed
         };
+        self.counters
+            .release_bytes(removed.iter().map(|entry| entry.bytes).sum());
         release_and_free(removed);
     }
 
@@ -5488,6 +5589,8 @@ impl<K, V> Drop for PostingsCache<K, V> {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             st.entries.drain().map(|(_, entry)| entry).collect()
         };
+        self.counters
+            .release_bytes(gone.iter().map(|entry| entry.bytes).sum());
         release_and_free(gone);
     }
 }
@@ -5579,7 +5682,7 @@ impl LazyInvertedIndex {
         let index = Self {
             data,
             term_count,
-            cache: PostingsCache::new(postings_cache_max_bytes(), account),
+            cache: PostingsCache::new(postings_cache_max_bytes(), account, &TEXT_POSTINGS_COUNTERS),
         };
         for i in 0..term_count {
             let (term_off, term_len, p_off, p_len) = index.raw_entry(i);
@@ -6122,8 +6225,16 @@ impl SplitInvertedIndex {
             segment_dir,
             term_count,
             encoding,
-            cache: PostingsCache::new(postings_cache_max_bytes(), account.clone()),
-            scoring_cache: PostingsCache::new(postings_cache_max_bytes(), account),
+            cache: PostingsCache::new(
+                postings_cache_max_bytes(),
+                account.clone(),
+                &TEXT_POSTINGS_COUNTERS,
+            ),
+            scoring_cache: PostingsCache::new(
+                postings_cache_max_bytes(),
+                account,
+                &TEXT_POSTINGS_COUNTERS,
+            ),
             blob_read_failure: std::sync::atomic::AtomicBool::new(false),
             posting_spans: false,
         };
@@ -7789,8 +7900,8 @@ pub fn with_knn_scan_stats<R>(f: impl FnOnce() -> R) -> (R, KnnScanStats) {
 /// when the probe returns, so none of it outlives the segment visit.
 struct PostingScan<'a> {
     vi: &'a LazyVectorIndex,
-    probe: ProbeQuery<'a>,
-    accept: Option<&'a dyn Fn(u32) -> bool>,
+    probe: &'a ProbeQuery<'a>,
+    accept: Option<KnnAccept<'a>>,
     reader: span_cache::LocalRangeReader,
     /// Decode scratch for an f32 posting that is not kept and cannot be
     /// scored in place (a big-endian target).
@@ -7805,10 +7916,23 @@ impl<'a> PostingScan<'a> {
     fn new(
         segment_dir: &Path,
         vi: &'a LazyVectorIndex,
-        probe: ProbeQuery<'a>,
-        accept: Option<&'a dyn Fn(u32) -> bool>,
+        probe: &'a ProbeQuery<'a>,
+        accept: Option<KnnAccept<'a>>,
     ) -> Self {
         let timed = KNN_SCAN_STATS.with(|stats| stats.get().is_some());
+        Self::with_timing(segment_dir, vi, probe, accept, timed)
+    }
+
+    /// A scan of the same column for another thread (see
+    /// [`SegmentReader::scan_budgeted_postings`]): its own reader and
+    /// scratch, timed as the probe it belongs to is.
+    fn with_timing(
+        segment_dir: &Path,
+        vi: &'a LazyVectorIndex,
+        probe: &'a ProbeQuery<'a>,
+        accept: Option<KnnAccept<'a>>,
+        timed: bool,
+    ) -> Self {
         Self {
             vi,
             probe,
@@ -7919,6 +8043,11 @@ impl CandidateSink {
         }
     }
 
+    /// A sink of the same kind and `k`, with nothing in it.
+    fn empty_like(&self) -> Self {
+        Self::with_running_top_k(self.k, self.top.is_some())
+    }
+
     fn push(&mut self, id: u32, similarity: f32, error: f32) {
         let score = similarity as f64;
         let seq = self.count as u64;
@@ -7928,12 +8057,49 @@ impl CandidateSink {
             self.errors.push(error);
             return;
         };
-        if top.len() < self.k {
-            top.push(TopKEntry { score, seq, id });
+        Self::offer(top, self.k, TopKEntry { score, seq, id });
+    }
+
+    /// Keeps `entry` if it belongs in the running top `k`. Entries must
+    /// arrive in increasing `seq`: a tie with the current `k`-th is then
+    /// always the later-seen one, which does not displace it.
+    fn offer(top: &mut std::collections::BinaryHeap<TopKEntry>, k: usize, entry: TopKEntry) {
+        if top.len() < k {
+            top.push(entry);
         } else if let Some(mut worst) = top.peek_mut() {
-            if score > worst.score {
-                *worst = TopKEntry { score, seq, id };
+            if entry.score > worst.score {
+                *worst = entry;
             }
+        }
+    }
+
+    /// Appends `part`, a sink (from [`Self::empty_like`]) of the candidates
+    /// scored right after everything in `self`, as if they had been pushed
+    /// here one by one.
+    ///
+    /// A quantized column's candidates are concatenated. For a running
+    /// top `k`, `part` kept the best `k` of its own candidates by (score
+    /// descending, position ascending); offering those, at their position
+    /// offset by `self`'s count and in position order, keeps exactly what
+    /// pushing every candidate would have: anything `part` dropped was
+    /// beaten by `k` of its own, which also beat it here.
+    fn absorb(&mut self, part: CandidateSink) {
+        let base = self.count as u64;
+        self.count += part.count;
+        match (self.top.as_mut(), part.top) {
+            (Some(top), Some(part_top)) => {
+                let mut kept = part_top.into_vec();
+                kept.sort_unstable_by_key(|entry| entry.seq);
+                for entry in kept {
+                    let seq = base + entry.seq;
+                    Self::offer(top, self.k, TopKEntry { seq, ..entry });
+                }
+            }
+            (None, None) => {
+                self.scored.extend(part.scored);
+                self.errors.extend(part.errors);
+            }
+            _ => unreachable!("absorb takes a sink from empty_like"),
         }
     }
 
@@ -8119,9 +8285,13 @@ type VectorPostingsCache = PostingsCache<(u64, usize), SharedVectorPosting>;
 /// The process-wide vector postings cache every [`SegmentReader`] uses.
 fn shared_vector_cache() -> Arc<VectorPostingsCache> {
     static CACHE: OnceLock<Arc<VectorPostingsCache>> = OnceLock::new();
-    Arc::clone(
-        CACHE.get_or_init(|| Arc::new(PostingsCache::new(vector_postings_cache_max_bytes(), None))),
-    )
+    Arc::clone(CACHE.get_or_init(|| {
+        Arc::new(PostingsCache::new(
+            vector_postings_cache_max_bytes(),
+            None,
+            &VECTOR_POSTINGS_COUNTERS,
+        ))
+    }))
 }
 
 /// A new [`SegmentReader::vector_cache_owner`].
@@ -8232,6 +8402,7 @@ impl SegmentReader {
             multi_vector_cache: PostingsCache::new(
                 late_interaction_postings_cache_max_bytes(),
                 postings_account,
+                &LATE_INTERACTION_POSTINGS_COUNTERS,
             ),
         })
     }
@@ -8342,7 +8513,8 @@ impl SegmentReader {
     /// first search: whatever the cache already holds is dropped.
     pub fn with_late_interaction_postings_cache_max_bytes(mut self, max_bytes: usize) -> Self {
         let account = self.multi_vector_cache.account.clone();
-        self.multi_vector_cache = PostingsCache::new(max_bytes, account);
+        self.multi_vector_cache =
+            PostingsCache::new(max_bytes, account, &LATE_INTERACTION_POSTINGS_COUNTERS);
         self
     }
 
@@ -8385,7 +8557,7 @@ impl SegmentReader {
         query: &[&[f32]],
         k: usize,
         params: LateInteractionParams,
-        accept: Option<&dyn Fn(u32) -> bool>,
+        accept: Option<KnnAccept<'_>>,
     ) -> Result<LateInteractionHits, KoshaError> {
         let Some(i) = self
             .footer
@@ -8951,6 +9123,21 @@ impl SegmentReader {
         f32_similarity: impl Fn(&[f32]) -> f32,
         emit: impl FnMut(u32, f32, f32),
     ) -> Result<(), KoshaError> {
+        self.scan_posting_with(scan, held, range_idx, None, f32_similarity, emit)
+    }
+
+    /// [`Self::scan_posting`], with the second-touch decision for a miss
+    /// already taken by the caller when `admission` is `Some` (see
+    /// [`Self::second_touch_admissions`]); `None` takes it here.
+    fn scan_posting_with(
+        &self,
+        scan: &mut PostingScan<'_>,
+        held: &PrefetchHolds<'_>,
+        range_idx: usize,
+        admission: Option<bool>,
+        f32_similarity: impl Fn(&[f32]) -> f32,
+        emit: impl FnMut(u32, f32, f32),
+    ) -> Result<(), KoshaError> {
         let vi = scan.vi;
         let centroid = vi.centroid(range_idx);
         let key = self.vector_cache_key(vi.slot, range_idx);
@@ -8961,7 +9148,7 @@ impl SegmentReader {
             None => self.vector_cache.get(key),
         };
         if let Some(hit) = hit {
-            hit.for_each_similarity(scan.accept, f32_similarity, &scan.probe, centroid, emit);
+            hit.for_each_similarity(scan.accept, f32_similarity, scan.probe, centroid, emit);
             scan.stats.postings_cached += 1;
             scan.stats.score_nanos += lap_nanos(&mut clock);
             return Ok(());
@@ -9001,8 +9188,10 @@ impl SegmentReader {
         // probes (a cold namespace scanned once) pass through without
         // evicting a hot working set; probes that recur across queries get
         // cached on their second hydration, however many one query makes.
-        let window = self.vector_cache.vector_miss_window(bytes.len());
-        let admit = self.vector_cache.admit_on_miss_within(key, window);
+        let admit = match admission {
+            Some(admit) => admit,
+            None => self.admit_vector_miss(key, bytes.len()),
+        };
         if !vi.quantized {
             let count = bytes.len() / vector_entry_size(vi.dim as u32, vi.version);
             let keep = admit
@@ -9048,9 +9237,132 @@ impl SegmentReader {
             );
         }
         scan.stats.decode_nanos += lap_nanos(&mut clock);
-        decoded.for_each_similarity(scan.accept, f32_similarity, &scan.probe, centroid, emit);
+        decoded.for_each_similarity(scan.accept, f32_similarity, scan.probe, centroid, emit);
         scan.stats.postings_decoded += 1;
         scan.stats.score_nanos += lap_nanos(&mut clock);
+        Ok(())
+    }
+
+    /// Second-touch admission of a missed vector posting of `length`
+    /// bytes (see [`PostingsCache::vector_miss_window`]).
+    fn admit_vector_miss(&self, key: (u64, usize), length: usize) -> bool {
+        let window = self.vector_cache.vector_miss_window(length);
+        self.vector_cache.admit_on_miss_within(key, window)
+    }
+
+    /// The second-touch decision for each of `postings`, taken in their
+    /// order, as a serial scan takes it: `None` for a posting cached now
+    /// or pinned by the prefetch in `held` (decided at scan time, should a
+    /// cached one be evicted before then).
+    ///
+    /// The miss history is ordered by when misses are recorded. Recorded
+    /// from several threads, that order would change from one run of a
+    /// probe to the next, so a posting at the end of one run's list could
+    /// be missed again within the window by the next run, and a probe
+    /// larger than the cache's reach would admit postings it can only
+    /// churn (`a_probe_larger_than_the_cache_reach_passes_through`).
+    fn second_touch_admissions(
+        &self,
+        vi: &LazyVectorIndex,
+        held: &PrefetchHolds<'_>,
+        postings: &[u32],
+    ) -> Vec<Option<bool>> {
+        postings
+            .iter()
+            .map(|&range_idx| {
+                let range_idx = range_idx as usize;
+                let key = self.vector_cache_key(vi.slot, range_idx);
+                (held.pinned(range_idx).is_none() && !self.vector_cache.contains(key))
+                    .then(|| self.admit_vector_miss(key, vi.ranges[range_idx].1 as usize))
+            })
+            .collect()
+    }
+
+    /// Scores `postings` (a budgeted probe's, nearest first) into `sink`,
+    /// exactly as calling [`Self::scan_posting`] on each in order would.
+    ///
+    /// A large probe of one segment is split into contiguous runs of at
+    /// least [`KNN_PARALLEL_MIN_POSTINGS`] postings scored on the current
+    /// rayon pool, so a query whose matter is one big segment uses more
+    /// than one core. It joins the pool the caller runs on (the query
+    /// layer's per-segment `par_iter`), never a pool of its own: an idle
+    /// worker steals a run, a busy pool scans the runs back to back on the
+    /// caller's thread, and no thread is added.
+    ///
+    /// The result does not depend on the split. Each run collects into a
+    /// sink of its own, and runs are merged in posting order with their
+    /// candidates' positions offset by the candidates scored before them
+    /// (see [`CandidateSink::absorb`]). An error is the one the serial
+    /// scan would have returned: the first failing posting in order. The
+    /// cache's second-touch decisions are taken in posting order before
+    /// the split (see [`Self::second_touch_admissions`]); only the order
+    /// in which admitted postings are inserted, and so their relative
+    /// recency, can differ from a serial scan.
+    fn scan_budgeted_postings(
+        &self,
+        scan: &mut PostingScan<'_>,
+        held: &PrefetchHolds<'_>,
+        sink: &mut CandidateSink,
+        postings: &[u32],
+        similarity: &(dyn Fn(&[f32]) -> f32 + Sync),
+    ) -> Result<(), KoshaError> {
+        if postings.len() < 2 * KNN_PARALLEL_MIN_POSTINGS || rayon::current_num_threads() < 2 {
+            for &range_idx in postings {
+                self.scan_posting(
+                    scan,
+                    held,
+                    range_idx as usize,
+                    similarity,
+                    |id, sim, err| sink.push(id, sim, err),
+                )?;
+            }
+            return Ok(());
+        }
+        use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+        let (vi, probe, accept, timed) = (scan.vi, scan.probe, scan.accept, scan.timed);
+        let empty = sink.empty_like();
+        let admissions = self.second_touch_admissions(vi, held, postings);
+        // While this thread waits for the runs it may run other rayon jobs
+        // (a run of this probe, another segment, another query). Those
+        // must not count into this thread's stats scope: the runs report
+        // their stats here explicitly, and anything else opens its own.
+        let scope = KNN_SCAN_STATS.take();
+        let runs: Vec<(CandidateSink, KnnScanStats, Option<KoshaError>)> = postings
+            .par_iter()
+            .zip(admissions.par_iter())
+            .with_min_len(KNN_PARALLEL_MIN_POSTINGS)
+            .fold(
+                || {
+                    let scan =
+                        PostingScan::with_timing(&self.segment_dir, vi, probe, accept, timed);
+                    (scan, empty.empty_like(), None::<KoshaError>)
+                },
+                |(mut scan, mut sink, mut failed), (&range_idx, &admission)| {
+                    if failed.is_none() {
+                        failed = self
+                            .scan_posting_with(
+                                &mut scan,
+                                held,
+                                range_idx as usize,
+                                admission,
+                                similarity,
+                                |id, s, e| sink.push(id, s, e),
+                            )
+                            .err();
+                    }
+                    (scan, sink, failed)
+                },
+            )
+            .map(|(mut scan, sink, failed)| (sink, std::mem::take(&mut scan.stats), failed))
+            .collect();
+        KNN_SCAN_STATS.set(scope);
+        for (part, stats, failed) in runs {
+            scan.stats.add(&stats);
+            if let Some(e) = failed {
+                return Err(e);
+            }
+            sink.absorb(part);
+        }
         Ok(())
     }
 
@@ -9081,7 +9393,7 @@ impl SegmentReader {
         query: &[f32],
         k: usize,
         nprobe: usize,
-        accept: Option<&dyn Fn(u32) -> bool>,
+        accept: Option<KnnAccept<'_>>,
     ) -> Option<Result<Vec<(u32, f64)>, KoshaError>> {
         self.knn_search_filtered_fetching(field, query, k, nprobe, accept, None)
     }
@@ -9094,7 +9406,7 @@ impl SegmentReader {
         query: &[f32],
         k: usize,
         nprobe: usize,
-        accept: Option<&dyn Fn(u32) -> bool>,
+        accept: Option<KnnAccept<'_>>,
         fetch: Option<VectorSpanFetch<'_>>,
     ) -> Option<Result<Vec<(u32, f64)>, KoshaError>> {
         let index = match self.vector_field(field) {
@@ -9543,7 +9855,7 @@ impl SegmentReader {
         k: usize,
         max_distance: f32,
         max_probes: usize,
-        accept: Option<&dyn Fn(u32) -> bool>,
+        accept: Option<KnnAccept<'_>>,
     ) -> BudgetedKnnResult {
         self.knn_search_within_filtered_fetching(
             field,
@@ -9570,7 +9882,7 @@ impl SegmentReader {
         k: usize,
         max_distance: f32,
         max_probes: usize,
-        accept: Option<&dyn Fn(u32) -> bool>,
+        accept: Option<KnnAccept<'_>>,
         refill: KnnRefill,
         fetch: Option<VectorSpanFetch<'_>>,
     ) -> BudgetedKnnResult {
@@ -9610,7 +9922,7 @@ impl SegmentReader {
         query: &[f32],
         k: usize,
         ranking: &KnnSegmentRanking,
-        accept: Option<&dyn Fn(u32) -> bool>,
+        accept: Option<KnnAccept<'_>>,
         refill: KnnRefill,
         fetch: Option<VectorSpanFetch<'_>>,
     ) -> BudgetedKnnResult {
@@ -9666,7 +9978,7 @@ impl SegmentReader {
         query: &[f32],
         k: usize,
         budget: KnnProbeBudget<'_>,
-        accept: Option<&dyn Fn(u32) -> bool>,
+        accept: Option<KnnAccept<'_>>,
         fetch: Option<VectorSpanFetch<'_>>,
     ) -> Option<Result<KnnCandidates, KoshaError>> {
         let index = match self.vector_field(field) {
@@ -9755,6 +10067,42 @@ impl SegmentReader {
             postings,
             exact: false,
         }))
+    }
+
+    /// Rescore a bounded quantized shortlist before returning a ranked list.
+    /// A missing exact score fails the probe rather than mixing estimates
+    /// into an order that can change when the sidecar becomes warm.
+    pub fn knn_rescore_shortlist_fetching(
+        &self,
+        field: &str,
+        query: &[f32],
+        k: usize,
+        budget: KnnProbeBudget<'_>,
+        accept: Option<KnnAccept<'_>>,
+        fetch: Option<VectorSpanFetch<'_>>,
+    ) -> BudgetedKnnResult {
+        self.knn_candidates_fetching(field, query, k, budget, accept, fetch)
+            .map(|found| {
+                let mut found = found?;
+                found
+                    .candidates
+                    .truncate(k.saturating_mul(self.vector_rescore_factor.max(1)));
+                let mut seqs: Vec<_> = found.candidates.iter().map(|c| c.doc_seq).collect();
+                if seqs.is_empty() {
+                    return Ok((Vec::new(), found.postings));
+                }
+                seqs.sort_unstable();
+                let exact = self
+                    .knn_exact_from_sidecar(field, query, k, &seqs, fetch)
+                    .filter(|result| result.vectors_scored == seqs.len())
+                    .ok_or_else(|| {
+                        KoshaError::NotFound(format!(
+                            "{}: exact kNN shortlist unavailable",
+                            self.segment_dir.display()
+                        ))
+                    })?;
+                Ok((exact.hits, found.postings))
+            })
     }
 
     /// Exact cosine similarity of `query` with `field`'s full-precision
@@ -9956,12 +10304,8 @@ impl SegmentReader {
         let is_candidate = |id: u32| candidates.binary_search(&id).is_ok();
         let lanes = DotLanes::from_env();
         let unit = Self::unit_query(vi, query);
-        let mut scan = PostingScan::new(
-            &self.segment_dir,
-            vi,
-            Self::probe_query(vi, query),
-            Some(&is_candidate),
-        );
+        let probe = Self::probe_query(vi, query);
+        let mut scan = PostingScan::new(&self.segment_dir, vi, &probe, Some(&is_candidate));
         for range_idx in 0..vi.ranges.len() {
             let scanned = self.scan_posting(
                 &mut scan,
@@ -10064,7 +10408,7 @@ impl SegmentReader {
         } else {
             let ranges = dv.field_vector_ranges(field, candidates);
             let mut spans = span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE);
-            if let Some(fetch) = fetch {
+            let _held = if let Some(fetch) = fetch {
                 let missing: Vec<(u64, u64)> = ranges
                     .iter()
                     .copied()
@@ -10075,8 +10419,13 @@ impl SegmentReader {
                     // index sees what the fetch left only in memory.
                     let _held = fetch(&self.segment_dir, DOC_VECTORS_FILE, &missing);
                     spans = span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE);
+                    Some(_held)
+                } else {
+                    None
                 }
-            }
+            } else {
+                None
+            };
             dv.visit_field_vectors_cached(&spans, field, candidates, score)
         };
         match visited {
@@ -10108,7 +10457,7 @@ impl SegmentReader {
         k: usize,
         max_distance: f32,
         max_probes: usize,
-        accept: Option<&dyn Fn(u32) -> bool>,
+        accept: Option<KnnAccept<'_>>,
         refill: KnnRefill,
         fetch: Option<VectorSpanFetch<'_>>,
     ) -> Result<(Vec<(u32, f64)>, usize), KoshaError> {
@@ -10145,7 +10494,7 @@ impl SegmentReader {
         k: usize,
         max_distance: f32,
         max_probes: usize,
-        accept: Option<&dyn Fn(u32) -> bool>,
+        accept: Option<KnnAccept<'_>>,
         refill: KnnRefill,
         fetch: Option<VectorSpanFetch<'_>>,
         planned: Option<&KnnSegmentRanking>,
@@ -10180,23 +10529,15 @@ impl SegmentReader {
         let mut held =
             self.prefetch_vector_postings(vi, ranking.budgeted.iter().map(|&i| i as usize), fetch);
 
-        let mut probes = 0usize;
         let mut sink = CandidateSink::new(vi, k);
         let lanes = DotLanes::from_env();
         let unit = Self::unit_query(vi, query);
-        let mut scan =
-            PostingScan::new(&self.segment_dir, vi, Self::probe_query(vi, query), accept);
+        let similarity = |v: &[f32]| Self::f32_similarity(lanes, unit.as_deref(), query, v);
+        let probe = Self::probe_query(vi, query);
+        let mut scan = PostingScan::new(&self.segment_dir, vi, &probe, accept);
         scan.stats.rank_nanos += rank_nanos;
-        for &range_idx in &ranking.budgeted {
-            probes += 1;
-            self.scan_posting(
-                &mut scan,
-                &held,
-                range_idx as usize,
-                |v| Self::f32_similarity(lanes, unit.as_deref(), query, v),
-                |id, sim, err| sink.push(id, sim, err),
-            )?;
-        }
+        self.scan_budgeted_postings(&mut scan, &held, &mut sink, &ranking.budgeted, &similarity)?;
+        let mut probes = budgeted;
         // Past the budget. Without a restriction this is where the probe
         // ends. With one, keep going only while the page is still short
         // (see the doc comment on the public wrapper), and, when the
@@ -10241,7 +10582,7 @@ impl SegmentReader {
                     &mut scan,
                     &held,
                     ranked[position].0 as usize,
-                    |v| Self::f32_similarity(lanes, unit.as_deref(), query, v),
+                    similarity,
                     |id, sim, err| sink.push(id, sim, err),
                 )?;
             }
@@ -10268,7 +10609,7 @@ impl SegmentReader {
         query: &[f32],
         k: usize,
         nprobe: usize,
-        accept: Option<&dyn Fn(u32) -> bool>,
+        accept: Option<KnnAccept<'_>>,
         fetch: Option<VectorSpanFetch<'_>>,
     ) -> Result<Vec<(u32, f64)>, KoshaError> {
         // Unit-norm segments: normalize the query once, then every stored
@@ -10296,7 +10637,7 @@ impl SegmentReader {
         query: &[f32],
         k: usize,
         nprobe: usize,
-        accept: Option<&dyn Fn(u32) -> bool>,
+        accept: Option<KnnAccept<'_>>,
         fetch: Option<VectorSpanFetch<'_>>,
     ) -> Result<ProbedCandidates, KoshaError> {
         // With a restriction, rank every posting so the probe can continue
@@ -10328,8 +10669,8 @@ impl SegmentReader {
         let mut sink = CandidateSink::new(vi, k);
         // `query` is already unit-normalized for every unit-norm column,
         // which includes every quantized one.
-        let mut scan =
-            PostingScan::new(&self.segment_dir, vi, Self::probe_query(vi, query), accept);
+        let probe = Self::probe_query(vi, query);
+        let mut scan = PostingScan::new(&self.segment_dir, vi, &probe, accept);
         let mut postings = 0usize;
         let lanes = DotLanes::from_env();
         for (position, &range_idx) in candidates.iter().enumerate() {
@@ -12687,7 +13028,8 @@ mod tests {
 
         // Budget-eviction behavior on the cache itself: two entries whose
         // combined size exceeds the budget can't both stay resident.
-        let cache = PostingsCache::new(100, None);
+        static COUNTERS: PostingsCacheCounters = PostingsCacheCounters::new();
+        let cache = PostingsCache::new(100, None, &COUNTERS);
         let big = Arc::new(vec![Posting {
             doc_id: 1,
             term_frequency: 1,
@@ -12704,6 +13046,18 @@ mod tests {
         // evict everything and still churn).
         cache.insert(2, big, 1000);
         assert!(cache.get(2).is_none());
+        assert!(!cache.admit_on_miss(3));
+        assert_eq!(
+            COUNTERS.snapshot(),
+            PostingsCacheStats {
+                hits: 1,
+                misses: 1,
+                evictions: 1,
+                bytes: 60,
+            }
+        );
+        drop(cache);
+        assert_eq!(COUNTERS.snapshot().bytes, 0);
 
         let _ = fs::remove_dir_all(&dir);
     }

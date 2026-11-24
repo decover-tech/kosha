@@ -35,6 +35,8 @@ const (
 
 // Defines values for V1DeletionRecordScope.
 const (
+	V1DeletionRecordScopeBranch    V1DeletionRecordScope = "branch"
+	V1DeletionRecordScopeMigrated  V1DeletionRecordScope = "migrated"
 	V1DeletionRecordScopeNamespace V1DeletionRecordScope = "namespace"
 	V1DeletionRecordScopeTenant    V1DeletionRecordScope = "tenant"
 )
@@ -126,20 +128,8 @@ type KoshaServiceExistsBody struct {
 	Ids []string `json:"ids"`
 }
 
-// KoshaServiceExportNamespaceBody defines model for KoshaServiceExportNamespaceBody.
-type KoshaServiceExportNamespaceBody struct {
-	// Format The only supported format is "jsonl"; omission defaults to it.
-	Format *string `json:"format,omitempty"`
-}
-
 // KoshaServiceFlushBody defines model for KoshaServiceFlushBody.
 type KoshaServiceFlushBody = map[string]interface{}
-
-// KoshaServiceHardDeleteNamespaceBody defines model for KoshaServiceHardDeleteNamespaceBody.
-type KoshaServiceHardDeleteNamespaceBody struct {
-	// Confirm Must equal the namespace name in the URL.
-	Confirm string `json:"confirm"`
-}
 
 // KoshaServiceIndexDocumentsBody defines model for KoshaServiceIndexDocumentsBody.
 type KoshaServiceIndexDocumentsBody struct {
@@ -310,6 +300,24 @@ type V1CollapseSpec struct {
 	Field string `json:"field"`
 }
 
+// V1CreateBillingPortalSessionResponse defines model for v1CreateBillingPortalSessionResponse.
+type V1CreateBillingPortalSessionResponse struct {
+	// Body The JSON response body.
+	Body *map[string]interface{} `json:"body,omitempty"`
+}
+
+// V1CreateCheckoutSessionResponse defines model for v1CreateCheckoutSessionResponse.
+type V1CreateCheckoutSessionResponse struct {
+	// Body The JSON response body.
+	Body *map[string]interface{} `json:"body,omitempty"`
+}
+
+// V1CreateExportResponse defines model for v1CreateExportResponse.
+type V1CreateExportResponse struct {
+	// Body The JSON response body.
+	Body *map[string]interface{} `json:"body,omitempty"`
+}
+
 // V1CreateNamespaceRequest defines model for v1CreateNamespaceRequest.
 type V1CreateNamespaceRequest struct {
 	Namespace string             `json:"namespace"`
@@ -329,18 +337,34 @@ type V1CreateNamespaceResponse struct {
 	Version      *int64             `json:"version,omitempty"`
 }
 
+// V1CreateTenantApiKeyResponse defines model for v1CreateTenantApiKeyResponse.
+type V1CreateTenantApiKeyResponse struct {
+	// Body The JSON response body.
+	Body *map[string]interface{} `json:"body,omitempty"`
+}
+
 // V1DeleteBranchResponse defines model for v1DeleteBranchResponse.
 type V1DeleteBranchResponse struct {
-	Deleted   *string          `json:"deleted,omitempty"`
-	Parent    *string          `json:"parent,omitempty"`
-	Reclaimed *V1BranchReclaim `json:"reclaimed,omitempty"`
-	Version   *int64           `json:"version,omitempty"`
+	Deleted *string `json:"deleted,omitempty"`
+
+	// Deletion One hard delete of a namespace or a tenant, as the control store keeps it
+	// (kosha.deletion_records). Holds identifiers and counters only.
+	Deletion  *V1DeletionRecord `json:"deletion,omitempty"`
+	Parent    *string           `json:"parent,omitempty"`
+	Reclaimed *V1BranchReclaim  `json:"reclaimed,omitempty"`
+	Version   *int64            `json:"version,omitempty"`
 }
 
 // V1DeleteByQueryResponse defines model for v1DeleteByQueryResponse.
 type V1DeleteByQueryResponse struct {
 	Deleted   *int64  `json:"deleted,omitempty"`
 	Namespace *string `json:"namespace,omitempty"`
+}
+
+// V1DeleteExportResponse defines model for v1DeleteExportResponse.
+type V1DeleteExportResponse struct {
+	// Body The JSON response body.
+	Body *map[string]interface{} `json:"body,omitempty"`
 }
 
 // V1DeleteNamespaceResponse defines model for v1DeleteNamespaceResponse.
@@ -361,10 +385,17 @@ type V1DeleteNamespaceResponse struct {
 // V1DeletionRecord One hard delete of a namespace or a tenant, as the control store keeps it
 // (kosha.deletion_records). Holds identifiers and counters only.
 type V1DeletionRecord struct {
+	// AcksRequired Purge pods must acknowledge their cache purge before the record
+	// completes (#347, KOSHA_DELETION_REQUIRE_ACKS).
+	AcksRequired *bool `json:"acks_required,omitempty"`
+
 	// Attempts Storage-reclaim attempts so far.
-	Attempts      *int64  `json:"attempts,omitempty"`
-	CompletedAtMs *int64  `json:"completed_at_ms,omitempty"`
-	Id            *string `json:"id,omitempty"`
+	Attempts      *int64 `json:"attempts,omitempty"`
+	CompletedAtMs *int64 `json:"completed_at_ms,omitempty"`
+
+	// ExportsDeleted Exports (#347) of the subject deleted with it.
+	ExportsDeleted *int64  `json:"exports_deleted,omitempty"`
+	Id             *string `json:"id,omitempty"`
 
 	// LastError Why the last attempt did not complete.
 	LastError *string `json:"last_error,omitempty"`
@@ -385,6 +416,9 @@ type V1DeletionRecord struct {
 	// State "pending" (rows gone, stored objects may remain) or "completed".
 	State *V1DeletionRecordState `json:"state,omitempty"`
 
+	// StorageVerified Storage reclaim finished and the prefix listed empty.
+	StorageVerified *bool `json:"storage_verified,omitempty"`
+
 	// Subject Internal namespace id ("<tenant>/<name>") or tenant id, per `scope`.
 	Subject  *string `json:"subject,omitempty"`
 	TenantId *string `json:"tenant_id,omitempty"`
@@ -400,6 +434,12 @@ type V1DeletionRecordState string
 type V1Document struct {
 	Fields []V1Field `json:"fields"`
 	Id     string    `json:"id"`
+}
+
+// V1DownloadExportResponse defines model for v1DownloadExportResponse.
+type V1DownloadExportResponse struct {
+	// Body The JSON response body.
+	Body *map[string]interface{} `json:"body,omitempty"`
 }
 
 // V1ErrorResponse The body of every non-2xx JSON response, on every route (ADR-350 §b).
@@ -448,17 +488,6 @@ type V1ExistsResponse struct {
 	Existing  *[]string `json:"existing,omitempty"`
 	Missing   *[]string `json:"missing,omitempty"`
 	Namespace *string   `json:"namespace,omitempty"`
-}
-
-// V1ExportNamespaceResponse defines model for v1ExportNamespaceResponse.
-type V1ExportNamespaceResponse struct {
-	DocumentCount *int64 `json:"document_count,omitempty"`
-
-	// DownloadUrl A bearer URL: anyone with the URL can download the export until expiry.
-	DownloadUrl      *string `json:"download_url,omitempty"`
-	ExpiresInSeconds *int64  `json:"expires_in_seconds,omitempty"`
-	Format           *string `json:"format,omitempty"`
-	Namespace        *string `json:"namespace,omitempty"`
 }
 
 // V1Field defines model for v1Field.
@@ -559,6 +588,12 @@ type V1GetBillingResponse struct {
 	Usage *map[string]interface{} `json:"usage,omitempty"`
 }
 
+// V1GetExportResponse defines model for v1GetExportResponse.
+type V1GetExportResponse struct {
+	// Body The JSON response body.
+	Body *map[string]interface{} `json:"body,omitempty"`
+}
+
 // V1GetNamespaceSchemaResponse defines model for v1GetNamespaceSchemaResponse.
 type V1GetNamespaceSchemaResponse struct {
 	Namespace *string            `json:"namespace,omitempty"`
@@ -608,15 +643,10 @@ type V1GetUsageResponse struct {
 	Total *map[string]interface{} `json:"total,omitempty"`
 }
 
-// V1HardDeleteNamespaceResponse defines model for v1HardDeleteNamespaceResponse.
-type V1HardDeleteNamespaceResponse struct {
-	Acknowledged *bool `json:"acknowledged,omitempty"`
-
-	// Deletion One hard delete of a namespace or a tenant, as the control store keeps it
-	// (kosha.deletion_records). Holds identifiers and counters only.
-	Deletion         *V1DeletionRecord `json:"deletion,omitempty"`
-	Namespace        *string           `json:"namespace,omitempty"`
-	StorageReclaimed *bool             `json:"storage_reclaimed,omitempty"`
+// V1HandleStripeWebhookResponse defines model for v1HandleStripeWebhookResponse.
+type V1HandleStripeWebhookResponse struct {
+	// Body The JSON response body.
+	Body *map[string]interface{} `json:"body,omitempty"`
 }
 
 // V1HealthCheckResponse defines model for v1HealthCheckResponse.
@@ -674,9 +704,21 @@ type V1ListBranchesResponse struct {
 	Namespace *string              `json:"namespace,omitempty"`
 }
 
+// V1ListExportsResponse defines model for v1ListExportsResponse.
+type V1ListExportsResponse struct {
+	// Body The JSON response body.
+	Body *map[string]interface{} `json:"body,omitempty"`
+}
+
 // V1ListNamespacesResponse defines model for v1ListNamespacesResponse.
 type V1ListNamespacesResponse struct {
 	Namespaces *[]V1ListedNamespace `json:"namespaces,omitempty"`
+}
+
+// V1ListTenantApiKeysResponse defines model for v1ListTenantApiKeysResponse.
+type V1ListTenantApiKeysResponse struct {
+	// Body The JSON response body.
+	Body *map[string]interface{} `json:"body,omitempty"`
 }
 
 // V1ListedNamespace defines model for v1ListedNamespace.
@@ -728,7 +770,10 @@ type V1NamespaceSchema struct {
 // V1PutNamespaceSchemaResponse defines model for v1PutNamespaceSchemaResponse.
 type V1PutNamespaceSchemaResponse struct {
 	// Changed False when the stored schema was already identical.
-	Changed   *bool              `json:"changed,omitempty"`
+	Changed *bool `json:"changed,omitempty"`
+
+	// Changes The online changes applied, per field (#347).
+	Changes   *[]V1SchemaChange  `json:"changes,omitempty"`
 	Namespace *string            `json:"namespace,omitempty"`
 	Schema    *V1NamespaceSchema `json:"schema,omitempty"`
 }
@@ -785,6 +830,18 @@ type V1Rerank struct {
 	TopN *int64 `json:"top_n,omitempty"`
 }
 
+// V1RevokeTenantApiKeyResponse defines model for v1RevokeTenantApiKeyResponse.
+type V1RevokeTenantApiKeyResponse struct {
+	// Body The JSON response body.
+	Body *map[string]interface{} `json:"body,omitempty"`
+}
+
+// V1RotateTenantApiKeyResponse defines model for v1RotateTenantApiKeyResponse.
+type V1RotateTenantApiKeyResponse struct {
+	// Body The JSON response body.
+	Body *map[string]interface{} `json:"body,omitempty"`
+}
+
 // V1RrfRank score(d) = sum over retrievers r of 1 / (rank_constant + rank_r(d)).
 type V1RrfRank struct {
 	// RankConstant Default 60; must be >= 1.
@@ -793,6 +850,20 @@ type V1RrfRank struct {
 	// RankWindowSize Per-retriever list length and fused list length. Default: max_results;
 	// must be >= max_results.
 	RankWindowSize *int64 `json:"rank_window_size,omitempty"`
+}
+
+// V1SchemaChange One online schema change (#347).
+type V1SchemaChange struct {
+	// Change "field_added", "field_removed", "declarative_changed",
+	// "analyzer_changed", "embedding_declared", "embedding_removed" or
+	// "settings_changed".
+	Change *string `json:"change,omitempty"`
+
+	// Effect What happens to existing documents.
+	Effect *string `json:"effect,omitempty"`
+
+	// Field The field, or "*" for the namespace-wide defaults.
+	Field *string `json:"field,omitempty"`
 }
 
 // V1ScoredDocument defines model for v1ScoredDocument.
@@ -878,11 +949,40 @@ type V1WildcardQuery struct {
 	Pattern         string `json:"pattern"`
 }
 
-// KoshaServicePutNamespaceSchemaParams defines parameters for KoshaServicePutNamespaceSchema.
-type KoshaServicePutNamespaceSchemaParams struct {
-	// RequireOnlineSafe Reject changes or removals of declared field types on a populated
-	// namespace. Defaults to false, preserving v1 schema replacement behavior.
-	RequireOnlineSafe *bool `form:"require_online_safe,omitempty" json:"require_online_safe,omitempty"`
+// KoshaServiceCreateTenantApiKeyJSONBody defines parameters for KoshaServiceCreateTenantApiKey.
+type KoshaServiceCreateTenantApiKeyJSONBody = map[string]interface{}
+
+// KoshaServiceRevokeTenantApiKeyJSONBody defines parameters for KoshaServiceRevokeTenantApiKey.
+type KoshaServiceRevokeTenantApiKeyJSONBody = map[string]interface{}
+
+// KoshaServiceRotateTenantApiKeyJSONBody defines parameters for KoshaServiceRotateTenantApiKey.
+type KoshaServiceRotateTenantApiKeyJSONBody = map[string]interface{}
+
+// KoshaServiceCreateCheckoutSessionJSONBody defines parameters for KoshaServiceCreateCheckoutSession.
+type KoshaServiceCreateCheckoutSessionJSONBody = map[string]interface{}
+
+// KoshaServiceCreateBillingPortalSessionJSONBody defines parameters for KoshaServiceCreateBillingPortalSession.
+type KoshaServiceCreateBillingPortalSessionJSONBody = map[string]interface{}
+
+// KoshaServiceHandleStripeWebhookJSONBody defines parameters for KoshaServiceHandleStripeWebhook.
+type KoshaServiceHandleStripeWebhookJSONBody = map[string]interface{}
+
+// KoshaServiceListExportsParams defines parameters for KoshaServiceListExports.
+type KoshaServiceListExportsParams struct {
+	// Limit At most this many exports (default and cap 100).
+	Limit *int64 `form:"limit,omitempty" json:"limit,omitempty"`
+
+	// Before Page after this export id (`next` of the previous page).
+	Before *string `form:"before,omitempty" json:"before,omitempty"`
+}
+
+// KoshaServiceCreateExportJSONBody defines parameters for KoshaServiceCreateExport.
+type KoshaServiceCreateExportJSONBody = map[string]interface{}
+
+// KoshaServiceDownloadExportParams defines parameters for KoshaServiceDownloadExport.
+type KoshaServiceDownloadExportParams struct {
+	// Part The part to download (default 0).
+	Part *int64 `form:"part,omitempty" json:"part,omitempty"`
 }
 
 // KoshaServiceGetUsageParams defines parameters for KoshaServiceGetUsage.
@@ -893,6 +993,24 @@ type KoshaServiceGetUsageParams struct {
 	// To Window end, Unix seconds (default: now).
 	To *int64 `form:"to,omitempty" json:"to,omitempty"`
 }
+
+// KoshaServiceCreateTenantApiKeyJSONRequestBody defines body for KoshaServiceCreateTenantApiKey for application/json ContentType.
+type KoshaServiceCreateTenantApiKeyJSONRequestBody = KoshaServiceCreateTenantApiKeyJSONBody
+
+// KoshaServiceRevokeTenantApiKeyJSONRequestBody defines body for KoshaServiceRevokeTenantApiKey for application/json ContentType.
+type KoshaServiceRevokeTenantApiKeyJSONRequestBody = KoshaServiceRevokeTenantApiKeyJSONBody
+
+// KoshaServiceRotateTenantApiKeyJSONRequestBody defines body for KoshaServiceRotateTenantApiKey for application/json ContentType.
+type KoshaServiceRotateTenantApiKeyJSONRequestBody = KoshaServiceRotateTenantApiKeyJSONBody
+
+// KoshaServiceCreateCheckoutSessionJSONRequestBody defines body for KoshaServiceCreateCheckoutSession for application/json ContentType.
+type KoshaServiceCreateCheckoutSessionJSONRequestBody = KoshaServiceCreateCheckoutSessionJSONBody
+
+// KoshaServiceCreateBillingPortalSessionJSONRequestBody defines body for KoshaServiceCreateBillingPortalSession for application/json ContentType.
+type KoshaServiceCreateBillingPortalSessionJSONRequestBody = KoshaServiceCreateBillingPortalSessionJSONBody
+
+// KoshaServiceHandleStripeWebhookJSONRequestBody defines body for KoshaServiceHandleStripeWebhook for application/json ContentType.
+type KoshaServiceHandleStripeWebhookJSONRequestBody = KoshaServiceHandleStripeWebhookJSONBody
 
 // KoshaServiceCreateNamespaceJSONRequestBody defines body for KoshaServiceCreateNamespace for application/json ContentType.
 type KoshaServiceCreateNamespaceJSONRequestBody = V1CreateNamespaceRequest
@@ -909,14 +1027,11 @@ type KoshaServiceIndexDocumentsJSONRequestBody = KoshaServiceIndexDocumentsBody
 // KoshaServiceExistsJSONRequestBody defines body for KoshaServiceExists for application/json ContentType.
 type KoshaServiceExistsJSONRequestBody = KoshaServiceExistsBody
 
-// KoshaServiceExportNamespaceJSONRequestBody defines body for KoshaServiceExportNamespace for application/json ContentType.
-type KoshaServiceExportNamespaceJSONRequestBody = KoshaServiceExportNamespaceBody
+// KoshaServiceCreateExportJSONRequestBody defines body for KoshaServiceCreateExport for application/json ContentType.
+type KoshaServiceCreateExportJSONRequestBody = KoshaServiceCreateExportJSONBody
 
 // KoshaServiceFlushJSONRequestBody defines body for KoshaServiceFlush for application/json ContentType.
 type KoshaServiceFlushJSONRequestBody = KoshaServiceFlushBody
-
-// KoshaServiceHardDeleteNamespaceJSONRequestBody defines body for KoshaServiceHardDeleteNamespace for application/json ContentType.
-type KoshaServiceHardDeleteNamespaceJSONRequestBody = KoshaServiceHardDeleteNamespaceBody
 
 // KoshaServiceReplaceDocumentsJSONRequestBody defines body for KoshaServiceReplaceDocuments for application/json ContentType.
 type KoshaServiceReplaceDocumentsJSONRequestBody = KoshaServiceReplaceDocumentsBody

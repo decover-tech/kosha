@@ -554,124 +554,6 @@ service KoshaService {
     };
   }
 
-  // Permanently delete a namespace after the caller confirms its name.
-  // The legacy v1 DELETE operation is unchanged.
-  rpc HardDeleteNamespace(HardDeleteNamespaceRequest) returns (HardDeleteNamespaceResponse) {
-    option (google.api.http) = {
-      post: "/v1/namespaces/{namespace}/hard-delete"
-      body: "*"
-    };
-    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
-      responses: {
-        key: "408"
-        value: {
-          description: "request_timeout"
-          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
-          headers: {key: "Retry-After", value: {type: "integer", description: "Seconds to wait before retrying, when retryable."}}
-        }
-      }
-      responses: {
-        key: "409"
-        value: {
-          description: "conflict; write_conflict is retryable"
-          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
-          headers: {key: "Retry-After", value: {type: "integer", description: "Seconds to wait before retrying, when retryable."}}
-        }
-      }
-      responses: {
-        key: "429"
-        value: {
-          description: "tenant rate limits or overload"
-          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
-          headers: {key: "Retry-After", value: {type: "integer", description: "Seconds to wait before retrying, when retryable."}}
-        }
-      }
-      responses: {
-        key: "502"
-        value: {
-          description: "upstream_error"
-          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
-          headers: {key: "Retry-After", value: {type: "integer", description: "Seconds to wait before retrying, when retryable."}}
-        }
-      }
-      responses: {
-        key: "503"
-        value: {
-          description: "unavailable"
-          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
-          headers: {key: "Retry-After", value: {type: "integer", description: "Seconds to wait before retrying, when retryable."}}
-        }
-      }
-      extensions: {
-        key: "x-kosha-error-codes"
-        value: {list_value: {values: [{string_value: "conflict"}, {string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "namespace_not_found"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}, {string_value: "write_conflict"}]}}
-      }
-      extensions: {
-        key: "x-stability-level"
-        value: {string_value: "stable"}
-      }
-    };
-  }
-
-  // Export all live documents, including acknowledged unflushed writes,
-  // as newline-delimited JSON to a short-lived signed S3 download URL.
-  rpc ExportNamespace(ExportNamespaceRequest) returns (ExportNamespaceResponse) {
-    option (google.api.http) = {
-      post: "/v1/namespaces/{namespace}/export"
-      body: "*"
-    };
-    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
-      responses: {
-        key: "408"
-        value: {
-          description: "request_timeout"
-          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
-          headers: {key: "Retry-After", value: {type: "integer", description: "Seconds to wait before retrying, when retryable."}}
-        }
-      }
-      responses: {
-        key: "409"
-        value: {
-          description: "conflict; write_conflict is retryable"
-          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
-          headers: {key: "Retry-After", value: {type: "integer", description: "Seconds to wait before retrying, when retryable."}}
-        }
-      }
-      responses: {
-        key: "429"
-        value: {
-          description: "tenant rate limits or overload"
-          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
-          headers: {key: "Retry-After", value: {type: "integer", description: "Seconds to wait before retrying, when retryable."}}
-        }
-      }
-      responses: {
-        key: "502"
-        value: {
-          description: "upstream_error"
-          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
-          headers: {key: "Retry-After", value: {type: "integer", description: "Seconds to wait before retrying, when retryable."}}
-        }
-      }
-      responses: {
-        key: "503"
-        value: {
-          description: "unavailable"
-          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
-          headers: {key: "Retry-After", value: {type: "integer", description: "Seconds to wait before retrying, when retryable."}}
-        }
-      }
-      extensions: {
-        key: "x-kosha-error-codes"
-        value: {list_value: {values: [{string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "namespace_not_found"}, {string_value: "not_implemented"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "payment_required"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "tenant_write_rate_exceeded"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
-      }
-      extensions: {
-        key: "x-stability-level"
-        value: {string_value: "stable"}
-      }
-    };
-  }
-
   // Index documents: each one is inserted, or replaces the stored document
   // with the same id in full.
   rpc IndexDocuments(IndexDocumentsRequest) returns (IndexDocumentsResponse) {
@@ -1292,9 +1174,7 @@ service KoshaService {
 
   // Set a namespace's schema (issue #220): per-field analyzers for segments
   // written from now on. Existing segments keep the analysis recorded in
-  // their footers and stay searchable with it. Fields can be added online;
-  // with require_online_safe=true, changing or removing a declared type on
-  // a nonempty namespace returns 409 with details.reason "reindex_required".
+  // their footers and stay searchable with it.
   rpc PutNamespaceSchema(PutNamespaceSchemaRequest) returns (PutNamespaceSchemaResponse) {
     option (google.api.http) = {
       post: "/v1/namespaces/{namespace}/schema"
@@ -1984,6 +1864,1078 @@ service KoshaService {
       }
     };
   }
+
+  // The caller's tenant API keys, without secrets (issue #346). Needs an
+  // `admin`-scoped key.
+  rpc ListTenantApiKeys(ListTenantApiKeysRequest) returns (ListTenantApiKeysResponse) {
+    option (google.api.http) = {
+      get: "/v1/api-keys"
+      response_body: "body"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "429"
+        value: {
+          description: "overloaded and tenant rate limits; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "503"
+        value: {
+          description: "unavailable; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
+      extensions: {
+        key: "x-stability-level"
+        value: {string_value: "beta"}
+      }
+    };
+  }
+
+  // Mints a scoped API key for the caller's tenant (issue #346); the
+  // plaintext key is returned once. Body: `description`, `scopes`,
+  // `namespaces`, `expires_at`.
+  rpc CreateTenantApiKey(CreateTenantApiKeyRequest) returns (CreateTenantApiKeyResponse) {
+    option (google.api.http) = {
+      post: "/v1/api-keys"
+      body: "body"
+      response_body: "body"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "429"
+        value: {
+          description: "overloaded and tenant rate limits; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "503"
+        value: {
+          description: "unavailable; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
+      extensions: {
+        key: "x-stability-level"
+        value: {string_value: "beta"}
+      }
+    };
+  }
+
+  // Replaces a key with a new one of the same scopes (issue #346). Body:
+  // `key_id`, optional `grace_seconds`.
+  rpc RotateTenantApiKey(RotateTenantApiKeyRequest) returns (RotateTenantApiKeyResponse) {
+    option (google.api.http) = {
+      post: "/v1/api-keys/rotate"
+      body: "body"
+      response_body: "body"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "429"
+        value: {
+          description: "overloaded and tenant rate limits; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "503"
+        value: {
+          description: "unavailable; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
+      extensions: {
+        key: "x-stability-level"
+        value: {string_value: "beta"}
+      }
+    };
+  }
+
+  // Revokes a key at once (issue #346). Body: `key_id`.
+  rpc RevokeTenantApiKey(RevokeTenantApiKeyRequest) returns (RevokeTenantApiKeyResponse) {
+    option (google.api.http) = {
+      post: "/v1/api-keys/revoke"
+      body: "body"
+      response_body: "body"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "429"
+        value: {
+          description: "overloaded and tenant rate limits; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "503"
+        value: {
+          description: "unavailable; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
+      extensions: {
+        key: "x-stability-level"
+        value: {string_value: "beta"}
+      }
+    };
+  }
+
+  // Starts a Stripe Checkout session to subscribe to or change plan
+  // (issue #349). 404 when billing is off.
+  rpc CreateCheckoutSession(CreateCheckoutSessionRequest) returns (CreateCheckoutSessionResponse) {
+    option (google.api.http) = {
+      post: "/v1/billing/checkout"
+      body: "body"
+      response_body: "body"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "429"
+        value: {
+          description: "overloaded and tenant rate limits; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "503"
+        value: {
+          description: "unavailable; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
+      extensions: {
+        key: "x-stability-level"
+        value: {string_value: "beta"}
+      }
+    };
+  }
+
+  // A Stripe billing-portal link for the caller's customer (issue #349).
+  // 404 when billing is off.
+  rpc CreateBillingPortalSession(CreateBillingPortalSessionRequest) returns (CreateBillingPortalSessionResponse) {
+    option (google.api.http) = {
+      post: "/v1/billing/portal"
+      body: "body"
+      response_body: "body"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "429"
+        value: {
+          description: "overloaded and tenant rate limits; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "503"
+        value: {
+          description: "unavailable; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
+      extensions: {
+        key: "x-stability-level"
+        value: {string_value: "beta"}
+      }
+    };
+  }
+
+  // Stripe's webhook endpoint (issue #349). Authenticated by the
+  // `Stripe-Signature` header, not an API key.
+  rpc HandleStripeWebhook(HandleStripeWebhookRequest) returns (HandleStripeWebhookResponse) {
+    option (google.api.http) = {
+      post: "/v1/billing/webhooks/stripe"
+      body: "body"
+      response_body: "body"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "429"
+        value: {
+          description: "overloaded and tenant rate limits; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "503"
+        value: {
+          description: "unavailable; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
+      extensions: {
+        key: "x-stability-level"
+        value: {string_value: "beta"}
+      }
+    };
+  }
+
+  // Starts a JSONL export of every live document (issue #347); answers
+  // 202 with the export record. Body: `include_vectors`, `upload_url`.
+  rpc CreateExport(CreateExportRequest) returns (CreateExportResponse) {
+    option (google.api.http) = {
+      post: "/v1/namespaces/{namespace}/exports"
+      body: "body"
+      response_body: "body"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "429"
+        value: {
+          description: "overloaded and tenant rate limits; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "503"
+        value: {
+          description: "unavailable; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
+      extensions: {
+        key: "x-stability-level"
+        value: {string_value: "beta"}
+      }
+    };
+  }
+
+  // The namespace's exports, newest first (issue #347).
+  rpc ListExports(ListExportsRequest) returns (ListExportsResponse) {
+    option (google.api.http) = {
+      get: "/v1/namespaces/{namespace}/exports"
+      response_body: "body"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "429"
+        value: {
+          description: "overloaded and tenant rate limits; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "503"
+        value: {
+          description: "unavailable; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
+      extensions: {
+        key: "x-stability-level"
+        value: {string_value: "beta"}
+      }
+    };
+  }
+
+  // One export: state, parts and their download paths (issue #347).
+  rpc GetExport(GetExportRequest) returns (GetExportResponse) {
+    option (google.api.http) = {
+      get: "/v1/namespaces/{namespace}/exports/{id}"
+      response_body: "body"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "429"
+        value: {
+          description: "overloaded and tenant rate limits; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "503"
+        value: {
+          description: "unavailable; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
+      extensions: {
+        key: "x-stability-level"
+        value: {string_value: "beta"}
+      }
+    };
+  }
+
+  // Deletes an export and its files (issue #347).
+  rpc DeleteExport(DeleteExportRequest) returns (DeleteExportResponse) {
+    option (google.api.http) = {
+      delete: "/v1/namespaces/{namespace}/exports/{id}"
+      response_body: "body"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "429"
+        value: {
+          description: "overloaded and tenant rate limits; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "503"
+        value: {
+          description: "unavailable; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
+      extensions: {
+        key: "x-stability-level"
+        value: {string_value: "beta"}
+      }
+    };
+  }
+
+  // One part of a completed export as `application/x-ndjson`
+  // (issue #347).
+  rpc DownloadExport(DownloadExportRequest) returns (DownloadExportResponse) {
+    option (google.api.http) = {
+      get: "/v1/namespaces/{namespace}/exports/{id}/download"
+      response_body: "body"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "429"
+        value: {
+          description: "overloaded and tenant rate limits; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "503"
+        value: {
+          description: "unavailable; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
+      extensions: {
+        key: "x-stability-level"
+        value: {string_value: "beta"}
+      }
+    };
+  }
 }
 
 // ─── Health ──────────────────────────────────────────────────────────────────
@@ -2098,37 +3050,6 @@ message DeleteNamespaceResponse {
   DeletionRecord deletion = 4;
 }
 
-message HardDeleteNamespaceRequest {
-  string namespace = 1;
-  // Must equal the namespace name in the URL.
-  string confirm = 2 [(google.api.field_behavior) = REQUIRED];
-}
-
-message HardDeleteNamespaceResponse {
-  string namespace = 1;
-  bool acknowledged = 2;
-  bool storage_reclaimed = 3;
-  DeletionRecord deletion = 4;
-}
-
-message ExportNamespaceRequest {
-  string namespace = 1;
-  // The only supported format is "jsonl"; omission defaults to it.
-  optional string format = 2;
-}
-
-message ExportNamespaceResponse {
-  string namespace = 1;
-  string format = 2;
-  // A bearer URL: anyone with the URL can download the export until expiry.
-  string download_url = 3;
-  uint32 expires_in_seconds = 4;
-  uint64 document_count = 5 [(grpc.gateway.protoc_gen_openapiv2.options.openapiv2_field) = {
-    type: INTEGER
-    format: "int64"
-  }];
-}
-
 // One hard delete of a namespace or a tenant, as the control store keeps it
 // (kosha.deletion_records). Holds identifiers and counters only.
 message DeletionRecord {
@@ -2137,7 +3058,9 @@ message DeletionRecord {
   string scope = 2 [(grpc.gateway.protoc_gen_openapiv2.options.openapiv2_field) = {
     enum: [
       "namespace",
-      "tenant"
+      "tenant",
+      "branch",
+      "migrated"
     ]
   }];
   // Internal namespace id ("<tenant>/<name>") or tenant id, per `scope`.
@@ -2174,6 +3097,16 @@ message DeletionRecord {
     type: INTEGER
     format: "int64"
   }];
+  // Purge pods must acknowledge their cache purge before the record
+  // completes (#347, KOSHA_DELETION_REQUIRE_ACKS).
+  bool acks_required = 13;
+  // Storage reclaim finished and the prefix listed empty.
+  bool storage_verified = 14;
+  // Exports (#347) of the subject deleted with it.
+  uint64 exports_deleted = 15 [(grpc.gateway.protoc_gen_openapiv2.options.openapiv2_field) = {
+    type: INTEGER
+    format: "int64"
+  }];
 }
 
 message PutNamespaceSchemaRequest {
@@ -2181,9 +3114,6 @@ message PutNamespaceSchemaRequest {
   // The schema itself is the request body (`{"fields": {...}}`); a body
   // wrapped as `{"schema": {...}}` is accepted too.
   NamespaceSchema schema = 2;
-  // Reject changes or removals of declared field types on a populated
-  // namespace. Defaults to false, preserving v1 schema replacement behavior.
-  optional bool require_online_safe = 3;
 }
 
 message PutNamespaceSchemaResponse {
@@ -2191,6 +3121,20 @@ message PutNamespaceSchemaResponse {
   NamespaceSchema schema = 2;
   // False when the stored schema was already identical.
   bool changed = 3;
+  // The online changes applied, per field (#347).
+  repeated SchemaChange changes = 4;
+}
+
+// One online schema change (#347).
+message SchemaChange {
+  // The field, or "*" for the namespace-wide defaults.
+  string field = 1;
+  // "field_added", "field_removed", "declarative_changed",
+  // "analyzer_changed", "embedding_declared", "embedding_removed" or
+  // "settings_changed".
+  string change = 2;
+  // What happens to existing documents.
+  string effect = 3;
 }
 
 message GetNamespaceSchemaRequest {
@@ -2315,6 +3259,8 @@ message DeleteBranchResponse {
     format: "int64"
   }];
   BranchReclaim reclaimed = 4;
+  // The durable record of this deletion (#347).
+  DeletionRecord deletion = 5;
 }
 
 // ─── Document model ─────────────────────────────────────────────────────────
@@ -2828,4 +3774,130 @@ message GetBillingResponse {
   // What the month would cost if it ended now: `{lines, total_cents}`.
   google.protobuf.Struct accrued = 8;
   repeated google.protobuf.Struct invoices = 9;
+}
+
+// ─── API keys, billing sessions, exports (Phase H) ──────────────────────────
+
+message ListTenantApiKeysRequest {
+}
+
+message ListTenantApiKeysResponse {
+  // The JSON response body.
+  google.protobuf.Struct body = 1;
+}
+
+message CreateTenantApiKeyRequest {
+  // The JSON request body.
+  google.protobuf.Struct body = 1;
+}
+
+message CreateTenantApiKeyResponse {
+  // The JSON response body.
+  google.protobuf.Struct body = 1;
+}
+
+message RotateTenantApiKeyRequest {
+  // The JSON request body.
+  google.protobuf.Struct body = 1;
+}
+
+message RotateTenantApiKeyResponse {
+  // The JSON response body.
+  google.protobuf.Struct body = 1;
+}
+
+message RevokeTenantApiKeyRequest {
+  // The JSON request body.
+  google.protobuf.Struct body = 1;
+}
+
+message RevokeTenantApiKeyResponse {
+  // The JSON response body.
+  google.protobuf.Struct body = 1;
+}
+
+message CreateCheckoutSessionRequest {
+  // The JSON request body.
+  google.protobuf.Struct body = 1;
+}
+
+message CreateCheckoutSessionResponse {
+  // The JSON response body.
+  google.protobuf.Struct body = 1;
+}
+
+message CreateBillingPortalSessionRequest {
+  // The JSON request body.
+  google.protobuf.Struct body = 1;
+}
+
+message CreateBillingPortalSessionResponse {
+  // The JSON response body.
+  google.protobuf.Struct body = 1;
+}
+
+message HandleStripeWebhookRequest {
+  // The JSON request body.
+  google.protobuf.Struct body = 1;
+}
+
+message HandleStripeWebhookResponse {
+  // The JSON response body.
+  google.protobuf.Struct body = 1;
+}
+
+message CreateExportRequest {
+  string namespace = 1;
+  // The JSON request body.
+  google.protobuf.Struct body = 2;
+}
+
+message CreateExportResponse {
+  // The JSON response body.
+  google.protobuf.Struct body = 1;
+}
+
+message ListExportsRequest {
+  string namespace = 1;
+  // At most this many exports (default and cap 100).
+  optional uint32 limit = 2;
+  // Page after this export id (`next` of the previous page).
+  optional string before = 3;
+}
+
+message ListExportsResponse {
+  // The JSON response body.
+  google.protobuf.Struct body = 1;
+}
+
+message GetExportRequest {
+  string namespace = 1;
+  string id = 2;
+}
+
+message GetExportResponse {
+  // The JSON response body.
+  google.protobuf.Struct body = 1;
+}
+
+message DeleteExportRequest {
+  string namespace = 1;
+  string id = 2;
+}
+
+message DeleteExportResponse {
+  // The JSON response body.
+  google.protobuf.Struct body = 1;
+}
+
+message DownloadExportRequest {
+  string namespace = 1;
+  string id = 2;
+  // The part to download (default 0).
+  optional uint32 part = 3;
+}
+
+message DownloadExportResponse {
+  // The JSON response body.
+  google.protobuf.Struct body = 1;
 }

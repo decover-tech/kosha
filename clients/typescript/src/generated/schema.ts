@@ -7,6 +7,68 @@
  */
 
 export interface paths {
+    "/v1/api-keys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The caller's tenant API keys, without secrets (issue #346). Needs an
+         *     `admin`-scoped key.
+         */
+        get: operations["KoshaService_ListTenantApiKeys"];
+        put?: never;
+        /**
+         * Mints a scoped API key for the caller's tenant (issue #346); the
+         *     plaintext key is returned once. Body: `description`, `scopes`,
+         *     `namespaces`, `expires_at`.
+         */
+        post: operations["KoshaService_CreateTenantApiKey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/api-keys/revoke": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Revokes a key at once (issue #346). Body: `key_id`. */
+        post: operations["KoshaService_RevokeTenantApiKey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/api-keys/rotate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Replaces a key with a new one of the same scopes (issue #346). Body:
+         *     `key_id`, optional `grace_seconds`.
+         */
+        post: operations["KoshaService_RotateTenantApiKey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/billing": {
         parameters: {
             query?: never;
@@ -21,6 +83,66 @@ export interface paths {
         get: operations["KoshaService_GetBilling"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/billing/checkout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Starts a Stripe Checkout session to subscribe to or change plan
+         *     (issue #349). 404 when billing is off.
+         */
+        post: operations["KoshaService_CreateCheckoutSession"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/billing/portal": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * A Stripe billing-portal link for the caller's customer (issue #349).
+         *     404 when billing is off.
+         */
+        post: operations["KoshaService_CreateBillingPortalSession"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/billing/webhooks/stripe": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Stripe's webhook endpoint (issue #349). Authenticated by the
+         *     `Stripe-Signature` header, not an API key.
+         */
+        post: operations["KoshaService_HandleStripeWebhook"];
         delete?: never;
         options?: never;
         head?: never;
@@ -180,20 +302,59 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/namespaces/{namespace}/export": {
+    "/v1/namespaces/{namespace}/exports": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /** The namespace's exports, newest first (issue #347). */
+        get: operations["KoshaService_ListExports"];
         put?: never;
         /**
-         * Export all live documents, including acknowledged unflushed writes,
-         *     as newline-delimited JSON to a short-lived signed S3 download URL.
+         * Starts a JSONL export of every live document (issue #347); answers
+         *     202 with the export record. Body: `include_vectors`, `upload_url`.
          */
-        post: operations["KoshaService_ExportNamespace"];
+        post: operations["KoshaService_CreateExport"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/namespaces/{namespace}/exports/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One export: state, parts and their download paths (issue #347). */
+        get: operations["KoshaService_GetExport"];
+        put?: never;
+        post?: never;
+        /** Deletes an export and its files (issue #347). */
+        delete: operations["KoshaService_DeleteExport"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/namespaces/{namespace}/exports/{id}/download": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One part of a completed export as `application/x-ndjson`
+         *     (issue #347).
+         */
+        get: operations["KoshaService_DownloadExport"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -211,26 +372,6 @@ export interface paths {
         put?: never;
         /** Flush buffered documents to a segment. */
         post: operations["KoshaService_Flush"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/namespaces/{namespace}/hard-delete": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Permanently delete a namespace after the caller confirms its name.
-         *     The legacy v1 DELETE operation is unchanged.
-         */
-        post: operations["KoshaService_HardDeleteNamespace"];
         delete?: never;
         options?: never;
         head?: never;
@@ -271,9 +412,7 @@ export interface paths {
         /**
          * Set a namespace's schema (issue #220): per-field analyzers for segments
          *     written from now on. Existing segments keep the analysis recorded in
-         *     their footers and stay searchable with it. Fields can be added online;
-         *     with require_online_safe=true, changing or removing a declared type on
-         *     a nonempty namespace returns 409 with details.reason "reindex_required".
+         *     their footers and stay searchable with it.
          */
         post: operations["KoshaService_PutNamespaceSchema"];
         delete?: never;
@@ -370,15 +509,7 @@ export interface components {
         KoshaServiceExistsBody: {
             ids: string[];
         };
-        KoshaServiceExportNamespaceBody: {
-            /** @description The only supported format is "jsonl"; omission defaults to it. */
-            format?: string;
-        };
         KoshaServiceFlushBody: Record<string, unknown>;
-        KoshaServiceHardDeleteNamespaceBody: {
-            /** @description Must equal the namespace name in the URL. */
-            confirm: string;
-        };
         KoshaServiceIndexDocumentsBody: {
             documents: components["schemas"]["v1Document"][];
         };
@@ -552,6 +683,18 @@ export interface components {
         v1CollapseSpec: {
             field: string;
         };
+        v1CreateBillingPortalSessionResponse: {
+            /** @description The JSON response body. */
+            body?: Record<string, unknown>;
+        };
+        v1CreateCheckoutSessionResponse: {
+            /** @description The JSON response body. */
+            body?: Record<string, unknown>;
+        };
+        v1CreateExportResponse: {
+            /** @description The JSON response body. */
+            body?: Record<string, unknown>;
+        };
         v1CreateNamespaceRequest: {
             namespace: string;
             schema?: components["schemas"]["v1NamespaceSchema"];
@@ -572,8 +715,13 @@ export interface components {
             /** Format: int64 */
             version?: number;
         };
+        v1CreateTenantApiKeyResponse: {
+            /** @description The JSON response body. */
+            body?: Record<string, unknown>;
+        };
         v1DeleteBranchResponse: {
             deleted?: string;
+            deletion?: components["schemas"]["v1DeletionRecord"];
             parent?: string;
             reclaimed?: components["schemas"]["v1BranchReclaim"];
             /** Format: int64 */
@@ -583,6 +731,10 @@ export interface components {
             /** Format: int64 */
             deleted?: number;
             namespace?: string;
+        };
+        v1DeleteExportResponse: {
+            /** @description The JSON response body. */
+            body?: Record<string, unknown>;
         };
         v1DeleteNamespaceResponse: {
             acknowledged?: boolean;
@@ -601,12 +753,22 @@ export interface components {
          */
         v1DeletionRecord: {
             /**
+             * @description Purge pods must acknowledge their cache purge before the record
+             *     completes (#347, KOSHA_DELETION_REQUIRE_ACKS).
+             */
+            acks_required?: boolean;
+            /**
              * Format: int64
              * @description Storage-reclaim attempts so far.
              */
             attempts?: number;
             /** Format: int64 */
             completed_at_ms?: number;
+            /**
+             * Format: int64
+             * @description Exports (#347) of the subject deleted with it.
+             */
+            exports_deleted?: number;
             id?: string;
             /** @description Why the last attempt did not complete. */
             last_error?: string;
@@ -628,12 +790,14 @@ export interface components {
              * @description "namespace" or "tenant".
              * @enum {string}
              */
-            scope?: "namespace" | "tenant";
+            scope?: "namespace" | "tenant" | "branch" | "migrated";
             /**
              * @description "pending" (rows gone, stored objects may remain) or "completed".
              * @enum {string}
              */
             state?: "pending" | "completed";
+            /** @description Storage reclaim finished and the prefix listed empty. */
+            storage_verified?: boolean;
             /** @description Internal namespace id ("<tenant>/<name>") or tenant id, per `scope`. */
             subject?: string;
             tenant_id?: string;
@@ -641,6 +805,10 @@ export interface components {
         v1Document: {
             fields: components["schemas"]["v1Field"][];
             id: string;
+        };
+        v1DownloadExportResponse: {
+            /** @description The JSON response body. */
+            body?: Record<string, unknown>;
         };
         /**
          * @description The body of every non-2xx JSON response, on every route (ADR-350 §b).
@@ -688,16 +856,6 @@ export interface components {
         v1ExistsResponse: {
             existing?: string[];
             missing?: string[];
-            namespace?: string;
-        };
-        v1ExportNamespaceResponse: {
-            /** Format: int64 */
-            document_count?: number;
-            /** @description A bearer URL: anyone with the URL can download the export until expiry. */
-            download_url?: string;
-            /** Format: int64 */
-            expires_in_seconds?: number;
-            format?: string;
             namespace?: string;
         };
         v1Field: {
@@ -784,6 +942,10 @@ export interface components {
             /** @description Month-to-date usage totals. */
             usage?: Record<string, unknown>;
         };
+        v1GetExportResponse: {
+            /** @description The JSON response body. */
+            body?: Record<string, unknown>;
+        };
         v1GetNamespaceSchemaResponse: {
             namespace?: string;
             schema?: components["schemas"]["v1NamespaceSchema"];
@@ -840,11 +1002,9 @@ export interface components {
             /** @description The counters summed over `namespaces`. */
             total?: Record<string, unknown>;
         };
-        v1HardDeleteNamespaceResponse: {
-            acknowledged?: boolean;
-            deletion?: components["schemas"]["v1DeletionRecord"];
-            namespace?: string;
-            storage_reclaimed?: boolean;
+        v1HandleStripeWebhookResponse: {
+            /** @description The JSON response body. */
+            body?: Record<string, unknown>;
         };
         v1HealthCheckResponse: {
             /** @description "ok". */
@@ -898,8 +1058,16 @@ export interface components {
             branches?: components["schemas"]["v1NamespaceBranch"][];
             namespace?: string;
         };
+        v1ListExportsResponse: {
+            /** @description The JSON response body. */
+            body?: Record<string, unknown>;
+        };
         v1ListNamespacesResponse: {
             namespaces?: components["schemas"]["v1ListedNamespace"][];
+        };
+        v1ListTenantApiKeysResponse: {
+            /** @description The JSON response body. */
+            body?: Record<string, unknown>;
         };
         v1ListedNamespace: {
             /**
@@ -957,6 +1125,8 @@ export interface components {
         v1PutNamespaceSchemaResponse: {
             /** @description False when the stored schema was already identical. */
             changed?: boolean;
+            /** @description The online changes applied, per field (#347). */
+            changes?: components["schemas"]["v1SchemaChange"][];
             namespace?: string;
             schema?: components["schemas"]["v1NamespaceSchema"];
         };
@@ -1014,6 +1184,14 @@ export interface components {
              */
             top_n?: number;
         };
+        v1RevokeTenantApiKeyResponse: {
+            /** @description The JSON response body. */
+            body?: Record<string, unknown>;
+        };
+        v1RotateTenantApiKeyResponse: {
+            /** @description The JSON response body. */
+            body?: Record<string, unknown>;
+        };
         /** @description score(d) = sum over retrievers r of 1 / (rank_constant + rank_r(d)). */
         v1RrfRank: {
             /**
@@ -1027,6 +1205,19 @@ export interface components {
              *     must be >= max_results.
              */
             rank_window_size?: number;
+        };
+        /** @description One online schema change (#347). */
+        v1SchemaChange: {
+            /**
+             * @description "field_added", "field_removed", "declarative_changed",
+             *     "analyzer_changed", "embedding_declared", "embedding_removed" or
+             *     "settings_changed".
+             */
+            change?: string;
+            /** @description What happens to existing documents. */
+            effect?: string;
+            /** @description The field, or "*" for the namespace-wide defaults. */
+            field?: string;
         };
         v1ScoredDocument: {
             doc_id?: string;
@@ -1124,6 +1315,645 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    KoshaService_ListTenantApiKeys: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The JSON response body. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, unknown>;
+                };
+            };
+            /** @description invalid_argument, invalid_query */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unauthenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payment_required (billing refuses the operation for the account's standing) */
+            402: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description permission_denied and quota codes */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_found, namespace_not_found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description method_not_allowed; the `Allow` header lists the methods the path takes */
+            405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds */
+            408: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds */
+            409: {
+                headers: {
+                    /** @description Seconds to wait before retrying; sent with write_conflict only. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payload_too_large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description overloaded and tenant rate limits; retry after `Retry-After` seconds */
+            429: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description internal */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds */
+            502: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unavailable; retry after `Retry-After` seconds */
+            503: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+        };
+    };
+    KoshaService_CreateTenantApiKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description The JSON request body. */
+        requestBody: {
+            content: {
+                "application/json": Record<string, unknown>;
+            };
+        };
+        responses: {
+            /** @description The JSON response body. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, unknown>;
+                };
+            };
+            /** @description invalid_argument, invalid_query */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unauthenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payment_required (billing refuses the operation for the account's standing) */
+            402: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description permission_denied and quota codes */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_found, namespace_not_found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description method_not_allowed; the `Allow` header lists the methods the path takes */
+            405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds */
+            408: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds */
+            409: {
+                headers: {
+                    /** @description Seconds to wait before retrying; sent with write_conflict only. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payload_too_large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description overloaded and tenant rate limits; retry after `Retry-After` seconds */
+            429: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description internal */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds */
+            502: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unavailable; retry after `Retry-After` seconds */
+            503: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+        };
+    };
+    KoshaService_RevokeTenantApiKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description The JSON request body. */
+        requestBody: {
+            content: {
+                "application/json": Record<string, unknown>;
+            };
+        };
+        responses: {
+            /** @description The JSON response body. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, unknown>;
+                };
+            };
+            /** @description invalid_argument, invalid_query */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unauthenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payment_required (billing refuses the operation for the account's standing) */
+            402: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description permission_denied and quota codes */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_found, namespace_not_found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description method_not_allowed; the `Allow` header lists the methods the path takes */
+            405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds */
+            408: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds */
+            409: {
+                headers: {
+                    /** @description Seconds to wait before retrying; sent with write_conflict only. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payload_too_large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description overloaded and tenant rate limits; retry after `Retry-After` seconds */
+            429: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description internal */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds */
+            502: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unavailable; retry after `Retry-After` seconds */
+            503: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+        };
+    };
+    KoshaService_RotateTenantApiKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description The JSON request body. */
+        requestBody: {
+            content: {
+                "application/json": Record<string, unknown>;
+            };
+        };
+        responses: {
+            /** @description The JSON response body. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, unknown>;
+                };
+            };
+            /** @description invalid_argument, invalid_query */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unauthenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payment_required (billing refuses the operation for the account's standing) */
+            402: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description permission_denied and quota codes */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_found, namespace_not_found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description method_not_allowed; the `Allow` header lists the methods the path takes */
+            405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds */
+            408: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds */
+            409: {
+                headers: {
+                    /** @description Seconds to wait before retrying; sent with write_conflict only. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payload_too_large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description overloaded and tenant rate limits; retry after `Retry-After` seconds */
+            429: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description internal */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds */
+            502: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unavailable; retry after `Retry-After` seconds */
+            503: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+        };
+    };
     KoshaService_GetBilling: {
         parameters: {
             query?: never;
@@ -1140,6 +1970,489 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["v1GetBillingResponse"];
+                };
+            };
+            /** @description invalid_argument, invalid_query */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unauthenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payment_required (billing refuses the operation for the account's standing) */
+            402: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description permission_denied and quota codes */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_found, namespace_not_found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description method_not_allowed; the `Allow` header lists the methods the path takes */
+            405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds */
+            408: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds */
+            409: {
+                headers: {
+                    /** @description Seconds to wait before retrying; sent with write_conflict only. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payload_too_large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description overloaded and tenant rate limits; retry after `Retry-After` seconds */
+            429: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description internal */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds */
+            502: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unavailable; retry after `Retry-After` seconds */
+            503: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+        };
+    };
+    KoshaService_CreateCheckoutSession: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description The JSON request body. */
+        requestBody: {
+            content: {
+                "application/json": Record<string, unknown>;
+            };
+        };
+        responses: {
+            /** @description The JSON response body. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, unknown>;
+                };
+            };
+            /** @description invalid_argument, invalid_query */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unauthenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payment_required (billing refuses the operation for the account's standing) */
+            402: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description permission_denied and quota codes */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_found, namespace_not_found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description method_not_allowed; the `Allow` header lists the methods the path takes */
+            405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds */
+            408: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds */
+            409: {
+                headers: {
+                    /** @description Seconds to wait before retrying; sent with write_conflict only. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payload_too_large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description overloaded and tenant rate limits; retry after `Retry-After` seconds */
+            429: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description internal */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds */
+            502: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unavailable; retry after `Retry-After` seconds */
+            503: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+        };
+    };
+    KoshaService_CreateBillingPortalSession: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description The JSON request body. */
+        requestBody: {
+            content: {
+                "application/json": Record<string, unknown>;
+            };
+        };
+        responses: {
+            /** @description The JSON response body. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, unknown>;
+                };
+            };
+            /** @description invalid_argument, invalid_query */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unauthenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payment_required (billing refuses the operation for the account's standing) */
+            402: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description permission_denied and quota codes */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_found, namespace_not_found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description method_not_allowed; the `Allow` header lists the methods the path takes */
+            405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds */
+            408: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds */
+            409: {
+                headers: {
+                    /** @description Seconds to wait before retrying; sent with write_conflict only. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payload_too_large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description overloaded and tenant rate limits; retry after `Retry-After` seconds */
+            429: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description internal */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds */
+            502: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unavailable; retry after `Retry-After` seconds */
+            503: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+        };
+    };
+    KoshaService_HandleStripeWebhook: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description The JSON request body. */
+        requestBody: {
+            content: {
+                "application/json": Record<string, unknown>;
+            };
+        };
+        responses: {
+            /** @description The JSON response body. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, unknown>;
                 };
             };
             /** @description invalid_argument, invalid_query */
@@ -2875,28 +4188,29 @@ export interface operations {
             };
         };
     };
-    KoshaService_ExportNamespace: {
+    KoshaService_ListExports: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description At most this many exports (default and cap 100). */
+                limit?: number;
+                /** @description Page after this export id (`next` of the previous page). */
+                before?: string;
+            };
             header?: never;
             path: {
                 namespace: string;
             };
             cookie?: never;
         };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["KoshaServiceExportNamespaceBody"];
-            };
-        };
+        requestBody?: never;
         responses: {
-            /** @description A successful response. */
+            /** @description The JSON response body. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["v1ExportNamespaceResponse"];
+                    "application/json": Record<string, unknown>;
                 };
             };
             /** @description invalid_argument, invalid_query */
@@ -2953,10 +4267,10 @@ export interface operations {
                     "application/json": components["schemas"]["v1ErrorResponse"];
                 };
             };
-            /** @description request_timeout */
+            /** @description request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds */
             408: {
                 headers: {
-                    /** @description Seconds to wait before retrying, when retryable. */
+                    /** @description Seconds to wait before retrying. */
                     "Retry-After"?: number;
                     [name: string]: unknown;
                 };
@@ -2964,10 +4278,10 @@ export interface operations {
                     "application/json": components["schemas"]["v1ErrorResponse"];
                 };
             };
-            /** @description conflict; write_conflict is retryable */
+            /** @description already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds */
             409: {
                 headers: {
-                    /** @description Seconds to wait before retrying, when retryable. */
+                    /** @description Seconds to wait before retrying; sent with write_conflict only. */
                     "Retry-After"?: number;
                     [name: string]: unknown;
                 };
@@ -2984,10 +4298,10 @@ export interface operations {
                     "application/json": components["schemas"]["v1ErrorResponse"];
                 };
             };
-            /** @description tenant rate limits or overload */
+            /** @description overloaded and tenant rate limits; retry after `Retry-After` seconds */
             429: {
                 headers: {
-                    /** @description Seconds to wait before retrying, when retryable. */
+                    /** @description Seconds to wait before retrying. */
                     "Retry-After"?: number;
                     [name: string]: unknown;
                 };
@@ -3013,10 +4327,10 @@ export interface operations {
                     "application/json": components["schemas"]["v1ErrorResponse"];
                 };
             };
-            /** @description upstream_error */
+            /** @description upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds */
             502: {
                 headers: {
-                    /** @description Seconds to wait before retrying, when retryable. */
+                    /** @description Seconds to wait before retrying. */
                     "Retry-After"?: number;
                     [name: string]: unknown;
                 };
@@ -3024,10 +4338,653 @@ export interface operations {
                     "application/json": components["schemas"]["v1ErrorResponse"];
                 };
             };
-            /** @description unavailable */
+            /** @description unavailable; retry after `Retry-After` seconds */
             503: {
                 headers: {
-                    /** @description Seconds to wait before retrying, when retryable. */
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+        };
+    };
+    KoshaService_CreateExport: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                namespace: string;
+            };
+            cookie?: never;
+        };
+        /** @description The JSON request body. */
+        requestBody: {
+            content: {
+                "application/json": Record<string, unknown>;
+            };
+        };
+        responses: {
+            /** @description The JSON response body. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, unknown>;
+                };
+            };
+            /** @description invalid_argument, invalid_query */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unauthenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payment_required (billing refuses the operation for the account's standing) */
+            402: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description permission_denied and quota codes */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_found, namespace_not_found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description method_not_allowed; the `Allow` header lists the methods the path takes */
+            405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds */
+            408: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds */
+            409: {
+                headers: {
+                    /** @description Seconds to wait before retrying; sent with write_conflict only. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payload_too_large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description overloaded and tenant rate limits; retry after `Retry-After` seconds */
+            429: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description internal */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds */
+            502: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unavailable; retry after `Retry-After` seconds */
+            503: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+        };
+    };
+    KoshaService_GetExport: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                namespace: string;
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The JSON response body. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, unknown>;
+                };
+            };
+            /** @description invalid_argument, invalid_query */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unauthenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payment_required (billing refuses the operation for the account's standing) */
+            402: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description permission_denied and quota codes */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_found, namespace_not_found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description method_not_allowed; the `Allow` header lists the methods the path takes */
+            405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds */
+            408: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds */
+            409: {
+                headers: {
+                    /** @description Seconds to wait before retrying; sent with write_conflict only. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payload_too_large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description overloaded and tenant rate limits; retry after `Retry-After` seconds */
+            429: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description internal */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds */
+            502: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unavailable; retry after `Retry-After` seconds */
+            503: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+        };
+    };
+    KoshaService_DeleteExport: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                namespace: string;
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The JSON response body. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, unknown>;
+                };
+            };
+            /** @description invalid_argument, invalid_query */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unauthenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payment_required (billing refuses the operation for the account's standing) */
+            402: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description permission_denied and quota codes */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_found, namespace_not_found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description method_not_allowed; the `Allow` header lists the methods the path takes */
+            405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds */
+            408: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds */
+            409: {
+                headers: {
+                    /** @description Seconds to wait before retrying; sent with write_conflict only. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payload_too_large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description overloaded and tenant rate limits; retry after `Retry-After` seconds */
+            429: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description internal */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds */
+            502: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unavailable; retry after `Retry-After` seconds */
+            503: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+        };
+    };
+    KoshaService_DownloadExport: {
+        parameters: {
+            query?: {
+                /** @description The part to download (default 0). */
+                part?: number;
+            };
+            header?: never;
+            path: {
+                namespace: string;
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The JSON response body. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, unknown>;
+                };
+            };
+            /** @description invalid_argument, invalid_query */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unauthenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payment_required (billing refuses the operation for the account's standing) */
+            402: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description permission_denied and quota codes */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_found, namespace_not_found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description method_not_allowed; the `Allow` header lists the methods the path takes */
+            405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds */
+            408: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds */
+            409: {
+                headers: {
+                    /** @description Seconds to wait before retrying; sent with write_conflict only. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payload_too_large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description overloaded and tenant rate limits; retry after `Retry-After` seconds */
+            429: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description internal */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds */
+            502: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unavailable; retry after `Retry-After` seconds */
+            503: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
                     "Retry-After"?: number;
                     [name: string]: unknown;
                 };
@@ -3190,168 +5147,6 @@ export interface operations {
             503: {
                 headers: {
                     /** @description Seconds to wait before retrying. */
-                    "Retry-After"?: number;
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["v1ErrorResponse"];
-                };
-            };
-        };
-    };
-    KoshaService_HardDeleteNamespace: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                namespace: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["KoshaServiceHardDeleteNamespaceBody"];
-            };
-        };
-        responses: {
-            /** @description A successful response. */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["v1HardDeleteNamespaceResponse"];
-                };
-            };
-            /** @description invalid_argument, invalid_query */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["v1ErrorResponse"];
-                };
-            };
-            /** @description unauthenticated */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["v1ErrorResponse"];
-                };
-            };
-            /** @description payment_required (billing refuses the operation for the account's standing) */
-            402: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["v1ErrorResponse"];
-                };
-            };
-            /** @description permission_denied and quota codes */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["v1ErrorResponse"];
-                };
-            };
-            /** @description not_found, namespace_not_found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["v1ErrorResponse"];
-                };
-            };
-            /** @description method_not_allowed; the `Allow` header lists the methods the path takes */
-            405: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["v1ErrorResponse"];
-                };
-            };
-            /** @description request_timeout */
-            408: {
-                headers: {
-                    /** @description Seconds to wait before retrying, when retryable. */
-                    "Retry-After"?: number;
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["v1ErrorResponse"];
-                };
-            };
-            /** @description conflict; write_conflict is retryable */
-            409: {
-                headers: {
-                    /** @description Seconds to wait before retrying, when retryable. */
-                    "Retry-After"?: number;
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["v1ErrorResponse"];
-                };
-            };
-            /** @description payload_too_large */
-            413: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["v1ErrorResponse"];
-                };
-            };
-            /** @description tenant rate limits or overload */
-            429: {
-                headers: {
-                    /** @description Seconds to wait before retrying, when retryable. */
-                    "Retry-After"?: number;
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["v1ErrorResponse"];
-                };
-            };
-            /** @description internal */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["v1ErrorResponse"];
-                };
-            };
-            /** @description not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable */
-            501: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["v1ErrorResponse"];
-                };
-            };
-            /** @description upstream_error */
-            502: {
-                headers: {
-                    /** @description Seconds to wait before retrying, when retryable. */
-                    "Retry-After"?: number;
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["v1ErrorResponse"];
-                };
-            };
-            /** @description unavailable */
-            503: {
-                headers: {
-                    /** @description Seconds to wait before retrying, when retryable. */
                     "Retry-After"?: number;
                     [name: string]: unknown;
                 };
@@ -3683,13 +5478,7 @@ export interface operations {
     };
     KoshaService_PutNamespaceSchema: {
         parameters: {
-            query?: {
-                /**
-                 * @description Reject changes or removals of declared field types on a populated
-                 *     namespace. Defaults to false, preserving v1 schema replacement behavior.
-                 */
-                require_online_safe?: boolean;
-            };
+            query?: never;
             header?: never;
             path: {
                 namespace: string;

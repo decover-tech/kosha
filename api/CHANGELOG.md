@@ -9,18 +9,25 @@ Sections: Added, Changed, Deprecated, Removed.
 
 ## [1.1.0]
 
+Phase H control plane (#345–#349). All new operations are beta.
+
 ### Added
 
-- `POST /v1/namespaces/{namespace}/hard-delete` requires the namespace name
-  as confirmation and returns the durable deletion record. Existing v1
-  DELETE clients remain compatible.
-- `POST /v1/namespaces/{namespace}/export` gives tenant administrators a
-  signed URL to the namespace's complete live document snapshot as JSONL.
-
-- `POST /v1/namespaces/{namespace}/schema?require_online_safe=true` opts in
-  to rejecting changes or removals of declared field types on populated
-  namespaces with `409 conflict` and `details.reason: "reindex_required"`.
-  Existing v1 schema replacements are unchanged by default.
+- Self-serve tenant API keys (#346): `GET`/`POST /v1/api-keys`,
+  `POST /v1/api-keys/rotate`, `POST /v1/api-keys/revoke` (an
+  `admin`-scoped key manages its own tenant's keys).
+- Namespace exports (#347): `POST`/`GET /v1/namespaces/{namespace}/exports`,
+  `GET`/`DELETE /v1/namespaces/{namespace}/exports/{id}` and
+  `GET /v1/namespaces/{namespace}/exports/{id}/download` (JSONL parts).
+- Billing self-service (#349): `POST /v1/billing/checkout`,
+  `POST /v1/billing/portal`, and Stripe's
+  `POST /v1/billing/webhooks/stripe` (signed by Stripe, no API key).
+- Response fields (#347): `changes` on `PUT /v1/namespaces/{namespace}/schema`
+  (the online changes applied); `deletion` on `DELETE .../branch`;
+  `acks_required`, `storage_verified` and `exports_deleted` on deletion
+  records, whose `scope` may also be `branch` or `migrated`.
+- Admin document: `POST /v1/admin/billing/dunning` and
+  `POST /v1/admin/billing/catalog/reload`.
 
 ## [1.0.0]
 

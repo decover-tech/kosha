@@ -295,32 +295,6 @@ fn an_untyped_embedding_field_is_a_vector_and_its_canonical_schema_round_trips()
 }
 
 #[test]
-fn strict_schema_replacement_preserves_inferred_embedding_types() {
-    let state = state_with(EmbedderRegistry::with_mock());
-    let mut creation_schema = schema(MODEL, DIMS);
-    creation_schema["fields"]["emb"]
-        .as_object_mut()
-        .unwrap()
-        .remove("type");
-    let (status, body) = call(
-        &state,
-        "POST /v1/namespaces",
-        serde_json::json!({"namespace": "shop", "schema": creation_schema}),
-    );
-    assert_eq!(status, 200, "{body}");
-    let (status, body) = index_texts(&state, "shop", &[("one", "some text")]);
-    assert_eq!(status, 200, "{body}");
-
-    let route = "POST /v1/namespaces/shop/schema?require_online_safe=true";
-    let (status, body) = call(&state, route, creation_schema);
-    assert_eq!(status, 200, "{body}");
-    let (status, body) = call(&state, route, serde_json::json!({"fields": {"emb": {}}}));
-    assert_eq!(status, 409, "{body}");
-    assert_eq!(body["details"]["reason"], "reindex_required");
-    std::fs::remove_dir_all(&state.data_dir).unwrap();
-}
-
-#[test]
 fn text_is_embedded_at_ingest_and_query_text_finds_neighbours() {
     let counting = Counting::new(MODEL, DIMS);
     let state = state_with(EmbedderRegistry::default().with_embedder(counting.clone()));

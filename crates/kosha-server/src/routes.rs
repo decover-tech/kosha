@@ -9,7 +9,7 @@
 //! - whether a `/v1` path exists at all (`route` answers 404 for one that
 //!   is not here, and 405 with `Allow` for a known path with the wrong
 //!   method);
-//! - `is_write_path` / `is_search_route` for `/v1` paths, so a new route
+//! - forwarding, write admission and search admission for `/v1` paths, so a new route
 //!   cannot be forwarded or limited differently from what it declares;
 //! - the spec: `public_routes_match_spec` asserts the table and the spec
 //!   describe the same operations, and that every operation reaches a
@@ -29,7 +29,7 @@ pub(crate) enum Class {
     /// Mutates state; a query pod forwards it to the ingest pod.
     Write,
     /// Read-only, but the state it reads lives on the writer pod
-    /// (compaction jobs), so a query pod forwards it like a write.
+    /// (e.g., unflushed documents or compaction jobs), so a query pod forwards it.
     WriterRead,
 }
 
@@ -106,18 +106,6 @@ pub(crate) static ROUTES: &[Route] = &[
     ),
     public(
         "POST",
-        "/v1/namespaces/{namespace}/hard-delete",
-        "KoshaService_HardDeleteNamespace",
-        Write,
-    ),
-    public(
-        "POST",
-        "/v1/namespaces/{namespace}/export",
-        "KoshaService_ExportNamespace",
-        Write,
-    ),
-    public(
-        "POST",
         "/v1/namespaces/{namespace}/documents",
         "KoshaService_IndexDocuments",
         Write,
@@ -138,7 +126,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "POST",
         "/v1/namespaces/{namespace}/exists",
         "KoshaService_Exists",
-        Read,
+        WriterRead,
     ),
     public(
         "POST",
@@ -196,6 +184,78 @@ pub(crate) static ROUTES: &[Route] = &[
     ),
     public("GET", "/v1/usage", "KoshaService_GetUsage", Read),
     public("GET", "/v1/billing", "KoshaService_GetBilling", Read),
+    public(
+        "GET",
+        "/v1/api-keys",
+        "KoshaService_ListTenantApiKeys",
+        Read,
+    ),
+    public(
+        "POST",
+        "/v1/api-keys",
+        "KoshaService_CreateTenantApiKey",
+        Read,
+    ),
+    public(
+        "POST",
+        "/v1/api-keys/rotate",
+        "KoshaService_RotateTenantApiKey",
+        Read,
+    ),
+    public(
+        "POST",
+        "/v1/api-keys/revoke",
+        "KoshaService_RevokeTenantApiKey",
+        Read,
+    ),
+    public(
+        "POST",
+        "/v1/billing/checkout",
+        "KoshaService_CreateCheckoutSession",
+        Read,
+    ),
+    public(
+        "POST",
+        "/v1/billing/portal",
+        "KoshaService_CreateBillingPortalSession",
+        Read,
+    ),
+    public(
+        "POST",
+        "/v1/billing/webhooks/stripe",
+        "KoshaService_HandleStripeWebhook",
+        Read,
+    ),
+    public(
+        "POST",
+        "/v1/namespaces/{namespace}/exports",
+        "KoshaService_CreateExport",
+        Write,
+    ),
+    public(
+        "GET",
+        "/v1/namespaces/{namespace}/exports",
+        "KoshaService_ListExports",
+        Read,
+    ),
+    public(
+        "GET",
+        "/v1/namespaces/{namespace}/exports/{id}",
+        "KoshaService_GetExport",
+        Read,
+    ),
+    public(
+        "DELETE",
+        "/v1/namespaces/{namespace}/exports/{id}",
+        "KoshaService_DeleteExport",
+        Write,
+    ),
+    public(
+        "GET",
+        "/v1/namespaces/{namespace}/exports/{id}/download",
+        "KoshaService_DownloadExport",
+        Read,
+    ),
     // ── Admin: proto/kosha/v1/admin.proto `AdminService` ───────────────────
     admin("GET", "/v1/stats", "AdminService_GetServerStats", Read),
     admin(
@@ -371,6 +431,18 @@ pub(crate) static ROUTES: &[Route] = &[
         "POST",
         "/v1/admin/billing/invoices/mark-paid",
         "AdminService_MarkInvoicePaid",
+        Write,
+    ),
+    admin(
+        "POST",
+        "/v1/admin/billing/dunning",
+        "AdminService_RunDunning",
+        Write,
+    ),
+    admin(
+        "POST",
+        "/v1/admin/billing/catalog/reload",
+        "AdminService_ReloadBillingCatalog",
         Write,
     ),
     admin("POST", "/v1/admin/users", "AdminService_CreateUser", Write),
@@ -573,19 +645,15 @@ mod tests {
         assert!(allowed_methods("/v1/namespaces/docs/nope").is_empty());
     }
 
-    /// Recorded from `is_write_path` / `is_search_route` before they were
-    /// driven by [`ROUTES`] (#350), and required to hold unchanged after:
-    /// `(request line, forwarded to ingest, search route)`.
+    /// Pinned routing behavior: `(request line, forwarded to ingest, search route)`.
     const PINNED: &[(&str, bool, bool)] = &[
         ("GET /v1/healthz HTTP/1.1", false, false),
         ("POST /v1/namespaces HTTP/1.1", true, false),
         ("GET /v1/namespaces HTTP/1.1", false, false),
         ("DELETE /v1/namespaces/docs HTTP/1.1", true, false),
-        ("POST /v1/namespaces/docs/hard-delete HTTP/1.1", true, false),
-        ("POST /v1/namespaces/docs/export HTTP/1.1", true, false),
         ("POST /v1/namespaces/docs/documents HTTP/1.1", true, false),
         ("POST /v1/namespaces/docs/search HTTP/1.1", false, true),
-        ("POST /v1/namespaces/docs/exists HTTP/1.1", false, false),
+        ("POST /v1/namespaces/docs/exists HTTP/1.1", true, false),
         ("POST /v1/namespaces/docs/flush HTTP/1.1", true, false),
         ("POST /v1/namespaces/docs/delete HTTP/1.1", true, false),
         ("GET /v1/namespaces/docs/stats HTTP/1.1", false, false),
@@ -666,12 +734,38 @@ mod tests {
             false,
         ),
         ("GET /v1/admin/orgs/o1/audit-log HTTP/1.1", false, false),
+        ("GET /v1/api-keys HTTP/1.1", false, false),
+        ("POST /v1/api-keys HTTP/1.1", false, false),
+        ("POST /v1/api-keys/rotate HTTP/1.1", false, false),
+        ("POST /v1/api-keys/revoke HTTP/1.1", false, false),
+        ("POST /v1/billing/checkout HTTP/1.1", false, false),
+        ("POST /v1/billing/portal HTTP/1.1", false, false),
+        ("POST /v1/billing/webhooks/stripe HTTP/1.1", false, false),
+        ("POST /v1/namespaces/docs/exports HTTP/1.1", true, false),
+        ("GET /v1/namespaces/docs/exports HTTP/1.1", false, false),
+        ("GET /v1/namespaces/docs/exports/e1 HTTP/1.1", false, false),
+        (
+            "DELETE /v1/namespaces/docs/exports/e1 HTTP/1.1",
+            true,
+            false,
+        ),
+        (
+            "GET /v1/namespaces/docs/exports/e1/download HTTP/1.1",
+            false,
+            false,
+        ),
+        ("POST /v1/admin/billing/dunning HTTP/1.1", true, false),
+        (
+            "POST /v1/admin/billing/catalog/reload HTTP/1.1",
+            true,
+            false,
+        ),
         // Legacy routes stay hand-classified.
         ("POST /index HTTP/1.1", true, false),
         ("POST /replace HTTP/1.1", true, false),
         ("POST /flush HTTP/1.1", true, false),
         ("POST /delete HTTP/1.1", true, false),
-        ("POST /exists HTTP/1.1", false, false),
+        ("POST /exists HTTP/1.1", true, false),
         ("POST /search HTTP/1.1", false, true),
         ("GET /search?ns=docs&q=x HTTP/1.1", false, true),
         ("GET /stats HTTP/1.1", false, false),
@@ -680,8 +774,12 @@ mod tests {
 
     #[test]
     fn route_table_pins_today() {
-        for &(line, write, search) in PINNED {
-            assert_eq!(crate::is_write_path(line), write, "is_write_path({line})");
+        for &(line, ingest, search) in PINNED {
+            assert_eq!(
+                crate::is_ingest_path(line),
+                ingest,
+                "is_ingest_path({line})"
+            );
             assert_eq!(
                 crate::is_search_route(line),
                 search,

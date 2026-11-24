@@ -64,11 +64,10 @@ ConfigMap). The role is validated at startup (#254): `query` requires
 
 **Clients only ever need `kosha-service`** — for both reads and writes,
 exactly like a single OpenSearch cluster endpoint. `kosha-service` selects
-`role: query`; a query pod handles reads itself and *transparently forwards*
-write-path requests (`/index`, `/flush`, `/replace`, `/delete`,
-`/v1/admin/*`) to `kosha-ingest-service` (which selects `role: ingest`),
-relaying the response back verbatim. See `crates/kosha-server/src/main.rs`'s
-`is_write_path`/`forward_to_ingest` for the implementation.
+`role: query`; a query pod handles most reads itself and *transparently forwards*
+writes and reads of writer-local state to `kosha-ingest-service` (which selects
+`role: ingest`), relaying the response back verbatim. This includes existence
+checks so they see acknowledged writes that have not been flushed.
 `kosha-ingest-service` is not meant for direct
 client use; it exists as the forwarding target and an optional bypass for
 admin/migration scripts.

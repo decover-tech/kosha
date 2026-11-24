@@ -40,7 +40,7 @@ from typing import Dict, List, Optional, Tuple
 
 MARKER = "<!-- kosha-relevance-compare -->"
 DEFAULT_THRESHOLD = 1.0
-DEFAULT_OVERRIDES: List[Tuple[str, float]] = [("filtered_knn.*@0.1%.*", 2.0)]
+DEFAULT_OVERRIDES: List[Tuple[str, float]] = [("*filtered_knn.*@0.1%.*", 2.0)]
 # Deltas within this many points are float noise, not a change.
 EPS = 1e-9
 
@@ -89,7 +89,7 @@ def parse_override(text: str) -> Tuple[str, float]:
 
 MODE_ORDER = {"lexical": 0, "vector": 1, "hybrid": 2}
 POLICY_ORDER = {"probe": 0, "planned": 1}
-_FILTERED = re.compile(r"^filtered_knn\.(\w+)@([\d.]+)%\.(.*)$")
+_FILTERED = re.compile(r"^(ood\.)?filtered_knn\.(\w+)@([\d.]+)%\.(.*)$")
 
 
 def sort_key(name: str) -> tuple:
@@ -101,7 +101,8 @@ def sort_key(name: str) -> tuple:
         return (0, MODE_ORDER[mode], name)
     m = _FILTERED.match(name)
     if m:
-        return (1, POLICY_ORDER.get(m.group(1), 9), m.group(1), -float(m.group(2)), m.group(3))
+        ood, policy, selectivity, metric = m.groups()
+        return (1, bool(ood), POLICY_ORDER.get(policy, 9), policy, -float(selectivity), metric)
     return (2, name)
 
 
@@ -204,6 +205,21 @@ def render_comment(
             f"segments, {fx.get('judged_queries')} judged queries; kNN num_candidates "
             f"{cfg.get('num_candidates')}.",
         ]
+        exact = head_report.get("vector_vs_exact")
+        if exact:
+            lines += [
+                "",
+                "**ANN vs exact on the head** (same embeddings and qrels; points ×100):",
+                "",
+                "| metric | ANN | exact | ANN − exact | queries |",
+                "|---|---:|---:|---:|---:|",
+            ]
+            for name, scores in sorted(exact.items()):
+                delta = scores["delta"]
+                lines.append(
+                    f"| `{name}` | {fmt_value(scores['ann'])} | {fmt_value(scores['exact'])} "
+                    f"| {fmt_delta(None if delta is None else delta * 100)} | {scores['queries']} |"
+                )
     if stale_baseline:
         shown = ", ".join(f"`{n}`" for n in stale_baseline[:6])
         more = "" if len(stale_baseline) <= 6 else f" and {len(stale_baseline) - 6} more"

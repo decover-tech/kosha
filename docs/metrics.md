@@ -65,10 +65,10 @@ plus `+Inf`.
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `kosha_cache_bytes` | gauge | `cache` (`tenant`) | `nvme`: bytes in the local read-through file cache (`KOSHA_DATA_DIR`). `segment`: approximate bytes of parsed segments held in memory (the `KOSHA_SEGMENT_CACHE_MAX_BYTES` ledger). `result`: bytes of cached `POST /search` responses (`KOSHA_RESULT_CACHE_MAX_BYTES`). Not reported for `corpus_stats` and `ceiling`, which are bounded by entry count |
-| `kosha_cache_evictions_total` | counter | `cache` (`tenant`) | `nvme`: evictions from the local file cache, one per file or directory (such as a segment) removed, whether by the `KOSHA_CACHE_MAX_BYTES` limit or by an explicit eviction. A span directory dropped because a promotion landed its whole file is not counted: nothing became less local. `segment`, `result`: entries evicted to stay within the cache's budget. `corpus_stats`, `ceiling`: manifest versions evicted to stay within the cache's entry bound (a version replaced by a newer one of the same namespace is not counted) |
-| `kosha_cache_hits_total` | counter | `cache` (`tenant`) | Lookups that found their entry (#342). `nvme`: a search's segment whose scoring files were already local, counted per segment checked by a hydration pass and, for a warm search served from the cached hydration verdict, per manifest segment. `segment`: a parsed segment found in memory. `result`: a search answered from the result cache. `corpus_stats`: a search whose namespace corpus statistics (BM25 totals) were cached for its manifest version. `ceiling`: the same for per-segment score ceilings |
-| `kosha_cache_misses_total` | counter | `cache` (`tenant`) | Lookups that did not (#342). `nvme`: a search's segment that had to be hydrated. `segment`: a segment opened and parsed. `result`: a cacheable search that ran. `corpus_stats`, `ceiling`: the manifest version's entry had to be built |
+| `kosha_cache_bytes` | gauge | `cache` (`tenant`) | `nvme`: bytes in the local read-through file cache (`KOSHA_DATA_DIR`). `segment`: approximate bytes of parsed segments held in memory (the `KOSHA_SEGMENT_CACHE_MAX_BYTES` ledger). `result`: bytes of cached `POST /search` responses (`KOSHA_RESULT_CACHE_MAX_BYTES`). `postings`: bytes of decoded text postings held in memory, summed over segments (`KOSHA_POSTINGS_CACHE_MAX_BYTES` per segment). `vector_postings`: bytes in the process-wide decoded vector postings cache (`KOSHA_VECTOR_POSTINGS_CACHE_MAX_BYTES`). Not reported for `corpus_stats` and `ceiling`, which are bounded by entry count, or for `posting_blob_presence` |
+| `kosha_cache_evictions_total` | counter | `cache` (`tenant`) | `nvme`: evictions from the local file cache, one per file or directory (such as a segment) removed, whether by the `KOSHA_CACHE_MAX_BYTES` limit or by an explicit eviction. A span directory dropped because a promotion landed its whole file is not counted: nothing became less local. `segment`, `result`, `postings`, `vector_postings`: entries evicted to stay within the cache's budget. `corpus_stats`, `ceiling`: manifest versions evicted to stay within the cache's entry bound (a version replaced by a newer one of the same namespace is not counted). Not reported for `posting_blob_presence`, whose one entry per namespace is replaced, never evicted, when the manifest version or eviction generation moves |
+| `kosha_cache_hits_total` | counter | `cache` (`tenant`) | Lookups that found their entry (#342). `nvme`: a search's segment whose scoring files were already local, counted per segment checked by a hydration pass and, for a warm search served from the cached hydration verdict, per manifest segment. `segment`: a parsed segment found in memory. `result`: a search answered from the result cache. `corpus_stats`: a search whose namespace corpus statistics (BM25 totals) were cached for its manifest version. `ceiling`: the same for per-segment score ceilings. `postings`, `vector_postings`: a decoded text or vector posting found in memory (#197). `posting_blob_presence`: a segment whose posting shards (or terms, for ranged reads) a search needs were all already confirmed local for this manifest version, so no stat or term-table read was needed; counted per segment per lookup, and stays at zero without S3 |
+| `kosha_cache_misses_total` | counter | `cache` (`tenant`) | Lookups that did not (#342). `nvme`: a search's segment that had to be hydrated. `segment`: a segment opened and parsed. `result`: a cacheable search that ran. `corpus_stats`, `ceiling`: the manifest version's entry had to be built. `postings`, `vector_postings`: a posting that had to be read and decoded. `posting_blob_presence`: a segment whose posting shards had to be checked on disk or fetched. A falling hit ratio after warmup means evictions or failed span writes keep invalidating the cache |
 | `kosha_hydrations_total` | counter | `source` | Segment files a hydration needed, by where they came from. `s3`: fetched from the object store. `peer`: streamed from the replica holding the hydration lease. `local`: already in the local cache when the fetch ran. Ranged span reads of doc stores and postings are not counted. Stays at zero without S3 |
 | `kosha_hydration_lease_outcome_total` | counter | `outcome` | Cross-replica hydration lease claims (S3 and Postgres builds with `POD_IP` set). `won`: this replica fetches the file. `streamed_from_peer`: another replica held the lease and served the bytes. `timeout`: the holder did not serve the bytes within the peer-fetch budget (or the fetch failed), and the file was fetched from S3 instead |
 | `kosha_segment_checksum_failures_total` | counter | none | Hydrated segment files that failed their `_COMMIT` size or CRC check, refetch failures included. The same number as `segment_checksum_failures` in `GET /v1/stats` |
@@ -99,15 +99,67 @@ like any other explicit eviction. Its own counters are per pod, in the `deletion
 | `kosha_deletion_purge_parsed_segments_dropped_total` | Parsed segments dropped from memory |
 | `kosha_deletion_purge_deferred_total` | Directories or namespaces a sweep left for a later one (written to within the last 5 s, pinned, being fetched, or held by a writer's unpublished state) |
 | `kosha_deletion_purge_errors_total` | Passes or sweeps that failed (control store unreadable, a file that could not be removed) |
-| `kosha_deletion_resume_attempts_total`, `kosha_deletion_resume_completed_total` | Automatic retries of pending namespace records on a writer pod (`KOSHA_DELETION_RESUME_INTERVAL_MS`), and how many completed the record |
+| `kosha_deletion_resume_attempts_total`, `kosha_deletion_resume_completed_total` | Automatic retries of pending namespace, branch and tenant records on a writer pod (`KOSHA_DELETION_RESUME_INTERVAL_MS`), and how many finished the storage reclaim |
 | `kosha_deletion_resume_fenced_total` | Automatic retries skipped because the namespace's writer lease could not be taken (another writer pod holds it, or the lease store could not be reached) |
+| `pod_id`, `require_acks` | This pod's id in the pod registry, and whether deletions it records wait for acknowledgements (`KOSHA_DELETION_REQUIRE_ACKS`) |
+| `kosha_deletion_acks_written_total` | Acknowledgements this pod wrote (one per record with `acks_required`, after a clean sweep of its subject) |
+| `kosha_deletion_records_finalized_total` | Records this pod saw complete once their acknowledgements were in |
+| `kosha_deletion_heartbeat_errors_total` | Pod-registry heartbeats that failed (control store unreachable); a pod that cannot heartbeat stops being waited for after `KOSHA_POD_LIVENESS_MS` |
+
+Namespace exports (`KOSHA_EXPORTS`, #347) add no family to `/metrics` either. Their per-pod
+counters are in the `exports` block of `GET /v1/stats`:
+
+| Field | Meaning |
+| --- | --- |
+| `enabled`, `running` | Whether exports are served, and how many this pod is writing now (at most 2) |
+| `kosha_exports_started_total` | Exports started on this pod (`POST .../exports`) |
+| `kosha_exports_completed_total`, `kosha_exports_failed_total` | Exports this pod finished, and those that failed (their objects are deleted) |
+| `kosha_exports_expired_total` | Completed exports the sweep expired (objects deleted) after `KOSHA_EXPORT_TTL_SECS` |
+| `kosha_exports_deleted_total` | Exports deleted by their owner or with their namespace or tenant |
 
 Each cache keeps these figures per tenant (#342): the tenant is the first component of the
 `<tenant>/<name>` namespace id, and bare namespace ids from before tenants existed count as
 one shared `_legacy` tenant. Without tenant labels each `kosha_cache_*` family has one series
 per cache, summed over tenants; with `KOSHA_METRICS_TENANT_LABELS=on` it has one series per
 cache and tenant instead (see [Tenant labels](#tenant-labels)). The labelled NVMe evictions add
-up to the unlabelled count.
+up to the unlabelled count. The `postings` and `vector_postings` caches are shared across
+tenants, so their series carry only the `cache` label in both modes.
+
+### Usage metering
+
+Present only on a pod with `KOSHA_USAGE_METERING=on` (#348). Each pod reports its own pipeline:
+the events it produced, its spool, and its deliveries to the usage store. The same counters (since
+process start) are in `pipeline` of `GET /v1/admin/usage`.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `kosha_usage_events_emitted_total` | counter | none | Usage events this pod produced: searches, writes, deletes and snapshots. Spooled plus dropped |
+| `kosha_usage_events_spooled_total` | counter | none | Events appended to the local spool |
+| `kosha_usage_events_delivered_total` | counter | none | Events the usage store accepted (flushed). A file resent after a crash counts again here, not in the store |
+| `kosha_usage_events_dropped_total` | counter | none | Events dropped because the spool was at `KOSHA_USAGE_SPOOL_MAX_BYTES` or unwritable. **Alert on any increase**: those events are lost for billing |
+| `kosha_usage_spool_malformed_lines_total` | counter | none | Spool lines that did not parse when delivered (a write cut short by a crash) |
+| `kosha_usage_sink_errors_total` | counter | none | Flushes that failed (usage store unreachable, spool file error). Events stay spooled and are retried every `KOSHA_USAGE_FLUSH_MS` |
+| `kosha_usage_spool_bytes` | gauge | none | Bytes of events waiting in the spool. Growing steadily means delivery is failing |
+| `kosha_usage_last_delivery_timestamp_seconds` | gauge | none | Unix time of the last flush that delivered the whole spool; 0 before the first |
+| `kosha_usage_snapshot_runs_total` | counter | none | Runs of the snapshot tick (`KOSHA_USAGE_SNAPSHOT_TICK_MS`, writer pods only) |
+| `kosha_usage_snapshots_total` | counter | `meter` | Hourly namespace snapshots emitted, `stored_bytes` or `vector_dimensions` |
+| `kosha_usage_snapshot_failures_total` | counter | none | Namespace snapshots a tick could not take (object listing or segment footer read failed); retried next tick |
+| `kosha_usage_footer_reads_total` | counter | none | Segment footers read for the `vector_dimensions` meter. Each segment's footer is read once; a rate that keeps up with the snapshot rate means the cache is not working |
+
+### Billing
+
+Present only on a pod with `KOSHA_BILLING=on` (#349).
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `kosha_billing_webhook_events_total` | counter | `outcome` | Stripe webhook deliveries. `processed`: applied (including events billing ignores). `duplicate`: an event id processed before. `bad_signature`: refused with 400 (missing, stale or wrong `Stripe-Signature`; a steady rate means a wrong `KOSHA_STRIPE_WEBHOOK_SECRET`). `invalid`: signed but not an event. `failed`: a store or provider error, answered 503 so Stripe delivers it again |
+| `kosha_billing_scheduler_runs_total` | counter | `result` | Scheduler ticks (`KOSHA_BILLING_SCHEDULER=on`). `ok`, `failed` (a step reported an error; see the log), `not_leader` (another pod holds the lease) |
+| `kosha_billing_scheduler_last_run_timestamp_seconds` | gauge | none | Unix time of the last tick this pod ran as the leader; 0 if none. Across pods, alert when the maximum is older than a few intervals |
+| `kosha_billing_notices_total` | counter | `outcome` | Dunning notices: `sent`, or `failed` (offered again on the next pass) |
+| `kosha_billing_payment_retries_total` | counter | none | Payments retried by dunning |
+| `kosha_billing_payments_collected_total` | counter | none | Invoices a dunning retry collected |
+| `kosha_billing_catalog_reloads_total` | counter | `outcome` | Plan catalog reloads: `applied`, or `rejected` (invalid, or drops a plan an account is on; the old catalog stays) |
+| `kosha_billing_refresh_failures_total` | counter | none | Standings refreshes that failed; the pod enforces its previous standings |
 
 ## Namespace labels
 

@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use crate::http_routes::legacy_route_disabled;
 use crate::routes::{self, Surface};
 use crate::*;
 
@@ -332,8 +333,9 @@ fn legacy_flag_off_and_allowlist_through_the_router() {
         assert_eq!(status_of(&index("a")), 410);
         assert_eq!(status_of(&index("b")), 410);
     });
-    // Back to the process default (on): served again.
-    assert_eq!(status_of(&index("a")), 200);
+    auth::with_legacy_policy(true, "", || {
+        assert_eq!(status_of(&index("a")), 200);
+    });
 }
 
 /// A missing namespace is `namespace_not_found` on every route, delete
@@ -386,6 +388,7 @@ fn every_operation_lists_its_error_codes() {
 /// cutover is counted; a /v1 response carries no deprecation headers.
 #[test]
 fn legacy_responses_carry_deprecation_headers_and_are_counted() {
+    let _legacy = auth::override_legacy_policy(true, "");
     let state = AppState::new(tests::test_dir());
     let headers = HashMap::new();
     let body = serde_json::json!({"namespace": "docs", "documents": [{"id": "1", "fields": [
@@ -437,4 +440,8 @@ fn a_disabled_legacy_route_names_its_replacement() {
         body["details"]["replacement"],
         "POST /v1/namespaces/{namespace}/documents"
     );
+
+    let raw = legacy_route_disabled("/stats");
+    assert_eq!(status_of(&raw), 410);
+    assert_eq!(body_of(&raw)["details"]["replacement"], "GET /v1/stats");
 }

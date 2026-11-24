@@ -761,9 +761,9 @@ pub struct S3Storage {
     local: LocalStorage,
     bucket: String,
     prefix: String,
-    custom_endpoint: bool,
     rt: tokio::runtime::Runtime,
     client: aws_sdk_s3::Client,
+    custom_endpoint: bool,
     sse: SseConfig,
     tenant_kms_key_lookup: Option<Box<TenantKmsKeyLookup>>,
 }
@@ -811,9 +811,9 @@ impl S3Storage {
             local,
             bucket: config.bucket,
             prefix: config.prefix,
-            custom_endpoint: config.endpoint.is_some(),
             rt,
             client,
+            custom_endpoint: config.endpoint.is_some(),
             sse: config.sse,
             tenant_kms_key_lookup: None,
         })
@@ -1033,46 +1033,6 @@ impl S3Storage {
         let key = self.s3_key(logical_path);
         self.rt
             .block_on(async move { put_bytes(client, bucket, key, data, sse).await })
-    }
-
-    pub(crate) fn upload_export(
-        &self,
-        local_path: &Path,
-        logical_path: &str,
-    ) -> Result<String, KoshaError> {
-        use aws_sdk_s3::presigning::PresigningConfig;
-
-        let key = self.s3_key(logical_path);
-        let size = std::fs::metadata(local_path)?.len();
-        let part_size = (64 * 1024 * 1024).max(size.div_ceil(10_000));
-        let sse = self.sse_for_path(logical_path)?;
-        self.rt.block_on(async {
-            put_stream(
-                &self.client,
-                &self.bucket,
-                &key,
-                sse.as_ref(),
-                size,
-                part_size,
-                UploadSource::File(local_path),
-            )
-            .await?;
-            let expiry = PresigningConfig::expires_in(std::time::Duration::from_secs(
-                crate::namespace_export::URL_EXPIRY_SECONDS,
-            ))
-            .map_err(|e| KoshaError::Io(std::io::Error::other(e)))?;
-            let signed = self
-                .client
-                .get_object()
-                .bucket(&self.bucket)
-                .key(&key)
-                .response_content_type("application/x-ndjson")
-                .response_cache_control("no-store")
-                .presigned(expiry)
-                .await
-                .map_err(|e| KoshaError::NotFound(log_s3_error("presign export", &key, &e)))?;
-            Ok(signed.uri().to_string())
-        })
     }
 
     /// Download multiple logical paths concurrently, bounded by
@@ -1546,6 +1506,92 @@ impl S3Storage {
         )
     }
 
+    /// Upload a local file to `logical_path` as an object of `tenant`
+    /// (#347 exports, which live under `_exports/` where
+    /// [`SseConfig::for_path`] would see no tenant): the tenant's SSE key
+    /// applies. The file is read whole; export parts are bounded by
+    /// `KOSHA_EXPORT_PART_BYTES`.
+    pub fn put_file_for_tenant(
+        &self,
+        local: &Path,
+        logical_path: &str,
+        tenant: &str,
+    ) -> Result<(), KoshaError> {
+        let data = std::fs::read(local).map_err(KoshaError::Io)?;
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key = self.s3_key(logical_path);
+        let sse = self.sse.for_tenant(Some(tenant));
+        self.rt
+            .block_on(async move { put_bytes(client, bucket, key, data, sse).await })
+    }
+
+    /// Stream one object into a local file (created or truncated), without
+    /// going through the segment cache. Returns its length.
+    pub fn get_object_to_file(&self, logical_path: &str, dest: &Path) -> Result<u64, KoshaError> {
+        use tokio::io::AsyncWriteExt;
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key = self.s3_key(logical_path);
+        let dest = dest.to_path_buf();
+        self.rt.block_on(async move {
+            let resp = client
+                .get_object()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 get_object: {}",
+                        log_get_object_error(&key, &e)
+                    ))
+                })?;
+            let mut body = resp.body;
+            let mut file = tokio::fs::File::create(&dest).await?;
+            let mut written = 0u64;
+            while let Some(chunk) = body.try_next().await.map_err(|e| {
+                KoshaError::NotFound(format!(
+                    "S3 read body: {}",
+                    log_s3_error("read body", &key, &e)
+                ))
+            })? {
+                file.write_all(&chunk).await?;
+                written += chunk.len() as u64;
+            }
+            file.flush().await?;
+            Ok(written)
+        })
+    }
+
+    /// A presigned `GET` URL for `logical_path`, valid for `expires_in`.
+    pub fn presign_get(
+        &self,
+        logical_path: &str,
+        expires_in: std::time::Duration,
+    ) -> Result<String, KoshaError> {
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key = self.s3_key(logical_path);
+        let config = aws_sdk_s3::presigning::PresigningConfig::expires_in(expires_in)
+            .map_err(|e| KoshaError::NotFound(format!("presigning config: {e}")))?;
+        self.rt.block_on(async move {
+            client
+                .get_object()
+                .bucket(&bucket)
+                .key(&key)
+                .presigned(config)
+                .await
+                .map(|request| request.uri().to_string())
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 presign get_object: {}",
+                        log_s3_error("presign get_object", &key, &e)
+                    ))
+                })
+        })
+    }
+
     /// Delete one object from S3, surfacing failures (unlike the trait's
     /// `delete`, which predates GC and is best-effort remotely).
     pub fn delete_remote(&self, path: &str) -> Result<(), KoshaError> {
@@ -1596,6 +1642,14 @@ impl S3Storage {
                     log_s3_error("list_object_versions", prefix, &e)
                 ))
             })?;
+        if page.versions().is_empty()
+            && page.delete_markers().is_empty()
+            && page.is_truncated().unwrap_or_default()
+        {
+            return Err(KoshaError::NotFound(
+                "S3 version listing was truncated without returning entries".into(),
+            ));
+        }
         page.versions()
             .iter()
             .map(|v| (v.key(), v.version_id()))
@@ -1680,6 +1734,8 @@ impl S3Storage {
         }
     }
 
+    /// A lower bound on entries still under this prefix; zero means neither
+    /// listing found an entry.
     pub(crate) fn count_erasure_page(&self, path: &str) -> Result<usize, KoshaError> {
         let prefix = self.erasure_prefix(path)?;
         self.rt.block_on(async {
@@ -2722,153 +2778,94 @@ async fn put_bytes(
     data: Vec<u8>,
     sse: Option<ObjectSse>,
 ) -> Result<(), KoshaError> {
-    put_stream(
-        &client,
-        &bucket,
-        &key,
-        sse.as_ref(),
-        data.len() as u64,
-        5 * 1024 * 1024,
-        UploadSource::Bytes(&data),
-    )
-    .await
-}
+    let size = data.len();
 
-enum UploadSource<'a> {
-    Bytes(&'a [u8]),
-    File(&'a Path),
-}
-
-impl UploadSource<'_> {
-    async fn read(
-        &self,
-        offset: u64,
-        length: u64,
-    ) -> Result<aws_sdk_s3::primitives::ByteStream, KoshaError> {
-        use aws_sdk_s3::primitives::{ByteStream, Length};
-
-        match self {
-            Self::Bytes(data) => Ok(ByteStream::from(
-                data[offset as usize..(offset + length) as usize].to_vec(),
-            )),
-            Self::File(path) => ByteStream::read_from()
-                .path(*path)
-                .offset(offset)
-                .length(Length::Exact(length))
-                .build()
-                .await
-                .map_err(|e| KoshaError::Io(std::io::Error::other(e))),
-        }
-    }
-}
-
-async fn put_stream(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-    key: &str,
-    sse: Option<&ObjectSse>,
-    size: u64,
-    part_size: u64,
-    source: UploadSource<'_>,
-) -> Result<(), KoshaError> {
-    if size > part_size {
+    if size > 5 * 1024 * 1024 {
         let mpu = client
             .create_multipart_upload()
-            .bucket(bucket)
-            .key(key)
-            .apply_sse(sse)
+            .bucket(&bucket)
+            .key(&key)
+            .apply_sse(sse.as_ref())
             .send()
             .await
             .map_err(|e| {
                 KoshaError::NotFound(format!(
                     "S3 create_multipart_upload: {}",
-                    log_s3_error("create_multipart_upload", key, &e)
+                    log_s3_error("create_multipart_upload", &key, &e)
                 ))
             })?;
 
         let upload_id = mpu.upload_id().unwrap_or_default();
-        let upload = async {
-            let mut parts: Vec<aws_sdk_s3::types::CompletedPart> = Vec::new();
-            let mut offset = 0;
-            let mut part_number = 1;
+        let mut parts: Vec<aws_sdk_s3::types::CompletedPart> = Vec::new();
+        let part_size = 5 * 1024 * 1024;
+        let mut offset = 0;
+        let mut part_number = 1;
 
-            while offset < size {
-                let end = std::cmp::min(offset + part_size, size);
-                let upload_part_res = client
-                    .upload_part()
-                    .bucket(bucket)
-                    .key(key)
-                    .upload_id(upload_id)
-                    .part_number(part_number)
-                    .body(source.read(offset, end - offset).await?)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        KoshaError::NotFound(format!(
-                            "S3 upload_part: {}",
-                            log_s3_error("upload_part", key, &e)
-                        ))
-                    })?;
+        while offset < size {
+            let end = std::cmp::min(offset + part_size, size);
+            let part_data = &data[offset..end];
 
-                let etag = upload_part_res.e_tag().unwrap_or_default().to_string();
-                parts.push(
-                    aws_sdk_s3::types::CompletedPart::builder()
-                        .e_tag(etag)
-                        .part_number(part_number)
-                        .build(),
-                );
-
-                offset = end;
-                part_number += 1;
-            }
-
-            client
-                .complete_multipart_upload()
-                .bucket(bucket)
-                .key(key)
+            let upload_part_res = client
+                .upload_part()
+                .bucket(&bucket)
+                .key(&key)
                 .upload_id(upload_id)
-                .multipart_upload(
-                    aws_sdk_s3::types::CompletedMultipartUpload::builder()
-                        .set_parts(Some(parts))
-                        .build(),
-                )
+                .part_number(part_number)
+                .body(aws_sdk_s3::primitives::ByteStream::from(Vec::from(
+                    part_data,
+                )))
                 .send()
                 .await
                 .map_err(|e| {
                     KoshaError::NotFound(format!(
-                        "S3 complete_multipart_upload: {}",
-                        log_s3_error("complete_multipart_upload", key, &e)
+                        "S3 upload_part: {}",
+                        log_s3_error("upload_part", &key, &e)
                     ))
                 })?;
-            Ok(())
+
+            let etag = upload_part_res.e_tag().unwrap_or_default().to_string();
+            parts.push(
+                aws_sdk_s3::types::CompletedPart::builder()
+                    .e_tag(etag)
+                    .part_number(part_number)
+                    .build(),
+            );
+
+            offset = end;
+            part_number += 1;
         }
-        .await;
-        if let Err(error) = upload {
-            if let Err(abort_error) = client
-                .abort_multipart_upload()
-                .bucket(bucket)
-                .key(key)
-                .upload_id(upload_id)
-                .send()
-                .await
-            {
-                log_s3_error("abort_multipart_upload", key, &abort_error);
-            }
-            return Err(error);
-        }
+
+        client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(&key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                    .set_parts(Some(parts))
+                    .build(),
+            )
+            .send()
+            .await
+            .map_err(|e| {
+                KoshaError::NotFound(format!(
+                    "S3 complete_multipart_upload: {}",
+                    log_s3_error("complete_multipart_upload", &key, &e)
+                ))
+            })?;
     } else {
         client
             .put_object()
-            .bucket(bucket)
-            .key(key)
-            .apply_sse(sse)
-            .body(source.read(0, size).await?)
+            .bucket(&bucket)
+            .key(&key)
+            .apply_sse(sse.as_ref())
+            .body(aws_sdk_s3::primitives::ByteStream::from(data))
             .send()
             .await
             .map_err(|e| {
                 KoshaError::NotFound(format!(
                     "S3 put_object: {}",
-                    log_s3_error("put_object", key, &e)
+                    log_s3_error("put_object", &key, &e)
                 ))
             })?;
     }
@@ -3848,9 +3845,9 @@ pub(crate) mod capture {
             local: kosha_core::LocalStorage::new(local_root),
             bucket: "bucket".into(),
             prefix: prefix.into(),
-            custom_endpoint: false,
             rt: tokio::runtime::Runtime::new().unwrap(),
             client,
+            custom_endpoint: false,
             sse,
             tenant_kms_key_lookup: None,
         };
@@ -4039,23 +4036,6 @@ mod sse_request_tests {
     }
 
     #[test]
-    fn export_upload_fails_closed_when_tenant_kms_lookup_fails() {
-        let root = temp_root("export-kms-unavailable");
-        let file = root.join("export.jsonl");
-        std::fs::write(&file, b"{}\n").unwrap();
-        let (mut storage, capture) = capture::storage(root.clone(), "", kms_config());
-        storage.tenant_kms_key_lookup = Some(Box::new(|_| {
-            Err(KoshaError::ControlPlane("database unavailable".into()))
-        }));
-        assert!(matches!(
-            storage.upload_export(&file, "acme/docs/_exports/example.jsonl"),
-            Err(KoshaError::ControlPlane(_))
-        ));
-        assert!(capture.take().is_empty());
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn copy_object_adopts_the_destination_tenant_key() {
         // The helper a server-side copy path (#344) applies.
         let (client, capture) = capture::client();
@@ -4236,18 +4216,17 @@ mod error_path_tests {
 
     #[test]
     fn erasure_removes_hidden_versions_and_delete_markers_before_verifying_empty() {
-        let mut request = 0;
+        let mut deleted = false;
         let endpoint = serve_requests(move |head, body| {
             if head.starts_with("GET /bucket/?uploads") {
                 return ("200 OK", "<ListMultipartUploadsResult/>");
             }
-            request += 1;
-            if request == 2 {
-                assert!(head.starts_with("POST /bucket/?delete"), "{head}");
+            if head.starts_with("POST /bucket/?delete") {
                 let body = std::str::from_utf8(body).unwrap();
                 assert!(body.contains("<Key>secret-prefix/acme/docs/seg/doc_store.bin</Key>"));
                 assert!(body.contains("<VersionId>old</VersionId>"));
                 assert!(body.contains("<VersionId>marker</VersionId>"));
+                deleted = true;
                 return ("200 OK", "<DeleteResult/>");
             }
             assert!(head.starts_with("GET /bucket/?versions"), "{head}");
@@ -4255,7 +4234,7 @@ mod error_path_tests {
                 head.contains("prefix=secret-prefix%2Facme%2Fdocs%2F"),
                 "{head}"
             );
-            if request == 1 {
+            if !deleted {
                 return (
                     "200 OK",
                     "<ListVersionsResult>\
@@ -4267,8 +4246,10 @@ mod error_path_tests {
             ("200 OK", "<ListVersionsResult/>")
         });
         let (storage, root) = storage(&endpoint, "versions");
+        use crate::namespace_deletion::RemotePrefixStore;
+        assert_eq!(storage.count_prefix("acme/docs").unwrap(), 2);
         assert_eq!(storage.delete_prefix("acme/docs").unwrap(), 2);
-        assert_eq!(storage.count_erasure_page("acme/docs").unwrap(), 0);
+        assert_eq!(storage.count_prefix("acme/docs").unwrap(), 0);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -4398,31 +4379,6 @@ mod error_path_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn export_upload_returns_a_get_url_for_the_uploaded_tenant_object() {
-        let data = b"{\"id\":\"example\",\"fields\":[]}\n";
-        let endpoint = serve_requests(move |head, body| {
-            assert!(
-                head.starts_with("PUT /bucket/secret-prefix/acme/docs/_exports/example.jsonl?"),
-                "{head}"
-            );
-            assert!(body.windows(data.len()).any(|window| window == data));
-            ("200 OK", "")
-        });
-        let (storage, root) = storage(&endpoint, "export");
-        let file = root.join("export.jsonl");
-        std::fs::write(&file, data).unwrap();
-        let signed = storage
-            .upload_export(&file, "acme/docs/_exports/example.jsonl")
-            .unwrap();
-        assert!(signed.starts_with(&format!(
-            "{endpoint}/bucket/secret-prefix/acme/docs/_exports/example.jsonl?"
-        )));
-        assert!(signed.contains("X-Amz-Expires=900"));
-        assert!(signed.contains("X-Amz-Signature="));
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
     fn storage(endpoint: &str, tag: &str) -> (S3Storage, PathBuf) {
         let root = std::env::temp_dir().join(format!("kosha-s3-err-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -4439,9 +4395,9 @@ mod error_path_tests {
             local: LocalStorage::new(root.clone()),
             bucket: "bucket".into(),
             prefix: "secret-prefix".into(),
-            custom_endpoint: false,
             rt: tokio::runtime::Runtime::new().unwrap(),
             client: aws_sdk_s3::Client::from_conf(config),
+            custom_endpoint: false,
             sse: SseConfig::default(),
             tenant_kms_key_lookup: None,
         };
