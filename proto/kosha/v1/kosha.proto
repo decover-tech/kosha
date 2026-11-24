@@ -913,7 +913,7 @@ service KoshaService {
 
   // Every live document of the namespace, a page at a time, sorted by id,
   // in the shape IndexDocuments accepts (#347). Pass a page's next_cursor
-  // back as cursor until next_cursor is null.
+  // back as cursor until a page comes without one.
   rpc ExportDocuments(ExportDocumentsRequest) returns (ExportDocumentsResponse) {
     option (google.api.http) = {
       post: "/v1/namespaces/{namespace}/export"
@@ -2333,7 +2333,7 @@ message ExportDocumentsRequest {
   string namespace = 1;
   // Documents per page: default 1000, at most 10000.
   optional uint32 limit = 2;
-  // The previous page's next_cursor; absent or empty for the first page.
+  // The previous page's next_cursor; absent for the first page.
   optional string cursor = 3;
   // "strong" (default) includes acknowledged writes not yet flushed.
   optional string consistency = 4 [(grpc.gateway.protoc_gen_openapiv2.options.openapiv2_field) = {
@@ -2347,7 +2347,7 @@ message ExportDocumentsRequest {
 message ExportDocumentsResponse {
   string namespace = 1;
   repeated Document documents = 2;
-  // The cursor for the next page; null once this page was the last.
+  // The cursor for the next page; absent once this page is the last.
   optional string next_cursor = 3;
 }
 

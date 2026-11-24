@@ -54,7 +54,6 @@ fn parse_request(body: &[u8]) -> Result<ExportPage, String> {
     };
     let cursor = match obj.get("cursor") {
         None | Some(serde_json::Value::Null) => None,
-        Some(serde_json::Value::String(s)) if s.is_empty() => None,
         Some(serde_json::Value::String(s)) => Some(s.clone()),
         Some(other) => return Err(format!("'cursor' must be a string, got {other}")),
     };
@@ -72,7 +71,8 @@ fn search_body(page: &ExportPage) -> serde_json::Value {
         "query_text": "",
         "filter": {"match_all": {}},
         "sort": [{"_id": {"order": "asc"}}],
-        "max_results": page.limit,
+        // One past the page: whether it exists decides `next_cursor`.
+        "max_results": page.limit + 1,
         "no_cache": true,
     });
     if let Some(cursor) = &page.cursor {
@@ -98,8 +98,10 @@ fn export_response(namespace: &str, limit: u64, search: String) -> String {
         Err(e) => return api_error(ErrorCode::Internal, &format!("search response: {e}")),
     };
     let hits = parsed["results"].as_array().cloned().unwrap_or_default();
+    let more = hits.len() as u64 > limit;
     let documents: Vec<serde_json::Value> = hits
         .iter()
+        .take(limit as usize)
         .map(|hit| {
             serde_json::json!({
                 "id": hit["doc_id"],
@@ -107,16 +109,15 @@ fn export_response(namespace: &str, limit: u64, search: String) -> String {
             })
         })
         .collect();
-    let next_cursor = if documents.len() as u64 == limit {
-        documents.last().map(|d| d["id"].clone())
-    } else {
-        None
-    };
-    crate::json_ok(&serde_json::json!({
+    let next_cursor = more.then(|| documents.last().map(|d| d["id"].clone()));
+    let mut page = serde_json::json!({
         "namespace": namespace,
         "documents": documents,
-        "next_cursor": next_cursor,
-    }))
+    });
+    if let Some(Some(cursor)) = next_cursor {
+        page["next_cursor"] = cursor;
+    }
+    crate::json_ok(&page)
 }
 
 pub(crate) fn handle_export_with_ns(
@@ -179,7 +180,7 @@ mod tests {
         });
         assert_eq!(body["sort"], serde_json::json!([{"_id": {"order": "asc"}}]));
         assert_eq!(body["search_after"], serde_json::json!(["k"]));
-        assert_eq!(body["max_results"], 3);
+        assert_eq!(body["max_results"], 4);
         assert!(body.get("consistency").is_none());
     }
 
@@ -202,7 +203,9 @@ mod tests {
     ) -> Vec<serde_json::Value> {
         let mut out = Vec::new();
         let mut cursor = serde_json::Value::Null;
+        let mut pages = 0;
         loop {
+            pages += 1;
             let page = post(
                 state,
                 "/v1/namespaces/docs/export",
@@ -212,9 +215,16 @@ mod tests {
             let docs = page["documents"].as_array().unwrap();
             assert!(docs.len() as u64 <= limit);
             out.extend(docs.iter().cloned());
-            cursor = page["next_cursor"].clone();
-            if cursor.is_null() {
-                return out;
+            assert!(
+                !docs.is_empty() || pages == 1,
+                "an empty page after the first"
+            );
+            match page.get("next_cursor") {
+                None => return out,
+                Some(next) => {
+                    assert!(next.is_string(), "{next}");
+                    cursor = next.clone();
+                }
             }
         }
     }
@@ -294,7 +304,34 @@ mod tests {
             serde_json::json!({"consistency": "eventual"}),
         );
         assert_eq!(copy["documents"], serde_json::json!(exported));
-        assert!(copy["next_cursor"].is_null());
+        assert!(copy.get("next_cursor").is_none(), "{copy}");
+    }
+
+    /// The empty id sorts first; a cursor naming it still moves forward.
+    #[test]
+    fn export_pages_past_an_empty_id() {
+        let state = crate::AppState::new(crate::tests::test_dir());
+        let docs: Vec<serde_json::Value> = ["", "a", "b"]
+            .iter()
+            .map(|id| {
+                serde_json::json!({"id": id, "fields": [
+                    {"name": "title", "field_type": "Text", "value": "x"}
+                ]})
+            })
+            .collect();
+        post(
+            &state,
+            "/v1/namespaces/docs/documents",
+            serde_json::json!({"documents": docs}),
+        );
+        post(&state, "/v1/namespaces/docs/flush", serde_json::json!({}));
+        let first = post(
+            &state,
+            "/v1/namespaces/docs/export",
+            serde_json::json!({"limit": 1, "consistency": "eventual"}),
+        );
+        assert_eq!(first["next_cursor"], "");
+        assert_eq!(ids(&export_all(&state, 1, "eventual")), ["", "a", "b"]);
     }
 
     #[test]

@@ -137,7 +137,7 @@ type KoshaServiceExportDocumentsBody struct {
 	// Consistency "strong" (default) includes acknowledged writes not yet flushed.
 	Consistency *KoshaServiceExportDocumentsBodyConsistency `json:"consistency,omitempty"`
 
-	// Cursor The previous page's next_cursor; absent or empty for the first page.
+	// Cursor The previous page's next_cursor; absent for the first page.
 	Cursor *string `json:"cursor,omitempty"`
 
 	// Limit Documents per page: default 1000, at most 10000.
@@ -464,7 +464,7 @@ type V1ExportDocumentsResponse struct {
 	Documents *[]V1Document `json:"documents,omitempty"`
 	Namespace *string       `json:"namespace,omitempty"`
 
-	// NextCursor The cursor for the next page; null once this page was the last.
+	// NextCursor The cursor for the next page; absent once this page is the last.
 	NextCursor *string `json:"next_cursor,omitempty"`
 }
 

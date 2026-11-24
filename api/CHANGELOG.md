@@ -15,7 +15,7 @@ Sections: Added, Changed, Deprecated, Removed.
   live document of a namespace, a page at a time, sorted by id, in the shape
   `IndexDocuments` accepts. Request `limit` (default 1000, at most 10000),
   `cursor` (the previous page's `next_cursor`) and `consistency`; response
-  `documents` and `next_cursor` (`null` after the last page). Read scope.
+  `documents` and `next_cursor` (absent on the last page). Read scope.
 
 ## [1.0.0]
 

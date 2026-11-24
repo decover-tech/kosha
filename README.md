@@ -523,8 +523,8 @@ returns every live document a page at a time, sorted by id, in the shape
 `limit` (default 1000, at most 10000), `cursor` (the previous page's
 `next_cursor`; omit it for the first page) and `consistency` (as for search;
 `strong` includes acknowledged writes not yet flushed). The response is
-`{"namespace", "documents": [{"id", "fields"}], "next_cursor"}`; `next_cursor`
-is `null` once the page was the last. Each page is a `match_all` search sorted
+`{"namespace", "documents": [{"id", "fields"}], "next_cursor"}`; the last page
+has no `next_cursor`. Each page is a `match_all` search sorted
 by `_id` with `search_after`, so it counts as a search for metrics, tenant
 limits and billing. Pages are not a snapshot: a document written or deleted
 during an export is included or not depending on where its id falls relative

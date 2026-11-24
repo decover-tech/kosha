@@ -192,7 +192,7 @@ export interface paths {
         /**
          * Every live document of the namespace, a page at a time, sorted by id,
          *     in the shape IndexDocuments accepts (#347). Pass a page's next_cursor
-         *     back as cursor until next_cursor is null.
+         *     back as cursor until a page comes without one.
          */
         post: operations["KoshaService_ExportDocuments"];
         delete?: never;
@@ -355,7 +355,7 @@ export interface components {
              * @enum {string}
              */
             consistency?: "strong" | "eventual";
-            /** @description The previous page's next_cursor; absent or empty for the first page. */
+            /** @description The previous page's next_cursor; absent for the first page. */
             cursor?: string;
             /**
              * Format: int64
@@ -678,7 +678,7 @@ export interface components {
         v1ExportDocumentsResponse: {
             documents?: components["schemas"]["v1Document"][];
             namespace?: string;
-            /** @description The cursor for the next page; null once this page was the last. */
+            /** @description The cursor for the next page; absent once this page is the last. */
             next_cursor?: string;
         };
         v1Field: {
