@@ -9974,16 +9974,26 @@ impl SegmentReader {
         query: &[f32],
         k: usize,
         budget: KnnProbeBudget<'_>,
-        accept: Option<&dyn Fn(u32) -> bool>,
+        accept: Option<KnnAccept<'_>>,
         fetch: Option<VectorSpanFetch<'_>>,
     ) -> BudgetedKnnResult {
+        let index = match self.vector_field(field) {
+            Ok(index) => index?,
+            Err(e) => return Some(Err(e)),
+        };
+        let vi = index.lazy.as_ref()?;
+        let limit = k
+            .saturating_mul(self.vector_rescore_factor.max(1))
+            .saturating_mul(if vi.rabitq { RABITQ_SHORTLIST_CAP } else { 1 });
         self.knn_candidates_fetching(field, query, k, budget, accept, fetch)
             .map(|found| {
-                let mut found = found?;
-                found
+                let found = found?;
+                let mut seqs: Vec<_> = found
                     .candidates
-                    .truncate(k.saturating_mul(self.vector_rescore_factor.max(1)));
-                let mut seqs: Vec<_> = found.candidates.iter().map(|c| c.doc_seq).collect();
+                    .into_iter()
+                    .take(limit)
+                    .map(|c| c.doc_seq)
+                    .collect();
                 if seqs.is_empty() {
                     return Ok((Vec::new(), found.postings));
                 }
@@ -16493,6 +16503,96 @@ mod global_rescore_tests {
             "bounds held {held}/{total}"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ranged_shortlist_matches_local_rabitq_bound_expansion() {
+        let (dir, _) = segment("rabitq-shortlist", VectorQuantization::RaBitQ);
+        let reader = SegmentReader::open(dir.clone())
+            .unwrap()
+            .with_vector_rescore_factor(1);
+        let k = 10;
+        let mut used_expanded_candidates = false;
+        for seed in 700_000..700_020 {
+            let query = vector(seed);
+            let expected = reader
+                .knn_search_filtered_fetching("emb", &query, k, 1_000_000, None, None)
+                .unwrap()
+                .unwrap();
+            let (actual, _) = reader
+                .knn_rescore_shortlist_fetching("emb", &query, k, ALL, None, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(actual.len(), expected.len());
+            for (&(seq, score), &(expected_seq, expected_score)) in actual.iter().zip(&expected) {
+                assert_eq!(seq, expected_seq);
+                assert!((score - expected_score).abs() < 1e-6);
+            }
+            let estimated = reader
+                .knn_candidates_fetching("emb", &query, k, ALL, None, None)
+                .unwrap()
+                .unwrap();
+            let narrow: HashSet<_> = estimated
+                .candidates
+                .iter()
+                .take(k)
+                .map(|c| c.doc_seq)
+                .collect();
+            used_expanded_candidates |= actual.iter().any(|(seq, _)| !narrow.contains(seq));
+        }
+        assert!(used_expanded_candidates);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ranged_shortlist_fetches_only_candidates_that_pass_the_bound() {
+        let dir = scratch("bound-filter");
+        let mut writer = SegmentWriter::new(SegmentId("s".into()), dir.clone())
+            .with_vector_store_mode(VectorStoreMode::Sidecar)
+            .with_vector_quantization(VectorQuantizationConfig::all(VectorQuantization::I8));
+        let query = vector(1);
+        for i in 0..8 {
+            let v = if i == 0 {
+                query.clone()
+            } else {
+                query.iter().map(|&x| -x).collect()
+            };
+            writer.add_document(DocumentId(format!("d{i}")), vec![Field::vector("emb", v)]);
+        }
+        writer.finalize(Bm25Params::default()).unwrap();
+        let path = dir.join(DOC_VECTORS_FILE);
+        let dv = DocVectors::open(path.clone()).unwrap();
+        let wanted = dv.field_vector_ranges("emb", &[0]);
+        let bytes = fs::read(&path).unwrap();
+        fs::remove_file(path).unwrap();
+        let spans = span_cache::spans_dir(&dir, DOC_VECTORS_FILE);
+        fs::create_dir_all(&spans).unwrap();
+        let put = |start: u64, end: u64| {
+            fs::write(
+                spans.join(span_cache::span_file_name(start, end)),
+                &bytes[start as usize..end as usize],
+            )
+            .unwrap();
+        };
+        put(0, doc_vectors_header_len(&bytes).unwrap().unwrap());
+        let fetch = |_: &Path, file: &str, ranges: &[(u64, u64)]| {
+            assert_eq!(file, DOC_VECTORS_FILE);
+            assert_eq!(ranges, wanted);
+            for &(start, end) in ranges {
+                put(start, end);
+            }
+            span_cache::SpanHolds::new()
+        };
+        let reader = SegmentReader::open(dir.clone())
+            .unwrap()
+            .with_vector_rescore_factor(8);
+        let (hits, _) = reader
+            .knn_rescore_shortlist_fetching("emb", &query, 1, ALL, None, Some(&fetch))
+            .unwrap()
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, 0);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
