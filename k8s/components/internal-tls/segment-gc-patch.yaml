@@ -1,0 +1,28 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: kosha-segment-gc
+  namespace: kosha
+spec:
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          volumes:
+            - name: internal-ca
+              secret:
+                secretName: kosha-internal-tls
+                items:
+                  - key: ca.crt
+                    path: ca.crt
+          containers:
+            - name: gc
+              env:
+                - name: KOSHA_GC_INGEST_SCHEME
+                  value: https
+                - name: CURL_CA_BUNDLE
+                  value: /etc/kosha/tls/ca.crt
+              volumeMounts:
+                - name: internal-ca
+                  mountPath: /etc/kosha/tls
+                  readOnly: true

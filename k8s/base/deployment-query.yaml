@@ -9,7 +9,7 @@ metadata:
 spec:
   # Bootstrap value only — the HPA (hpa-query.yaml) takes ownership of this
   # field once applied.
-  replicas: 1
+  replicas: 3
   selector:
     matchLabels:
       app: kosha
@@ -38,6 +38,15 @@ spec:
       # Deliberately NOT on the dedicated NVMe/Karpenter pool — that pool is
       # already near capacity from the single ingest pod, and scheduling N
       # query replicas there risks starving ingest. General node pool only.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          nodeTaintsPolicy: Honor
+          labelSelector:
+            matchLabels:
+              app: kosha
+              role: query
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -45,6 +54,7 @@ spec:
               podAffinityTerm:
                 labelSelector:
                   matchLabels:
+                    app: kosha
                     role: query
                 topologyKey: kubernetes.io/hostname
       containers:

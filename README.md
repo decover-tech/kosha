@@ -48,7 +48,7 @@ latency guarantees and the limits Kosha enforces.
 | Multiple vector columns | A namespace can hold several `Vector` fields (e.g. a 384-dim `title_emb` and a 1536-dim `body_emb`); each segment builds one index per field and `knn.field` picks the one searched. Each field has one dimension per namespace, fixed by the first vector written to it: a document whose vector disagrees is rejected with a 400, and so is a `knn` naming a field no segment indexes or a query vector of the wrong dimension. Segments written before this change keep serving any `knn.field` from their single index, unless their `doc_vectors.bin` names exactly one field (#204) |
 | i8 vector quantization | `KOSHA_VECTOR_QUANTIZATION=i8` (or per field, `KOSHA_VECTOR_QUANTIZATION_FIELDS=body_emb:i8,title_emb:f32`) stores each segment's ANN posting entries as one f32 scale plus `dim` signed bytes instead of `dim` f32s: `vector.idx`, the bytes a cold kNN hydrates and the warm posting cache all shrink ~4x (measured 3.96x at 768 dims). The probe scores with an i8 dot product, then rescores its best `k * KOSHA_VECTOR_RESCORE_FACTOR` candidates (default 4, `0` disables) with the full-precision vectors in `doc_vectors.bin`, so final scores are exact cosine. f32 and i8 segments mix freely in a namespace. Default `f32`; see the rollout note below (#210) |
 | Late-interaction (ColBERT-style) vectors | A `Vector` field whose value is a bag of token vectors (`[[f32; dim]; n]`) is indexed for MaxSim: `"knn": {"field": "tokens", "vectors": [[...], [...]], "k": 10}` scores `Σ over query tokens of max cosine over the document's tokens`. See [Late interaction](#late-interaction) |
-| Native embedding | A vector field may declare `"embedding": {"model", "dims", "provider"}` in the namespace schema; the server then embeds text sent for it and `"knn": {"field": "emb", "query_text": "..."}` with that model (OpenAI-compatible HTTP provider or a deterministic mock). Changing the model of an indexed field is a 409. See [Native embedding](#native-embedding) |
+| Native embedding | A vector field may declare `"embedding": {"model", "dims", "distance_metric", "provider"}` in the namespace schema; the server then embeds text sent for it and `"knn": {"field": "emb", "query_text": "..."}` with that model (local ONNX, OpenAI-compatible HTTP, or a deterministic mock). Changing the model of an indexed field is a 409. See [Native embedding](#native-embedding) |
 | kNN-scoped filters | `knn.filter` restricts only the vector list; the top-level `filter` restricts both the lexical and the vector list |
 | Filtered kNN | Filters are applied inside the probe, and a filtered kNN always returns `min(k, documents passing)` hits. When at most 50,000 documents pass namespace-wide (`KOSHA_KNN_EXACT_THRESHOLD`; `0` disables), every passing document's vector is scored exactly instead of probing centroids, so recall is 1.0. A segment where at most 1% of documents pass (`KOSHA_KNN_EXACT_FRACTION`) is searched exactly too. Otherwise the global probe budget is widened by the inverse of the filter's selectivity (at most 8x, `KOSHA_KNN_FILTER_BUDGET_MAX_SCALE`). The response reports `knn_mode` (`ann` / `exact` / `mixed`) and `knn_filtered_candidates` (documents passing the filter). Unfiltered kNN is unchanged and reports `ann` |
 | Sorting | Multi-field `sort` over stored fields and [nested dotted paths](#nested-attributes), plus `_id`. A multi-valued field sorts by its smallest value for `asc` and its largest for `desc` (Elasticsearch's default `mode`) |
@@ -85,6 +85,9 @@ request and response shapes:
 
 - Each aggregation object has exactly one type key. An unknown or misspelled
   type (`stats`, `averag`) is a 400 that lists the supported types.
+- For `knn` without a lexical query or top-level `filter`, aggregations and
+  `total_hits` use the same namespace-wide neighbor set (up to `knn.k`
+  documents) regardless of page size.
 - `min`, `max`, `sum` and `avg` read `Integer` and `Float` fields, and `Date`
   fields as epoch milliseconds (`value_as_string` is added for `min` / `max` /
   `avg` over dates). Date text is parsed as `YYYY-MM-DD[THH:MM[:SS[.fff]]][Z|±HH:MM]`;
@@ -372,7 +375,7 @@ own document, or combine the two values into one leaf (`"name_org": "Ada|beta"`)
 - Multi-field scoring other than a boosted sum (`dis_max` / `best_fields` tie-breakers, turbopuffer `Product` / `Max` of fields), field-name patterns in `fields`, and block-max WAND for `fields` queries.
 - Analyzer features beyond the list in [Analyzers](#analyzers): per-language stemmers other than English, synonyms, n-grams, CJK dictionary segmentation (`standard@2` splits Han ideographs one per token), full Unicode case folding (`ß` and `SS` stay distinct). Other `FieldSchema` members (`type`, `indexed`, `stored`) are stored but not enforced — field types still come with each document.
 - Fuzzy: block-max WAND over expansions (fuzzy queries score every posting of every expansion), highlighting of fuzzy matches, fuzzy inside `fields` / `match_phrase`, bloom pruning for two-edit tokens.
-- Native embedding with a local model runtime (ONNX / candle): only the HTTP and mock providers exist. A model change does not reindex automatically, late-interaction bags are not embedded, and the original text of an embedded field is not kept.
+- Native embedding model changes do not reindex automatically, late-interaction bags are not embedded, and the original text of an embedded field is not kept.
 - gRPC — the service is defined in the proto, but HTTP/JSON is the only implemented transport.
 - A namespace-level centroid index shared across segments and updated from the WAL (#253 step 2): each segment still carries its own postings, and a kNN probes every segment's centroids under the global budget.
 
@@ -683,11 +686,17 @@ as for single-vector kNN. A query whose tokens differ in dimension from the fiel
 
 **How it runs.** Each segment keeps, per late-interaction field, `multivec.{i}.bags` (every
 token, unit-normalized f32, with a per-document offsets table so one bag is one ranged read) and
-`multivec.{i}.ivf` (the tokens clustered with the same balanced k-means as the single-vector
-index; each posting holds its tokens' doc ids and int8 codes). For every query token the
+`multivec.{i}.ivf` (each token assigned to the nearest centroid of a ColBERTv2-style codebook of
+about `16 * sqrt(tokens)` centroids, trained once by spherical k-means on a sample of at most 64
+tokens per centroid and then frozen, two-level above 256 centroids; each posting holds its
+tokens' doc ids and int8 codes; the file format is unchanged). For every query token the
 `KOSHA_LATE_INTERACTION_NPROBE` (default 16) nearest postings are scored from the int8 codes,
 the best `num_candidates` documents by that approximate MaxSim are re-scored exactly from their
-bags, and the top `k` are kept. With enough probes and candidates the result is exact MaxSim
+bags, and the top `k` are kept. Probed postings are kept decoded in a per-segment LRU
+(`KOSHA_LATE_INTERACTION_POSTINGS_CACHE_MAX_BYTES`, default 32 MiB, `0` disables), so a warm
+query reads only bags from disk. A late-interaction query reads no single-vector column: the
+searcher opens its segments as for a lexical query, and the server hydrates only the field's
+`multivec` files for it, never `vector*.idx` or `vector*.offsets`. With enough probes and candidates the result is exact MaxSim
 (tested against a brute-force reference). The source JSON stays in the doc store, so documents
 read back as sent and compaction rebuilds the files from it; a binary older than this change
 reads these segments normally, just without late-interaction hits, and its compactions drop the
@@ -697,11 +706,34 @@ reads these segments normally, just without late-interaction hits, and its compa
 Apple M5). Per document, relative to its raw f32 tokens: `.bags` 1.00x, `.ivf` 0.28x, and the
 source JSON in the doc store 2.55x, so about 4.8x the raw token bytes in all. With 128-dim
 tokens, 64 per document, that is 32 KB raw, ~124 KB stored, against ~0.5 KB for one 128-dim
-vector; the index build is k-means over every token (7.6 s for 8,000 such documents, 512k
-tokens). Queries: 8,000 documents x 64 tokens, 32 query tokens: warm p50 15.3 ms, recall@10
+vector. Training the codebook on a sample instead of clustering every token cuts the
+token-index build (Linux VM, 128 dims): 2M tokens (32,000 such documents in one segment) build in
+29 s against 112 s with balanced k-means over every token, with warm p50 16.8 ms against 25.0 ms
+and recall@10 0.895 against 0.930 at the default 16 probes; 8,000 documents in 4 segments build in
+5.6 s against 13.9 s, recall 1.000 both. Queries: 8,000 documents x 64 tokens, 32 query
+tokens: warm p50 15.3 ms, recall@10
 against brute-force MaxSim 1.000 (single-vector kNN over mean-pooled tokens: 1.1 ms, but only
 0.40 of the MaxSim top 10). 4,000 x 32 tokens at 64 dim, 16 query tokens: 1.9 ms. Single-vector
 kNN is unchanged when the feature is unused (`knn_open_search` p50s identical to main).
+
+**Relevance on a real corpus.** `kosha-late-interaction-eval` (in `kosha-build-segments`)
+indexes a token-embedding corpus into in-process segments and reports recall@10 and nDCG@10
+against qrels for three rankings: Kosha's late interaction, exact MaxSim (every posting probed,
+every bag re-scored), and single-vector kNN over mean-pooled tokens, plus each one's overlap with
+the exact MaxSim top 10 and p50 latency. Its input is a directory of `docs.jsonl` and
+`queries.jsonl` (`{"id": ..., "tokens": [[f32; dim], ...]}` per line) and `qrels.tsv` (BEIR's
+`query-id corpus-id score`, or TREC's four columns). Use the BEIR **SciFact** test split (5,183
+passages, 300 queries with qrels; small enough to run on a laptop) or a slice of the
+**MS MARCO** passage dev set (`qrels.dev.small.tsv` over a sample of passages that includes the
+judged ones), encoded with **ColBERTv2** (`colbert-ir/colbertv2.0`, 128-dim tokens): each
+passage's token matrix without padding, and each query's (32 tokens, mask-augmented) matrix.
+
+```text
+cargo run --release -p kosha-build-segments --bin kosha-late-interaction-eval -- \
+  eval --corpus /data/scifact-colbertv2 --nprobe 16 --num-candidates 100 --json scifact.json
+# try the harness without real embeddings:
+cargo run --release -p kosha-build-segments --bin kosha-late-interaction-eval -- gen --out /tmp/li
+```
 
 ## Native embedding
 
@@ -712,7 +744,8 @@ with the same model, so the write path and the query path cannot drift apart:
 ```json
 POST /v1/namespaces/shop/schema
 {"fields": {"emb": {"type": "FIELD_TYPE_VECTOR",
-                    "embedding": {"model": "text-embedding-3-small", "dims": 1536, "provider": "http"}}}}
+                    "embedding": {"model": "text-embedding-3-small", "dims": 1536,
+                                  "distance_metric": "cosine", "provider": "http"}}}}
 
 POST /v1/namespaces/shop/documents
 {"documents": [{"id": "p1", "fields": [{"name": "emb", "field_type": "Text", "value": "red trail running shoes"}]}]}
@@ -722,11 +755,13 @@ POST /v1/namespaces/shop/search
 ```
 
 - **Providers** are configured per pod (`KOSHA_EMBEDDING_PROVIDERS`, see
-  [configuration](docs/configuration.md#native-embedding)): `http` calls any OpenAI-compatible
+  [configuration](docs/configuration.md#native-embedding)): `onnx` runs a local model without
+  making an API call, `http` calls any OpenAI-compatible
   `POST {KOSHA_EMBEDDING_URL}/embeddings` in batches, and `mock` is a deterministic hashed bag of
   words for tests. Query pods need the same settings as ingest pods;
   an `indexer` pod needs none (compaction copies vectors and never embeds). `provider` may be omitted
-  (`http` when enabled, else `mock`).
+  for HTTP/mock (`http` when enabled, else `mock`); ONNX must be explicit.
+  `distance_metric` defaults to `cosine`, the only supported metric.
 - **Ingest.** A value of an embedded field that is text (not a JSON number array) is embedded
   and replaced by its vector before the write reaches the WAL, so replay, compaction and the doc
   store hold vectors only (the text is not kept; a document reads back with its vector). A
@@ -736,7 +771,8 @@ POST /v1/namespaces/shop/search
 - **Query.** `knn` takes exactly one of `vector`, `vectors` or `query_text`. `query_text` against
   a field with no declared model is a 400. Non-kNN queries, and namespaces that declare no model,
   never touch a provider.
-- **Model pinning.** Each segment records the model in its footer
+- **Model pinning.** The manifest persists the model as part of the namespace schema. Each
+  segment also records the model in its footer
   (`vector_fields[].embedding_model`). Changing a field's model or `dims` while the namespace
   holds vectors for it (in a segment or still buffered) is a 409 (`field "emb" is indexed with
   model A; changing to B requires a reindex`); with no data it is allowed. Should a segment of

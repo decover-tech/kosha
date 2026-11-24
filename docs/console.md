@@ -69,7 +69,7 @@ key is not a session and is refused there.
 
 ## Storage
 
-Migration 008 adds `kosha.signin_tokens`, `kosha.user_sessions` and
+Migration 009 adds `kosha.signin_tokens`, `kosha.user_sessions` and
 `kosha.email_verifications`, applied at startup like 006. Without Postgres
 they are held in memory, and sessions end when the server restarts. Run the
 console on Postgres in any multi-pod deployment: each pod would otherwise

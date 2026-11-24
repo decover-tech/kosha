@@ -1,9 +1,55 @@
 //! Opt-in database tests. Use a dedicated disposable database:
 //! KOSHA_TEST_DATABASE_URL=... cargo test -p kosha-control --features postgres --test postgres_cas -- --ignored
 #![cfg(feature = "postgres")]
-use kosha_control::PgStore;
+use kosha_control::{HydrationLease, HydrationLeaseStore, PgStore};
 use kosha_core::{ControlStore, KoshaError, Manifest, ManifestEntry, NamespaceId, SegmentId};
 use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant};
+
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn postgres_hydration_lease_fails_open_when_claims_stall() {
+    let url = std::env::var("KOSHA_TEST_DATABASE_URL").expect("set a dedicated test database URL");
+    let _store = PgStore::new(&url).unwrap();
+    let leases = HydrationLeaseStore::new(&url).unwrap();
+    let path = format!("hydration-test-{}", uuid::Uuid::new_v4());
+    let ttl = Duration::from_secs(30);
+    assert!(matches!(
+        leases.try_claim(&path, "first", ttl),
+        HydrationLease::Owner
+    ));
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let lock = rt.block_on(async {
+        let pool = sqlx::PgPool::connect(&url).await.unwrap();
+        let mut lock = pool.begin().await.unwrap();
+        sqlx::query(
+            "SELECT segment_key FROM kosha.hydration_leases WHERE segment_key = $1 FOR UPDATE",
+        )
+        .bind(&path)
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+        lock
+    });
+    let started = Instant::now();
+    assert!(matches!(
+        leases.try_claim(&path, "second", ttl),
+        HydrationLease::Unavailable
+    ));
+    assert!(!leases.release(&path, "first"));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    rt.block_on(lock.rollback()).unwrap();
+    assert!(leases.release(&path, "first"));
+    assert!(matches!(
+        leases.try_claim(&path, "second", ttl),
+        HydrationLease::Owner
+    ));
+    assert!(leases.release(&path, "second"));
+}
 
 fn candidate(segment: &str, version: u64) -> Manifest {
     Manifest {
@@ -25,6 +71,18 @@ fn candidate(segment: &str, version: u64) -> Manifest {
             .into_iter()
             .collect(),
     }
+}
+
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn postgres_cas_reports_a_failed_statement_separately_from_commit() {
+    let url = std::env::var("KOSHA_TEST_DATABASE_URL").expect("set a dedicated test database URL");
+    let mut store = PgStore::new(&url).unwrap();
+    let invalid = NamespaceId("invalid\0namespace".into());
+    assert!(matches!(
+        store.compare_and_swap_manifest(&invalid, 0, candidate("uncommitted", 1)),
+        Err(KoshaError::ManifestCommitNotAttempted(_))
+    ));
 }
 
 #[test]
@@ -444,7 +502,7 @@ const MIGRATED_TABLES: &[&str] = &[
     // 007_billing
     "billing_accounts",
     "billing_invoices",
-    // 008_console_signin
+    // 009_console_signin
     "email_verifications",
     "signin_tokens",
     "user_sessions",
@@ -513,6 +571,26 @@ fn booting_twice_on_one_database_creates_every_table_once() {
         );
     }
     assert!(after_first.1.contains(&"idx_api_keys_key_hash".to_string()));
+    assert!(after_first
+        .0
+        .contains(&("tenants".into(), "kms_key_id".into())));
+    admin_exec(
+        &fresh,
+        "INSERT INTO kosha.organizations (id, slug, name) VALUES ('kms-org', 'kms-org', 'KMS');
+         INSERT INTO kosha.tenants (tenant_id, org_id)
+         VALUES ('kms-tenant', 'kms-org'), ('kms-other', 'kms-org');",
+    );
+    assert_eq!(first.tenant_kms_key_id("kms-tenant").unwrap(), None);
+    assert_eq!(first.tenant_kms_key_id("unknown-tenant").unwrap(), None);
+    admin_exec(
+        &fresh,
+        "UPDATE kosha.tenants SET kms_key_id = 'alias/tenant-key' WHERE tenant_id = 'kms-tenant';",
+    );
+    assert_eq!(
+        first.tenant_kms_key_id("kms-tenant").unwrap().as_deref(),
+        Some("alias/tenant-key")
+    );
+    assert_eq!(first.tenant_kms_key_id("kms-other").unwrap(), None);
 
     // Rows written between the boots survive the second one.
     let tenant = format!("boot-{}", uuid::Uuid::new_v4());
