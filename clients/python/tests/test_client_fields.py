@@ -81,6 +81,44 @@ def test_source_to_fields_short_numeric_lists_are_keyword_not_vector():
     assert by_name["rgb_triplet"]["value"] == json.dumps([255, 128, 0])
 
 
+def test_source_to_fields_maps_a_token_bag_to_a_vector_field():
+    """Late interaction (#205): equal-length numeric token vectors, each at
+    least _MIN_VECTOR_DIM long, are one Vector field holding the JSON bag."""
+    bag = [[0.01 * (i + t) for i in range(12)] for t in range(5)]
+    fields = KoshaClient._source_to_fields(
+        {"content": "hello", "tokens": bag, "as_tuples": tuple(tuple(t) for t in bag)}
+    )
+    by_name = {f["name"]: f for f in fields}
+    for name in ("tokens", "as_tuples"):
+        assert by_name[name]["field_type"] == "Vector", name
+        assert json.loads(by_name[name]["value"]) == bag
+    # A one-token bag is still a bag.
+    one = KoshaClient._source_to_fields({"tokens": [_EMBEDDING]})
+    assert one[0]["field_type"] == "Vector"
+    assert json.loads(one[0]["value"]) == [_EMBEDDING]
+    # And it reads back as the nested list it was.
+    assert KoshaClient._decode_field_value(by_name["tokens"]["value"], "Vector") == bag
+
+
+def test_source_to_fields_ragged_or_short_nested_lists_stay_keyword():
+    """Anything not a clean bag keeps the pre-#205 Keyword mapping."""
+    long = [0.5] * 12
+    cases = {
+        "ragged": [long, long[:10]],
+        "short_tokens": [[1.0, 2.0], [3.0, 4.0]],  # polygon / bbox pairs
+        "one_short": [long, [1.0, 2.0]],
+        "mixed": [long, "x"],
+        "nested_strings": [["a"] * 9, ["b"] * 9],
+        "bools": [[True] * 9, [False] * 9],
+        "empty_tokens": [[], []],
+        "deeper": [[long]],
+    }
+    fields = KoshaClient._source_to_fields(cases)
+    by_name = {f["name"]: f for f in fields}
+    for name, value in cases.items():
+        assert by_name[name]["field_type"] == "Keyword", name
+        assert json.loads(by_name[name]["value"]) == value, name
+
 def test_decode_field_value_restores_python_types():
     """The server always returns field values as strings on the wire;
     _decode_field_value is the reverse of _field_to_kosha and must hand
@@ -544,3 +582,16 @@ def test_strong_consistency_makes_wait_for_flush_free(monkeypatch):
 def test_consistency_is_validated():
     with pytest.raises(ValueError):
         KoshaClient(hosts="http://kosha.invalid", api_key="k", consistency="sometimes")
+
+
+def test_source_to_fields_keeps_a_stored_keyword_matrix_keyword():
+    """A matrix stored as Keyword before #205 and read back with its type
+    (update_by_query rewrites) is not silently re-typed as a Vector bag."""
+    bag = [[0.01 * (i + t) for i in range(12)] for t in range(3)]
+    fields = KoshaClient._source_to_fields(
+        {"m": bag, "__type__m": "Keyword", "fresh": bag}
+    )
+    by_name = {f["name"]: f for f in fields}
+    assert by_name["m"]["field_type"] == "Keyword"
+    assert json.loads(by_name["m"]["value"]) == bag
+    assert by_name["fresh"]["field_type"] == "Vector"

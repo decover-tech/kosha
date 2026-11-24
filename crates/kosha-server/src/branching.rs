@@ -42,6 +42,25 @@ impl Reclaimed {
     }
 }
 
+fn branch_commit_error(error: &KoshaError, existing_placeholder: Option<u64>) -> String {
+    match (error, existing_placeholder) {
+        (KoshaError::ManifestCommitNotAttempted(_), None) => {
+            control_store_unavailable(&format!("branch commit failed: {error}"))
+        }
+        (KoshaError::ManifestCommitNotAttempted(_), Some(version)) => ApiError::new(
+            ErrorCode::Unavailable,
+            format!("branch commit failed: {error}"),
+        )
+        .redact("branch was not created; an empty namespace already occupies its name")
+        .detail("reason", "control_store")
+        .detail("outcome", "branch_not_created")
+        .detail("placeholder_version", version)
+        .not_retryable()
+        .into_raw(),
+        _ => publication_error("branch commit failed", error),
+    }
+}
+
 impl AppState {
     /// Resolve every deletion bitmap `manifest` (of `ns`) references into
     /// its in-memory tombstones, reading each where it lives.
@@ -142,9 +161,9 @@ impl AppState {
                     .lock()
                     .unwrap()
                     .compare_and_swap_manifest(child, at, stored.clone())
-                    .map_err(|e| publication_error("branch commit failed", &e))?;
+                    .map_err(|e| branch_commit_error(&e, Some(at)))?;
             }
-            Err(e) => return Err(publication_error("branch commit failed", &e)),
+            Err(e) => return Err(branch_commit_error(&e, None)),
         }
 
         // The writer needs the deletes in memory. This process normally

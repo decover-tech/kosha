@@ -1,0 +1,11 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kosha-query
+  namespace: kosha
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: kosha
+      role: query

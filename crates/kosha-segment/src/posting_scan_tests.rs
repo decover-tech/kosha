@@ -875,6 +875,72 @@ fn flat_decode_equals_the_per_float_decode() {
     }
 }
 
+/// Scoring a posting in place from the aligned read buffer sees the same
+/// ids and the same float bits as decoding it, so every similarity is
+/// bit-identical. An unaligned buffer is declined, never misread.
+#[test]
+fn in_place_scan_equals_the_flat_decode() {
+    let mut rng = Lcg(13);
+    let (mut ids, mut vectors) = (Vec::new(), Vec::new());
+    for dim in [0usize, 1, 3, 8, 24, 33] {
+        for count in [0usize, 1, 2, 17] {
+            for trailing in [0usize, 1, 3] {
+                // Words, so the bytes start aligned, as the read buffer's do.
+                let mut words = Vec::new();
+                for _ in 0..count * (dim + 1) {
+                    words.push(rng.next() as u32);
+                }
+                let mut bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                bytes.extend(std::iter::repeat_n(0xAB, trailing.min(3 + 4 * dim)));
+                let aligned: Vec<u32> = bytes
+                    .chunks(4)
+                    .map(|c| {
+                        let mut w = [0u8; 4];
+                        w[..c.len()].copy_from_slice(c);
+                        u32::from_ne_bytes(w)
+                    })
+                    .collect();
+                let aligned = &bytemuck::cast_slice::<u32, u8>(&aligned)[..bytes.len()];
+                decode_f32_entries_into(aligned, dim, &mut ids, &mut vectors);
+                let similarity = |v: &[f32]| v.iter().fold(0.0f32, |a, x| a + x.abs().min(1.0));
+                let mut want = Vec::new();
+                for_each_f32_similarity(&ids, &vectors, dim, None, similarity, |id, s, e| {
+                    want.push((id, s.to_bits(), e.to_bits()))
+                });
+                let in_place = f32_entries_in_place(aligned, dim).expect("aligned bytes");
+                assert_eq!(in_place.len(), count * (dim + 1));
+                let mut got = Vec::new();
+                for_each_f32_similarity_in_place(in_place, dim, None, similarity, |id, s, e| {
+                    got.push((id, s.to_bits(), e.to_bits()))
+                });
+                assert_eq!(got, want, "dim {dim} count {count} trailing {trailing}");
+                // The restriction sees the same ids.
+                let odd = |id: u32| id % 2 == 1;
+                let (mut a, mut b) = (Vec::new(), Vec::new());
+                for_each_f32_similarity(&ids, &vectors, dim, Some(&odd), similarity, |id, _, _| {
+                    a.push(id)
+                });
+                for_each_f32_similarity_in_place(
+                    in_place,
+                    dim,
+                    Some(&odd),
+                    similarity,
+                    |id, _, _| b.push(id),
+                );
+                assert_eq!(a, b);
+                // Off by one byte: declined, so the caller decodes instead.
+                let mut padded = vec![0u32; aligned.len().div_ceil(4) + 1];
+                let shifted = &mut bytemuck::cast_slice_mut::<u32, u8>(&mut padded)[1..];
+                shifted[..aligned.len()].copy_from_slice(aligned);
+                if count > 0 {
+                    let shifted = &shifted[..aligned.len()];
+                    assert!(f32_entries_in_place(shifted, dim).is_none());
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn running_top_k_equals_a_stable_sort_and_cut() {
     let mut rng = Lcg(11);
