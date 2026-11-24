@@ -1555,16 +1555,72 @@ impl S3Storage {
             .collect()
     }
 
+    async fn multipart_erasure_page(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, String)>, KoshaError> {
+        let page = self
+            .client
+            .list_multipart_uploads()
+            .bucket(&self.bucket)
+            .prefix(prefix)
+            .send()
+            .await
+            .map_err(|e| {
+                KoshaError::NotFound(format!(
+                    "S3 list_multipart_uploads: {}",
+                    log_s3_error("list_multipart_uploads", prefix, &e)
+                ))
+            })?;
+        page.uploads()
+            .iter()
+            .map(|upload| match (upload.key(), upload.upload_id()) {
+                (Some(key), Some(id)) if key.starts_with(prefix) => Ok((key.into(), id.into())),
+                _ => Err(KoshaError::NotFound(
+                    "S3 multipart listing returned an invalid key or upload ID".into(),
+                )),
+            })
+            .collect()
+    }
+
     pub(crate) fn count_erasure_page(&self, path: &str) -> Result<usize, KoshaError> {
         let prefix = self.erasure_prefix(path)?;
-        Ok(self.rt.block_on(self.erasure_page(&prefix))?.len())
+        self.rt.block_on(async {
+            Ok(self.erasure_page(&prefix).await?.len()
+                + self.multipart_erasure_page(&prefix).await?.len())
+        })
     }
 
     /// Permanently delete every version and delete marker under a logical
-    /// directory (unversioned objects use the S3 "null" version).
+    /// directory (unversioned objects use the S3 "null" version), and
+    /// abort incomplete multipart uploads under the same prefix.
     pub fn delete_prefix(&self, path: &str) -> Result<usize, KoshaError> {
         let prefix = self.erasure_prefix(path)?;
         self.rt.block_on(async {
+            loop {
+                let uploads = self.multipart_erasure_page(&prefix).await?;
+                if uploads.is_empty() {
+                    break;
+                }
+                for (key, id) in uploads {
+                    if let Err(e) = self
+                        .client
+                        .abort_multipart_upload()
+                        .bucket(&self.bucket)
+                        .key(&key)
+                        .upload_id(id)
+                        .send()
+                        .await
+                    {
+                        if !e.as_service_error().is_some_and(|e| e.is_no_such_upload()) {
+                            return Err(KoshaError::NotFound(format!(
+                                "S3 abort_multipart_upload: {}",
+                                log_s3_error("abort_multipart_upload", &key, &e)
+                            )));
+                        }
+                    }
+                }
+            }
             let mut deleted = 0usize;
             loop {
                 let objects = self.erasure_page(&prefix).await?;
@@ -4028,6 +4084,9 @@ mod error_path_tests {
     fn erasure_removes_hidden_versions_and_delete_markers_before_verifying_empty() {
         let mut request = 0;
         let endpoint = serve_requests(move |head, body| {
+            if head.starts_with("GET /bucket/?uploads") {
+                return ("200 OK", "<ListMultipartUploadsResult/>");
+            }
             request += 1;
             if request == 2 {
                 assert!(head.starts_with("POST /bucket/?delete"), "{head}");
@@ -4055,6 +4114,48 @@ mod error_path_tests {
         });
         let (storage, root) = storage(&endpoint, "versions");
         assert_eq!(storage.delete_prefix("acme/docs").unwrap(), 2);
+        assert_eq!(storage.count_erasure_page("acme/docs").unwrap(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn erasure_aborts_unfinished_uploads_even_without_any_object_versions() {
+        let mut aborted = false;
+        let endpoint = serve_requests(move |head, _| {
+            let request = head.lines().next().unwrap();
+            if request.starts_with("GET /bucket/?uploads") {
+                assert!(request.contains("prefix=secret-prefix%2Facme%2Fdocs%2F"));
+                if aborted {
+                    return ("200 OK", "<ListMultipartUploadsResult/>");
+                }
+                return (
+                    "200 OK",
+                    "<ListMultipartUploadsResult>\
+                     <Upload><Key>secret-prefix/acme/docs/_exports/partial.jsonl</Key>\
+                     <UploadId>unfinished</UploadId></Upload>\
+                     </ListMultipartUploadsResult>",
+                );
+            }
+            if request.starts_with("DELETE ") {
+                assert!(request
+                    .starts_with("DELETE /bucket/secret-prefix/acme/docs/_exports/partial.jsonl?"));
+                let query = request
+                    .split_once('?')
+                    .unwrap()
+                    .1
+                    .split(' ')
+                    .next()
+                    .unwrap();
+                assert!(query.split('&').any(|part| part == "uploadId=unfinished"));
+                aborted = true;
+                return ("204 No Content", "");
+            }
+            assert!(request.starts_with("GET /bucket/?versions"), "{request}");
+            ("200 OK", "<ListVersionsResult/>")
+        });
+        let (storage, root) = storage(&endpoint, "unfinished");
+        assert_eq!(storage.count_erasure_page("acme/docs").unwrap(), 1);
+        assert_eq!(storage.delete_prefix("acme/docs").unwrap(), 0);
         assert_eq!(storage.count_erasure_page("acme/docs").unwrap(), 0);
         std::fs::remove_dir_all(root).unwrap();
     }

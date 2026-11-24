@@ -536,14 +536,16 @@ under the namespace's publication lock:
    the WAL stream (`discarded`), so recovery skips the deleted namespace's
    records in it.
 3. Its local segment directory and per-namespace caches are removed.
-4. With S3 configured, every object version and delete marker under the namespace's prefix
+4. With S3 configured, incomplete multipart uploads are aborted and every
+   object version and delete marker under the namespace's prefix
    (`{KOSHA_S3_PREFIX}/{tenant}/{ns}/`) is deleted before the response returns,
    and the prefix is then listed again. If the delete fails or the listing is
    not empty, the namespace is still deleted and the response says
    `"storage_reclaimed": false`; the leftover objects are unreferenced, and a
    re-created namespace never reuses their keys. The ingest role needs
-   `s3:ListBucketVersions` and `s3:DeleteObjectVersion` in addition to its
-   existing S3 permissions.
+   `s3:ListBucketVersions`, `s3:DeleteObjectVersion`,
+   `s3:ListBucketMultipartUploads`, and `s3:AbortMultipartUpload` in addition
+   to its existing S3 permissions.
 
 **Exporting a namespace.** Send `{"format":"jsonl"}` (or `{}`) to
 `POST /v1/namespaces/{ns}/export`. With S3 configured, the ingest pod builds
