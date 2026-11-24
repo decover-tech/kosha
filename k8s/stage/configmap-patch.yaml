@@ -7,7 +7,7 @@
 # routes, with Deprecation/Sunset headers and kosha_legacy_requests_total.
 # Flip stage only after this release has run here and the counter reads zero
 # for 7 days (or the stragglers are known), and after kosha-client 0.3.0 is
-# on PyPI. Then set:
+# on PyPI. Then change the opt-in below to:
 #   KOSHA_LEGACY_ROUTES: "off"
 #   KOSHA_LEGACY_ROUTES_TENANTS: "<tenants still migrating>"
 # under data (docs/api/versioning.md, "Legacy routes").
@@ -17,4 +17,5 @@ kind: ConfigMap
 metadata:
   name: kosha-config
   namespace: kosha
-data: {}
+data:
+  KOSHA_LEGACY_ROUTES: "on"

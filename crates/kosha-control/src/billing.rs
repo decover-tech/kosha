@@ -46,7 +46,33 @@
 //! the job can be run again (after a failure, or from two pods) without
 //! double-billing; a re-run also submits invoices an earlier run could not
 //! hand to the [`BillingProvider`]. [`Biller::sync_payments`] copies payment
-//! results back from the provider.
+//! results back from the provider; the provider's webhooks do the same as
+//! they happen (`stripe_webhook`, `billing_ledger::apply_webhook`), and the
+//! polling sync stays as the fallback for a missed delivery.
+//!
+//! # Plan changes inside a month (proration)
+//!
+//! When a [`PlanHistory`] is given ([`Biller::plan_changes`]) and it records
+//! a change of the tenant's plan inside the period, the period is cut at
+//! each change into stretches, each on the plan in force during it, and
+//! each stretch is rated on its own plan ([`rate_prorated`]):
+//!
+//! - its usage is the usage recorded inside the stretch (searches, writes,
+//!   byte-hours and dimension-hours of the hourly snapshots in it);
+//! - its base fee and every meter's included amount are the plan's,
+//!   multiplied by the stretch's share of the period's milliseconds and
+//!   rounded half up;
+//! - storage (and vector dimensions) are the stretch's byte-hours divided
+//!   by the hours of the whole period, so a constant size billed over two
+//!   stretches of one plan costs what it costs over the whole month.
+//!
+//! Without a change the invoice is rated exactly as before (one stretch,
+//! [`rate`]). The lines of a prorated invoice carry the plan they were
+//! rated on. The plan in force at an instant is the target of the latest
+//! change at or before it; before the first recorded change it is that
+//! change's previous plan (the catalog default when the tenant had no
+//! account). Free stretches charge nothing. A plan change is recorded when
+//! an operator or a completed checkout moves a tenant to another plan.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -68,8 +94,17 @@ pub mod billable {
     pub const BYTES_WRITTEN: &str = "bytes_written";
     /// Average bytes stored over the period.
     pub const STORED_BYTES: &str = "stored_bytes";
+    /// Average vector dimensions stored over the period (dimension-hours
+    /// divided by the hours in the period), like `stored_bytes`.
+    pub const VECTOR_DIMENSIONS: &str = "vector_dimensions";
     /// Every meter a plan may price.
-    pub const ALL: [&str; 4] = [QUERIES, BYTES_QUERIED, BYTES_WRITTEN, STORED_BYTES];
+    pub const ALL: [&str; 5] = [
+        QUERIES,
+        BYTES_QUERIED,
+        BYTES_WRITTEN,
+        STORED_BYTES,
+        VECTOR_DIMENSIONS,
+    ];
     /// The invoice line of a plan's monthly base fee (not a meter).
     pub const BASE_FEE: &str = "base_fee";
 }
@@ -268,9 +303,13 @@ fn default_read_only_after_days() -> u64 {
 fn default_suspend_after_days() -> u64 {
     21
 }
+fn default_retry_after_days() -> Vec<u64> {
+    vec![3, 5, 7]
+}
 
-/// When an unpaid invoice restricts an account.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// When an unpaid invoice restricts an account, and when a failed payment
+/// is retried (see `dunning`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DunningPolicy {
     /// An invoice is due this many days after it is issued.
@@ -282,6 +321,12 @@ pub struct DunningPolicy {
     /// Days past due before everything is refused.
     #[serde(default = "default_suspend_after_days")]
     pub suspend_after_days: u64,
+    /// After a failed payment, retry it this many days after the failure,
+    /// then this many days after that retry, and so on: `[3, 5, 7]`
+    /// retries on days 3, 8 and 15 after the first failure. Empty: Kosha
+    /// never retries (leave it to the provider's own retries).
+    #[serde(default = "default_retry_after_days")]
+    pub retry_after_days: Vec<u64>,
 }
 
 impl Default for DunningPolicy {
@@ -290,6 +335,7 @@ impl Default for DunningPolicy {
             payment_terms_days: default_payment_terms_days(),
             read_only_after_days: default_read_only_after_days(),
             suspend_after_days: default_suspend_after_days(),
+            retry_after_days: default_retry_after_days(),
         }
     }
 }
@@ -323,6 +369,11 @@ pub struct Catalog {
     pub default_plan: Option<String>,
     #[serde(default)]
     pub dunning: DunningPolicy,
+    /// The plan a tenant moves to by completing a self-service checkout
+    /// (`POST /v1/billing/checkout`). `None`: self-service upgrade is off.
+    /// Must name a plan that is not free.
+    #[serde(default)]
+    pub upgrade_plan: Option<String>,
 }
 
 impl Catalog {
@@ -344,6 +395,20 @@ impl Catalog {
             return Err(
                 "dunning: read_only_after_days must not be greater than suspend_after_days".into(),
             );
+        }
+        if self.dunning.retry_after_days.len() > 10 || self.dunning.retry_after_days.contains(&0) {
+            return Err(
+                "dunning: retry_after_days takes at most 10 entries, each at least 1 day".into(),
+            );
+        }
+        if let Some(plan) = &self.upgrade_plan {
+            match self.plans.get(plan) {
+                None => return Err(format!("upgrade plan {plan:?} is not defined in `plans`")),
+                Some(p) if p.kind == PlanKind::Free => {
+                    return Err(format!("upgrade plan {plan:?} is a free plan"))
+                }
+                Some(_) => {}
+            }
         }
         for (name, plan) in &self.plans {
             if name.is_empty() {
@@ -412,6 +477,11 @@ pub struct UsageTotals {
     pub stored_byte_hours: u64,
     /// Bytes stored now: the sum of each namespace's latest snapshot.
     pub stored_bytes_latest: u64,
+    #[serde(default)]
+    pub vector_dimension_hours: u64,
+    /// Vector dimensions stored now, like `stored_bytes_latest`.
+    #[serde(default)]
+    pub vector_dimensions_latest: u64,
 }
 
 impl UsageTotals {
@@ -426,6 +496,8 @@ impl UsageTotals {
             bytes_written: total.bytes_written,
             stored_byte_hours: total.stored_byte_hours,
             stored_bytes_latest: total.stored_bytes_latest.unwrap_or(0),
+            vector_dimension_hours: total.vector_dimension_hours,
+            vector_dimensions_latest: total.vector_dimensions_latest.unwrap_or(0),
         }
     }
 
@@ -437,6 +509,7 @@ impl UsageTotals {
             billable::BYTES_QUERIED => self.bytes_queried,
             billable::BYTES_WRITTEN => self.bytes_written,
             billable::STORED_BYTES => self.stored_byte_hours / period_hours.max(1),
+            billable::VECTOR_DIMENSIONS => self.vector_dimension_hours / period_hours.max(1),
             _ => 0,
         }
     }
@@ -447,6 +520,7 @@ impl UsageTotals {
     fn metered(&self, meter: &str) -> u64 {
         match meter {
             billable::STORED_BYTES => self.stored_bytes_latest,
+            billable::VECTOR_DIMENSIONS => self.vector_dimensions_latest,
             other => self.billed(other, 1),
         }
     }
@@ -464,6 +538,10 @@ pub struct LineItem {
     pub unit: u64,
     pub unit_price_cents: u64,
     pub amount_cents: u64,
+    /// The plan this line was rated on, on a prorated invoice only (see
+    /// "Plan changes inside a month" above).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
 }
 
 /// `quantity * price / unit`, rounded half up, saturating at `i64::MAX`
@@ -490,6 +568,7 @@ pub fn rate(plan: &Plan, totals: &UsageTotals, period_hours: u64) -> Vec<LineIte
             unit: 1,
             unit_price_cents: plan.base_fee_cents,
             amount_cents: charge_cents(1, 1, plan.base_fee_cents),
+            plan: None,
         });
     }
     for (meter, terms) in &plan.meters {
@@ -503,7 +582,166 @@ pub fn rate(plan: &Plan, totals: &UsageTotals, period_hours: u64) -> Vec<LineIte
             unit: terms.unit,
             unit_price_cents: terms.unit_price_cents,
             amount_cents: charge_cents(billable, terms.unit, terms.unit_price_cents),
+            plan: None,
         });
+    }
+    lines
+}
+
+/// One stretch of a period spent on one plan (see "Plan changes inside a
+/// month" above).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlanStretch {
+    pub plan: String,
+    pub start_ms: u64,
+    /// Exclusive.
+    pub end_ms: u64,
+}
+
+/// A change of a tenant's plan, as [`PlanHistory`] records it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanChange {
+    pub tenant: String,
+    pub at_ms: u64,
+    /// The plan before; `None` when the tenant had no account (it was on
+    /// the catalog's default plan, if any).
+    pub from_plan: Option<String>,
+    pub to_plan: String,
+    /// What made the change: `admin`, `checkout`.
+    pub source: String,
+}
+
+/// Where plan changes are recorded (`billing_ledger`).
+pub trait PlanHistory: Send + Sync {
+    /// `tenant`'s plan changes with `from_ms <= at_ms < to_ms`, oldest
+    /// first.
+    fn plan_changes(
+        &self,
+        tenant: &str,
+        from_ms: u64,
+        to_ms: u64,
+    ) -> Result<Vec<PlanChange>, KoshaError>;
+}
+
+/// The stretches of `[start_ms, end_ms)` and the plan in force during
+/// each, given `changes` (oldest first, from `start_ms` on; changes after
+/// `end_ms` tell which plan was in force at its end), the plan in force
+/// with no change recorded (`current`) and the catalog's default plan. A
+/// stretch on no plan is left out.
+pub fn plan_stretches(
+    start_ms: u64,
+    end_ms: u64,
+    changes: &[PlanChange],
+    current: Option<&str>,
+    default_plan: Option<&str>,
+) -> Vec<PlanStretch> {
+    let Some(first) = changes.first() else {
+        return current
+            .map(|plan| {
+                vec![PlanStretch {
+                    plan: plan.to_string(),
+                    start_ms,
+                    end_ms,
+                }]
+            })
+            .unwrap_or_default();
+    };
+    let mut plan: Option<String> = first
+        .from_plan
+        .clone()
+        .or_else(|| default_plan.map(str::to_string));
+    let mut at = start_ms;
+    let mut stretches = Vec::new();
+    for change in changes
+        .iter()
+        .filter(|c| c.at_ms >= start_ms && c.at_ms < end_ms)
+    {
+        if change.at_ms > at {
+            if let Some(plan) = &plan {
+                stretches.push(PlanStretch {
+                    plan: plan.clone(),
+                    start_ms: at,
+                    end_ms: change.at_ms,
+                });
+            }
+            at = change.at_ms;
+        }
+        plan = Some(change.to_plan.clone());
+    }
+    if let Some(plan) = plan {
+        if end_ms > at {
+            stretches.push(PlanStretch {
+                plan,
+                start_ms: at,
+                end_ms,
+            });
+        }
+    }
+    // Two stretches in a row on the same plan (a change back and forth
+    // within one millisecond, or a repeated change) are one.
+    let mut merged: Vec<PlanStretch> = Vec::with_capacity(stretches.len());
+    for stretch in stretches {
+        match merged.last_mut() {
+            Some(last) if last.plan == stretch.plan && last.end_ms == stretch.start_ms => {
+                last.end_ms = stretch.end_ms
+            }
+            _ => merged.push(stretch),
+        }
+    }
+    merged
+}
+
+/// `value * part / whole`, rounded half up.
+fn prorate(value: u64, part: u64, whole: u64) -> u64 {
+    charge_cents(value, whole.max(1), part.min(whole))
+}
+
+/// Rate a period of `period_hours` hours (`period_ms` milliseconds) spent
+/// on several plans: one `(plan name, plan, usage inside the stretch,
+/// stretch milliseconds)` per stretch. A single stretch that covers the
+/// whole period is rated by [`rate`], unchanged. Otherwise each stretch's
+/// base fee and included amounts are its plan's prorated by its share of
+/// the period, and each line names its plan.
+pub fn rate_prorated(
+    stretches: &[(&str, &Plan, UsageTotals, u64)],
+    period_hours: u64,
+    period_ms: u64,
+) -> Vec<LineItem> {
+    if let [(_, plan, totals, ms)] = stretches {
+        if *ms >= period_ms {
+            return rate(plan, totals, period_hours);
+        }
+    }
+    let mut lines = Vec::new();
+    for (name, plan, totals, ms) in stretches {
+        if plan.base_fee_cents > 0 {
+            let amount = prorate(plan.base_fee_cents, *ms, period_ms);
+            lines.push(LineItem {
+                meter: billable::BASE_FEE.to_string(),
+                quantity: 1,
+                included: 0,
+                billable: 1,
+                unit: 1,
+                unit_price_cents: amount,
+                amount_cents: amount,
+                plan: Some(name.to_string()),
+            });
+        }
+        for (meter, terms) in &plan.meters {
+            let quantity = totals.billed(meter, period_hours);
+            let included = prorate(terms.included, *ms, period_ms);
+            let billable = quantity.saturating_sub(included);
+            lines.push(LineItem {
+                meter: meter.clone(),
+                quantity,
+                included,
+                billable,
+                unit: terms.unit,
+                unit_price_cents: terms.unit_price_cents,
+                amount_cents: charge_cents(billable, terms.unit, terms.unit_price_cents),
+                plan: Some(name.to_string()),
+            });
+        }
     }
     lines
 }
@@ -662,7 +900,11 @@ impl TenantStanding {
         }
         let restricted: &[&str] = match operation {
             Operation::Query => &[billable::QUERIES, billable::BYTES_QUERIED],
-            Operation::Write => &[billable::BYTES_WRITTEN, billable::STORED_BYTES],
+            Operation::Write => &[
+                billable::BYTES_WRITTEN,
+                billable::STORED_BYTES,
+                billable::VECTOR_DIMENSIONS,
+            ],
             _ => &[],
         };
         self.free_tier_exceeded
@@ -948,6 +1190,76 @@ pub trait BillingProvider: Send + Sync {
         &self,
         provider_invoice_id: &str,
     ) -> Result<ProviderInvoiceStatus, KoshaError>;
+
+    /// Try to collect an unpaid invoice again from the customer's default
+    /// payment method (dunning, `attempt` counts Kosha's retries from 1).
+    /// `Ok` is the invoice's status afterwards; a declined payment is an
+    /// `Err` carrying the provider's reason.
+    fn retry_payment(
+        &self,
+        provider_invoice_id: &str,
+        attempt: u32,
+    ) -> Result<ProviderInvoiceStatus, KoshaError> {
+        let _ = (provider_invoice_id, attempt);
+        Err(unsupported(self.name(), "retrying a payment"))
+    }
+
+    /// A hosted page where `customer` enters a payment method, for
+    /// `request.tenant` to move to `request.plan` (self-service upgrade).
+    fn create_checkout_session(
+        &self,
+        customer: &str,
+        request: &CheckoutRequest,
+    ) -> Result<ProviderSession, KoshaError> {
+        let _ = (customer, request);
+        Err(unsupported(self.name(), "checkout"))
+    }
+
+    /// A hosted page where `customer` manages payment methods and sees
+    /// invoices.
+    fn create_portal_session(
+        &self,
+        customer: &str,
+        return_url: &str,
+    ) -> Result<ProviderSession, KoshaError> {
+        let _ = (customer, return_url);
+        Err(unsupported(self.name(), "the customer portal"))
+    }
+
+    /// After a completed checkout: make the payment method it collected
+    /// (through `setup_intent`, when there is one) `customer`'s default.
+    /// Returns the payment method, `None` when there was none to set.
+    fn finish_checkout(
+        &self,
+        customer: &str,
+        setup_intent: Option<&str>,
+    ) -> Result<Option<String>, KoshaError> {
+        let _ = (customer, setup_intent);
+        Err(unsupported(self.name(), "checkout"))
+    }
+}
+
+fn unsupported(provider: &str, what: &str) -> KoshaError {
+    KoshaError::InvalidQuery(format!(
+        "the billing provider ({provider}) does not support {what}"
+    ))
+}
+
+/// What a tenant asks for when it starts a self-service checkout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CheckoutRequest {
+    pub tenant: String,
+    /// The plan to move to once a payment method is collected.
+    pub plan: String,
+    pub success_url: String,
+    pub cancel_url: String,
+}
+
+/// A hosted provider page to send the user to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderSession {
+    pub id: String,
+    pub url: String,
 }
 
 /// What a [`FakeBillingProvider`] was asked to collect.
@@ -966,6 +1278,11 @@ struct FakeProviderInner {
     invoices: BTreeMap<String, FakeInvoice>,
     fail: bool,
     create_invoice_calls: u64,
+    /// Payments of these customers are declined.
+    declining: BTreeSet<String>,
+    retries: u64,
+    sessions: Vec<(String, CheckoutRequest)>,
+    default_payment_methods: BTreeMap<String, String>,
 }
 
 /// An in-memory [`BillingProvider`] for tests and local runs: it records
@@ -1019,6 +1336,36 @@ impl FakeBillingProvider {
     /// How many times `create_invoice` was called, repeats included.
     pub fn create_invoice_calls(&self) -> u64 {
         self.inner.lock().unwrap().create_invoice_calls
+    }
+
+    /// Decline (or stop declining) `customer`'s payments on retry.
+    pub fn set_declining(&self, customer: &str, declining: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        if declining {
+            inner.declining.insert(customer.to_string());
+        } else {
+            inner.declining.remove(customer);
+        }
+    }
+
+    /// How many times `retry_payment` was called.
+    pub fn retries(&self) -> u64 {
+        self.inner.lock().unwrap().retries
+    }
+
+    /// Checkout sessions started, in order.
+    pub fn checkout_sessions(&self) -> Vec<(String, CheckoutRequest)> {
+        self.inner.lock().unwrap().sessions.clone()
+    }
+
+    /// The default payment method `finish_checkout` set for `customer`.
+    pub fn default_payment_method(&self, customer: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .default_payment_methods
+            .get(customer)
+            .cloned()
     }
 
     fn check(inner: &FakeProviderInner) -> Result<(), KoshaError> {
@@ -1080,6 +1427,78 @@ impl BillingProvider for FakeBillingProvider {
                 KoshaError::NotFound(format!("fake billing provider: {provider_invoice_id}"))
             })
     }
+
+    fn retry_payment(
+        &self,
+        provider_invoice_id: &str,
+        _attempt: u32,
+    ) -> Result<ProviderInvoiceStatus, KoshaError> {
+        let mut inner = self.inner.lock().unwrap();
+        Self::check(&inner)?;
+        inner.retries += 1;
+        let declining = inner.declining.clone();
+        let invoice = inner
+            .invoices
+            .values_mut()
+            .find(|i| i.provider_invoice_id == provider_invoice_id)
+            .ok_or_else(|| {
+                KoshaError::NotFound(format!("fake billing provider: {provider_invoice_id}"))
+            })?;
+        if invoice.status == ProviderInvoiceStatus::Open {
+            if declining.contains(&invoice.customer) {
+                return Err(KoshaError::ControlPlane(
+                    "fake billing provider: your card was declined".into(),
+                ));
+            }
+            invoice.status = ProviderInvoiceStatus::Paid;
+        }
+        Ok(invoice.status)
+    }
+
+    fn create_checkout_session(
+        &self,
+        customer: &str,
+        request: &CheckoutRequest,
+    ) -> Result<ProviderSession, KoshaError> {
+        let mut inner = self.inner.lock().unwrap();
+        Self::check(&inner)?;
+        inner.sessions.push((customer.to_string(), request.clone()));
+        let id = format!("cs_fake_{}", inner.sessions.len());
+        Ok(ProviderSession {
+            url: format!("https://checkout.fake.invalid/{id}"),
+            id,
+        })
+    }
+
+    fn create_portal_session(
+        &self,
+        customer: &str,
+        _return_url: &str,
+    ) -> Result<ProviderSession, KoshaError> {
+        let inner = self.inner.lock().unwrap();
+        Self::check(&inner)?;
+        Ok(ProviderSession {
+            id: format!("bps_fake_{customer}"),
+            url: format!("https://portal.fake.invalid/{customer}"),
+        })
+    }
+
+    fn finish_checkout(
+        &self,
+        customer: &str,
+        setup_intent: Option<&str>,
+    ) -> Result<Option<String>, KoshaError> {
+        let mut inner = self.inner.lock().unwrap();
+        Self::check(&inner)?;
+        let Some(setup_intent) = setup_intent else {
+            return Ok(None);
+        };
+        let method = format!("pm_fake_{setup_intent}");
+        inner
+            .default_payment_methods
+            .insert(customer.to_string(), method.clone());
+        Ok(Some(method))
+    }
 }
 
 // ─── The jobs ───────────────────────────────────────────────────────────────
@@ -1118,6 +1537,9 @@ pub struct Biller<'a> {
     pub store: &'a dyn BillingStore,
     pub usage: &'a dyn UsageStore,
     pub provider: Option<&'a dyn BillingProvider>,
+    /// Recorded plan changes, for proration. `None`: every invoice is
+    /// rated on one plan.
+    pub plan_changes: Option<&'a dyn PlanHistory>,
 }
 
 fn by_tenant(usage: Vec<NamespaceUsage>) -> BTreeMap<String, Vec<NamespaceUsage>> {
@@ -1167,10 +1589,14 @@ impl Biller<'_> {
             .map(|a| a.tenant.as_str())
             .collect();
         if self.catalog.default_plan.is_some() {
+            // Tenants that used the period on the default plan, including
+            // one whose account was created after the period ended (a
+            // checkout started before the month was closed): the month is
+            // still theirs to pay, on the plan in force during it.
             tenants.extend(
                 usage
                     .keys()
-                    .filter(|t| !accounts.contains_key(*t))
+                    .filter(|t| accounts.get(*t).is_none_or(|a| a.created_at_ms >= end_ms))
                     .map(String::as_str),
             );
         }
@@ -1211,14 +1637,17 @@ impl Biller<'_> {
                 existing
             }
             None => {
-                let plan_name = self
-                    .catalog
-                    .plan_name_for(account)
-                    .ok_or_else(|| KoshaError::NotFound("no plan".into()))?;
-                let plan = self.catalog.plan(plan_name).ok_or_else(|| {
-                    KoshaError::NotFound(format!("plan {plan_name:?} is not in the catalog"))
-                })?;
-                let lines = rate(plan, &UsageTotals::of(usage), period.hours());
+                let (plan_name, lines) =
+                    // An account created after the period did not exist
+                    // during it: the period was on the default plan.
+                    self.rate_period(
+                        tenant,
+                        account.filter(|a| a.created_at_ms < period.end_ms()),
+                        usage,
+                        period,
+                        now_ms,
+                    )?;
+                let plan_name = plan_name.as_str();
                 let total = total_cents(&lines);
                 let invoice = Invoice {
                     id: id.clone(),
@@ -1280,6 +1709,82 @@ impl Biller<'_> {
         self.store.set_provider_invoice(&id, &provider_invoice_id)?;
         report.submitted += 1;
         Ok(())
+    }
+
+    /// The plan an invoice of `tenant` for `period` is issued on (the one
+    /// in force at its end) and its lines, prorated over the plan changes
+    /// recorded inside the period. `usage` is the tenant's usage over the
+    /// whole period.
+    fn rate_period(
+        &self,
+        tenant: &str,
+        account: Option<&BillingAccount>,
+        usage: &[NamespaceUsage],
+        period: BillingPeriod,
+        now_ms: u64,
+    ) -> Result<(String, Vec<LineItem>), KoshaError> {
+        let (start_ms, end_ms) = (period.start_ms(), period.end_ms());
+        let current = self.catalog.plan_name_for(account);
+        let changes = match self.plan_changes {
+            // Changes after the period too: the first of them says which
+            // plan was in force at its end.
+            Some(history) => history.plan_changes(tenant, start_ms, now_ms.max(end_ms))?,
+            None => Vec::new(),
+        };
+        let in_period = changes.iter().filter(|c| c.at_ms < end_ms).count();
+        let end_plan = match changes.get(in_period) {
+            Some(next) => next
+                .from_plan
+                .as_deref()
+                .or(self.catalog.default_plan.as_deref()),
+            None => in_period
+                .checked_sub(1)
+                .map(|last| changes[last].to_plan.as_str())
+                .or(current),
+        };
+        let stretches = plan_stretches(
+            start_ms,
+            end_ms,
+            &changes[..in_period],
+            end_plan,
+            self.catalog.default_plan.as_deref(),
+        );
+        let plan_of = |name: &str| {
+            self.catalog
+                .plan(name)
+                .ok_or_else(|| KoshaError::NotFound(format!("plan {name:?} is not in the catalog")))
+        };
+        let Some(end_plan) = end_plan.or(stretches.last().map(|s| s.plan.as_str())) else {
+            return Err(KoshaError::NotFound("no plan".into()));
+        };
+        if in_period == 0 {
+            // No change inside the period: one plan, as always.
+            let plan = plan_of(end_plan)?;
+            return Ok((
+                end_plan.to_string(),
+                rate(plan, &UsageTotals::of(usage), period.hours()),
+            ));
+        }
+        let mut rated = Vec::with_capacity(stretches.len());
+        for stretch in &stretches {
+            let plan = plan_of(&stretch.plan)?;
+            let totals = UsageTotals::of(&usage_summary(
+                self.usage,
+                Some(tenant),
+                stretch.start_ms,
+                stretch.end_ms,
+            )?);
+            rated.push((
+                stretch.plan.as_str(),
+                plan,
+                totals,
+                stretch.end_ms - stretch.start_ms,
+            ));
+        }
+        Ok((
+            end_plan.to_string(),
+            rate_prorated(&rated, period.hours(), end_ms - start_ms),
+        ))
     }
 
     /// Ask the provider about every open, submitted invoice and record the
@@ -1517,7 +2022,7 @@ mod pg {
                 .map_err(|e| format!("failed to create tokio runtime: {e}"))?;
             let pool = {
                 let _guard = rt.enter();
-                sqlx::postgres::PgPoolOptions::new()
+                crate::postgres::writer_pool_options()
                     .max_connections(2)
                     .acquire_timeout(Duration::from_secs(5))
                     .connect_lazy(database_url)
@@ -1832,6 +2337,7 @@ mod tests {
             store: &store,
             usage: &usage,
             provider: Some(&provider),
+            plan_changes: None,
         };
         let report = biller.close_period(oct, oct.end_ms()).unwrap();
         assert_eq!((report.submitted, report.errors.len()), (1, 0));
@@ -1969,6 +2475,7 @@ mod tests {
             bytes_written: 10 * GIB + GIB / 4, // 10.25 GiB at $2/GiB  = 2050
             stored_byte_hours: 51 * GIB * 744, // avg 51 GiB, 50 billable at 33c = 1650
             stored_bytes_latest: 0,
+            ..Default::default()
         };
         let lines = rate(payg, &totals, 744);
         let amounts: Vec<(&str, u64, u64)> = lines
@@ -2207,6 +2714,7 @@ mod tests {
             store: &store,
             usage: &usage,
             provider: Some(&provider),
+            plan_changes: None,
         };
 
         // Not before the month is over.
@@ -2344,6 +2852,7 @@ mod tests {
             store: &store,
             usage: &usage,
             provider: Some(&provider),
+            plan_changes: None,
         };
 
         provider.set_failing(true);
@@ -2428,6 +2937,7 @@ mod tests {
             store: &store,
             usage: &usage,
             provider: Some(&provider),
+            plan_changes: None,
         };
         let oct = BillingPeriod::parse("2026-10").unwrap();
         let now = oct.start_ms() + 10 * DAY_MS;
@@ -2524,6 +3034,216 @@ mod tests {
         provider.set_failing(true);
         let sync = biller.sync_payments(late).unwrap();
         assert_eq!((sync.checked, sync.errors.len()), (1, 1));
+    }
+
+    fn change(tenant: &str, at_ms: u64, from: Option<&str>, to: &str) -> PlanChange {
+        PlanChange {
+            tenant: tenant.into(),
+            at_ms,
+            from_plan: from.map(str::to_string),
+            to_plan: to.into(),
+            source: "admin".into(),
+        }
+    }
+
+    #[test]
+    fn plan_stretches_follow_the_recorded_changes() {
+        let s = |plan: &str, start_ms: u64, end_ms: u64| PlanStretch {
+            plan: plan.into(),
+            start_ms,
+            end_ms,
+        };
+        // No change: the current plan for the whole period.
+        assert_eq!(
+            plan_stretches(0, 100, &[], Some("payg"), Some("free")),
+            vec![s("payg", 0, 100)]
+        );
+        assert_eq!(plan_stretches(0, 100, &[], None, None), vec![]);
+        // An account created mid-period: the default plan before it.
+        let created = [change("t", 40, None, "payg")];
+        assert_eq!(
+            plan_stretches(0, 100, &created, Some("payg"), Some("free")),
+            vec![s("free", 0, 40), s("payg", 40, 100)]
+        );
+        // Without a default plan the time before it is on no plan.
+        assert_eq!(
+            plan_stretches(0, 100, &created, Some("payg"), None),
+            vec![s("payg", 40, 100)]
+        );
+        // Up and back down; a repeated change merges.
+        let changes = [
+            change("t", 10, Some("free"), "payg"),
+            change("t", 20, Some("free"), "payg"),
+            change("t", 70, Some("payg"), "free"),
+        ];
+        assert_eq!(
+            plan_stretches(0, 100, &changes, Some("free"), Some("free")),
+            vec![s("free", 0, 10), s("payg", 10, 70), s("free", 70, 100)]
+        );
+        // A change at the very start of the period.
+        assert_eq!(
+            plan_stretches(0, 100, &[change("t", 0, Some("free"), "payg")], None, None),
+            vec![s("payg", 0, 100)]
+        );
+    }
+
+    /// Proration: a tenant upgraded from free to payg at the start of
+    /// October 16 pays the usage plan's prices for the 384 hours after the
+    /// change only, with the base fee and included amounts cut to 384/744;
+    /// the free stretch charges nothing.
+    #[test]
+    fn a_plan_change_inside_the_month_is_prorated() {
+        let catalog = catalog();
+        let oct = BillingPeriod::parse("2026-10").unwrap();
+        let store = MemoryBillingStore::new();
+        let usage = MemoryUsageStore::new();
+        let history = crate::billing_ledger::MemoryBillingLedger::new();
+        usage.record(&synthetic_month("acme", oct)).unwrap();
+        let upgrade_at = oct.start_ms() + 360 * HOUR_MS;
+        store
+            .put_account(&account("acme", "payg", upgrade_at))
+            .unwrap();
+        crate::billing_ledger::BillingLedger::record_plan_change(
+            &history,
+            &change("acme", upgrade_at, None, "payg"),
+        )
+        .unwrap();
+        let biller = Biller {
+            catalog: &catalog,
+            store: &store,
+            usage: &usage,
+            provider: None,
+            plan_changes: Some(&history),
+        };
+        let report = biller.close_period(oct, oct.end_ms()).unwrap();
+        assert_eq!(report.errors, vec![]);
+        let invoice = store.invoice("acme/2026-10").unwrap().unwrap();
+        assert_eq!(invoice.plan, "payg");
+        let payg: Vec<(&str, u64, u64, u64)> = invoice
+            .lines
+            .iter()
+            .filter(|l| l.plan.as_deref() == Some("payg"))
+            .map(|l| (l.meter.as_str(), l.quantity, l.included, l.amount_cents))
+            .collect();
+        assert_eq!(
+            payg,
+            vec![
+                ("base_fee", 1, 0, 1290),
+                ("bytes_queried", 2_000 * 384 * 3 * GIB, 0, 1_125_000),
+                ("bytes_written", 16 * GIB, 0, 3200),
+                ("queries", 2_000 * 384, 516_129, 101),
+                ("stored_bytes", 3 * GIB * 384 / 744, 554_189_329, 34),
+            ]
+        );
+        // The free stretch: lines on the free plan, nothing charged.
+        assert!(invoice
+            .lines
+            .iter()
+            .filter(|l| l.plan.as_deref() == Some("free"))
+            .all(|l| l.amount_cents == 0));
+        assert!(invoice.lines.iter().all(|l| l.plan.is_some()));
+        assert_eq!(invoice.total_cents, 1_129_625);
+
+        // The same month without the recorded change is rated on one plan
+        // as before, lines without a plan.
+        let flat = MemoryBillingStore::new();
+        flat.put_account(&account("acme", "payg", 0)).unwrap();
+        let unprorated = Biller {
+            store: &flat,
+            plan_changes: None,
+            ..biller
+        };
+        unprorated.close_period(oct, oct.end_ms()).unwrap();
+        let whole = flat.invoice("acme/2026-10").unwrap().unwrap();
+        assert!(whole.lines.iter().all(|l| l.plan.is_none()));
+        assert_eq!(
+            whole.lines,
+            rate(
+                catalog.plan("payg").unwrap(),
+                &UsageTotals::of(
+                    &usage_summary(&usage, None, oct.start_ms(), oct.end_ms()).unwrap()
+                ),
+                oct.hours()
+            )
+        );
+    }
+
+    /// A period closed after a later plan change is rated on the plan in
+    /// force during it, not on the plan the tenant is on when it is closed.
+    #[test]
+    fn a_late_close_rates_the_plan_in_force_during_the_period() {
+        let catalog = catalog();
+        let oct = BillingPeriod::parse("2026-10").unwrap();
+        let store = MemoryBillingStore::new();
+        let usage = MemoryUsageStore::new();
+        let history = crate::billing_ledger::MemoryBillingLedger::new();
+        usage.record(&synthetic_month("acme", oct)).unwrap();
+        // On payg since September; moved to enterprise on November 3.
+        store.put_account(&account("acme", "ent", 0)).unwrap();
+        let moved = oct.end_ms() + 2 * DAY_MS;
+        crate::billing_ledger::BillingLedger::record_plan_change(
+            &history,
+            &change("acme", moved, Some("payg"), "ent"),
+        )
+        .unwrap();
+        let biller = Biller {
+            catalog: &catalog,
+            store: &store,
+            usage: &usage,
+            provider: None,
+            plan_changes: Some(&history),
+        };
+        biller.close_period(oct, moved + DAY_MS).unwrap();
+        let invoice = store.invoice("acme/2026-10").unwrap().unwrap();
+        assert_eq!(invoice.plan, "payg");
+        assert!(invoice.lines.iter().any(|l| l.meter == "queries"));
+    }
+
+    /// Review finding 5: an account created after the period ended (a
+    /// checkout between the month's end and its close) does not drop the
+    /// month: it is invoiced on the plan in force during it, the default.
+    #[test]
+    fn an_account_created_after_the_period_does_not_drop_its_usage() {
+        let catalog = catalog();
+        let oct = BillingPeriod::parse("2026-10").unwrap();
+        let usage = MemoryUsageStore::new();
+        usage.record(&synthetic_month("acme", oct)).unwrap();
+        let after = oct.end_ms() + HOUR_MS;
+        for with_history in [true, false] {
+            let store = MemoryBillingStore::new();
+            let history = crate::billing_ledger::MemoryBillingLedger::new();
+            crate::billing_ledger::change_plan(
+                &store, &history, "acme", "payg", None, "checkout", after,
+            )
+            .unwrap();
+            let biller = Biller {
+                catalog: &catalog,
+                store: &store,
+                usage: &usage,
+                provider: None,
+                plan_changes: with_history.then_some(&history as &dyn PlanHistory),
+            };
+            let report = biller.close_period(oct, after + HOUR_MS).unwrap();
+            assert_eq!(report.created, vec!["acme/2026-10"], "{report:?}");
+            let invoice = store.invoice("acme/2026-10").unwrap().unwrap();
+            assert_eq!(invoice.plan, "free", "history: {with_history}");
+            assert_eq!(invoice.total_cents, 0);
+        }
+    }
+
+    #[test]
+    fn catalog_checks_the_upgrade_plan_and_retry_schedule() {
+        let parse = |extra: &str| {
+            Catalog::parse(&format!(
+                r#"{{"plans": {{"free": {{"kind": "free"}}, "payg": {{"kind": "usage"}}}}{extra}}}"#
+            ))
+        };
+        assert!(parse(r#", "upgrade_plan": "payg""#).is_ok());
+        assert!(parse(r#", "upgrade_plan": "free""#).is_err());
+        assert!(parse(r#", "upgrade_plan": "gold""#).is_err());
+        assert!(parse(r#", "dunning": {"retry_after_days": []}"#).is_ok());
+        assert!(parse(r#", "dunning": {"retry_after_days": [0]}"#).is_err());
+        assert_eq!(parse("").unwrap().dunning.retry_after_days, vec![3, 5, 7]);
     }
 
     #[test]

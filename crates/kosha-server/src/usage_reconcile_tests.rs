@@ -728,6 +728,67 @@ fn a_snapshot_older_than_the_window_is_no_snapshot() {
     assert_eq!(at(NOW + 2 * HOUR_MS), Status::StorageWithoutSnapshot);
 }
 
+/// The byte floor only absorbs two measurements of the same segments:
+/// storage no manifest covers never matches a small snapshot (PR #433
+/// nit), and neither does an empty prefix.
+#[test]
+fn the_byte_floor_does_not_pass_unreferenced_storage_or_an_empty_prefix() {
+    let control = control_with(vec![("acme/docs", manifest(&["seg-a"]))]);
+    // `acme/old` is not in the control plane and holds 10 MiB nothing
+    // references; its writer still snapshots it, small.
+    let inventory = MemoryInventory::with(&[("acme/old/seg-x/postings.bin", 10 << 20)]);
+    let store = MemoryUsageStore::new();
+    snapshot(&store, "acme", "old", NOW, 300 << 10);
+    snapshot(&store, "acme", "docs", NOW, 500 << 10);
+    let options = Options::from_lookup(|_| None, NOW).unwrap();
+    assert_eq!(options.tolerance_bytes, 1 << 20);
+    let report = reconcile(&control, &store, &inventory, &options).unwrap();
+    let old = row(&report, "acme", "old");
+    assert_eq!(old.control_plane, ControlPlane::Unknown);
+    assert_eq!(
+        (old.status, old.within_tolerance),
+        (Status::Mismatch, false)
+    );
+    // A live namespace with a 500 KiB snapshot and nothing stored.
+    let docs = row(&report, "acme", "docs");
+    assert_eq!(
+        (docs.status, docs.within_tolerance),
+        (Status::SnapshotWithoutStorage, false)
+    );
+    assert!(!report.within_tolerance);
+
+    // A zero snapshot of an empty namespace is still a match, and growth
+    // since a zero snapshot is still absorbed by the floor.
+    let store = MemoryUsageStore::new();
+    snapshot(&store, "acme", "docs", NOW, 0);
+    let inventory = MemoryInventory::default();
+    let report = reconcile(&control, &store, &inventory, &options).unwrap();
+    assert_eq!(row(&report, "acme", "docs").status, Status::Match);
+    let inventory = MemoryInventory::with(&[("acme/docs/seg-a/postings.bin", 4_096)]);
+    let report = reconcile(&control, &store, &inventory, &options).unwrap();
+    assert_eq!(row(&report, "acme", "docs").status, Status::Match);
+}
+
+/// The window starts at the top of an hour, so the shortest accepted
+/// window (one hour) still sees the previous hour's snapshot before the
+/// current hour's is taken (PR #433 nit).
+#[test]
+fn a_one_hour_window_still_sees_the_previous_hours_snapshot() {
+    let control = control_with(vec![("acme/docs", manifest(&["seg-a"]))]);
+    let inventory = MemoryInventory::with(&[("acme/docs/seg-a/postings.bin", 100)]);
+    let store = MemoryUsageStore::new();
+    // 07:02, the 06:00 snapshot only.
+    let now_ms = NOW / HOUR_MS * HOUR_MS + 2 * 60_000;
+    snapshot(&store, "acme", "docs", now_ms - HOUR_MS, 100);
+    let options = Options {
+        max_snapshot_age_ms: HOUR_MS,
+        now_ms,
+        ..exact()
+    };
+    let report = reconcile(&control, &store, &inventory, &options).unwrap();
+    assert_eq!(row(&report, "acme", "docs").status, Status::Match);
+}
+
 // ─── Failures ────────────────────────────────────────────────────────────────
 
 struct DownStore;
