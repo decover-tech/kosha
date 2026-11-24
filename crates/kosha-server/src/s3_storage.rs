@@ -1591,42 +1591,46 @@ impl S3Storage {
         })
     }
 
+    async fn abort_incomplete_uploads(&self, prefix: &str) -> Result<(), KoshaError> {
+        loop {
+            let uploads = self.multipart_erasure_page(prefix).await?;
+            if uploads.is_empty() {
+                return Ok(());
+            }
+            for (key, id) in uploads {
+                if let Err(e) = self
+                    .client
+                    .abort_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(&key)
+                    .upload_id(id)
+                    .send()
+                    .await
+                {
+                    if !e.as_service_error().is_some_and(|e| e.is_no_such_upload()) {
+                        return Err(KoshaError::NotFound(format!(
+                            "S3 abort_multipart_upload: {}",
+                            log_s3_error("abort_multipart_upload", &key, &e)
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
     /// Permanently delete every version and delete marker under a logical
     /// directory (unversioned objects use the S3 "null" version), and
     /// abort incomplete multipart uploads under the same prefix.
     pub fn delete_prefix(&self, path: &str) -> Result<usize, KoshaError> {
         let prefix = self.erasure_prefix(path)?;
         self.rt.block_on(async {
-            loop {
-                let uploads = self.multipart_erasure_page(&prefix).await?;
-                if uploads.is_empty() {
-                    break;
-                }
-                for (key, id) in uploads {
-                    if let Err(e) = self
-                        .client
-                        .abort_multipart_upload()
-                        .bucket(&self.bucket)
-                        .key(&key)
-                        .upload_id(id)
-                        .send()
-                        .await
-                    {
-                        if !e.as_service_error().is_some_and(|e| e.is_no_such_upload()) {
-                            return Err(KoshaError::NotFound(format!(
-                                "S3 abort_multipart_upload: {}",
-                                log_s3_error("abort_multipart_upload", &key, &e)
-                            )));
-                        }
-                    }
-                }
-            }
+            let multipart = self.abort_incomplete_uploads(&prefix).await;
             let mut deleted = 0usize;
             loop {
                 let objects = self.erasure_page(&prefix).await?;
                 let count = objects.len();
                 if count == 0 {
-                    return Ok(deleted);
+                    return multipart.map(|()| deleted);
                 }
                 let delete = aws_sdk_s3::types::Delete::builder()
                     .set_objects(Some(objects))
@@ -4157,6 +4161,43 @@ mod error_path_tests {
         assert_eq!(storage.count_erasure_page("acme/docs").unwrap(), 1);
         assert_eq!(storage.delete_prefix("acme/docs").unwrap(), 0);
         assert_eq!(storage.count_erasure_page("acme/docs").unwrap(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn erasure_removes_versions_but_fails_if_multipart_listing_is_denied() {
+        let mut deleted = false;
+        let endpoint = serve_requests(move |head, body| {
+            let request = head.lines().next().unwrap();
+            if request.starts_with("GET /bucket/?uploads") {
+                return ("403 Forbidden", "<Error><Code>AccessDenied</Code></Error>");
+            }
+            if request.starts_with("POST /bucket/?delete") {
+                assert!(std::str::from_utf8(body)
+                    .unwrap()
+                    .contains("<VersionId>old</VersionId>"));
+                deleted = true;
+                return ("200 OK", "<DeleteResult/>");
+            }
+            assert!(request.starts_with("GET /bucket/?versions"), "{request}");
+            if deleted {
+                return ("200 OK", "<ListVersionsResult/>");
+            }
+            (
+                "200 OK",
+                "<ListVersionsResult>\
+                 <Version><Key>secret-prefix/acme/docs/doc_store.bin</Key><VersionId>old</VersionId></Version>\
+                 </ListVersionsResult>",
+            )
+        });
+        let (storage, root) = storage(&endpoint, "multipart-denied");
+        let error = storage.delete_prefix("acme/docs").unwrap_err();
+        assert!(error.to_string().contains("S3 list_multipart_uploads"));
+        assert!(storage
+            .rt
+            .block_on(storage.erasure_page("secret-prefix/acme/docs/"))
+            .unwrap()
+            .is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 
