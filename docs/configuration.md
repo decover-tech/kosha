@@ -276,6 +276,7 @@ Read once in `crates/kosha-query/src/lib.rs`.
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
 | `KOSHA_KNN_GLOBAL_BUDGET` | Treat `knn.num_candidates` as one probe budget for the whole query. `0`, `false` or `off` gives each segment its own budget (old behavior) | on | flag |
+| `KOSHA_KNN_SEGMENT_NPROBE` | Experimental coarse routing for unfiltered single-vector kNN. Probe the nearest N summarized segments plus all segments without usable summaries. `0` disables pruning. A smaller N can lower recall | `0` | segments |
 | `KOSHA_KNN_BUDGET_FRACTION` | Lower bound on the probe budget, as a fraction of the namespace's centroids. Must be > 0 | `0.05` | fraction |
 | `KOSHA_KNN_BUDGET_MAX_CAP` | Ceiling on that lower bound. A larger explicit `num_candidates` is still honored | `20000` | centroids |
 | `KOSHA_KNN_EXACT_THRESHOLD` | A filtered kNN with at most this many filter-passing documents namespace-wide scores every passing document's vector exactly instead of probing (#252). `0` disables exact filtered kNN | `50000` | documents |
@@ -778,6 +779,7 @@ before rolling back, until every reader understands the newer one. Read once in
 | --- | --- | --- | --- |
 | `KOSHA_POSTINGS_WRITE_VERSION` | Inverted-postings version written by indexing and compaction: `4`, `5`, `6` (experimental bit-packed full scoring blocks), or `7` (also packs positions and uses the skip entry for singleton scoring blocks). Enable an experimental version only once every reader supports it. Changing the setting affects new segments only; older binaries still cannot read segments already written in a newer format | `5` | version |
 | `KOSHA_VECTOR_WRITE_VERSION` | Vector-index write tier: `1` (flat), `2`–`4` (posting-based), or `5` (experimental #458, adds p50 and p90 alongside max in `vector.offsets`; on-disk headers 6–8 for f32/i8/RaBitQ). Enable tier 5 only after all readers support it. To roll back to older readers, restore tier 4 and rewrite tier 5 segments before downgrading | `4` | version |
+| `KOSHA_KNN_SEGMENT_SUMMARIES` | Set to `1` to write coarse vector centroids in segment footers during offline builds, flushes and compaction, for use by `KOSHA_KNN_SEGMENT_NPROBE`. Has no effect on flat vector indexes | off | flag |
 | `KOSHA_VECTOR_STORE` | Where vector field values are stored: `sidecar` (`doc_vectors.bin`) or `inline` (in `doc_store.bin`). Set `inline` before rolling back past #243 | `sidecar` | enum |
 | `KOSHA_DOC_STORE_COMPRESSION` | Experimental (research #388). `zstd`: new segments store each `doc_store.bin` record as its own zstd frame with a per-segment trained dictionary (kept in the `doc_store.offsets` trailer), and vectors always go to `doc_vectors.bin`. `auto`: fresh segments raw, merges keep their inputs' format. `none`: always raw (compact with this before rolling back past #388; older readers cannot read compressed segments) | `auto` | enum |
 | `KOSHA_DOC_STORE_ZSTD_LEVEL` | zstd level for a compressed doc store (1-22) | `3` | int |
