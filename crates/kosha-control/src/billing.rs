@@ -1322,12 +1322,15 @@ impl Biller<'_> {
     /// Record what the provider reports for one of our invoices, as a
     /// payment notification (a webhook) delivers it: `id` is ours when the
     /// provider echoes it back, and `provider_invoice_id` must be the one
-    /// we submitted. `Ok(None)` when the invoice is not ours or is no
-    /// longer open; otherwise the status it now has.
+    /// we submitted. Before that id is stored, the event must name ours
+    /// and the tenant's provider `customer`, which no other deployment
+    /// sharing the provider account has. `Ok(None)` when the invoice is not
+    /// ours or is no longer open; otherwise the status it now has.
     pub fn record_provider_status(
         &self,
         id: Option<&str>,
         provider_invoice_id: &str,
+        customer: Option<&str>,
         status: ProviderInvoiceStatus,
         now_ms: u64,
     ) -> Result<Option<InvoiceStatus>, KoshaError> {
@@ -1349,7 +1352,15 @@ impl Biller<'_> {
             Some(known) if known == provider_invoice_id => {}
             // The provider can report on an invoice (paid from credit at
             // finalization) before its id is stored; the event names ours.
-            None if id == Some(invoice.id.as_str()) => {
+            None if id == Some(invoice.id.as_str())
+                && customer.is_some()
+                && self
+                    .store
+                    .account(&invoice.tenant)?
+                    .and_then(|a| a.provider_customer_id)
+                    .as_deref()
+                    == customer =>
+            {
                 self.store
                     .set_provider_invoice(&invoice.id, provider_invoice_id)?;
             }

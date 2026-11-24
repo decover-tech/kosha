@@ -1184,6 +1184,15 @@ fn stripe_signature(body: &[u8], secret: &str, at_ms: u64) -> String {
 }
 
 fn stripe_event(kind: &str, stripe_id: &str, ours: Option<&str>) -> Vec<u8> {
+    stripe_event_for(kind, stripe_id, ours, None)
+}
+
+fn stripe_event_for(
+    kind: &str,
+    stripe_id: &str,
+    ours: Option<&str>,
+    customer: Option<&str>,
+) -> Vec<u8> {
     let metadata = match ours {
         Some(id) => serde_json::json!({"kosha_invoice_id": id}),
         None => serde_json::json!({}),
@@ -1192,7 +1201,9 @@ fn stripe_event(kind: &str, stripe_id: &str, ours: Option<&str>) -> Vec<u8> {
         "id": "evt_1",
         "object": "event",
         "type": kind,
-        "data": {"object": {"id": stripe_id, "object": "invoice", "metadata": metadata}},
+        "data": {"object": {
+            "id": stripe_id, "object": "invoice", "customer": customer, "metadata": metadata,
+        }},
     }))
     .unwrap()
 }
@@ -1612,6 +1623,9 @@ fn a_payment_reported_before_the_provider_id_is_stored_is_recorded() {
         "POST /v1/admin/billing/accounts",
         serde_json::json!({"tenant": "acme", "plan": "payg"}),
     );
+    f.store
+        .set_provider_customer("acme", "payg", "cus_acme", oct.start_ms())
+        .unwrap();
     f.now.store(oct.end_ms() + HOUR_MS, Ordering::SeqCst);
     f.provider.set_failing(true);
     f.admin_ok(
@@ -1627,14 +1641,30 @@ fn a_payment_reported_before_the_provider_id_is_stored_is_recorded() {
         None
     );
     let now = f.now.load(Ordering::SeqCst);
-    // Without our id the event cannot be matched; with it, it is.
-    let anonymous = stripe_event("invoice.paid", "in_early", None);
-    let (_, body) = f.webhook(
-        &anonymous,
-        Some(&stripe_signature(&anonymous, WEBHOOK_SECRET, now)),
+    let customer = f
+        .store
+        .account("acme")
+        .unwrap()
+        .unwrap()
+        .provider_customer_id
+        .unwrap();
+    // Without our id, or from another customer (another deployment on the
+    // same Stripe account), the event is not matched; with both, it is.
+    for (ours, cus) in [
+        (None, Some(customer.as_str())),
+        (Some("acme/2026-10"), Some("cus_other_deployment")),
+        (Some("acme/2026-10"), None),
+    ] {
+        let event = stripe_event_for("invoice.paid", "in_early", ours, cus);
+        let (_, body) = f.webhook(&event, Some(&stripe_signature(&event, WEBHOOK_SECRET, now)));
+        assert_eq!(body["invoice"], serde_json::Value::Null, "{ours:?} {cus:?}");
+    }
+    let paid = stripe_event_for(
+        "invoice.paid",
+        "in_early",
+        Some("acme/2026-10"),
+        Some(&customer),
     );
-    assert_eq!(body["invoice"], serde_json::Value::Null);
-    let paid = stripe_event("invoice.paid", "in_early", Some("acme/2026-10"));
     let (status, body) = f.webhook(&paid, Some(&stripe_signature(&paid, WEBHOOK_SECRET, now)));
     assert_eq!(
         (status, body["status"].clone()),

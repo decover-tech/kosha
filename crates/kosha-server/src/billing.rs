@@ -635,10 +635,13 @@ pub(crate) fn handle_stripe_webhook(
         return api_error(ErrorCode::InvalidArgument, "the event has no invoice id");
     };
     let ours = object["metadata"]["kosha_invoice_id"].as_str();
-    match billing
-        .biller()
-        .record_provider_status(ours, stripe_id, status, billing.now_ms())
-    {
+    match billing.biller().record_provider_status(
+        ours,
+        stripe_id,
+        object["customer"].as_str(),
+        status,
+        billing.now_ms(),
+    ) {
         Ok(Some(status)) => {
             billing.refresh_logged();
             json_ok(&serde_json::json!({
