@@ -703,10 +703,32 @@ fn waits_for_operator_lock<T: Send + 'static>(
         done.send(()).unwrap();
         out
     });
-    assert!(
-        finished.recv_timeout(Duration::from_millis(750)).is_err(),
-        "the change did not wait for the operator's lock"
-    );
+    // Proof that the change is blocked on this lock, not merely slow to
+    // start: Postgres shows it waiting on an advisory lock we hold.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            finished.try_recv().is_err(),
+            "the change did not wait for the operator's lock"
+        );
+        let (waiting,): (i64,) = rt.block_on(async {
+            sqlx::query_as(
+                "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' \
+                 AND NOT granted AND pg_backend_pid() = ANY(pg_blocking_pids(pid))",
+            )
+            .fetch_one(&mut conn)
+            .await
+            .unwrap()
+        });
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the change never queued on the operator's lock"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     while_locked(&mut conn, &rt);
     rt.block_on(async {
         sqlx::query("COMMIT").execute(&mut conn).await.unwrap();

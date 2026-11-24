@@ -345,8 +345,8 @@ enum AdminCommands {
     /// credential itself)
     ListOperators,
     /// Revoke one operator credential by id, or every credential of an
-    /// operator with --name; servers stop accepting them within their key
-    /// refresh interval
+    /// operator with --name; each server stops accepting them on its next
+    /// successful key refresh
     RevokeOperator {
         /// The credential's id, from `list-operators` or its creation
         #[arg(required_unless_present = "name", conflicts_with = "name")]
@@ -909,8 +909,8 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
                     .map(Vec::len)
                     .unwrap_or(0);
                 println!(
-                    "revoked {revoked} operator credential(s); servers stop accepting them \
-                     within their key refresh interval"
+                    "revoked {revoked} operator credential(s); each server stops accepting \
+                     them on its next successful key refresh"
                 );
                 Ok(())
             })?;
