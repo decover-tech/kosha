@@ -257,10 +257,15 @@ def plan_upgrade(deployments: dict[str, dict], target: str, wal_mode: str,
     ):
         raise mixed
     versions = [release_version(image) for image in rest]
-    if len(set(rest)) > 1 and (
-        None in versions or any(a < b for a, b in zip(versions, versions[1:]))
-    ):
-        raise mixed
+    if len(set(rest)) > 1:
+        if None in versions and not args.confirm_forward_only:
+            raise ValueError(
+                f"cannot order {found} by release tag. Pass --confirm-forward-only "
+                "after checking each role's image is at least as new as the next "
+                "role's and the target is not older. " + UPGRADE_NOTE
+            )
+        if None not in versions and any(a < b for a, b in zip(versions, versions[1:])):
+            raise mixed
     new = release_version(target)
     if rest and new and None not in versions:
         if any(new < old for old in versions):

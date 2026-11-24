@@ -419,6 +419,19 @@ def test_upgrade_fixes_forward_past_a_failed_ingest_release(kubectl):
     assert set_image("kosha-indexer", fixed) in calls
 
 
+def test_upgrade_fixes_forward_past_a_failed_digest_pinned_ingest(kubectl, capsys):
+    invoke, calls, responses, _ = kubectl
+    pin = "registry.example:5000/kosha@sha256:"
+    old, failed, fixed = pin + "a" * 64, pin + "b" * 64, pin + "c" * 64
+    prime(responses, query=failed, ingest=failed, indexer=old, ready=False,
+          indexer_replicas=0)
+    assert invoke("upgrade", "--image", fixed) == 1
+    assert "--confirm-forward-only" in capsys.readouterr().err
+    assert invoke("upgrade", "--image", fixed, "--confirm-forward-only") == 0
+    assert set_image("kosha", fixed) in calls
+    assert set_image("kosha-indexer", fixed) in calls
+
+
 def test_upgrade_refuses_reader_older_than_writer(kubectl, capsys):
     invoke, _, responses, _ = kubectl
     prime(responses, query=OLD, ingest=NEW, indexer="registry.example:5000/kosha:1.0.0")
@@ -487,6 +500,14 @@ def test_status_flags_unfinished_upgrade(kubectl, capsys):
     assert invoke("status") == 1
     out = capsys.readouterr().out
     assert "UNHEALTHY" in out and "different images" in out
+
+
+def test_status_flags_ingest_scaled_to_zero(kubectl, capsys):
+    invoke, _, responses, _ = kubectl
+    responses[tuple(HEALTH)] = health_items(replicas=0)
+    assert invoke("status") == 1
+    out = capsys.readouterr().out
+    assert "UNHEALTHY" in out and "ingest: scaled to 0 replicas" in out
 
 
 def test_status_reports_each_cluster(monkeypatch, capsys):
