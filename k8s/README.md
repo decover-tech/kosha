@@ -305,7 +305,8 @@ Use `scripts/kosha_cluster.py` from this checkout with Python 3.10+ and
 - Provision an empty Postgres database and an unused S3 bucket/prefix.
   Give the Kosha service account access to S3 (and KMS if required). On
   EKS with IRSA, pass the role ARN below; the role must trust
-  `system:serviceaccount:kosha:kosha` in this cluster.
+  `system:serviceaccount:kosha:kosha` in this cluster. Leave creation of
+  that service account to the installer.
 - In namespace `kosha`, provision the Secret `kosha-secret` with keys
   `database-url` and `bootstrap-api-key` using your usual secret tooling.
   The installer neither creates nor overwrites that Secret.

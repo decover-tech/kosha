@@ -14,6 +14,7 @@ import kosha_cluster  # noqa: E402
 KUBECTL = ["kubectl", "--context", "customer", "--namespace", "kosha"]
 DEPLOYMENTS = ["deployment/kosha", "deployment/kosha-query", "deployment/kosha-indexer"]
 LOOKUP = ["get", *DEPLOYMENTS, "--ignore-not-found", "-o", "name"]
+ACCOUNT = ["get", "serviceaccount/kosha", "--ignore-not-found", "-o", "name"]
 SECRET = ["get", "secret/kosha-secret", "-o", "name"]
 INSTALL = [
     "install", "--image", "registry.example:5000/kosha:1.2.3",
@@ -56,10 +57,10 @@ def kubectl(monkeypatch):
 def test_install_configures_existing_base_and_waits_for_all_roles(kubectl):
     invoke, calls, _, rendered = kubectl
     assert invoke(*INSTALL) == 0
-    assert calls[:2] == [LOOKUP, SECRET]
-    assert calls[2][:2] == ["create", "-k"]
-    assert not Path(calls[2][2]).exists()
-    assert calls[3:] == [
+    assert calls[:3] == [LOOKUP, ACCOUNT, SECRET]
+    assert calls[3][:2] == ["create", "-k"]
+    assert not Path(calls[3][2]).exists()
+    assert calls[4:] == [
         ["rollout", "status", deployment, "--timeout=20m"] for deployment in DEPLOYMENTS
     ]
     assert rendered["images"] == [{
@@ -88,12 +89,21 @@ def test_refuses_to_upgrade_any_existing_role(kubectl, capsys, deployment):
     assert "Old readers cannot read new manifests" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("check", [LOOKUP, SECRET])
+def test_rejects_preexisting_service_account_before_creating_anything(kubectl, capsys):
+    invoke, calls, responses, _ = kubectl
+    responses[tuple(ACCOUNT)] = "serviceaccount/kosha\n"
+    assert invoke(*INSTALL) == 1
+    assert calls == [LOOKUP, ACCOUNT]
+    assert "serviceaccount/kosha already exists" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("check", [LOOKUP, ACCOUNT, SECRET])
 def test_preflight_failure_does_not_create_resources(kubectl, check):
     invoke, calls, responses, _ = kubectl
     responses[tuple(check)] = 1
     assert invoke(*INSTALL) == 1
-    assert calls == ([LOOKUP] if check == LOOKUP else [LOOKUP, SECRET])
+    checks = [LOOKUP, ACCOUNT, SECRET]
+    assert calls == checks[:checks.index(check) + 1]
 
 
 def test_requires_empty_storage_confirmation(kubectl):

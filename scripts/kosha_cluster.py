@@ -85,6 +85,15 @@ def install(kubectl: list[str], args: argparse.Namespace) -> None:
             "Old readers cannot read new manifests. "
             "See README.md for the manifest/WAL upgrade note."
         )
+    account = subprocess.run(
+        [*kubectl, "get", "serviceaccount/kosha", "--ignore-not-found", "-o", "name"],
+        check=True, stdout=subprocess.PIPE, text=True,
+    ).stdout
+    if account.strip():
+        raise ValueError(
+            "serviceaccount/kosha already exists. The installer creates this account; "
+            "no resources were created."
+        )
     subprocess.run([*kubectl, "get", "secret/kosha-secret", "-o", "name"], check=True)
     with tempfile.TemporaryDirectory(prefix="kosha-install-") as scratch:
         overlay = render_overlay(Path(scratch), args)
