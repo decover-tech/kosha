@@ -19,6 +19,7 @@ mod centroid_index;
 mod centroid_probe;
 mod error;
 mod kmeans;
+pub mod namespace_centroids;
 mod ops;
 mod point;
 mod posting;

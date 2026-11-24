@@ -3093,7 +3093,8 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub deletion_vectors: HashMap<SegmentId, deletes::DeletionVector>,
     /// Namespace schema (`POST /v1/namespaces/{ns}/schema`). Read by the
-    /// segment writers (flush and compaction) for each field's analyzer.
+    /// segment writers (flush and compaction) for each field's analyzer
+    /// and persisted embedding model id.
     /// Segments record the chains they actually used in their own footer,
     /// so editing the schema never changes how an existing segment is
     /// searched. `None` = no schema: every field uses `standard`.

@@ -451,8 +451,8 @@ fn wal_error(message: String) -> KoshaError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wal::{GroupCommitConfig, WalWriter};
-    use kosha_core::{Document, DocumentId, Field, NamespaceId};
+    use crate::wal::{encode_wal_file, GroupCommitConfig, WalReader, WalWriter};
+    use kosha_core::{Document, DocumentId, Field, NamespaceId, WalRecord};
     use std::sync::Barrier;
 
     fn doc(id: &str) -> Document {
@@ -478,6 +478,74 @@ mod tests {
 
     fn ns() -> NamespaceId {
         NamespaceId("t/ns".into())
+    }
+
+    #[test]
+    fn read_only_replay_resumes_inside_a_group_after_indexer_loss() {
+        let backend = MemoryObjectBackend::new();
+        let stream = store(&backend, "ingest-0");
+        assert!(WalReader::open(stream.clone()).unwrap().is_none());
+        assert!(backend.keys().is_empty());
+        let (writer, _) = open(&backend);
+        let other = NamespaceId("t/other".into());
+        let lsns = writer
+            .append_records(&[
+                WalRecord::new(ns(), vec![doc("published")]),
+                WalRecord::new(other.clone(), vec![doc("other")]),
+                WalRecord::new(ns(), vec![doc("pending")]),
+            ])
+            .unwrap();
+        let reader = WalReader::open(stream.clone()).unwrap().unwrap();
+        assert_eq!(reader.origin(), writer.origin());
+        let pending = reader.read_namespace(&ns(), lsns[0], lsns[2]).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, lsns[2]);
+        assert_eq!(pending[0].1.documents[0].id.0, "pending");
+        drop(reader);
+
+        let tail = writer
+            .append_delete(&ns(), vec![DocumentId("pending".into())])
+            .unwrap();
+        let keys = backend.keys();
+        let replacement = WalReader::open(stream).unwrap().unwrap();
+        assert!(replacement
+            .read_namespace(&ns(), lsns[0], lsns[1])
+            .unwrap()
+            .is_empty());
+        let replay = replacement.read_namespace(&ns(), lsns[0], tail).unwrap();
+        assert_eq!(
+            replay.iter().map(|(lsn, _)| *lsn).collect::<Vec<_>>(),
+            [lsns[2], tail]
+        );
+        assert_eq!(replay[1].1.deleted_ids, [DocumentId("pending".into())]);
+        assert_eq!(backend.keys(), keys);
+
+        writer.discard_namespace(&ns()).unwrap();
+        assert!(replacement
+            .read_namespace(&ns(), 0, tail)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            replacement.read_namespace(&other, 0, tail).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn read_only_replay_fails_on_a_torn_group_without_repairing_it() {
+        let backend = MemoryObjectBackend::new();
+        let stream = store(&backend, "ingest-0");
+        let (writer, _) = open(&backend);
+        let lsn = writer.append(&ns(), &[doc("complete")]).unwrap() + 1;
+        let mut torn = encode_wal_file(&[(lsn, WalRecord::new(ns(), vec![doc("torn")]))]);
+        torn.pop();
+        stream.append_batch(lsn, &torn).unwrap();
+        let reader = WalReader::open(stream.clone()).unwrap().unwrap();
+        assert!(matches!(
+            reader.read_namespace(&ns(), 0, lsn),
+            Err(KoshaError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+        assert_eq!(stream.read(lsn).unwrap(), torn);
     }
 
     #[test]

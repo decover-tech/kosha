@@ -280,6 +280,7 @@ Read once in `crates/kosha-query/src/lib.rs`.
 | `KOSHA_KNN_SEGMENT_NPROBE` | Experimental coarse routing for unfiltered single-vector kNN. Probe the nearest N summarized segments plus all segments without usable summaries. `0` disables pruning. A smaller N can lower recall | `0` | segments |
 | `KOSHA_KNN_BUDGET_FRACTION` | Lower bound on the probe budget, as a fraction of the namespace's centroids. Must be > 0 | `0.05` | fraction |
 | `KOSHA_KNN_BUDGET_MAX_CAP` | Ceiling on that lower bound. A larger explicit `num_candidates` is still honored | `20000` | centroids |
+| `KOSHA_KNN_NAMESPACE_CENTROIDS` | Experimental (#253). `1`, `true` or `on`: enable on the indexer and query nodes (or standalone). The indexer updates the directory when it observes a committed flush or publishes a compaction. Eligible unfiltered single-vector queries probe at most `num_candidates` postings across the namespace, without the fraction floor. Missing or stale directories, legacy columns, filters, deletes, and the relative cutoff use the ordinary planner. | off | flag |
 | `KOSHA_KNN_EXACT_THRESHOLD` | A filtered kNN with at most this many filter-passing documents namespace-wide scores every passing document's vector exactly instead of probing (#252). `0` disables exact filtered kNN | `50000` | documents |
 | `KOSHA_KNN_EXACT_FRACTION` | A segment where at most this fraction of documents pass the filter is searched exactly too (#252) | `0.01` | fraction |
 | `KOSHA_KNN_EXACT_COST_MODEL` | Experimental (#465): pick exact or probed per segment by estimated bytes read instead of `KOSHA_KNN_EXACT_THRESHOLD` / `KOSHA_KNN_EXACT_FRACTION` (a threshold of `0` still disables exact) | off | `1` / `true` / `on` |
@@ -295,7 +296,9 @@ Read once in `crates/kosha-query/src/lib.rs`.
 | `KOSHA_KNN_BOUND_STOP_ALPHA` | Experimental (#384). Per-query early termination inside each segment's budgeted kNN probe: skip a posting when the segment's k-th guaranteed similarity so far (exact on f32 columns, `estimate - error` on RaBitQ ones) is at least `alpha x` the best cosine similarity any member of the posting can have, from the angle triangle inequality on its centroid distance and stored radius. `1` skips only postings that cannot change the segment's top k on f32 columns (on RaBitQ columns the `estimate - error` floor holds with ~94% confidence per estimate, so rare misses are possible); `< 1` trades recall for fewer postings. Off for pre-radius sidecars, i8 columns and quantized columns without local exact rescoring. The fixed budget stays the cap. Skipped postings count as `knn_bound_skips=` on the `search timing:` line. Unset, `0` or invalid = off. Read once in `crates/kosha-segment/src/lib.rs` | unset (off) | ratio |
 | `KOSHA_KNN_PROBE_RADIUS` | Experimental (#458). Selects `max`, `p90`, or `p50` member distance for probe ordering only, not for safe pruning. With `max` or missing quantiles, ordering is unchanged: max radius (zero on pre-radius versions) with global budgeting, raw centroid distance with per-segment budgeting | `max` | enum |
 | `KOSHA_KNN_PLAN_I8` | Two-stage kNN planning. A unit-norm vector column keeps i8 codes of its centroids in memory (built at load, about a quarter of the f32 centroids' bytes, no on-disk change); a query first bounds every centroid's rank score from the codes, then scores in f32 only the centroids that could be inside the probe budget. The bounds are guaranteed, so the plan (cutoff, postings probed, their order) and the results are identical to scoring every centroid. `0`, `false` or `off` loads no codes and scores every f32 centroid. `knn_plan_exact_centroids=` on the `search timing:` line counts the f32-scored centroids. Read once in `crates/kosha-segment/src/lib.rs` | `1` | flag |
+| `KOSHA_KNN_SEGMENT_PRUNE` | kNN segment pruning (#253). A unit-norm vector column keeps, in memory, a spherical cap holding all its centroids (built at load, no on-disk change); from it a query gets a guaranteed floor under every posting's rank score in that segment. The plan scores the segments with the lowest floors until they hold the probe budget, then leaves out unscored every segment whose floor is above the budget-th score found, since none of its postings can be probed. The plan (cutoff, postings probed, their order) and the results are identical to scoring every segment; it saves centroid scoring when segments hold spatially coherent vectors. `0`, `false` or `off` plans every segment. `knn_plan_exact_centroids=` on the `search timing:` line drops when segments are left out. Read once per searcher in `crates/kosha-query/src/lib.rs` | `1` | flag |
 | `KOSHA_LATE_INTERACTION_NPROBE` | Token-index postings probed per query token by a late-interaction (`knn.vectors`) search, before candidates are re-scored exactly (#205) | `16` | postings |
+| `KOSHA_LATE_INTERACTION_POSTINGS_CACHE_MAX_BYTES` | Decoded late-interaction token-index (`multivec.{i}.ivf`) postings LRU, per open segment, separate from the single-vector one; resident bytes count toward the query pod's live-bytes watermark like other postings caches; `0` disables (#205) | `33554432` (32 MiB) | bytes |
 | `KOSHA_DEFAULT_CONSISTENCY` | Consistency of a search that does not ask for one: `strong` (also search acknowledged but unindexed writes) or `eventual` (indexed segments only), #255. Unset: `strong`, except on a query pod without `KOSHA_INTERNAL_API_KEY`, which defaults to `eventual` | unset | enum |
 | `KOSHA_TAIL_FETCH_TIMEOUT_MS` | Query pods: timeout of the fetch of the ingest pod's unindexed tail for a strong search (#255) | `10000` | ms |
 | `KOSHA_MAX_UNINDEXED_BYTES` | Per-namespace cap on acknowledged but unindexed writes; past it `/index` and `/replace` return 429 with `retry-after` (#255). `0` disables | `2147483648` (2 GiB) | bytes |
@@ -829,16 +832,38 @@ field opts in through the namespace schema
 then embeds text sent for that field at ingest and `knn.query_text` at query time. Ingest and
 query pods need the same settings; an `indexer` pod needs none (compaction copies vectors and
 never embeds). A schema naming a model this pod has no provider for answers
-`503` to text writes and `query_text` searches; namespaces without a declared model never call a
+`501` to text writes and `query_text` searches; namespaces without a declared model never call a
 provider. The API key is never logged or returned.
 
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
-| `KOSHA_EMBEDDING_PROVIDERS` | Enabled providers: `http` (OpenAI-compatible server) and/or `mock` (deterministic hashed bag of words, for tests and local development only) | unset (no native embedding) | list |
+| `KOSHA_EMBEDDING_PROVIDERS` | Enabled providers: `onnx` (local CPU inference), `http` (OpenAI-compatible server) and/or `mock` (deterministic hashed bag of words, for tests and local development only) | unset (no native embedding) | list |
+| `KOSHA_EMBEDDING_ONNX_MODELS` | Map of model IDs to local artifact paths and sequence lengths. Required for `onnx` | unset | JSON object |
 | `KOSHA_EMBEDDING_URL` | Base URL of the OpenAI-compatible server; `/embeddings` is appended. Required for `http` | unset | URL |
 | `KOSHA_EMBEDDING_API_KEY` | Sent as `Authorization: Bearer ...` | unset | string |
 | `KOSHA_EMBEDDING_TIMEOUT_MS` | Timeout of one provider request | `10000` | ms |
 | `KOSHA_EMBEDDING_BATCH_SIZE` | Texts per provider request | `64` | count |
+
+### Local ONNX models
+
+Build with `cargo build --release -p kosha-server --features onnx`. Enable
+`KOSHA_EMBEDDING_PROVIDERS=onnx` and supply a JSON model map, for example:
+
+```json
+{"my-model@1": {"model_path": "/models/my-model/model.onnx", "tokenizer_path": "/models/my-model/tokenizer.json", "sequence_length": 128}}
+```
+
+Set the field's `embedding` to `{"model":"my-model@1","dims":384,"distance_metric":"cosine","provider":"onnx"}`.
+Kosha loads local files on first use; it does not download artifacts. The ONNX graph must take
+`int64` `input_ids` and `attention_mask`, with optional `token_type_ids`, shaped
+`[1, sequence_length]`, and output one pooled `float32` tensor shaped `[1, dims]`. A
+tokenizer export must supply padding settings or contain a `[PAD]` token. Inputs are truncated
+and padded to the configured sequence length (1–512). Graphs that output per-token embeddings
+need to be exported with pooling before they can be used here.
+
+Mount identical artifacts and use the same sequence length on every ingest and query pod.
+Treat a model ID as immutable: use a new ID for a different graph, tokenizer, or sequence length,
+and reindex before serving queries against that new model.
 
 ## CLI and Python client
 
