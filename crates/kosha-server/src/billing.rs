@@ -405,6 +405,7 @@ fn limits_of(quotas: &PlanQuotas) -> TenantLimits {
         write_bytes_per_sec: quotas.write_bytes_per_sec,
         namespaces: quotas.namespaces,
         docs_per_namespace: quotas.docs_per_namespace,
+        bytes_per_namespace: quotas.bytes_per_namespace,
         vector_dims: quotas.vector_dims,
         max_body_bytes: quotas.max_body_bytes,
         weight: quotas.weight,

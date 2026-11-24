@@ -513,7 +513,7 @@ pub(crate) struct Metrics {
     lease_outcomes: [Counter; 3],
     knn_degraded_segments: Counter,
     tenant_rejections: Family<Labels, Counter>,
-    tenant_rejection_reasons: [Counter; 8],
+    tenant_rejection_reasons: [Counter; crate::tenant_limits::RejectReason::ALL.len()],
     legacy_requests: Family<Labels, Counter>,
 }
 
