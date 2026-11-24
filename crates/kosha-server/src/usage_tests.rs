@@ -208,6 +208,7 @@ fn writes_and_searches_are_metered_per_tenant_and_namespace() {
 
 #[test]
 fn legacy_routes_and_replace_are_metered_too() {
+    let _legacy = auth::override_legacy_policy(true, "");
     let (state, store) = metered_state();
     ok(call(
         &state,

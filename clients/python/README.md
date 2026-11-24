@@ -48,14 +48,11 @@ Since 0.3.0 the client calls only the `/v1` API (`/v1/namespaces/{ns}/documents`
 `.../replace`, `.../search`, ...), so it works against servers with
 `KOSHA_LEGACY_ROUTES=off`; 0.2.x needs the legacy routes on.
 
-**Server compatibility.** 0.3.0 works with every server that serves `/v1`.
+**Server compatibility.** Upgrade the server before upgrading the SDK.
 Partial updates (`update()`, bulk `update` actions, `update_by_query`) use
-`POST /v1/namespaces/{ns}/replace`, which servers gained in API contract
-0.9.0 (`Kosha-Api-Version`). Against an older server the client sees that
-route's bare 404, logs a warning once, and falls back to the deprecated
-`POST /replace` for the rest of its life, so upgrading the client before the
-server is safe. Turn `KOSHA_LEGACY_ROUTES` off only once the server is on
-0.9.0 or later. `KoshaRequestError`
+`POST /v1/namespaces/{ns}/replace` and require a server that supports it
+(API contract 0.10.0 or later). The SDK surfaces any error from that
+operation rather than retrying it on the deprecated route. `KoshaRequestError`
 carries the server's error model: `code`, `retryable`, `retry_after_ms` and
 `request_id` (see [docs/api/errors.md](../../docs/api/errors.md)), plus
 `attempts`.
@@ -68,8 +65,7 @@ server or a proxy) is retried after the server's `retry_after_ms` /
 never retried. `max_retries` (default 3) counts attempts, so `max_retries=1`
 fails fast. A connection that could not be opened is retried for every
 operation; a timeout after the request was sent only for idempotent ones
-(search, upsert, merge, including the deprecated `POST /replace` fallback,
-delete-by-query, flush, every GET), unless you pass
+(search, upsert, merge, delete-by-query, flush, every GET), unless you pass
 `retry_non_idempotent=True`. `retry_on_timeout=False` turns off every
 transport-error retry (timeouts, resets, refused connections, DNS
 failures), as in 0.2.x; HTTP error responses still follow the policy.

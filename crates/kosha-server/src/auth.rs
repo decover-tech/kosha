@@ -605,11 +605,17 @@ pub fn max_body_bytes() -> usize {
     })
 }
 
-/// `KOSHA_LEGACY_ROUTES=off` disables the unversioned Phase 1 routes: the
-/// pod default (ADR-350 §c).
+/// The unversioned Phase 1 routes are off unless explicitly enabled.
 pub fn legacy_routes_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| !env_flag_disabled("KOSHA_LEGACY_ROUTES"))
+    *ON.get_or_init(|| {
+        std::env::var("KOSHA_LEGACY_ROUTES").is_ok_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "enabled" | "on" | "true" | "1"
+            )
+        })
+    })
 }
 
 /// `KOSHA_LEGACY_ROUTES_TENANTS`: tenants that keep the legacy routes while
@@ -661,16 +667,21 @@ thread_local! {
 /// `allowlist`, on this thread only.
 #[cfg(test)]
 pub fn with_legacy_policy<T>(default_on: bool, allowlist: &str, f: impl FnOnce() -> T) -> T {
+    let _policy = override_legacy_policy(default_on, allowlist);
+    f()
+}
+
+#[cfg(test)]
+pub fn override_legacy_policy(default_on: bool, allowlist: &str) -> impl Drop {
     let policy = (default_on, parse_tenant_list(Some(allowlist)));
-    LEGACY_POLICY_OVERRIDE.with(|p| *p.borrow_mut() = Some(policy));
-    struct Reset;
+    let previous = LEGACY_POLICY_OVERRIDE.with(|p| p.replace(Some(policy)));
+    struct Reset(Option<(bool, HashSet<String>)>);
     impl Drop for Reset {
         fn drop(&mut self) {
-            LEGACY_POLICY_OVERRIDE.with(|p| *p.borrow_mut() = None);
+            LEGACY_POLICY_OVERRIDE.with(|p| p.replace(self.0.take()));
         }
     }
-    let _reset = Reset;
-    f()
+    Reset(previous)
 }
 
 /// The decision behind [`legacy_routes_enabled_for`], for tests.
