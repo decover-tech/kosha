@@ -3,6 +3,9 @@
 This is an operator-only starting point, not a customer SLA. It does not deploy monitoring, set
 commercial entitlements, publish a status site, or assign people to on-call.
 
+Related operator docs: [high availability and Postgres failover](../high-availability.md) and
+[backups and point-in-time restore](backup-restore.md).
+
 ## Draft search SLOs
 
 Map the deployment's configured [billing plans](../configuration.md#billing) to these draft
@@ -99,7 +102,7 @@ the scheduler interval and normal ingest volume.
 | Cache churn / inline span writes | Check per-pod disk free space and I/O, cache bytes, miss and eviction rates. Check whether eviction activity is a deletion sweep rather than capacity pressure. | Relieve disk pressure or resize only within available disk capacity. Confirm miss rate, eviction rate and inline writes subside, and search latency recovers. |
 | Compaction backlog | On the scheduler pod inspect scheduler ticks and enabled state, namespace `needs_compaction` and segment counts, and recent job failures. Check storage headroom and store connectivity. | Restore the scheduler or dependency first. Don't start concurrent full merges as a first response; assess merge size, disk headroom and existing jobs before considering a tiered pass. Confirm jobs complete and segment counts trend down. |
 | S3 throttling | Correlate `SlowDown`/503s in dependency logs or provider metrics with fetches, deployment churn, and compaction. | Reduce competing background work and stagger warm-up or rollouts. Confirm throttling declines and customer read and write probes recover before restoring load. |
-| Postgres failover | Check the provider's writer endpoint and failover state, Kosha readiness, connection errors and writer fencing. | Restore connectivity to the elected writer. Don't bypass fencing or promote a second writer. Confirm authenticated search, an isolated write/flush/read-back probe, and compaction job progress before resolving. |
+| Postgres failover | Check the provider's writer endpoint and failover state, Kosha readiness, connection errors and writer fencing. While Postgres is not writable, writes return `503` with `Retry-After` and searches keep serving the cached manifest ([failover behaviour](../high-availability.md)). | Restore connectivity to the elected writer. Don't bypass fencing or promote a second writer. Confirm authenticated search, an isolated write/flush/read-back probe, and compaction job progress before resolving. |
 
 ## On-call and public status
 
