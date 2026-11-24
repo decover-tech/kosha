@@ -311,7 +311,11 @@ Use `scripts/kosha_cluster.py` from this checkout with Python 3.10+ and
 
 - Set up a kubeconfig context and permissions to deploy the base manifests.
   The cluster needs the [Kosha NVMe node pool](#the-kosha-node-pool-karpenter-nvme-instance-store)
-  for ingest.
+  for ingest. The base manifests include the query PodDisruptionBudget, so
+  the deploying identity also needs `policy/poddisruptionbudgets` (see
+  `base/rbac-query-pdb.yaml`), and the three query replicas need schedulable
+  capacity in three availability zones, or the install waits on the query
+  rollout ([HA deployment](../docs/high-availability.md)).
 - Provision an empty Postgres database and an unused S3 bucket/prefix.
   Give the Kosha service account access to S3 (and KMS if required). On
   EKS with IRSA, pass the role ARN below; the role must trust
