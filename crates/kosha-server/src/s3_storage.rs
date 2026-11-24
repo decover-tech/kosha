@@ -1504,6 +1504,92 @@ impl S3Storage {
         )
     }
 
+    /// Upload a local file to `logical_path` as an object of `tenant`
+    /// (#347 exports, which live under `_exports/` where
+    /// [`SseConfig::for_path`] would see no tenant): the tenant's SSE key
+    /// applies. The file is read whole; export parts are bounded by
+    /// `KOSHA_EXPORT_PART_BYTES`.
+    pub fn put_file_for_tenant(
+        &self,
+        local: &Path,
+        logical_path: &str,
+        tenant: &str,
+    ) -> Result<(), KoshaError> {
+        let data = std::fs::read(local).map_err(KoshaError::Io)?;
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key = self.s3_key(logical_path);
+        let sse = self.sse.for_tenant(Some(tenant));
+        self.rt
+            .block_on(async move { put_bytes(client, bucket, key, data, sse).await })
+    }
+
+    /// Stream one object into a local file (created or truncated), without
+    /// going through the segment cache. Returns its length.
+    pub fn get_object_to_file(&self, logical_path: &str, dest: &Path) -> Result<u64, KoshaError> {
+        use tokio::io::AsyncWriteExt;
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key = self.s3_key(logical_path);
+        let dest = dest.to_path_buf();
+        self.rt.block_on(async move {
+            let resp = client
+                .get_object()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 get_object: {}",
+                        log_get_object_error(&key, &e)
+                    ))
+                })?;
+            let mut body = resp.body;
+            let mut file = tokio::fs::File::create(&dest).await?;
+            let mut written = 0u64;
+            while let Some(chunk) = body.try_next().await.map_err(|e| {
+                KoshaError::NotFound(format!(
+                    "S3 read body: {}",
+                    log_s3_error("read body", &key, &e)
+                ))
+            })? {
+                file.write_all(&chunk).await?;
+                written += chunk.len() as u64;
+            }
+            file.flush().await?;
+            Ok(written)
+        })
+    }
+
+    /// A presigned `GET` URL for `logical_path`, valid for `expires_in`.
+    pub fn presign_get(
+        &self,
+        logical_path: &str,
+        expires_in: std::time::Duration,
+    ) -> Result<String, KoshaError> {
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key = self.s3_key(logical_path);
+        let config = aws_sdk_s3::presigning::PresigningConfig::expires_in(expires_in)
+            .map_err(|e| KoshaError::NotFound(format!("presigning config: {e}")))?;
+        self.rt.block_on(async move {
+            client
+                .get_object()
+                .bucket(&bucket)
+                .key(&key)
+                .presigned(config)
+                .await
+                .map(|request| request.uri().to_string())
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 presign get_object: {}",
+                        log_s3_error("presign get_object", &key, &e)
+                    ))
+                })
+        })
+    }
+
     /// Delete one object from S3, surfacing failures (unlike the trait's
     /// `delete`, which predates GC and is best-effort remotely).
     pub fn delete_remote(&self, path: &str) -> Result<(), KoshaError> {

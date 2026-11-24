@@ -821,6 +821,12 @@ impl Metrics {
         self.lease_outcomes[outcome as usize].inc();
     }
 
+    /// Add a collector read at scrape time: the usage pipeline's and
+    /// billing's families (`pipeline_metrics.rs`, #348/#349).
+    pub(crate) fn register_collector(&mut self, collector: Box<dyn Collector>) {
+        self.registry.register_collector(collector);
+    }
+
     /// The registry in Prometheus text format (0.0.4), with `scrape` as
     /// the current value of every scrape-time series.
     pub(crate) fn render(&self, scrape: &Scrape) -> String {

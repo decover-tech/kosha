@@ -3,17 +3,18 @@
 use std::collections::HashMap;
 
 use super::{
-    addressable_namespace, admin_actor, api_error, api_key_admin, auth, bare_namespace, billing,
-    branching, extract_namespace, handle_backfill_offset_tables, handle_compact_namespace,
-    handle_compaction_job, handle_compaction_status, handle_create_namespace, handle_delete,
-    handle_delete_namespace, handle_delete_with_ns, handle_exists, handle_exists_with_ns,
-    handle_flush, handle_flush_with_ns, handle_get_schema_with_ns, handle_import_namespace,
-    handle_index, handle_index_with_ns, handle_list_namespaces, handle_namespace_stats,
-    handle_put_schema_with_ns, handle_put_shards_with_ns, handle_rebuild_filter_blooms,
-    handle_replace, handle_replace_with_ns, handle_search_get, handle_search_post,
-    handle_search_post_with_ns, handle_segment_gc, handle_stats, http, is_create_namespace_route,
-    is_list_namespaces_route, json_ok, legacy_route, namespace_deletion, operator_admin, org_admin,
-    parse_method_and_path, path_decode, routes, service_authorized, tenant_namespace, unindexed,
+    addressable_namespace, admin_actor, admin_audit, api_error, api_key_admin, auth,
+    bare_namespace, billing, branching, exports, extract_namespace, handle_backfill_offset_tables,
+    handle_compact_namespace, handle_compaction_job, handle_compaction_status,
+    handle_create_namespace, handle_delete, handle_delete_namespace, handle_delete_with_ns,
+    handle_exists, handle_exists_with_ns, handle_flush, handle_flush_with_ns,
+    handle_get_schema_with_ns, handle_import_namespace, handle_index, handle_index_with_ns,
+    handle_list_namespaces, handle_namespace_stats, handle_put_schema_with_ns,
+    handle_put_shards_with_ns, handle_rebuild_filter_blooms, handle_replace,
+    handle_replace_with_ns, handle_search_get, handle_search_post, handle_search_post_with_ns,
+    handle_segment_gc, handle_stats, http, is_create_namespace_route, is_list_namespaces_route,
+    json_ok, legacy_route, namespace_deletion, operator_admin, org_admin, parse_method_and_path,
+    path_decode, routes, service_authorized, tenant_key_admin, tenant_namespace, unindexed,
     url_decode, usage, usage_reconcile, valid_name_component, with_header, ApiError, AppState,
     ErrorCode,
 };
@@ -33,6 +34,10 @@ pub(super) fn route(
     if legacy_route(request_line).is_none() {
         return response;
     }
+    with_legacy_deprecation(response)
+}
+
+pub(super) fn with_legacy_deprecation(response: String) -> String {
     let response = with_header(
         response,
         "link",
@@ -67,7 +72,7 @@ fn route_checked(
             return response;
         }
         // Organizations, users, projects, audit log (#345).
-        let key_table = match auth::global() {
+        let key_table = match state.auth() {
             auth::Auth::Keys(keys) => Some(keys),
             auth::Auth::Disabled => None,
         };
@@ -95,6 +100,16 @@ fn route_checked(
         if let Some(response) = operator_admin::handle(method, path, body, &operator) {
             return response;
         }
+        // Tenant API keys (#346), audited as the credential's holder.
+        if let Some(response) = api_key_admin::handle(method, path, body, &operator) {
+            return response;
+        }
+        // Every other admin change is audited here, naming the operator.
+        if method != "GET" {
+            return admin_audit::audited(&state.orgs, &operator, method, path, || {
+                route_inner(request_line, headers, body, tenant, state)
+            });
+        }
     } else if path.starts_with("/internal/") {
         if !service_authorized(headers, state.internal_service_key.as_deref()) {
             return api_error(
@@ -114,6 +129,10 @@ fn route_checked(
             // otherwise validate `_shard-0001?x=` and delete the shard).
             let rest = rest.split('?').next().unwrap_or(rest);
             let ns = match rest.rsplit_once('/') {
+                // `/v1/namespaces/{ns}/exports/{id}[/download]` (#347).
+                _ if rest.split('/').nth(1) == Some("exports") => {
+                    rest.split('/').next().unwrap_or(rest)
+                }
                 Some((ns, _action)) => ns,
                 None => rest,
             };
@@ -242,7 +261,7 @@ fn legacy_replacement(path: &str) -> &'static str {
         "/search" => "POST /v1/namespaces/{namespace}/search",
         "/flush" => "POST /v1/namespaces/{namespace}/flush",
         "/delete" => "POST /v1/namespaces/{namespace}/delete",
-        "/stats" => "GET /v1/namespaces/{namespace}/stats",
+        "/stats" => "GET /v1/stats",
         _ => "/v1/namespaces/{namespace}/...",
     }
 }
@@ -252,9 +271,7 @@ pub(super) fn legacy_route_disabled(path: &str) -> String {
     let replacement = legacy_replacement(path);
     ApiError::new(
         ErrorCode::LegacyRouteDisabled,
-        format!(
-            "unversioned route {path} is disabled (KOSHA_LEGACY_ROUTES=off); use {replacement}"
-        ),
+        format!("unversioned route {path} is disabled; use {replacement}"),
     )
     .detail("route", path)
     .detail("replacement", replacement)
@@ -263,7 +280,7 @@ pub(super) fn legacy_route_disabled(path: &str) -> String {
 
 pub(super) fn route_inner(
     request_line: &str,
-    _headers: &HashMap<String, String>,
+    headers: &HashMap<String, String>,
     body: &[u8],
     tenant: &str,
     state: &AppState,
@@ -280,6 +297,11 @@ pub(super) fn route_inner(
     }
 
     if let Some(ns) = bare_namespace(request_line, "DELETE") {
+        if let Err(response) =
+            namespace_deletion::check_delete_confirmation(request_line, &ns, state)
+        {
+            return response;
+        }
         return handle_delete_namespace(&ns, tenant, state);
     }
 
@@ -362,12 +384,17 @@ pub(super) fn route_inner(
     }
 
     // ── Billing (#349) ─────────────────────────────────────────────────────
+    // `dispatch` answers Stripe webhooks before authentication; one that
+    // reaches the router (an in-process caller) gets the same answer.
+    if let Some(response) = billing::webhook_response(state, request_line, headers, body) {
+        return response;
+    }
     if let Some(response) = billing::route(request_line, body, tenant, state) {
         return response;
     }
 
-    // ── Admin routes (Postgres-backed only) ────────────────────────────────
-    if let Some(response) = api_key_admin::handle(request_line, body) {
+    // ── A tenant's own API keys (#346 self-service, Postgres only) ─────────
+    if let Some(response) = tenant_key_admin::handle(request_line, body) {
         return response;
     }
 
@@ -408,6 +435,11 @@ pub(super) fn route_inner(
 
     // Tenant deletion and deletion records (#347).
     if let Some(response) = namespace_deletion::route_admin(request_line, body, state) {
+        return response;
+    }
+
+    // Namespace exports (#347); the download streams from `dispatch`.
+    if let Some(response) = exports::route(request_line, body, tenant, state) {
         return response;
     }
 

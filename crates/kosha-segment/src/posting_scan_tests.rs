@@ -119,25 +119,31 @@ impl Fixture {
     /// postings (in file order) to a span file.
     fn move_idx_to_spans(&self, per_span: usize) {
         let index = self.index();
-        let vi = index.lazy.as_ref().unwrap();
-        let mut ranges: Vec<(u64, u64)> = vi
-            .ranges
-            .iter()
-            .map(|&(offset, length)| (offset, offset + length as u64))
-            .collect();
-        ranges.sort_unstable();
-        let spans = span_cache::spans_dir(&self.dir, VECTOR_IDX_FILE);
-        fs::create_dir_all(&spans).unwrap();
-        for group in ranges.chunks(per_span) {
-            let (start, end) = (group[0].0, group[group.len() - 1].1);
-            fs::write(
-                spans.join(span_cache::span_file_name(start, end)),
-                &self.idx[start as usize..end as usize],
-            )
-            .unwrap();
-        }
-        fs::remove_file(self.dir.join(VECTOR_IDX_FILE)).unwrap();
+        move_idx_to_spans(&self.dir, index.lazy.as_ref().unwrap(), &self.idx, per_span);
     }
+}
+
+/// Move the `vector.idx` of the segment in `dir` (whose bytes are `idx`)
+/// into the span cache: `per_span` consecutive postings (in file order) to
+/// a span file.
+fn move_idx_to_spans(dir: &Path, vi: &LazyVectorIndex, idx: &[u8], per_span: usize) {
+    let mut ranges: Vec<(u64, u64)> = vi
+        .ranges
+        .iter()
+        .map(|&(offset, length)| (offset, offset + length as u64))
+        .collect();
+    ranges.sort_unstable();
+    let spans = span_cache::spans_dir(dir, VECTOR_IDX_FILE);
+    fs::create_dir_all(&spans).unwrap();
+    for group in ranges.chunks(per_span) {
+        let (start, end) = (group[0].0, group[group.len() - 1].1);
+        fs::write(
+            spans.join(span_cache::span_file_name(start, end)),
+            &idx[start as usize..end as usize],
+        )
+        .unwrap();
+    }
+    fs::remove_file(dir.join(VECTOR_IDX_FILE)).unwrap();
 }
 
 impl Drop for Fixture {
@@ -172,7 +178,7 @@ fn reference_within(
     k: usize,
     max_distance: f32,
     max_probes: usize,
-    accept: Option<&dyn Fn(u32) -> bool>,
+    accept: Option<KnnAccept<'_>>,
     refill: KnnRefill,
 ) -> (Vec<(u32, f64)>, usize) {
     let mut ranked: Vec<(usize, f32)> = SegmentReader::centroid_lower_bounds(vi, query)
@@ -593,7 +599,7 @@ fn filtered_and_tombstoned_probes_keep_their_refill_behaviour() {
     let sparse = |id: u32| id % 97 == 5;
     let half = |id: u32| id.is_multiple_of(2);
     let nothing = |_: u32| false;
-    let accepts: [(&str, &dyn Fn(u32) -> bool); 3] =
+    let accepts: [(&str, KnnAccept<'_>); 3] =
         [("sparse", &sparse), ("half", &half), ("nothing", &nothing)];
     // Run everything twice: the second pass meets admitted and cached
     // postings.
@@ -641,7 +647,7 @@ fn filtered_and_tombstoned_probes_keep_their_refill_behaviour() {
     }
     // The refill really ran past the budget, and really stopped early.
     let query = &queries()[0];
-    let probes = |accept: &dyn Fn(u32) -> bool, refill| {
+    let probes = |accept: KnnAccept<'_>, refill| {
         fixture
             .reader
             .knn_search_within_filtered_fetching(
@@ -1200,7 +1206,7 @@ fn planned_probe_matches_the_segment_ranking_its_own_postings() {
     // So few pass that the probe runs past any budget, to the last posting.
     let rare = |id: u32| id % 300 == 7;
     let none = |_: u32| false;
-    type Accept<'a> = Option<&'a dyn Fn(u32) -> bool>;
+    type Accept<'a> = Option<KnnAccept<'a>>;
     let accepts: [(&str, Accept<'_>); 4] = [
         ("unrestricted", None),
         ("even", Some(&even)),
@@ -1825,6 +1831,490 @@ fn evicted_and_removed_entries_are_freed_outside_the_cache_lock() {
     );
     assert_eq!(FREED_LOCKED.load(Ordering::SeqCst), 0);
     assert_eq!(account.live(), 0);
+}
+
+// ── One segment's budgeted probe on several threads ──────────────────
+
+/// A segment of `docs` `dim`-wide vectors in `quantization`, in its own
+/// directory, with its `vector.idx` as written. Every seventh vector
+/// repeats an earlier one, so equal scores (and their order) are exercised.
+fn write_split_segment(
+    name: &str,
+    docs: usize,
+    dim: usize,
+    quantization: VectorQuantization,
+    seed: u64,
+) -> (PathBuf, Vec<Vec<f32>>) {
+    let dir = std::env::temp_dir().join(format!("kosha-split-{name}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let mut writer = SegmentWriter::new(SegmentId(name.into()), dir.clone())
+        .with_vector_quantization(VectorQuantizationConfig::all(quantization));
+    let mut rng = Lcg(seed);
+    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(docs);
+    for i in 0..docs {
+        let v = if i % 7 == 6 {
+            vectors[i / 2].clone()
+        } else {
+            (0..dim).map(|_| rng.coord()).collect()
+        };
+        writer.add_document(
+            DocumentId(format!("d{i}")),
+            vec![Field::vector(FIELD, v.clone())],
+        );
+        vectors.push(v);
+    }
+    writer.finalize(Bm25Params::default()).unwrap();
+    (dir, vectors)
+}
+
+fn pool(threads: usize) -> rayon::ThreadPool {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .unwrap()
+}
+
+/// Everything a probe returns that must not depend on the split: the
+/// candidates bit for bit, the postings probed, and what the scan counted.
+type ProbeOutcome = (Vec<(u32, u64, u64)>, usize, bool, (usize, usize, usize));
+
+fn probe_outcome(
+    reader: &SegmentReader,
+    query: &[f32],
+    k: usize,
+    budget: KnnProbeBudget<'_>,
+    accept: Option<KnnAccept<'_>>,
+) -> ProbeOutcome {
+    let (found, stats) = with_knn_scan_stats(|| {
+        reader
+            .knn_candidates_fetching(FIELD, query, k, budget, accept, None)
+            .unwrap()
+            .unwrap()
+    });
+    let candidates = found
+        .candidates
+        .iter()
+        .map(|c| (c.doc_seq, c.estimate.to_bits(), c.error.to_bits()))
+        .collect();
+    let counts = (
+        stats.postings_scanned,
+        stats.postings_decoded,
+        stats.postings_cached,
+    );
+    (candidates, found.postings, found.exact, counts)
+}
+
+/// A budgeted probe split across a pool of four returns exactly what one
+/// thread returns (which is the serial scan): f32, i8 and RaBitQ columns,
+/// several corpora, filters, tombstones and both together, ties, every
+/// budget shape, every `k`. For f32 both also equal the probe as it was
+/// before #435.
+#[test]
+fn a_probe_split_across_threads_returns_what_one_thread_returns() {
+    const SPLIT_DOCS: usize = 8_000;
+    const SPLIT_DIM: usize = 16;
+    let (one, four) = (pool(1), pool(4));
+    let mut split = 0usize;
+    for (name, quantization) in [
+        ("f32", VectorQuantization::F32),
+        ("i8", VectorQuantization::I8),
+        ("rabitq", VectorQuantization::RaBitQ),
+    ] {
+        for seed in [0x5EED_u64, 0xD1CE] {
+            let (dir, vectors) = write_split_segment(
+                &format!("{name}-{seed}"),
+                SPLIT_DOCS,
+                SPLIT_DIM,
+                quantization,
+                seed,
+            );
+            let mut reader = SegmentReader::open_with_options(dir.clone(), true).unwrap();
+            reader.vector_cache = Arc::new(PostingsCache::new(0, None, &TEST_POSTINGS_COUNTERS));
+            let index = reader.vector_field(FIELD).unwrap().unwrap();
+            let vi = index.lazy.as_ref().unwrap();
+            let postings = vi.ranges.len();
+            assert!(
+                postings >= 4 * KNN_PARALLEL_MIN_POSTINGS,
+                "{name}: {postings} postings is too few to split"
+            );
+            let idx = fs::read(dir.join(VECTOR_IDX_FILE)).unwrap();
+            let dead: HashSet<u32> = (0..SPLIT_DOCS as u32).filter(|i| i % 11 == 3).collect();
+            let even = |id: u32| id.is_multiple_of(2);
+            let rare = |id: u32| id % 97 == 5;
+            let tombstoned = |id: u32| !dead.contains(&id);
+            let both = |id: u32| id.is_multiple_of(2) && !dead.contains(&id);
+            let nothing = |_: u32| false;
+            let accepts: [(&str, Option<KnnAccept<'_>>); 6] = [
+                ("unrestricted", None),
+                ("even", Some(&even)),
+                ("rare", Some(&rare)),
+                ("tombstoned", Some(&tombstoned)),
+                ("filter+tombstones", Some(&both)),
+                ("nothing", Some(&nothing)),
+            ];
+            let mut rng = Lcg(seed ^ 0xABCD);
+            let mut queries: Vec<Vec<f32>> = (0..3)
+                .map(|_| (0..SPLIT_DIM).map(|_| rng.coord()).collect())
+                .collect();
+            // Equal to a stored, repeated vector: ties at the very top.
+            queries.push(vectors[6].clone());
+            for (q, query) in queries.iter().enumerate() {
+                let bounds = reader.knn_centroid_distances(FIELD, query).unwrap();
+                let ranking = KnnSegmentRanking::new(bounds, f32::INFINITY, postings / 2);
+                let within = |max_probes, refill| KnnProbeBudget::Within {
+                    max_distance: f32::INFINITY,
+                    max_probes,
+                    refill,
+                };
+                let budgets = [
+                    ("all", within(usize::MAX, KnnRefill::Always)),
+                    (
+                        "just split",
+                        within(2 * KNN_PARALLEL_MIN_POSTINGS, KnnRefill::Always),
+                    ),
+                    (
+                        "too few",
+                        within(2 * KNN_PARALLEL_MIN_POSTINGS - 1, KnnRefill::Always),
+                    ),
+                    ("odd", within(postings / 3 + 7, KnnRefill::BudgetedSegments)),
+                    ("zero", within(0, KnnRefill::BudgetedSegments)),
+                    (
+                        "planned",
+                        KnnProbeBudget::Planned {
+                            ranking: &ranking,
+                            refill: KnnRefill::Always,
+                        },
+                    ),
+                    ("nprobe", KnnProbeBudget::Nprobe(postings)),
+                ];
+                for (budget_name, budget) in budgets {
+                    for (accept_name, accept) in accepts {
+                        for k in [1usize, 10, 100, SPLIT_DOCS * 2] {
+                            let context = format!(
+                                "{name} seed {seed:x} query {q} {budget_name} {accept_name} k {k}"
+                            );
+                            let serial =
+                                one.install(|| probe_outcome(&reader, query, k, budget, accept));
+                            let parallel =
+                                four.install(|| probe_outcome(&reader, query, k, budget, accept));
+                            assert_eq!(parallel, serial, "{context}");
+                            split += usize::from(serial.1 >= 2 * KNN_PARALLEL_MIN_POSTINGS);
+                            if quantization != VectorQuantization::F32 {
+                                continue;
+                            }
+                            let KnnProbeBudget::Within {
+                                max_distance,
+                                max_probes,
+                                refill,
+                            } = budget
+                            else {
+                                continue;
+                            };
+                            let (expect, probes) = reference_within(
+                                vi,
+                                &idx,
+                                query,
+                                k,
+                                max_distance,
+                                max_probes,
+                                accept,
+                                refill,
+                            );
+                            let got = four.install(|| {
+                                reader
+                                    .knn_search_within_filtered_fetching(
+                                        FIELD,
+                                        query,
+                                        k,
+                                        max_distance,
+                                        max_probes,
+                                        accept,
+                                        refill,
+                                        None,
+                                    )
+                                    .unwrap()
+                                    .unwrap()
+                            });
+                            assert_eq!(
+                                (bits(&got.0), got.1),
+                                (bits(&expect), probes),
+                                "{context}: against the pre-#435 probe"
+                            );
+                        }
+                    }
+                }
+            }
+            drop(index);
+            drop(reader);
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+    assert!(split > 0, "no probe was large enough to split");
+}
+
+/// The cache sees a split probe as it sees a serial one: the same
+/// postings are read, admitted on their second touch and then served from
+/// the cache, run after run.
+#[test]
+fn a_split_probe_admits_to_the_cache_as_a_serial_one_does() {
+    let (dir, _) = write_split_segment("admit", 4_000, 16, VectorQuantization::F32, 0xCAC4E);
+    let query: Vec<f32> = (0..16).map(|i| (i as f32 * 0.37).sin()).collect();
+    let runs = |threads: usize| {
+        let mut reader = SegmentReader::open_with_options(dir.clone(), true).unwrap();
+        reader.vector_cache = Arc::new(PostingsCache::new(
+            usize::MAX / 2,
+            None,
+            &TEST_POSTINGS_COUNTERS,
+        ));
+        let pool = pool(threads);
+        let budget = KnnProbeBudget::Within {
+            max_distance: f32::INFINITY,
+            max_probes: usize::MAX,
+            refill: KnnRefill::Always,
+        };
+        (0..3)
+            .map(|_| pool.install(|| probe_outcome(&reader, &query, 10, budget, None)))
+            .collect::<Vec<_>>()
+    };
+    let serial = runs(1);
+    assert!(serial[0].1 >= 2 * KNN_PARALLEL_MIN_POSTINGS);
+    assert_eq!(runs(4), serial);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A query whose matter is one segment scores that segment's postings on
+/// more than one thread of the pool it runs on. Before the split, every
+/// posting of one segment was scored on the thread that visited it.
+#[test]
+fn one_segment_probe_is_scored_on_more_than_one_thread() {
+    let (dir, _) = write_split_segment("spread", 20_000, 16, VectorQuantization::F32, 0x5A7E);
+    let mut reader = SegmentReader::open_with_options(dir.clone(), true).unwrap();
+    reader.vector_cache = Arc::new(PostingsCache::new(0, None, &TEST_POSTINGS_COUNTERS));
+    let query: Vec<f32> = (0..16).map(|i| (i as f32 * 0.61).cos()).collect();
+    let threads = Mutex::new(HashSet::new());
+    // The filter runs on whichever thread scores the posting.
+    let accept = |_: u32| {
+        threads.lock().unwrap().insert(std::thread::current().id());
+        true
+    };
+    let pool = pool(4);
+    // Work stealing is not a promise: retry, as a run may finish before
+    // another worker wakes.
+    for _ in 0..50 {
+        pool.install(|| {
+            reader
+                .knn_search_within_filtered(
+                    FIELD,
+                    &query,
+                    10,
+                    f32::INFINITY,
+                    usize::MAX,
+                    Some(&accept),
+                )
+                .unwrap()
+                .unwrap()
+        });
+        if threads.lock().unwrap().len() > 1 {
+            break;
+        }
+    }
+    let seen = threads.lock().unwrap().len();
+    drop(reader);
+    let _ = fs::remove_dir_all(&dir);
+    assert!(seen > 1, "every posting was scored on one thread");
+}
+
+/// Two postings of one probe, far apart in probe order (so in different
+/// runs of a split), cannot be read: the split probe fails with the
+/// serial probe's error, the one naming the earlier posting.
+#[test]
+fn a_split_probe_fails_on_its_earliest_unreadable_posting() {
+    let (dir, _) = write_split_segment("fail", 8_000, 16, VectorQuantization::F32, 0xFA11);
+    let mut reader = SegmentReader::open_with_options(dir.clone(), true).unwrap();
+    reader.vector_cache = Arc::new(PostingsCache::new(0, None, &TEST_POSTINGS_COUNTERS));
+    let index = reader.vector_field(FIELD).unwrap().unwrap();
+    let vi = index.lazy.as_ref().unwrap();
+    let idx = fs::read(dir.join(VECTOR_IDX_FILE)).unwrap();
+    move_idx_to_spans(&dir, vi, &idx, 1);
+    let query: Vec<f32> = (0..16).map(|i| (i as f32 * 0.29).sin()).collect();
+    let bounds = reader.knn_centroid_distances(FIELD, &query).unwrap();
+    let ranking = KnnSegmentRanking::new(bounds, f32::INFINITY, usize::MAX);
+    let order = &ranking.budgeted;
+    assert!(order.len() >= 4 * KNN_PARALLEL_MIN_POSTINGS);
+    let (earlier, later) = (order[2] as usize, order[order.len() - 3] as usize);
+    let name = |range_idx: usize| {
+        let (offset, length) = vi.ranges[range_idx];
+        format!("[{offset}, +{length})")
+    };
+    for range_idx in [earlier, later] {
+        let (offset, length) = vi.ranges[range_idx];
+        let span = span_cache::span_file_name(offset, offset + length as u64);
+        fs::remove_file(span_cache::spans_dir(&dir, VECTOR_IDX_FILE).join(span)).unwrap();
+    }
+    let budgets = [
+        KnnProbeBudget::Planned {
+            ranking: &ranking,
+            refill: KnnRefill::Always,
+        },
+        KnnProbeBudget::Within {
+            max_distance: f32::INFINITY,
+            max_probes: usize::MAX,
+            refill: KnnRefill::Always,
+        },
+    ];
+    let error = |threads: usize, budget| {
+        pool(threads).install(|| {
+            match reader.knn_candidates_fetching(FIELD, &query, 10, budget, None, None) {
+                Some(Err(e)) => e.to_string(),
+                _ => panic!("{threads} threads: the probe did not fail"),
+            }
+        })
+    };
+    for budget in budgets {
+        let serial = error(1, budget);
+        assert!(serial.contains(&name(earlier)), "{serial}");
+        assert_eq!(error(4, budget), serial);
+    }
+    drop(index);
+    drop(reader);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// With part of the probe already cached (hits, second touches and first
+/// touches in one probe), a split probe still returns and counts exactly
+/// what a serial one does, run after run, restricted or not, for f32, i8
+/// and RaBitQ.
+#[test]
+fn a_split_probe_over_a_partly_warm_cache_returns_what_one_thread_returns() {
+    for (name, quantization) in [
+        ("warm-f32", VectorQuantization::F32),
+        ("warm-i8", VectorQuantization::I8),
+        ("warm-rabitq", VectorQuantization::RaBitQ),
+    ] {
+        let (dir, _) = write_split_segment(name, 8_000, 16, quantization, 0x3A3A);
+        let query: Vec<f32> = (0..16).map(|i| (i as f32 * 0.43).cos()).collect();
+        let dead: HashSet<u32> = (0..8_000).filter(|i| i % 13 == 1).collect();
+        let filtered = |id: u32| !id.is_multiple_of(3) && !dead.contains(&id);
+        let runs =
+            |threads: usize| {
+                let mut reader = SegmentReader::open_with_options(dir.clone(), true).unwrap();
+                reader.vector_cache = Arc::new(PostingsCache::new(
+                    usize::MAX / 2,
+                    None,
+                    &TEST_POSTINGS_COUNTERS,
+                ));
+                let within = |max_probes| KnnProbeBudget::Within {
+                    max_distance: f32::INFINITY,
+                    max_probes,
+                    refill: KnnRefill::Always,
+                };
+                // Warm the nearest 40 postings, serially: seen twice, so
+                // cached; the next 20 seen once, so admitted on their next miss.
+                let one = pool(1);
+                for max_probes in [40, 40, 60] {
+                    one.install(|| probe_outcome(&reader, &query, 10, within(max_probes), None));
+                }
+                let pool = pool(threads);
+                let mut outcomes = Vec::new();
+                for accept in [None, Some(&filtered as KnnAccept<'_>)] {
+                    for k in [1, 10, 500] {
+                        outcomes.push(pool.install(|| {
+                            probe_outcome(&reader, &query, k, within(usize::MAX), accept)
+                        }));
+                    }
+                }
+                outcomes
+            };
+        let serial = runs(1);
+        // The first probe meets every kind of posting.
+        let (_, postings, _, (scanned, decoded, cached)) = serial[0];
+        assert!(postings >= 4 * KNN_PARALLEL_MIN_POSTINGS, "{name}");
+        assert!(cached > 0 && decoded > 0, "{name}: {:?}", serial[0].3);
+        if quantization == VectorQuantization::F32 {
+            assert!(scanned > 0, "{name}: {:?}", serial[0].3);
+        }
+        assert_eq!(runs(4), serial, "{name}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// One large segment probed by one query, by pool size: staging's shape,
+/// ~1,600 postings of ~90 1536-d f32 vectors per segment.
+///
+/// `cargo test --release -p kosha-segment one_large_segment_probe -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn one_large_segment_probe_by_pool_size() {
+    const BENCH_DOCS: usize = 144_000;
+    const BENCH_DIM: usize = 1536;
+    const RUNS: usize = 7;
+    let built = std::time::Instant::now();
+    let (dir, _) = write_split_segment("bench", BENCH_DOCS, BENCH_DIM, VectorQuantization::F32, 1);
+    let mut reader = SegmentReader::open_with_options(dir.clone(), true).unwrap();
+    let postings = {
+        let index = reader.vector_field(FIELD).unwrap().unwrap();
+        index.lazy.as_ref().unwrap().ranges.len()
+    };
+    println!(
+        "{BENCH_DOCS} x {BENCH_DIM}-d f32: {postings} postings, {:.0} vectors each, built in {:.0} s",
+        BENCH_DOCS as f64 / postings as f64,
+        built.elapsed().as_secs_f64()
+    );
+    let mut rng = Lcg(99);
+    let query: Vec<f32> = (0..BENCH_DIM).map(|_| rng.coord()).collect();
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let mut sizes = vec![1, 2, 4, 8, cores];
+    sizes.sort_unstable();
+    sizes.dedup();
+    for (mode, budget) in [("cache off", 0usize), ("cache warm", usize::MAX / 2)] {
+        reader.vector_cache = Arc::new(PostingsCache::new(budget, None, &TEST_POSTINGS_COUNTERS));
+        let mut serial_ms = 0.0;
+        for &threads in &sizes {
+            let pool = pool(threads);
+            let probe = || {
+                reader
+                    .knn_search_within(&query, 10, f32::INFINITY, usize::MAX)
+                    .unwrap()
+                    .unwrap()
+            };
+            // Two runs first: the second admits every posting when warm.
+            pool.install(probe);
+            pool.install(probe);
+            let mut ms: Vec<f64> = (0..RUNS)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    std::hint::black_box(pool.install(probe));
+                    t.elapsed().as_secs_f64() * 1e3
+                })
+                .collect();
+            ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let median = ms[RUNS / 2];
+            if threads == 1 {
+                serial_ms = median;
+            }
+            println!(
+                "{mode:>10}, {threads:>2} threads: median {median:7.1} ms (min {:7.1}), {:.2}x",
+                ms[0],
+                serial_ms / median
+            );
+        }
+        // The split's serial part: one second-touch decision per posting
+        // on the caller's thread, under the cache mutex.
+        let index = reader.vector_field(FIELD).unwrap().unwrap();
+        let vi = index.lazy.as_ref().unwrap();
+        let all: Vec<u32> = (0..postings as u32).collect();
+        let t = std::time::Instant::now();
+        let held = PrefetchHolds::new(None);
+        for _ in 0..RUNS {
+            std::hint::black_box(reader.second_touch_admissions(vi, &held, &all));
+        }
+        println!(
+            "{mode:>10}, admission pre-pass: {:.3} ms per probe",
+            t.elapsed().as_secs_f64() * 1e3 / RUNS as f64
+        );
+    }
+    drop(reader);
+    let _ = fs::remove_dir_all(&dir);
 }
 
 // ---- Finding 31: what the prefetch skips must stay readable until scanned ----

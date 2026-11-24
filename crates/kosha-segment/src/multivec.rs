@@ -613,7 +613,7 @@ impl MultiVectorIndex {
         query: &[Vec<f32>],
         k: usize,
         params: LateInteractionParams,
-        accept: Option<&dyn Fn(u32) -> bool>,
+        accept: Option<crate::KnnAccept<'_>>,
         cache: &IvfPostingCache,
     ) -> Result<LateInteractionHits, KoshaError> {
         let posting_count = self.postings.len();

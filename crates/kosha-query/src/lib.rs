@@ -923,8 +923,13 @@ impl SegmentCache {
     }
 
     /// Drop every cached reader of the namespaces `matches` selects,
-    /// pinned or not. Returns how many went.
-    fn remove_namespaces(&self, matches: &dyn Fn(&str) -> bool) -> usize {
+    /// pinned or not. Returns each removed reader with its
+    /// `(namespace, segment)`, for the caller to drop outside the cache
+    /// locks (dropping one takes the ledger lock).
+    fn remove_namespaces(
+        &self,
+        matches: &dyn Fn(&str) -> bool,
+    ) -> Vec<((String, String), Arc<TrackedSegment>)> {
         let mut entries = self.entries.lock().unwrap();
         let mut tenants = self.tenants.lock().unwrap();
         let doomed: Vec<_> = entries
@@ -937,14 +942,12 @@ impl SegmentCache {
             if let Some((reader, size)) = entries.remove(&key) {
                 self.total_bytes.fetch_sub(size, Ordering::Relaxed);
                 tenants.sub_bytes(tenant_of_namespace(&key.0), size);
-                removed.push(reader);
+                removed.push(((key.0, key.1), reader));
             }
         }
         drop(tenants);
         drop(entries);
-        // The readers drop here, outside the cache locks (dropping one
-        // takes the ledger lock).
-        removed.len()
+        removed
     }
 
     /// Per-tenant bytes, hits, misses and evictions.
@@ -4283,8 +4286,37 @@ impl Searcher {
     /// A search already running keeps the readers it holds until it ends;
     /// nothing here waits for it. Forgetting a namespace that still exists
     /// only costs its next search a reload.
+    ///
+    /// The `draining` map is never cleared here: it is how
+    /// [`Self::release_segment`] tells the local GC (#239) that an
+    /// in-flight search still reads a retired segment, and `matches` can
+    /// select live namespaces too (a re-created namespace, every namespace
+    /// of a tenant with a deletion record). A removed reader that a search
+    /// still holds is registered there instead, as `release_segment` would
+    /// do, so a later `release_segment` of that segment still answers
+    /// "busy" until the search lets go.
     pub fn forget_namespaces(&self, matches: impl Fn(&str) -> bool) -> usize {
         let removed = self.segment_cache.remove_namespaces(&matches);
+        let count = removed.len();
+        let weak: Vec<((String, String), std::sync::Weak<TrackedSegment>)> = removed
+            .iter()
+            .map(|(key, reader)| (key.clone(), Arc::downgrade(reader)))
+            .collect();
+        // The cache's own references go first, outside every lock.
+        drop(removed);
+        {
+            let mut draining = self.draining.lock().unwrap();
+            for (key, reader) in weak {
+                if reader.strong_count() > 0 {
+                    let list = draining.entry(key).or_default();
+                    // Readers that ended since are dropped here, so a
+                    // segment forgotten again and again does not grow its
+                    // list (release_segment prunes the same way).
+                    list.retain(|w| w.strong_count() > 0);
+                    list.push(reader);
+                }
+            }
+        }
         self.corpus_stats
             .entries
             .lock()
@@ -4295,11 +4327,7 @@ impl Searcher {
             .lock()
             .unwrap()
             .retain(|key, _| !matches(&key.0));
-        self.draining
-            .lock()
-            .unwrap()
-            .retain(|(namespace, _), _| !matches(namespace));
-        removed
+        count
     }
 
     /// Stop caching a retired segment and report whether any reader of it
@@ -4838,7 +4866,7 @@ impl Searcher {
                     .and_then(|t| t.get(&entry.segment_id))
                     .filter(|seqs| !seqs.is_empty());
                 let accept = |doc_seq: u32| dead.is_none_or(|seqs| !seqs.contains(&doc_seq));
-                let accept_dyn: Option<&dyn Fn(u32) -> bool> =
+                let accept_dyn: Option<kosha_segment::KnnAccept<'_>> =
                     if dead.is_some() { Some(&accept) } else { None };
                 let (found, scan) = kosha_segment::with_knn_scan_stats(|| {
                     reader.knn_candidates_fetching(
@@ -7245,7 +7273,7 @@ impl Searcher {
             } else {
                 kosha_segment::KnnRefill::BudgetedSegments
             };
-            let knn_accept_dyn: Option<&dyn Fn(u32) -> bool> = if knn_restricted {
+            let knn_accept_dyn: Option<kosha_segment::KnnAccept<'_>> = if knn_restricted {
                 Some(&knn_accept)
             } else {
                 None
@@ -12157,6 +12185,44 @@ mod tests {
         assert_eq!(held.doc_count(), 1);
         drop(held);
         assert!(!searcher.release_segment("test", "s1"));
+        assert!(searcher.draining.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #347 review nit: forgetting a namespace (a deletion purge pass can
+    /// select a live, re-created one) must not hide from the local GC that
+    /// a search still reads one of its retired segments.
+    #[test]
+    fn forget_namespaces_keeps_inflight_readers_visible_to_release_segment() {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-forget-namespaces-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s1_dir = mk_segment(&dir, "acme/docs", "s1", "alpha");
+        let s2_dir = mk_segment(&dir, "acme/docs", "s2", "beta");
+        let searcher = Searcher::with_segment_cache_limits(dir.clone(), 10, u64::MAX);
+
+        // s1: retired while a search holds a reader, and the GC already
+        // asked once, so `draining` knows the reader.
+        let held = searcher
+            .open_segment("acme/docs", "s1", s1_dir, false, None, None, None)
+            .unwrap();
+        assert!(searcher.release_segment("acme/docs", "s1"));
+        // s2: cached and held by a search, never released yet.
+        let held2 = searcher
+            .open_segment("acme/docs", "s2", s2_dir, false, None, None, None)
+            .unwrap();
+
+        assert_eq!(searcher.forget_namespaces(|ns| ns == "acme/docs"), 1);
+        // Both stay busy for the GC while their searches run.
+        assert!(searcher.release_segment("acme/docs", "s1"), "s1 still read");
+        assert!(searcher.release_segment("acme/docs", "s2"), "s2 still read");
+        assert_eq!(held.doc_count(), 1);
+        drop(held);
+        drop(held2);
+        assert!(!searcher.release_segment("acme/docs", "s1"));
+        assert!(!searcher.release_segment("acme/docs", "s2"));
         assert!(searcher.draining.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
