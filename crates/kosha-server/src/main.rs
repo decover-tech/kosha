@@ -8408,6 +8408,42 @@ const SCHEMA_FIELD_TYPES: [&str; 8] = [
     "FIELD_TYPE_VECTOR",
 ];
 
+fn parse_schema_field_type(value: &serde_json::Value) -> Option<&'static str> {
+    match value {
+        serde_json::Value::Number(n) => n
+            .as_u64()
+            .and_then(|i| SCHEMA_FIELD_TYPES.get(i as usize).copied()),
+        serde_json::Value::String(t) => {
+            let upper = t.trim().to_ascii_uppercase();
+            let bare = upper.strip_prefix("FIELD_TYPE_").unwrap_or(&upper);
+            SCHEMA_FIELD_TYPES
+                .iter()
+                .copied()
+                .find(|known| known.strip_prefix("FIELD_TYPE_") == Some(bare))
+        }
+        _ => None,
+    }
+}
+
+fn validate_embedding_schema_field_types(schema: &serde_json::Value) -> Result<(), String> {
+    let Some(fields) = schema.get("fields").and_then(serde_json::Value::as_object) else {
+        return Ok(());
+    };
+    for (name, field) in fields {
+        if field.get("embedding").is_some_and(|value| !value.is_null())
+            && ["type", "field_type"]
+                .iter()
+                .filter_map(|key| field.get(*key))
+                .any(|value| parse_schema_field_type(value) != Some("FIELD_TYPE_VECTOR"))
+        {
+            return Err(format!(
+                "schema field '{name}': 'embedding' is only supported on vector fields"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Validate a `NamespaceSchema` from a `CreateNamespaceRequest` and return
 /// it in canonical proto-JSON form: every field has `type` (the
 /// `FIELD_TYPE_*` name), `indexed`, `stored` and `analyzer`. A field type
@@ -8416,7 +8452,7 @@ const SCHEMA_FIELD_TYPES: [&str; 8] = [
 /// Unknown keys and unknown types are rejected rather than ignored. The
 /// analysis extensions `POST /v1/namespaces/{ns}/schema` takes
 /// (`default_analyzer`, `default_stopwords`, and a field's `stopwords`)
-/// pass through unchanged.
+/// and embedding declarations pass through unchanged.
 fn parse_namespace_schema(value: &serde_json::Value) -> Result<serde_json::Value, String> {
     const EXTENSIONS: [&str; 2] = ["default_analyzer", "default_stopwords"];
     let obj = value
@@ -8433,6 +8469,7 @@ fn parse_namespace_schema(value: &serde_json::Value) -> Result<serde_json::Value
         Some(serde_json::Value::Object(map)) => map.clone(),
         Some(_) => return Err("schema.fields must be an object".into()),
     };
+    validate_embedding_schema_field_types(value)?;
     let mut out = serde_json::Map::new();
     for (name, field) in fields {
         if name.is_empty() {
@@ -8442,7 +8479,13 @@ fn parse_namespace_schema(value: &serde_json::Value) -> Result<serde_json::Value
             .as_object()
             .ok_or_else(|| format!("schema field '{name}' must be an object"))?;
         let mut canonical = serde_json::Map::new();
-        let mut field_type = SCHEMA_FIELD_TYPES[0];
+        // An embedding declaration implies a vector field, so the canonical
+        // schema can be saved back through `POST /v1/namespaces/{ns}/schema`.
+        let mut field_type = if field.get("embedding").is_some_and(|v| !v.is_null()) {
+            "FIELD_TYPE_VECTOR"
+        } else {
+            SCHEMA_FIELD_TYPES[0]
+        };
         let mut seen_type = false;
         for (key, v) in field {
             match key.as_str() {
@@ -8451,21 +8494,8 @@ fn parse_namespace_schema(value: &serde_json::Value) -> Result<serde_json::Value
                         return Err(format!("schema field '{name}' names its type twice"));
                     }
                     seen_type = true;
-                    field_type = match v {
-                        serde_json::Value::Number(n) => n
-                            .as_u64()
-                            .and_then(|i| SCHEMA_FIELD_TYPES.get(i as usize).copied()),
-                        serde_json::Value::String(t) => {
-                            let upper = t.trim().to_ascii_uppercase();
-                            let bare = upper.strip_prefix("FIELD_TYPE_").unwrap_or(&upper);
-                            SCHEMA_FIELD_TYPES
-                                .iter()
-                                .copied()
-                                .find(|known| known.strip_prefix("FIELD_TYPE_") == Some(bare))
-                        }
-                        _ => None,
-                    }
-                    .ok_or_else(|| format!("schema field '{name}' has unknown type {v}"))?;
+                    field_type = parse_schema_field_type(v)
+                        .ok_or_else(|| format!("schema field '{name}' has unknown type {v}"))?;
                 }
                 "indexed" | "stored" => {
                     let flag = v
@@ -8491,7 +8521,7 @@ fn parse_namespace_schema(value: &serde_json::Value) -> Result<serde_json::Value
                     };
                     canonical.insert("analyzer".into(), serde_json::json!(analyzers));
                 }
-                "stopwords" => {
+                "stopwords" | "embedding" => {
                     canonical.insert(key.clone(), v.clone());
                 }
                 other => return Err(format!("schema field '{name}' has unknown key '{other}'")),
@@ -10737,6 +10767,9 @@ fn handle_put_schema_with_ns(
         Some(inner) => inner.clone(),
         None => value,
     };
+    if let Err(e) = validate_embedding_schema_field_types(&value) {
+        return api_error(ErrorCode::InvalidArgument, &format!("invalid schema: {e}"));
+    }
     let schema: kosha_core::NamespaceSchema = match serde_json::from_value(value) {
         Ok(schema) => schema,
         Err(e) => return api_error(ErrorCode::InvalidArgument, &format!("invalid schema: {e}")),
