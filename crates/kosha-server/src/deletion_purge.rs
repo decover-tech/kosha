@@ -44,11 +44,16 @@
 //! - a directory with a pinned or in-flight fetch is left for the next
 //!   sweep.
 //!
-//! **What "completed" on a record means.** Unchanged: the control store,
-//! the pod that ran the delete and object storage. A record carries no
-//! per-pod acknowledgement, because the control store has no list of pods
-//! to wait for. What holds instead, for a pod with the purge enabled that
-//! can read the control store:
+//! **What "completed" on a record means.** The control store, the pod that
+//! ran the delete and object storage, and, for a record written with
+//! `acks_required` (`KOSHA_DELETION_REQUIRE_ACKS`), every live purge pod.
+//! Each pass heartbeats this pod into the pod registry; after a clean sweep
+//! of a subject it acknowledges the subject's records that ask for it
+//! (a tenant only once its storage reclaim is done) and completes a record
+//! once no live pod is missing ([`AppState::finalize_deletion_if_acked`]).
+//! A pod whose heartbeat is older than `KOSHA_POD_LIVENESS_MS` is not
+//! waited for. What holds for a pod with the purge enabled that can read
+//! the control store, acknowledgements or not:
 //!
 //! - a record is handled by the first pass that starts after the record's
 //!   transaction commits, so within one interval plus the length of a pass;
@@ -65,17 +70,20 @@
 //!
 //! Not covered: a pod with the purge off (the default); parsed segments a
 //! search already running still holds, until that search ends; a pod that
-//! cannot read the control store, until it can; a branch deleted on its
-//! own (`DELETE /v1/namespaces/{ns}/branch` writes no deletion record, so
-//! its cached copies go only by eviction, or with its tenant); freed disk
-//! blocks and the operating system's page cache. `GET /v1/stats` reports
+//! cannot read the control store, until it can; freed disk blocks and the
+//! operating system's page cache. A branch deleted on its own has a record
+//! of scope `branch` (#347): its sweep keeps what any manifest of the
+//! tenant still lists, since a branch of the branch can list segments in
+//! its prefix. `GET /v1/stats` reports
 //! each pod's progress under `deletion_purge`.
 //!
 //! **Retrying pending records.** `KOSHA_DELETION_RESUME_INTERVAL_MS`
 //! (opt-in, writer pods only) retries the storage reclaim of pending
-//! *namespace* records at boot and on a timer, with a growing pause per
-//! record. Tenant records are not retried automatically: a pending tenant
-//! record deletes whatever the tenant id holds at the time it runs.
+//! namespace, branch and tenant records at boot and on a timer, with a
+//! growing pause per record. A pending tenant record is a standing order:
+//! a retry deletes whatever the tenant id holds at the time it runs. A
+//! record that waits only for acknowledgements is not retried, and a
+//! `migrated` one is finished by `migrate-namespace`.
 //!
 //! A retry deletes the namespace's whole object-storage prefix, and it runs
 //! unattended at boot, which is when two writer pods can overlap. So each
@@ -90,10 +98,41 @@
 
 use super::*;
 use kosha_core::deletion::{
-    DeletionFilter, DeletionPosition, DeletionRecord, DeletionScope, DeletionState,
+    DeletionFilter, DeletionPosition, DeletionRecord, DeletionScope, PodHeartbeat,
 };
 use std::collections::{BTreeMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// This pod's id in the pod registry and on its acknowledgements:
+/// `KOSHA_POD_ID`, else `HOSTNAME` (the pod name on Kubernetes), else a
+/// random id for the life of the process.
+pub(crate) fn pod_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        ["KOSHA_POD_ID", "HOSTNAME"]
+            .iter()
+            .filter_map(|name| std::env::var(name).ok())
+            .map(|value| value.trim().to_string())
+            .find(|value| !value.is_empty())
+            .unwrap_or_else(|| format!("pod-{}-{}", std::process::id(), unix_millis()))
+    })
+}
+
+/// A subject's records in one pass: its scope, the highest retired
+/// version, the tenant records whose reclaim is not done, and the records
+/// waiting for this pod's acknowledgement.
+type FreshSubject = (DeletionScope, Option<u64>, Vec<String>, Vec<String>);
+
+/// The order subjects are swept in: namespaces and branches before the
+/// tenants they belong to.
+fn scope_order(scope: DeletionScope) -> u8 {
+    match scope {
+        DeletionScope::Namespace => 0,
+        DeletionScope::Branch => 1,
+        DeletionScope::Migrated => 2,
+        DeletionScope::Tenant => 3,
+    }
+}
 use std::time::SystemTime;
 
 /// How far behind the newest record it has seen a pass re-reads. A record
@@ -111,7 +150,7 @@ const RECENT_RECORD_MS: u64 = 60 * 60 * 1000;
 const RESUME_MAX_BACKOFF: Duration = Duration::from_secs(3600);
 
 /// `KOSHA_DELETION_PURGE_INTERVAL_MS` and `KOSHA_DELETION_RESUME_INTERVAL_MS`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PurgeSettings {
     /// How often this pod purges the caches of deleted namespaces; `None`
     /// when off.
@@ -119,22 +158,96 @@ pub(crate) struct PurgeSettings {
     /// How often a writer pod retries pending namespace deletions; `None`
     /// when off.
     pub resume_interval: Option<Duration>,
+    /// `KOSHA_DELETION_REQUIRE_ACKS`: deletions recorded on this pod
+    /// complete only once every live purge pod acknowledged them.
+    pub require_acks: bool,
+    /// `KOSHA_POD_LIVENESS_MS`: a pod whose last heartbeat is older is not
+    /// waited for.
+    pub liveness: Duration,
+    /// `KOSHA_NAMESPACE_DELETE_CONFIRM`: `DELETE /v1/namespaces/{ns}`
+    /// requires `?confirm=<ns>`.
+    pub confirm_deletes: bool,
+}
+
+/// Default `KOSHA_POD_LIVENESS_MS`.
+const DEFAULT_LIVENESS: Duration = Duration::from_secs(5 * 60);
+
+fn parse_switch(name: &str, raw: Option<&str>) -> Result<bool, String> {
+    match raw.map(str::trim) {
+        None | Some("") | Some("off") | Some("0") | Some("false") => Ok(false),
+        Some("on") | Some("1") | Some("true") => Ok(true),
+        Some(other) => Err(format!("{name}={other:?}: expected on or off")),
+    }
+}
+
+impl Default for PurgeSettings {
+    fn default() -> Self {
+        Self {
+            interval: None,
+            resume_interval: None,
+            require_acks: false,
+            liveness: DEFAULT_LIVENESS,
+            confirm_deletes: false,
+        }
+    }
 }
 
 impl PurgeSettings {
     /// `Err` is the message to refuse to start with.
     pub(crate) fn from_env() -> Result<Self, String> {
         let var = |name: &str| std::env::var(name).ok();
-        Self::parse(
+        let mut settings = Self::parse(
             var("KOSHA_DELETION_PURGE_INTERVAL_MS").as_deref(),
             var("KOSHA_DELETION_RESUME_INTERVAL_MS").as_deref(),
-        )
+        )?;
+        settings.require_acks = parse_switch(
+            "KOSHA_DELETION_REQUIRE_ACKS",
+            var("KOSHA_DELETION_REQUIRE_ACKS").as_deref(),
+        )?;
+        settings.confirm_deletes = parse_switch(
+            "KOSHA_NAMESPACE_DELETE_CONFIRM",
+            var("KOSHA_NAMESPACE_DELETE_CONFIRM").as_deref(),
+        )?;
+        if let Some(liveness) = parse_interval(
+            "KOSHA_POD_LIVENESS_MS",
+            var("KOSHA_POD_LIVENESS_MS").as_deref(),
+        )? {
+            settings.liveness = liveness;
+        }
+        settings.check()?;
+        Ok(settings)
+    }
+
+    /// Settings that cannot work together. Acknowledgements come from purge
+    /// passes, so a pod that requires them must run the purge itself, and
+    /// its heartbeat must come well inside the liveness window.
+    pub(crate) fn check(&self) -> Result<(), String> {
+        if !self.require_acks {
+            return Ok(());
+        }
+        let Some(interval) = self.interval else {
+            return Err(
+                "KOSHA_DELETION_REQUIRE_ACKS=on needs KOSHA_DELETION_PURGE_INTERVAL_MS: \
+                        acknowledgements come from purge passes"
+                    .into(),
+            );
+        };
+        if interval * 3 > self.liveness {
+            return Err(format!(
+                "KOSHA_POD_LIVENESS_MS ({} ms) must be at least three purge intervals ({} ms): \
+                 a live pod would read as dead between heartbeats",
+                self.liveness.as_millis(),
+                interval.as_millis() * 3
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn parse(purge: Option<&str>, resume: Option<&str>) -> Result<Self, String> {
         Ok(Self {
             interval: parse_interval("KOSHA_DELETION_PURGE_INTERVAL_MS", purge)?,
             resume_interval: parse_interval("KOSHA_DELETION_RESUME_INTERVAL_MS", resume)?,
+            ..Self::default()
         })
     }
 }
@@ -183,11 +296,15 @@ struct Resweep {
     subject: String,
     /// The highest retired version among the subject's records.
     floor: Option<u64>,
-    /// Tenant records of the subject not yet seen completed. While any is
-    /// pending the subject stays queued: the tenant's namespaces are still
-    /// in the control store, and what goes with them without a record of
-    /// its own is only removable after the record completes.
+    /// Tenant records of the subject whose storage reclaim is not yet
+    /// seen done. While any is pending the subject stays queued: the
+    /// tenant's namespaces are still in the control store, and what goes
+    /// with them without a record of its own is only removable after the
+    /// reclaim finished.
     pending: Vec<String>,
+    /// Records of the subject that wait for this pod's acknowledgement
+    /// (`acks_required`), not yet acknowledged.
+    unacked: Vec<String>,
     due: Instant,
 }
 
@@ -224,6 +341,22 @@ pub(crate) struct PurgeState {
     resume_attempts: AtomicU64,
     resume_completed: AtomicU64,
     resume_fenced: AtomicU64,
+    /// `KOSHA_DELETION_REQUIRE_ACKS`: deletions recorded on this pod wait
+    /// for every live purge pod's acknowledgement.
+    require_acks: AtomicBool,
+    /// `KOSHA_POD_LIVENESS_MS`.
+    liveness_ms: AtomicU64,
+    /// `KOSHA_NAMESPACE_DELETE_CONFIRM`.
+    confirm_deletes: AtomicBool,
+    acks_written: AtomicU64,
+    records_finalized: AtomicU64,
+    heartbeat_errors: AtomicU64,
+    /// When this pod last looked for records that wait only for
+    /// acknowledgements.
+    last_finalize_scan: Mutex<Option<Instant>>,
+    /// This pod's id when not the process-wide [`pod_id`] (tests run
+    /// several pods in one process).
+    pub(crate) pod_id: Mutex<Option<String>>,
 }
 
 impl PurgeState {
@@ -252,6 +385,11 @@ impl PurgeState {
             "kosha_deletion_resume_attempts_total": load(&self.resume_attempts),
             "kosha_deletion_resume_completed_total": load(&self.resume_completed),
             "kosha_deletion_resume_fenced_total": load(&self.resume_fenced),
+            "pod_id": self.pod_id.lock().unwrap().clone().unwrap_or_else(|| pod_id().to_string()),
+            "require_acks": self.require_acks.load(Ordering::Relaxed),
+            "kosha_deletion_acks_written_total": load(&self.acks_written),
+            "kosha_deletion_records_finalized_total": load(&self.records_finalized),
+            "kosha_deletion_heartbeat_errors_total": load(&self.heartbeat_errors),
         })
     }
 }
@@ -327,13 +465,14 @@ fn modified_since(path: &std::path::Path, cutoff: SystemTime) -> bool {
 
 impl AppState {
     /// A pod that follows manifests published elsewhere and never writes.
-    fn follows_only(&self) -> bool {
+    pub(crate) fn follows_only(&self) -> bool {
         self.role == role::Role::Query || self.ingest_host.is_some()
     }
 
     /// Start the purge thread (and, on a writer pod, the retry thread) when
     /// configured. The first pass runs at once: that is the boot catch-up.
     pub(crate) fn spawn_deletion_purge(self: &Arc<Self>, settings: PurgeSettings) {
+        self.configure_deletion_purge(&settings);
         match settings.interval {
             None => println!(
                 "deletion purge disabled (KOSHA_DELETION_PURGE_INTERVAL_MS unset or 0): cached \
@@ -370,7 +509,7 @@ impl AppState {
             return;
         }
         println!(
-            "pending namespace deletions are retried every {} ms",
+            "pending deletions (namespaces, branches, tenants) are retried every {} ms",
             interval.as_millis()
         );
         let weak = Arc::downgrade(self);
@@ -394,6 +533,8 @@ impl AppState {
         let _one = purge.pass.lock().unwrap();
         let mut report = PassReport::default();
         let now_ms = unix_millis();
+        // Before reading records: a pod that is live waits nobody out.
+        self.heartbeat();
 
         // ── Read what is new ───────────────────────────────────────────
         let mut cursor = purge
@@ -437,18 +578,20 @@ impl AppState {
         // Several records can name one subject (deleted, re-created,
         // deleted again): one sweep covers them, against the highest
         // retired version.
-        let mut subjects: BTreeMap<(bool, String), (Option<u64>, Vec<String>)> = BTreeMap::new();
+        let mut subjects: BTreeMap<(u8, String), FreshSubject> = BTreeMap::new();
         for record in &fresh {
-            let tenant = record.scope == DeletionScope::Tenant;
-            let (floor, pending) = subjects
-                .entry((tenant, record.subject.clone()))
-                .or_default();
-            if !tenant {
+            let (scope, floor, pending, unacked) = subjects
+                .entry((scope_order(record.scope), record.subject.clone()))
+                .or_insert((record.scope, None, Vec::new(), Vec::new()));
+            if *scope != DeletionScope::Tenant {
                 *floor = Some(floor.unwrap_or(0).max(record.last_version));
-            } else if record.state != DeletionState::Completed {
-                // Read before the sweep below: a record seen completed here
-                // was complete before its subject is swept.
+            } else if !record.storage_done() {
+                // Read before the sweep below: a record seen done here was
+                // done before its subject is swept.
                 pending.push(record.id.clone());
+            }
+            if record.acks_required && !record.is_completed() {
+                unacked.push(record.id.clone());
             }
         }
         let recent = fresh
@@ -457,20 +600,25 @@ impl AppState {
             .map(|record| record.subject.as_str())
             .collect::<HashSet<_>>();
         let mut requeue: Vec<Resweep> = Vec::new();
-        for ((tenant, subject), (floor, pending)) in subjects {
-            let scope = if tenant {
-                DeletionScope::Tenant
-            } else {
-                DeletionScope::Namespace
-            };
+        for ((_, subject), (scope, floor, pending, unacked)) in subjects {
             let outcome = self.sweep_deleted_subject(scope, &subject, floor, tuning);
             self.note_sweep(&outcome, &subject, &mut report);
-            if outcome.unfinished() || recent.contains(subject.as_str()) || !pending.is_empty() {
+            let unacked = if outcome.unfinished() {
+                unacked
+            } else {
+                self.acknowledge_swept(&unacked, &pending)
+            };
+            if outcome.unfinished()
+                || recent.contains(subject.as_str())
+                || !pending.is_empty()
+                || !unacked.is_empty()
+            {
                 requeue.push(Resweep {
                     scope,
                     subject,
                     floor,
                     pending,
+                    unacked,
                     due: Instant::now() + tuning.settle,
                 });
             }
@@ -490,6 +638,11 @@ impl AppState {
                     return true;
                 };
                 new.pending.append(&mut queued.pending);
+                for id in queued.unacked.drain(..) {
+                    if !new.unacked.contains(&id) {
+                        new.unacked.push(id);
+                    }
+                }
                 false
             });
             let (due, later) = std::mem::take(&mut progress.queue)
@@ -505,14 +658,21 @@ impl AppState {
             let outcome =
                 self.sweep_deleted_subject(queued.scope, &queued.subject, queued.floor, tuning);
             self.note_sweep(&outcome, &queued.subject, &mut report);
-            if outcome.unfinished() || !pending.is_empty() {
+            let unacked = if outcome.unfinished() {
+                queued.unacked.clone()
+            } else {
+                self.acknowledge_swept(&queued.unacked, &pending)
+            };
+            if outcome.unfinished() || !pending.is_empty() || !unacked.is_empty() {
                 requeue.push(Resweep {
                     due: Instant::now() + tuning.settle,
                     pending,
+                    unacked,
                     ..queued
                 });
             }
         }
+        self.finalize_waiting_deletions(tuning);
 
         // ── Remember ───────────────────────────────────────────────────
         report.records = fresh.len() as u64;
@@ -546,20 +706,128 @@ impl AppState {
         report
     }
 
-    /// The records among `ids` that are not completed. A record that
-    /// cannot be read counts as pending; one that no longer exists does not.
+    /// The records among `ids` whose storage reclaim is not done. A record
+    /// that cannot be read counts as pending; one that no longer exists
+    /// does not.
     fn deletions_still_pending(&self, ids: &[String]) -> Vec<String> {
         ids.iter()
             .filter(|id| {
                 let record = self.controller.lock().unwrap().deletion(id);
                 match record {
-                    Ok(Some(record)) => record.state != DeletionState::Completed,
+                    Ok(Some(record)) => !record.storage_done(),
                     Ok(None) => false,
                     Err(_) => true,
                 }
             })
             .cloned()
             .collect()
+    }
+
+    /// After a clean sweep: acknowledge every record of `unacked` that is
+    /// not in `pending` (a tenant whose reclaim is still running is swept
+    /// again before this pod vouches for it), then try to complete each.
+    /// Returns the records still unacknowledged (a failed write).
+    fn acknowledge_swept(&self, unacked: &[String], pending: &[String]) -> Vec<String> {
+        let purge = &self.deletion_purge;
+        let liveness = self.pod_liveness_ms();
+        let mut left = Vec::new();
+        for id in unacked {
+            if pending.contains(id) {
+                left.push(id.clone());
+                continue;
+            }
+            let acked = self
+                .controller
+                .lock()
+                .unwrap()
+                .acknowledge_deletion(id, &self.pod_id());
+            match acked {
+                Ok(()) => {
+                    purge.acks_written.fetch_add(1, Ordering::Relaxed);
+                    self.finalize_deletion_if_acked(id, liveness);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "WARN: deletion purge: acknowledging {id} failed: {e}; it is retried"
+                    );
+                    left.push(id.clone());
+                }
+            }
+        }
+        left
+    }
+
+    /// Complete record `id` if it waits only for acknowledgements and every
+    /// live pod has given one.
+    pub(crate) fn finalize_deletion_if_acked(
+        &self,
+        id: &str,
+        liveness_ms: u64,
+    ) -> Option<DeletionRecord> {
+        let finalized = self
+            .controller
+            .lock()
+            .unwrap()
+            .finalize_deletion(id, liveness_ms);
+        match finalized {
+            Ok(record) => {
+                if record.is_completed() && record.acks_required {
+                    // Counted by whoever sees it complete; a record
+                    // finalized twice is still one record.
+                    self.deletion_purge
+                        .records_finalized
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Some(record)
+            }
+            Err(e) => {
+                eprintln!("WARN: deletion {id}: finalizing failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Every `settle`, complete the records that wait only for
+    /// acknowledgements: a pod that died stops counting once its heartbeat
+    /// is older than the liveness window, which no acknowledgement of this
+    /// pod would notice.
+    fn finalize_waiting_deletions(&self, tuning: &PurgeTuning) {
+        let purge = &self.deletion_purge;
+        {
+            let mut last = purge.last_finalize_scan.lock().unwrap();
+            if last.is_some_and(|at| at.elapsed() < tuning.settle) {
+                return;
+            }
+            *last = Some(Instant::now());
+        }
+        let pending = self
+            .controller
+            .lock()
+            .unwrap()
+            .deletions(&DeletionFilter::pending());
+        let Ok(pending) = pending else {
+            return;
+        };
+        let liveness = self.pod_liveness_ms();
+        for record in pending.iter().filter(|record| record.awaiting_acks()) {
+            self.finalize_deletion_if_acked(&record.id, liveness);
+        }
+    }
+
+    /// Refresh this pod's row in the pod registry.
+    fn heartbeat(&self) {
+        let heartbeat = PodHeartbeat {
+            pod_id: self.pod_id(),
+            role: self.role.to_string(),
+            purge_enabled: true,
+        };
+        let written = self.controller.lock().unwrap().heartbeat_pod(&heartbeat);
+        if let Err(e) = written {
+            self.deletion_purge
+                .heartbeat_errors
+                .fetch_add(1, Ordering::Relaxed);
+            eprintln!("WARN: deletion purge: pod heartbeat failed: {e}");
+        }
     }
 
     fn note_sweep(&self, outcome: &SweepOutcome, subject: &str, report: &mut PassReport) {
@@ -599,7 +867,7 @@ impl AppState {
     /// Drop what this process caches in memory for `subject` and every
     /// namespace below it. Safe for a namespace that exists again: all of
     /// it is rebuilt from the manifest and the files on the next search.
-    fn purge_deleted_from_memory(&self, subject: &str) -> u64 {
+    pub(crate) fn purge_deleted_from_memory(&self, subject: &str) -> u64 {
         let below = format!("{subject}/");
         let matches = |ns: &str| ns == subject || ns.starts_with(&below);
         let dropped = self.searcher.forget_namespaces(matches) as u64;
@@ -692,8 +960,11 @@ impl AppState {
         // namespace exists there again (a delete is refused while a branch
         // shares the namespace's segments). Then every manifest of the
         // tenant is read: a branch can list a segment its parent dropped.
+        // A deleted branch's prefix can hold segments a remaining branch
+        // of it still lists (its delete reclaims only the unreferenced
+        // ones), so for a branch they are always read.
         let mut keep = Keep::default();
-        if stored.keys().any(|ns| in_subject(&ns.0)) {
+        if scope == DeletionScope::Branch || stored.keys().any(|ns| in_subject(&ns.0)) {
             let tenant = first_component(subject);
             let tenant_below = format!("{tenant}/");
             for ns in stored
@@ -714,7 +985,9 @@ impl AppState {
 
         let mut namespaces: Vec<NamespaceId> = Vec::new();
         match scope {
-            DeletionScope::Namespace => namespaces.push(NamespaceId(subject.to_string())),
+            DeletionScope::Namespace | DeletionScope::Branch | DeletionScope::Migrated => {
+                namespaces.push(NamespaceId(subject.to_string()))
+            }
             DeletionScope::Tenant => {
                 // A pre-#262 namespace named like the tenant keeps its
                 // segments directly under `{tenant}/`, where this would read
@@ -962,10 +1235,15 @@ impl AppState {
             .resume_backoff
             .retain(|id, _| listed.contains(id.as_str()));
         let mut completed = 0;
-        for record in pending
+        // A tenant's pass re-checks its namespaces, so those go first; a
+        // record that waits only for acknowledgements has nothing to retry,
+        // and a migrated source is finished by the migration tool.
+        let mut retried: Vec<&DeletionRecord> = pending
             .iter()
-            .filter(|record| record.scope == DeletionScope::Namespace)
-        {
+            .filter(|record| !record.storage_done() && record.scope != DeletionScope::Migrated)
+            .collect();
+        retried.sort_by_key(|record| record.scope == DeletionScope::Tenant);
+        for record in retried {
             let waiting = purge
                 .progress
                 .lock()
@@ -977,15 +1255,27 @@ impl AppState {
                 continue;
             }
             let ns = NamespaceId(record.subject.clone());
+            // A tenant has no single writer lease: its pass deletes each
+            // namespace through the delete path, refuses while any is left
+            // and re-checks after sweeping the prefix.
+            if record.scope == DeletionScope::Tenant {
+                purge.resume_attempts.fetch_add(1, Ordering::Relaxed);
+                let after = self.delete_tenant(auth::global(), record).record;
+                self.note_resume(record, after.storage_done(), interval, now, &mut completed);
+                continue;
+            }
             let held_before = self.writer_leases.held_before(&ns);
-            let state = match self.writer_leases.token(&ns, &self.controller) {
+            let done = match self.writer_leases.token(&ns, &self.controller) {
                 Ok(_) => {
                     purge.resume_attempts.fetch_add(1, Ordering::Relaxed);
-                    let after = self.resume_namespace_deletion(record);
+                    let after = match record.scope {
+                        DeletionScope::Branch => self.resume_branch_deletion(record),
+                        _ => self.resume_namespace_deletion(record),
+                    };
                     if !held_before {
                         self.writer_leases.release(&ns, &self.controller);
                     }
-                    after.state
+                    after.storage_done()
                 }
                 Err(error) => {
                     purge.resume_fenced.fetch_add(1, Ordering::Relaxed);
@@ -996,29 +1286,86 @@ impl AppState {
                             record.id, record.subject
                         );
                     }
-                    DeletionState::Pending
+                    false
                 }
             };
-            let mut progress = purge.progress.lock().unwrap();
-            if state == DeletionState::Completed {
-                completed += 1;
-                purge.resume_completed.fetch_add(1, Ordering::Relaxed);
-                progress.resume_backoff.remove(&record.id);
-                println!(
-                    "deletion resume: {} ({}) completed",
-                    record.id, record.subject
-                );
-            } else {
-                let pause = progress
-                    .resume_backoff
-                    .get(&record.id)
-                    .map_or(interval, |(_, pause)| (*pause * 2).min(RESUME_MAX_BACKOFF));
-                progress
-                    .resume_backoff
-                    .insert(record.id.clone(), (now + pause, pause));
-            }
+            self.note_resume(record, done, interval, now, &mut completed);
         }
         completed
+    }
+
+    /// Count a retry, and set the record's next pause when it stays pending.
+    fn note_resume(
+        &self,
+        record: &DeletionRecord,
+        done: bool,
+        interval: Duration,
+        now: Instant,
+        completed: &mut usize,
+    ) {
+        let purge = &self.deletion_purge;
+        let mut progress = purge.progress.lock().unwrap();
+        if done {
+            *completed += 1;
+            purge.resume_completed.fetch_add(1, Ordering::Relaxed);
+            progress.resume_backoff.remove(&record.id);
+            println!(
+                "deletion resume: {} ({} {}) storage reclaimed",
+                record.id,
+                record.scope.as_str(),
+                record.subject
+            );
+        } else {
+            let pause = progress
+                .resume_backoff
+                .get(&record.id)
+                .map_or(interval, |(_, pause)| (*pause * 2).min(RESUME_MAX_BACKOFF));
+            progress
+                .resume_backoff
+                .insert(record.id.clone(), (now + pause, pause));
+        }
+    }
+
+    /// Store the settings a pass and the delete handlers read.
+    pub(crate) fn configure_deletion_purge(&self, settings: &PurgeSettings) {
+        let purge = &self.deletion_purge;
+        purge
+            .require_acks
+            .store(settings.require_acks, Ordering::Relaxed);
+        purge
+            .liveness_ms
+            .store(settings.liveness.as_millis() as u64, Ordering::Relaxed);
+        purge
+            .confirm_deletes
+            .store(settings.confirm_deletes, Ordering::Relaxed);
+    }
+
+    /// This pod's id in the pod registry ([`pod_id`]).
+    pub(crate) fn pod_id(&self) -> String {
+        self.deletion_purge
+            .pod_id
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| pod_id().to_string())
+    }
+
+    /// Whether deletions recorded on this pod wait for acknowledgements.
+    pub(crate) fn deletion_requires_acks(&self) -> bool {
+        self.deletion_purge.require_acks.load(Ordering::Relaxed)
+    }
+
+    /// `KOSHA_POD_LIVENESS_MS`, in milliseconds.
+    pub(crate) fn pod_liveness_ms(&self) -> u64 {
+        match self.deletion_purge.liveness_ms.load(Ordering::Relaxed) {
+            0 => DEFAULT_LIVENESS.as_millis() as u64,
+            ms => ms,
+        }
+    }
+
+    /// Whether `DELETE /v1/namespaces/{ns}` requires `?confirm=<ns>`.
+    pub(crate) fn namespace_delete_needs_confirm(&self) -> bool {
+        self.deletion_purge.confirm_deletes.load(Ordering::Relaxed)
     }
 }
 

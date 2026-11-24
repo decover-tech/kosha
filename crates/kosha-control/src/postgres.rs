@@ -102,7 +102,7 @@ fn is_migration_race(e: &sqlx::Error) -> bool {
         .is_some_and(|code| MIGRATION_RACE_SQLSTATES.contains(&code.as_ref()))
 }
 
-/// Apply the embedded migrations (001, both 003 files, 004, 005, 006, 007, 008, 009, then 011) in one transaction on one
+/// Apply the embedded migrations (001, both 003 files, 004, 005, 006, 007, 008, 009, 010, then 011) in one transaction on one
 /// connection, holding a transaction-scoped advisory lock for its duration.
 ///
 /// Concurrent constructors against a fresh database (several pods booting
@@ -133,7 +133,7 @@ async fn run_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
 /// "migration 004 failed" for 004, "migration 005 failed" for 005,
 /// "migration 006 failed" for 006, "migration 007 failed" for 007,
 /// "migration 008 failed" for 008, "migration 009 failed" for 009,
-/// "migration 011 failed" for 011.
+/// "migration 010 failed" for 010, "migration 011 failed" for 011.
 async fn migrate_once(pool: &sqlx::PgPool) -> Result<(), (sqlx::Error, &'static str)> {
     const FAILED: &str = "migration failed";
     let mut tx = pool.begin().await.map_err(|e| (e, FAILED))?;
@@ -195,6 +195,13 @@ async fn migrate_once(pool: &sqlx::PgPool) -> Result<(), (sqlx::Error, &'static 
         .execute(&mut *tx)
         .await
         .map_err(|e| (e, "migration 009 failed"))?;
+    // Namespace lifecycle (#347): branch / migrated deletion scopes, pod
+    // registry and acknowledgements, exports. Additive, idempotent.
+    let migration = include_str!("../migrations/010_namespace_lifecycle.sql");
+    sqlx::raw_sql(migration)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (e, "migration 010 failed"))?;
     // Billing ledger (#349): plan changes, webhook events, dunning; additive.
     let migration = include_str!("../migrations/011_billing_ledger.sql");
     sqlx::raw_sql(migration)
@@ -809,6 +816,103 @@ impl ControlStore for PgStore {
     ) -> Result<Vec<DeletionRecord>, KoshaError> {
         self.rt
             .block_on(crate::deletion::list_after(&self.pool, after, limit))
+    }
+
+    fn note_deletion_exports(&mut self, deletion_id: &str, count: u64) -> Result<(), KoshaError> {
+        self.rt.block_on(crate::deletion::note_exports(
+            &self.pool,
+            deletion_id,
+            count,
+        ))
+    }
+
+    fn heartbeat_pod(
+        &mut self,
+        pod: &kosha_core::deletion::PodHeartbeat,
+    ) -> Result<(), KoshaError> {
+        self.rt
+            .block_on(crate::deletion::heartbeat(&self.pool, pod))
+    }
+
+    fn acknowledge_deletion(&mut self, deletion_id: &str, pod_id: &str) -> Result<(), KoshaError> {
+        self.rt.block_on(crate::deletion::acknowledge(
+            &self.pool,
+            deletion_id,
+            pod_id,
+        ))
+    }
+
+    fn deletion_ack_status(
+        &self,
+        deletion_id: &str,
+        live_within_ms: u64,
+    ) -> Result<kosha_core::deletion::AckStatus, KoshaError> {
+        self.rt.block_on(crate::deletion::ack_status(
+            &self.pool,
+            deletion_id,
+            live_within_ms,
+        ))
+    }
+
+    fn finalize_deletion(
+        &mut self,
+        deletion_id: &str,
+        live_within_ms: u64,
+    ) -> Result<DeletionRecord, KoshaError> {
+        self.rt.block_on(crate::deletion::finalize(
+            &self.pool,
+            deletion_id,
+            live_within_ms,
+        ))
+    }
+
+    fn create_export(
+        &mut self,
+        export: &kosha_core::export::NewExport,
+    ) -> Result<kosha_core::export::ExportRecord, KoshaError> {
+        self.rt.block_on(crate::export::create(&self.pool, export))
+    }
+
+    fn export(
+        &self,
+        export_id: &str,
+    ) -> Result<Option<kosha_core::export::ExportRecord>, KoshaError> {
+        self.rt.block_on(crate::export::get(&self.pool, export_id))
+    }
+
+    fn exports(
+        &self,
+        filter: &kosha_core::export::ExportFilter,
+    ) -> Result<Vec<kosha_core::export::ExportRecord>, KoshaError> {
+        self.rt.block_on(crate::export::list(&self.pool, filter))
+    }
+
+    fn update_export(
+        &mut self,
+        export_id: &str,
+        update: &kosha_core::export::ExportUpdate,
+    ) -> Result<Option<kosha_core::export::ExportRecord>, KoshaError> {
+        self.rt
+            .block_on(crate::export::update(&self.pool, export_id, update))
+    }
+
+    fn claim_export(
+        &mut self,
+        export_id: &str,
+        holder: &str,
+        stale_after_ms: u64,
+    ) -> Result<Option<kosha_core::export::ExportRecord>, KoshaError> {
+        self.rt.block_on(crate::export::claim(
+            &self.pool,
+            export_id,
+            holder,
+            stale_after_ms,
+        ))
+    }
+
+    fn delete_exports(&mut self, export_ids: &[String]) -> Result<u64, KoshaError> {
+        self.rt
+            .block_on(crate::export::delete(&self.pool, export_ids))
     }
 
     fn list_namespaces(&self) -> Vec<NamespaceId> {

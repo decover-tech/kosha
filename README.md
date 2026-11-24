@@ -492,13 +492,14 @@ the routes marked *write* to the ingest pod.
 |---|---|---|
 | `POST /v1/namespaces` | `CreateNamespaceRequest` → `CreateNamespaceResponse` | *write*. 409 if it exists, 400 for an invalid name or schema. Optional: namespaces still auto-create on first write. A `schema` is validated, echoed back and stored as the namespace schema, as `POST /v1/namespaces/{ns}/schema` would (see [Analyzers](#analyzers)). |
 | `GET /v1/namespaces` | → `{"namespaces": [{"name", "documents", "segments", "manifest_version"}]}` | The caller's namespaces (#214), tenant prefix stripped; shard and internal namespaces are left out. |
-| `DELETE /v1/namespaces/{ns}` | → `DeleteNamespaceResponse` | *write*. 404 if it does not exist, 409 while a branch still shares its segments, and 409 for a branch (delete it with `DELETE /v1/namespaces/{ns}/branch`). Permanent; see below. |
+| `DELETE /v1/namespaces/{ns}` | → `DeleteNamespaceResponse` | *write*. 404 if it does not exist, 409 while a branch still shares its segments, and 409 for a branch (delete it with `DELETE /v1/namespaces/{ns}/branch`). With `KOSHA_NAMESPACE_DELETE_CONFIRM=on` it needs `?confirm=<ns>` (400 otherwise). Permanent; see below. |
 | `POST /v1/namespaces/{ns}/documents` | `IndexDocumentsRequest` → `IndexDocumentsResponse` | *write*. Upsert by id. |
 | `POST /v1/namespaces/{ns}/flush` | → `FlushResponse` | *write*. Make buffered writes searchable. |
 | `POST /v1/namespaces/{ns}/delete` | `DeleteByQueryRequest` → `DeleteByQueryResponse` | *write*. Delete by query. |
-| `POST /v1/namespaces/{ns}/branch`, `GET /v1/namespaces/{ns}/branches`, `DELETE /v1/namespaces/{ns}/branch` | `{"name": "<branch>"}` → the branch; → its branches; → what was reclaimed | Create (*write*), list and delete (*write*) copy-on-write branches (#208). 409 if the name is taken, or for deleting a namespace that is not a branch. |
+| `POST /v1/namespaces/{ns}/branch`, `GET /v1/namespaces/{ns}/branches`, `DELETE /v1/namespaces/{ns}/branch` | `{"name": "<branch>"}` → the branch; → its branches; → what was reclaimed and its `deletion` record | Create (*write*), list and delete (*write*) copy-on-write branches (#208). 409 if the name is taken, or for deleting a namespace that is not a branch. |
+| `POST /v1/namespaces/{ns}/exports`, `GET /v1/namespaces/{ns}/exports[/{id}]`, `GET /v1/namespaces/{ns}/exports/{id}/download[?part=N]`, `DELETE /v1/namespaces/{ns}/exports/{id}` | `{"include_vectors"?, "upload_url"?}` → the export (202) | *read* scope. Export everything the namespace stores as gzip JSON Lines; 404 unless `KOSHA_EXPORTS=on`. See [Exports](#exports). |
 | `POST /v1/namespaces/{ns}/shards` | `{"shards": N}` → `{"namespace", "shards", "changed"}` | *write*. Create the namespace sharded (#207); see [Namespace sharding](#namespace-sharding). |
-| `POST /v1/namespaces/{ns}/schema`, `GET /v1/namespaces/{ns}/schema` | `NamespaceSchema` | Set (*write*) or read the namespace schema; see [Analyzers](#analyzers). |
+| `POST /v1/namespaces/{ns}/schema`, `GET /v1/namespaces/{ns}/schema` | `NamespaceSchema` | Set (*write*) or read the namespace schema; see [Analyzers](#analyzers). A change existing documents cannot follow is a 409 naming the field and the rule; see [Schema evolution](#schema-evolution). The response lists the online `changes`. |
 | `POST /v1/namespaces/{ns}/search` | `SearchRequest` → `SearchResponse` | 404 for a missing namespace. |
 | `POST /v1/namespaces/{ns}/exists` | ids → per-id existence | |
 | `GET /v1/namespaces/{ns}/stats` | → `NamespaceStats` | 404 for a missing namespace. |
@@ -536,11 +537,20 @@ under the namespace's publication lock:
    `"storage_reclaimed": false`; the leftover objects are unreferenced, and a
    re-created namespace never reuses their keys.
 
+The pod that runs the delete also drops, in the request, what it holds in memory
+for the namespace: parsed segments, corpus statistics, score ceilings, result
+pages and hydration verdicts. The namespace's exports are deleted too (objects
+and rows) and counted on the record (`exports_deleted`).
+
 Query pods answer 404 for the namespace once they see the control store has no
 manifest for it: within one manifest refresh (`KOSHA_MANIFEST_REFRESH_MS`,
 default 500 ms), or at once for a search with `max_staleness_seconds: 0`. Their local disk copies of its segments are not removed
-eagerly; the LRU cache (`KOSHA_CACHE_MAX_BYTES`) evicts them. Re-creating the
+eagerly; the LRU cache (`KOSHA_CACHE_MAX_BYTES`) evicts them, or the purge below. Re-creating the
 namespace, explicitly or by writing to it, starts it empty.
+
+With `KOSHA_NAMESPACE_DELETE_CONFIRM=on` (off by default, so existing callers
+keep working) the request must name the namespace again:
+`DELETE /v1/namespaces/docs?confirm=docs`; anything else is a 400.
 
 **Cached copies on every pod.** With `KOSHA_DELETION_PURGE_INTERVAL_MS` set
 (off by default), each pod of any role reads the deletion records it has not
@@ -562,9 +572,24 @@ for the next sweep. So is a namespace on a writer pod whose first publish
 registered it after the sweep listed the control store: the writer asks the
 store again under its locks before it removes anything.
 
-A deletion record carries no per-pod acknowledgement: the control store has
-no list of pods to wait for. What holds for a pod that has the purge on and
-can read the control store:
+**Per-pod acknowledgement.** Every pod with the purge on keeps a row in the
+pod registry (`kosha.pods`, a heartbeat per pass) and, after a clean sweep of
+a deleted subject, writes an acknowledgement (`kosha.deletion_acks`) for each
+of its records that asks for one. With `KOSHA_DELETION_REQUIRE_ACKS=on` on the
+writer pod, a record is written with `acks_required`: once storage is
+verified it stays `pending` (`storage_verified: true`) until every *live* pod
+has acknowledged it, and only then becomes `completed`. A pod is live while its
+last heartbeat is younger than `KOSHA_POD_LIVENESS_MS` (default 5 minutes, by
+the database's clock); a pod that died stops being waited for after that
+window and is listed as `expired`. A pod that restarts handles every record
+again in its first pass. A tenant is acknowledged only by a sweep that ran
+after the tenant's storage reclaim finished. `GET /v1/admin/deletions/{id}`
+shows, for such a record, `acks: {complete, live_pods, acknowledged, missing,
+expired, liveness_ms}`. Any purge pod completes a record once nobody live is
+missing (it checks every 60 s, so a dead pod's expiry is noticed).
+
+What holds for a pod that has the purge on and can read the control store,
+with or without acknowledgements:
 
 - it handles a record in the first pass that starts after the delete commits,
   so within one interval plus the length of a pass. (Records are read in
@@ -583,13 +608,14 @@ can read the control store:
   starts when the tenant record completes, not when the delete was requested;
 - a pod that was down handles every record in its first pass after boot.
 
-Not covered: a pod with the purge off; parsed segments a search already
-running still holds, until it ends; a pod that cannot read the control store,
-until it can; a writer pod holding unpublished writes for a namespace another
-pod deleted, until they are published or dropped; a branch deleted on its own
-with `DELETE /v1/namespaces/{ns}/branch`, which writes no deletion record (its
-cached copies leave a pod only by eviction, or when its tenant is deleted);
-freed disk blocks and the operating system's page cache. `GET /v1/stats`
+Not covered: a pod with the purge off (with acknowledgements required it is
+not in the registry, so the record does not wait for it either: turn the
+purge on everywhere); parsed segments a search already running still holds,
+until it ends; a pod that cannot read the control store, until it can (it
+cannot acknowledge either, so the record waits until its heartbeat expires);
+a writer pod holding unpublished writes for a namespace another pod deleted,
+until they are published or dropped (it does not acknowledge meanwhile); freed
+disk blocks and the operating system's page cache. `GET /v1/stats`
 reports each pod's progress
 under `deletion_purge` (`caught_up`, `pending_sweeps`, `last_error`, counters).
 
@@ -606,11 +632,30 @@ that drops the namespace, and the response returns it as `deletion`:
 ```
 
 A record is `pending` until step 4 has deleted the prefix **and** listed it
-empty; only then is it `completed`. A record holds identifiers and counters,
-never document content, and is kept as the evidence that the erasure finished.
-What `completed` covers is the control store, the ingest pod's memory, WAL and
-disk, and object storage. It does not cover the caches of other pods, which
-each pod purges for itself within the window described above.
+empty (and the namespace's exports are gone); only then is it `completed`. A
+record holds identifiers and counters, never document content, and is kept as
+the evidence that the erasure finished.
+
+**Exactly what `completed` proves.** Without `acks_required`: the control
+store has no row of the subject, the deleting pod's memory, WAL and disk hold
+nothing of it, its exports are deleted, and a listing of its object-storage
+prefix came back empty after the delete. Other pods' caches are then purged by
+each pod within the window above, but the record does not prove it. With
+`acks_required` (`KOSHA_DELETION_REQUIRE_ACKS=on`): all of that, **and** every
+purge pod that was live (heartbeat within `KOSHA_POD_LIVENESS_MS`) when the
+record completed had swept the subject cleanly from its memory and local disk
+and said so; the acknowledging pods are listed on the record. It never proves
+anything about pods without the purge, freed disk blocks, or backups of the
+bucket or database kept outside Kosha.
+
+Scopes: `namespace`; `tenant`; `branch` (a branch deleted with
+`DELETE /v1/namespaces/{ns}/branch`, or with its tenant: complete once every
+object of its prefix that no remaining manifest lists is gone, since objects a
+branch of the branch still lists stay by design and go with that branch); and
+`migrated` (the bare source id of `kosha-server migrate-namespace`, written by
+the tool after the control-plane rename, `tenant_id` the destination's tenant,
+completed when the copied source objects are deleted, pending with
+`--keep-source`).
 
 | Method and path | Notes |
 |---|---|
@@ -625,11 +670,13 @@ after that namespace is deleted again. With the in-memory control store (no
 `DATABASE_URL`) records last only as long as the process.
 
 With `KOSHA_DELETION_RESUME_INTERVAL_MS` set (off by default), a writer pod
-(`ingest` or `standalone`) retries pending **namespace** records itself, at
-boot and then on that interval, under the same rule. A record that stays
-pending waits twice as long before each further try, up to one hour. Pending
-tenant records are left to `POST /v1/admin/deletions/resume`: a tenant pass
-deletes whatever keys and namespaces the tenant id has when it runs.
+(`ingest` or `standalone`) retries pending namespace, branch and tenant
+records itself (namespaces and branches first), at boot and then on that
+interval, under the same rule. A record that stays pending waits twice as long
+before each further try, up to one hour. A pending tenant record is a standing
+order: each retry deletes whatever keys and namespaces the tenant id has when
+it runs. A record that waits only for acknowledgements is not retried; a
+`migrated` record is finished by re-running `migrate-namespace`.
 
 A retry deletes the namespace's whole prefix in object storage, unattended,
 and the first one runs at boot, when a second writer pod can still be alive.
@@ -657,6 +704,89 @@ cannot be removed at runtime, so a tenant that still has one stays pending
 until the deployment's environment changes. Tenant ids starting with `_` or
 `.` are refused, and so is a tenant whose id is also the name of an unscoped
 (pre-#262) namespace, which stores its segments under the same prefix.
+
+## Exports
+
+A customer can take back everything a namespace stores (#347). Opt-in:
+`KOSHA_EXPORTS=on` (see [docs/configuration.md](docs/configuration.md)). Every route needs the
+*read* scope on the namespace, like a search.
+
+```
+POST /v1/namespaces/docs/exports                      {"include_vectors": true, "upload_url": "https://..."}
+GET  /v1/namespaces/docs/exports                      every export of the namespace
+GET  /v1/namespaces/docs/exports/{id}                 status, parts, presigned download URLs (S3)
+GET  /v1/namespaces/docs/exports/{id}/download?part=0 one part, streamed
+DELETE /v1/namespaces/docs/exports/{id}               delete it now
+```
+
+- **Format**: gzip-compressed JSON Lines, one document per line in the index API's own form
+  (`{"id", "fields": [{"name", "field_type", "value"}]}`), so lines go straight back to
+  `POST /v1/namespaces/{ns}/documents`. `Vector` fields are included unless
+  `"include_vectors": false`. Large exports are split into parts of at most
+  `KOSHA_EXPORT_PART_BYTES` of JSON; each part is a complete gzip member, so the parts
+  concatenated in order are one valid `.jsonl.gz`. Parquet is not offered: the `parquet` and
+  `arrow` crates would be the heaviest dependency tree in the server, for a format any customer
+  can derive from these lines.
+- **Consistency**: starting an export flushes and publishes the namespace (every acknowledged
+  write is in it) and pins the manifest it reads (every shard's, for a sharded namespace) on the
+  export record. Segment GC and the local GC keep whatever a pinned manifest references while the
+  export is pending or running, so a compaction mid-export cannot take a segment away. Deletes
+  are applied as of the pinned version.
+- **Jobs**: the record (`kosha.exports`, migration 010) is durable. A writer pod claims and runs
+  it and refreshes the claim every 30 s; if that pod dies, a writer pod's sweep (every 60 s)
+  claims it after 10 minutes and runs it again from the start against the same pins. States:
+  `pending`, `running`, `completed`, `failed` (objects deleted, `error` says why), `expired`.
+  At most `KOSHA_EXPORT_MAX_ACTIVE` (default 2) pending or running exports per tenant (429).
+- **Delivery**: parts are stored under `_exports/{tenant}/{id}/` in the bucket (with the
+  tenant's SSE key, #343), or under the data directory without S3. On S3 the status route returns
+  a presigned `GET` URL per part valid for `KOSHA_EXPORT_PRESIGN_SECS`; any pod streams a part
+  through `.../download`. An optional `upload_url` (a presigned PUT URL in the customer's bucket)
+  receives the whole export as one object: it must be `https`, carry no credentials before the
+  host, and every address its host resolves to must be public (loopback, private, link-local,
+  CGNAT, multicast, reserved and documentation ranges are refused, for IPv4, IPv6 and
+  IPv4-mapped forms). The upload connects to the address that was checked and follows no
+  redirects. The URL is kept only until the delivery ends and is never returned; the record shows
+  `delivery_host`, `delivery_state` and `delivery_error`. A failed delivery leaves the export
+  completed and downloadable.
+- **Lifetime and erasure**: a completed export expires after `KOSHA_EXPORT_TTL_SECS` (default 7
+  days): its objects are deleted and it reads `expired`. Deleting the namespace deletes its
+  exports, deleting the tenant deletes all of them and the whole `_exports/{tenant}/` prefix, and
+  the deletion record counts them (`exports_deleted`). An export id is answered only together
+  with the caller's tenant and the namespace in the path; anything else is a 404.
+
+## Schema evolution
+
+A namespace schema (`POST /v1/namespaces/{ns}/schema`, or `schema` on `POST /v1/namespaces`) can
+change while the namespace holds documents only in ways those documents can follow (#347). The
+rules live in `kosha_core::schema_evolution` and are enforced by the writer for every route that
+sets a schema, shards of a sharded namespace included. On a namespace without documents any valid
+schema applies.
+
+| Change | With documents |
+| --- | --- |
+| Add a field (any settings) | online |
+| Remove a field from the schema | online: new segments use the defaults |
+| Declare a `type` for a field that had none, or drop the declaration | online (types are declarative; documents keep the types they were sent with) |
+| Change `analyzer` / `stopwords` of a field, `default_analyzer`, `default_stopwords` | online, lazily: new segments use the new chain, existing segments answer with the chain their footer records until compaction re-analyzes them (`POST /v1/admin/compact-namespace` with `"mode": "full"`) or a reindex |
+| Declare an `embedding` on a field holding no vectors | online |
+| Drop a field's `embedding` | online: stored vectors stay, clients send vectors again |
+| Change a declared `type` | **reindex** (`type_change`) |
+| Change `indexed` or `stored` (absent means `true`) | **reindex** (`indexed_change`, `stored_change`) |
+| Change a field's embedding model or `dims` while it holds vectors | **reindex** (`embedding_change`) |
+| Declare an `embedding` whose `dims` differ from the vectors the field holds | **reindex** (`vector_dims_change`) |
+
+A refused change is a **409** with `{"error", "field", "rule", "reindex_required": true}` and
+changes nothing; an invalid schema is still a 400. A successful response lists the online
+`changes` (`field`, `change`, `effect`).
+
+Analyzer changes stay online, unlike in Elasticsearch, because every segment records the chains
+it was written with and queries are analyzed per segment ([Analyzers](#analyzers)), so no
+segment ever returns wrong hits; what changes is only when old documents pick up the new chain.
+
+**Reindex path.** Create a new namespace with the new schema (`POST /v1/namespaces` with
+`schema`), export the old one ([Exports](#exports)) and send its lines to the new namespace's
+`/documents`, switch readers over, then delete the old namespace. A branch is no shortcut: it
+shares the parent's segments, which keep their old settings.
 
 ## Late interaction
 

@@ -98,8 +98,23 @@ like any other explicit eviction. Its own counters are per pod, in the `deletion
 | `kosha_deletion_purge_parsed_segments_dropped_total` | Parsed segments dropped from memory |
 | `kosha_deletion_purge_deferred_total` | Directories or namespaces a sweep left for a later one (written to within the last 5 s, pinned, being fetched, or held by a writer's unpublished state) |
 | `kosha_deletion_purge_errors_total` | Passes or sweeps that failed (control store unreadable, a file that could not be removed) |
-| `kosha_deletion_resume_attempts_total`, `kosha_deletion_resume_completed_total` | Automatic retries of pending namespace records on a writer pod (`KOSHA_DELETION_RESUME_INTERVAL_MS`), and how many completed the record |
+| `kosha_deletion_resume_attempts_total`, `kosha_deletion_resume_completed_total` | Automatic retries of pending namespace, branch and tenant records on a writer pod (`KOSHA_DELETION_RESUME_INTERVAL_MS`), and how many finished the storage reclaim |
 | `kosha_deletion_resume_fenced_total` | Automatic retries skipped because the namespace's writer lease could not be taken (another writer pod holds it, or the lease store could not be reached) |
+| `pod_id`, `require_acks` | This pod's id in the pod registry, and whether deletions it records wait for acknowledgements (`KOSHA_DELETION_REQUIRE_ACKS`) |
+| `kosha_deletion_acks_written_total` | Acknowledgements this pod wrote (one per record with `acks_required`, after a clean sweep of its subject) |
+| `kosha_deletion_records_finalized_total` | Records this pod saw complete once their acknowledgements were in |
+| `kosha_deletion_heartbeat_errors_total` | Pod-registry heartbeats that failed (control store unreachable); a pod that cannot heartbeat stops being waited for after `KOSHA_POD_LIVENESS_MS` |
+
+Namespace exports (`KOSHA_EXPORTS`, #347) add no family to `/metrics` either. Their per-pod
+counters are in the `exports` block of `GET /v1/stats`:
+
+| Field | Meaning |
+| --- | --- |
+| `enabled`, `running` | Whether exports are served, and how many this pod is writing now (at most 2) |
+| `kosha_exports_started_total` | Exports started on this pod (`POST .../exports`) |
+| `kosha_exports_completed_total`, `kosha_exports_failed_total` | Exports this pod finished, and those that failed (their objects are deleted) |
+| `kosha_exports_expired_total` | Completed exports the sweep expired (objects deleted) after `KOSHA_EXPORT_TTL_SECS` |
+| `kosha_exports_deleted_total` | Exports deleted by their owner or with their namespace or tenant |
 
 Each cache keeps these figures per tenant (#342): the tenant is the first component of the
 `<tenant>/<name>` namespace id, and bare namespace ids from before tenants existed count as

@@ -772,7 +772,11 @@ impl Deletions {
         // Oldest first, so a later record of the same subject replaces it.
         for record in records {
             let map = match record.scope {
-                DeletionScope::Namespace => &mut deletions.namespaces,
+                // A branch or a migrated (pre-#262) source id is a
+                // namespace id too (#347).
+                DeletionScope::Namespace | DeletionScope::Branch | DeletionScope::Migrated => {
+                    &mut deletions.namespaces
+                }
                 DeletionScope::Tenant => &mut deletions.tenants,
             };
             map.insert(record.subject.clone(), record);

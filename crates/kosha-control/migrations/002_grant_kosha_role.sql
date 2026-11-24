@@ -47,6 +47,10 @@ ALTER TABLE IF EXISTS kosha.login_flows OWNER TO kosha;
 ALTER TABLE IF EXISTS kosha.api_key_creators OWNER TO kosha;
 -- 009_api_key_scrub.sql (#346). IF EXISTS for the same reason.
 ALTER TABLE IF EXISTS kosha.api_key_scrub OWNER TO kosha;
+-- 010_namespace_lifecycle.sql (#347). IF EXISTS for the same reason.
+ALTER TABLE IF EXISTS kosha.pods OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.deletion_acks OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.exports OWNER TO kosha;
 -- 011_billing_ledger.sql (#349). IF EXISTS for the same reason. Moving
 -- billing_plan_changes also moves the sequence its BIGSERIAL id owns.
 ALTER TABLE IF EXISTS kosha.billing_plan_changes OWNER TO kosha;
