@@ -126,8 +126,9 @@ impl S3Config {
         }
     }
 
-    /// [`S3Config::from_env`] that returns an invalid encryption setting as
-    /// an error instead of exiting.
+    /// [`S3Config::from_env`] that returns an invalid encryption setting
+    /// (or a plain-HTTP endpoint under `KOSHA_INTERNAL_TLS=required`) as an
+    /// error instead of exiting.
     pub fn try_from_env() -> Result<Option<Self>, String> {
         let Ok(bucket) = std::env::var("KOSHA_S3_BUCKET") else {
             return Ok(None);
@@ -162,6 +163,9 @@ impl S3Config {
             });
 
         let sse = SseConfig::from_env()?;
+        // Encryption in transit to S3 (#343): `KOSHA_INTERNAL_TLS=required`
+        // refuses a plain-HTTP custom endpoint.
+        crate::internal_tls::check_s3_endpoint_env()?;
 
         Ok(Some(Self {
             bucket,
@@ -429,7 +433,7 @@ pub mod sse {
         (!legacy_shard).then_some(tenant)
     }
 
-    fn validate_key_id(what: &str, key: &str) -> Result<String, String> {
+    pub(super) fn validate_key_id(what: &str, key: &str) -> Result<String, String> {
         if key.is_empty() {
             return Err(format!("{what}: empty KMS key id"));
         }
@@ -741,6 +745,8 @@ pub mod sse {
     }
 }
 
+type TenantKmsKeyLookup = dyn Fn(&str) -> Result<Option<String>, KoshaError> + Send + Sync;
+
 /// S3-backed storage that wraps a local cache and uploads/downloads
 /// segment files to/from an S3 bucket.
 ///
@@ -758,6 +764,7 @@ pub struct S3Storage {
     rt: tokio::runtime::Runtime,
     client: aws_sdk_s3::Client,
     sse: SseConfig,
+    tenant_kms_key_lookup: Option<Box<TenantKmsKeyLookup>>,
 }
 
 impl Debug for S3Storage {
@@ -806,6 +813,7 @@ impl S3Storage {
             rt,
             client,
             sse: config.sse,
+            tenant_kms_key_lookup: None,
         })
     }
 
@@ -817,8 +825,27 @@ impl S3Storage {
     /// The SSE headers for a write of `logical_path` (unprefixed; the
     /// destination path for a copy). Apply them with
     /// [`ApplySse::apply_sse`].
-    pub fn sse_for_path(&self, logical_path: &str) -> Option<ObjectSse> {
-        self.sse.for_path(logical_path)
+    pub fn sse_for_path(&self, logical_path: &str) -> Result<Option<ObjectSse>, KoshaError> {
+        let mut headers = self.sse.for_path(logical_path);
+        if let (sse::SseMode::AwsKms, Some(resolve), Some(tenant), Some(headers)) = (
+            self.sse.mode,
+            &self.tenant_kms_key_lookup,
+            sse::tenant_of_path(logical_path),
+            &mut headers,
+        ) {
+            if let Some(key) = resolve(tenant)? {
+                headers.kms_key_id = Some(
+                    sse::validate_key_id("control-plane tenant KMS key", &key)
+                        .map_err(KoshaError::ControlPlane)?,
+                );
+            }
+        }
+        Ok(headers)
+    }
+
+    #[cfg(feature = "postgres")]
+    pub fn set_tenant_kms_key_store(&mut self, store: kosha_control::PgStore) {
+        self.tenant_kms_key_lookup = Some(Box::new(move |tenant| store.tenant_kms_key_id(tenant)));
     }
 
     pub fn bucket(&self) -> &str {
@@ -919,6 +946,11 @@ impl S3Storage {
         // Each task reads its own file, so at most `upload_concurrency`
         // files are in memory at once, not the whole segment.
         let limit = Arc::new(tokio::sync::Semaphore::new(upload_concurrency()));
+        let commit_path = logical_dir
+            .join(segment_commit::COMMIT_FILE)
+            .to_string_lossy()
+            .into_owned();
+        let sse = self.sse_for_path(&commit_path)?;
         let uploads: Vec<(String, PathBuf, String, Option<ObjectSse>)> = names
             .iter()
             .map(|name| {
@@ -927,7 +959,7 @@ impl S3Storage {
                     name.clone(),
                     local_dir.join(name),
                     self.s3_key(&logical_path),
-                    self.sse_for_path(&logical_path),
+                    sse.clone(),
                 )
             })
             .collect();
@@ -969,13 +1001,9 @@ impl S3Storage {
                 None => Ok(files),
             }
         })?;
-        let commit_path = logical_dir
-            .join(segment_commit::COMMIT_FILE)
-            .to_string_lossy()
-            .into_owned();
         segment_commit::commit_uploaded_files(files, |commit| {
             self.local.write(&commit_path, &commit)?;
-            self.upload_bytes(commit, &commit_path)
+            self.upload_bytes_with_sse(commit, &commit_path, sse)
         })
     }
 
@@ -988,10 +1016,19 @@ impl S3Storage {
     /// Upload bytes to S3 at `logical_path` (unprefixed), with its SSE
     /// headers. Uses multi-part upload for payloads > 5MB.
     fn upload_bytes(&self, data: Vec<u8>, logical_path: &str) -> Result<(), KoshaError> {
+        let sse = self.sse_for_path(logical_path)?;
+        self.upload_bytes_with_sse(data, logical_path, sse)
+    }
+
+    fn upload_bytes_with_sse(
+        &self,
+        data: Vec<u8>,
+        logical_path: &str,
+        sse: Option<ObjectSse>,
+    ) -> Result<(), KoshaError> {
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         let key = self.s3_key(logical_path);
-        let sse = self.sse_for_path(logical_path);
         self.rt
             .block_on(async move { put_bytes(client, bucket, key, data, sse).await })
     }
@@ -1465,6 +1502,92 @@ impl S3Storage {
             },
             visit,
         )
+    }
+
+    /// Upload a local file to `logical_path` as an object of `tenant`
+    /// (#347 exports, which live under `_exports/` where
+    /// [`SseConfig::for_path`] would see no tenant): the tenant's SSE key
+    /// applies. The file is read whole; export parts are bounded by
+    /// `KOSHA_EXPORT_PART_BYTES`.
+    pub fn put_file_for_tenant(
+        &self,
+        local: &Path,
+        logical_path: &str,
+        tenant: &str,
+    ) -> Result<(), KoshaError> {
+        let data = std::fs::read(local).map_err(KoshaError::Io)?;
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key = self.s3_key(logical_path);
+        let sse = self.sse.for_tenant(Some(tenant));
+        self.rt
+            .block_on(async move { put_bytes(client, bucket, key, data, sse).await })
+    }
+
+    /// Stream one object into a local file (created or truncated), without
+    /// going through the segment cache. Returns its length.
+    pub fn get_object_to_file(&self, logical_path: &str, dest: &Path) -> Result<u64, KoshaError> {
+        use tokio::io::AsyncWriteExt;
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key = self.s3_key(logical_path);
+        let dest = dest.to_path_buf();
+        self.rt.block_on(async move {
+            let resp = client
+                .get_object()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 get_object: {}",
+                        log_get_object_error(&key, &e)
+                    ))
+                })?;
+            let mut body = resp.body;
+            let mut file = tokio::fs::File::create(&dest).await?;
+            let mut written = 0u64;
+            while let Some(chunk) = body.try_next().await.map_err(|e| {
+                KoshaError::NotFound(format!(
+                    "S3 read body: {}",
+                    log_s3_error("read body", &key, &e)
+                ))
+            })? {
+                file.write_all(&chunk).await?;
+                written += chunk.len() as u64;
+            }
+            file.flush().await?;
+            Ok(written)
+        })
+    }
+
+    /// A presigned `GET` URL for `logical_path`, valid for `expires_in`.
+    pub fn presign_get(
+        &self,
+        logical_path: &str,
+        expires_in: std::time::Duration,
+    ) -> Result<String, KoshaError> {
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key = self.s3_key(logical_path);
+        let config = aws_sdk_s3::presigning::PresigningConfig::expires_in(expires_in)
+            .map_err(|e| KoshaError::NotFound(format!("presigning config: {e}")))?;
+        self.rt.block_on(async move {
+            client
+                .get_object()
+                .bucket(&bucket)
+                .key(&key)
+                .presigned(config)
+                .await
+                .map(|request| request.uri().to_string())
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 presign get_object: {}",
+                        log_s3_error("presign get_object", &key, &e)
+                    ))
+                })
+        })
     }
 
     /// Delete one object from S3, surfacing failures (unlike the trait's
@@ -3600,6 +3723,7 @@ pub(crate) mod capture {
             rt: tokio::runtime::Runtime::new().unwrap(),
             client,
             sse,
+            tenant_kms_key_lookup: None,
         };
         (storage, capture)
     }
@@ -3752,6 +3876,40 @@ mod sse_request_tests {
     }
 
     #[test]
+    fn control_plane_key_wins_and_missing_keys_fall_back_on_put() {
+        const CONTROL_KEY: &str = "alias/control-plane-acme";
+        let root = temp_root("control-plane");
+        let (mut storage, capture) = capture::storage(root.clone(), "", kms_config());
+        storage.tenant_kms_key_lookup = Some(Box::new(|tenant| match tenant {
+            "acme" => Ok(Some(CONTROL_KEY.into())),
+            "unavailable" => Err(KoshaError::ControlPlane("database unavailable".into())),
+            _ => Ok(None),
+        }));
+        storage
+            .sse
+            .tenant_kms_keys
+            .insert("beta".into(), "alias/config-beta".into());
+        for (tenant, key) in [
+            ("acme", CONTROL_KEY),
+            ("beta", "alias/config-beta"),
+            ("gamma", DEFAULT_KEY),
+        ] {
+            assert!(storage
+                .write(&format!("{tenant}/docs/seg/a.bin"), b"a")
+                .is_err());
+            let requests = capture.take();
+            assert_eq!(requests.len(), 1, "{requests:?}");
+            assert_kms(&requests[0], key);
+        }
+        assert!(matches!(
+            storage.write("unavailable/docs/seg/a.bin", b"a"),
+            Err(KoshaError::ControlPlane(_))
+        ));
+        assert!(capture.take().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn copy_object_adopts_the_destination_tenant_key() {
         // The helper a server-side copy path (#344) applies.
         let (client, capture) = capture::client();
@@ -3810,7 +3968,7 @@ mod sse_request_tests {
                 "bucket".into(),
                 storage.s3_key(&format!("{seg}/big.bin")),
                 vec![0u8; 5 * 1024 * 1024 + 1],
-                storage.sse_for_path(&format!("{seg}/big.bin")),
+                storage.sse_for_path(&format!("{seg}/big.bin")).unwrap(),
             ));
             assert!(multipart.is_err());
             let copy = rt.block_on(
@@ -3834,7 +3992,7 @@ mod sse_request_tests {
         let (storage, capture) = start_pod(None);
         write_all(
             &storage,
-            storage.sse_for_path("acme/docs/docs-000002/a.bin"),
+            storage.sse_for_path("acme/docs/docs-000002/a.bin").unwrap(),
         );
         let requests = capture.take();
         assert_eq!(requests.len(), 3, "{requests:?}");
@@ -3847,7 +4005,7 @@ mod sse_request_tests {
         let (storage, capture) = start_pod(None);
         write_all(
             &storage,
-            storage.sse_for_path("acme/docs/docs-000002/a.bin"),
+            storage.sse_for_path("acme/docs/docs-000002/a.bin").unwrap(),
         );
         let requests = capture.take();
         assert_eq!(requests.len(), 3, "{requests:?}");
@@ -3941,6 +4099,7 @@ mod error_path_tests {
             rt: tokio::runtime::Runtime::new().unwrap(),
             client: aws_sdk_s3::Client::from_conf(config),
             sse: SseConfig::default(),
+            tenant_kms_key_lookup: None,
         };
         (storage, root)
     }

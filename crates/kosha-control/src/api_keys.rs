@@ -62,6 +62,11 @@ impl Scopes {
         self.0 == 0
     }
 
+    /// Whether every scope in `self` is also in `other`.
+    pub fn is_subset_of(self, other: Scopes) -> bool {
+        self.0 & !other.0 == 0
+    }
+
     /// The scope names, in `read`, `write`, `admin` order.
     pub fn names(self) -> Vec<&'static str> {
         Scope::ALL
@@ -199,9 +204,262 @@ pub struct NewApiKey {
     pub expires_at: Option<i64>,
 }
 
+/// What a key-granting caller may hand out (#346 tenant self-service): the
+/// tenant, scopes, namespaces and expiry of the API key making the request,
+/// or of whatever else a front end (the organization console) decides a
+/// user may grant. A key it creates or rotates never does more than the
+/// authority, nor outlives it; a key it lists, rotates or revokes is one it
+/// could have created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyAuthority {
+    pub tenant: String,
+    pub scopes: Scopes,
+    /// `None`: every namespace of the tenant.
+    pub namespaces: Option<Vec<String>>,
+    /// Unix seconds; `None` never expires.
+    pub expires_at: Option<i64>,
+}
+
+impl KeyAuthority {
+    /// Whether this authority could have issued `record`: same tenant, a
+    /// subset of its scopes and namespaces. Expiry is not compared: a
+    /// longer-lived key may still be revoked, and rotating it gives a
+    /// replacement bounded by [`Self::bound_expiry`]. Never an operator
+    /// credential.
+    pub fn can_manage(&self, record: &ApiKeyRecord) -> bool {
+        record.tenant_id == self.tenant
+            && !is_operator_tenant_id(&record.tenant_id)
+            && record.scopes.is_subset_of(self.scopes)
+            && namespaces_within(record.namespaces.as_deref(), self.namespaces.as_deref())
+    }
+
+    /// The expiry a key issued under this authority gets: `requested`, or
+    /// the authority's own expiry when none is requested. `Err` when the
+    /// request would outlive the authority.
+    pub fn bound_expiry(&self, requested: Option<i64>) -> Result<Option<i64>, String> {
+        match (requested, self.expires_at) {
+            (None, limit) => Ok(limit),
+            (Some(at), Some(limit)) if at > limit => Err(format!(
+                "the key would outlive the key that grants it (which expires at unix time \
+                 {limit}); ask for an expiry no later than that"
+            )),
+            (Some(at), _) => Ok(Some(at)),
+        }
+    }
+
+    /// Complete and check a key to create under this authority. Scopes and
+    /// namespaces the request left out (`None`) default to the
+    /// authority's own; the expiry defaults to the authority's. `Err` is
+    /// the reason it may not be granted (a 403).
+    pub fn grant(
+        &self,
+        description: String,
+        scopes: Option<Scopes>,
+        namespaces: Option<Vec<String>>,
+        expires_at: Option<i64>,
+    ) -> Result<NewApiKey, String> {
+        let scopes = scopes.unwrap_or(self.scopes);
+        if !scopes.is_subset_of(self.scopes) {
+            return Err(format!(
+                "cannot grant scopes [{}]: the granting key has only [{}]",
+                scopes.names().join(", "),
+                self.scopes.names().join(", ")
+            ));
+        }
+        let namespaces = namespaces.or_else(|| self.namespaces.clone());
+        if !namespaces_within(namespaces.as_deref(), self.namespaces.as_deref()) {
+            return Err(
+                "cannot grant namespaces outside those of the granting key (omit 'namespaces' \
+                 to get exactly its own)"
+                    .into(),
+            );
+        }
+        Ok(NewApiKey {
+            tenant_id: self.tenant.clone(),
+            description,
+            scopes,
+            namespaces,
+            expires_at: self.bound_expiry(expires_at)?,
+        })
+    }
+}
+
+/// Whether the namespace allow-list `inner` grants no more than `outer`
+/// (`None` = every namespace).
+fn namespaces_within(inner: Option<&[String]>, outer: Option<&[String]>) -> bool {
+    match (inner, outer) {
+        (_, None) => true,
+        (None, Some(_)) => false,
+        (Some(inner), Some(outer)) => inner.iter().all(|ns| outer.contains(ns)),
+    }
+}
+
+/// How long the latest usable operator credential must still have to live
+/// for the lock-out guard to count it (#346): one day, time enough to
+/// issue or rotate another before it lapses.
+pub const LOCKOUT_MARGIN_SECS: i64 = 24 * 60 * 60;
+
+/// Whether a set of usable operator credentials (their expiries, unix
+/// seconds, `None` = never) keeps `/v1/admin/*` reachable for at least
+/// [`LOCKOUT_MARGIN_SECS`] after `now`.
+fn keeps_admin_reachable(expiries: &[Option<i64>], now: i64) -> bool {
+    expiries
+        .iter()
+        .any(|at| at.is_none_or(|at| at >= now + LOCKOUT_MARGIN_SECS))
+}
+
+/// The lock-out guard (#346): with the shared bootstrap key switched off,
+/// a change to operator credentials must not leave the deployment without
+/// an admin credential. `before` and `after` are the expiries of the
+/// usable operator credentials before and after the change (a credential
+/// being rotated out is not counted after it). `Err` explains a refusal:
+/// the change leaves none at all, or it is what makes the last one lapse
+/// within [`LOCKOUT_MARGIN_SECS`].
+pub fn check_lockout(
+    before: &[Option<i64>],
+    after: &[Option<i64>],
+    now: i64,
+) -> Result<(), String> {
+    if after.is_empty() {
+        return Err(
+            "this would leave no usable operator credential while the shared admin key is \
+             off (KOSHA_ADMIN_BOOTSTRAP_KEY=disabled, or KOSHA_ADMIN_API_KEY unset), locking \
+             every operator out of /v1/admin/*; issue another credential first, or repeat \
+             with \"force\": true"
+                .into(),
+        );
+    }
+    if keeps_admin_reachable(before, now) && !keeps_admin_reachable(after, now) {
+        return Err(format!(
+            "this would let the last usable operator credential lapse within {} hours while \
+             the shared admin key is off (KOSHA_ADMIN_BOOTSTRAP_KEY=disabled, or \
+             KOSHA_ADMIN_API_KEY unset); give it a later expiry, issue another credential \
+             first, or repeat with \"force\": true",
+            LOCKOUT_MARGIN_SECS / 3600
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn authority(
+        scopes: &[Scope],
+        namespaces: Option<&[&str]>,
+        expires_at: Option<i64>,
+    ) -> KeyAuthority {
+        KeyAuthority {
+            tenant: "acme".into(),
+            scopes: Scopes::of(scopes),
+            namespaces: namespaces.map(|ns| ns.iter().map(|n| n.to_string()).collect()),
+            expires_at,
+        }
+    }
+
+    fn key(tenant: &str, scopes: &[Scope], namespaces: Option<&[&str]>) -> ApiKeyRecord {
+        ApiKeyRecord {
+            key_hash: hash_api_key("k"),
+            tenant_id: tenant.into(),
+            description: String::new(),
+            scopes: Scopes::of(scopes),
+            namespaces: namespaces.map(|ns| ns.iter().map(|n| n.to_string()).collect()),
+            expires_at: None,
+            last_used_at: None,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn an_authority_grants_at_most_itself() {
+        use Scope::{Admin, Read, Write};
+        let docs_admin = authority(&[Read, Admin], Some(&["docs", "wiki"]), Some(1_000));
+        // Defaults: its own scopes, namespaces and expiry.
+        let new = docs_admin.grant("ci".into(), None, None, None).unwrap();
+        assert_eq!(new.tenant_id, "acme");
+        assert_eq!(new.scopes, Scopes::of(&[Read, Admin]));
+        assert_eq!(new.namespaces, Some(vec!["docs".into(), "wiki".into()]));
+        assert_eq!(new.expires_at, Some(1_000));
+        // Narrower is fine.
+        let narrow = docs_admin
+            .grant(
+                String::new(),
+                Some(Scopes::of(&[Read])),
+                Some(vec!["docs".into()]),
+                Some(500),
+            )
+            .unwrap();
+        assert_eq!(narrow.expires_at, Some(500));
+        // Wider is not.
+        let more_scopes = docs_admin.grant(String::new(), Some(Scopes::of(&[Write])), None, None);
+        assert!(more_scopes.unwrap_err().contains("write"));
+        let more_ns = docs_admin.grant(String::new(), None, Some(vec!["other".into()]), None);
+        assert!(more_ns.unwrap_err().contains("namespaces"));
+        assert!(docs_admin
+            .grant(String::new(), None, None, Some(1_001))
+            .is_err());
+        // An unrestricted, non-expiring authority grants anything in its tenant.
+        let full = authority(&[Read, Write, Admin], None, None);
+        let any = full.grant(String::new(), None, None, Some(9_999)).unwrap();
+        assert_eq!((any.scopes, any.namespaces), (Scopes::ALL, None));
+        // A namespace-restricted one cannot grant "every namespace".
+        assert_eq!(
+            docs_admin
+                .grant(String::new(), None, None, None)
+                .unwrap()
+                .namespaces
+                .map(|n| n.len()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn an_authority_manages_only_keys_it_could_have_issued() {
+        use Scope::{Admin, Read, Write};
+        let docs_admin = authority(&[Read, Admin], Some(&["docs"]), None);
+        assert!(docs_admin.can_manage(&key("acme", &[Read], Some(&["docs"]))));
+        assert!(docs_admin.can_manage(&key("acme", &[Read, Admin], Some(&["docs"]))));
+        assert!(!docs_admin.can_manage(&key("acme", &[Read, Write], Some(&["docs"]))));
+        assert!(!docs_admin.can_manage(&key("acme", &[Read], None)));
+        assert!(!docs_admin.can_manage(&key("acme", &[Read], Some(&["docs", "x"]))));
+        assert!(!docs_admin.can_manage(&key("other", &[Read], Some(&["docs"]))));
+        let full = authority(&[Read, Write, Admin], None, None);
+        assert!(full.can_manage(&key("acme", &[Read, Write, Admin], None)));
+        assert!(!full.can_manage(&key("other", &[Read], None)));
+        let operator = KeyAuthority {
+            tenant: operator_tenant_id("alice"),
+            ..full
+        };
+        assert!(!operator.can_manage(&key(&operator_tenant_id("alice"), &[], None)));
+    }
+
+    #[test]
+    fn the_lockout_guard_refuses_only_what_locks_operators_out() {
+        let now = 1_000_000;
+        let day = LOCKOUT_MARGIN_SECS;
+        // Revoking the last one.
+        assert!(check_lockout(&[None], &[], now).is_err());
+        // Revoking one of two.
+        assert!(check_lockout(&[None, Some(now + 2 * day)], &[Some(now + 2 * day)], now).is_ok());
+        // Rotating the last long-lived one into a short-lived one.
+        let lapse = check_lockout(&[None], &[Some(now + 600)], now).unwrap_err();
+        assert!(lapse.contains("lapse"), "{lapse}");
+        // ... into one that lives long enough.
+        assert!(check_lockout(&[None], &[Some(now + 90 * day)], now).is_ok());
+        // Already short-lived: the change does not make it worse.
+        assert!(check_lockout(&[Some(now + 60), Some(now + 70)], &[Some(now + 60)], now).is_ok());
+        assert!(check_lockout(&[Some(now + 60)], &[], now).is_err());
+    }
+
+    #[test]
+    fn scope_subsets() {
+        let read = Scopes::of(&[Scope::Read]);
+        assert!(read.is_subset_of(Scopes::ALL));
+        assert!(Scopes::NONE.is_subset_of(read));
+        assert!(!Scopes::ALL.is_subset_of(read));
+        assert!(read.is_subset_of(read));
+    }
 
     #[test]
     fn scopes_parse_strictly_and_round_trip() {

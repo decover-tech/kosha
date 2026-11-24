@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: List
+items:
+  - apiVersion: rbac.authorization.k8s.io/v1
+    kind: Role
+    metadata:
+      name: kosha-query-pdb-deployer
+      namespace: kosha
+    rules:
+      - apiGroups: ["policy"]
+        resources: ["poddisruptionbudgets"]
+        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiVersion: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    metadata:
+      name: kosha-ci-query-pdb-deployer
+      namespace: kosha
+    subjects:
+      - kind: Group
+        name: kosha-ci
+        apiGroup: rbac.authorization.k8s.io
+    roleRef:
+      kind: Role
+      name: kosha-query-pdb-deployer
+      apiGroup: rbac.authorization.k8s.io

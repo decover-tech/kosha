@@ -98,6 +98,14 @@ impl WriterLeases {
         self.enabled
     }
 
+    pub(crate) fn check_writable(&self, controller: &Controller) -> Result<(), KoshaError> {
+        match &self.backend {
+            LeaseBackend::ControlStore => controller.lock().unwrap().check_writable(),
+            #[cfg(feature = "postgres")]
+            LeaseBackend::Postgres(store) => store.check_writable(),
+        }
+    }
+
     pub(crate) fn ttl(&self) -> Duration {
         self.ttl
     }

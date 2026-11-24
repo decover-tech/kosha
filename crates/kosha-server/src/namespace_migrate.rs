@@ -599,7 +599,7 @@ mod s3_objects {
             // back to the bucket default rather than keeping the source's
             // encryption. Resolve from the destination path, so a namespace
             // moved into `<tenant>/...` lands under that tenant's KMS key.
-            let sse = self.s3.sse().for_path(to);
+            let sse = self.s3.sse_for_path(to).map_err(|e| e.to_string())?;
             self.rt.block_on(async move {
                 if size > SINGLE_COPY_MAX {
                     return Self::multipart_copy(
@@ -1047,7 +1047,9 @@ where
             from.0, to.0, to.0
         )),
         (None, None) => Err(format!("namespace {} does not exist", from.0)),
-        (None, Some(manifest)) => finish_after_rename(objects, &from, &to, &manifest, args, out),
+        (None, Some(manifest)) => {
+            finish_after_rename(ctrl, objects, &from, &to, &manifest, args, out)
+        }
         (Some(_), None) => fresh(ctrl, objects, wal, &from, &to, args, out),
     }
 }
@@ -1060,7 +1062,8 @@ where
 /// rewritten objects in place (a segment's `footer.json`) or collected
 /// them. So nothing is copied, whatever the sizes; only source objects
 /// whose destination exists are deleted, and any other is left in place.
-fn finish_after_rename(
+fn finish_after_rename<C: ControlStore + ?Sized>(
+    ctrl: &mut C,
     objects: &dyn SegmentObjects,
     from: &NamespaceId,
     to: &NamespaceId,
@@ -1105,8 +1108,99 @@ fn finish_after_rename(
     if args.dry_run {
         return Ok(report);
     }
-    report.deleted = delete_source(objects, from, &planned, args, out)?;
+    let record = migrated_record(ctrl, from, to, manifest.version, out);
+    let deleted = delete_source(objects, from, &planned, args, out);
+    note_migrated_record(ctrl, record.as_ref(), &deleted, args, out);
+    report.deleted = deleted?;
     Ok(report)
+}
+
+/// The deletion record (#347, scope `migrated`) of `from`, the bare source
+/// of a migration to `to`: the pending one an earlier run left, or a new
+/// one. Usage reconciliation and the per-pod purge read it like any other
+/// deletion record. `None` (with a warning) when the control store cannot
+/// record it; the migration itself goes on.
+fn migrated_record<C: ControlStore + ?Sized>(
+    ctrl: &mut C,
+    from: &NamespaceId,
+    to: &NamespaceId,
+    version: u64,
+    out: &mut dyn Write,
+) -> Option<kosha_core::deletion::DeletionRecord> {
+    use kosha_core::deletion::{DeletionFilter, DeletionScope, DeletionState, NewDeletion};
+    let tenant =
+        to.0.split_once('/')
+            .map_or(to.0.as_str(), |(tenant, _)| tenant);
+    let pending = ctrl.deletions(&DeletionFilter {
+        state: Some(DeletionState::Pending),
+        tenant_id: Some(tenant.to_string()),
+        limit: None,
+    });
+    let existing = pending.ok().and_then(|records| {
+        records
+            .into_iter()
+            .find(|r| r.scope == DeletionScope::Migrated && r.subject == from.0)
+    });
+    if existing.is_some() {
+        return existing;
+    }
+    match ctrl.begin_deletion(&NewDeletion::migrated(&from.0, tenant), version) {
+        Ok(record) => {
+            let _ = writeln!(
+                out,
+                "deletion record {} (scope migrated) for {}",
+                record.id, from.0
+            );
+            Some(record)
+        }
+        Err(e) => {
+            let _ = writeln!(
+                out,
+                "WARN: could not write the deletion record for {}: {e}",
+                from.0
+            );
+            None
+        }
+    }
+}
+
+/// Complete `record` once the source objects are deleted; keep it pending
+/// with the reason otherwise (`--keep-source`, a failed delete).
+fn note_migrated_record<C: ControlStore + ?Sized>(
+    ctrl: &mut C,
+    record: Option<&kosha_core::deletion::DeletionRecord>,
+    deleted: &Result<usize, String>,
+    args: &Args,
+    out: &mut dyn Write,
+) {
+    let Some(record) = record else {
+        return;
+    };
+    let (objects, error) = match deleted {
+        Ok(_) if args.keep_source => (
+            0,
+            Some("--keep-source: the source objects were kept; rerun without it".to_string()),
+        ),
+        Ok(n) => (*n as u64, None),
+        Err(e) => (0, Some(format!("deleting the source objects failed: {e}"))),
+    };
+    match ctrl.record_deletion_attempt(&record.id, objects, error.as_deref()) {
+        Ok(after) => {
+            let _ = writeln!(
+                out,
+                "deletion record {}: {}",
+                after.id,
+                after.state.as_str()
+            );
+        }
+        Err(e) => {
+            let _ = writeln!(
+                out,
+                "WARN: could not update deletion record {}: {e}",
+                record.id
+            );
+        }
+    }
 }
 
 fn delete_source(
@@ -1378,7 +1472,10 @@ where
         manifest.segments.len(),
         report.documents
     );
-    report.deleted = delete_source(objects, from, &planned, args, out)?;
+    let record = migrated_record(ctrl, from, to, manifest.version, out);
+    let deleted = delete_source(objects, from, &planned, args, out);
+    note_migrated_record(ctrl, record.as_ref(), &deleted, args, out);
+    report.deleted = deleted?;
     Ok((report, outcome.lease_token))
 }
 
@@ -1887,7 +1984,8 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         let mut stdout = std::io::stdout();
         #[cfg(feature = "s3")]
         if let Some(config) = crate::s3_storage::S3Config::from_env() {
-            let s3 = connect_s3(config)?;
+            let mut s3 = connect_s3(config)?;
+            s3.set_tenant_kms_key_store(ctrl.clone());
             let objects = s3_objects::S3Objects::new(&s3)?;
             // `--verify` only reads the control plane and the segments.
             let wal = if args.verify {
@@ -2525,6 +2623,23 @@ mod tests {
         };
         let first = migrate(&mut control, &objects, None, &migrate_args, &mut Vec::new()).unwrap();
         assert_eq!((first.copied, first.deleted), (3, 0));
+        // #347: the source has a deletion record, pending while it is kept.
+        let migrated = |control: &Controller| {
+            let mut records: Vec<_> = control
+                .deletions(&kosha_core::deletion::DeletionFilter::default())
+                .into_iter()
+                .filter(|r| r.scope == kosha_core::deletion::DeletionScope::Migrated)
+                .collect();
+            assert_eq!(records.len(), 1, "{records:?}");
+            records.remove(0)
+        };
+        let record = migrated(&control);
+        assert_eq!(
+            (record.subject.as_str(), record.tenant_id.as_deref()),
+            ("corpus", Some("acme"))
+        );
+        assert!(!record.is_completed());
+        assert!(record.last_error.unwrap().contains("--keep-source"));
 
         // The live namespace rewrites its footer in place (a different
         // size) and drops another object.
@@ -2559,6 +2674,11 @@ mod tests {
             ),
             (2, 0, 2, 1)
         );
+        // The same record, completed by the run that deleted the source.
+        let done = migrated(&control);
+        assert_eq!(done.id, record.id);
+        assert!(done.is_completed(), "{done:?}");
+        assert_eq!(done.objects_deleted, 2);
         // The rewritten footer is untouched and nothing was copied back.
         assert_eq!(
             std::fs::read(&footer).unwrap(),

@@ -43,7 +43,8 @@ latency guarantees and the limits Kosha enforces.
 | `fuzzy` | Typo-tolerant term matching: `"fuzzy": {"field": "content", "value": "recieve", "fuzziness": 1}` finds `receive`. `fuzziness` is `0`, `1`, `2` or `"auto"` (default; Elasticsearch `AUTO:3,6`: exact below 3 characters, one edit up to 5, two from 6; `"auto:low,high"` moves the thresholds). An edit is an insertion, deletion, substitution or — with `transpositions` (default `true`) — a swap of adjacent characters. `prefix_length` (default 0) leading characters must match exactly and make expansion cheaper; `max_expansions` (default 50, at most 1024) caps the terms each token expands to per segment, nearest first, the exact term always kept. A non-exact match must leave a character of the shorter string untouched (`ox` never matches `o`). The value is analyzed with each segment's own analyzer and every token is expanded against that segment's sorted term dictionary (a Levenshtein-automaton walk that skips whole prefix ranges); several tokens combine with `operator` (AND by default). Scoring is tiered so **an exact match always outranks a one-edit match, which always outranks a two-edit one**: per token, `score = (2 − edits) + tf_norm` with `tf_norm ∈ (0, 1]` BM25's length-normalized tf saturation (namespace `avgdl`); no IDF, since expansions differ per segment. `field` (`""` / `_all` / `*` = every `Text` field) restricts it to one field's postings; segments written before per-field indexes answer from their combined index. Its own lexical query: not combinable with `query_text` / `fields` / `wildcard` / `match_phrase`, but can be the lexical leg of a hybrid request and takes `rank_by`. Segments are bloom-pruned for 0- and 1-edit tokens (see [Fuzzy bloom](#fuzzy-bloom)). Runs on an exhaustive path (no block-max WAND). On 1M docs x 30 words in 8 segments (1.08M distinct terms), warm: ~0.5–1 ms at 1 edit and ~3.5–4.5 ms at 2 edits for mid-frequency and rare words, ~10–14 ms when an expansion is a very frequent word (every posting is scored; the exact `query_text` WAND query takes 0.5 ms). The dictionary walk itself is ~0.2 ms per segment at 1 edit and ~2 ms at 2 edits (~0.3 ms with `prefix_length: 2`). Non-fuzzy queries are unchanged (`cargo bench -p kosha-query --bench fuzzy_expansion`) |
 | kNN / ANN vector search | Cluster-and-posting on-disk vector index with centroid probing and triangle-inequality lower bounds; global probe budget; flat/HNSW fallback for older segments. Compaction merges the inputs' postings and repairs them with SPFresh's LIRE split / merge / reassign instead of re-clustering every vector (`KOSHA_VECTOR_COMPACTION=lire`, the default; `rebuild` re-clusters as before). Same on-disk format either way (#253) |
 | Hybrid retrieval (RRF) | A lexical query (`query_text` / `wildcard` / `match_phrase` / `fuzzy`) plus a `knn` clause is fused with Reciprocal Rank Fusion, `score = Σ 1/(rank_constant + rank)`. Tune with `"rank": {"rrf": {"rank_window_size": 100, "rank_constant": 60}}` (Elasticsearch names and defaults: window = `max_results`, constant = 60; window must be ≥ `max_results`). Each retriever is ranked across the whole namespace before fusing: the lexical list is the best `rank_window_size` BM25 hits, the vector list the nearest `min(knn.k, rank_window_size)`. Vector-only hits are kept. Each hit returns the fused `score` plus `rank_details` (`lexical_rank` / `lexical_score` / `knn_rank` / `knn_score`). The fused list is at most `rank_window_size` long; `from` / `max_results`, `sort`, `collapse` and `search_after` (e.g. on `[_score desc, _id asc]`) apply within it. `total_hits` and aggregations count the lexical matches plus the vector window. Optional `"mode": "lexical" \| "semantic" \| "hybrid"` is checked against the clauses present |
-| Filters | `term`, `terms`, `range` (`gte`/`gt`/`lte`/`lt`), `exists`, `prefix`, `bool` (`must` / `must_not` / `should` / `minimum_should_match`; OpenSearch's `filter` is accepted as `must`), `match_all`. Every clause composes inside `bool` and works in `filter`, `knn.filter` and `/delete`. An unknown or malformed clause is a 400, never a match-all. On a multi-valued field (a list, or a [nested path](#nested-attributes) with several values) a clause matches if ANY value does |
+| Weighted multi-query RRF | `"rank_by": {"rrf": {"queries": [...], "k": 60, "weights": [...], "rank_window_size": 100}}` fuses independent lexical and vector retrievers before paging. See [Weighted multi-query RRF](#weighted-multi-query-rrf). |
+| Filters | `term`, `terms`, `range` (`gte`/`gt`/`lte`/`lt`), `exists`, `prefix`, `bool` (`must` / `must_not` / `should` / `minimum_should_match`; OpenSearch's `filter` is accepted as `must`), `match_all`. Every clause composes inside `bool` and works in `filter`, `knn.filter` and `/delete`. An unknown or malformed clause is a 400, never a match-all. `exists` is `{"exists": {"field": "matterId"}}` and matches a document that has a value for the field in any column type: an empty string `""` is a value (as in OpenSearch), an empty list `[]`, a list of only nulls, or an absent field is not. The "missing" case is `{"bool": {"must_not": [{"exists": {"field": "matterId"}}]}}`. On a multi-valued field (a list, or a [nested path](#nested-attributes) with several values) a clause matches if ANY value does |
 | `prefix` filter | `{"prefix": {"path": "/matters/2026/"}}`, or the long form `{"prefix": {"path": {"value": "/matters/2026/", "case_insensitive": true}}}`. Case-sensitive by default, like `term` (and unlike the `wildcard` query): `"ab"` matches `abc` and `ab`, not `a`, `xab` or `ABC`. A list value matches when any element does. The empty prefix matches exactly the documents `exists` matches. String fields only: a `prefix` on an `Integer`/`Float` field is a 400. Only `value` and `case_insensitive` are accepted in the long form. Evaluated by a scan of the segment's filter column (each distinct value once on a columnar segment), cached per segment; bloom filters cannot skip segments for it |
 | Multiple vector columns | A namespace can hold several `Vector` fields (e.g. a 384-dim `title_emb` and a 1536-dim `body_emb`); each segment builds one index per field and `knn.field` picks the one searched. Each field has one dimension per namespace, fixed by the first vector written to it: a document whose vector disagrees is rejected with a 400, and so is a `knn` naming a field no segment indexes or a query vector of the wrong dimension. Segments written before this change keep serving any `knn.field` from their single index, unless their `doc_vectors.bin` names exactly one field (#204) |
 | i8 vector quantization | `KOSHA_VECTOR_QUANTIZATION=i8` (or per field, `KOSHA_VECTOR_QUANTIZATION_FIELDS=body_emb:i8,title_emb:f32`) stores each segment's ANN posting entries as one f32 scale plus `dim` signed bytes instead of `dim` f32s: `vector.idx`, the bytes a cold kNN hydrates and the warm posting cache all shrink ~4x (measured 3.96x at 768 dims). The probe scores with an i8 dot product, then rescores its best `k * KOSHA_VECTOR_RESCORE_FACTOR` candidates (default 4, `0` disables) with the full-precision vectors in `doc_vectors.bin`, so final scores are exact cosine. f32 and i8 segments mix freely in a namespace. Default `f32`; see the rollout note below (#210) |
@@ -61,6 +62,52 @@ latency guarantees and the limits Kosha enforces.
 | Total-hit accounting | Capped counting with an `eq` / `gte` relation (`track_total_hits`-style), overridable per query via `exact_total_hits` / `total_hits_cap` |
 | Rerank | `"rerank": {"provider": "cohere", "model": "rerank-v3.5", "field": "content", "top_n": 50, "timeout_ms": 2000}` sends the top `top_n` hits (the fused list for a hybrid request) to an external reranker and pages the reordered list. `top_n` defaults to `from + max_results` and must be ≥ it (≤ 1000; ≤ `rank_window_size` when that is set); `timeout_ms` defaults to 2000. Each hit then has `score` = `rerank_score` (the provider's) and `fused_score` (the search-stage score). On timeout or provider error the hits keep search order and the response has `rerank_degraded: true` and `rerank_degraded_reason`; such responses are not cached. Not combinable with `sort` / `search_after`. Providers are configured on the server from the environment (`KOSHA_RERANK_PROVIDERS`, `KOSHA_RERANK_<NAME>_URL` / `_API_KEY` / `_MODEL`; `cohere` reads `COHERE_API_KEY`); any Cohere-style `POST /rerank` API works. Per-provider calls, outcomes, documents, billed units and a latency histogram are under `rerank` in admin `/stats` |
 | Degradation signal | `knn_degraded_segments` reports segments whose vector search failed, so a 200 with silently missing neighbors is visible to the caller |
+
+### Weighted multi-query RRF
+
+```json
+{
+  "namespace": "articles",
+  "query_text": "",
+  "rank_by": {
+    "rrf": {
+      "queries": [
+        {"query_text": "breach notice"},
+        {"query_text": "security incident", "fields": ["title"]},
+        {"knn": {"field": "embedding", "vector": [0.1, 0.2], "k": 20}}
+      ],
+      "k": 60,
+      "weights": [2, 1, 0.5],
+      "rank_window_size": 100
+    }
+  },
+  "max_results": 10
+}
+```
+
+Supply 1–16 subqueries, each with one lexical or kNN retriever. The outer
+`filter` and each subquery's `filter` are applied together. The contribution
+from each list is `weight / (k + rank)`, where rank starts at 1 and `k`
+defaults to 60. Omit weights to use 1 for each list; otherwise provide one
+finite, nonnegative weight per list with a positive finite sum.
+
+The fixed per-retriever window defaults to 100 (1–1000); kNN also honors
+the retriever's own `knn.k`. The fused result set is the deduplicated union
+of those lists. `total_hits` counts this union independently of the page
+and uses the usual capped `gte` relation unless exact counting is requested.
+To page in score-descending, ID-ascending order, use `from` / `max_results`
+or pass the last hit's `[score, doc_id]` as strings in `search_after`, keeping
+the retrievers, weights, and window unchanged. Cursor paging assumes an
+unchanged namespace snapshot. Explicitly sorting by `_id asc` instead
+uses a one-value `[doc_id]` cursor, as the Go and TypeScript iterators do
+by default. This variant does not use the response cache.
+
+To rerank the fused top `top_n`, add the regular `rerank` object with an
+explicit `rerank.query` and page with `from` / `max_results`. The default
+`top_n` is fixed at 100, regardless of the page offset. This variant does
+not accept top-level retrieval clauses, legacy `rank` / `mode`,
+aggregations, highlighting, `collapse`, or `limit_per`. The existing
+two-retriever hybrid and `rank_by.functions` score modifiers are unchanged.
 
 ### Aggregations
 
@@ -85,6 +132,9 @@ request and response shapes:
 
 - Each aggregation object has exactly one type key. An unknown or misspelled
   type (`stats`, `averag`) is a 400 that lists the supported types.
+- For `knn` without a lexical query or top-level `filter`, aggregations and
+  `total_hits` use the same namespace-wide neighbor set (up to `knn.k`
+  documents) regardless of page size.
 - `min`, `max`, `sum` and `avg` read `Integer` and `Float` fields, and `Date`
   fields as epoch milliseconds (`value_as_string` is added for `min` / `max` /
   `avg` over dates). Date text is parsed as `YYYY-MM-DD[THH:MM[:SS[.fff]]][Z|±HH:MM]`;
@@ -350,11 +400,18 @@ own document, or combine the two values into one leaf (`"name_org": "Ada|beta"`)
 - `GET /healthz` (liveness), `GET /readyz` (readiness), `GET /v1/stats` and per-namespace stats.
 - `GET /metrics` in Prometheus text format: search outcomes and latency histograms, queue depth, cache bytes, hydrations and lease outcomes, degraded kNN segments. Unauthenticated by default (`KOSHA_METRICS_AUTH=admin` to require the admin key, `KOSHA_METRICS=off` to disable). See [docs/metrics.md](docs/metrics.md).
 - A built-in read-only dashboard at `/dashboard` (#214), off by default (`KOSHA_DASHBOARD=on`): the tenant's namespaces, per-namespace detail with a recent-latency sparkline, and a query console that shows hits, scores and the timing breakdown and flags `knn_degraded_segments` in red. It calls the normal API with the key pasted into the page. See [docs/dashboard.md](docs/dashboard.md).
+- A self-service console (#345), off by default (`KOSHA_CONSOLE=enabled`): sign-up with email verification (`KOSHA_SIGNUP=enabled`), password login and reset, Google and GitHub sign-in, per-organization OIDC single sign-on, and a web UI at `/console` for organizations, members and invites, projects, tenants, API keys (shown once), namespaces with document counts and sizes, usage, plan, the audit log and SSO settings. Sessions are cookies that authenticate the console only; the data plane keeps using API keys. SAML is not supported yet. See [docs/organizations.md](docs/organizations.md#self-service-console).
 - Admin endpoints: create API key, rebuild filter blooms, backfill offset tables, compact a namespace (sync or async), compaction job and scheduler status, warmup status, import a namespace.
 - Schema migrations via `kosha-server migrate`.
 - Usage metering per tenant and namespace (#348), off by default (`KOSHA_USAGE_METERING=on`): searches, bytes returned and fetched, bytes and documents written, and an hourly stored-bytes snapshot, as idempotent raw events in `kosha.usage_events` (migration 005), read back with `GET /v1/usage`. See "Usage metering" in [docs/configuration.md](docs/configuration.md).
 - Usage reconciliation (#348): `GET /v1/admin/usage/reconcile` and the one-shot `kosha-server reconcile-usage` compare each namespace's stored-bytes snapshot with the objects under its storage prefix (listings only), separate what the manifest references from retired, untracked and stray objects, and flag storage without snapshots and snapshots without storage, deleted namespaces included. The command prints JSON and exits non-zero when a namespace is out of tolerance; `k8s/base/cronjob-usage-reconcile.yaml` runs it daily, shipped suspended. See "Reconciling stored bytes with object storage" in [docs/configuration.md](docs/configuration.md).
 - Billing (#349), off by default (`KOSHA_BILLING=on`): free, usage-based and enterprise plans from a JSON catalog, a monthly job that rates usage into invoices (`kosha.billing_accounts`, `kosha.billing_invoices`, migration 007), free-tier limits and non-payment restrictions (read-only, then suspended) enforced with `402`, and an optional Stripe provider. See "Billing" in [docs/configuration.md](docs/configuration.md).
+  Second part: signed Stripe webhooks (idempotent, polling `sync` kept as fallback), self-service
+  checkout and customer portal (`POST /v1/billing/checkout`, `POST /v1/billing/portal`, `admin`
+  scope), dunning retries and notices (log or HTTP webhook), an opt-in in-process scheduler for
+  close-period, sync and dunning (`KOSHA_BILLING_SCHEDULER=on`, one pod at a time), proration of
+  plan changes inside a month, and plan catalog hot reload. USD only, no tax. See "Billing" in
+  `docs/configuration.md`.
 - Namespace branching (copy-on-write). `POST /v1/namespaces/{ns}/branch` with `{"name": "<branch>"}` creates a new namespace whose manifest lists the parent's segments and deletion bitmaps where they already are, so it takes the same time for 1M documents as for 10 and copies nothing. Writes, deletes, upserts and compactions on the branch go to the branch's own prefix; the parent's files and query results do not change. `GET /v1/namespaces/{ns}/branches` lists a namespace's branches (`GET .../stats` on a branch shows its parent and how many segments it still shares). `DELETE /v1/namespaces/{ns}/branch` deletes a branch and removes only the objects in its own prefix that no remaining manifest lists: segments a branch of the branch still uses are kept. Only branches can be deleted this way. Admin rewrites (`rebuild-filter-blooms`, `backfill-offset-tables`) on a branch skip the segments it shares with its parent. Segment GC never deletes an object a branch still lists, and `DELETE /v1/namespaces/{ns}` refuses (409) a namespace whose segments a branch still shares: delete the branches first. A sharded namespace cannot be branched yet.
 
 ### API and clients
@@ -367,9 +424,9 @@ own document, or combine the two values into one leaf (`"name_org": "Ada|beta"`)
 
 ### Not supported yet
 
-- Per-retriever weights for RRF. Reranking over more than one field, and ES `text_similarity_reranker` retrievers in the Python client.
+- Reranking over more than one field, and ES `text_similarity_reranker` retrievers in the Python client.
 - Multi-field scoring other than a boosted sum (`dis_max` / `best_fields` tie-breakers, turbopuffer `Product` / `Max` of fields), field-name patterns in `fields`, and block-max WAND for `fields` queries.
-- Analyzer features beyond the list in [Analyzers](#analyzers): per-language stemmers other than English, synonyms, n-grams, CJK dictionary segmentation (`standard@2` splits Han ideographs one per token), full Unicode case folding (`ß` and `SS` stay distinct). Other `FieldSchema` members (`type`, `indexed`, `stored`) are stored but not enforced — field types still come with each document.
+- Analyzer features beyond the list in [Analyzers](#analyzers): per-language stemmers other than English, synonyms, n-grams, CJK dictionary segmentation (`standard@2` splits Han ideographs one per token), full Unicode case folding (`ß` and `SS` stay distinct). Other `FieldSchema` members (`type`, `indexed`, `stored`) are stored but not enforced — field types still come with each document, and changing them is always online ([Schema evolution](#schema-evolution)).
 - Fuzzy: block-max WAND over expansions (fuzzy queries score every posting of every expansion), highlighting of fuzzy matches, fuzzy inside `fields` / `match_phrase`, bloom pruning for two-edit tokens.
 - Native embedding model changes do not reindex automatically, late-interaction bags are not embedded, and the original text of an embedded field is not kept.
 - gRPC — the service is defined in the proto, but HTTP/JSON is the only implemented transport.
@@ -539,11 +596,20 @@ under the namespace's publication lock:
    `"storage_reclaimed": false`; the leftover objects are unreferenced, and a
    re-created namespace never reuses their keys.
 
+The pod that runs the delete also drops, in the request, what it holds in memory
+for the namespace: parsed segments, corpus statistics, score ceilings, result
+pages and hydration verdicts. The namespace's exports are deleted too (objects
+and rows) and counted on the record (`exports_deleted`).
+
 Query pods answer 404 for the namespace once they see the control store has no
 manifest for it: within one manifest refresh (`KOSHA_MANIFEST_REFRESH_MS`,
 default 500 ms), or at once for a search with `max_staleness_seconds: 0`. Their local disk copies of its segments are not removed
-eagerly; the LRU cache (`KOSHA_CACHE_MAX_BYTES`) evicts them. Re-creating the
+eagerly; the LRU cache (`KOSHA_CACHE_MAX_BYTES`) evicts them, or the purge below. Re-creating the
 namespace, explicitly or by writing to it, starts it empty.
+
+With `KOSHA_NAMESPACE_DELETE_CONFIRM=on` (off by default, so existing callers
+keep working) the request must name the namespace again:
+`DELETE /v1/namespaces/docs?confirm=docs`; anything else is a 400.
 
 **Cached copies on every pod.** With `KOSHA_DELETION_PURGE_INTERVAL_MS` set
 (off by default), each pod of any role reads the deletion records it has not
@@ -565,9 +631,27 @@ for the next sweep. So is a namespace on a writer pod whose first publish
 registered it after the sweep listed the control store: the writer asks the
 store again under its locks before it removes anything.
 
-A deletion record carries no per-pod acknowledgement: the control store has
-no list of pods to wait for. What holds for a pod that has the purge on and
-can read the control store:
+**Per-pod acknowledgement.** Every pod with the purge on keeps a row in the
+pod registry (`kosha.pods`, a heartbeat per pass) and, after a clean sweep of
+a deleted subject, writes an acknowledgement (`kosha.deletion_acks`) for each
+of its records that asks for one. A deletion under an hour old is
+acknowledged only after its settle sweep (60 s after the first), and only
+once the writer verified its storage. The heartbeat runs on its own timer,
+so a long pass does not make a live pod look dead. With `KOSHA_DELETION_REQUIRE_ACKS=on` on the
+writer pod, a record is written with `acks_required`: once storage is
+verified it stays `pending` (`storage_verified: true`) until every *live* pod
+has acknowledged it, and only then becomes `completed`. A pod is live while its
+last heartbeat is younger than `KOSHA_POD_LIVENESS_MS` (default 5 minutes, by
+the database's clock); a pod that died stops being waited for after that
+window and is listed as `expired`. A pod that restarts handles every record
+again in its first pass. A tenant is acknowledged only by a sweep that ran
+after the tenant's storage reclaim finished. `GET /v1/admin/deletions/{id}`
+shows, for such a record, `acks: {complete, live_pods, acknowledged, missing,
+expired, liveness_ms}`. Any purge pod completes a record once nobody live is
+missing (it checks every 60 s, so a dead pod's expiry is noticed).
+
+What holds for a pod that has the purge on and can read the control store,
+with or without acknowledgements:
 
 - it handles a record in the first pass that starts after the delete commits,
   so within one interval plus the length of a pass. (Records are read in
@@ -586,13 +670,14 @@ can read the control store:
   starts when the tenant record completes, not when the delete was requested;
 - a pod that was down handles every record in its first pass after boot.
 
-Not covered: a pod with the purge off; parsed segments a search already
-running still holds, until it ends; a pod that cannot read the control store,
-until it can; a writer pod holding unpublished writes for a namespace another
-pod deleted, until they are published or dropped; a branch deleted on its own
-with `DELETE /v1/namespaces/{ns}/branch`, which writes no deletion record (its
-cached copies leave a pod only by eviction, or when its tenant is deleted);
-freed disk blocks and the operating system's page cache. `GET /v1/stats`
+Not covered: a pod with the purge off (with acknowledgements required it is
+not in the registry, so the record does not wait for it either: turn the
+purge on everywhere); parsed segments a search already running still holds,
+until it ends; a pod that cannot read the control store, until it can (it
+cannot acknowledge either, so the record waits until its heartbeat expires);
+a writer pod holding unpublished writes for a namespace another pod deleted,
+until they are published or dropped (it does not acknowledge meanwhile); freed
+disk blocks and the operating system's page cache. `GET /v1/stats`
 reports each pod's progress
 under `deletion_purge` (`caught_up`, `pending_sweeps`, `last_error`, counters).
 
@@ -609,11 +694,30 @@ that drops the namespace, and the response returns it as `deletion`:
 ```
 
 A record is `pending` until step 4 has deleted the prefix **and** listed it
-empty; only then is it `completed`. A record holds identifiers and counters,
-never document content, and is kept as the evidence that the erasure finished.
-What `completed` covers is the control store, the ingest pod's memory, WAL and
-disk, and object storage. It does not cover the caches of other pods, which
-each pod purges for itself within the window described above.
+empty (and the namespace's exports are gone); only then is it `completed`. A
+record holds identifiers and counters, never document content, and is kept as
+the evidence that the erasure finished.
+
+**Exactly what `completed` proves.** Without `acks_required`: the control
+store has no row of the subject, the deleting pod's memory, WAL and disk hold
+nothing of it, its exports are deleted, and a listing of its object-storage
+prefix came back empty after the delete. Other pods' caches are then purged by
+each pod within the window above, but the record does not prove it. With
+`acks_required` (`KOSHA_DELETION_REQUIRE_ACKS=on`): all of that, **and** every
+purge pod that was live (heartbeat within `KOSHA_POD_LIVENESS_MS`) when the
+record completed had swept the subject cleanly from its memory and local disk
+and said so; the acknowledging pods are listed on the record. It never proves
+anything about pods without the purge, freed disk blocks, or backups of the
+bucket or database kept outside Kosha.
+
+Scopes: `namespace`; `tenant`; `branch` (a branch deleted with
+`DELETE /v1/namespaces/{ns}/branch`, or with its tenant: complete once every
+object of its prefix that no remaining manifest lists is gone, since objects a
+branch of the branch still lists stay by design and go with that branch); and
+`migrated` (the bare source id of `kosha-server migrate-namespace`, written by
+the tool after the control-plane rename, `tenant_id` the destination's tenant,
+completed when the copied source objects are deleted, pending with
+`--keep-source`).
 
 | Method and path | Notes |
 |---|---|
@@ -628,11 +732,13 @@ after that namespace is deleted again. With the in-memory control store (no
 `DATABASE_URL`) records last only as long as the process.
 
 With `KOSHA_DELETION_RESUME_INTERVAL_MS` set (off by default), a writer pod
-(`ingest` or `standalone`) retries pending **namespace** records itself, at
-boot and then on that interval, under the same rule. A record that stays
-pending waits twice as long before each further try, up to one hour. Pending
-tenant records are left to `POST /v1/admin/deletions/resume`: a tenant pass
-deletes whatever keys and namespaces the tenant id has when it runs.
+(`ingest` or `standalone`) retries pending namespace, branch and tenant
+records itself (namespaces and branches first), at boot and then on that
+interval, under the same rule. A record that stays pending waits twice as long
+before each further try, up to one hour. A pending tenant record is a standing
+order: each retry deletes whatever keys and namespaces the tenant id has when
+it runs. A record that waits only for acknowledgements is not retried; a
+`migrated` record is finished by re-running `migrate-namespace`.
 
 A retry deletes the namespace's whole prefix in object storage, unattended,
 and the first one runs at boot, when a second writer pod can still be alive.
@@ -660,6 +766,102 @@ cannot be removed at runtime, so a tenant that still has one stays pending
 until the deployment's environment changes. Tenant ids starting with `_` or
 `.` are refused, and so is a tenant whose id is also the name of an unscoped
 (pre-#262) namespace, which stores its segments under the same prefix.
+
+## Exports
+
+A customer can take back everything a namespace stores (#347). Opt-in:
+`KOSHA_EXPORTS=on` (see [docs/configuration.md](docs/configuration.md)). Every route needs the
+*read* scope on the namespace, like a search.
+
+```
+POST /v1/namespaces/docs/exports                      {"include_vectors": true, "upload_url": "https://..."}
+GET  /v1/namespaces/docs/exports                      every export of the namespace
+GET  /v1/namespaces/docs/exports/{id}                 status, parts, presigned download URLs (S3)
+GET  /v1/namespaces/docs/exports/{id}/download?part=0 one part, streamed
+DELETE /v1/namespaces/docs/exports/{id}               delete it now
+```
+
+- **Format**: gzip-compressed JSON Lines, one document per line in the index API's own form
+  (`{"id", "fields": [{"name", "field_type", "value"}]}`), so lines go straight back to
+  `POST /v1/namespaces/{ns}/documents`. `Vector` fields are included unless
+  `"include_vectors": false`. Large exports are split into parts of at most
+  `KOSHA_EXPORT_PART_BYTES` of JSON; each part is a complete gzip member, so the parts
+  concatenated in order are one valid `.jsonl.gz`. Parquet is not offered: the `parquet` and
+  `arrow` crates would be the heaviest dependency tree in the server, for a format any customer
+  can derive from these lines.
+- **Consistency**: starting an export flushes and publishes the namespace (every acknowledged
+  write is in it) and pins the manifest it reads (every shard's, for a sharded namespace) on the
+  export record. Segment GC and the local GC keep whatever a pinned manifest references while the
+  export is pending or running, so a compaction mid-export cannot take a segment away. Deletes
+  are applied as of the pinned version.
+- **Jobs**: the record (`kosha.exports`, migration 010) is durable. A writer pod claims and runs
+  it and refreshes the claim every 30 s on a timer of its own, while writing and while
+  delivering; if that pod dies, a writer pod's sweep (every 60 s) claims it after 10 minutes and
+  runs it again from the start against the same pins. Each attempt writes under its own
+  `attempt-{n}/` prefix, and a run that lost its claim removes only its own files. States:
+  `pending`, `running`, `completed`, `failed` (objects deleted, `error` says why), `expired`.
+  At most `KOSHA_EXPORT_MAX_ACTIVE` (default 2) pending or running exports per tenant (429).
+- **Delivery**: parts are stored under `_exports/{tenant}/{id}/attempt-{n}/` in the bucket (with the
+  tenant's SSE key, #343), or under the data directory without S3. On S3 the status route returns
+  a presigned `GET` URL per part valid for `KOSHA_EXPORT_PRESIGN_SECS`; any pod streams a part
+  through `.../download`. An optional `upload_url` (a presigned PUT URL in the customer's bucket)
+  receives the whole export as one object: it must be `https`, carry no credentials before the
+  host, and every address its host resolves to must be public (loopback, private, link-local,
+  CGNAT, multicast, reserved and documentation ranges are refused, for IPv4, IPv6 and
+  IPv4-mapped forms; 6to4, Teredo, local-use NAT64 and discard-only IPv6 are refused too). The
+  upload connects to the address that was checked, ignores `HTTP(S)_PROXY`, and follows no
+  redirects. The URL is kept only until the delivery ends and is never returned; the record shows
+  `delivery_host`, `delivery_state` and `delivery_error`. A failed delivery leaves the export
+  completed and downloadable.
+- **Lifetime and erasure**: a completed export expires after `KOSHA_EXPORT_TTL_SECS` (default 7
+  days): its objects are deleted and it reads `expired`. Deleting the namespace deletes its
+  exports, deleting the tenant deletes all of them and the whole `_exports/{tenant}/` prefix, and
+  the deletion record counts them (`exports_deleted`). A row is deleted only after its objects
+  are confirmed gone; until then it stays (`expired`, unpinned) and the deletion record stays
+  `pending`, so the retry finds it. Failed and expired rows are removed after 30 days. An export
+  id is answered only together with the caller's tenant and the namespace in the path; anything
+  else is a 404.
+- **Listing**: `GET .../exports` is newest first, at most `?limit=` (default and maximum 100)
+  per page; `next` is the `?before=` of the following page.
+- **Turned off**: with `KOSHA_EXPORTS` off only starting an export is refused (404); existing
+  exports can still be read, downloaded and deleted. A writer pod booting with exports off fails
+  any export still pending or running, so its pinned segments are released to GC.
+
+## Schema evolution
+
+A namespace schema (`POST /v1/namespaces/{ns}/schema`, or `schema` on `POST /v1/namespaces`) can
+change while the namespace holds documents only in ways those documents can follow (#347). The
+rules live in `kosha_core::schema_evolution` and are enforced by the writer for every route that
+sets a schema, shards of a sharded namespace included. On a namespace without documents any valid
+schema applies.
+
+| Change | With documents |
+| --- | --- |
+| Add a field (any settings) | online |
+| Remove a field from the schema | online: new segments use the defaults |
+| Change `type`, `indexed` or `stored` (declare, change or drop) | online, reported as `declarative_changed`: the engine does not read them, so documents keep the types they were sent with and are indexed and stored as before |
+| Change `analyzer` / `stopwords` of a field, `default_analyzer`, `default_stopwords` | online, lazily: new segments use the new chain, existing segments answer with the chain their footer records until compaction re-analyzes them (`POST /v1/admin/compact-namespace` with `"mode": "full"`) or a reindex |
+| Declare an `embedding` on a field holding no vectors | online |
+| Drop a field's `embedding` | online: stored vectors stay, clients send vectors again |
+| Change a field's embedding model or `dims` while it holds vectors | **reindex** (`embedding_change`) |
+| Declare an `embedding` whose model differs from the model the field's stored vectors were embedded with (also after dropping the old declaration in an earlier request) | **reindex** (`embedding_change`) |
+| Declare an `embedding` whose `dims` differ from the vectors the field holds | **reindex** (`vector_dims_change`) |
+
+A refused change is a **409** with `{"error", "field", "rule", "reindex_required": true}` and
+changes nothing; an invalid schema is still a 400. A successful response lists the online
+`changes` (`field`, `change`, `effect`). Only the embedding rules can refuse a change: they are
+judged against the models and dimensions the stored segments record, not only the previous
+schema, and buffered documents are flushed before an embedding declaration changes so their
+model is recorded first; removing a declaration and adding another one cannot get around them.
+
+Analyzer changes stay online, unlike in Elasticsearch, because every segment records the chains
+it was written with and queries are analyzed per segment ([Analyzers](#analyzers)), so no
+segment ever returns wrong hits; what changes is only when old documents pick up the new chain.
+
+**Reindex path.** Create a new namespace with the new schema (`POST /v1/namespaces` with
+`schema`), export the old one ([Exports](#exports)) and send its lines to the new namespace's
+`/documents`, switch readers over, then delete the old namespace. A branch is no shortcut: it
+shares the parent's segments, which keep their old settings.
 
 ## Late interaction
 
@@ -845,6 +1047,12 @@ and the server logs a warning at startup for any in `KOSHA_API_KEYS`.
   under `/v1/admin/users` and `/v1/admin/orgs`; see
   [docs/organizations.md](docs/organizations.md). Existing tenants and keys need
   no migration.
+- `KOSHA_CONSOLE=enabled` lets users sign up (with `KOSHA_SIGNUP=enabled`),
+  sign in and manage their organizations and keys themselves at `/console`;
+  set `KOSHA_CONSOLE_PUBLIC_URL`, a real mailer (`KOSHA_MAILER=smtp`) and, for
+  organization SSO, `KOSHA_CONSOLE_SECRET_KEY`. See
+  [docs/organizations.md](docs/organizations.md#self-service-console) and
+  "Self-service console" in [docs/configuration.md](docs/configuration.md).
 - Set a separate `KOSHA_INTERNAL_API_KEY` on every peer participating in segment
   hydration. Tenant API keys do not authorize admin or peer-file access.
 - Both service capabilities are disabled when their respective secret is unset.
@@ -854,8 +1062,9 @@ and the server logs a warning at startup for any in `KOSHA_API_KEYS`.
   `KOSHA_AUTH=disabled` is set explicitly (local development only). Postgres keys
   are re-read every `KOSHA_API_KEY_REFRESH_SECS` (default 30), request bodies are
   capped at `KOSHA_MAX_BODY_BYTES` (default 64 MiB, 413 above it), and
-  `KOSHA_LEGACY_ROUTES=off` turns the unversioned routes into 410s
-  (`KOSHA_LEGACY_ROUTES_TENANTS` keeps them for named tenants; see
+  the deprecated unversioned routes return 410 by default.
+  `KOSHA_LEGACY_ROUTES=on` opts in all tenants, or
+  `KOSHA_LEGACY_ROUTES_TENANTS` opts in named tenants (see
   [docs/api/versioning.md](docs/api/versioning.md#legacy-routes)).
 
 ### Scoped API keys (Postgres key registry)
@@ -868,17 +1077,29 @@ a query pod forwards a write to the ingest pod:
 |---|---|
 | `read` | search, exists, namespace stats, reading a schema, listing namespaces and branches, the tenant's own usage (`GET /v1/usage`) and billing state (`GET /v1/billing`) |
 | `write` | index, replace, delete documents, flush |
-| `admin` | create and delete namespaces and branches, change a namespace's schema or shards |
+| `admin` | create and delete namespaces and branches, change a namespace's schema or shards, manage the tenant's own keys (`/v1/api-keys`, below), start a billing checkout or open the billing portal (`POST /v1/billing/checkout`, `POST /v1/billing/portal`) |
 
 Scopes are independent (`admin` does not include `write`). A request outside a
 key's scopes or namespaces gets a `403` naming what is missing; an expired key
 gets `401` "API key expired". The `admin` scope is tenant-level: `/v1/admin/*`
-still needs an admin credential. Env keys (`KOSHA_API_KEY`, `KOSHA_API_KEYS`)
-and every key created before scopes existed have all three scopes, every
-namespace and no expiry, so they behave as before. A key restricted to
-namespaces cannot use the routes that answer for the whole tenant (listing all
-namespaces, `GET /v1/usage`, `GET /v1/billing`), and can only create a
-namespace or branch whose name is on its list.
+still needs an admin credential. Every key created before scopes existed has
+all three scopes, every namespace and no expiry, so it behaves as before. A key
+restricted to namespaces sees only those namespaces in `GET /v1/namespaces`,
+cannot use the routes that answer for the whole tenant (`GET /v1/usage`,
+`GET /v1/billing`), and can only create a namespace or branch whose name is on
+its list.
+
+Env keys can be narrowed the same way (#346). A `KOSHA_API_KEYS` entry takes
+`;`-separated attributes after its tenant:
+
+```
+KOSHA_API_KEYS="sk-app=acme,sk-ci=acme;scopes=read+write;namespaces=docs+wiki;expires_at=1798761600"
+```
+
+`scopes` and `namespaces` are `+`-separated, `expires_at` is unix seconds. An
+entry without attributes (`sk-app=acme`, and `KOSHA_API_KEY`) has every scope,
+every namespace and no expiry, exactly as before. A malformed attribute stops
+the server at startup with an error that names the entry, never the key.
 
 Manage keys with the admin credential (`kosha admin ...` wraps these):
 
@@ -888,13 +1109,35 @@ Manage keys with the admin credential (`kosha admin ...` wraps these):
 | `GET /v1/admin/api-keys[?tenant_id=T]` | List keys that are not revoked: id, tenant, scopes, namespaces, `expires_at`, `last_used_at` (unix seconds). No secrets |
 | `POST /v1/admin/api-keys/revoke` | `{"key_id"}`. The pod that answers refuses the key at once, the others within `KOSHA_API_KEY_REFRESH_SECS` |
 | `POST /v1/admin/api-keys/rotate` | `{"key_id", "overlap_secs": 86400}`. Issues a replacement with the same tenant, scopes and namespaces; the old key keeps working for the overlap (default one day), so clients switch without downtime |
-| `POST /v1/admin/api-keys/scrub-plaintext` | Removes the plaintext that keys created before this feature still hold in the database |
-| `GET /v1/admin/api-keys/plaintext-count` | Read-only: `{"plaintext_rows": N, "scrub_due": true}`, the rows `scrub-plaintext` would rewrite. The server logs the same count at startup (`api keys: N row(s) still hold a plaintext key`) |
+| `POST /v1/admin/api-keys/scrub-plaintext` | Removes, now, the plaintext that keys created before this feature still hold in the database (the server also does it by itself; see **Upgrading** below) |
+| `GET /v1/admin/api-keys/plaintext-count` | Read-only: `{"plaintext_rows": N, "scrub_due": true}`, the rows `scrub-plaintext` would rewrite. The server logs the state at startup (`api keys: N row(s) still hold a plaintext key; the automatic scrub removes it at unix time T`) |
 
 Keys are stored as SHA-256 hashes; a key's `key_id` is that hash. Creating,
 rotating and revoking a key are recorded in the audit log, in the same
-transaction as the change; see [docs/organizations.md](docs/organizations.md#audit-log).
-`last_used_at` is written about once per refresh interval, not per request.
+transaction as the change, naming the admin credential that did it
+(`operator` or `operator:<name>`); see
+[docs/organizations.md](docs/organizations.md#audit-log). `last_used_at` is
+written about once per refresh interval, not per request.
+
+**A tenant managing its own keys.** A key with the `admin` scope can list,
+create, rotate and revoke its own tenant's registry keys without an operator
+(`kosha keys ...` wraps these; Postgres control plane only):
+
+| Route | Does |
+|---|---|
+| `GET /v1/api-keys` | The tenant's keys the calling key may manage, as in the admin listing, plus `current` for the calling key itself |
+| `POST /v1/api-keys` | `{"description", "scopes", "namespaces", "expires_in_secs"}`, all optional. Left out, the scopes, namespaces and expiry are the calling key's own. The key is in the response and is never shown again |
+| `POST /v1/api-keys/rotate` | `{"key_id", "overlap_secs", "expires_in_secs"}`, as the admin route |
+| `POST /v1/api-keys/revoke` | `{"key_id"}` |
+
+A key never grants more than it holds: what it creates has a subset of its
+scopes and namespaces and expires no later than it does (asking for more is a
+`403`), and it can see, rotate or revoke only keys of its own tenant that it
+could itself have created (any other `key_id` is a `404`). A rotation's
+replacement is bounded by the calling key's expiry too. Env keys are never
+listed or changed here. Every change is in the audit log with the calling key
+as the actor (`api_key:<first twelve characters of its id>`). The admin
+credential gets `403` on these routes; operators use `/v1/admin/api-keys`.
 
 ### Operator admin credentials
 
@@ -913,8 +1156,18 @@ its detail carries `"via": "operator:<name>"`.
 |---|---|
 | `POST /v1/admin/operators` | Issue a credential: `{"name": "alice", "description", "expires_in_secs": 7776000}`. Only `name` is required (1 to 64 of letters, digits, `. _ - @ +`). The credential is in the response and is never shown again. `409` if that operator already holds a usable one: rotate it |
 | `GET /v1/admin/operators` | List credentials that are not revoked: id, name, `expires_at`, `last_used_at`. No secrets |
-| `POST /v1/admin/operators/revoke` | `{"key_id"}` revokes one credential, `{"name"}` every credential of that operator. The pod that answers refuses them at once, the others within `KOSHA_API_KEY_REFRESH_SECS` |
-| `POST /v1/admin/operators/rotate` | `{"key_id", "overlap_secs": 86400}`. Issues a replacement for the same operator; the old credential keeps working for the overlap (default one day) |
+| `POST /v1/admin/operators/revoke` | `{"key_id"}` revokes one credential, `{"name"}` every credential of that operator. The pod that answers refuses them at once, the others within `KOSHA_API_KEY_REFRESH_SECS` (a pod that cannot reload its keys for ten intervals refuses every operator credential until it can). `"force": true` overrides the lock-out guard |
+| `POST /v1/admin/operators/rotate` | `{"key_id", "overlap_secs": 86400}`. Issues a replacement for the same operator; the old credential keeps working for the overlap (default one day). `"force": true` overrides the lock-out guard |
+
+`kosha admin create-operator --name alice`, `list-operators`,
+`rotate-operator <key_id>`, `revoke-operator <key_id>` (or `--name alice`) and
+`api-key-plaintext-count` wrap these.
+
+Every other admin request that changes state (segment GC, compaction, imports
+and repairs, tenant deletion, billing and usage administration) is written to
+the audit log too, as `admin.*` with the method, path and response status and
+the credential that made it; see
+[docs/organizations.md](docs/organizations.md#audit-log).
 
 Operator credentials are stored in the key registry like tenant keys (hashed,
 same expiry, rotation and refresh), but the two never mix: an operator
@@ -947,23 +1200,55 @@ whoever did it, in the same transaction as the change.
    works again. Rotate it afterwards if it was exposed.
 
 Leaving the variable unset keeps today's behaviour: the shared key and operator
-credentials both work. The server refuses to start on any other value. It does
-not stop you disabling the shared key while no operator credential is usable;
-it logs a warning at startup, and step 4 is the way back. During a rolling
+credentials both work. The server refuses to start on any other value.
+
+**Lock-out guard.** While the shared key is off (`KOSHA_ADMIN_BOOTSTRAP_KEY=disabled`,
+or `KOSHA_ADMIN_API_KEY` unset), the server refuses with `409` a revoke or
+rotate that would leave no usable operator credential, or that makes the last
+one lapse within a day (rotating it into a short-lived one, say). Nothing
+changes; issue another credential first. To do it anyway, repeat the request
+with `"force": true` (`--force` on the CLI), knowing that step 4 is then the
+way back in. Credentials that simply reach their expiry are not an API call
+the server can refuse, so with the shared key disabled it warns at startup and
+about hourly when none is usable or the last one expires within a week.
+During a rolling
 upgrade, pods still on a build without this feature refuse operator credentials
 (as an admin credential and as a tenant key), so issue them once every pod is
 upgraded. `/internal/*` and `KOSHA_INTERNAL_API_KEY` are unaffected.
 
 **Upgrading.** The migration (`003_scoped_api_keys.sql`, also applied by the
 server at startup) only adds columns and hashes existing keys; it leaves their
-plaintext in place, because pods still running the previous build read it. Roll
-every pod to the new build, then run `kosha admin scrub-plaintext-api-keys`
-once. Until every pod is upgraded, a key created through an upgraded pod is not
-accepted by the pods still on the old build. After the scrub the table holds no
-usable key, and a rollback to a build from
-before this feature would no longer accept Postgres keys (env keys are
-unaffected). The server's database role must own `kosha.api_keys`
-(`002_grant_kosha_role.sql`) or an admin must apply the migration first
+plaintext in place, because pods still running a build from before hashed keys
+read it. Until every pod is upgraded, a key created through an upgraded pod is
+not accepted by the pods still on the old build.
+
+The plaintext is then removed without an operator (`009_api_key_scrub.sql`,
+`KOSHA_API_KEY_AUTO_SCRUB`). Every server with Postgres runs a scrub round on
+each key refresh, and it rewrites the plaintext rows
+`KOSHA_API_KEY_SCRUB_GRACE_SECS` (default one day) after the database last
+showed a sign of an old build: the first start of a server with the automatic
+scrub (recorded by the server, so applying migrations ahead of a deploy starts
+no clock), or a key row only an old build inserts (one without a hash), which
+restarts the clock. One pod does it per round, and running it again changes
+nothing. The server logs the state at startup and when it changes. The upgrade
+path:
+
+1. Roll out the new build as usual. Old and new pods both accept every key.
+2. Nothing else. A day after the first new pod started (or after the last old
+   pod created a key), the plaintext is gone; the startup line says
+   `api keys: no row holds a plaintext key`, and
+   `GET /v1/admin/api-keys/plaintext-count` answers `0`.
+
+Upgrading from a build that already has hashed keys (but no automatic scrub)
+is the same: such builds read keys by hash, so the scrub cannot lock them out.
+If a rollout of a build from before hashed keys could take longer than a day,
+raise `KOSHA_API_KEY_SCRUB_GRACE_SECS`, or set `KOSHA_API_KEY_AUTO_SCRUB=off`
+and run `kosha admin scrub-plaintext-api-keys` yourself once every pod is
+upgraded. After the scrub the table holds no usable key, and a rollback to a
+build from before hashed keys would no longer accept Postgres keys (env keys
+are unaffected); a rollback to any build with hashed keys is unaffected. The
+server's database role must own `kosha.api_keys` and `kosha.api_key_scrub`
+(`002_grant_kosha_role.sql`) or an admin must apply the migrations first
 (`make db-migrate`).
 
 **Upgrading an instance that was set up with `make db-migrate`.** Tables created
