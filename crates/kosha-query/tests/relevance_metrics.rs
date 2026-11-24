@@ -7,7 +7,10 @@ mod metrics;
 
 use std::collections::HashMap;
 
-use metrics::{brute_force_top_k, cosine, ndcg_at, parse_qrels, recall_at, set_recall, Mean};
+use metrics::{
+    brute_force_top_k, cosine, ndcg_at, parse_qrels, recall_at, reciprocal_rank_at, set_recall,
+    ExactNeighbors, Mean,
+};
 
 fn ids(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
@@ -80,4 +83,34 @@ fn mean_skips_unscorable_queries() {
     m.add(None);
     m.add(Some(0.0));
     assert_eq!((m.value(), m.n), (Some(0.5), 2));
+}
+
+#[test]
+fn reciprocal_rank_uses_the_first_positive_at_the_requested_cutoff() {
+    let j = judged(&[("a", 1), ("b", 2), ("x", 0)]);
+    let ranked = ids(&["x", "a", "b"]);
+    assert_eq!(reciprocal_rank_at(&ranked, &j, 3), Some(0.5));
+    assert_eq!(reciprocal_rank_at(&ranked, &j, 1), Some(0.0));
+    assert_eq!(reciprocal_rank_at(&ranked, &HashMap::new(), 3), None);
+}
+
+#[test]
+fn tie_tolerant_recall_uses_exact_distances_and_counts_each_hit_once() {
+    let candidates: [(&str, &[f32]); 4] = [
+        ("near", &[1.0, 0.0]),
+        ("tie_a", &[0.0, 1.0]),
+        ("tie_b", &[0.0, 2.0]),
+        ("far", &[-1.0, 0.0]),
+    ];
+    let q = [1.0, 0.0];
+    let exact = ExactNeighbors::new(&q, candidates.into_iter(), 2);
+    assert_eq!(exact.recall(&ids(&["near", "tie_b"])), Some(1.0));
+    assert_eq!(exact.recall(&ids(&["tie_b", "tie_b", "near"])), Some(0.5));
+    assert_eq!(exact.recall(&ids(&["near", "far"])), Some(0.5));
+    let small = ExactNeighbors::new(&q, candidates[..1].iter().copied(), 10);
+    assert_eq!(small.recall(&ids(&["near"])), Some(1.0));
+    assert_eq!(
+        ExactNeighbors::new(&q, std::iter::empty(), 10).recall(&[]),
+        None
+    );
 }

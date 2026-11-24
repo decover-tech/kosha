@@ -49,6 +49,7 @@ QUERIES_PER_TOPIC = 4
 BODY_WORDS = 24
 TITLE_WORDS = 4
 FILTERED_QUERY_EVERY = 5  # every 5th query filters on lang = "en"
+OOD_QUERIES = 30
 
 CONSONANTS = "bcdfghjklmnprstvz"
 VOWELS = "aeiou"
@@ -154,6 +155,16 @@ def generate() -> tuple[list[dict], list[dict], list[tuple[str, str, int]]]:
                 if dt != t or (flt is not None and lang != "en"):
                     continue
                 qrels.append((qid, doc_id, 2 if dkey == key else 1))
+    # Independent of the corpus topic centers, key offsets and RNG stream.
+    ood_rng = random.Random(SEED + 1)
+    for i in range(OOD_QUERIES):
+        queries.append(
+            {
+                "qid": f"ood{i:02d}",
+                "distribution": "ood",
+                "vector": [r4(ood_rng.gauss(0, 1)) for _ in range(DIM)],
+            }
+        )
     return docs, queries, qrels
 
 
