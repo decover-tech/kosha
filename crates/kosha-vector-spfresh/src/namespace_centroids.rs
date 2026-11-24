@@ -393,7 +393,9 @@ mod tests {
         };
         let segments = 100;
         for i in 0..segments {
-            snapshot.directory.insert_segment(&i.to_string(), Vec::new());
+            snapshot
+                .directory
+                .insert_segment(&i.to_string(), Vec::new());
         }
         let without_vectors = snapshot.estimated_heap_bytes();
         for i in 0..segments {
