@@ -256,6 +256,33 @@ const DOCS: &[(&str, &str)] = &[
 ];
 
 #[test]
+fn embedding_schema_rejects_explicit_non_vector_fields() {
+    let state = state_with(EmbedderRegistry::with_mock());
+    let mut rejected = Vec::new();
+    for (name, type_key, text_type) in [
+        ("canonical", "type", serde_json::json!("FIELD_TYPE_TEXT")),
+        ("alias", "field_type", serde_json::json!("text")),
+        ("number", "type", serde_json::json!(1)),
+    ] {
+        let mut schema = serde_json::json!({"fields": {"emb": {
+            "embedding": {"model": MODEL, "dims": DIMS}
+        }}});
+        schema["fields"]["emb"][type_key] = text_type;
+        rejected.push(call(
+            &state,
+            "POST /v1/namespaces",
+            serde_json::json!({"namespace": name, "schema": schema}),
+        ));
+        rejected.push(put_schema(&state, &format!("update-{name}"), schema));
+    }
+    let statuses: Vec<_> = rejected.iter().map(|(status, _)| *status).collect();
+    assert_eq!(statuses, [400; 6]);
+    for (_, body) in rejected {
+        assert!(body["error"].as_str().unwrap().contains("vector"), "{body}");
+    }
+}
+
+#[test]
 fn text_is_embedded_at_ingest_and_query_text_finds_neighbours() {
     let counting = Counting::new(MODEL, DIMS);
     let state = state_with(EmbedderRegistry::default().with_embedder(counting.clone()));
