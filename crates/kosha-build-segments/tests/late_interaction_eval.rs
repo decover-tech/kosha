@@ -148,3 +148,41 @@ fn trec_qrels_and_skip_exact_are_supported() {
     assert!((report["late_interaction"]["ndcg_at_k"].as_f64().unwrap() - 1.0).abs() < 1e-9);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn a_non_empty_work_dir_is_refused_and_left_intact() {
+    let root = std::env::temp_dir().join(format!("kosha-li-eval-work-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let corpus = root.join("corpus");
+    run(&[
+        "gen",
+        "--out",
+        path(&corpus),
+        "--docs",
+        "20",
+        "--queries",
+        "2",
+        "--dim",
+        "8",
+        "--tokens",
+        "4",
+    ]);
+    let out = Command::new(BIN)
+        .args([
+            "eval",
+            "--corpus",
+            path(&corpus),
+            "--work-dir",
+            path(&corpus),
+        ])
+        .output()
+        .expect("run the harness");
+    assert!(
+        !out.status.success(),
+        "a non-empty --work-dir must be refused"
+    );
+    for f in ["docs.jsonl", "queries.jsonl", "qrels.tsv"] {
+        assert!(corpus.join(f).exists(), "{f} was deleted");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}

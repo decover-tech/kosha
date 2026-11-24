@@ -82,8 +82,8 @@ enum Command {
         /// Directory holding docs.jsonl, queries.jsonl and qrels.tsv
         #[arg(long)]
         corpus: PathBuf,
-        /// Where the segments are built (default: a temporary directory,
-        /// removed afterwards)
+        /// Where the segments are built; must be absent or empty (default:
+        /// a temporary directory, removed afterwards)
         #[arg(long)]
         work_dir: Option<PathBuf>,
         #[arg(long, default_value_t = 50_000)]
@@ -175,6 +175,15 @@ fn main() {
             let work = work_dir.unwrap_or_else(|| {
                 std::env::temp_dir().join(format!("kosha-li-eval-{}", std::process::id()))
             });
+            if temp {
+                let _ = std::fs::remove_dir_all(&work);
+            } else {
+                assert!(
+                    std::fs::read_dir(&work).map_or(true, |mut d| d.next().is_none()),
+                    "--work-dir {} must be absent or empty",
+                    work.display()
+                );
+            }
             let report = eval(
                 &corpus,
                 &work,
@@ -377,7 +386,6 @@ fn check_bag(kind: &str, item: &Item, dim: &mut Option<usize>) {
 
 /// Builds the segments; returns `(segment dirs, docs, tokens, dim)`.
 fn build(corpus: &Path, work: &Path, segment_docs: usize) -> (Vec<PathBuf>, usize, usize, usize) {
-    let _ = std::fs::remove_dir_all(work);
     let mut dirs = Vec::new();
     let mut writer: Option<SegmentWriter> = None;
     let (mut docs, mut tokens, mut in_segment) = (0usize, 0usize, 0usize);
