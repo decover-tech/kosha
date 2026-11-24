@@ -11,6 +11,8 @@ Subcommands
 replay   Trace + file sizes -> hit ratio, GETs, bytes, $ per policy and size.
 logcost  Price what archived server logs say searches actually fetched
          (``search timing:`` lines): today's measured cost, no simulation.
+arm      Summarize latency, S3 work, and local GiB-hours for one archived
+         timed benchmark run, excluding its unmeasured warm fill.
 p99ci    Bootstrap confidence intervals for p99 (and p50) latency of two bench
          arms from query_bench.py ``--raw-out`` files, and for their
          difference: decides whether a bounded arm is "within noise".
@@ -77,6 +79,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import csv
 import gzip
 import json
 import math
@@ -84,6 +87,7 @@ import random
 import re
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 
 CLASSES = ("scoring", "postings", "docstore", "vectors")
 
@@ -610,6 +614,8 @@ def run_replay(queries: list, capacities: list, policies: list, c: Costs, train_
 
 TIMING_RE = re.compile(r"search timing: (.*)$")
 KV_RE = re.compile(r"(\w+)=(\S+)")
+GET_COUNTERS = ("hydrate_files", "page_gets", "page_whole_files", "postings_gets",
+                "vector_gets", "vector_whole_files")
 
 
 def parse_timing_lines(path: str) -> list:
@@ -639,17 +645,7 @@ def run_logcost(rows: list, c: Costs, duration: float | None) -> dict:
     with_s3 = 0
     totals = []
     for kv in rows:
-        g = sum(
-            _num(kv, k)
-            for k in (
-                "hydrate_files",
-                "page_gets",
-                "page_whole_files",
-                "postings_gets",
-                "vector_gets",
-                "vector_whole_files",
-            )
-        )
+        g = sum(_num(kv, k) for k in GET_COUNTERS)
         gets += g
         bytes_ += _num(kv, "s3_bytes")
         with_s3 += g > 0
@@ -740,6 +736,105 @@ def run_p99ci(a_paths: list, b_paths: list, iters: int, seed: int) -> dict:
     for name, p in (("p50", 0.50), ("p99", 0.99)):
         out[name] = bootstrap_ci(a, b if b_paths else None, p, iters, seed)
     return out
+
+
+# ---------------------------------------------------------------------------
+# arm: measured storage costs and latency from a timed benchmark artifact
+
+
+def footprint_byte_seconds(samples: list, start: tuple, end: tuple) -> float:
+    """Integrate with linear interpolation, using samples inside this phase only."""
+    points = [start, *(p for p in samples if start[0] < p[0] < end[0]), end]
+    return sum((t1 - t0) * (b0 + b1) / 2
+               for (t0, b0), (t1, b1) in zip(points, points[1:]))
+
+
+def run_arm(run_dir: Path, c: Costs) -> dict:
+    meta = json.loads((run_dir / "meta.json").read_text())
+    suite = meta["suite"]
+    if meta["warm_gate"] != "timed" or suite not in ("bm25", "vector"):
+        raise ValueError("expected a timed benchmark with suite=bm25 or vector")
+    repeats = int(meta["phase_repeats"])
+    if not 1 <= repeats <= 5:
+        raise ValueError("phase_repeats must be in [1, 5]")
+    prefix = "warm_or_nocache" if suite == "bm25" else "knn_warm_nocache"
+    labels = [f"{prefix}_r{i}" for i in range(1, repeats + 1)]
+    suite_dir = run_dir / suite
+    with (suite_dir / "footprint.tsv").open() as f:
+        samples = [(float(t), int(b)) for t, b in csv.reader(f, delimiter="\t")]
+    if (any(not math.isfinite(t) or b < 0 for t, b in samples)
+            or any(a[0] >= b[0] for a, b in zip(samples, samples[1:]))):
+        raise ValueError("invalid or out-of-order footprint samples")
+    with (suite_dir / "phase_footprint.tsv").open() as f:
+        windows = list(csv.DictReader(f, delimiter="\t"))
+    if [w.get("phase") for w in windows] != labels:
+        raise ValueError("phase_footprint.tsv does not match the expected measured repeats")
+
+    phases, pooled, prev_end = [], [], -math.inf
+    for label, w in zip(labels, windows):
+        try:
+            start = float(w["start_s"]), int(w["start_bytes"])
+            end = float(w["end_s"]), int(w["end_bytes"])
+        except (KeyError, TypeError, ValueError) as e:
+            raise ValueError(f"{label}: missing or invalid phase footprint boundary") from e
+        if not (math.isfinite(start[0]) and math.isfinite(end[0])
+                and prev_end <= start[0] < end[0] and min(start[1], end[1]) >= 0):
+            raise ValueError(f"{label}: invalid phase footprint window")
+        prev_end = end[0]
+        occupancy = footprint_byte_seconds(samples, start, end)
+        summary = json.loads((suite_dir / f"{label}.json").read_text())
+        latencies, errors = load_latencies([str(suite_dir / f"{label}.requests.jsonl.gz")])
+        requests = summary["requests"]
+        if (not latencies or not all(math.isfinite(v) and v >= 0 for v in latencies)
+                or (len(latencies), errors, len(latencies) + errors)
+                != (summary["successes"], summary["errors"], requests)):
+            raise ValueError(f"{label}: missing or invalid client request records")
+        rows = parse_timing_lines(str(suite_dir / "server" / f"{label}.log.gz"))
+        if not len(latencies) <= len(rows) <= requests:
+            raise ValueError(f"{label}: expected {len(latencies)} to {requests} server search timings, got {len(rows)}")
+        counters = (row.get(k, "") for row in rows for k in (*GET_COUNTERS, "s3_bytes"))
+        if any(not (v.isascii() and v.isdecimal()) for v in counters):
+            raise ValueError(f"{label}: missing or invalid S3 counters in server search timings")
+        s3 = run_logcost(rows, c, None)
+        pooled.extend(latencies)
+        phases.append({
+            "phase": label,
+            "duration_s": end[0] - start[0],
+            "requests": requests,
+            "errors": errors,
+            "knn_degraded_requests": summary["knn_degraded_requests"],
+            "logged_searches": s3["searches"],
+            "s3_gets": s3["gets"],
+            "s3_gib": s3["s3_gb"],
+            "s3_dollars": s3["s3_dollars"],
+            "local_gib_hours": occupancy / (1 << 30) / 3600,
+            "local_dollars": occupancy * c.nvme_per_byte_s(),
+            "end_local_bytes": end[1],
+            "p99_ms": pctl(sorted(latencies), 0.99),
+        })
+
+    totals = {k: sum(p[k] for p in phases) for k in phases[0]
+              if k not in ("phase", "end_local_bytes", "p99_ms")}
+    n, seconds = totals["requests"], totals["duration_s"]
+    total_dollars = totals["s3_dollars"] + totals["local_dollars"]
+    pooled.sort()
+    return {
+        "run": meta,
+        "phases": phases,
+        "totals": totals | {
+            "p50_ms": pctl(pooled, 0.50),
+            "p90_ms": pctl(pooled, 0.90),
+            "p99_ms": pctl(pooled, 0.99),
+            "gets_per_query": totals["s3_gets"] / n,
+            "s3_bytes_per_query": totals["s3_gib"] * (1 << 30) / n,
+            "mean_local_bytes": totals["local_gib_hours"] * (1 << 30) * 3600 / seconds,
+            "end_local_bytes": phases[-1]["end_local_bytes"],
+            "total_dollars": total_dollars,
+            "dollars_per_1k_queries": total_dollars * 1000 / n,
+        },
+        "prices": {"get_per_1k": c.get_per_1k, "transfer_per_gib": c.transfer_per_gb,
+                   "local_gib_month": c.nvme_gb_month, "hours_per_month": c.hours_per_month},
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -858,6 +953,13 @@ def main(argv=None) -> int:
     lc.add_argument("--json")
     add_cost_args(lc)
 
+    arm = sub.add_parser("arm", help="report measured cost, footprint and latency for a timed run")
+    arm.add_argument("--run-dir", type=Path, required=True,
+                     help="unpacked bench-results directory (contains meta.json)")
+    arm.add_argument("--get-per-1k", type=float, default=Costs.get_per_1k)
+    arm.add_argument("--transfer-per-gb", type=float, default=Costs.transfer_per_gb)
+    arm.add_argument("--nvme-gb-month", type=float, default=Costs.nvme_gb_month)
+
     s = sub.add_parser("synth", help="write a synthetic trace + sizes (testing only)")
     s.add_argument("--trace-out", required=True)
     s.add_argument("--sizes-out", required=True)
@@ -896,6 +998,17 @@ def main(argv=None) -> int:
         if args.json:
             with open(args.json, "w") as f:
                 json.dump(out, f, indent=2)
+        return 0
+
+    if args.cmd == "arm":
+        prices = {k: getattr(args, k) for k in ("get_per_1k", "transfer_per_gb", "nvme_gb_month")}
+        if not all(math.isfinite(p) and p >= 0 for p in prices.values()):
+            arm.error("prices must be finite and nonnegative")
+        try:
+            out = run_arm(args.run_dir, Costs(**prices))
+        except (OSError, KeyError, TypeError, ValueError) as e:
+            arm.error(str(e))
+        print(json.dumps(out, indent=2))
         return 0
 
     c = costs_from(args)
