@@ -4,10 +4,13 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use kosha_core::{Bm25Params, DocumentId, Field, SegmentId, VectorQuantization};
+use kosha_core::{
+    Bm25Params, DocumentId, Field, SegmentId, VectorQuantization, VectorRadiusReference,
+};
 use kosha_segment::{
-    SegmentReader, SegmentWriter, VectorIndexBuild, VectorQuantizationConfig, VectorSeedPosting,
-    I8_VECTOR_INDEX_VERSION, LIRE_ADOPT_MIN_VECTORS, RADIUS_AWARE_VECTOR_INDEX_VERSION,
+    SegmentReader, SegmentWriter, VectorIndexBuild, VectorQuantizationConfig, VectorRebuildReason,
+    VectorRebuildTrigger, VectorSeedPosting, I8_VECTOR_INDEX_VERSION, LIRE_ADOPT_MIN_VECTORS,
+    RADIUS_AWARE_VECTOR_INDEX_VERSION,
 };
 
 const DIM: usize = 16;
@@ -105,7 +108,7 @@ fn seeds_from(dir: &Path, map: impl Fn(u32) -> Option<u32>) -> Vec<VectorSeedPos
             let doc_seqs: Vec<u32> = p.doc_seqs.into_iter().filter_map(&map).collect();
             VectorSeedPosting {
                 centroid: p.centroid,
-                dropped: doc_seqs.len() != before,
+                dropped: before - doc_seqs.len(),
                 doc_seqs,
             }
         })
@@ -169,7 +172,7 @@ fn seeded_merge_keeps_untouched_postings_and_covers_every_vector() {
         new_seq[old as usize] = Some(seq as u32);
     }
     let seeds = seeds_from(&input, |d| new_seq[d as usize]);
-    let dropped_postings = seeds.iter().filter(|s| s.dropped).count();
+    let dropped_postings = seeds.iter().filter(|s| s.dropped > 0).count();
     let output = temp_dir("output");
     let ids: Vec<u64> = kept.iter().copied().chain(n..n + 5).collect();
     let builds = write(&output, ids.clone(), VectorQuantization::F32, seeds);
@@ -343,4 +346,275 @@ fn seeds_naming_unknown_or_duplicate_doc_seqs_are_tolerated() {
 #[test]
 fn adopt_threshold_is_eight_default_postings() {
     assert_eq!(LIRE_ADOPT_MIN_VECTORS, 1024);
+}
+
+// ─── Staleness signals and rebuild trigger (#464) ───────────────────────────
+
+/// [`write`] with an explicit rebuild trigger and seeds carrying
+/// `reference`; also returns the output's `emb` column metadata.
+fn write_triggered(
+    dir: &Path,
+    ids: impl IntoIterator<Item = u64>,
+    seeds: Vec<VectorSeedPosting>,
+    reference: Option<VectorRadiusReference>,
+    trigger: VectorRebuildTrigger,
+) -> (VectorIndexBuild, kosha_core::VectorFieldMeta) {
+    let mut w = SegmentWriter::new(SegmentId("lire".into()), dir.to_path_buf())
+        .with_vector_quantization(VectorQuantizationConfig::all(VectorQuantization::F32))
+        .with_vector_rebuild_trigger(trigger);
+    for i in ids {
+        let (id, fields) = doc(i);
+        w.add_document(id, fields);
+    }
+    w.seed_vector_postings_with_reference("emb", seeds, reference);
+    let builds = w.vector_index_builds();
+    let footer = w.finalize(Bm25Params::default()).unwrap();
+    let build = builds.lock().unwrap()[0].clone();
+    let meta = footer.vector_fields.unwrap().remove(0);
+    (build, meta)
+}
+
+/// A 3,000-doc input, then the ids kept by dropping every doc `keep`
+/// rejects and the input's postings as seeds remapped onto them.
+fn merge_input(name: &str, keep: impl Fn(u64) -> bool) -> (Vec<u64>, Vec<VectorSeedPosting>) {
+    let input = temp_dir(name);
+    let n = 3_000u64;
+    write(&input, 0..n, VectorQuantization::F32, Vec::new());
+    let kept: Vec<u64> = (0..n).filter(|&i| keep(i)).collect();
+    let mut new_seq = vec![None; n as usize];
+    for (seq, &old) in kept.iter().enumerate() {
+        new_seq[old as usize] = Some(seq as u32);
+    }
+    let seeds = seeds_from(&input, |d| new_seq[d as usize]);
+    (kept, seeds)
+}
+
+fn assert_every_doc_finds_itself(dir: &Path, ids: &[u64]) {
+    assert_eq!(
+        layout_doc_seqs(dir),
+        (0..ids.len() as u32).collect::<Vec<_>>()
+    );
+    let reader = SegmentReader::open(dir.to_path_buf()).unwrap();
+    for (seq, &i) in ids.iter().enumerate().step_by(97) {
+        let hits = reader.knn_search(&vector(i), 1, 4).unwrap().unwrap();
+        assert_eq!(hits[0].0, seq as u32, "doc {i}");
+    }
+}
+
+#[test]
+fn flushed_column_carries_no_radius_reference() {
+    let dir = temp_dir("flush-ref");
+    let builds = write(&dir, 0..2_000, VectorQuantization::F32, Vec::new());
+    let build = &builds[0];
+    assert!(!build.lire && build.rebuild.is_none());
+    let reference = build
+        .radius_reference
+        .expect("a fresh build profiles itself");
+    assert_eq!(reference.vectors, 2_000);
+    assert!(
+        reference.p50 > 0.0 && reference.p50 <= reference.p90,
+        "{reference:?}"
+    );
+    let reader = SegmentReader::open(dir).unwrap();
+    let meta = &reader.footer().vector_fields.as_ref().unwrap()[0];
+    assert_eq!(meta.radius_reference, None);
+
+    // A compaction output clustered from scratch (no usable seeds) keeps
+    // its fresh profile as the next merge's baseline.
+    let out = temp_dir("unseeded-compaction-ref");
+    let mut w = SegmentWriter::new(SegmentId("lire".into()), out.clone())
+        .with_vector_radius_reference(true);
+    for i in 0..2_000 {
+        let (id, fields) = doc(i);
+        w.add_document(id, fields);
+    }
+    let footer = w.finalize(Bm25Params::default()).unwrap();
+    let meta = &footer.vector_fields.unwrap()[0];
+    assert_eq!(meta.radius_reference.unwrap().vectors, 2_000);
+}
+
+#[test]
+fn untouched_merge_changes_nothing() {
+    let (ids, seeds) = merge_input("untouched", |_| true);
+    let out = temp_dir("untouched-out");
+    let (build, meta) = write_triggered(&out, ids, seeds, None, VectorRebuildTrigger::default());
+    assert!(build.lire, "{build:?}");
+    assert_eq!(build.tombstone_ratio, 0.0);
+    assert_eq!(build.changed_ratio, 0.0);
+    let inflation = build.radius_inflation.unwrap();
+    assert!((0.99..1.01).contains(&inflation), "{build:?}");
+    assert_eq!(meta.radius_reference, build.radius_reference);
+}
+
+#[test]
+fn seeded_merge_reports_staleness_signals() {
+    // Every 10th doc deleted: 300 of 3,000 seeded members.
+    let (ids, seeds) = merge_input("signals", |i| i % 10 != 3);
+    let out = temp_dir("signals-out");
+    let (build, meta) = write_triggered(
+        &out,
+        ids.clone(),
+        seeds,
+        None,
+        VectorRebuildTrigger::default(),
+    );
+    assert!(build.lire && build.rebuild.is_none(), "{build:?}");
+    assert!((build.tombstone_ratio - 0.1).abs() < 1e-6, "{build:?}");
+    // Deleted docs are odd, so only the odd cluster centres' postings
+    // (about half) lost members.
+    assert!(
+        build.changed_ratio > 0.3 && build.changed_ratio < 0.7,
+        "{build:?}"
+    );
+    // Bootstrapped from the adopted postings: the survivors.
+    let reference = build.radius_reference.unwrap();
+    assert_eq!(reference.vectors, 2_700);
+    let inflation = build.radius_inflation.unwrap();
+    assert!((0.5..2.0).contains(&inflation), "{build:?}");
+    let npa = build.npa_violation_rate.unwrap();
+    assert!((0.0..=1.0).contains(&npa), "{build:?}");
+    assert_eq!(meta.radius_reference, Some(reference));
+    let line = build.to_string();
+    assert!(
+        line.contains("tombstone_ratio=0.100") && line.contains("rebuild=-"),
+        "{line}"
+    );
+    assert_every_doc_finds_itself(&out, &ids);
+}
+
+#[test]
+fn tombstone_ratio_trigger_rebuilds_from_scratch() {
+    // Every 4th doc deleted: a 25% tombstone ratio.
+    let (ids, seeds) = merge_input("tombstones", |i| i % 4 != 1);
+    let out = temp_dir("tombstones-out");
+    let trigger = VectorRebuildTrigger {
+        tombstone_ratio: Some(0.2),
+        ..VectorRebuildTrigger::default()
+    };
+    let (build, meta) = write_triggered(&out, ids.clone(), seeds, None, trigger);
+    assert_eq!(
+        build.rebuild,
+        Some(VectorRebuildReason::Tombstones),
+        "{build:?}"
+    );
+    assert!(!build.lire);
+    assert!((build.tombstone_ratio - 0.25).abs() < 1e-6, "{build:?}");
+    // The output's reference is the fresh build's own profile.
+    let reference = meta.radius_reference.unwrap();
+    assert_eq!(reference.vectors, ids.len() as u32);
+    assert_eq!(reference.p90, build.radius_p90);
+    assert_every_doc_finds_itself(&out, &ids);
+}
+
+#[test]
+fn min_changed_ratio_holds_a_rebuild_back() {
+    let (ids, seeds) = merge_input("min-changed", |i| i % 4 != 1);
+    let out = temp_dir("min-changed-out");
+    let trigger = VectorRebuildTrigger {
+        tombstone_ratio: Some(0.2),
+        min_changed_ratio: 2.0,
+        ..VectorRebuildTrigger::default()
+    };
+    let (build, _) = write_triggered(&out, ids, seeds, None, trigger);
+    assert!(build.lire && build.rebuild.is_none(), "{build:?}");
+}
+
+#[test]
+fn inherited_reference_drives_radius_inflation() {
+    let (ids, seeds) = merge_input("inherited", |_| true);
+    let tight = VectorRadiusReference {
+        p50: 0.001,
+        p90: 0.001,
+        vectors: 3_000,
+    };
+    let out = temp_dir("inherited-kept");
+    let (build, meta) = write_triggered(
+        &out,
+        ids.clone(),
+        seeds.clone(),
+        Some(tight),
+        VectorRebuildTrigger::default(),
+    );
+    assert!(build.lire);
+    assert_eq!(build.radius_reference, Some(tight));
+    assert!(build.radius_inflation.unwrap() > 10.0, "{build:?}");
+    assert_eq!(meta.radius_reference, Some(tight), "carried forward");
+
+    let out = temp_dir("inherited-rebuilt");
+    let trigger = VectorRebuildTrigger {
+        radius_inflation: Some(1.5),
+        ..VectorRebuildTrigger::default()
+    };
+    let (build, meta) = write_triggered(&out, ids.clone(), seeds, Some(tight), trigger);
+    assert_eq!(build.rebuild, Some(VectorRebuildReason::RadiusInflation));
+    assert_ne!(meta.radius_reference, Some(tight), "reset by the rebuild");
+    assert_every_doc_finds_itself(&out, &ids);
+}
+
+#[test]
+fn npa_trigger_fires_at_zero_threshold() {
+    let (ids, seeds) = merge_input("npa", |i| i % 10 != 3);
+    let out = temp_dir("npa-out");
+    let trigger = VectorRebuildTrigger {
+        npa_violation_rate: Some(0.0),
+        ..VectorRebuildTrigger::default()
+    };
+    let (build, _) = write_triggered(&out, ids, seeds, None, trigger);
+    assert_eq!(build.rebuild, Some(VectorRebuildReason::NpaViolations));
+}
+
+#[test]
+fn rebuild_trigger_parses_env_values() {
+    let env = |pairs: &'static [(&'static str, &'static str)]| {
+        move |key: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        }
+    };
+    assert_eq!(
+        VectorRebuildTrigger::parse(env(&[])),
+        VectorRebuildTrigger::default()
+    );
+    let trigger = VectorRebuildTrigger::parse(env(&[
+        ("KOSHA_VECTOR_REBUILD_TOMBSTONE_RATIO", "0.3"),
+        ("KOSHA_VECTOR_REBUILD_RADIUS_INFLATION", " 1.25 "),
+        ("KOSHA_VECTOR_REBUILD_NPA_VIOLATIONS", "off"),
+        ("KOSHA_VECTOR_REBUILD_MIN_CHANGED", "0.1"),
+    ]));
+    assert_eq!(
+        trigger,
+        VectorRebuildTrigger {
+            tombstone_ratio: Some(0.3),
+            radius_inflation: Some(1.25),
+            npa_violation_rate: None,
+            min_changed_ratio: 0.1,
+        }
+    );
+    let bad = VectorRebuildTrigger::parse(env(&[
+        ("KOSHA_VECTOR_REBUILD_TOMBSTONE_RATIO", "-1"),
+        ("KOSHA_VECTOR_REBUILD_RADIUS_INFLATION", "lots"),
+        ("KOSHA_VECTOR_REBUILD_MIN_CHANGED", "NaN"),
+    ]));
+    assert_eq!(bad, VectorRebuildTrigger::default());
+}
+
+#[test]
+fn zero_radius_reference_still_inflates() {
+    let (ids, seeds) = merge_input("zero-ref", |_| true);
+    let zero = VectorRadiusReference {
+        p50: 0.0,
+        p90: 0.0,
+        vectors: 3_000,
+    };
+    let out = temp_dir("zero-ref-out");
+    let trigger = VectorRebuildTrigger {
+        radius_inflation: Some(1.5),
+        ..VectorRebuildTrigger::default()
+    };
+    let (build, meta) = write_triggered(&out, ids, seeds, Some(zero), trigger);
+    assert_eq!(build.radius_inflation, Some(f32::INFINITY), "{build:?}");
+    assert_eq!(build.rebuild, Some(VectorRebuildReason::RadiusInflation));
+    assert!(meta.radius_reference.unwrap().p90 > 0.0);
 }

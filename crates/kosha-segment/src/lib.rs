@@ -18,7 +18,7 @@ use kosha_core::{
     build_filter_blooms, build_term_bloom, AggBucket, AggBucketResult, AggMetricResult,
     AggregationResults, Bm25Params, DocRecord, DocSet, DocumentId, Field, FieldType, FilterClause,
     FilterStore, Footer, KoshaError, LocalStorage, Posting, SegmentId, StorageBackend,
-    VectorFieldMeta, VectorQuantization, VectorStore,
+    VectorFieldMeta, VectorQuantization, VectorRadiusReference, VectorStore,
 };
 use kosha_core::{AnalysisConfig, AnalyzerSpec, SegmentAnalysis};
 
@@ -140,7 +140,13 @@ pub struct SegmentWriter {
     /// Postings of compaction inputs to seed each vector column's index
     /// from, by field name, one group per input (#253). See
     /// [`Self::seed_vector_postings`].
-    vector_seeds: HashMap<String, Vec<Vec<VectorSeedPosting>>>,
+    vector_seeds: HashMap<String, Vec<SeedGroup>>,
+    /// When a seeded column is rebuilt from scratch instead (#464). See
+    /// [`VectorRebuildTrigger`].
+    vector_rebuild_trigger: VectorRebuildTrigger,
+    /// Persist each clustered column's radius reference even without
+    /// seeds. See [`Self::with_vector_radius_reference`].
+    record_radius_reference: bool,
     /// How each column's index was built by `finalize`, for tests and
     /// diagnostics. See [`VectorIndexBuild`].
     vector_index_builds: Arc<Mutex<Vec<VectorIndexBuild>>>,
@@ -267,6 +273,8 @@ impl SegmentWriter {
             vector_quantization: VectorQuantizationConfig::from_env().clone(),
             doc_vector_entries: Vec::new(),
             vector_seeds: HashMap::new(),
+            vector_rebuild_trigger: VectorRebuildTrigger::from_env(),
+            record_radius_reference: false,
             vector_index_builds: Arc::new(Mutex::new(Vec::new())),
             profile_vector_compaction: false,
             default_analyzer: Analyzer::new(&AnalyzerSpec::legacy()),
@@ -453,10 +461,45 @@ impl SegmentWriter {
         field: &str,
         postings: impl IntoIterator<Item = VectorSeedPosting>,
     ) {
+        self.seed_vector_postings_with_reference(field, postings, None);
+    }
+
+    /// [`Self::seed_vector_postings`], plus the radius reference the
+    /// input's column carried (`VectorFieldMeta::radius_reference`, #464).
+    /// If this input's postings are adopted, the output column inherits
+    /// the reference, so radius inflation is measured against the last
+    /// from-scratch build rather than against the previous compaction.
+    pub fn seed_vector_postings_with_reference(
+        &mut self,
+        field: &str,
+        postings: impl IntoIterator<Item = VectorSeedPosting>,
+        reference: Option<VectorRadiusReference>,
+    ) {
         self.vector_seeds
             .entry(field.to_string())
             .or_default()
-            .push(postings.into_iter().collect());
+            .push(SeedGroup {
+                postings: postings.into_iter().collect(),
+                reference,
+            });
+    }
+
+    /// Override when seeded vector columns are rebuilt from scratch
+    /// (#464). Production writers use `KOSHA_VECTOR_REBUILD_*`; see
+    /// [`VectorRebuildTrigger`].
+    pub fn with_vector_rebuild_trigger(mut self, trigger: VectorRebuildTrigger) -> Self {
+        self.vector_rebuild_trigger = trigger;
+        self
+    }
+
+    /// Write `VectorFieldMeta::radius_reference` for every clustered
+    /// column, seeded or not (#464). Compaction sets it, so an output
+    /// clustered from scratch (no input big enough to seed from, or
+    /// `KOSHA_VECTOR_COMPACTION=rebuild`) is the baseline its next LIRE
+    /// merge measures against. Seeded columns always write one.
+    pub fn with_vector_radius_reference(mut self, record: bool) -> Self {
+        self.record_radius_reference = record;
+        self
     }
 
     /// A handle to how `finalize` built each vector column's index — read
@@ -575,7 +618,7 @@ impl SegmentWriter {
             seeds.push(VectorSeedPosting {
                 centroid: posting.centroid,
                 doc_seqs: (first..first + members.len() as u32).collect(),
-                dropped: false,
+                dropped: 0,
             });
         }
         order.extend(rest);
@@ -1313,6 +1356,7 @@ impl SegmentWriter {
                 quantization: VectorQuantization::F32,
                 embedding_model: self.embedding_models.get(&column.name).cloned(),
                 knn_segment_centroid: None,
+                radius_reference: None,
             };
             self.backend.write(&meta.idx_file(), &buf)?;
             metas.push(meta);
@@ -1350,6 +1394,15 @@ impl SegmentWriter {
                 }
                 VectorQuantization::F32
             };
+            let seeds = self.vector_seeds.get(&column.name);
+            let (idx_bytes, offsets_bytes, build) = Self::encode_vector_column(
+                &column.vectors,
+                seeds,
+                quantization,
+                write_version,
+                self.vector_rebuild_trigger,
+                self.profile_vector_compaction,
+            )?;
             let meta = VectorFieldMeta {
                 name: column.name.clone(),
                 dim: column.dim as u32,
@@ -1362,15 +1415,12 @@ impl SegmentWriter {
                     .knn_segment_summaries
                     .then(|| coarse_vector_centroid(column))
                     .flatten(),
+                // Compaction outputs only: a flush segment's footer stays
+                // as it was before #464.
+                radius_reference: (self.record_radius_reference || seeds.is_some())
+                    .then_some(build.radius_reference)
+                    .flatten(),
             };
-            let seeds = self.vector_seeds.get(&column.name);
-            let (idx_bytes, offsets_bytes, build) = Self::encode_vector_column(
-                &column.vectors,
-                seeds,
-                quantization,
-                write_version,
-                self.profile_vector_compaction,
-            )?;
             self.vector_index_builds
                 .lock()
                 .unwrap()
@@ -1390,12 +1440,14 @@ impl SegmentWriter {
     /// dimension (`buffer_vector` guarantees it). With `seeds`, the index
     /// is seeded from them and repaired by LIRE when they cover enough of
     /// the column (see [`Self::seed_vector_postings`]); otherwise it is
-    /// clustered from scratch.
+    /// clustered from scratch. A seeded column whose staleness signals
+    /// cross `trigger` is clustered from scratch after all (#464).
     fn encode_vector_column(
         column: &[(u32, Vec<f32>)],
-        seeds: Option<&Vec<Vec<VectorSeedPosting>>>,
+        seeds: Option<&Vec<SeedGroup>>,
         quantization: VectorQuantization,
         write_version: u32,
+        trigger: VectorRebuildTrigger,
         profile_compaction: bool,
     ) -> Result<(Vec<u8>, Vec<u8>, VectorIndexBuild), KoshaError> {
         let dim = column[0].1.len();
@@ -1425,23 +1477,47 @@ impl SegmentWriter {
             Some(seeds) if !seeds.is_empty() => seed_cluster_index(vectors, seeds, config.clone()),
             _ => None,
         };
-        let (index, mut build) = match seeded {
-            Some(seeded) => seeded,
+        let build_from_scratch = |config| {
+            kosha_vector_spfresh::ClusterIndex::build(vectors, config).map_err(|e| {
+                // A real ClusterIndex::build failure here (practically
+                // always DimensionMismatch — inconsistent vector
+                // dimensionality across documents in the same
+                // segment) means the legacy writer above would have
+                // silently written ragged, unparseable bytes instead.
+                // Fail loud rather than emit a corrupt vector.idx.
+                KoshaError::CorruptSegment(format!("failed to build vector index: {e}"))
+            })
+        };
+        let (mut postings, mut build) = match seeded {
+            Some((index, mut build)) => {
+                let postings = index.snapshot();
+                build.measure_staleness(&postings, vectors.len());
+                match trigger.evaluate(&build) {
+                    None => (postings, build),
+                    Some(reason) => {
+                        let postings = build_from_scratch(config)?.snapshot();
+                        let fresh = radius_profile(&postings, vectors.len());
+                        build.lire = false;
+                        build.rebuild = Some(reason);
+                        build.radius_p50 = fresh.p50;
+                        build.radius_p90 = fresh.p90;
+                        build.radius_reference = Some(fresh);
+                        (postings, build)
+                    }
+                }
+            }
             None => {
-                let index =
-                    kosha_vector_spfresh::ClusterIndex::build(vectors, config).map_err(|e| {
-                        // A real ClusterIndex::build failure here (practically
-                        // always DimensionMismatch — inconsistent vector
-                        // dimensionality across documents in the same
-                        // segment) means the legacy writer above would have
-                        // silently written ragged, unparseable bytes instead.
-                        // Fail loud rather than emit a corrupt vector.idx.
-                        KoshaError::CorruptSegment(format!("failed to build vector index: {e}"))
-                    })?;
-                (index, VectorIndexBuild::default())
+                let postings = build_from_scratch(config)?.snapshot();
+                let fresh = radius_profile(&postings, vectors.len());
+                let build = VectorIndexBuild {
+                    radius_p50: fresh.p50,
+                    radius_p90: fresh.p90,
+                    radius_reference: Some(fresh),
+                    ..VectorIndexBuild::default()
+                };
+                (postings, build)
             }
         };
-        let mut postings = index.snapshot();
         build.postings = postings.len();
         build.imbalance_factor = kosha_vector_spfresh::posting_imbalance_factor(
             postings.iter().map(|p| p.entries.len()),
@@ -1622,9 +1698,19 @@ pub struct VectorSeedPosting {
     pub centroid: Vec<f32>,
     /// Its members that survive into the output, as output doc_seqs.
     pub doc_seqs: Vec<u32>,
-    /// Whether any member was dropped (deleted or tombstoned) on the way:
-    /// the centroid is then recomputed from the survivors.
-    pub dropped: bool,
+    /// How many members were dropped (deleted or tombstoned) on the way.
+    /// Non-zero: the centroid is recomputed from the survivors. The sum
+    /// over a column's seeds is its tombstone ratio's numerator (#464).
+    pub dropped: usize,
+}
+
+/// One compaction input's seeds for a column, with the radius reference
+/// its column carried (see
+/// [`SegmentWriter::seed_vector_postings_with_reference`]).
+#[derive(Debug, Clone, PartialEq)]
+struct SeedGroup {
+    postings: Vec<VectorSeedPosting>,
+    reference: Option<VectorRadiusReference>,
 }
 
 /// [`SegmentWriter::posting_order`]'s result (#456).
@@ -1661,6 +1747,36 @@ pub struct VectorIndexBuild {
     pub rewrite_profile: Option<VectorPostingRewriteProfile>,
     /// Faiss imbalance factor over the posting sizes written for this field.
     pub imbalance_factor: f64,
+    /// Staleness signals of a seeded build (#464); zero / `None` for a
+    /// column clustered from scratch without seeds.
+    ///
+    /// Share of the seeds' members dropped on the way (deleted,
+    /// tombstoned, or upserted away).
+    pub tombstone_ratio: f32,
+    /// Share of the column's vectors not in an untouched posting of the
+    /// adopted input: everything absorbed, inserted, or in a posting that
+    /// lost members. O'Neil's batch-merge M, the fraction a merge changed.
+    pub changed_ratio: f32,
+    /// Median and p90 posting radius (cosine distance to the centroid) of
+    /// the index LIRE produced, or of the from-scratch build that replaced
+    /// it.
+    pub radius_p50: f32,
+    pub radius_p90: f32,
+    /// What the radii are compared with: inherited from the adopted
+    /// input's column, else measured on the adopted postings themselves.
+    /// For a from-scratch build, its own profile. Persisted as
+    /// `VectorFieldMeta::radius_reference`.
+    pub radius_reference: Option<VectorRadiusReference>,
+    /// `radius_p90 / radius_reference.p90` of the LIRE-produced index.
+    pub radius_inflation: Option<f32>,
+    /// Share of sampled vectors (up to [`NPA_SAMPLE`]) with a nearer
+    /// centroid than their own posting's: the nearest-partition-assignment
+    /// property LIRE's reassign maintains, measured after the build.
+    pub npa_violation_rate: Option<f32>,
+    /// Set when the seeded build was discarded and the column clustered
+    /// from scratch; the signals above are the discarded build's (radii
+    /// excepted).
+    pub rebuild: Option<VectorRebuildReason>,
 }
 
 /// #463 baseline: unchanged membership is not proof of byte-for-byte reuse.
@@ -1682,15 +1798,15 @@ pub struct VectorPostingRewriteProfile {
 
 impl VectorPostingRewriteProfile {
     fn measure(
-        seeds: &[Vec<VectorSeedPosting>],
+        seeds: &[SeedGroup],
         postings: &[kosha_vector_spfresh::PostingSnapshot],
         entry_bytes: usize,
         index_bytes_written: usize,
     ) -> Self {
         let inputs: HashSet<Vec<u32>> = seeds
             .iter()
-            .flatten()
-            .filter(|p| !p.dropped && !p.doc_seqs.is_empty())
+            .flat_map(|g| &g.postings)
+            .filter(|p| p.dropped == 0 && !p.doc_seqs.is_empty())
             .map(|p| {
                 let mut members = p.doc_seqs.clone();
                 members.sort_unstable();
@@ -1710,13 +1826,211 @@ impl VectorPostingRewriteProfile {
         }
         let membership_unchanged_payload_bytes = unchanged_entries * entry_bytes;
         Self {
-            input_postings_examined: seeds.iter().map(Vec::len).sum(),
+            input_postings_examined: seeds.iter().map(|g| g.postings.len()).sum(),
             output_postings: postings.len(),
             membership_unchanged_postings,
             index_bytes_written,
             membership_unchanged_payload_bytes,
             membership_changed_bytes_estimate: index_bytes_written
                 - membership_unchanged_payload_bytes,
+        }
+    }
+}
+
+impl VectorIndexBuild {
+    fn measure_staleness(
+        &mut self,
+        postings: &[kosha_vector_spfresh::PostingSnapshot],
+        vectors: usize,
+    ) {
+        let profile = radius_profile(postings, vectors);
+        self.radius_p50 = profile.p50;
+        self.radius_p90 = profile.p90;
+        // A zero baseline (every posting's members on its centroid) is
+        // inflated by any spread at all.
+        self.radius_inflation =
+            self.radius_reference
+                .map(|r| match (r.p90 > 0.0, profile.p90 > 0.0) {
+                    (true, _) => profile.p90 / r.p90,
+                    (false, true) => f32::INFINITY,
+                    (false, false) => 1.0,
+                });
+        self.npa_violation_rate = sampled_npa_violation_rate(postings);
+    }
+}
+
+impl std::fmt::Display for VectorIndexBuild {
+    /// One line of the signals, for compaction logs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let opt = |v: Option<f32>| v.map_or_else(|| "-".to_string(), |v| format!("{v:.3}"));
+        write!(
+            f,
+            "lire={} rebuild={} postings={} tombstone_ratio={:.3} changed_ratio={:.3} \
+             radius_p50={:.4} radius_p90={:.4} radius_inflation={} npa_violation_rate={}",
+            self.lire,
+            self.rebuild.map_or("-", VectorRebuildReason::as_str),
+            self.postings,
+            self.tombstone_ratio,
+            self.changed_ratio,
+            self.radius_p50,
+            self.radius_p90,
+            opt(self.radius_inflation),
+            opt(self.npa_violation_rate),
+        )
+    }
+}
+
+/// Vectors [`VectorIndexBuild::npa_violation_rate`] checks: every
+/// `n / NPA_SAMPLE`-th in posting order, each against every centroid.
+pub const NPA_SAMPLE: usize = 256;
+
+/// A nearer centroid must be nearer by more than this to count as a
+/// violation, so float noise between equidistant centroids does not.
+const NPA_TOLERANCE: f32 = 1e-6;
+
+fn sampled_npa_violation_rate(postings: &[kosha_vector_spfresh::PostingSnapshot]) -> Option<f32> {
+    use kosha_vector_spfresh::cosine_distance;
+    let total: usize = postings.iter().map(|p| p.entries.len()).sum();
+    if total == 0 {
+        return None;
+    }
+    let stride = total.div_ceil(NPA_SAMPLE);
+    let (mut sampled, mut violations, mut i) = (0usize, 0usize, 0usize);
+    for (own, posting) in postings.iter().enumerate() {
+        for (_, v) in &posting.entries {
+            if i % stride == 0 {
+                let d = cosine_distance(&posting.centroid, v) - NPA_TOLERANCE;
+                sampled += 1;
+                violations += postings
+                    .iter()
+                    .enumerate()
+                    .any(|(q, other)| q != own && cosine_distance(&other.centroid, v) < d)
+                    as usize;
+            }
+            i += 1;
+        }
+    }
+    Some(violations as f32 / sampled as f32)
+}
+
+/// Median and p90 of the postings' radii, recomputed from their entries
+/// (a snapshot's own `radius` predates the unit-norm renormalization).
+fn radius_profile(
+    postings: &[kosha_vector_spfresh::PostingSnapshot],
+    vectors: usize,
+) -> VectorRadiusReference {
+    let mut radii: Vec<f32> = postings
+        .iter()
+        .filter(|p| !p.entries.is_empty())
+        .map(|p| {
+            p.entries
+                .iter()
+                .map(|(_, v)| kosha_vector_spfresh::cosine_distance(&p.centroid, v))
+                .fold(0.0f32, f32::max)
+        })
+        .collect();
+    radii.sort_by(f32::total_cmp);
+    let quantile = |q: f64| {
+        if radii.is_empty() {
+            0.0
+        } else {
+            radii[((radii.len() - 1) as f64 * q).round() as usize]
+        }
+    };
+    VectorRadiusReference {
+        p50: quantile(0.5),
+        p90: quantile(0.9),
+        vectors: vectors as u32,
+    }
+}
+
+/// When compaction discards a column's LIRE-repaired index and clusters
+/// the column from scratch (#464). LIRE keeps postings balanced but lets
+/// partitions drift from where a fresh k-means would put them; each
+/// threshold here names one sign of that drift. `None` disables it; all
+/// `None` (the default) is the pre-#464 behaviour, LIRE always kept.
+///
+/// `KOSHA_VECTOR_REBUILD_TOMBSTONE_RATIO`,
+/// `KOSHA_VECTOR_REBUILD_RADIUS_INFLATION`,
+/// `KOSHA_VECTOR_REBUILD_NPA_VIOLATIONS`: rebuild when the
+/// [`VectorIndexBuild`] signal of that name is at or above the value.
+/// `KOSHA_VECTOR_REBUILD_MIN_CHANGED` (default `0`): rebuild only when at
+/// least this share of the column changed in this compaction, so a merge
+/// that rewrote little of a stale column does not pay for a full rebuild.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct VectorRebuildTrigger {
+    pub tombstone_ratio: Option<f32>,
+    pub radius_inflation: Option<f32>,
+    pub npa_violation_rate: Option<f32>,
+    pub min_changed_ratio: f32,
+}
+
+/// Which [`VectorRebuildTrigger`] threshold fired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorRebuildReason {
+    Tombstones,
+    RadiusInflation,
+    NpaViolations,
+}
+
+impl VectorRebuildReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tombstones => "tombstones",
+            Self::RadiusInflation => "radius_inflation",
+            Self::NpaViolations => "npa_violations",
+        }
+    }
+}
+
+impl VectorRebuildTrigger {
+    /// `KOSHA_VECTOR_REBUILD_*`, read once.
+    pub fn from_env() -> Self {
+        static TRIGGER: OnceLock<VectorRebuildTrigger> = OnceLock::new();
+        *TRIGGER.get_or_init(|| Self::parse(|key| std::env::var(key).ok()))
+    }
+
+    /// Unset, empty, or `off` disables a threshold; anything else must be
+    /// a non-negative number (warned about and disabled otherwise).
+    pub fn parse(get: impl Fn(&str) -> Option<String>) -> Self {
+        let threshold = |key: &str| {
+            let raw = get(key)?;
+            let raw = raw.trim();
+            if raw.is_empty() || raw.eq_ignore_ascii_case("off") {
+                return None;
+            }
+            match raw.parse::<f32>() {
+                Ok(v) if v.is_finite() && v >= 0.0 => Some(v),
+                _ => {
+                    eprintln!("WARN: {key}={raw} is not a non-negative number — ignoring it");
+                    None
+                }
+            }
+        };
+        Self {
+            tombstone_ratio: threshold("KOSHA_VECTOR_REBUILD_TOMBSTONE_RATIO"),
+            radius_inflation: threshold("KOSHA_VECTOR_REBUILD_RADIUS_INFLATION"),
+            npa_violation_rate: threshold("KOSHA_VECTOR_REBUILD_NPA_VIOLATIONS"),
+            min_changed_ratio: threshold("KOSHA_VECTOR_REBUILD_MIN_CHANGED").unwrap_or(0.0),
+        }
+    }
+
+    /// Whether a seeded `build` (signals measured) should be discarded for
+    /// a from-scratch one, and why. Thresholds are checked in the order of
+    /// the fields.
+    pub fn evaluate(&self, build: &VectorIndexBuild) -> Option<VectorRebuildReason> {
+        if !build.lire || build.changed_ratio < self.min_changed_ratio {
+            return None;
+        }
+        let over = |threshold: Option<f32>, value: Option<f32>| matches!((threshold, value), (Some(t), Some(v)) if v >= t);
+        if over(self.tombstone_ratio, Some(build.tombstone_ratio)) {
+            Some(VectorRebuildReason::Tombstones)
+        } else if over(self.radius_inflation, build.radius_inflation) {
+            Some(VectorRebuildReason::RadiusInflation)
+        } else if over(self.npa_violation_rate, build.npa_violation_rate) {
+            Some(VectorRebuildReason::NpaViolations)
+        } else {
+            None
         }
     }
 }
@@ -1777,20 +2091,26 @@ const LIRE_ABSORB_CANDIDATES: usize = 8;
 /// clusters from scratch.
 fn seed_cluster_index(
     vectors: &[(u32, Vec<f32>)],
-    groups: &[Vec<VectorSeedPosting>],
+    groups: &[SeedGroup],
     config: kosha_vector_spfresh::ClusterIndexConfig,
 ) -> Option<(kosha_vector_spfresh::ClusterIndex, VectorIndexBuild)> {
     use kosha_vector_spfresh::PostingSnapshot;
     let dim = config.dim;
-    if groups.iter().flatten().any(|s| s.centroid.len() != dim) {
+    let seeds = || groups.iter().flat_map(|g| &g.postings);
+    if seeds().any(|s| s.centroid.len() != dim) {
         return None;
     }
+    let dropped: usize = seeds().map(|s| s.dropped).sum();
+    let seeded_members: usize = seeds().map(|s| s.doc_seqs.len()).sum::<usize>() + dropped;
     let position = |doc_seq: u32| vectors.binary_search_by_key(&doc_seq, |(id, _)| *id).ok();
     let mut covered = vec![false; vectors.len()];
     let mut recentred = vec![0usize; groups.len()];
+    // Per input: members in postings kept exactly as they were.
+    let mut intact = vec![0usize; groups.len()];
     // Per input: its non-empty postings, members resolved to vectors.
     let mut snapshots: Vec<Vec<PostingSnapshot>> = Vec::with_capacity(groups.len());
     for (g, seeds) in groups.iter().enumerate() {
+        let seeds = &seeds.postings;
         let mut group = Vec::with_capacity(seeds.len());
         for seed in seeds {
             let mut entries = Vec::with_capacity(seed.doc_seqs.len());
@@ -1807,10 +2127,11 @@ fn seed_cluster_index(
             if entries.is_empty() {
                 continue;
             }
-            let centroid = if seed.dropped || entries.len() != seed.doc_seqs.len() {
+            let centroid = if seed.dropped > 0 || entries.len() != seed.doc_seqs.len() {
                 recentred[g] += 1;
                 kosha_vector_spfresh::mean_vector(entries.iter().map(|(_, v)| v.as_slice()), dim)
             } else {
+                intact[g] += entries.len();
                 seed.centroid.clone()
             };
             group.push(PostingSnapshot {
@@ -1830,11 +2151,21 @@ fn seed_cluster_index(
     // they are absorbed rather than kept side by side.
     let members = |g: &Vec<PostingSnapshot>| g.iter().map(|p| p.entries.len()).sum::<usize>();
     let base = (0..snapshots.len()).max_by_key(|&g| members(&snapshots[g]))?;
+    let reference = groups[base]
+        .reference
+        .unwrap_or_else(|| radius_profile(&snapshots[base], members(&snapshots[base])));
     let mut build = VectorIndexBuild {
         lire: true,
         seeded_postings: snapshots[base].len(),
         recentred_postings: recentred[base],
         inserted_vectors: uncovered.len(),
+        tombstone_ratio: if seeded_members == 0 {
+            0.0
+        } else {
+            dropped as f32 / seeded_members as f32
+        },
+        changed_ratio: 1.0 - intact[base] as f32 / vectors.len() as f32,
+        radius_reference: Some(reference),
         ..VectorIndexBuild::default()
     };
     let adopted = snapshots.swap_remove(base);
@@ -3101,9 +3432,13 @@ mod vector_index_v2_tests {
             doc_seqs,
             dropped,
         };
+        let group = |postings| SeedGroup {
+            postings,
+            reference: None,
+        };
         let seeds = vec![
-            vec![seed(vec![3, 0], false), seed(vec![2], true)],
-            vec![seed(vec![1, 0], false)],
+            group(vec![seed(vec![3, 0], 0), seed(vec![2], 1)]),
+            group(vec![seed(vec![1, 0], 0)]),
         ];
         let postings = sample_postings();
         for version in [RADIUS_AWARE_VECTOR_INDEX_VERSION, I8_VECTOR_INDEX_VERSION] {
@@ -3311,9 +3646,25 @@ mod vector_index_v2_tests {
             ),
         ] {
             let (_, old_offsets, _) =
-                SegmentWriter::encode_vector_column(&column, None, quantization, 4, false).unwrap();
+                SegmentWriter::encode_vector_column(
+                    &column,
+                    None,
+                    quantization,
+                    4,
+                    VectorRebuildTrigger::default(),
+                    false,
+                )
+                .unwrap();
             let (idx, new_offsets, _) =
-                SegmentWriter::encode_vector_column(&column, None, quantization, 5, false).unwrap();
+                SegmentWriter::encode_vector_column(
+                    &column,
+                    None,
+                    quantization,
+                    5,
+                    VectorRebuildTrigger::default(),
+                    false,
+                )
+                .unwrap();
             assert_eq!(parse_vector_idx_header(&idx), Some((2, 2, newer)));
             let old = parse_vector_offsets(&old_offsets, 2, older).unwrap();
             let new = parse_vector_offsets(&new_offsets, 2, newer).unwrap();

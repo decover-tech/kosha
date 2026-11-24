@@ -2495,7 +2495,27 @@ pub struct VectorFieldMeta {
     /// coarse kNN segment selection. Older segments omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knn_segment_centroid: Option<Vec<i8>>,
+    /// Posting radii of the from-scratch build this column's postings
+    /// descend from (#464): what a LIRE compaction measures its radius
+    /// inflation against. Written only by compaction; flush footers and
+    /// every footer written before #464 omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radius_reference: Option<VectorRadiusReference>,
 }
+
+/// Median and p90 posting radius (cosine distance) of a vector index
+/// build, and how many vectors it clustered (#464). Radii shrink as the
+/// same space holds more vectors, so a reference taken at a smaller
+/// `vectors` understates later inflation.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct VectorRadiusReference {
+    pub p50: f32,
+    pub p90: f32,
+    pub vectors: u32,
+}
+
+// Radii are finite cosine distances, never NaN.
+impl Eq for VectorRadiusReference {}
 
 /// Storage of a vector column's ANN posting entries (#210). Centroids and
 /// `doc_vectors.bin` stay `f32` either way.
