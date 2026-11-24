@@ -240,6 +240,9 @@ pub fn canonical_schema_field_type(value: &serde_json::Value) -> Option<&'static
         serde_json::Value::String(t) => {
             let upper = t.trim().to_ascii_uppercase();
             let bare = upper.strip_prefix("FIELD_TYPE_").unwrap_or(&upper);
+            if matches!(bare, "GEO_POINT" | "GEOPOINT") {
+                return Some("FIELD_TYPE_GEO_POINT");
+            }
             SCHEMA_FIELD_TYPES
                 .iter()
                 .copied()

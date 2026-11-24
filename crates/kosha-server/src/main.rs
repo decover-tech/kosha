@@ -8360,6 +8360,7 @@ fn parse_namespace_schema(value: &serde_json::Value) -> Result<serde_json::Value
                     }
                     seen_type = true;
                     field_type = canonical_schema_field_type(v)
+                        .filter(|ty| *ty != "FIELD_TYPE_GEO_POINT")
                         .ok_or_else(|| format!("schema field '{name}' has unknown type {v}"))?;
                 }
                 "indexed" | "stored" => {
@@ -21791,6 +21792,22 @@ mod tests {
             "search response: {search_resp}"
         );
         assert!(search_resp.contains("\"total_hits\":1"));
+    }
+
+    #[test]
+    fn schema_update_accepts_a_geo_point_when_the_namespace_is_empty() {
+        let state = test_state();
+        let response = v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/geo/schema",
+            serde_json::json!({"fields": {"location": {"type": "GEO_POINT"}}}),
+        );
+        assert_eq!(status_of(&response), 200, "{response}");
+        assert_eq!(
+            body_of(&response)["schema"]["fields"]["location"]["type"],
+            "GEO_POINT"
+        );
     }
 
     #[test]
