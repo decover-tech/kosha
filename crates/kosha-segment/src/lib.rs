@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use instant_distance::{Builder, HnswMap, Point, Search};
@@ -5080,6 +5081,68 @@ pub trait PostingsMemoryAccount: Send + Sync {
 
 type SharedAccount = Arc<dyn PostingsMemoryAccount + Send + Sync>;
 
+/// Process-wide figures of one kind of decoded-postings cache, summed over
+/// every cache of that kind (the text caches are per segment), for
+/// `kosha_cache_*` on `GET /metrics`.
+struct PostingsCacheCounters {
+    hits: AtomicU64,
+    misses: AtomicU64,
+    evictions: AtomicU64,
+    bytes: AtomicU64,
+}
+
+impl PostingsCacheCounters {
+    const fn new() -> Self {
+        Self {
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+        }
+    }
+
+    fn snapshot(&self) -> PostingsCacheStats {
+        let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        PostingsCacheStats {
+            hits: load(&self.hits),
+            misses: load(&self.misses),
+            evictions: load(&self.evictions),
+            bytes: load(&self.bytes),
+        }
+    }
+
+    fn release_bytes(&self, bytes: usize) {
+        if bytes > 0 {
+            self.bytes.fetch_sub(bytes as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+static TEXT_POSTINGS_COUNTERS: PostingsCacheCounters = PostingsCacheCounters::new();
+static VECTOR_POSTINGS_COUNTERS: PostingsCacheCounters = PostingsCacheCounters::new();
+
+/// Lookups, budget evictions and resident bytes of one kind of decoded
+/// postings cache since the process started. A hit is a lookup that found
+/// its entry; a miss is one that went on to read and decode the posting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PostingsCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    /// Entries evicted to stay within the cache's byte budget.
+    pub evictions: u64,
+    pub bytes: u64,
+}
+
+/// [`PostingsCacheStats`] of the per-segment text postings caches, summed.
+pub fn text_postings_cache_stats() -> PostingsCacheStats {
+    TEXT_POSTINGS_COUNTERS.snapshot()
+}
+
+/// [`PostingsCacheStats`] of the process-wide vector postings cache.
+pub fn vector_postings_cache_stats() -> PostingsCacheStats {
+    VECTOR_POSTINGS_COUNTERS.snapshot()
+}
+
 /// Small LRU of decoded postings.
 ///
 /// The lazy v2 format trades resident memory for a per-query decode — the
@@ -5113,6 +5176,8 @@ struct PostingsCache<K, V> {
     /// Account for [`Self::insert`]; the shared vector cache has none and
     /// takes each segment's account per entry ([`Self::insert_for`]).
     account: Option<SharedAccount>,
+    /// Where this cache's hits, misses, evictions and bytes are summed.
+    counters: &'static PostingsCacheCounters,
 }
 
 struct CacheEntry<V> {
@@ -5193,7 +5258,11 @@ const POSTINGS_CACHE_MISS_RING: usize = 256;
 const VECTOR_MISS_WINDOW_MAX: usize = 1 << 18;
 
 impl<K: Copy + Eq + std::hash::Hash, V: Clone> PostingsCache<K, V> {
-    fn new(max_bytes: usize, account: Option<SharedAccount>) -> Self {
+    fn new(
+        max_bytes: usize,
+        account: Option<SharedAccount>,
+        counters: &'static PostingsCacheCounters,
+    ) -> Self {
         Self {
             max_bytes,
             state: Box::new(Mutex::new(PostingsCacheState {
@@ -5204,6 +5273,7 @@ impl<K: Copy + Eq + std::hash::Hash, V: Clone> PostingsCache<K, V> {
                 miss_order: StampedFifo::new(),
             })),
             account,
+            counters,
         }
     }
 
@@ -5215,6 +5285,7 @@ impl<K: Copy + Eq + std::hash::Hash, V: Clone> PostingsCache<K, V> {
         let mut guard = self.state.lock().unwrap();
         let st = &mut *guard;
         let entry = st.entries.get_mut(&key)?;
+        self.counters.hits.fetch_add(1, Ordering::Relaxed);
         entry.stamp = st.recency.stamp(key);
         let hit = entry.value.clone();
         let entries = &st.entries;
@@ -5252,6 +5323,7 @@ impl<K: Copy + Eq + std::hash::Hash, V: Clone> PostingsCache<K, V> {
     /// admitted on their second lookup; one-shot ones age out of the
     /// history without disturbing anything.
     fn admit_on_miss_within(&self, key: K, window: usize) -> bool {
+        self.counters.misses.fetch_add(1, Ordering::Relaxed);
         let mut guard = self.state.lock().unwrap();
         let st = &mut *guard;
         if st.misses.remove(&key).is_some() {
@@ -5329,6 +5401,7 @@ impl<K: Copy + Eq + std::hash::Hash, V: Clone> PostingsCache<K, V> {
         // insert can evict many postings, and every kNN worker of every
         // segment waits on this lock.
         let mut gone: Vec<CacheEntry<V>> = Vec::new();
+        let mut evictions = 0u64;
         {
             let mut guard = self.state.lock().unwrap();
             let st = &mut *guard;
@@ -5354,11 +5427,22 @@ impl<K: Copy + Eq + std::hash::Hash, V: Clone> PostingsCache<K, V> {
                 if let Some(evicted) = st.entries.remove(&oldest) {
                     st.total_bytes -= evicted.bytes;
                     gone.push(evicted);
+                    evictions += 1;
                 }
             }
             let entries = &st.entries;
             st.recency
                 .compact(entries.len(), |k| entries.get(k).map(|e| e.stamp));
+        }
+        self.counters
+            .bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        self.counters
+            .release_bytes(gone.iter().map(|entry| entry.bytes).sum());
+        if evictions > 0 {
+            self.counters
+                .evictions
+                .fetch_add(evictions, Ordering::Relaxed);
         }
         release_and_free(gone);
         if let Some(account) = account {
@@ -5388,6 +5472,8 @@ impl<K: Copy + Eq + std::hash::Hash, V: Clone> PostingsCache<K, V> {
                 .compact(entries.len(), |k| entries.get(k).map(|e| e.stamp));
             removed
         };
+        self.counters
+            .release_bytes(removed.iter().map(|entry| entry.bytes).sum());
         release_and_free(removed);
     }
 
@@ -5434,6 +5520,8 @@ impl<K, V> Drop for PostingsCache<K, V> {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             st.entries.drain().map(|(_, entry)| entry).collect()
         };
+        self.counters
+            .release_bytes(gone.iter().map(|entry| entry.bytes).sum());
         release_and_free(gone);
     }
 }
@@ -5525,7 +5613,7 @@ impl LazyInvertedIndex {
         let index = Self {
             data,
             term_count,
-            cache: PostingsCache::new(postings_cache_max_bytes(), account),
+            cache: PostingsCache::new(postings_cache_max_bytes(), account, &TEXT_POSTINGS_COUNTERS),
         };
         for i in 0..term_count {
             let (term_off, term_len, p_off, p_len) = index.raw_entry(i);
@@ -6068,8 +6156,16 @@ impl SplitInvertedIndex {
             segment_dir,
             term_count,
             encoding,
-            cache: PostingsCache::new(postings_cache_max_bytes(), account.clone()),
-            scoring_cache: PostingsCache::new(postings_cache_max_bytes(), account),
+            cache: PostingsCache::new(
+                postings_cache_max_bytes(),
+                account.clone(),
+                &TEXT_POSTINGS_COUNTERS,
+            ),
+            scoring_cache: PostingsCache::new(
+                postings_cache_max_bytes(),
+                account,
+                &TEXT_POSTINGS_COUNTERS,
+            ),
             blob_read_failure: std::sync::atomic::AtomicBool::new(false),
             posting_spans: false,
         };
@@ -7852,9 +7948,13 @@ type VectorPostingsCache = PostingsCache<(u64, usize), SharedVectorPosting>;
 /// The process-wide vector postings cache every [`SegmentReader`] uses.
 fn shared_vector_cache() -> Arc<VectorPostingsCache> {
     static CACHE: OnceLock<Arc<VectorPostingsCache>> = OnceLock::new();
-    Arc::clone(
-        CACHE.get_or_init(|| Arc::new(PostingsCache::new(vector_postings_cache_max_bytes(), None))),
-    )
+    Arc::clone(CACHE.get_or_init(|| {
+        Arc::new(PostingsCache::new(
+            vector_postings_cache_max_bytes(),
+            None,
+            &VECTOR_POSTINGS_COUNTERS,
+        ))
+    }))
 }
 
 /// A new [`SegmentReader::vector_cache_owner`].
@@ -12318,7 +12418,8 @@ mod tests {
 
         // Budget-eviction behavior on the cache itself: two entries whose
         // combined size exceeds the budget can't both stay resident.
-        let cache = PostingsCache::new(100, None);
+        static COUNTERS: PostingsCacheCounters = PostingsCacheCounters::new();
+        let cache = PostingsCache::new(100, None, &COUNTERS);
         let big = Arc::new(vec![Posting {
             doc_id: 1,
             term_frequency: 1,
@@ -12335,6 +12436,18 @@ mod tests {
         // evict everything and still churn).
         cache.insert(2, big, 1000);
         assert!(cache.get(2).is_none());
+        assert!(!cache.admit_on_miss(3));
+        assert_eq!(
+            COUNTERS.snapshot(),
+            PostingsCacheStats {
+                hits: 1,
+                misses: 1,
+                evictions: 1,
+                bytes: 60,
+            }
+        );
+        drop(cache);
+        assert_eq!(COUNTERS.snapshot().bytes, 0);
 
         let _ = fs::remove_dir_all(&dir);
     }
