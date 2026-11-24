@@ -8,86 +8,14 @@
 //! redirects. Without this an admin could point "SSO" at the server's own
 //! network (metadata services, internal admin ports).
 //!
-//! The address rules mirror the export upload guard (#347,
-//! `exports::is_public_ip`); the two are to be merged into one.
+//! The address rules are the export upload guard's
+//! (`public_url::is_public_ip`), so the two cannot drift apart.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::net::{SocketAddr, ToSocketAddrs};
 
-/// Whether `ip` is a public unicast address: not loopback, private,
-/// link-local, CGNAT, multicast, unspecified, broadcast, documentation,
-/// benchmarking, reserved, unique-local or site-local, and, for an IPv6
-/// address that embeds an IPv4 one (IPv4-mapped, IPv4-compatible, NAT64
-/// `64:ff9b::/96` and `64:ff9b:1::/48`, 6to4 `2002::/16`, Teredo
-/// `2001::/32`), not one whose embedded address fails these rules.
-/// Discard-only `100::/64` is refused.
-pub(crate) fn is_public_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => is_public_v4(v4),
-        IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_public_v4(v4);
-            }
-            let s = v6.segments();
-            let v4_at = |hi: u16, lo: u16| {
-                let [a, b] = hi.to_be_bytes();
-                let [c, d] = lo.to_be_bytes();
-                Ipv4Addr::new(a, b, c, d)
-            };
-            // NAT64, well-known (64:ff9b::/96) and local-use (64:ff9b:1::/48).
-            if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
-                return is_public_v4(v4_at(s[6], s[7]));
-            }
-            if s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1 {
-                return false;
-            }
-            // 6to4: the IPv4 address follows the prefix.
-            if s[0] == 0x2002 {
-                return is_public_v4(v4_at(s[1], s[2]));
-            }
-            // Teredo: the client's IPv4 address is the last 32 bits,
-            // inverted; the server's is bits 32-63. Refuse when either is
-            // not public.
-            if s[0] == 0x2001 && s[1] == 0 {
-                let client = v4_at(!s[6], !s[7]);
-                let server = v4_at(s[2], s[3]);
-                return is_public_v4(client) && is_public_v4(server);
-            }
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                // ::/96 IPv4-compatible (deprecated)
-                || s[..6] == [0, 0, 0, 0, 0, 0]
-                // 100::/64 discard-only
-                || s[..4] == [0x100, 0, 0, 0]
-                // fc00::/7 unique local
-                || (s[0] & 0xfe00) == 0xfc00
-                // fe80::/10 link-local, fec0::/10 site-local
-                || (s[0] & 0xffc0) == 0xfe80
-                || (s[0] & 0xffc0) == 0xfec0
-                // 2001:db8::/32 documentation
-                || (s[0] == 0x2001 && s[1] == 0x0db8))
-        }
-    }
-}
-
-fn is_public_v4(v4: Ipv4Addr) -> bool {
-    let [a, b, c, _] = v4.octets();
-    !(v4.is_private()
-        || v4.is_loopback()
-        || v4.is_link_local()
-        || v4.is_unspecified()
-        || v4.is_broadcast()
-        || v4.is_multicast()
-        || v4.is_documentation()
-        || a == 0
-        || a >= 240
-        // 100.64.0.0/10 carrier-grade NAT
-        || (a == 100 && (64..128).contains(&b))
-        // 192.0.0.0/24 IETF protocol assignments
-        || (a == 192 && b == 0 && c == 0)
-        // 198.18.0.0/15 benchmarking
-        || (a == 198 && (b == 18 || b == 19)))
-}
+/// The shared outbound-address guard (#347's `public_url`): one rule set
+/// for every URL the server fetches on a customer's or admin's say-so.
+pub(crate) use crate::public_url::is_public_ip;
 
 /// A URL that passed [`check_url`], with the address to connect to.
 #[derive(Debug, Clone)]
@@ -197,7 +125,9 @@ mod tests {
             assert!(!is_public_ip(blocked.parse().unwrap()), "{blocked}");
         }
         // 6to4 of a public address is public.
-        assert!(is_public_ip("2002:808:808::1".parse().unwrap()));
+        // 6to4 is refused outright, even around a public IPv4 address: the
+        // relay decides where the bytes go.
+        assert!(!is_public_ip("2002:808:808::1".parse().unwrap()));
     }
 
     #[test]
