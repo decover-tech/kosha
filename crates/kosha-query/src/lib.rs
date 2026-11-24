@@ -4202,7 +4202,7 @@ impl Searcher {
         &self,
         namespace: &NamespaceId,
         manifest: &Manifest,
-        load_vectors: bool,
+        load_modes: &[bool],
         estimate: u64,
         needed: u64,
         what: AdmissionEvict,
@@ -4218,7 +4218,9 @@ impl Searcher {
             estimate,
             what,
             |key| {
-                key.0 == namespace.0 && key.2 == load_vectors && segments.contains(key.1.as_str())
+                key.0 == namespace.0
+                    && load_modes.contains(&key.2)
+                    && segments.contains(key.1.as_str())
             },
         );
     }
@@ -4290,7 +4292,7 @@ impl Searcher {
 
         let tenant = tenant_of_namespace(&namespace.0);
         let permit = self.ledger.admit(tenant, estimate, |needed, what| {
-            self.evict_for_admission(namespace, manifest, load_vectors, estimate, needed, what);
+            self.evict_for_admission(namespace, manifest, &[load_vectors], estimate, needed, what);
         })?;
 
         let mut pinned = Vec::with_capacity(present.len());
@@ -7560,23 +7562,6 @@ impl Searcher {
         doc_store_hydrator: DocStoreHydrator<'_>,
         vector_fetch: Option<VectorSpanFetch<'_>>,
     ) -> Result<(SearchResult, SearchPhaseStats), KoshaError> {
-        let (page, mut result, mut stats) =
-            self.rank_inner(namespace, manifest, query, tombstones, vector_fetch, false)?;
-        let started = Instant::now();
-        result.results = Self::materialize_page(&page, query, doc_store_hydrator, &mut stats)?;
-        stats.materialize_wall_ms += started.elapsed().as_secs_f64() * 1e3;
-        Ok((result, stats))
-    }
-
-    fn rank_inner(
-        &self,
-        namespace: &NamespaceId,
-        manifest: &Manifest,
-        query: &SearchQuery,
-        tombstones: Option<&HashMap<kosha_core::SegmentId, HashSet<u32>>>,
-        vector_fetch: Option<VectorSpanFetch<'_>>,
-        fused_leg: bool,
-    ) -> Result<(Vec<HitCandidate>, SearchResult, SearchPhaseStats), KoshaError> {
         // Out-of-range BM25 parameters are a client error, not something
         // to clamp: every entry point funnels through here.
         query.validate()?;
@@ -7590,6 +7575,93 @@ impl Searcher {
                     .into(),
             ));
         }
+        let t_admit = Instant::now();
+        let permit = if manifest.segments.is_empty() {
+            None
+        } else {
+            let load_modes: &[bool] = match query.multi_rrf() {
+                Some(rrf) => match (
+                    rrf.queries.iter().any(|q| q.knn.is_some()),
+                    rrf.queries.iter().any(|q| q.knn.is_none()),
+                ) {
+                    (true, true) => &[false, true],
+                    (true, false) => &[true],
+                    _ => &[false],
+                },
+                None => &[query.knn.is_some()],
+            };
+            Some(self.admit_search(namespace, manifest, load_modes)?)
+        };
+        let admit_wall_ms = permit
+            .as_ref()
+            .map_or(0.0, |_| t_admit.elapsed().as_secs_f64() * 1e3);
+        let (page, mut result, mut stats) = self.rank_inner(
+            namespace,
+            manifest,
+            query,
+            tombstones,
+            vector_fetch,
+            false,
+            permit.as_ref(),
+        )?;
+        stats.admit_wall_ms = admit_wall_ms;
+        let started = Instant::now();
+        result.results = Self::materialize_page(&page, query, doc_store_hydrator, &mut stats)?;
+        stats.materialize_wall_ms += started.elapsed().as_secs_f64() * 1e3;
+        Ok((result, stats))
+    }
+
+    fn admit_search(
+        &self,
+        namespace: &NamespaceId,
+        manifest: &Manifest,
+        load_modes: &[bool],
+    ) -> Result<AdmissionPermit, KoshaError> {
+        self.segment_cache.enforce_budget();
+        // Reserve for the union of reader cache keys so fusion never
+        // waits on a permit held by one of its own retrievers.
+        let estimate = manifest
+            .segments
+            .iter()
+            .map(|entry| {
+                let seg_dir = manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id);
+                if !seg_dir.exists() {
+                    return 0;
+                }
+                load_modes
+                    .iter()
+                    .filter_map(|&load_vectors| {
+                        let key = (
+                            namespace.0.clone(),
+                            entry.segment_id.0.clone(),
+                            load_vectors,
+                        );
+                        (!self.segment_cache.contains(&key))
+                            .then(|| approx_segment_bytes(&seg_dir, load_vectors))
+                    })
+                    .sum::<u64>()
+            })
+            .sum();
+        self.ledger.admit(
+            tenant_of_namespace(&namespace.0),
+            estimate,
+            |needed, what| {
+                self.evict_for_admission(namespace, manifest, load_modes, estimate, needed, what);
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rank_inner(
+        &self,
+        namespace: &NamespaceId,
+        manifest: &Manifest,
+        query: &SearchQuery,
+        tombstones: Option<&HashMap<kosha_core::SegmentId, HashSet<u32>>>,
+        vector_fetch: Option<VectorSpanFetch<'_>>,
+        fused_leg: bool,
+        permit: Option<&AdmissionPermit>,
+    ) -> Result<(Vec<HitCandidate>, SearchResult, SearchPhaseStats), KoshaError> {
         if let Some(subqueries) = query.rrf_subqueries() {
             let rrf = query
                 .multi_rrf()
@@ -7605,6 +7677,7 @@ impl Searcher {
                     tombstones,
                     vector_fetch,
                     true,
+                    permit,
                 )?;
                 let weight = rrf.weights.as_ref().map_or(1.0, |weights| weights[i]);
                 fuse_ranked_hits(
@@ -7617,7 +7690,6 @@ impl Searcher {
                 stats
                     .knn_degraded_segments
                     .extend(phase.knn_degraded_segments);
-                stats.admit_wall_ms += phase.admit_wall_ms;
                 stats.score_wall_ms += phase.score_wall_ms;
                 stats.materialize_wall_ms += phase.materialize_wall_ms;
                 stats.open_total_ms += phase.open_total_ms;
@@ -7738,46 +7810,7 @@ impl Searcher {
                 phase_stats,
             ));
         }
-        let t_admit = Instant::now();
-
-        // Lazy budget enforcement: segments that were pinned by in-flight
-        // requests at insert time (and so skipped by eviction — see
-        // `SegmentCache::evict_idle_until`) get another look now that those
-        // requests may have finished. Cheap when already under budget.
-        self.segment_cache.enforce_budget();
-
-        // ── Admission (see `MemoryLedger`) ──
-        // Estimate the incremental live bytes this search can add: the
-        // on-disk footprint of every manifest segment that's present
-        // locally but not already in the in-memory cache. Deliberately
-        // conservative — bloom pruning may skip some of these without ever
-        // opening them; the unconsumed reservation is returned when the
-        // permit drops at the end of this search. The broad, unfiltered
-        // queries this gate exists for prune nothing, so for exactly the
-        // dangerous case the estimate is accurate.
-        let load_vectors = query.knn.is_some();
-        let estimate: u64 = manifest
-            .segments
-            .iter()
-            .map(|entry| {
-                let seg_dir = manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id);
-                let key = (
-                    namespace.0.clone(),
-                    entry.segment_id.0.clone(),
-                    load_vectors,
-                );
-                if seg_dir.exists() && !self.segment_cache.contains(&key) {
-                    approx_segment_bytes(&seg_dir, load_vectors)
-                } else {
-                    0
-                }
-            })
-            .sum();
-        let tenant = tenant_of_namespace(&namespace.0);
-        let permit = self.ledger.admit(tenant, estimate, |needed, what| {
-            self.evict_for_admission(namespace, manifest, load_vectors, estimate, needed, what);
-        })?;
-        phase_stats.admit_wall_ms = t_admit.elapsed().as_secs_f64() * 1e3;
+        let permit = permit.expect("non-empty search is admitted before ranking");
 
         let query_analysis = QueryAnalysis::new(query);
         let term_prune = term_bloom_prune_mode(query);
@@ -7860,7 +7893,7 @@ impl Searcher {
                     knn,
                     &filter_keys,
                     tombstones,
-                    &permit,
+                    permit,
                     &open_stats,
                 )?;
                 phase_stats.knn_plan_ms = t_knn_plan.elapsed().as_secs_f64() * 1e3;
@@ -7899,7 +7932,7 @@ impl Searcher {
                     knn_plan.cutoff,
                     &knn_plan.rankings,
                     tombstones,
-                    &permit,
+                    permit,
                     &open_stats,
                     vector_fetch,
                 );
@@ -7935,7 +7968,7 @@ impl Searcher {
                     manifest,
                     query,
                     &query_analysis,
-                    &permit,
+                    permit,
                     &stats_open_stats,
                 );
                 phase_stats.bm25_stats = if corpus.is_some() {
@@ -7960,7 +7993,7 @@ impl Searcher {
                 &sort_value_fields,
                 tombstones,
                 manifest,
-                &permit,
+                permit,
                 &open_stats,
                 knn_plan.cutoff,
                 knn_plan.rankings.get(&entry.segment_id),
@@ -7997,7 +8030,7 @@ impl Searcher {
                 manifest,
                 query,
                 &query_analysis,
-                &permit,
+                permit,
                 &bound_open_stats,
                 corpus.as_ref(),
                 &floor,
@@ -16035,11 +16068,13 @@ mod tests {
 
         let requested: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
         let requested_clone = Arc::clone(&requested);
+        let ledger = Arc::clone(&searcher.ledger);
         // Test-side stand-in for an S3 whole-file fetch of `doc_store.bin`:
         // restore the backed-up file to its on-disk path so the segment's
         // local `doc_record_full` seek+read succeeds, exactly as it would
         // after the real hydrator's `ensure_files_local` lands the file.
         let ensure_doc_store = move |segs: &[PageSegment<'_>]| {
+            assert_eq!(ledger.state.lock().unwrap().active, 1);
             for seg in segs {
                 let seg = seg.segment_dir;
                 requested_clone.lock().unwrap().push(seg.to_path_buf());
@@ -16063,6 +16098,7 @@ mod tests {
         assert!(requested.lock().unwrap().is_empty());
         fused.max_results = 1;
         assert_eq!(run_fused(&fused).results[0].doc_id.0, "d2");
+        assert_eq!(ledger_snapshot(&searcher).2, 0);
         assert_eq!(*requested.lock().unwrap(), [dir.join("test/s2")]);
         std::fs::remove_file(dir.join("test/s2/doc_store.bin")).unwrap();
         requested.lock().unwrap().clear();
