@@ -9,7 +9,7 @@ pub mod span_cache;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -84,6 +84,8 @@ pub struct SegmentWriter {
     /// Inverted-index version `finalize` writes; see
     /// [`postings_write_version`].
     postings_write_version: u32,
+    two_tier_head_fraction: Option<f64>,
+    tier_build_params: Bm25Params,
     /// Leave every `postings-*.bin` shard raw (no zstd wrapper) so query
     /// nodes can range-read single terms (#245); recorded as
     /// `Footer::posting_blobs_raw`. See [`posting_blobs_raw`].
@@ -243,6 +245,11 @@ impl SegmentWriter {
             peak_inverted_bytes: 0,
             build_memory_bytes: segment_build_memory_bytes(),
             postings_write_version: postings_write_version(),
+            two_tier_head_fraction: std::env::var("KOSHA_TWO_TIER_HEAD_FRACTION")
+                .ok()
+                .and_then(|value| value.parse::<f64>().ok())
+                .filter(|&fraction| fraction > 0.0 && fraction < 1.0),
+            tier_build_params: Bm25Params::default(),
             posting_blobs_raw: posting_blobs_raw(),
             runs: Vec::new(),
             io_error: None,
@@ -389,6 +396,13 @@ impl SegmentWriter {
     /// writers use `KOSHA_POSTINGS_RAW_BLOBS`; see [`posting_blobs_raw`].
     pub fn with_raw_posting_blobs(mut self, raw: bool) -> Self {
         self.posting_blobs_raw = raw;
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_two_tier_head_fraction(mut self, fraction: f64) -> Self {
+        assert!(fraction > 0.0 && fraction < 1.0);
+        self.two_tier_head_fraction = Some(fraction);
         self
     }
 
@@ -892,6 +906,10 @@ impl SegmentWriter {
         self.backend.create_dir_all("")?;
         self.write_doc_store()?;
         self.write_doc_vectors()?;
+        if self.two_tier_head_fraction.is_some() {
+            self.posting_blobs_raw = true;
+            self.tier_build_params = bm25_params.clone();
+        }
         self.write_inverted_index()?;
         self.write_filters()?;
         let vector_fields = match vector_write_version() {
@@ -1003,13 +1021,18 @@ impl SegmentWriter {
             (0..POSTING_BLOB_SHARDS).map(|_| None).collect();
         let mut blob_lens: Vec<u64> = vec![0; POSTING_BLOB_SHARDS];
         let mut pool: Vec<u8> = Vec::new();
-        // (term_off_in_pool, term_len, blob_id, postings_off_in_blob, postings_len)
-        let mut entries: Vec<(u64, u32, u32, u64, u32)> = Vec::new();
-        let write_version = self.postings_write_version;
+        let mut entries = Vec::new();
+        let fraction = self.two_tier_head_fraction;
+        let write_version = fraction.map_or(self.postings_write_version, |_| {
+            TIERED_SPLIT_INVERTED_VERSION
+        });
+        let mut tier_metadata = Vec::new();
+        let mut tail_output = None;
+        let mut tail_offset = 0u64;
         // Rollout/rollback compatibility: v4 (`KOSHA_POSTINGS_WRITE_VERSION=4`)
         // streams through the same encoder; see `postings_write_version`.
         let mut encoder = TermEncoder::new(
-            write_version,
+            fraction.map_or(write_version, |_| SKIP_SPLIT_INVERTED_VERSION),
             &build_dir,
             term_spill_limit(self.build_memory_bytes),
         );
@@ -1024,7 +1047,80 @@ impl SegmentWriter {
                     slot.insert(std::io::BufWriter::new(file))
                 }
             };
-            let encoded_len = encoder.finish(blob)?;
+            let tier_record = tier_metadata.len();
+            let encoded_len = if let Some(fraction) = fraction {
+                let mut full_span = Vec::new();
+                encoder.finish(&mut full_span)?;
+                let (mut postings, _) = BlockedTermPostings::parse(Arc::new(full_span))
+                    .and_then(|span| span.decode_full())
+                    .ok_or_else(|| KoshaError::CorruptSegment("newly encoded tier input".into()))?;
+                let df = u32::try_from(postings.len())
+                    .map_err(|_| std::io::Error::other("tier document frequency exceeds u32"))?;
+                let mut tail = Vec::new();
+                let mut frontier = Vec::new();
+                let lengths = if kosha_core::fields::is_field_key(&term) {
+                    &[][..]
+                } else {
+                    &self.field_lengths
+                };
+                if !lengths.is_empty() && postings.len() >= SCORING_BLOCK_LEN {
+                    let head_count =
+                        ((postings.len() as f64 * fraction).ceil() as usize).min(postings.len());
+                    let avgdl = self.total_field_length as f64 / lengths.len() as f64;
+                    let impact = |posting: &Posting| {
+                        let tf = f64::from(posting.term_frequency);
+                        let dl = f64::from(lengths[posting.doc_id as usize]);
+                        // IDF and k1 + 1 are constant within the term.
+                        tf / (tf
+                            + self.tier_build_params.k1
+                                * (1.0 - self.tier_build_params.b
+                                    + self.tier_build_params.b * dl / avgdl))
+                    };
+                    if head_count < postings.len() {
+                        postings.select_nth_unstable_by(head_count, |a, b| {
+                            impact(b)
+                                .total_cmp(&impact(a))
+                                .then(a.doc_id.cmp(&b.doc_id))
+                        });
+                        tail = postings.split_off(head_count);
+                        postings.sort_unstable_by_key(|posting| posting.doc_id);
+                        tail.sort_unstable_by_key(|posting| posting.doc_id);
+                        frontier = tail_frontier(
+                            &mut tail
+                                .iter()
+                                .map(|p| (p.term_frequency, lengths[p.doc_id as usize]))
+                                .collect::<Vec<_>>(),
+                        );
+                    }
+                }
+                let mut span = Vec::new();
+                if !tail.is_empty() {
+                    write_postings_skip_split(&mut span, &tail, lengths);
+                    if tail_output.is_none() {
+                        tail_output = Some(std::io::BufWriter::new(fs::File::create(
+                            build_dir.join(TIER_TAIL_FILE),
+                        )?));
+                    }
+                    tail_output.as_mut().unwrap().write_all(&span)?;
+                }
+                let tail_len = u32::try_from(span.len())
+                    .map_err(|_| std::io::Error::other("tier span exceeds u32"))?;
+                tier_metadata.extend_from_slice(&df.to_le_bytes());
+                tier_metadata.extend_from_slice(&tail_offset.to_le_bytes());
+                tier_metadata.extend_from_slice(&tail_len.to_le_bytes());
+                tier_metadata.extend_from_slice(&(frontier.len() as u32).to_le_bytes());
+                for (dl, tf) in frontier {
+                    tier_metadata.extend_from_slice(&dl.to_le_bytes());
+                    tier_metadata.extend_from_slice(&tf.to_le_bytes());
+                }
+                tail_offset += u64::from(tail_len);
+                span.clear();
+                write_postings_skip_split(&mut span, &postings, lengths);
+                blob.write_all(&span)?;
+                span.len() as u64
+            } else {
+                encoder.finish(blob)?
+            };
             let encoded_len = u32::try_from(encoded_len).map_err(|_| {
                 KoshaError::Io(std::io::Error::other(format!(
                     "postings for term {term:?} encode to {encoded_len} bytes, over the \
@@ -1041,6 +1137,7 @@ impl SegmentWriter {
                 blob_id as u32,
                 p_off,
                 encoded_len,
+                tier_record,
             ));
         }
         drop(encoder);
@@ -1068,20 +1165,38 @@ impl SegmentWriter {
         buf.extend_from_slice(&write_version.to_le_bytes());
         buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
         buf.extend_from_slice(&(POSTING_BLOB_SHARDS as u32).to_le_bytes());
-        for (term_off, term_len, blob_id, p_off, p_len) in entries {
+        for (term_off, term_len, blob_id, p_off, p_len, tier_record) in entries {
             buf.extend_from_slice(&(pool_base + term_off).to_le_bytes());
             buf.extend_from_slice(&term_len.to_le_bytes());
             buf.extend_from_slice(&blob_id.to_le_bytes());
             buf.extend_from_slice(&p_off.to_le_bytes());
             buf.extend_from_slice(&p_len.to_le_bytes());
-            buf.extend_from_slice(&0u32.to_le_bytes());
+            let tier_offset = if fraction.is_some() {
+                u32::try_from(pool_base + pool.len() as u64 + tier_record as u64)
+                    .map_err(|_| std::io::Error::other("tier TOC exceeds u32"))?
+            } else {
+                0
+            };
+            buf.extend_from_slice(&tier_offset.to_le_bytes());
         }
         buf.extend_from_slice(&pool);
+        buf.extend_from_slice(&tier_metadata);
+        if let Some(mut tail) = tail_output {
+            tail.flush()?;
+            drop(tail);
+            fs::rename(
+                build_dir.join(TIER_TAIL_FILE),
+                self.output_dir.join(TIER_TAIL_FILE),
+            )?;
+        }
         // TOC and every posting blob are wrapped independently (see
         // `maybe_compress_inverted`) so the lazy per-shard fetch/decode
         // semantics are unchanged — each artifact self-describes.
-        let encoded_toc = maybe_compress_inverted(&buf);
-        drop(buf);
+        let encoded_toc = if fraction.is_some() {
+            buf
+        } else {
+            maybe_compress_inverted(&buf)
+        };
         self.backend.write("inverted.idx", &encoded_toc)?;
         for (blob_id, blob) in blobs.into_iter().enumerate() {
             let Some(blob) = blob else { continue };
@@ -3070,6 +3185,21 @@ pub const SKIP_SPLIT_INVERTED_VERSION: u32 = 5;
 /// the positions section stay v5 varints. Written only when
 /// `KOSHA_POSTINGS_WRITE_VERSION=6`; never the default.
 pub const BITPACKED_SKIP_SPLIT_INVERTED_VERSION: u32 = 6;
+pub const TIERED_SPLIT_INVERTED_VERSION: u32 = 7;
+pub const TIER_TAIL_FILE: &str = "tail-00.bin";
+
+/// Strictly increasing (field length, term frequency) points not dominated
+/// by any shorter document with the same or higher frequency.
+pub fn tail_frontier(tail: &mut [(u32, u32)]) -> Vec<(u32, u32)> {
+    tail.sort_unstable_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)));
+    let mut steps: Vec<(u32, u32)> = Vec::new();
+    for &(tf, dl) in tail.iter() {
+        if steps.last().is_none_or(|&(_, best)| tf > best) {
+            steps.push((dl, tf));
+        }
+    }
+    steps
+}
 
 /// THE canonical "is this a split-format inverted TOC?" predicate. Every
 /// site that dispatches on split-ness (the server's posting-blob hydration
@@ -3083,6 +3213,7 @@ pub fn is_split_inverted_version(version: u32) -> bool {
         || version == SPLIT_INVERTED_VERSION
         || version == SKIP_SPLIT_INVERTED_VERSION
         || version == BITPACKED_SKIP_SPLIT_INVERTED_VERSION
+        || version == TIERED_SPLIT_INVERTED_VERSION
 }
 
 /// The inverted-postings version the writer emits —
@@ -4644,6 +4775,42 @@ pub fn all_posting_blob_files() -> Vec<String> {
         .collect()
 }
 
+/// Whether a segment has the complete v7 postings needed for publication.
+/// Query hydration deliberately does not require the tail to be local.
+pub fn tier_files_present(segment_dir: &Path) -> bool {
+    let path = segment_dir.join("inverted.idx");
+    let mut header = [0; 8];
+    if fs::File::open(&path)
+        .and_then(|mut toc| toc.read_exact(&mut header))
+        .is_err()
+    {
+        return false;
+    }
+    if header[..4] != INVERTED_MAGIC.to_le_bytes()
+        || header[4..] != TIERED_SPLIT_INVERTED_VERSION.to_le_bytes()
+    {
+        return true;
+    }
+    let Ok(index) = fs::read(path)
+        .map_err(KoshaError::Io)
+        .and_then(|data| SplitInvertedIndex::from_bytes(data, segment_dir.to_path_buf(), None))
+    else {
+        return false;
+    };
+    let tail_len = index
+        .tier_terms
+        .as_ref()
+        .and_then(|terms| terms.last())
+        .map_or(0, |term| term.tail_end);
+    (tail_len == 0
+        || fs::metadata(segment_dir.join(TIER_TAIL_FILE)).is_ok_and(|m| m.len() == tail_len))
+        && (0..index.term_count)
+            .map(|i| index.raw_entry(i).2)
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .all(|blob| segment_dir.join(posting_blob_file_for_id(blob)).is_file())
+}
+
 /// Shards actually referenced by a split index's TOC. Empty shard files
 /// are not written, so hydration must not request them merely because a
 /// query term hashes to that shard. Does not read posting payloads.
@@ -4735,7 +4902,11 @@ pub fn postings_section_stats(segment_dir: &Path) -> Result<PostingsSectionStats
     let data = read_inverted_payload(fs::read(segment_dir.join("inverted.idx"))?)?;
     let index = SplitInvertedIndex::from_bytes(data, segment_dir.to_path_buf(), None)?;
     let inverted_version = u32::from_le_bytes(index.data[4..8].try_into().unwrap());
-    let Some(bitpacked) = index.encoding.skip_split() else {
+    let Some(bitpacked) = index
+        .encoding
+        .skip_split()
+        .filter(|_| index.tier_terms.is_none())
+    else {
         return Err(corrupt(format!(
             "inverted version {inverted_version} is not skip-split (v5/v6)"
         )));
@@ -4878,6 +5049,7 @@ pub struct SplitInvertedIndex {
     data: Vec<u8>,
     segment_dir: PathBuf,
     term_count: usize,
+    tier_terms: Option<Vec<TierTerm>>,
     encoding: SplitPostingsEncoding,
     cache: PostingsCache<usize, Arc<Vec<Posting>>>,
     /// v5 (skip-split) only: per-term scoring views (skip table + raw
@@ -4899,6 +5071,13 @@ pub struct SplitInvertedIndex {
     /// (`postings-XX.bin.spans/`, see [`span_cache`]) that a query node
     /// fills with ranged GETs of just the query terms' spans (#245).
     posting_spans: bool,
+}
+
+struct TierTerm {
+    df: u32,
+    tail_start: u64,
+    tail_end: u64,
+    frontier: Vec<(u32, u32)>,
 }
 
 /// Where one shard's term spans are read from for a batch of terms.
@@ -6044,7 +6223,9 @@ impl SplitInvertedIndex {
         let encoding = match version {
             FIXED_SPLIT_INVERTED_VERSION => SplitPostingsEncoding::Fixed32,
             SPLIT_INVERTED_VERSION => SplitPostingsEncoding::VarintDelta,
-            SKIP_SPLIT_INVERTED_VERSION => SplitPostingsEncoding::SkipSplit,
+            SKIP_SPLIT_INVERTED_VERSION | TIERED_SPLIT_INVERTED_VERSION => {
+                SplitPostingsEncoding::SkipSplit
+            }
             BITPACKED_SKIP_SPLIT_INVERTED_VERSION => SplitPostingsEncoding::BitPackedSkipSplit,
             _ => return Err(corrupt(&format!("unsupported version {version}"))),
         };
@@ -6063,10 +6244,11 @@ impl SplitInvertedIndex {
         if table_end > data.len() {
             return Err(corrupt("term table extends past end of file"));
         }
-        let index = Self {
+        let mut index = Self {
             data,
             segment_dir,
             term_count,
+            tier_terms: None,
             encoding,
             cache: PostingsCache::new(postings_cache_max_bytes(), account.clone()),
             scoring_cache: PostingsCache::new(postings_cache_max_bytes(), account),
@@ -6087,6 +6269,65 @@ impl SplitInvertedIndex {
             if std::str::from_utf8(&index.data[term_off..term_end]).is_err() {
                 return Err(corrupt(&format!("table entry {i} term is not UTF-8")));
             }
+        }
+        if version == TIERED_SPLIT_INVERTED_VERSION {
+            let mut terms = Vec::with_capacity(term_count);
+            let mut offset = (0..term_count)
+                .map(|i| {
+                    let (start, len, ..) = index.raw_entry(i);
+                    start + len
+                })
+                .max()
+                .unwrap_or(table_end);
+            let mut tail_end = 0u64;
+            for i in 0..term_count {
+                let slot = INVERTED_HEADER_LEN + i * SPLIT_INVERTED_TABLE_ENTRY_LEN + 28;
+                if u32::from_le_bytes(index.data[slot..slot + 4].try_into().unwrap()) as usize
+                    != offset
+                {
+                    return Err(corrupt("invalid tier metadata offset"));
+                }
+                let metadata = index
+                    .data
+                    .get(offset..)
+                    .ok_or_else(|| corrupt("invalid tier metadata"))?;
+                let mut cursor = Checked::new(metadata, "tier metadata");
+                let df = cursor.u32()?;
+                let start = cursor.array().map(u64::from_le_bytes)?;
+                let len = cursor.u32()?;
+                let count = cursor.u32()? as usize;
+                let record_len = count
+                    .checked_mul(8)
+                    .and_then(|n| n.checked_add(20))
+                    .filter(|&n| n <= metadata.len())
+                    .ok_or_else(|| corrupt("truncated tier metadata"))?;
+                if start != tail_end || df == 0 || (len == 0) != (count == 0) {
+                    return Err(corrupt("invalid tier span"));
+                }
+                tail_end = start
+                    .checked_add(u64::from(len))
+                    .ok_or_else(|| corrupt("tier span overflow"))?;
+                let mut frontier = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let dl = cursor.u32()?;
+                    let tf = cursor.u32()?;
+                    if tf == 0 || frontier.last().is_some_and(|&(d, t)| d >= dl || t >= tf) {
+                        return Err(corrupt("invalid tier frontier"));
+                    }
+                    frontier.push((dl, tf));
+                }
+                terms.push(TierTerm {
+                    df,
+                    tail_start: start,
+                    tail_end,
+                    frontier,
+                });
+                offset += record_len;
+            }
+            if offset != index.data.len() {
+                return Err(corrupt("trailing tier metadata"));
+            }
+            index.tier_terms = Some(terms);
         }
         Ok(index)
     }
@@ -6145,6 +6386,12 @@ impl SplitInvertedIndex {
     }
 
     fn postings_for_terms<'a>(&'a self, terms: &'a [String]) -> Vec<(&'a str, Arc<Vec<Posting>>)> {
+        if self.tier_terms.is_some() {
+            return terms
+                .iter()
+                .filter_map(|term| self.postings(term).map(|p| (term.as_str(), p)))
+                .collect();
+        }
         // The output is emitted strictly in the requested `terms` order.
         // That order is load-bearing: both the general scoring path and the
         // WAND join sum per-term float scores in whatever order this
@@ -6213,6 +6460,32 @@ impl SplitInvertedIndex {
     }
 
     fn decode_postings_inner(&self, i: usize) -> Option<(Vec<Posting>, usize)> {
+        let (mut head, mut bytes) = self.decode_head(i)?;
+        if let Some(tier) = self.tier_terms.as_ref().map(|terms| &terms[i]) {
+            if tier.tail_start != tier.tail_end {
+                let tail = span_cache::read_local_range(
+                    &self.segment_dir,
+                    TIER_TAIL_FILE,
+                    tier.tail_end,
+                    tier.tail_start,
+                    tier.tail_end - tier.tail_start,
+                )?;
+                let (tail, tail_bytes) = self.decode_term(&tail)?;
+                head.extend(tail);
+                bytes += tail_bytes;
+                head.sort_unstable_by_key(|p| p.doc_id);
+                if head.windows(2).any(|w| w[0].doc_id == w[1].doc_id) {
+                    return None;
+                }
+            }
+            if head.len() != tier.df as usize {
+                return None;
+            }
+        }
+        Some((head, bytes))
+    }
+
+    fn decode_head(&self, i: usize) -> Option<(Vec<Posting>, usize)> {
         let (_, _, blob_id, p_off, p_len) = self.raw_entry(i);
         let blob = self.open_posting_blob(blob_id)?;
         let bytes = self.term_bytes(&blob, blob_id, p_off, p_len)?;
@@ -6256,6 +6529,9 @@ impl SplitInvertedIndex {
         &'a self,
         terms: &'a [String],
     ) -> Option<Vec<(&'a str, Arc<BlockedTermPostings>)>> {
+        if self.tier_terms.is_some() {
+            return None;
+        }
         let bitpacked = self.encoding.skip_split()?;
         // Slot-assembled in requested-term order — same load-bearing
         // reason as `postings_for_terms`: the WAND leapfrog join sums
@@ -7782,6 +8058,12 @@ pub struct ExactKnnResult {
     /// Postings hydrated (zero when served from the sidecar).
     pub postings_hydrated: usize,
     pub source: ExactKnnSource,
+}
+
+pub struct TierHead<'a> {
+    pub postings: Vec<Posting>,
+    pub df: u32,
+    pub frontier: &'a [(u32, u32)],
 }
 
 pub struct SegmentReader {
@@ -10322,6 +10604,75 @@ impl SegmentReader {
             .collect()
     }
 
+    pub fn is_tiered(&self) -> bool {
+        matches!(&self.inverted, InvertedAccess::Split(index) if index.tier_terms.is_some())
+    }
+
+    /// The head plus full document frequency and the tail's (dl, tf) frontier.
+    pub fn tier_head(&self, term: &str) -> Result<Option<TierHead<'_>>, KoshaError> {
+        let InvertedAccess::Split(index) = &self.inverted else {
+            return Ok(None);
+        };
+        let (Some(terms), Some(i)) = (&index.tier_terms, index.find(term)) else {
+            return Ok(None);
+        };
+        let tier = &terms[i];
+        let (postings, _) = index.decode_head(i).ok_or_else(|| {
+            KoshaError::CorruptSegment(format!(
+                "{}: unreadable head for {term:?}",
+                self.segment_dir.display()
+            ))
+        })?;
+        let count = postings.len();
+        if count == 0
+            || count > tier.df as usize
+            || (count == tier.df as usize) != tier.frontier.is_empty()
+            || postings.iter().any(|p| p.doc_id >= self.doc_count())
+            || postings.windows(2).any(|p| p[0].doc_id >= p[1].doc_id)
+        {
+            return Err(KoshaError::CorruptSegment(format!(
+                "invalid tier head for {term:?}"
+            )));
+        }
+        Ok(Some(TierHead {
+            postings,
+            df: tier.df,
+            frontier: &tier.frontier,
+        }))
+    }
+
+    /// Hold missing tail spans for a full-postings read. The callback is the
+    /// same ranged cache used by vector postings; full files already local
+    /// to the segment need no callback.
+    pub fn fetch_tier_tails<'a>(
+        &self,
+        terms: impl IntoIterator<Item = &'a str>,
+        fetch: Option<VectorSpanFetch<'_>>,
+    ) -> span_cache::SpanHolds {
+        let (InvertedAccess::Split(index), Some(fetch)) = (&self.inverted, fetch) else {
+            return span_cache::SpanHolds::new();
+        };
+        let Some(metadata) = &index.tier_terms else {
+            return span_cache::SpanHolds::new();
+        };
+        let local_len = fs::metadata(self.segment_dir.join(TIER_TAIL_FILE)).map_or(0, |m| m.len());
+        let mut ranges: Vec<_> = terms
+            .into_iter()
+            .filter_map(|term| {
+                let entry = &metadata[index.find(term)?];
+                (entry.tail_end > entry.tail_start && entry.tail_end > local_len)
+                    .then_some((entry.tail_start, entry.tail_end))
+            })
+            .collect();
+        ranges.sort_unstable();
+        ranges.dedup();
+        if ranges.is_empty() {
+            span_cache::SpanHolds::new()
+        } else {
+            fetch(&self.segment_dir, TIER_TAIL_FILE, &ranges)
+        }
+    }
+
     /// Document frequency of each of `terms` that this segment contains,
     /// for namespace-level BM25 statistics (issue #246). Goes through the
     /// same scoring-postings fetch the scoring pass uses, so on v5 segments
@@ -10330,6 +10681,16 @@ impl SegmentReader {
     /// `None` when a TOC-present term's posting blob could not be read —
     /// a partial answer would silently understate `df`.
     pub fn doc_frequencies(&self, terms: &[String]) -> Option<Vec<(String, u32)>> {
+        if let InvertedAccess::Split(index) = &self.inverted {
+            if let Some(tier) = &index.tier_terms {
+                return Some(
+                    terms
+                        .iter()
+                        .filter_map(|term| Some((term.clone(), tier[index.find(term)?].df)))
+                        .collect(),
+                );
+            }
+        }
         let dfs: Vec<(String, u32)> = self
             .scoring_postings_for_terms(terms)
             .into_iter()
@@ -10925,6 +11286,11 @@ impl SegmentReader {
             return Ok(InvertedAccess::Lazy(LazyInvertedIndex::from_bytes(
                 data, account,
             )?));
+        }
+        if data.starts_with(&INVERTED_MAGIC.to_le_bytes()) {
+            return Err(KoshaError::CorruptSegment(
+                "unsupported inverted.idx version".into(),
+            ));
         }
         Ok(InvertedAccess::Eager(Self::parse_legacy_inverted(&data)?))
     }
@@ -14321,6 +14687,31 @@ mod doc_vectors_tests {
 #[cfg(test)]
 mod bounded_build_tests {
     use super::*;
+
+    #[test]
+    fn pre_v7_inverted_dispatch_rejects_a_tiered_toc() {
+        let dir = std::env::temp_dir().join(format!("kosha-tiered-toc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut writer = SegmentWriter::new(SegmentId("test".into()), dir.clone())
+            .with_two_tier_head_fraction(0.25);
+        writer.add_document(DocumentId("d".into()), vec![Field::text("t", "test")]);
+        writer.finalize(Bm25Params::default()).unwrap();
+        let toc = fs::read(dir.join("inverted.idx")).unwrap();
+        let version = u32::from_le_bytes(toc[4..8].try_into().unwrap());
+        assert_eq!(version, TIERED_SPLIT_INVERTED_VERSION);
+        assert!(!(3..=BITPACKED_SKIP_SPLIT_INVERTED_VERSION).contains(&version));
+        // A pre-v7 reader skips its split parser and instead sees the
+        // shared magic in the inline-format detector, then rejects v7.
+        assert!(LazyInvertedIndex::detect(&toc));
+        assert!(matches!(
+            LazyInvertedIndex::from_bytes(toc, None),
+            Err(KoshaError::CorruptSegment(message)) if message.contains("unsupported version 7")
+        ));
+        let reader = SegmentReader::open(dir.clone()).unwrap();
+        assert_eq!(reader.postings("test").unwrap().len(), 1);
+        assert!(!dir.join(TIER_TAIL_FILE).exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     fn scratch(name: &str) -> PathBuf {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

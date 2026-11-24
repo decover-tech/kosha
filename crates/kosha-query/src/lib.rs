@@ -2282,6 +2282,7 @@ fn score_fuzzy_query(
     params: Bm25Params,
     combined: &Bm25Scorer,
     rejected: &dyn Fn(u32) -> bool,
+    span_fetch: Option<VectorSpanFetch<'_>>,
 ) -> Result<HashMap<u32, f64>, KoshaError> {
     let field_index = reader.field_index();
     // A segment without per-field indexes (before #249) answers a field
@@ -2318,6 +2319,7 @@ fn score_fuzzy_query(
                 &mut ExpandStats::default(),
             );
             let keys: Vec<String> = expansions.iter().map(|e| e.key.clone()).collect();
+            let _tier_holds = reader.fetch_tier_tails(keys.iter().map(String::as_str), span_fetch);
             let edits_of: HashMap<&str, u8> = expansions
                 .iter()
                 .map(|e| (e.key.as_str(), e.edits))
@@ -3833,6 +3835,7 @@ pub struct Searcher {
     /// default; only tests and benches turn it off, to compare against
     /// per-segment pruning — see [`Searcher::set_global_wand_threshold`].
     global_wand: std::sync::atomic::AtomicBool,
+    two_tier_exact: bool,
     /// Per-segment score-ceiling inputs per manifest version (issue #248).
     ceilings: CeilingCache,
     /// Readers of retired segments, released from the cache by
@@ -3972,6 +3975,7 @@ impl Searcher {
             ledger: Arc::new(MemoryLedger::new(max_live_bytes, admission_timeout)),
             corpus_stats: CorpusStatsCache::default(),
             global_wand: std::sync::atomic::AtomicBool::new(true),
+            two_tier_exact: std::env::var("KOSHA_TWO_TIER_QUERY").as_deref() == Ok("exact"),
             ceilings: CeilingCache::default(),
             draining: Mutex::new(HashMap::new()),
             knn_exact_threshold: knn_exact_threshold_from_env(),
@@ -4000,6 +4004,12 @@ impl Searcher {
 
     pub fn set_global_wand_threshold(&self, enabled: bool) {
         self.global_wand.store(enabled, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn with_two_tier_exact(mut self, enabled: bool) -> Self {
+        self.two_tier_exact = enabled;
+        self
     }
 
     /// Forget everything cached in memory for the namespaces `matches`
@@ -5329,6 +5339,9 @@ impl Searcher {
                     ) else {
                         return unknown();
                     };
+                    if reader.is_tiered() {
+                        return unknown();
+                    }
                     let slot_of = |term: &str| missing.iter().position(|t| t == term);
                     // A term the TOC has whose postings do not come back
                     // was unreadable: its ceiling stays unknown. (The
@@ -5668,6 +5681,38 @@ impl Searcher {
         let field_query = analysis
             .fields()
             .filter(|_| analysis.has_text() && !is_wildcard_mode && reader.field_index().is_some());
+        let _tier_holds = if reader.is_tiered() && (has_query || multi_reading) {
+            if self.two_tier_exact
+                && !multi_reading
+                && wand_eligible_query(query, analysis.has_text())
+                && (operator == kosha_core::QueryOperator::Or || effective_terms.len() == 1)
+            {
+                if let Some(output) = two_tier::certify_segment(
+                    &reader,
+                    &effective_terms,
+                    &scorer,
+                    query.collect_depth(),
+                    count_budget,
+                    restricted,
+                    &rejected,
+                )? {
+                    return Ok(Some(output));
+                }
+            }
+            if query.fuzzy.is_some() {
+                None
+            } else if field_query.is_some() || multi_reading {
+                let terms = analysis.union_terms([reader.footer().analysis.as_ref()]);
+                Some(reader.fetch_tier_tails(terms.iter().map(String::as_str), vector_fetch))
+            } else if !missing_required_term {
+                let terms = phrase_tokenized.unwrap_or(&effective_terms);
+                Some(reader.fetch_tier_tails(terms.iter().map(String::as_str), vector_fetch))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         if let Some(ref fuzzy) = query.fuzzy {
             let scored = score_fuzzy_query(
                 &reader,
@@ -5679,6 +5724,7 @@ impl Searcher {
                 params.clone(),
                 &scorer,
                 &rejected,
+                vector_fetch,
             )?;
             for (doc_seq, score) in scored {
                 if reader.doc_meta(doc_seq).is_some() {
@@ -7456,6 +7502,8 @@ impl Searcher {
     /// probe in parallel, so their calls overlap (one round trip of wall
     /// time); a restricted probe that runs past its budget calls again for
     /// the next few postings.
+    /// On tiered lexical segments the same callback can also fetch
+    /// required ranges of `tail-00.bin`.
     pub fn search_with_hydrators(
         &self,
         namespace: &NamespaceId,

@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use kosha_core::{
     Bm25Params, DocumentId, Field, Manifest, ManifestEntry, NamespaceId, QueryOperator,
@@ -12,7 +13,8 @@ use kosha_core::{
 };
 use kosha_query::two_tier::{self, Config, StatsScope};
 use kosha_query::Searcher;
-use kosha_segment::SegmentWriter;
+use kosha_segment::span_cache::{PendingSpan, SpanHolds};
+use kosha_segment::{SegmentWriter, TIER_TAIL_FILE};
 
 struct Lcg(u64);
 
@@ -86,6 +88,121 @@ fn queries(n: usize) -> Vec<String> {
                 .join(" ")
         })
         .collect()
+}
+
+#[test]
+fn tiered_search_certifies_or_fetches_and_matches_full_postings() {
+    let root = std::env::temp_dir().join(format!("kosha-tiered-live-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let full = root.join("full");
+    let tiered = root.join("tiered");
+    let ns = NamespaceId("tt".into());
+    let mut manifest = build(&full, &ns, &[]);
+    for s in 0..3 {
+        let id = SegmentId(format!("seg{s}"));
+        let version = if s == 2 { 6 } else { 5 };
+        let docs = 160 + s * 10;
+        for (dir, use_tier) in [(&full, false), (&tiered, s == 0)] {
+            let writer = SegmentWriter::new(id.clone(), dir.join(&ns.0).join(&id.0))
+                .with_postings_write_version(version);
+            let mut writer = if use_tier {
+                writer
+                    .with_two_tier_head_fraction(0.25)
+                    .with_build_memory_bytes(8192)
+            } else {
+                writer
+            };
+            for d in 0..docs {
+                let strong_count = if d < 10 { 25 + d } else { 1 };
+                let text = format!(
+                    "{}flat {}",
+                    "strong ".repeat(strong_count),
+                    "filler ".repeat(s)
+                );
+                writer.add_document(
+                    DocumentId(format!("s{s}-d{d:03}")),
+                    vec![Field::text("t", text)],
+                );
+            }
+            writer.finalize(Bm25Params::default()).unwrap();
+        }
+        manifest.segments.push(ManifestEntry {
+            segment_id: id,
+            doc_count: docs as u32,
+        });
+    }
+
+    let seg = tiered.join(&ns.0).join("seg0");
+    let version = std::fs::read(seg.join("inverted.idx")).unwrap();
+    assert_eq!(&version[4..8], &7u32.to_le_bytes());
+    assert!(kosha_segment::tier_files_present(&seg));
+    let remote = std::fs::read(seg.join(TIER_TAIL_FILE)).unwrap();
+    std::fs::remove_file(seg.join(TIER_TAIL_FILE)).unwrap();
+    assert!(!kosha_segment::tier_files_present(&seg));
+    let fetched = AtomicUsize::new(0);
+    let fetch = |dir: &Path, file: &str, ranges: &[(u64, u64)]| -> SpanHolds {
+        assert_eq!(dir, seg);
+        assert_eq!(file, TIER_TAIL_FILE);
+        fetched.fetch_add(ranges.len(), Ordering::Relaxed);
+        ranges
+            .iter()
+            .map(|&(start, end)| {
+                PendingSpan::register(
+                    dir,
+                    file,
+                    start,
+                    remote[start as usize..end as usize].to_vec(),
+                    false,
+                )
+            })
+            .collect()
+    };
+
+    let oracle = Searcher::new(full);
+    let exact = Searcher::new(tiered.clone()).with_two_tier_exact(true);
+    let off = Searcher::new(tiered).with_two_tier_exact(false);
+    let scores = |r: &kosha_core::SearchResult| {
+        r.results
+            .iter()
+            .map(|hit| (hit.doc_id.0.clone(), hit.score.to_bits()))
+            .collect::<Vec<_>>()
+    };
+    for (searcher, text, exact_count, fetch_count) in [
+        (&exact, "strong", true, 0),
+        (&exact, "strong strong", false, 0),
+        (&exact, "strong missingword", false, 0),
+        (&exact, "flat", false, 1),
+        (&exact, "strong flat", false, 2),
+        (&off, "strong", true, 1),
+    ] {
+        let query: SearchQuery = serde_json::from_value(serde_json::json!({
+            "query_text": text,
+            "max_results": 10,
+            "operator": QueryOperator::Or,
+            "exact_total_hits": exact_count,
+            "total_hits_cap": 15,
+        }))
+        .unwrap();
+        let expected = oracle.search(&ns, &manifest, &query, None).unwrap();
+        let (actual, _) = searcher
+            .search_with_hydrators(&ns, &manifest, &query, None, None, Some(&fetch))
+            .unwrap();
+        assert_eq!(fetched.swap(0, Ordering::Relaxed), fetch_count, "{text}");
+        assert_eq!(scores(&actual), scores(&expected), "{text}");
+        assert_eq!(actual.total_hits, expected.total_hits, "{text}");
+        assert_eq!(
+            actual.total_hits_relation, expected.total_hits_relation,
+            "{text}"
+        );
+    }
+
+    let needs_tail: SearchQuery = serde_json::from_value(serde_json::json!({
+        "query_text": "flat", "max_results": 10,
+    }))
+    .unwrap();
+    let cold = Searcher::new(root.join("tiered")).with_two_tier_exact(true);
+    assert!(cold.search(&ns, &manifest, &needs_tail, None).is_err());
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

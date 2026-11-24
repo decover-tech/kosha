@@ -212,59 +212,82 @@ MSMarco.
 On this corpus, per-term heads certify almost nothing beyond short
 queries. If MSMarco looks similar, the two-tier index fails the issue's
 95% bar, and the cheaper outcome is an approximate or anytime head-only
-mode, not exact tiering. The real numbers come from the bench run below.
+mode, not exact tiering. The MSMarco measurement is still pending.
 
-## Format sketch (not built; gated)
+## MSMarco benchmark status
 
-- A new inverted version, `TIERED_SPLIT_INVERTED_VERSION = 6`, written only
-  when a writer flag is set (`KOSHA_TWO_TIER_HEAD_FRACTION`, unset = off and
-  v5 unchanged). This follows the precedent of `KOSHA_POSTINGS_WRITE_VERSION`
-  for v5: a reader cannot read versions newer than its own build, so v6 must
-  never be written by default, and the flag stays off until every replica
-  reads v6. Before the prototype, a test must confirm that a pre-v6 reader
-  *errors* on a v6 segment rather than misparsing it. Mixed namespaces are
-  fine, because v5 segments simply have no tail.
+No valid MSMarco evaluation was found in the GitHub Actions runs available
+after [#411](https://github.com/decover-tech/kosha/pull/411) merged the
+analysis harness. The two-tier step was skipped wherever it appeared, including
+main runs [45078634960](https://github.com/decover-tech/kosha/actions/runs/45078634960)
+and [45104084241](https://github.com/decover-tech/kosha/actions/runs/45104084241).
+All 13 available `bench-results` artifacts had `two_tier_eval=false` in
+`meta.json` and none contained a two-tier result. The other three runs were
+cancelled without artifacts. The S3 archives were not checked because the
+investigation environment had no AWS credentials.
+
+Score-exact share, local text ratios and run validity are therefore
+unmeasured on MSMarco. This is not a no-go result. The requested next
+step without a valid run is the default-off exact prototype below,
+without claiming the success bar has been met. The go/no-go run is still
+pending: dispatch `benchmark.yml` with `suite=none`, `mode=restore`,
+`bm25_docs=10m`, and `two_tier_eval=true` against the existing untiered
+MSMarco snapshot.
+
+## Experimental format (default off)
+
+- Version 7 is allocated to tiering because #411 already assigned v6
+  to bit-packed scoring blocks (#386). Write v7 only with
+  `KOSHA_TWO_TIER_HEAD_FRACTION` set to a fraction in `(0, 1)`. Keep
+  this flag off until every replica can read v7. With the flag off,
+  both v5 and v6 read and write as before. Mixed namespaces are supported.
 - Each TOC entry gains:
   - a **head span**: a v5-layout span over the head postings in doc order,
     with positions, in the existing `postings-XX.bin` shards. This is what
     hydration and warmup fetch;
-  - a **tail span**: the same layout over the tail, in separate
-    `tail-XX.bin` shards that warmup never hydrates, so they stay S3-only
-    unless span promotion pulls them;
-  - **tail bound** metadata: the frontier step function `(dl, tf)*` (median
-    size to be read from the footprint report; the synthetic run had 34-40
-    points per term at most), or one `(max tf, min dl)` pair if the bench
-    shows the cheaper bound is enough.
+  - a **tail span**: the same layout in one raw `tail-00.bin` object per
+    segment, excluded from warmup; the object is absent if no term splits;
+  - **tail bound** metadata: the frontier step function `(dl, tf)*`.
+    The raw v7 TOC uses the old entry's reserved word to point into these
+    appended records.
 - `df` stays the full posting count (head + tail), so `doc_frequencies`
   (#246) and namespace statistics are unchanged. Head selection uses build
   time statistics only. Correctness never depends on them, because the tail
   bound holds under any statistics.
-- Compaction re-splits from merged postings. Head plus tail is lossless, so
-  a merge reads both, which costs tail GETs at compaction time only.
+- Terms shorter than one scoring block and per-field keys stay whole.
+  The opt-in writer buffers one full term at a time to partition its
+  postings. Measure peak writer memory before using it with large segments.
+- Compaction rebuilds postings from the original documents and splits
+  the output only when the writer flag is enabled.
 
-## Query-path sketch (not built; gated)
+## Exact query prototype (default off)
 
-`KOSHA_TWO_TIER_QUERY=off|exact|anytime` (default off: v6 heads and tails
-are read like v5 by concatenating, so results are identical).
+`KOSHA_TWO_TIER_QUERY=exact` enables the head-only check for plain ranked
+BM25 OR and single-term queries on v7 segments. With it unset, v7 always
+reads full postings. Scores and document frequency use the same BM25
+statistics and parameters as the full path.
 
-1. **Head pass.** WAND over head spans only, carrying the per-document
-   `LB`/`UB` above. The tail bounds play the role of the "non-essential"
-   list ceilings in MaxScore.
-2. **Certify** against the namespace-wide `theta`. The shared WAND floor
-   (#248) already makes this a global quantity.
-3. **Tail pass**, in `exact` mode and only for segments that fail. Issue one
-   ranged GET per (segment, term) tail, in parallel and largest bound
-   first, then re-certify. Stop as soon as certified. Tail fetches go
-   through the existing span cache, so a frequently needed tail becomes
-   local, and the footprint adapts to the workload.
-4. **Anytime** mode (Mackenzie et al.): with a budget
-   (`KOSHA_TWO_TIER_BUDGET_MS`), return the head-only answer when the budget
-   runs out, and flag the response `approximate`. The tool's `overlap@k` and
-   `head_answer_exact` columns are exactly this mode's quality.
+1. Score the term heads and certify **each segment's** top window using
+   Pareto bounds with the active BM25 statistics. Every winner's score
+   must be final and every outsider must be strictly below the cutoff.
+   The exact top windows can then be merged without a global certificate.
+2. Preserve hit counts: an unrestricted single term knows its exact
+   count from `df`; an OR query can skip tails only if its head hits also
+   prove the reported count is capped. Other counts use full postings.
+3. In segments that cannot certify, fetch the missing query-term tails
+   in one range batch through the existing span cache. Merge the sorted
+   head and tail postings and use the normal scorer. Phrase, multi-term
+   AND, hybrid and other unsupported query shapes use this full path.
+   A missing required tail fails the query rather than dropping matches.
+
+Namespace-wide certification, incremental fetch-and-recertify, and an
+anytime mode with an explicit approximate response are follow-up ideas,
+not part of the prototype.
 
 Interactions:
-- MaxScore and WAND: the head is the essential list. Block-max ceilings
-  inside the tail still prune within a tail read.
+- The head plays the role of the essential list in MaxScore. The
+  prototype scores v7 posts exhaustively after a tail fetch; it does not
+  prune within a fetched tail.
 - R6 (docid ordering): reordering makes heads denser in docid space, which
   shrinks head scoring bytes (the deltas get smaller).
 - Segment count: tail GETs scale with segments times terms. Fewer, larger

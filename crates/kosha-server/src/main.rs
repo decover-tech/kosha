@@ -1462,6 +1462,11 @@ fn sync_segment_dir_to_s3(
             "segment {rel} is missing filter index files locally"
         ));
     }
+    if !kosha_segment::tier_files_present(seg_dir) {
+        return Err(format!(
+            "segment {rel} is missing tier posting files locally"
+        ));
+    }
     s3.sync_segment_dir(Path::new(&rel))
         .map_err(|e| format!("S3 upload of segment {rel} failed: {e}"))
 }
@@ -5868,14 +5873,14 @@ impl AppState {
     }
 
     /// The [`kosha_query::VectorSpanFetch`] the search handlers pass down:
-    /// fetch the probed kNN postings' `vector.idx` ranges of one segment
-    /// into the span cache (#245). A range that fails (not shed) falls back
+    /// fetch vector or lexical tail ranges into the span cache (#245).
+    /// A vector range that fails (not shed) can fall back
     /// to the whole `vector.idx`, so the probe still reads every posting it
     /// needs; anything still missing marks the segment degraded. Returns
     /// the spans the probe must hold while it reads them (see
     /// [`kosha_query::VectorSpanFetch`]).
     #[cfg(feature = "s3")]
-    fn hydrate_vector_postings(
+    fn hydrate_query_spans(
         &self,
         seg: &Path,
         file: &str,
@@ -5919,7 +5924,12 @@ impl AppState {
         // segment on staging). The pass reports the vectors it could not
         // read as unavailable (and the segment degraded) instead.
         let error = o.error.as_deref().unwrap_or_default();
-        if o.failed && file != kosha_segment::DOC_VECTORS_FILE {
+        if o.failed && file == kosha_segment::TIER_TAIL_FILE {
+            eprintln!(
+                "WARN: ranged read of {}/{file} failed ({error}){rid}",
+                seg.display()
+            );
+        } else if o.failed && file != kosha_segment::DOC_VECTORS_FILE {
             let (files, bytes) = self.ensure_files_local(&[seg.to_path_buf()], file, request);
             stats.rounds += 1;
             stats.whole_files = files as u64;
@@ -9830,10 +9840,15 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     #[cfg(feature = "s3")]
     let vector_fetch_stats = Mutex::new(posting_spans::PostingFetchStats::default());
     #[cfg(feature = "s3")]
+    let tier_fetch_stats = Mutex::new(posting_spans::PostingFetchStats::default());
+    #[cfg(feature = "s3")]
     let fetch_vectors = |seg: &Path, file: &str, ranges: &[(u64, u64)]| {
-        let (stats, held) =
-            state.hydrate_vector_postings(seg, file, ranges, &hydration_request, &rid);
-        vector_fetch_stats.lock().unwrap().add(&stats);
+        let (stats, held) = state.hydrate_query_spans(seg, file, ranges, &hydration_request, &rid);
+        if file == kosha_segment::TIER_TAIL_FILE {
+            tier_fetch_stats.lock().unwrap().add(&stats);
+        } else {
+            vector_fetch_stats.lock().unwrap().add(&stats);
+        }
         held
     };
     #[cfg(feature = "s3")]
@@ -9856,10 +9871,18 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
             result.exhaustive_search_count = view.exhaustive_search_count();
             result.consistency_fallback = view.fallback.clone();
             #[cfg(feature = "s3")]
-            let hydration = HydrationOutcome {
-                page: *page_fetch.lock().unwrap(),
-                vectors: *vector_fetch_stats.lock().unwrap(),
-                ..hydration
+            let hydration = {
+                let tier = *tier_fetch_stats.lock().unwrap();
+                let mut postings = hydration.postings;
+                postings.add(&tier);
+                HydrationOutcome {
+                    page: *page_fetch.lock().unwrap(),
+                    vectors: *vector_fetch_stats.lock().unwrap(),
+                    postings,
+                    rounds: hydration.rounds + tier.rounds,
+                    bytes_fetched: hydration.bytes_fetched + tier.ranged_bytes,
+                    ..hydration
+                }
             };
             obs.s3_bytes.set(hydration.s3_bytes());
             state.metrics.record_search_phases(
@@ -10472,10 +10495,15 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
     #[cfg(feature = "s3")]
     let vector_fetch_stats = Mutex::new(posting_spans::PostingFetchStats::default());
     #[cfg(feature = "s3")]
+    let tier_fetch_stats = Mutex::new(posting_spans::PostingFetchStats::default());
+    #[cfg(feature = "s3")]
     let fetch_vectors = |seg: &Path, file: &str, ranges: &[(u64, u64)]| {
-        let (stats, held) =
-            state.hydrate_vector_postings(seg, file, ranges, &hydration_request, &rid);
-        vector_fetch_stats.lock().unwrap().add(&stats);
+        let (stats, held) = state.hydrate_query_spans(seg, file, ranges, &hydration_request, &rid);
+        if file == kosha_segment::TIER_TAIL_FILE {
+            tier_fetch_stats.lock().unwrap().add(&stats);
+        } else {
+            vector_fetch_stats.lock().unwrap().add(&stats);
+        }
         held
     };
     #[cfg(feature = "s3")]
@@ -10495,10 +10523,18 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
             result.exhaustive_search_count = view.exhaustive_search_count();
             result.consistency_fallback = view.fallback.clone();
             #[cfg(feature = "s3")]
-            let hydration = HydrationOutcome {
-                page: *page_fetch.lock().unwrap(),
-                vectors: *vector_fetch_stats.lock().unwrap(),
-                ..hydration
+            let hydration = {
+                let tier = *tier_fetch_stats.lock().unwrap();
+                let mut postings = hydration.postings;
+                postings.add(&tier);
+                HydrationOutcome {
+                    page: *page_fetch.lock().unwrap(),
+                    vectors: *vector_fetch_stats.lock().unwrap(),
+                    postings,
+                    rounds: hydration.rounds + tier.rounds,
+                    bytes_fetched: hydration.bytes_fetched + tier.ranged_bytes,
+                    ..hydration
+                }
             };
             obs.s3_bytes.set(hydration.s3_bytes());
             state.metrics.record_search_phases(
