@@ -2412,6 +2412,7 @@ fn score_field_query(
     params: Bm25Params,
     combined: &Bm25Scorer,
     rejected: &dyn Fn(u32) -> bool,
+    span_fetch: Option<VectorSpanFetch<'_>>,
 ) -> Result<HashMap<u32, f64>, KoshaError> {
     let Some(field_index) = reader.field_index() else {
         return Ok(HashMap::new());
@@ -2464,6 +2465,10 @@ fn score_field_query(
         });
     }
 
+    let _tier_holds = reader.fetch_tier_tails(
+        slots.values().flatten().map(|(_, key)| key.as_str()),
+        span_fetch,
+    );
     let mut matched: Option<HashMap<u32, f64>> = None;
     for keys in slots.values() {
         let mut slot_scores: HashMap<u32, f64> = HashMap::new();
@@ -5681,6 +5686,10 @@ impl Searcher {
         let field_query = analysis
             .fields()
             .filter(|_| analysis.has_text() && !is_wildcard_mode && reader.field_index().is_some());
+        let restricted_phrase = analysis
+            .phrase_fields()
+            .zip(query.match_phrase.as_ref())
+            .zip(reader.field_index());
         let _tier_holds = if reader.is_tiered() && (has_query || multi_reading) {
             if self.two_tier_exact
                 && !multi_reading
@@ -5699,12 +5708,12 @@ impl Searcher {
                     return Ok(Some(output));
                 }
             }
-            if query.fuzzy.is_some() {
-                None
-            } else if field_query.is_some() || multi_reading {
-                let terms = analysis.union_terms([reader.footer().analysis.as_ref()]);
-                Some(reader.fetch_tier_tails(terms.iter().map(String::as_str), vector_fetch))
-            } else if !missing_required_term {
+            if query.fuzzy.is_none()
+                && field_query.is_none()
+                && restricted_phrase.is_none()
+                && !multi_reading
+                && !missing_required_term
+            {
                 let terms = phrase_tokenized.unwrap_or(&effective_terms);
                 Some(reader.fetch_tier_tails(terms.iter().map(String::as_str), vector_fetch))
             } else {
@@ -5742,6 +5751,7 @@ impl Searcher {
                 params.clone(),
                 &scorer,
                 &rejected,
+                vector_fetch,
             )?;
             for (doc_seq, score) in scored {
                 if reader.doc_meta(doc_seq).is_some() {
@@ -6532,6 +6542,9 @@ impl Searcher {
                                  scorer: &Bm25Scorer,
                                  lengths: Option<&[u32]>|
              -> Result<HashMap<u32, f64>, KoshaError> {
+                let _tier_holds = (multi_reading || restricted_phrase.is_some()).then(|| {
+                    reader.fetch_tier_tails(terms_for_bm25.iter().map(String::as_str), vector_fetch)
+                });
                 let length_of = |doc_seq: u32, combined: u32| -> u32 {
                     match lengths {
                         Some(lengths) => lengths.get(doc_seq as usize).copied().unwrap_or(0),
@@ -6739,10 +6752,6 @@ impl Searcher {
 
                 Ok(scored)
             };
-            let restricted_phrase = analysis
-                .phrase_fields()
-                .zip(query.match_phrase.as_ref())
-                .zip(reader.field_index());
             let scored = if let Some(((phrase_fields, mp), field_index)) = restricted_phrase {
                 // A phrase restricted to fields (#249): matched in each
                 // field's own postings, read with that field's chain and

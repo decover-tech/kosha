@@ -218,6 +218,29 @@ fn tiered_search_certifies_or_fetches_and_matches_full_postings() {
     .unwrap();
     let cold = Searcher::new(root.join("tiered")).with_two_tier_exact(true);
     assert!(cold.search(&ns, &manifest, &needs_tail, None).is_err());
+    for (body, fetch_count) in [
+        (
+            serde_json::json!({"query_text": "flat", "fields": ["t"]}),
+            0,
+        ),
+        (
+            serde_json::json!({"query_text": "", "match_phrase": {"field": "t", "phrase": "strong flat"}}),
+            0,
+        ),
+        (
+            serde_json::json!({"query_text": "flat", "fields": ["t", "_all"]}),
+            1,
+        ),
+    ] {
+        let query: SearchQuery = serde_json::from_value(body).unwrap();
+        let expected = oracle.search(&ns, &manifest, &query, None).unwrap();
+        let (actual, _) = cold
+            .search_with_hydrators(&ns, &manifest, &query, None, None, Some(&fetch))
+            .unwrap();
+        assert!(!expected.results.is_empty());
+        assert_eq!(fetched.swap(0, Ordering::Relaxed), fetch_count);
+        assert_eq!(scores(&actual), scores(&expected));
+    }
     std::fs::remove_dir_all(root).unwrap();
 }
 
