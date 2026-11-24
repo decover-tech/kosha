@@ -12,7 +12,8 @@
 //!
 //! Creating, rotating and revoking a tenant key each append a row to
 //! `kosha.audit_log` (migration 006, #345) in the transaction that makes
-//! the change, with the operator as the actor: these back the operator's
+//! the change, with the admin credential's holder (`operator` or
+//! `operator:<name>`) as the actor: these back the operator's
 //! `/v1/admin/api-keys` routes. Keys created through the organization
 //! console are audited by `orgs::create_api_key`.
 
@@ -159,6 +160,7 @@ fn issued_detail(issued: &IssuedApiKey) -> serde_json::Value {
 /// transaction that makes the change, so neither exists without the other.
 async fn audit<'e, E>(
     executor: E,
+    actor: &str,
     action: &str,
     tenant_id: &str,
     detail: &serde_json::Value,
@@ -169,9 +171,10 @@ where
     sqlx::query(
         "INSERT INTO kosha.audit_log (org_id, actor, action, target_type, target_id, detail) \
          VALUES ((SELECT org_id FROM kosha.tenants WHERE tenant_id = $1), \
-                 'operator', $2, 'tenant', $1, $3)",
+                 $2, $3, 'tenant', $1, $4)",
     )
     .bind(tenant_id)
+    .bind(actor)
     .bind(action)
     .bind(detail.to_string())
     .execute(executor)
@@ -264,6 +267,19 @@ async fn rotate(
     }))
 }
 
+/// Serialize changes to one operator's credentials (create, rotate,
+/// revoke-by-name) across pods, for the rest of `tx`.
+async fn lock_operator(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(tenant_id)
+        .execute(&mut **tx)
+        .await
+        .map(|_| ())
+}
+
 /// Append the audit row of a change to the operator `name`'s credentials.
 async fn audit_operator(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -315,15 +331,16 @@ impl PgStore {
     }
 
     /// Create a key. Only its hash is stored; the returned `api_key` is the
-    /// one chance to see the key. Audited as `api_key.created` by the
-    /// operator, in the same transaction.
-    pub fn create_api_key(&self, new: &NewApiKey) -> Result<IssuedApiKey, KoshaError> {
+    /// one chance to see the key. Audited as `api_key.created` by `actor`
+    /// (an audit label such as `operator` or `operator:alice`), in the same
+    /// transaction.
+    pub fn create_api_key(&self, new: &NewApiKey, actor: &str) -> Result<IssuedApiKey, KoshaError> {
         let (pool, rt) = self.pool_and_runtime();
         rt.block_on(async {
             let mut tx = pool.begin().await?;
             let issued = insert(&mut *tx, new).await?;
             let detail = issued_detail(&issued);
-            audit(&mut *tx, "api_key.created", &new.tenant_id, &detail).await?;
+            audit(&mut *tx, actor, "api_key.created", &new.tenant_id, &detail).await?;
             tx.commit().await?;
             Ok::<_, sqlx::Error>(issued)
         })
@@ -374,9 +391,8 @@ impl PgStore {
 
     /// Revoke the tenant key with this hash. `false` when there is no such
     /// active key. Servers stop accepting it on their next key refresh.
-    /// Audited as `api_key.revoked` by the operator, in the same
-    /// transaction.
-    pub fn revoke_api_key(&self, key_hash: &str) -> Result<bool, KoshaError> {
+    /// Audited as `api_key.revoked` by `actor`, in the same transaction.
+    pub fn revoke_api_key(&self, key_hash: &str, actor: &str) -> Result<bool, KoshaError> {
         let (pool, rt) = self.pool_and_runtime();
         let sql = format!(
             "UPDATE kosha.api_keys SET revoked_at = NOW() \
@@ -397,7 +413,7 @@ impl PgStore {
                 "key_id_prefix": key_id_prefix(key_hash),
                 "description": description,
             });
-            audit(&mut *tx, "api_key.revoked", &tenant_id, &detail).await?;
+            audit(&mut *tx, actor, "api_key.revoked", &tenant_id, &detail).await?;
             tx.commit().await?;
             Ok::<_, sqlx::Error>(true)
         })
@@ -410,13 +426,13 @@ impl PgStore {
     /// `overlap_secs` more seconds. The overlap never extends the old key:
     /// one that already expires sooner keeps its earlier expiry. `None`
     /// when there is no such key, or it is revoked or already expired.
-    /// Audited as `api_key.rotated` by the operator, in the same
-    /// transaction.
+    /// Audited as `api_key.rotated` by `actor`, in the same transaction.
     pub fn rotate_api_key(
         &self,
         key_hash: &str,
         overlap_secs: u64,
         new_expires_at: Option<i64>,
+        actor: &str,
     ) -> Result<Option<RotatedApiKey>, KoshaError> {
         let (pool, rt) = self.pool_and_runtime();
         rt.block_on(async {
@@ -439,7 +455,7 @@ impl PgStore {
                 "expires_at": rotated.old_expires_at,
             });
             let tenant_id = &rotated.new.record.tenant_id;
-            audit(&mut *tx, "api_key.rotated", tenant_id, &detail)
+            audit(&mut *tx, actor, "api_key.rotated", tenant_id, &detail)
                 .await
                 .map_err(db_error)?;
             tx.commit().await.map_err(db_error)?;
@@ -469,11 +485,7 @@ impl PgStore {
         rt.block_on(async {
             let mut tx = pool.begin().await.map_err(db_error)?;
             // Two creates for one name must not both find it free.
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-                .bind(&tenant_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(db_error)?;
+            lock_operator(&mut tx, &tenant_id).await.map_err(db_error)?;
             let taken: Option<(i32,)> = sqlx::query_as(
                 "SELECT 1 FROM kosha.api_keys \
                  WHERE tenant_id = $1 AND revoked_at IS NULL \
@@ -542,6 +554,11 @@ impl PgStore {
         );
         rt.block_on(async {
             let mut tx = pool.begin().await.map_err(db_error)?;
+            // Offboarding must not miss a replacement a concurrent rotation
+            // is inserting: wait for it to commit, then revoke it too.
+            if let Some(tenant_id) = &tenant_id {
+                lock_operator(&mut tx, tenant_id).await.map_err(db_error)?;
+            }
             let rows: Vec<(String, String)> = sqlx::query_as(&sql)
                 .bind(key_hash)
                 .bind(tenant_id)
@@ -578,8 +595,23 @@ impl PgStore {
         actor: &str,
     ) -> Result<Option<RotatedApiKey>, KoshaError> {
         let (pool, rt) = self.pool_and_runtime();
+        let owner = format!(
+            "SELECT tenant_id FROM kosha.api_keys WHERE {KEY_HASH} = $1 AND {}",
+            Kind::Operator.condition()
+        );
         rt.block_on(async {
             let mut tx = pool.begin().await.map_err(db_error)?;
+            // Take the operator's lock before the row's, as revoke-by-name
+            // does, so an offboarding revoke sees this replacement.
+            let tenant_id: Option<(String,)> = sqlx::query_as(&owner)
+                .bind(key_hash)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_error)?;
+            let Some((tenant_id,)) = tenant_id else {
+                return Ok(None);
+            };
+            lock_operator(&mut tx, &tenant_id).await.map_err(db_error)?;
             let Some(rotated) = rotate(
                 &mut tx,
                 Kind::Operator,

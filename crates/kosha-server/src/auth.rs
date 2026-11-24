@@ -434,9 +434,11 @@ pub fn parse_bootstrap_admin_key_flag(value: Option<&str>) -> Result<bool, Strin
     match value.to_ascii_lowercase().as_str() {
         "" | "enabled" | "on" | "true" | "1" => Ok(true),
         "disabled" | "off" | "false" | "0" => Ok(false),
-        _ => Err(format!(
-            "invalid KOSHA_ADMIN_BOOTSTRAP_KEY '{value}' (expected 'enabled' or 'disabled')"
-        )),
+        // The value is not echoed: the likeliest mistake is putting the
+        // shared admin key itself here, and this message is logged.
+        _ => {
+            Err("invalid KOSHA_ADMIN_BOOTSTRAP_KEY (expected 'enabled' or 'disabled')".to_string())
+        }
     }
 }
 
@@ -1047,6 +1049,10 @@ mod tests {
         for flag in ["disable", "no", "yes", "2"] {
             let e = parse_bootstrap_admin_key_flag(Some(flag)).unwrap_err();
             assert!(e.contains("KOSHA_ADMIN_BOOTSTRAP_KEY"), "{e}");
+            assert!(
+                !e.contains(&format!("'{flag}'")),
+                "the value is echoed: {e}"
+            );
             assert_eq!(bootstrap_admin_key_from(Some("sk-admin"), Some(flag)), None);
         }
         // No key configured is no credential, whatever the flag.

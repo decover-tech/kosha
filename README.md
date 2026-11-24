@@ -858,9 +858,14 @@ Manage keys with the admin credential (`kosha admin ...` wraps these):
 | `POST /v1/admin/api-keys/scrub-plaintext` | Removes the plaintext that keys created before this feature still hold in the database |
 | `GET /v1/admin/api-keys/plaintext-count` | Read-only: `{"plaintext_rows": N, "scrub_due": true}`, the rows `scrub-plaintext` would rewrite. The server logs the same count at startup (`api keys: N row(s) still hold a plaintext key`) |
 
+`kosha admin create-api-key`, `list-api-keys`, `revoke-api-key`,
+`rotate-api-key`, `count-plaintext-api-keys` and `scrub-plaintext-api-keys`
+call them.
+
 Keys are stored as SHA-256 hashes; a key's `key_id` is that hash. Creating,
 rotating and revoking a key are recorded in the audit log, in the same
-transaction as the change; see [docs/organizations.md](docs/organizations.md#audit-log).
+transaction as the change, with the admin credential that made it as the actor
+(`operator`, or `operator:<name>`); see [docs/organizations.md](docs/organizations.md#audit-log).
 `last_used_at` is written about once per refresh interval, not per request.
 
 ### Operator admin credentials
@@ -882,6 +887,17 @@ its detail carries `"via": "operator:<name>"`.
 | `GET /v1/admin/operators` | List credentials that are not revoked: id, name, `expires_at`, `last_used_at`. No secrets |
 | `POST /v1/admin/operators/revoke` | `{"key_id"}` revokes one credential, `{"name"}` every credential of that operator. The pod that answers refuses them at once, the others within `KOSHA_API_KEY_REFRESH_SECS` |
 | `POST /v1/admin/operators/rotate` | `{"key_id", "overlap_secs": 86400}`. Issues a replacement for the same operator; the old credential keeps working for the overlap (default one day) |
+
+From the CLI: `kosha admin create-operator alice [--expires-in-secs N]`,
+`list-operators`, `revoke-operator <key_id>` or `revoke-operator --name alice`,
+and `rotate-operator <key_id> [--overlap-secs N]`. Revoking by name while that
+operator rotates cannot leave the replacement behind: the two are serialized
+per operator, and whichever runs second sees the other's result.
+
+A revocation reaches the other pods on their next successful key refresh. If a
+pod cannot reach Postgres, it keeps the credentials it last loaded (and logs
+the failed refresh) rather than locking every operator out, so a credential
+revoked during an outage keeps working on that pod until Postgres is back.
 
 Operator credentials are stored in the key registry like tenant keys (hashed,
 same expiry, rotation and refresh), but the two never mix: an operator

@@ -59,13 +59,16 @@ fn created_keys_are_stored_hashed_with_their_attributes() {
     let t = tenant("scoped");
     let expires = now() + 3600;
     let issued = store
-        .create_api_key(&NewApiKey {
-            tenant_id: t.clone(),
-            description: "read only".into(),
-            scopes: Scopes::of(&[Scope::Read]),
-            namespaces: Some(vec!["docs".into(), "wiki".into()]),
-            expires_at: Some(expires),
-        })
+        .create_api_key(
+            &NewApiKey {
+                tenant_id: t.clone(),
+                description: "read only".into(),
+                scopes: Scopes::of(&[Scope::Read]),
+                namespaces: Some(vec!["docs".into(), "wiki".into()]),
+                expires_at: Some(expires),
+            },
+            "operator",
+        )
         .unwrap();
     assert!(issued.api_key.starts_with("sk-"));
     assert_eq!(issued.record.key_hash, hash_api_key(&issued.api_key));
@@ -188,16 +191,19 @@ fn rotation_overlaps_then_the_old_key_expires() {
     let store = PgStore::new(&url()).unwrap();
     let t = tenant("rotate");
     let old = store
-        .create_api_key(&NewApiKey {
-            scopes: Scopes::of(&[Scope::Read, Scope::Write]),
-            namespaces: Some(vec!["docs".into()]),
-            ..full_access(&t)
-        })
+        .create_api_key(
+            &NewApiKey {
+                scopes: Scopes::of(&[Scope::Read, Scope::Write]),
+                namespaces: Some(vec!["docs".into()]),
+                ..full_access(&t)
+            },
+            "operator",
+        )
         .unwrap();
 
     let started = now();
     let rotated = store
-        .rotate_api_key(&old.record.key_hash, 600, None)
+        .rotate_api_key(&old.record.key_hash, 600, None, "operator")
         .unwrap()
         .expect("active key rotates");
     // The replacement carries the old key's attributes and is a new secret.
@@ -223,25 +229,30 @@ fn rotation_overlaps_then_the_old_key_expires() {
 
     // A second rotation of the old key cannot extend its life.
     let again = store
-        .rotate_api_key(&old.record.key_hash, 86_400, None)
+        .rotate_api_key(&old.record.key_hash, 86_400, None, "operator")
         .unwrap()
         .unwrap();
     assert_eq!(again.old_expires_at, rotated.old_expires_at);
 
     // A zero overlap retires the key at once; it can then not be rotated.
     let cut = store
-        .rotate_api_key(&rotated.new.record.key_hash, 0, Some(started + 7200))
+        .rotate_api_key(
+            &rotated.new.record.key_hash,
+            0,
+            Some(started + 7200),
+            "operator",
+        )
         .unwrap()
         .unwrap();
     assert_eq!(cut.new.record.expires_at, Some(started + 7200));
     assert_eq!(store.validate_api_key(&rotated.new.api_key), None);
     assert_eq!(store.validate_api_key(&cut.new.api_key), Some(t.clone()));
     assert!(store
-        .rotate_api_key(&rotated.new.record.key_hash, 600, None)
+        .rotate_api_key(&rotated.new.record.key_hash, 600, None, "operator")
         .unwrap()
         .is_none());
     assert!(store
-        .rotate_api_key(&hash_api_key("sk-never-issued"), 600, None)
+        .rotate_api_key(&hash_api_key("sk-never-issued"), 600, None, "operator")
         .unwrap()
         .is_none());
 }
@@ -251,22 +262,31 @@ fn rotation_overlaps_then_the_old_key_expires() {
 fn revoked_and_expired_keys_stop_validating() {
     let store = PgStore::new(&url()).unwrap();
     let t = tenant("revoke");
-    let live = store.create_api_key(&full_access(&t)).unwrap();
+    let live = store.create_api_key(&full_access(&t), "operator").unwrap();
     let expired = store
-        .create_api_key(&NewApiKey {
-            expires_at: Some(now() - 10),
-            ..full_access(&t)
-        })
+        .create_api_key(
+            &NewApiKey {
+                expires_at: Some(now() - 10),
+                ..full_access(&t)
+            },
+            "operator",
+        )
         .unwrap();
 
     assert_eq!(store.validate_api_key(&expired.api_key), None);
     // Expired keys stay listed (an operator can see them); revoked do not.
     assert_eq!(store.list_api_keys(Some(&t)).unwrap().len(), 2);
 
-    assert!(store.revoke_api_key(&live.record.key_hash).unwrap());
+    assert!(store
+        .revoke_api_key(&live.record.key_hash, "operator")
+        .unwrap());
     assert_eq!(store.validate_api_key(&live.api_key), None);
-    assert!(!store.revoke_api_key(&live.record.key_hash).unwrap());
-    assert!(!store.revoke_api_key(&hash_api_key("sk-unknown")).unwrap());
+    assert!(!store
+        .revoke_api_key(&live.record.key_hash, "operator")
+        .unwrap());
+    assert!(!store
+        .revoke_api_key(&hash_api_key("sk-unknown"), "operator")
+        .unwrap());
     let listed = store.list_api_keys(Some(&t)).unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].key_hash, expired.record.key_hash);
@@ -277,8 +297,8 @@ fn revoked_and_expired_keys_stop_validating() {
 fn last_used_only_moves_forward() {
     let store = PgStore::new(&url()).unwrap();
     let t = tenant("used");
-    let a = store.create_api_key(&full_access(&t)).unwrap();
-    let b = store.create_api_key(&full_access(&t)).unwrap();
+    let a = store.create_api_key(&full_access(&t), "operator").unwrap();
+    let b = store.create_api_key(&full_access(&t), "operator").unwrap();
     let last_used = |hash: &str| {
         store
             .list_api_keys(Some(&t))
@@ -405,7 +425,7 @@ fn operator_credentials_and_tenant_keys_never_mix() {
         .unwrap()
         .unwrap();
     let t = tenant("mixed");
-    let key = store.create_api_key(&full_access(&t)).unwrap();
+    let key = store.create_api_key(&full_access(&t), "operator").unwrap();
     let (credential_id, key_id) = (&credential.record.key_hash, &key.record.key_hash);
 
     // The tenant-key side does not see, validate, revoke or rotate an
@@ -417,9 +437,9 @@ fn operator_credentials_and_tenant_keys_never_mix() {
     assert!(tenant_keys
         .iter()
         .all(|k| !k.tenant_id.starts_with("_operator/")));
-    assert!(!store.revoke_api_key(credential_id).unwrap());
+    assert!(!store.revoke_api_key(credential_id, "operator").unwrap());
     assert!(store
-        .rotate_api_key(credential_id, 60, None)
+        .rotate_api_key(credential_id, 60, None, "operator")
         .unwrap()
         .is_none());
 
@@ -579,24 +599,33 @@ fn create_rotate_and_revoke_are_audited_without_secrets() {
     let t = tenant("audited");
     let expires = now() + 3600;
     let created = store
-        .create_api_key(&NewApiKey {
-            tenant_id: t.clone(),
-            description: "ci".into(),
-            scopes: Scopes::of(&[Scope::Read, Scope::Write]),
-            namespaces: Some(vec!["docs".into()]),
-            expires_at: Some(expires),
-        })
+        .create_api_key(
+            &NewApiKey {
+                tenant_id: t.clone(),
+                description: "ci".into(),
+                scopes: Scopes::of(&[Scope::Read, Scope::Write]),
+                namespaces: Some(vec!["docs".into()]),
+                expires_at: Some(expires),
+            },
+            "operator",
+        )
         .unwrap();
     let rotated = store
-        .rotate_api_key(&created.record.key_hash, 600, None)
+        .rotate_api_key(&created.record.key_hash, 600, None, "operator")
         .unwrap()
         .expect("active key");
-    assert!(store.revoke_api_key(&rotated.new.record.key_hash).unwrap());
-    // Changes that did not happen leave no row.
-    assert!(!store.revoke_api_key(&rotated.new.record.key_hash).unwrap());
-    assert!(!store.revoke_api_key(&hash_api_key("sk-unknown")).unwrap());
     assert!(store
-        .rotate_api_key(&hash_api_key("sk-unknown"), 600, None)
+        .revoke_api_key(&rotated.new.record.key_hash, "operator")
+        .unwrap());
+    // Changes that did not happen leave no row.
+    assert!(!store
+        .revoke_api_key(&rotated.new.record.key_hash, "operator")
+        .unwrap());
+    assert!(!store
+        .revoke_api_key(&hash_api_key("sk-unknown"), "operator")
+        .unwrap());
+    assert!(store
+        .rotate_api_key(&hash_api_key("sk-unknown"), 600, None, "operator")
         .unwrap()
         .is_none());
 
@@ -668,4 +697,77 @@ fn create_rotate_and_revoke_are_audited_without_secrets() {
             assert!(!detail.contains(secret.as_str()), "{detail}");
         }
     }
+}
+
+/// Offboarding while the operator rotates: whichever commits first, the
+/// operator is left with no usable credential (a replacement inserted by a
+/// concurrent rotation is revoked too).
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn revoking_an_operator_by_name_races_rotation_safely() {
+    use kosha_control::api_keys::operator_name;
+    use kosha_control::OperatorCredentials;
+    use std::sync::Barrier;
+    let rotating = PgStore::new(&url()).unwrap();
+    let revoking = PgStore::new(&url()).unwrap();
+    for round in 0..20 {
+        let name = operator(&format!("racer{round}"));
+        let issued = rotating
+            .create_operator_credential(&name, "", None, "operator")
+            .unwrap()
+            .unwrap();
+        let barrier = Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                rotating
+                    .rotate_operator_credential(&issued.record.key_hash, 600, None, "operator")
+                    .unwrap();
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                revoking
+                    .revoke_operator_credentials(OperatorCredentials::Operator(&name), "operator")
+                    .unwrap();
+            });
+        });
+        let left: Vec<_> = revoking
+            .list_operator_credentials()
+            .unwrap()
+            .into_iter()
+            .filter(|c| operator_name(&c.tenant_id) == Some(name.as_str()))
+            .collect();
+        assert!(left.is_empty(), "round {round}: {left:?}");
+    }
+}
+
+/// Tenant-key changes name the admin credential that made them.
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn tenant_key_changes_are_audited_with_the_named_operator() {
+    let store = PgStore::new(&url()).unwrap();
+    let t = tenant("named-actor");
+    let created = store
+        .create_api_key(&full_access(&t), "operator:alice")
+        .unwrap();
+    let rotated = store
+        .rotate_api_key(&created.record.key_hash, 600, None, "operator:bob")
+        .unwrap()
+        .expect("active key");
+    assert!(store
+        .revoke_api_key(&rotated.new.record.key_hash, "operator")
+        .unwrap());
+    let rows: Vec<(String, String)> = sql(
+        "SELECT actor, action FROM kosha.audit_log WHERE target_id = $1 ORDER BY id",
+        &[&t],
+    );
+    let rows: Vec<(&str, &str)> = rows.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    assert_eq!(
+        rows,
+        [
+            ("operator:alice", "api_key.created"),
+            ("operator:bob", "api_key.rotated"),
+            ("operator", "api_key.revoked"),
+        ]
+    );
 }

@@ -513,13 +513,16 @@ fn booting_twice_on_one_database_creates_every_table_once() {
     // Rows written between the boots survive the second one.
     let tenant = format!("boot-{}", uuid::Uuid::new_v4());
     let key = first
-        .create_api_key(&kosha_control::NewApiKey {
-            tenant_id: tenant.clone(),
-            description: "kept".to_string(),
-            scopes: kosha_control::Scopes::ALL,
-            namespaces: None,
-            expires_at: None,
-        })
+        .create_api_key(
+            &kosha_control::NewApiKey {
+                tenant_id: tenant.clone(),
+                description: "kept".to_string(),
+                scopes: kosha_control::Scopes::ALL,
+                namespaces: None,
+                expires_at: None,
+            },
+            "operator",
+        )
         .unwrap();
     drop(first);
     let second = PgStore::new(&fresh).unwrap();
@@ -840,12 +843,12 @@ fn postgres_records_namespace_and_tenant_deletions() {
         expires_at: None,
     };
     let key = store
-        .create_api_key(&new_key(&tenant, "to delete"))
+        .create_api_key(&new_key(&tenant, "to delete"), "operator")
         .unwrap()
         .api_key;
     let other_tenant = format!("{tenant}-other");
     let other_key = store
-        .create_api_key(&new_key(&other_tenant, "kept"))
+        .create_api_key(&new_key(&other_tenant, "kept"), "operator")
         .unwrap()
         .api_key;
     assert_eq!(

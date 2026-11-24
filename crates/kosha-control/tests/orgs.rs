@@ -716,13 +716,16 @@ mod postgres {
         // A key for a tenant no organization knows about, made the old way.
         let legacy_tenant = names.slug("legacy");
         let legacy_key = store
-            .create_api_key(&kosha_control::NewApiKey {
-                tenant_id: legacy_tenant.clone(),
-                description: "pre-orgs".to_string(),
-                scopes: kosha_control::Scopes::ALL,
-                namespaces: None,
-                expires_at: None,
-            })
+            .create_api_key(
+                &kosha_control::NewApiKey {
+                    tenant_id: legacy_tenant.clone(),
+                    description: "pre-orgs".to_string(),
+                    scopes: kosha_control::Scopes::ALL,
+                    namespaces: None,
+                    expires_at: None,
+                },
+                "operator",
+            )
             .unwrap()
             .api_key;
 
@@ -746,7 +749,7 @@ mod postgres {
             namespaces: Some(vec!["docs".to_string()]),
             expires_at: Some(4_102_444_800),
         };
-        let unlinked = store.create_api_key(&operator_key).unwrap();
+        let unlinked = store.create_api_key(&operator_key, "operator").unwrap();
         orgs::link_tenant(&store, &Actor::Operator, &f.org, Some(&legacy_tenant), None).unwrap();
         for key in [&legacy_key, &unlinked.api_key] {
             assert_eq!(store.validate_api_key(key), Some(legacy_tenant.clone()));
@@ -758,7 +761,7 @@ mod postgres {
             .any(|k| k.key_hash == kosha_control::hash_api_key(&legacy_key)));
         // The key made before the link was audited with no organization, so
         // it is not in this organization's log; one made after is.
-        let linked = store.create_api_key(&operator_key).unwrap();
+        let linked = store.create_api_key(&operator_key, "operator").unwrap();
         let log = orgs::list_audit(&store, &f.owner, &f.org, None, None).unwrap();
         let created: Vec<_> = log
             .iter()

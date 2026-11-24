@@ -301,6 +301,31 @@ impl Client {
         self.request(Method::POST, "/v1/admin/api-keys/scrub-plaintext", None)
     }
 
+    /// `POST /v1/admin/operators`.
+    pub fn create_operator_credential(&self, body: Value) -> Result<Value, RequestError> {
+        self.request(Method::POST, "/v1/admin/operators", Some(body))
+    }
+
+    /// `GET /v1/admin/operators`.
+    pub fn list_operator_credentials(&self) -> Result<Value, RequestError> {
+        self.request(Method::GET, "/v1/admin/operators", None)
+    }
+
+    /// `POST /v1/admin/operators/revoke`.
+    pub fn revoke_operator_credentials(&self, body: Value) -> Result<Value, RequestError> {
+        self.request(Method::POST, "/v1/admin/operators/revoke", Some(body))
+    }
+
+    /// `POST /v1/admin/operators/rotate`.
+    pub fn rotate_operator_credential(&self, body: Value) -> Result<Value, RequestError> {
+        self.request(Method::POST, "/v1/admin/operators/rotate", Some(body))
+    }
+
+    /// `GET /v1/admin/api-keys/plaintext-count`.
+    pub fn count_plaintext_api_keys(&self) -> Result<Value, RequestError> {
+        self.request(Method::GET, "/v1/admin/api-keys/plaintext-count", None)
+    }
+
     pub fn curl(
         &self,
         method: Method,

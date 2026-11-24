@@ -326,7 +326,7 @@ mod tests {
             source: Some((include_str!("billing.rs"), "\npub(crate) fn route(")),
         },
         Delegate {
-            call: "api_key_admin::handle(request_line, body)",
+            call: "api_key_admin::handle(request_line, body, || admin_label(headers, state))",
             routes: &[
                 ("POST", "/v1/admin/api-keys"),
                 ("GET", "/v1/admin/api-keys"),

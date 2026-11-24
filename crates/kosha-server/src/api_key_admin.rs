@@ -24,7 +24,9 @@
 //! a `key_id` is expected, `{"api_key": "<the key>"}` works too.
 //!
 //! Create, rotate and revoke are audited (#345): the registry writes the
-//! `kosha.audit_log` row in the transaction that makes the change.
+//! `kosha.audit_log` row in the transaction that makes the change, naming
+//! the admin credential's holder (`operator`, or `operator:<name>` for an
+//! operator credential) as the actor.
 
 use crate::{
     api_error, api_error_status, valid_namespace_component, valid_new_key_tenant_id, ErrorCode,
@@ -55,7 +57,12 @@ enum Action {
 }
 
 /// Answer an `/v1/admin/api-keys` request; `None` for any other route.
-pub(crate) fn handle(request_line: &str, body: &[u8]) -> Option<String> {
+/// `actor` gives the audit label of the admin credential's holder.
+pub(crate) fn handle(
+    request_line: &str,
+    body: &[u8],
+    actor: impl FnOnce() -> String,
+) -> Option<String> {
     let (method, path) = crate::parse_method_and_path(request_line)?;
     let (bare, query) = path.split_once('?').unwrap_or((path, ""));
     let sub = bare.strip_prefix("/v1/admin/api-keys")?;
@@ -66,7 +73,7 @@ pub(crate) fn handle(request_line: &str, body: &[u8]) -> Option<String> {
         Ok(action) => action,
         Err((status, message)) => return Some(api_error_status(status, &message)),
     };
-    Some(execute(action))
+    Some(execute(action, &actor()))
 }
 
 pub(crate) type Rejection = (u16, String);
@@ -238,7 +245,7 @@ fn record_json(record: &ApiKeyRecord, now: i64) -> serde_json::Value {
 }
 
 #[cfg(not(feature = "postgres"))]
-fn execute(_action: Action) -> String {
+fn execute(_action: Action, _actor: &str) -> String {
     api_error(
         ErrorCode::NotImplemented,
         "admin API requires postgres feature (compile with --features postgres)",
@@ -246,7 +253,7 @@ fn execute(_action: Action) -> String {
 }
 
 #[cfg(feature = "postgres")]
-fn execute(action: Action) -> String {
+fn execute(action: Action, actor: &str) -> String {
     use crate::{auth, json_ok};
     let auth::Auth::Keys(store) = auth::global() else {
         return api_error(
@@ -273,7 +280,7 @@ fn execute(action: Action) -> String {
         value
     };
     match action {
-        Action::Create(new) => match pg.create_api_key(&new) {
+        Action::Create(new) => match pg.create_api_key(&new, actor) {
             Ok(issued) => {
                 // Usable on this pod right away; other pods pick it up on
                 // their next key refresh.
@@ -289,7 +296,7 @@ fn execute(action: Action) -> String {
             }
             Err(e) => api_error(ErrorCode::Internal, &format!("failed to list keys: {e}")),
         },
-        Action::Revoke { key_hash } => match pg.revoke_api_key(&key_hash) {
+        Action::Revoke { key_hash } => match pg.revoke_api_key(&key_hash, actor) {
             Ok(true) => {
                 store.remove_db_key(&key_hash);
                 json_ok(&serde_json::json!({ "revoked": true, "key_id": key_hash }))
@@ -301,7 +308,7 @@ fn execute(action: Action) -> String {
             key_hash,
             overlap_secs,
             expires_at,
-        } => match pg.rotate_api_key(&key_hash, overlap_secs, expires_at) {
+        } => match pg.rotate_api_key(&key_hash, overlap_secs, expires_at, actor) {
             Ok(Some(rotated)) => {
                 store.upsert_db_key(rotated.new.record.clone());
                 // The old key keeps its attributes and gains the deadline.
@@ -498,8 +505,15 @@ mod tests {
         assert_eq!(post("/nope", "{}").unwrap_err().0, 404);
         assert_eq!(parse("DELETE", "", "", b"", NOW).unwrap_err().0, 404);
         // Not an api-keys route at all.
-        assert_eq!(handle("POST /v1/admin/api-keysx HTTP/1.1", b"{}"), None);
-        assert_eq!(handle("POST /v1/admin/gc HTTP/1.1", b"{}"), None);
+        assert_eq!(
+            handle("POST /v1/admin/api-keysx HTTP/1.1", b"{}", || "operator"
+                .into()),
+            None
+        );
+        assert_eq!(
+            handle("POST /v1/admin/gc HTTP/1.1", b"{}", || "operator".into()),
+            None
+        );
     }
 
     #[test]

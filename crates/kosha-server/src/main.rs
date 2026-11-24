@@ -7752,6 +7752,12 @@ fn admin_actor(
     admin_actor_in(headers, state.admin_auth_key.as_deref(), auth::global())
 }
 
+/// The audit label of the request's admin credential holder: `operator`
+/// for the shared key, `operator:<name>` for an operator credential.
+fn admin_label(headers: &HashMap<String, String>, state: &AppState) -> String {
+    admin_actor(headers, state).map_or_else(|| "operator".to_string(), |a| a.label())
+}
+
 /// A tenant id as presented on a request: non-empty, not `.` or `..`, and
 /// free of separators and control characters.
 fn valid_name_component(name: &str) -> bool {
@@ -8050,7 +8056,7 @@ fn legacy_route_disabled(path: &str) -> String {
 
 fn route_inner(
     request_line: &str,
-    _headers: &HashMap<String, String>,
+    headers: &HashMap<String, String>,
     body: &[u8],
     tenant: &str,
     state: &AppState,
@@ -8154,7 +8160,9 @@ fn route_inner(
     }
 
     // ── Admin routes (Postgres-backed only) ────────────────────────────────
-    if let Some(response) = api_key_admin::handle(request_line, body) {
+    if let Some(response) =
+        api_key_admin::handle(request_line, body, || admin_label(headers, state))
+    {
         return response;
     }
 

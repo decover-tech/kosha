@@ -208,8 +208,12 @@ fn invalid_bootstrap_key_switch_refuses_to_start() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
     assert!(
-        stderr.contains("FATAL: invalid KOSHA_ADMIN_BOOTSTRAP_KEY 'disable'"),
+        stderr.contains("FATAL: invalid KOSHA_ADMIN_BOOTSTRAP_KEY (expected"),
         "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("disable'"),
+        "the value is echoed: {stderr}"
     );
 }
 
@@ -521,7 +525,7 @@ mod scoped_keys {
         // Revoked elsewhere (another pod, or SQL): refused within the
         // refresh interval.
         let registry = kosha_control::PgStore::new(&database_url).unwrap();
-        assert!(registry.revoke_api_key(&full_id).unwrap());
+        assert!(registry.revoke_api_key(&full_id, "operator").unwrap());
         eventually("a revocation made elsewhere to arrive", || {
             status(port, "GET", &stats, &full, None) == 401
         });
