@@ -463,8 +463,15 @@ fn s3_endpoint_in_effect(get: impl Fn(&str) -> Option<String>) -> Option<(&'stat
 /// Keys and values are decoded the way the client decodes them
 /// (`application/x-www-form-urlencoded`: `%XX` and `+`), and values are not
 /// trimmed. Otherwise `?sslmode=require&ssl%2Dmode=disable` would pass the
-/// check as `require` while the client connects with `disable`.
+/// check as `require` while the client connects with `disable`. Like the
+/// client's URL parser, leading/trailing controls and spaces and every tab
+/// or newline are dropped first.
 fn database_url_ssl_mode(url: &str) -> Option<String> {
+    let url: String = url
+        .trim_matches(|c: char| c <= ' ')
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
     let (_, query) = url.split_once('?')?;
     let query = query.split('#').next().unwrap_or(query);
     form_urlencoded::parse(query.as_bytes())
@@ -851,6 +858,8 @@ mod tests {
             ("?sslmode=require%20", Some("require ")),
             ("?sslmode=require#sslmode=disable", Some("require")),
             ("?application_name=a%26sslmode%3Ddisable", None),
+            ("?sslmode=require\n", Some("require")),
+            ("?sslmode=req\r\nuire\t ", Some("require")),
         ] {
             assert_eq!(
                 database_url_ssl_mode(&url(query)).as_deref(),
