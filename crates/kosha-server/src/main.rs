@@ -502,8 +502,8 @@ struct AppState {
     /// `warm` and `warm_run`.
     warming: warm_run::Warming,
     /// `KOSHA_INGEST_HOST` — set only on query-role pods (deployment-query.yaml).
-    /// When present, write-path requests this pod receives are forwarded here
-    /// instead of executed locally — see `is_write_path`/`forward_to_ingest`.
+    /// When present, writes and writer-backed reads are forwarded here
+    /// instead of executed locally — see `is_ingest_path`/`forward_to_ingest`.
     /// `None` on the ingest pod itself, which never forwards.
     ingest_host: Option<String>,
     /// Built once, lazily, only when `ingest_host` is set — no cost on the
@@ -6903,11 +6903,8 @@ fn dispatch_authenticated(
     started: Instant,
 ) -> http::Response {
     // ── Query/ingest role routing ────────────────────────────────────────
-    // A query-role pod (KOSHA_INGEST_HOST set) forwards write-path requests
-    // to the single ingest pod instead of executing them locally — see
-    // is_write_path/forward_to_ingest. Every other request (all reads, and
-    // everything on the ingest pod itself, which never forwards) is handled
-    // locally exactly as before this existed.
+    // A query-role pod forwards writes and reads of writer-local state
+    // to the ingest pod; all other requests are handled locally.
     // ── Billing gate (#349) ──────────────────────────────────────────────
     // Ahead of the role routing, so a query pod refuses a blocked write
     // itself instead of forwarding it.
@@ -6934,7 +6931,7 @@ fn dispatch_authenticated(
                  /v1/admin/compact* and /v1/admin/compaction-*",
             ))
         }
-        (Ok(_), Some(ingest_host), Some(client)) if is_write_path(request_line) => {
+        (Ok(_), Some(ingest_host), Some(client)) if is_ingest_path(request_line) => {
             http::Response::from_raw(forward_to_ingest(
                 client,
                 ingest_host,
@@ -7074,13 +7071,7 @@ fn tenant_is_limited(state: &AppState, tenant: &str) -> bool {
 /// (its [`routes::ROUTES`] row), and the legacy `POST /search` and
 /// `GET /search?...`.
 fn is_search_route(request_line: &str) -> bool {
-    if let Some(route) = routes::lookup_line(request_line) {
-        return route.class == routes::Class::Search;
-    }
-    matches!(
-        legacy_route(request_line),
-        Some(("POST" | "GET", "/search"))
-    )
+    request_route_class(request_line) == routes::Class::Search
 }
 
 /// The response for a request refused by a tenant limit (#341, #350): its
@@ -7561,24 +7552,27 @@ fn unauthenticated(message: &str) -> String {
         .into_raw()
 }
 
-/// True for every write-mutating route — the set a query pod forwards to
-/// `KOSHA_INGEST_HOST` instead of handling locally. False for read-only
-/// routes (search/exists/stats/healthz), which every pod always handles
-/// itself.
-///
-/// `/v1` routes are classified by their row in [`routes::ROUTES`] (#350),
-/// the same table `route()` admits them by, so the two cannot drift. Only
-/// the legacy unversioned routes are matched here by hand, exactly.
-fn is_write_path(request_line: &str) -> bool {
+fn request_route_class(request_line: &str) -> routes::Class {
+    use routes::Class::{Read, Search, Write, WriterRead};
     if let Some(route) = routes::lookup_line(request_line) {
-        return matches!(
-            route.class,
-            routes::Class::Write | routes::Class::WriterRead
-        );
+        return route.class;
     }
+    match legacy_route(request_line) {
+        Some(("POST", "/index" | "/replace" | "/flush" | "/delete")) => Write,
+        Some(("POST", "/exists")) => WriterRead,
+        Some(("POST" | "GET", "/search")) => Search,
+        _ => Read,
+    }
+}
+
+fn is_write_path(request_line: &str) -> bool {
+    request_route_class(request_line) == routes::Class::Write
+}
+
+fn is_ingest_path(request_line: &str) -> bool {
     matches!(
-        legacy_route(request_line),
-        Some(("POST", "/index" | "/replace" | "/flush" | "/delete"))
+        request_route_class(request_line),
+        routes::Class::Write | routes::Class::WriterRead
     )
 }
 
@@ -7600,7 +7594,7 @@ fn legacy_route(request_line: &str) -> Option<(&str, &'static str)> {
     Some((method, path))
 }
 
-/// Forward a write-path request to the single ingest pod, verbatim, and
+/// Forward a writer-routed request to the single ingest pod, verbatim, and
 /// relay its response back as received: status (with its correct reason
 /// phrase), body, and the headers that are part of the API contract
 /// ([`RELAYED_HEADERS`]: `Retry-After`, `X-Request-Id`, `Allow`, the
@@ -9496,9 +9490,11 @@ fn add_manifest_follow_stats(state: &AppState, ns: &NamespaceId, entry: &mut ser
     let status = state.manifest_follow.status(ns);
     let lag = state.manifest_follow.lag(ns, Instant::now());
     entry["stored_manifest_version"] = serde_json::json!(status.as_ref().map(|s| s.stored_version));
-    entry["last_refresh_at"] = serde_json::json!(status
-        .as_ref()
-        .map(|s| manifest_follow::unix_seconds(s.last_refresh_at)));
+    entry["last_refresh_at"] = serde_json::json!(status.as_ref().map(|s| s
+        .last_refresh_at
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()));
     entry["manifest_lag_seconds"] = serde_json::json!(lag.map(|d| d.as_secs_f64()));
 }
 
@@ -14561,7 +14557,7 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(entry["manifest_version"], published);
-        assert!(entry["last_refresh_at"].as_f64().unwrap() > 0.0);
+        assert!(entry["last_refresh_at"].as_i64().unwrap() > 0);
         assert!(entry["manifest_lag_seconds"].as_f64().unwrap() < 5.0);
         assert_eq!(stats["manifest_refresh"]["enabled"], true);
         assert_eq!(stats["manifest_refresh"]["interval_ms"], 20);
@@ -18549,8 +18545,7 @@ mod tests {
     }
 
     /// Every write route `route()` actually dispatches to a mutating
-    /// handler must also be classified `true` here — this is the drift risk
-    /// called out in `is_write_path`'s own doc comment. If this test starts
+    /// handler must also be classified `true` here. If this test starts
     /// failing after adding a new write route to `route()`, that's the
     /// signal to update `is_write_path` too, not to weaken this test.
     #[test]
@@ -18567,8 +18562,6 @@ mod tests {
             "POST /v1/admin/rebuild-filter-blooms HTTP/1.1\r\n",
             "POST /v1/admin/backfill-offset-tables HTTP/1.1\r\n",
             "POST /v1/admin/compact-namespace HTTP/1.1\r\n",
-            "GET /v1/admin/compaction-status HTTP/1.1\r\n",
-            "GET /v1/admin/compaction-jobs/cj-1-1 HTTP/1.1\r\n",
             "POST /index HTTP/1.1\r\n",
             "POST /replace HTTP/1.1\r\n",
             "POST /flush HTTP/1.1\r\n",
@@ -18831,6 +18824,8 @@ mod tests {
             "GET /healthz HTTP/1.1\r\n",
             "POST /v1/namespaces/foo/search HTTP/1.1\r\n",
             "POST /v1/namespaces/foo/exists HTTP/1.1\r\n",
+            "GET /v1/admin/compaction-status HTTP/1.1\r\n",
+            "GET /v1/admin/compaction-jobs/cj-1-1 HTTP/1.1\r\n",
             "GET /v1/stats HTTP/1.1\r\n",
             "GET /v1/namespaces/foo/stats HTTP/1.1\r\n",
             "GET /v1/namespaces/foo/schema HTTP/1.1\r\n",
