@@ -6,11 +6,6 @@ import csv
 from collections import defaultdict
 from pathlib import Path
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
 
 def scans(row):
     return float(row["mean_scanned"])
@@ -30,15 +25,26 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--target", type=float, default=0.95)
     args = parser.parse_args()
-    curves = defaultdict(lambda: defaultdict(list))
+    curves = {}
     for path in args.csv:
+        panels = defaultdict(lambda: defaultdict(list))
         with path.open(newline="") as f:
             for row in csv.DictReader(f):
                 panel = (row["dataset"], row["layout"], row["encoding"])
                 variant = (row["assignment"], row["max_copies"], row["spill_fraction"])
-                curves[panel][variant].append(row)
+                panels[panel][variant].append(row)
+        overlap = curves.keys() & panels.keys()
+        if overlap:
+            names = ", ".join(" / ".join(panel) for panel in sorted(overlap))
+            parser.error(f"{path}: panels already supplied by another CSV: {names}")
+        curves.update(panels)
     if not curves:
         parser.error("no curves in the supplied CSVs")
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 
     height = (len(curves) + 1) // 2
     fig, axes = plt.subplots(height, 2, figsize=(13, 3.6 * height), squeeze=False)
