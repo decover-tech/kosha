@@ -8039,7 +8039,7 @@ fn legacy_replacement(path: &str) -> &'static str {
         "/search" => "POST /v1/namespaces/{namespace}/search",
         "/flush" => "POST /v1/namespaces/{namespace}/flush",
         "/delete" => "POST /v1/namespaces/{namespace}/delete",
-        "/stats" => "GET /v1/namespaces/{namespace}/stats",
+        "/stats" => "GET /v1/stats",
         _ => "/v1/namespaces/{namespace}/...",
     }
 }

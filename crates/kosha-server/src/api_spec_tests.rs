@@ -439,4 +439,8 @@ fn a_disabled_legacy_route_names_its_replacement() {
         body["details"]["replacement"],
         "POST /v1/namespaces/{namespace}/documents"
     );
+
+    let raw = legacy_route_disabled("/stats");
+    assert_eq!(status_of(&raw), 410);
+    assert_eq!(body_of(&raw)["details"]["replacement"], "GET /v1/stats");
 }

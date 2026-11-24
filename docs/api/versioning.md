@@ -117,7 +117,7 @@ The unversioned Phase 1 routes predate `/v1`:
 | `POST /search`, `GET /search?ns=...` | `POST /v1/namespaces/{namespace}/search` |
 | `POST /flush` | `POST /v1/namespaces/{namespace}/flush` (flush-all: iterate `GET /v1/namespaces`) |
 | `POST /delete` | `POST /v1/namespaces/{namespace}/delete` |
-| `GET /stats` | `GET /v1/namespaces/{namespace}/stats` (all namespaces: admin `GET /v1/stats`) |
+| `GET /stats` | `GET /v1/stats` (server-wide, admin only) |
 
 While they are served, every legacy response carries
 `Deprecation: @1797292800` (2026-12-15), `Sunset: Tue, 01 Jun 2027 00:00:00 GMT`
