@@ -11,8 +11,10 @@ organization ──< membership (owner | admin | member | read-only) >── use
      └──< tenant ──< API keys, `{tenant}/...` namespaces
 ```
 
-This is the data model and its admin API. Sign-up, email verification, OAuth,
-SAML/OIDC and the web console are not built yet; they will sit in front of it.
+This is the data model and its admin API. Users can also sign themselves up
+and manage their organizations in the self-serve web console
+([console.md](console.md)), which runs the same operations as the signed-in
+user. OAuth and SAML/OIDC are not built yet.
 
 ## What does not change
 

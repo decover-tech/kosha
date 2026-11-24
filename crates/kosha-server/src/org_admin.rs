@@ -74,7 +74,7 @@ impl OrgBackend {
         backend
     }
 
-    fn store(&self) -> Result<Arc<dyn OrgStore>, String> {
+    pub(crate) fn store(&self) -> Result<Arc<dyn OrgStore>, String> {
         #[cfg(feature = "postgres")]
         if let Some(url) = &self.database_url {
             // One pool per process: the key store's, when there is one.
@@ -97,12 +97,14 @@ impl OrgBackend {
     }
 }
 
-fn error_response(e: &OrgError) -> String {
+pub(crate) fn error_response(e: &OrgError) -> String {
     let status = match e {
         OrgError::Invalid(_) => 400,
         OrgError::Forbidden(_) => 403,
         OrgError::NotFound(_) => 404,
         OrgError::Conflict(_) => 409,
+        OrgError::Unauthorized(_) => 401,
+        OrgError::RateLimited(_) => 429,
         OrgError::Store(_) => 500,
     };
     api_error_status(status, &e.to_string())
@@ -149,7 +151,7 @@ fn actor(headers: &HashMap<String, String>, operator: &Actor) -> Result<Actor, O
     }
 }
 
-fn parse_body(body: &[u8]) -> Result<Value, OrgError> {
+pub(crate) fn parse_body(body: &[u8]) -> Result<Value, OrgError> {
     // A body-less POST is an empty object, so routes whose fields are all
     // optional need no body.
     if body.iter().all(u8::is_ascii_whitespace) {
@@ -162,7 +164,7 @@ fn parse_body(body: &[u8]) -> Result<Value, OrgError> {
 }
 
 /// An optional string field; present with another type is an error.
-fn optional<'a>(body: &'a Value, field: &str) -> Result<Option<&'a str>, OrgError> {
+pub(crate) fn optional<'a>(body: &'a Value, field: &str) -> Result<Option<&'a str>, OrgError> {
     match body.get(field) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => Ok(Some(s)),
@@ -170,7 +172,7 @@ fn optional<'a>(body: &'a Value, field: &str) -> Result<Option<&'a str>, OrgErro
     }
 }
 
-fn required<'a>(body: &'a Value, field: &str) -> Result<&'a str, OrgError> {
+pub(crate) fn required<'a>(body: &'a Value, field: &str) -> Result<&'a str, OrgError> {
     optional(body, field)?.ok_or_else(|| OrgError::Invalid(format!("missing '{field}'")))
 }
 
@@ -223,7 +225,7 @@ pub(crate) fn handle(
     Some(result.unwrap_or_else(|e| error_response(&e)))
 }
 
-fn dispatch(
+pub(crate) fn dispatch(
     method: &str,
     segments: &[&str],
     query: &str,

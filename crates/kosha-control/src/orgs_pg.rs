@@ -1,11 +1,12 @@
 //! Postgres storage for the organization model (#345): the [`OrgTx`]
-//! primitives over the tables of migration 006, and [`OrgStore`] for
+//! primitives over the tables of migrations 006 and 008, and [`OrgStore`] for
 //! [`PgStore`]. The rules are in `orgs`; nothing here decides anything.
 
 use crate::orgs::{
     ApiKey, AuditEvent, Member, NewAuditEvent, OrgError, OrgStore, OrgTx, Organization, Project,
     Role, TenantLink, User, MAX_LIST, ORG_EXISTS, PROJECT_EXISTS, TENANT_LINKED, USER_EXISTS,
 };
+use crate::signin::{SigninToken, UserSession};
 use crate::PgStore;
 
 fn store_error(e: sqlx::Error) -> OrgError {
@@ -468,5 +469,186 @@ impl OrgTx for PgTx<'_> {
                 },
             )
             .collect())
+    }
+
+    fn user_by_email(&mut self, email: &str) -> Result<Option<User>, OrgError> {
+        let row: Option<(String, String, String, i64)> = self
+            .rt
+            .block_on(
+                sqlx::query_as(
+                    "SELECT id, email, display_name, \
+                            ROUND(EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT \
+                     FROM kosha.users WHERE email = $1",
+                )
+                .bind(email)
+                .fetch_optional(&mut *self.tx),
+            )
+            .map_err(store_error)?;
+        Ok(row.map(|(id, email, display_name, created_at_ms)| User {
+            id,
+            email,
+            display_name,
+            created_at_ms,
+        }))
+    }
+
+    fn mark_email_verified(&mut self, user_id: &str, at_ms: i64) -> Result<bool, OrgError> {
+        self.rt
+            .block_on(
+                sqlx::query(
+                    "INSERT INTO kosha.email_verifications (user_id, verified_at) \
+                     VALUES ($1, to_timestamp($2)) ON CONFLICT (user_id) DO NOTHING",
+                )
+                .bind(user_id)
+                .bind(seconds(at_ms))
+                .execute(&mut *self.tx),
+            )
+            .map(|r| r.rows_affected() > 0)
+            .map_err(store_error)
+    }
+
+    fn user_orgs(&mut self, user_id: &str) -> Result<Vec<(Organization, Role)>, OrgError> {
+        let rows: Vec<(String, String, String, i64, String)> = self
+            .rt
+            .block_on(
+                sqlx::query_as(
+                    "SELECT o.id, o.slug, o.name, \
+                            ROUND(EXTRACT(EPOCH FROM o.created_at) * 1000)::BIGINT, m.role \
+                     FROM kosha.org_members m \
+                     JOIN kosha.organizations o ON o.id = m.org_id \
+                     WHERE m.user_id = $1 ORDER BY o.slug LIMIT $2",
+                )
+                .bind(user_id)
+                .bind(i64::from(MAX_LIST))
+                .fetch_all(&mut *self.tx),
+            )
+            .map_err(store_error)?;
+        rows.into_iter()
+            .map(|(id, slug, name, created_at_ms, role)| {
+                Ok((
+                    Organization {
+                        id,
+                        slug,
+                        name,
+                        created_at_ms,
+                    },
+                    parse_role(&role)?,
+                ))
+            })
+            .collect()
+    }
+
+    fn insert_signin_token(&mut self, token: &SigninToken) -> Result<(), OrgError> {
+        self.rt
+            .block_on(
+                sqlx::query(
+                    "INSERT INTO kosha.signin_tokens \
+                         (token_hash, email, display_name, created_at, expires_at) \
+                     VALUES ($1, $2, $3, to_timestamp($4), to_timestamp($5))",
+                )
+                .bind(&token.token_hash)
+                .bind(&token.email)
+                .bind(&token.display_name)
+                .bind(seconds(token.created_at_ms))
+                .bind(seconds(token.expires_at_ms))
+                .execute(&mut *self.tx),
+            )
+            .map(|_| ())
+            .map_err(store_error)
+    }
+
+    fn last_signin_token_ms(&mut self, email: &str) -> Result<Option<i64>, OrgError> {
+        self.rt
+            .block_on(
+                sqlx::query_scalar(
+                    "SELECT ROUND(EXTRACT(EPOCH FROM MAX(created_at)) * 1000)::BIGINT \
+                     FROM kosha.signin_tokens WHERE email = $1",
+                )
+                .bind(email)
+                .fetch_one(&mut *self.tx),
+            )
+            .map_err(store_error)
+    }
+
+    fn take_signin_token(
+        &mut self,
+        token_hash: &str,
+        now_ms: i64,
+    ) -> Result<Option<SigninToken>, OrgError> {
+        // One UPDATE both checks and spends the link, so two redemptions
+        // racing cannot both succeed.
+        let row: Option<(String, String, String, i64, i64)> = self
+            .rt
+            .block_on(
+                sqlx::query_as(
+                    "UPDATE kosha.signin_tokens SET used_at = to_timestamp($2) \
+                     WHERE token_hash = $1 AND used_at IS NULL \
+                       AND expires_at > to_timestamp($2) \
+                     RETURNING token_hash, email, display_name, \
+                       ROUND(EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT, \
+                       ROUND(EXTRACT(EPOCH FROM expires_at) * 1000)::BIGINT",
+                )
+                .bind(token_hash)
+                .bind(seconds(now_ms))
+                .fetch_optional(&mut *self.tx),
+            )
+            .map_err(store_error)?;
+        Ok(row.map(
+            |(token_hash, email, display_name, created_at_ms, expires_at_ms)| SigninToken {
+                token_hash,
+                email,
+                display_name,
+                created_at_ms,
+                expires_at_ms,
+            },
+        ))
+    }
+
+    fn insert_session(&mut self, session: &UserSession) -> Result<(), OrgError> {
+        self.rt
+            .block_on(
+                sqlx::query(
+                    "INSERT INTO kosha.user_sessions \
+                         (token_hash, user_id, created_at, expires_at) \
+                     VALUES ($1, $2, to_timestamp($3), to_timestamp($4))",
+                )
+                .bind(&session.token_hash)
+                .bind(&session.user_id)
+                .bind(seconds(session.created_at_ms))
+                .bind(seconds(session.expires_at_ms))
+                .execute(&mut *self.tx),
+            )
+            .map(|_| ())
+            .map_err(store_error)
+    }
+
+    fn session_user(&mut self, token_hash: &str, now_ms: i64) -> Result<Option<String>, OrgError> {
+        self.rt
+            .block_on(
+                sqlx::query_scalar(
+                    "SELECT user_id FROM kosha.user_sessions \
+                     WHERE token_hash = $1 AND revoked_at IS NULL \
+                       AND expires_at > to_timestamp($2)",
+                )
+                .bind(token_hash)
+                .bind(seconds(now_ms))
+                .fetch_optional(&mut *self.tx),
+            )
+            .map_err(store_error)
+    }
+
+    fn revoke_session(&mut self, token_hash: &str, now_ms: i64) -> Result<(), OrgError> {
+        self.rt
+            .block_on(
+                sqlx::query(
+                    "UPDATE kosha.user_sessions SET revoked_at = to_timestamp($2) \
+                     WHERE token_hash = $1 AND revoked_at IS NULL",
+                )
+                .bind(token_hash)
+                .bind(seconds(now_ms))
+                .execute(&mut *self.tx),
+            )
+            .map(|_| ())
+            .map_err(store_error)
     }
 }

@@ -28,6 +28,7 @@
 //! credential's holder vouches for. Nothing here authenticates a user; that
 //! is the job of the sign-up/login layer that will sit in front of it.
 
+use crate::signin::{SigninToken, UserSession};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -149,6 +150,10 @@ pub enum OrgError {
     NotFound(String),
     /// It collides with existing state (409).
     Conflict(String),
+    /// No valid credential: a bad sign-in link or session (401).
+    Unauthorized(String),
+    /// Asked again too soon (429).
+    RateLimited(String),
     /// The store failed (500).
     Store(String),
 }
@@ -159,7 +164,9 @@ impl std::fmt::Display for OrgError {
             OrgError::Invalid(m)
             | OrgError::Forbidden(m)
             | OrgError::NotFound(m)
-            | OrgError::Conflict(m) => f.write_str(m),
+            | OrgError::Conflict(m)
+            | OrgError::Unauthorized(m)
+            | OrgError::RateLimited(m) => f.write_str(m),
             OrgError::Store(m) => write!(f, "control plane error: {m}"),
         }
     }
@@ -287,6 +294,28 @@ pub trait OrgTx {
         limit: u32,
         before: Option<i64>,
     ) -> Result<Vec<AuditEvent>, OrgError>;
+
+    // Self-serve sign-in (`signin`).
+    fn user_by_email(&mut self, email: &str) -> Result<Option<User>, OrgError>;
+    /// Set the user's email verified at `at_ms` if it is not yet; returns
+    /// whether it changed.
+    fn mark_email_verified(&mut self, user_id: &str, at_ms: i64) -> Result<bool, OrgError>;
+    /// The organizations the user belongs to, by slug, capped at [`MAX_LIST`].
+    fn user_orgs(&mut self, user_id: &str) -> Result<Vec<(Organization, Role)>, OrgError>;
+    fn insert_signin_token(&mut self, token: &SigninToken) -> Result<(), OrgError>;
+    /// When the newest link for `email` was created.
+    fn last_signin_token_ms(&mut self, email: &str) -> Result<Option<i64>, OrgError>;
+    /// Mark the link used and return it, if it exists, is unused and has
+    /// not expired at `now_ms`.
+    fn take_signin_token(
+        &mut self,
+        token_hash: &str,
+        now_ms: i64,
+    ) -> Result<Option<SigninToken>, OrgError>;
+    fn insert_session(&mut self, session: &UserSession) -> Result<(), OrgError>;
+    /// The user of a session that is unrevoked and unexpired at `now_ms`.
+    fn session_user(&mut self, token_hash: &str, now_ms: i64) -> Result<Option<String>, OrgError>;
+    fn revoke_session(&mut self, token_hash: &str, now_ms: i64) -> Result<(), OrgError>;
 }
 
 /// A store that can run a closure in one all-or-nothing transaction.
@@ -299,7 +328,7 @@ pub trait OrgStore: Send + Sync {
     ) -> Result<(), OrgError>;
 }
 
-fn run<R>(
+pub(crate) fn run<R>(
     store: &dyn OrgStore,
     mut f: impl FnMut(&mut dyn OrgTx) -> Result<R, OrgError>,
 ) -> Result<R, OrgError> {
@@ -311,21 +340,21 @@ fn run<R>(
     out.ok_or_else(|| OrgError::Store("transaction committed without a result".into()))
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
 
-fn new_id(prefix: &str) -> String {
+pub(crate) fn new_id(prefix: &str) -> String {
     format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
 }
 
 // ── Validation ──────────────────────────────────────────────────────────────
 
 const MAX_SLUG_LEN: usize = 63;
-const MAX_NAME_LEN: usize = 200;
+pub(crate) const MAX_NAME_LEN: usize = 200;
 const MAX_EMAIL_LEN: usize = 254;
 const MAX_DESCRIPTION_LEN: usize = 500;
 /// The most rows a list call returns (and the audit log's largest page).
@@ -353,7 +382,12 @@ fn check_slug(what: &str, slug: &str) -> Result<(), OrgError> {
     }
 }
 
-fn check_text(what: &str, value: &str, max: usize, required: bool) -> Result<(), OrgError> {
+pub(crate) fn check_text(
+    what: &str,
+    value: &str,
+    max: usize,
+    required: bool,
+) -> Result<(), OrgError> {
     if required && value.trim().is_empty() {
         return Err(OrgError::Invalid(format!("'{what}' must not be empty")));
     }
@@ -367,7 +401,7 @@ fn check_text(what: &str, value: &str, max: usize, required: bool) -> Result<(),
 
 /// Trimmed and lowercased, so uniqueness is case-insensitive. A shape
 /// check only: whether the address is real is email verification's job.
-fn normalize_email(email: &str) -> Result<String, OrgError> {
+pub(crate) fn normalize_email(email: &str) -> Result<String, OrgError> {
     let email = email.trim().to_lowercase();
     let shape_ok = match email.split_once('@') {
         Some((local, domain)) => !local.is_empty() && !domain.is_empty() && !domain.contains('@'),
@@ -470,7 +504,7 @@ fn check_member_change(
     Ok(())
 }
 
-fn audit(
+pub(crate) fn audit(
     tx: &mut dyn OrgTx,
     actor: &Actor,
     org_id: Option<&str>,
@@ -496,7 +530,8 @@ fn audit(
 
 // ── Operations ──────────────────────────────────────────────────────────────
 
-/// Register a user. Operator only: self-serve sign-up is not built yet.
+/// Register a user. Operator only: users sign themselves up through
+/// [`crate::signin`].
 pub fn create_user(
     store: &dyn OrgStore,
     actor: &Actor,
@@ -923,6 +958,10 @@ struct MemoryState {
     tenants: Vec<TenantLink>,
     api_keys: Vec<ApiKey>,
     audit: Vec<AuditEvent>,
+    /// `(user_id, verified_at_ms)`.
+    email_verified: Vec<(String, i64)>,
+    signin_tokens: Vec<(SigninToken, bool)>,
+    sessions: Vec<(UserSession, bool)>,
 }
 
 /// The store for a server without Postgres, like the in-memory
@@ -1155,6 +1194,85 @@ impl OrgTx for MemoryState {
             .take(limit as usize)
             .cloned()
             .collect())
+    }
+
+    fn user_by_email(&mut self, email: &str) -> Result<Option<User>, OrgError> {
+        Ok(self.users.iter().find(|u| u.email == email).cloned())
+    }
+
+    fn mark_email_verified(&mut self, user_id: &str, at_ms: i64) -> Result<bool, OrgError> {
+        if self.email_verified.iter().any(|(id, _)| id == user_id) {
+            return Ok(false);
+        }
+        self.email_verified.push((user_id.to_string(), at_ms));
+        Ok(true)
+    }
+
+    fn user_orgs(&mut self, user_id: &str) -> Result<Vec<(Organization, Role)>, OrgError> {
+        let mut out: Vec<(Organization, Role)> = self
+            .members
+            .iter()
+            .filter(|m| m.user_id == user_id)
+            .filter_map(|m| {
+                let org = self.orgs.iter().find(|o| o.id == m.org_id)?;
+                Some((org.clone(), m.role))
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.slug.cmp(&b.0.slug));
+        out.truncate(MAX_LIST as usize);
+        Ok(out)
+    }
+
+    fn insert_signin_token(&mut self, token: &SigninToken) -> Result<(), OrgError> {
+        self.signin_tokens.push((token.clone(), false));
+        Ok(())
+    }
+
+    fn last_signin_token_ms(&mut self, email: &str) -> Result<Option<i64>, OrgError> {
+        Ok(self
+            .signin_tokens
+            .iter()
+            .filter(|(t, _)| t.email == email)
+            .map(|(t, _)| t.created_at_ms)
+            .max())
+    }
+
+    fn take_signin_token(
+        &mut self,
+        token_hash: &str,
+        now_ms: i64,
+    ) -> Result<Option<SigninToken>, OrgError> {
+        let Some((token, used)) = self
+            .signin_tokens
+            .iter_mut()
+            .find(|(t, used)| t.token_hash == token_hash && !*used && t.expires_at_ms > now_ms)
+        else {
+            return Ok(None);
+        };
+        *used = true;
+        Ok(Some(token.clone()))
+    }
+
+    fn insert_session(&mut self, session: &UserSession) -> Result<(), OrgError> {
+        self.sessions.push((session.clone(), false));
+        Ok(())
+    }
+
+    fn session_user(&mut self, token_hash: &str, now_ms: i64) -> Result<Option<String>, OrgError> {
+        Ok(self
+            .sessions
+            .iter()
+            .find(|(s, revoked)| s.token_hash == token_hash && !revoked && s.expires_at_ms > now_ms)
+            .map(|(s, _)| s.user_id.clone()))
+    }
+
+    fn revoke_session(&mut self, token_hash: &str, _now_ms: i64) -> Result<(), OrgError> {
+        for (s, revoked) in &mut self.sessions {
+            if s.token_hash == token_hash {
+                *revoked = true;
+            }
+        }
+        Ok(())
     }
 }
 

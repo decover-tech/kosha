@@ -17,6 +17,7 @@ mod namespace_rename;
 pub use namespace_rename::{rekey_manifest_references, NamespaceRename, RenameOutcome};
 
 pub mod orgs;
+pub mod signin;
 
 pub mod api_keys;
 #[cfg(feature = "postgres")]

@@ -444,6 +444,10 @@ const MIGRATED_TABLES: &[&str] = &[
     // 007_billing
     "billing_accounts",
     "billing_invoices",
+    // 008_console_signin
+    "email_verifications",
+    "signin_tokens",
+    "user_sessions",
 ];
 
 /// The migrations came from separate branches (#426): booting twice on

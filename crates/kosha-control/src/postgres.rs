@@ -131,7 +131,8 @@ async fn run_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
 /// plumbing, "migration 003 failed" for 003_writer_leases,
 /// "migration 003_scoped_api_keys failed" for 003_scoped_api_keys,
 /// "migration 004 failed" for 004, "migration 005 failed" for 005,
-/// "migration 006 failed" for 006, "migration 007 failed" for 007.
+/// "migration 006 failed" for 006, "migration 007 failed" for 007,
+/// "migration 008 failed" for 008.
 async fn migrate_once(pool: &sqlx::PgPool) -> Result<(), (sqlx::Error, &'static str)> {
     const FAILED: &str = "migration failed";
     let mut tx = pool.begin().await.map_err(|e| (e, FAILED))?;
@@ -181,6 +182,12 @@ async fn migrate_once(pool: &sqlx::PgPool) -> Result<(), (sqlx::Error, &'static 
         .execute(&mut *tx)
         .await
         .map_err(|e| (e, "migration 007 failed"))?;
+    // Console sign-in links and sessions (#345): additive, idempotent.
+    let migration = include_str!("../migrations/008_console_signin.sql");
+    sqlx::raw_sql(migration)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (e, "migration 008 failed"))?;
     tx.commit().await.map_err(|e| (e, FAILED))
 }
 

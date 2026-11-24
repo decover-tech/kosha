@@ -42,6 +42,7 @@ mod authz;
 mod branching;
 mod cache_reads;
 mod compaction_sched;
+mod console;
 mod dashboard;
 mod deletion_purge;
 mod doc_spans;
@@ -530,6 +531,8 @@ struct AppState {
     unindexed: unindexed::UnindexedState,
     /// `KOSHA_DASHBOARD` and the per-namespace recent-query rings (#214).
     dashboard: dashboard::Dashboard,
+    /// `KOSHA_CONSOLE`: self-serve sign-in and the web console (#345).
+    console: console::Console,
 }
 
 /// One cached merged manifest over a sharded namespace (#207).
@@ -2316,6 +2319,7 @@ impl AppState {
             unindexed_cap: unindexed::UnindexedCap::from_env(),
             unindexed: unindexed::UnindexedState::new(query_role),
             dashboard: dashboard::Dashboard::from_env(),
+            console: console::Console::from_env(),
         }
     }
 
@@ -6851,6 +6855,24 @@ fn dispatch_request(state: &AppState, request: http::Request) -> http::Response 
     // through the authenticated API below. 404 unless KOSHA_DASHBOARD is on.
     if let Some(resp) = dashboard::static_response(&request_line, state.dashboard.enabled()) {
         return http::Response::from_raw(resp);
+    }
+
+    // Self-serve console (#345): its API authenticates its own sessions,
+    // so it is answered here, ahead of API keys. 404 unless KOSHA_CONSOLE
+    // is on.
+    let key_table = match auth::global() {
+        auth::Auth::Keys(keys) => Some(keys),
+        auth::Auth::Disabled => None,
+    };
+    if let Some(resp) = state
+        .console
+        .handle(&request_line, &headers, &body, &state.orgs, key_table)
+    {
+        let response = http::Response::from_raw(resp);
+        if request_line.contains(" /console/api/") {
+            log_request(&request_line, "console", body.len(), &response, started);
+        }
+        return response;
     }
 
     // ── API key authentication ──────────────────────────────────────────
