@@ -8,5 +8,5 @@ metadata:
   name: kosha-query
   namespace: kosha
 spec:
-  minReplicas: 1
-  maxReplicas: 2
+  minReplicas: 3
+  maxReplicas: 3
