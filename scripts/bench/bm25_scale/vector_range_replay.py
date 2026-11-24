@@ -21,8 +21,10 @@ def read_offsets(path):
     if len(data) < 16:
         raise ValueError(f"{path}: truncated sidecar")
     magic, version, dim, count = struct.unpack_from("<4sIII", data)
-    record_bytes = 4 * dim + 12 + (4 if version >= 3 else 0)
-    if (magic != b"KVOF" or not 1 <= version <= 5 or dim == 0
+    # Radius: none before v3, max from v3, max/p50/p90 in the v6-v8 quantile layouts.
+    radius_bytes = 12 if version >= 6 else 4 if version >= 3 else 0
+    record_bytes = 4 * dim + 12 + radius_bytes
+    if (magic != b"KVOF" or not 1 <= version <= 8 or dim == 0
             or len(data) != 16 + count * record_bytes):
         raise ValueError(f"{path}: invalid vector.offsets header or length")
     centroids, spans = [], []
