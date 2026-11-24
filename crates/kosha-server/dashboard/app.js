@@ -563,7 +563,10 @@
     ];
     const load = async () => {
       const start = new Date(month.value + "-01T00:00:00Z");
-      if (!Number.isFinite(start.getTime())) return;
+      if (!month.value || !Number.isFinite(start.getTime())) {
+        out.replaceChildren(el("p", { class: "muted", text: "Choose a month to see usage." }));
+        return;
+      }
       const end = new Date(start.getTime());
       end.setUTCMonth(end.getUTCMonth() + 1);
       month.disabled = true;
