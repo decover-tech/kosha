@@ -146,7 +146,8 @@ Refused requests are not recorded.
 | `api_key.revoked` | tenant (operator routes) or `api_key` (console; target id is the `key_id_prefix`) | `key_id_prefix`, `description`; console: `tenant_id`, `description`, or `reason: "member removed"` and `member` |
 | `admin.segment_gc`, `admin.compaction`, `admin.tenant_deletion`, `admin.billing`, `admin.usage`, `admin.import_namespace`, `admin.repair`, `admin.request` | `tenant` for `DELETE /v1/admin/tenants/{tenant}`, otherwise `route` (target id: the path) | `method`, `path`, `status`: one entry per state-changing (`POST`, `DELETE`) admin request that has no entry of its own, written after it ran, so refused and failed attempts are there too. Never the request body |
 | `member.invited` | email | `role` |
-| `sso.configured` | organization | `issuer`, `client_id`, `allowed_domains`, `sso_required`, `client_secret_changed` (never the secret) |
+| `sso.configured` | organization | `issuer`, `client_id`, `allowed_domains`, `sso_required`, `client_secret_changed` (never the secret), `identities_unlinked` |
+| `sso.connected` | user | `issuer`, `sso_email`: a member connected their account to the organization's SSO |
 | `sso.removed` | organization | |
 | `namespace.deleted` | namespace | `deletion_id`. Actor `tenant:<tenant id>`: a tenant API key made the request |
 | `tenant.deleted` | tenant | `deletion_id`, `completed`. Actor `operator` (`DELETE /v1/admin/tenants/{tenant}`) |
@@ -240,10 +241,25 @@ is a second switch, `KOSHA_SIGNUP=enabled`, optionally limited to
   discovery document to check it). Members sign in from the login page with
   the organization's slug (`GET /v1/console/sso/start?org=<slug>`; callback
   `/v1/console/sso/callback`, the redirect URI to register with the provider).
-  Unknown addresses in an allowed domain get an account and a `read-only`
-  membership on first sign-in; anyone else must already be a member. The
-  client secret is sealed with `KOSHA_CONSOLE_SECRET_KEY` (AES-256-GCM, bound
-  to the organization) and never returned.
+  An SSO account signs in only as the Kosha user it is connected to. It is
+  **never matched to an existing user by email**, and SSO never drops a
+  password or marks an address verified. A member who already has an account
+  signs in another way and clicks "Connect single sign-on" on the
+  organization's SSO page (`GET /v1/console/sso/start?org=<slug>&connect=1`,
+  from a session not opened through SSO; the callback links the SSO account
+  to them and keeps their session). An address no Kosha user has, in one of
+  the organization's allowed domains, gets a **new** account (no password,
+  address unverified) and a `read-only` membership on first sign-in. Anyone
+  else is refused with a message to sign in another way and connect SSO.
+  Allowed domains are not verified yet (an organization could list a domain
+  it does not own), which is why they only ever create new accounts; domain
+  ownership verification is a follow-up. SSO accounts are keyed by issuer and
+  subject; changing the issuer or client id needs the client secret again,
+  disconnects every SSO account of the organization and ends the sessions SSO
+  opened, as removing SSO does. The client secret is sealed with
+  `KOSHA_CONSOLE_SECRET_KEY` (AES-256-GCM, bound to the organization) and never
+  returned. The issuer is stored as its discovery document declares it (with
+  or without a trailing `/`), and ID tokens are checked against that.
 - **Invites.** `POST /v1/console/orgs/{org}/invites {email, role}` mails a link
   valid seven days, once; the invited user (signed in with that exact,
   verified address) accepts it with `POST /v1/console/invites/accept {token}`.
@@ -319,20 +335,30 @@ mailer, to the owners and admins of the tenant's organization.
   Nothing secret is written to the audit log.
 - **No account enumeration.** Sign-up, resend and reset answer the same for
   any address, and login gives one error for an unknown address and a wrong
-  password (a dummy argon2 verification keeps the timing alike).
+  password (a dummy argon2 verification keeps the timing alike). Mail is sent
+  from a background thread, so an SMTP round trip for a known address does
+  not show in the response time.
 - **Attempt limits.** Per client IP and per address, in fixed windows: login
   (10 per address and 50 per IP per 15 minutes), sign-up (5 per address, 20
   per IP per hour), verification resends and resets (3 per address, 20 per IP
   per hour), plus token submissions and provider redirects per IP. Beyond
-  them: 429 with `Retry-After`. Counters are per pod.
+  them: 429 with `Retry-After`. Counters are per pod; an IPv6 client counts
+  by its /64. When the counter table is full, expired windows go first, then
+  the windows that end soonest; it is never wiped.
 - **Links come from configuration.** Email links and redirect URIs are built
   from `KOSHA_CONSOLE_PUBLIC_URL`, never from the request's `Host`.
 - **Organization SSO is trusted for its organization only.** An
   organization's admins choose its identity provider, so what that provider
   says about an address is no proof elsewhere. A session opened through an
   organization's SSO works only for that organization: it cannot open
-  another organization, create one, or accept invites. Just-in-time accounts
-  are made only for the organization's allowed domains.
+  another organization, create one, or accept invites, and it stops working
+  when the organization's SSO is removed or pointed elsewhere. SSO never signs
+  in as an existing account it was not connected to (see the SSO flow above).
+- **The identity provider client** (discovery, JWKS, token endpoint) fetches
+  only `https` URLs whose host resolves to public addresses (no loopback,
+  private, link-local, CGNAT, multicast, or IPv6 forms embedding such an IPv4
+  address), connects to the checked address, uses no proxy and follows no
+  redirects. Errors are logged; the browser gets a generic message.
 - **"SSO required"** refuses every member whose session was not opened
   through the organization's SSO, except owners, who keep a way in when the
   identity provider is down or misconfigured.

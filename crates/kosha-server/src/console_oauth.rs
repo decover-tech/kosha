@@ -128,9 +128,12 @@ pub(crate) fn authorize_url(endpoint: &str, r: &AuthRequest<'_>) -> String {
     url
 }
 
-/// Discovery and JWKS fetching with caches, over one HTTP client.
+/// Discovery and JWKS fetching with caches. Every request goes through
+/// [`crate::console_net`]: https only, public addresses only, pinned to the
+/// checked address, no proxy, no redirects.
 pub(crate) struct OidcClient {
-    http: reqwest::blocking::Client,
+    /// Tests only: admit `http` and loopback providers.
+    allow_insecure: bool,
     discovery: Mutex<HashMap<String, (Instant, Discovery)>>,
     jwks: Mutex<HashMap<String, JwksEntry>>,
 }
@@ -145,21 +148,37 @@ struct JwksEntry {
 
 impl OidcClient {
     pub(crate) fn new() -> Self {
-        let http = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::limited(3))
-            .user_agent("kosha-console")
-            .build()
-            .expect("HTTP client");
         Self {
-            http,
+            allow_insecure: false,
             discovery: Mutex::new(HashMap::new()),
             jwks: Mutex::new(HashMap::new()),
         }
     }
 
+    /// A client that also talks to `http://127.0.0.1` fakes.
+    #[cfg(test)]
+    pub(crate) fn insecure_for_tests() -> Self {
+        Self {
+            allow_insecure: true,
+            ..Self::new()
+        }
+    }
+
+    /// A request to `url` after the address checks.
+    fn request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+    ) -> Result<reqwest::blocking::RequestBuilder, String> {
+        let target = crate::console_net::check_url(url, self.allow_insecure)?;
+        let client = crate::console_net::client_for(&target)?;
+        Ok(client.request(method, target.url))
+    }
+
     fn get_json(&self, url: &str, bearer: Option<&str>) -> Result<Value, String> {
-        let mut request = self.http.get(url).header("accept", "application/json");
+        let mut request = self
+            .request(reqwest::Method::GET, url)?
+            .header("accept", "application/json");
         if let Some(token) = bearer {
             request = request.bearer_auth(token);
         }
@@ -192,6 +211,15 @@ impl OidcClient {
             return Err(format!(
                 "discovery document is for issuer '{declared}', not '{issuer}'"
             ));
+        }
+        // Every endpoint the server or the browser will use: https (the
+        // server's own fetches are checked again, address and all, when
+        // they are made).
+        for name in ["authorization_endpoint", "token_endpoint", "jwks_uri"] {
+            let url = field(name)?;
+            if !(url.starts_with("https://") || self.allow_insecure) {
+                return Err(format!("discovery document's {name} is not https: {url:?}"));
+            }
         }
         let methods: Vec<&str> = doc
             .get("token_endpoint_auth_methods_supported")
@@ -287,8 +315,7 @@ impl OidcClient {
             ("client_id", client_id),
         ];
         let mut request = self
-            .http
-            .post(&discovery.token_endpoint)
+            .request(reqwest::Method::POST, &discovery.token_endpoint)?
             .header("accept", "application/json");
         if discovery.secret_in_body {
             form.push(("client_secret", client_secret));
@@ -360,8 +387,7 @@ impl OidcClient {
         verifier: &str,
     ) -> Result<VerifiedUser, String> {
         let response = self
-            .http
-            .post(&gh.token_url)
+            .request(reqwest::Method::POST, &gh.token_url)?
             .header("accept", "application/json")
             .header("content-type", "application/x-www-form-urlencoded")
             .body(form_body(&[
@@ -720,7 +746,7 @@ pub(crate) mod tests {
         let keys = Arc::new(Mutex::new(vec![key.jwk()]));
         let fetches = Arc::new(Mutex::new(0));
         let idp = provider(keys.clone(), fetches.clone());
-        let client = OidcClient::new();
+        let client = OidcClient::insecure_for_tests();
         let d = client.discover(&idp.url).unwrap();
         assert_eq!(d.jwks_uri, format!("{}/jwks", idp.url));
         let iss = [idp.url.as_str()];
@@ -803,7 +829,9 @@ pub(crate) mod tests {
                 .to_string(),
             )
         }));
-        let err = OidcClient::new().discover(&idp.url).unwrap_err();
+        let err = OidcClient::insecure_for_tests()
+            .discover(&idp.url)
+            .unwrap_err();
         assert!(err.contains("someone-else"), "{err}");
     }
 
@@ -842,7 +870,7 @@ pub(crate) mod tests {
             token_url: format!("{}/login/oauth/access_token", gh.url),
             api_url: gh.url.clone(),
         };
-        let client = OidcClient::new();
+        let client = OidcClient::insecure_for_tests();
         let user = client
             .github_user(&config, "c-1", "https://kosha/cb", "v-1")
             .unwrap();

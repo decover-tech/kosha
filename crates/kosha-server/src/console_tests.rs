@@ -879,21 +879,28 @@ struct FakeIdp {
 
 impl FakeIdp {
     fn start(client_id: &'static str) -> FakeIdp {
+        Self::start_with(client_id, "")
+    }
+
+    /// `issuer_suffix`: appended to the declared issuer (Auth0 declares
+    /// `https://tenant.auth0.com/`, with the slash).
+    fn start_with(client_id: &'static str, issuer_suffix: &'static str) -> FakeIdp {
         let key = Arc::new(TestKey::new("k1"));
         let expect = Arc::new(Mutex::new((String::new(), String::new())));
         let who = Arc::new(Mutex::new(json!({})));
         let issuer = Arc::new(Mutex::new(String::new()));
         let (e, w, i, k) = (expect.clone(), who.clone(), issuer.clone(), key.clone());
         let http = FakeHttp::start(Arc::new(move |method, path, headers, body| {
-            let iss = i.lock().unwrap().clone();
+            let base = i.lock().unwrap().clone();
+            let iss = format!("{base}{issuer_suffix}");
             match (method, path) {
                 ("GET", "/.well-known/openid-configuration") => (
                     200,
                     json!({
                         "issuer": iss,
-                        "authorization_endpoint": format!("{iss}/authorize"),
-                        "token_endpoint": format!("{iss}/token"),
-                        "jwks_uri": format!("{iss}/jwks"),
+                        "authorization_endpoint": format!("{base}/authorize"),
+                        "token_endpoint": format!("{base}/token"),
+                        "jwks_uri": format!("{base}/jwks"),
                     })
                     .to_string(),
                 ),
@@ -1182,7 +1189,42 @@ fn organization_sso_is_scoped_to_its_organization() {
     );
     assert!(location.unwrap().contains("error="));
 
-    // Ada through SSO: linked by address, but that session only opens Acme.
+    // Review finding 1: the IdP asserting the owner's address does not sign
+    // in as the owner (an admin could point SSO at an IdP of their own).
+    let mut mallory = server.browser();
+    let (_, location) = idp.sign_in(
+        &mut mallory,
+        "/v1/console/sso/start?org=acme",
+        person("okta-3", "ada@acme.example"),
+    );
+    assert!(
+        location.unwrap().contains("connect"),
+        "tells to connect SSO"
+    );
+    assert_eq!(mallory.call("GET", "/v1/console/me", Value::Null).0, 401);
+
+    // Ada connects SSO from her own (password) session, which she keeps.
+    let (status, location) = idp.sign_in(
+        &mut ada,
+        "/v1/console/sso/start?org=acme&connect=1",
+        person("okta-3", "ada@acme.example"),
+    );
+    assert_eq!(status, 302);
+    assert_eq!(location.unwrap(), format!("/console#/orgs/{org_id}/sso"));
+    assert_eq!(
+        ada.ok("GET", "/v1/console/me", Value::Null)["auth_method"],
+        json!("password")
+    );
+    // Connecting needs a signed-in member.
+    let mut nobody = server.browser();
+    let (status, _, _) = nobody.request(
+        "GET",
+        "/v1/console/sso/start?org=acme&connect=1",
+        Value::Null,
+    );
+    assert_eq!(status, 401);
+
+    // Now SSO signs Ada in, and that session only opens Acme.
     let mut ada_sso = server.browser();
     idp.sign_in(
         &mut ada_sso,
@@ -1242,7 +1284,57 @@ fn organization_sso_is_scoped_to_its_organization() {
         .map(|e| e["action"].as_str().unwrap())
         .collect();
     assert!(actions.contains(&"sso.configured"), "{actions:?}");
+    assert!(actions.contains(&"sso.connected"), "{actions:?}");
     assert!(!log.to_string().contains("acme-secret"));
+
+    // Review finding 3: pointing SSO elsewhere needs a new secret.
+    let elsewhere = FakeIdp::start("acme-client");
+    let (status, _) = ada.call(
+        "POST",
+        &format!("{base}/sso"),
+        json!({ "issuer": elsewhere.http.url, "client_id": "acme-client",
+                "allowed_domains": ["acme.example"] }),
+    );
+    assert_eq!(status, 400);
+
+    // Review finding 7: removing SSO ends the sessions it opened.
+    kim.ok("GET", &base, Value::Null);
+    ada.ok("DELETE", &format!("{base}/sso"), Value::Null);
+    assert_eq!(kim.call("GET", &base, Value::Null).0, 401);
+    assert_eq!(ada_sso.call("GET", &base, Value::Null).0, 401);
+    ada.ok("GET", &base, Value::Null);
+}
+
+/// Review finding 6: an issuer declared with a trailing slash (Auth0)
+/// works: ID tokens are checked against the issuer discovery declared.
+#[test]
+fn an_issuer_with_a_trailing_slash_signs_in() {
+    let idp = FakeIdp::start_with("acme-client", "/");
+    let server = Server::new();
+    let mut ada = server.browser();
+    ada.join("ada@acme.example");
+    let org = ada.ok(
+        "POST",
+        "/v1/console/orgs",
+        json!({ "slug": "acme", "name": "Acme" }),
+    );
+    let base = format!("/v1/console/orgs/{}", org["id"].as_str().unwrap());
+    let sso = ada.ok(
+        "POST",
+        &format!("{base}/sso"),
+        json!({ "issuer": idp.http.url, "client_id": "acme-client",
+                "client_secret": "s", "allowed_domains": ["acme.example"] }),
+    );
+    assert_eq!(sso["issuer"], json!(format!("{}/", idp.http.url)));
+    let mut kim = server.browser();
+    let (status, location) = idp.sign_in(
+        &mut kim,
+        "/v1/console/sso/start?org=acme",
+        person("okta-1", "kim@acme.example"),
+    );
+    assert_eq!(status, 302);
+    assert!(!location.unwrap().contains("error="));
+    kim.ok("GET", &base, Value::Null);
 }
 
 // ── Billing (#349 wired into the console) ───────────────────────────────────

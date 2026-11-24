@@ -32,9 +32,11 @@
 //!   organization's admins configure its OIDC provider, so its assertions
 //!   are not proof of an address in general. A session opened through it is
 //!   scoped to that organization ([`session_may_act_in`]) and cannot create
-//!   organizations or accept invites; just-in-time accounts and memberships
-//!   (role `read-only`) are made only for addresses in the organization's
-//!   allowed domains.
+//!   organizations or accept invites. It never signs in as an existing
+//!   account by email: only as one a member explicitly connected, or as a
+//!   new just-in-time account (role `read-only`) for an unused address in
+//!   the organization's allowed domains (see [`sso_login`]). Changing the
+//!   provider or removing SSO disconnects its accounts and ends its sessions.
 //! - **"SSO required"** refuses every session of a member that was not
 //!   opened through the organization's SSO, except an owner's: owners keep a
 //!   way in when the identity provider is broken or misconfigured.
@@ -220,6 +222,10 @@ pub struct LoginFlow {
     pub provider: String,
     /// The organization, for `sso`.
     pub org_id: Option<String>,
+    /// For `sso`: the signed-in user (of a session not opened through any
+    /// SSO) who asked to connect their account to the organization's
+    /// identity provider. `None` for a plain sign-in.
+    pub connect_user_id: Option<String>,
     pub pkce_verifier: String,
     pub nonce: String,
     pub expires_at_ms: i64,
@@ -286,6 +292,11 @@ pub trait IdentityTx: OrgTx {
     fn touch_session(&mut self, token_hash: &str, now_ms: i64) -> Result<(), OrgError>;
     fn revoke_session(&mut self, token_hash: &str) -> Result<(), OrgError>;
     fn revoke_user_sessions(&mut self, user_id: &str) -> Result<(), OrgError>;
+    /// Revoke every live session opened with this auth method
+    /// (`sso:<org id>`).
+    fn revoke_method_sessions(&mut self, auth_method: &str) -> Result<(), OrgError>;
+    /// Unlink every identity of this provider (`sso:<org id>`); how many.
+    fn delete_identities(&mut self, provider: &str) -> Result<u64, OrgError>;
     fn identity_user(&mut self, provider: &str, subject: &str) -> Result<Option<String>, OrgError>;
     fn insert_identity(
         &mut self,
@@ -695,11 +706,18 @@ pub fn session_may_act_in(
                 .into(),
         ));
     }
-    if via_this_sso {
-        return Ok(());
-    }
     run(store, |tx| {
-        let Some(config) = tx.sso_config(org_id)? else {
+        let config = tx.sso_config(org_id)?;
+        if via_this_sso {
+            // Removing the organization's SSO also ends what it opened.
+            return match config {
+                Some(_) => Ok(()),
+                None => Err(OrgError::Forbidden(
+                    "this organization's single sign-on was removed; sign in again".into(),
+                )),
+            };
+        }
+        let Some(config) = config else {
             return Ok(());
         };
         if !config.sso_required {
@@ -868,44 +886,149 @@ fn external_login_tx(
 /// The role a just-in-time SSO membership gets.
 pub const SSO_JIT_ROLE: Role = Role::ReadOnly;
 
-/// Sign in through `org_id`'s SSO: [`external_login`] restricted to that
-/// organization's members, plus just-in-time accounts and memberships for
-/// addresses in its allowed domains.
+/// The identity provider name an organization's SSO identities are stored
+/// under, and the auth method of the sessions it opens.
+pub fn sso_provider(org_id: &str) -> String {
+    format!("sso:{org_id}")
+}
+
+/// The subject an SSO identity is stored under: the issuer and the
+/// provider's `sub`, so a `sub` from one identity provider never matches
+/// an account linked through another.
+fn sso_subject(issuer: &str, subject: &str) -> String {
+    format!("{issuer}#{subject}")
+}
+
+/// What an organization SSO sign-in is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SsoIntent<'a> {
+    /// Sign in.
+    SignIn,
+    /// Connect this signed-in user's account (an explicit action in the
+    /// console, from a session not opened through any SSO).
+    Connect { user_id: &'a str },
+}
+
+/// Sign in through `org_id`'s SSO (`issuer` is the one its discovery
+/// document declared).
+///
+/// An organization's admins choose its identity provider, so what that
+/// provider asserts about an address proves nothing about an existing
+/// Kosha account. An SSO identity therefore never links to an existing
+/// user by email, never drops a password and never marks an address
+/// verified. It signs in as:
+/// 1. the user it was connected to before (who must still be a member);
+/// 2. with [`SsoIntent::Connect`], the signed-in user who started it (who
+///    must be a member): the identity is connected to them;
+/// 3. a new user, created just in time with a `read-only` membership, when
+///    no user has the address and its domain is one of the organization's
+///    allowed domains.
+///
+/// Anything else is refused with a message to sign in another way and
+/// connect SSO from the console.
 pub fn sso_login(
     store: &dyn IdentityStore,
     org_id: &str,
+    issuer: &str,
     identity: &ExternalIdentity,
+    intent: SsoIntent<'_>,
 ) -> Result<User, OrgError> {
     let email = normalize_email(&identity.email)?;
     check_text("subject", &identity.subject, MAX_NAME_LEN, true)?;
+    let provider = sso_provider(org_id);
+    let subject = sso_subject(issuer, &identity.subject);
+    let name = clean_name(&identity.display_name);
     run(store, |tx| {
         let config = tx
             .sso_config(org_id)?
             .ok_or_else(|| OrgError::NotFound("single sign-on is not configured".into()))?;
-        let in_domain =
-            !config.allowed_domains.is_empty() && domain_allowed(&email, &config.allowed_domains);
-        let name = clean_name(&identity.display_name);
-        let user = external_login_tx(tx, identity, &email, &name, in_domain)?;
-        if tx.member_role(org_id, &user.id)?.is_none() {
-            if !in_domain {
-                return Err(OrgError::Forbidden(
-                    "this account is not a member of the organization".into(),
-                ));
+        require_org(tx, org_id, true)?;
+        let not_member =
+            || OrgError::Forbidden("this account is not a member of the organization".into());
+        if let Some(user_id) = tx.identity_user(&provider, &subject)? {
+            if let SsoIntent::Connect { user_id: asking } = intent {
+                if asking != user_id {
+                    return Err(OrgError::Conflict(
+                        "this single sign-on account is already connected to another user".into(),
+                    ));
+                }
             }
-            require_org(tx, org_id, true)?;
-            tx.put_member(org_id, &user.id, SSO_JIT_ROLE, now_ms())?;
+            tx.member_role(org_id, &user_id)?.ok_or_else(not_member)?;
+            return tx
+                .user(&user_id)?
+                .ok_or_else(|| OrgError::Store("identity linked to a missing user".into()));
+        }
+        if let SsoIntent::Connect { user_id } = intent {
+            tx.member_role(org_id, user_id)?.ok_or_else(not_member)?;
+            let user = tx
+                .user(user_id)?
+                .ok_or_else(|| OrgError::Forbidden("unknown user".into()))?;
+            tx.insert_identity(&provider, &subject, &user.id, &email)?;
             audit(
                 tx,
                 &user_actor(&user.id),
                 Some(org_id),
-                "member.added",
+                "sso.connected",
                 "user",
                 &user.id,
-                serde_json::json!({ "role": SSO_JIT_ROLE.as_str(), "via": "sso" }),
+                serde_json::json!({ "issuer": issuer, "sso_email": email }),
             )?;
+            return Ok(user);
         }
+        let in_domain =
+            !config.allowed_domains.is_empty() && domain_allowed(&email, &config.allowed_domains);
+        if tx.user_by_email(&email)?.is_some() || !in_domain {
+            return Err(OrgError::Forbidden(
+                "no Kosha account is connected to this single sign-on account; sign in \
+                 another way (password, Google or GitHub), then connect single sign-on from \
+                 the organization's page in the console"
+                    .into(),
+            ));
+        }
+        let user = User {
+            id: new_id("usr"),
+            email: email.clone(),
+            display_name: name.trim().to_string(),
+            created_at_ms: now_ms(),
+        };
+        tx.insert_user(&user)?;
+        // No password, and the address stays unverified: the organization's
+        // provider is no proof of it (a reset link proves it later).
+        tx.put_credentials(&Credentials {
+            user_id: user.id.clone(),
+            password_hash: None,
+            email_verified: false,
+        })?;
+        tx.insert_identity(&provider, &subject, &user.id, &email)?;
+        audit(
+            tx,
+            &user_actor(&user.id),
+            None,
+            "user.signed_up",
+            "user",
+            &user.id,
+            serde_json::json!({ "email": user.email, "method": provider }),
+        )?;
+        tx.put_member(org_id, &user.id, SSO_JIT_ROLE, now_ms())?;
+        audit(
+            tx,
+            &user_actor(&user.id),
+            Some(org_id),
+            "member.added",
+            "user",
+            &user.id,
+            serde_json::json!({ "role": SSO_JIT_ROLE.as_str(), "via": "sso" }),
+        )?;
         Ok(user)
     })
+}
+
+/// Forget everything an organization's SSO signed in: its identities and
+/// its live sessions. Run when its provider changes or SSO is removed.
+fn reset_sso(tx: &mut dyn IdentityTx, org_id: &str) -> Result<u64, OrgError> {
+    let provider = sso_provider(org_id);
+    tx.revoke_method_sessions(&provider)?;
+    tx.delete_identities(&provider)
 }
 
 /// Record a login flow; returns nothing (the caller holds the state).
@@ -1025,15 +1148,33 @@ pub fn put_sso_config(
                 "only an owner can require single sign-on".into(),
             ));
         }
+        let issuer = settings.issuer.trim().to_string();
+        let client_id = settings.client_id.trim().to_string();
+        // A different provider or client: the identities and sessions the
+        // old one vouched for go, and the stored secret is never sent to
+        // the new one (it was entered for the old).
+        let provider_changed = current
+            .as_ref()
+            .is_some_and(|c| c.issuer != issuer || c.client_id != client_id);
         let secret = match (&settings.client_secret_sealed, &current) {
             (Some(sealed), _) => sealed.clone(),
+            (None, Some(_)) if provider_changed => {
+                return Err(OrgError::Invalid(
+                    "a new 'client_secret' is required when the issuer or client id changes".into(),
+                ))
+            }
             (None, Some(current)) => current.client_secret_sealed.clone(),
             (None, None) => return Err(OrgError::Invalid("missing 'client_secret'".into())),
         };
+        let unlinked = if provider_changed {
+            reset_sso(tx, org_id)?
+        } else {
+            0
+        };
         let config = SsoConfig {
             org_id: org_id.to_string(),
-            issuer: settings.issuer.trim().trim_end_matches('/').to_string(),
-            client_id: settings.client_id.trim().to_string(),
+            issuer: issuer.clone(),
+            client_id: client_id.clone(),
             client_secret_sealed: secret,
             allowed_domains: domains.clone(),
             sso_required: settings.sso_required,
@@ -1053,6 +1194,7 @@ pub fn put_sso_config(
                 "allowed_domains": config.allowed_domains,
                 "sso_required": config.sso_required,
                 "client_secret_changed": settings.client_secret_sealed.is_some(),
+                "identities_unlinked": unlinked,
             }),
         )?;
         Ok(config)
@@ -1076,6 +1218,7 @@ pub fn delete_sso_config(
         }
         let removed = tx.delete_sso_config(org_id)?;
         if removed {
+            reset_sso(tx, org_id)?;
             audit(
                 tx,
                 actor,
@@ -1612,6 +1755,21 @@ impl IdentityTx for orgs::MemoryState {
             }
         }
         Ok(())
+    }
+
+    fn revoke_method_sessions(&mut self, auth_method: &str) -> Result<(), OrgError> {
+        for (_, s) in &mut self.identity.sessions {
+            if s.auth_method == auth_method {
+                s.revoked = true;
+            }
+        }
+        Ok(())
+    }
+
+    fn delete_identities(&mut self, provider: &str) -> Result<u64, OrgError> {
+        let before = self.identity.identities.len();
+        self.identity.identities.retain(|(p, _, _)| p != provider);
+        Ok((before - self.identity.identities.len()) as u64)
     }
 
     fn identity_user(&mut self, provider: &str, subject: &str) -> Result<Option<String>, OrgError> {

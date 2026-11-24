@@ -88,11 +88,18 @@ CREATE TABLE IF NOT EXISTS kosha.login_flows (
     state_hash    TEXT PRIMARY KEY,         -- SHA-256 hex of the `state` parameter
     provider      TEXT NOT NULL,
     org_id        TEXT,                     -- set for an organization's SSO
+    connect_user_id TEXT,                   -- SSO "connect" started by this signed-in user
     pkce_verifier TEXT NOT NULL,
     nonce         TEXT NOT NULL,
     expires_at    TIMESTAMPTZ NOT NULL,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- For a database that ran an earlier draft of this file.
+ALTER TABLE kosha.login_flows ADD COLUMN IF NOT EXISTS connect_user_id TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_sessions_auth_method
+    ON kosha.sessions (auth_method) WHERE revoked_at IS NULL;
 
 -- Who created a key through the console, so removing a member can revoke
 -- the keys they made. No foreign key: the key row may be deleted with its

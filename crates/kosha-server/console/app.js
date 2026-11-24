@@ -438,7 +438,7 @@
     );
     const body = el("div");
     render(el("h1", {}, info.org.name, el("span", { class: "muted" }, "  " + info.org.slug + " · " + role)), tabs, body);
-    const ctx = { orgId, base, role, manage, body };
+    const ctx = { orgId, slug: info.org.slug, base, role, manage, body };
     const pages = {
       namespaces: namespacesTab,
       keys: keysTab,
@@ -732,9 +732,26 @@
     );
   }
 
+  // Connecting your account to the organization's SSO: SSO never signs in
+  // as an existing account by email, only as one connected here.
+  function connectPanel(ctx) {
+    const mine = me.orgs.find((o) => o.id === ctx.orgId);
+    if (!mine || !mine.sso_configured) return el("span");
+    if (me.auth_method.startsWith("sso:")) {
+      return el("div", { class: "panel" }, el("p", { class: "muted" }, "You signed in with this organization's single sign-on."));
+    }
+    return el(
+      "div",
+      { class: "panel" },
+      el("h2", {}, "Your account"),
+      el("p", { class: "muted" }, "Connect your Kosha account to this organization's identity provider, so you can sign in with it."),
+      el("a", { href: "/v1/console/sso/start?connect=1&org=" + encodeURIComponent(ctx.slug) }, el("button", { type: "button", class: "secondary" }, "Connect single sign-on"))
+    );
+  }
+
   async function ssoTab(ctx) {
     if (!ctx.manage) {
-      ctx.body.replaceChildren(el("div", { class: "panel" }, el("p", { class: "muted" }, "Only owners and admins manage single sign-on.")));
+      ctx.body.replaceChildren(connectPanel(ctx), el("div", { class: "panel" }, el("p", { class: "muted" }, "Only owners and admins manage single sign-on.")));
       return;
     }
     if (!config.sso) {
@@ -750,18 +767,19 @@
         ssoTab(ctx);
       });
     ctx.body.replaceChildren(
+      connectPanel(ctx),
       el(
         "div",
         { class: "panel" },
         el("h2", {}, "OpenID Connect single sign-on"),
         el("p", { class: "muted" }, "Register this redirect URI with your identity provider: ", el("code", {}, sso.redirect_uri)),
-        el("p", { class: "muted" }, "Members sign in at the login page with the organization slug. SAML is not supported yet."),
+        el("p", { class: "muted" }, "Members sign in at the login page with the organization slug. A member who already has a Kosha account connects it first (Connect single sign-on); people from the allowed domains without an account get a new read-only one on first sign-in. Changing the issuer or client id disconnects every account and ends SSO sessions. SAML is not supported yet."),
         form(
           "stack",
           [
             field("Issuer URL", input({ name: "issuer", type: "url", required: true, value: sso.issuer || "", placeholder: "the issuer, e.g. login.example.com" })),
             field("Client id", input({ name: "client_id", required: true, value: sso.client_id || "" })),
-            field(sso.configured ? "Client secret (leave empty to keep the current one)" : "Client secret", input({ name: "client_secret", type: "password", autocomplete: "off", required: !sso.configured })),
+            field(sso.configured ? "Client secret (leave empty to keep it; required again if the issuer or client id changes)" : "Client secret", input({ name: "client_secret", type: "password", autocomplete: "off", required: !sso.configured })),
             field("Allowed email domains, comma-separated (people from these domains can join as read-only)", input({ name: "allowed_domains", value: (sso.allowed_domains || []).join(", ") })),
             el("label", { class: "check" }, el("input", { type: "checkbox", name: "sso_required", checked: !!sso.sso_required }), "Require SSO for members (owners can still use other sign-in methods)"),
           ],

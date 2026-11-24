@@ -43,6 +43,7 @@ mod compaction_sched;
 // Self-service console (#345): sign-up, sessions, OAuth/SSO, `/console`.
 mod console;
 mod console_crypto;
+mod console_net;
 mod console_oauth;
 mod dashboard;
 mod deletion_purge;

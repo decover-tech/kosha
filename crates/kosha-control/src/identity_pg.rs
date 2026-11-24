@@ -288,6 +288,31 @@ impl IdentityTx for PgTx<'_> {
             .map_err(store_error)
     }
 
+    fn revoke_method_sessions(&mut self, auth_method: &str) -> Result<(), OrgError> {
+        self.rt
+            .block_on(
+                sqlx::query(
+                    "UPDATE kosha.sessions SET revoked_at = NOW() \
+                     WHERE auth_method = $1 AND revoked_at IS NULL",
+                )
+                .bind(auth_method)
+                .execute(&mut *self.tx),
+            )
+            .map(|_| ())
+            .map_err(store_error)
+    }
+
+    fn delete_identities(&mut self, provider: &str) -> Result<u64, OrgError> {
+        self.rt
+            .block_on(
+                sqlx::query("DELETE FROM kosha.user_identities WHERE provider = $1")
+                    .bind(provider)
+                    .execute(&mut *self.tx),
+            )
+            .map(|r| r.rows_affected())
+            .map_err(store_error)
+    }
+
     fn identity_user(&mut self, provider: &str, subject: &str) -> Result<Option<String>, OrgError> {
         let row: Option<(String,)> = self
             .rt
@@ -454,12 +479,14 @@ impl IdentityTx for PgTx<'_> {
             .block_on(
                 sqlx::query(
                     "INSERT INTO kosha.login_flows \
-                         (state_hash, provider, org_id, pkce_verifier, nonce, expires_at) \
-                     VALUES ($1, $2, $3, $4, $5, to_timestamp($6))",
+                         (state_hash, provider, org_id, connect_user_id, pkce_verifier, nonce, \
+                          expires_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7))",
                 )
                 .bind(state_hash)
                 .bind(&flow.provider)
                 .bind(&flow.org_id)
+                .bind(&flow.connect_user_id)
                 .bind(&flow.pkce_verifier)
                 .bind(&flow.nonce)
                 .bind(seconds(flow.expires_at_ms))
@@ -472,10 +499,11 @@ impl IdentityTx for PgTx<'_> {
     fn take_login_flow(&mut self, state_hash: &str) -> Result<Option<LoginFlow>, OrgError> {
         let sql = format!(
             "DELETE FROM kosha.login_flows WHERE state_hash = $1 \
-             RETURNING provider, org_id, pkce_verifier, nonce, {}",
+             RETURNING provider, org_id, connect_user_id, pkce_verifier, nonce, {}",
             ms("expires_at")
         );
-        let row: Option<(String, Option<String>, String, String, i64)> = self
+        type FlowRow = (String, Option<String>, Option<String>, String, String, i64);
+        let row: Option<FlowRow> = self
             .rt
             .block_on(
                 sqlx::query_as(&sql)
@@ -484,9 +512,10 @@ impl IdentityTx for PgTx<'_> {
             )
             .map_err(store_error)?;
         Ok(row.map(
-            |(provider, org_id, pkce_verifier, nonce, expires_at_ms)| LoginFlow {
+            |(provider, org_id, connect_user_id, pkce_verifier, nonce, expires_at_ms)| LoginFlow {
                 provider,
                 org_id,
+                connect_user_id,
                 pkce_verifier,
                 nonce,
                 expires_at_ms,

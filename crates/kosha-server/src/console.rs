@@ -120,8 +120,9 @@ pub(crate) struct RateLimiter {
 }
 
 /// The most counters kept; beyond it expired ones are dropped, and if that
-/// is not enough, all of them (a flood of distinct keys must not grow
-/// memory without bound).
+/// is not enough, the oldest windows (a flood of distinct keys must not
+/// grow memory without bound, nor wipe the counters that matter, such as
+/// the per-address login limits being hit right now).
 const MAX_COUNTERS: usize = 100_000;
 
 impl RateLimiter {
@@ -140,17 +141,7 @@ impl RateLimiter {
         let window = now / window_secs;
         let mut windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
         if windows.len() >= MAX_COUNTERS {
-            windows.retain(|k, (w, _)| {
-                let secs = k
-                    .rsplit('|')
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(1);
-                *w == now / secs
-            });
-            if windows.len() >= MAX_COUNTERS {
-                windows.clear();
-            }
+            evict(&mut windows, now);
         }
         let entry = windows
             .entry(format!("{key}|{window_secs}"))
@@ -164,6 +155,49 @@ impl RateLimiter {
         } else {
             Ok(())
         }
+    }
+}
+
+/// The window size encoded in a counter key (`<key>|<window secs>`).
+fn window_secs_of(key: &str) -> u64 {
+    key.rsplit('|')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// Drop expired counters, then, if still at the cap, the tenth that ends
+/// soonest.
+fn evict(windows: &mut HashMap<String, (u64, u32)>, now: u64) {
+    windows.retain(|k, (w, _)| *w == now / window_secs_of(k));
+    if windows.len() < MAX_COUNTERS {
+        return;
+    }
+    let mut ends: Vec<(u64, String)> = windows
+        .iter()
+        .map(|(k, (w, _))| ((w + 1) * window_secs_of(k), k.clone()))
+        .collect();
+    ends.sort_unstable();
+    for (_, key) in ends.into_iter().take(MAX_COUNTERS / 10) {
+        windows.remove(&key);
+    }
+}
+
+/// What the per-IP limits count by: an IPv4 address, or the /64 of an
+/// IPv6 one (a client usually holds a whole /64 and could rotate through
+/// it).
+fn ip_bucket(ip: &str) -> String {
+    match ip.trim().parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let s = v6.segments();
+                format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+            }
+        },
+        Ok(ip) => ip.to_string(),
+        Err(_) => ip.trim().to_string(),
     }
 }
 
@@ -191,6 +225,8 @@ pub(crate) struct Console {
     /// fetches it, and plain-HTTP local services must not be reachable that
     /// way.
     allow_http_issuers: bool,
+    /// Send mail on the request thread (tests read it right after).
+    mail_inline: bool,
 }
 
 impl Console {
@@ -215,6 +251,7 @@ impl Console {
             limiter: RateLimiter::new(),
             client_ip_header: None,
             allow_http_issuers: false,
+            mail_inline: false,
         }
     }
 
@@ -228,6 +265,8 @@ impl Console {
             mailer,
             secret_key: Some(SecretKey::parse(&"42".repeat(32)).unwrap()),
             allow_http_issuers: true,
+            mail_inline: true,
+            oidc: OidcClient::insecure_for_tests(),
             ..Self::disabled()
         }
     }
@@ -333,6 +372,7 @@ impl Console {
             limiter: RateLimiter::new(),
             client_ip_header: env("KOSHA_CONSOLE_CLIENT_IP_HEADER").map(|h| h.to_ascii_lowercase()),
             allow_http_issuers: false,
+            mail_inline: false,
         };
         println!(
             "console: enabled at {}/console (sign-up {}, mailer {mailer_description}, \
@@ -513,13 +553,11 @@ fn client_ip(console: &Console, req: &Req<'_>) -> String {
     if let Some(name) = &console.client_ip_header {
         if let Some(value) = req.header(name) {
             if let Some(last) = value.rsplit(',').map(str::trim).find(|v| !v.is_empty()) {
-                return last.to_string();
+                return ip_bucket(last);
             }
         }
     }
-    req.header(http::PEER_IP_HEADER)
-        .unwrap_or("unknown")
-        .to_string()
+    ip_bucket(req.header(http::PEER_IP_HEADER).unwrap_or("unknown"))
 }
 
 /// The CSRF checks for a request that is not a `GET` (see module docs).
@@ -678,11 +716,25 @@ impl Ctx<'_> {
         client_ip(self.console, &self.req)
     }
 
-    /// Mail, logging (never failing the request on) a delivery error: the
-    /// answer must not depend on whether the address exists.
+    /// Mail, logging (never failing the request on) a delivery error. Sent
+    /// from another thread: whether a mail goes out depends on whether the
+    /// address exists, and an SMTP round trip on the request thread would
+    /// show in the response time.
     fn mail(&self, to: &str, subject: &str, body: &str) {
-        if let Err(e) = self.console.mailer.send(to, subject, body) {
-            eprintln!("WARN: console: mail to {to} failed: {e}");
+        let mailer = self.console.mailer.clone();
+        let (to, subject, body) = (to.to_string(), subject.to_string(), body.to_string());
+        let send = move || {
+            if let Err(e) = mailer.send(&to, &subject, &body) {
+                eprintln!("WARN: console: mail to {to} failed: {e}");
+            }
+        };
+        if self.console.mail_inline {
+            send();
+        } else if let Err(e) = std::thread::Builder::new()
+            .name("console-mail".into())
+            .spawn(send)
+        {
+            eprintln!("WARN: console: could not start a mail thread: {e}");
         }
     }
 
@@ -907,6 +959,7 @@ impl Ctx<'_> {
         &self,
         provider: &str,
         org_id: Option<String>,
+        connect_user_id: Option<String>,
         endpoint: &str,
         client_id: &str,
         oidc: bool,
@@ -916,6 +969,7 @@ impl Ctx<'_> {
         let flow = LoginFlow {
             provider: provider.to_string(),
             org_id,
+            connect_user_id,
             pkce_verifier: random_url_token(32),
             nonce: random_url_token(32),
             expires_at_ms: orgs_now_ms() + LOGIN_FLOW_TTL_MS,
@@ -955,6 +1009,7 @@ impl Ctx<'_> {
                 self.begin(
                     "google",
                     None,
+                    None,
                     &d.authorization_endpoint,
                     &google.client_id,
                     true,
@@ -966,7 +1021,14 @@ impl Ctx<'_> {
                     .github
                     .as_ref()
                     .ok_or_else(|| error(404, "GitHub sign-in is not configured"))?;
-                self.begin("github", None, &gh.authorize_url, &gh.client_id, false)
+                self.begin(
+                    "github",
+                    None,
+                    None,
+                    &gh.authorize_url,
+                    &gh.client_id,
+                    false,
+                )
             }
             _ => Err(error(404, "unknown sign-in provider")),
         }
@@ -987,6 +1049,23 @@ impl Ctx<'_> {
         let config = identity::sso_config_for_login(self.store, &org.id)
             .map_err(|e| org_error(&e))?
             .ok_or_else(not_configured)?;
+        // `?connect=1`: a signed-in user connects their account to this
+        // organization's SSO. Only from a session no SSO opened, and only
+        // for a member (checked again at the callback).
+        let connect = if self.req.query("connect").as_deref() == Some("1") {
+            let me = self.signed_in()?;
+            identity::session_is_global(&me.session).map_err(|e| org_error(&e))?;
+            let member = identity::user_orgs(self.store, &me.user.id)
+                .map_err(|e| org_error(&e))?
+                .iter()
+                .any(|o| o.org.id == org.id);
+            if !member {
+                return Err(error(403, "you are not a member of this organization"));
+            }
+            Some(me.user.id)
+        } else {
+            None
+        };
         // Fail now rather than at the callback if the secret is unusable.
         secret_key
             .open(&org.id, &config.client_secret_sealed)
@@ -999,6 +1078,7 @@ impl Ctx<'_> {
         self.begin(
             "sso",
             Some(org.id),
+            connect,
             &d.authorization_endpoint,
             &config.client_id,
             true,
@@ -1016,6 +1096,10 @@ impl Ctx<'_> {
             )
         };
         match self.finish_oauth(provider) {
+            // Connecting SSO keeps the session the user already has.
+            Ok((_, method, landing)) if method.is_empty() => {
+                redirect(&landing, std::slice::from_ref(&clear))
+            }
             Ok((user, method, landing)) => {
                 match identity::create_session(
                     self.store,
@@ -1061,9 +1145,13 @@ impl Ctx<'_> {
         let redirect_uri = self.redirect_uri(provider);
         let oidc = &self.console.oidc;
         let now = orgs_now_ms() / 1000;
+        // The detail (which can name internal addresses or the provider's
+        // answers) goes to the log; the browser gets a generic message.
         let log = |e: String| {
             eprintln!("WARN: console: {provider} sign-in failed: {e}");
-            e
+            "sign-in with the identity provider failed; try again or contact your \
+             administrator"
+                .to_string()
         };
         match provider {
             "google" => {
@@ -1126,22 +1214,33 @@ impl Ctx<'_> {
                         &flow.pkce_verifier,
                     )
                     .map_err(log)?;
-                let issuers = [config.issuer.as_str()];
+                // The issuer as the provider's discovery document declares it
+                // (it may end in '/', as Auth0's does).
+                let issuers = [d.issuer.as_str()];
                 let v = oidc
                     .verify_id_token(&id_token, &d, &issuers, &config.client_id, &flow.nonce, now)
                     .map_err(log)?;
-                let provider = format!("sso:{org_id}");
+                let provider = identity::sso_provider(&org_id);
+                let intent = match &flow.connect_user_id {
+                    Some(user_id) => identity::SsoIntent::Connect { user_id },
+                    None => identity::SsoIntent::SignIn,
+                };
                 let user = identity::sso_login(
                     self.store,
                     &org_id,
+                    &d.issuer,
                     &ExternalIdentity {
                         provider: provider.clone(),
                         subject: v.subject,
                         email: v.email,
                         display_name: v.name,
                     },
+                    intent,
                 )
                 .map_err(|e| public_message(&e))?;
+                if flow.connect_user_id.is_some() {
+                    return Ok((user, String::new(), format!("/console#/orgs/{org_id}/sso")));
+                }
                 Ok((user, provider, format!("/console#/orgs/{org_id}")))
             }
             _ => Err("unknown sign-in provider".into()),
@@ -1585,16 +1684,27 @@ impl Ctx<'_> {
         // Authorize before contacting the issuer, so a non-admin cannot make
         // the server fetch URLs of their choosing.
         identity::get_sso_config(self.store, actor, org).map_err(|e| org_error(&e))?;
-        self.console
+        let discovery = self
+            .console
             .oidc
             .discover(issuer.trim().trim_end_matches('/'))
-            .map_err(|e| error(400, &format!("the issuer's discovery document: {e}")))?;
+            .map_err(|e| {
+                eprintln!("WARN: console: SSO issuer check for {org} failed: {e}");
+                error(
+                    400,
+                    "the issuer's OpenID discovery document could not be fetched or is not \
+                     valid (it must be served over https from a public address, without \
+                     redirects, and name this issuer)",
+                )
+            })?;
         let config = identity::put_sso_config(
             self.store,
             actor,
             org,
             &SsoSettings {
-                issuer: issuer.to_string(),
+                // Exactly as the provider declares it: ID tokens carry this
+                // `iss` (with or without a trailing '/').
+                issuer: discovery.issuer,
                 client_id: client_id.to_string(),
                 client_secret_sealed: secret.map(|s| key.seal(org, s)),
                 allowed_domains: domains,
