@@ -100,9 +100,79 @@ fn refuses_to_start_when_database_has_no_keys_and_no_opt_out() {
     assert_refuses_to_start(&[("DATABASE_URL", "postgres://kosha:x@127.0.0.1:1/kosha")]);
 }
 
+/// #346: `KOSHA_API_KEYS` entries can carry scopes, namespaces and an
+/// expiry; a plain entry keeps full access. A read-only env key cannot
+/// write, and a namespace-restricted one lists only its namespaces.
+#[test]
+fn env_keys_take_scopes_namespaces_and_expiry() {
+    let (mut cmd, port) = server(&[(
+        "KOSHA_API_KEYS",
+        "sk-full=acme,sk-ro=acme;scopes=read,sk-docs=acme;namespaces=docs,\
+         sk-old=acme;expires_at=1000",
+    )]);
+    let mut child = cmd.spawn().unwrap();
+    wait_healthy(&mut child, port);
+    let request = |key: &str, line: &str, body: &str| {
+        http(
+            port,
+            &format!(
+                "{line} HTTP/1.1\r\nauthorization: Bearer {key}\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .unwrap()
+    };
+    let create = |ns: &str| {
+        let r = request(
+            "sk-full",
+            "POST /v1/namespaces",
+            &format!(r#"{{"namespace":"{ns}"}}"#),
+        );
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+    };
+    create("docs");
+    create("logs");
+    let ro_write = request("sk-ro", "POST /v1/namespaces/docs/flush", "{}");
+    let ro_read = request("sk-ro", "GET /v1/namespaces/docs/stats", "");
+    let docs_list = request("sk-docs", "GET /v1/namespaces", "");
+    let docs_other = request("sk-docs", "GET /v1/namespaces/logs/stats", "");
+    let expired = request("sk-old", "GET /v1/namespaces", "");
+    let full_list = request("sk-full", "GET /v1/namespaces", "");
+    child.kill().ok();
+    child.wait().ok();
+    assert!(ro_write.starts_with("HTTP/1.1 403"), "{ro_write}");
+    assert!(ro_write.contains("'write' scope"), "{ro_write}");
+    assert!(ro_read.starts_with("HTTP/1.1 200"), "{ro_read}");
+    assert!(docs_list.starts_with("HTTP/1.1 200"), "{docs_list}");
+    assert!(
+        docs_list.contains("\"docs\"") && !docs_list.contains("\"logs\""),
+        "{docs_list}"
+    );
+    assert!(docs_other.starts_with("HTTP/1.1 403"), "{docs_other}");
+    assert!(expired.starts_with("HTTP/1.1 401"), "{expired}");
+    assert!(expired.contains("expired"), "{expired}");
+    assert!(full_list.contains("\"logs\""), "{full_list}");
+}
+
+/// #346: a malformed env key attribute stops the server, naming the entry
+/// but never printing its key.
+#[test]
+fn a_malformed_env_key_attribute_refuses_to_start_without_echoing_the_key() {
+    let (mut cmd, _) = server(&[("KOSHA_API_KEYS", "sk-a=acme,sk-secret-b=beta;scope=read")]);
+    let out = cmd.output().expect("spawn kosha-server");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("KOSHA_API_KEYS entry 2 (tenant 'beta'): unknown attribute 'scope'"),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("sk-secret-b") && !stdout.contains("sk-secret-b"));
+}
+
 #[test]
 fn explicit_opt_out_starts_with_auth_disabled() {
-    let (mut cmd, port) = server(&[("KOSHA_AUTH", "disabled")]);
+    let (mut cmd, port) = server(&[("KOSHA_AUTH", "disabled"), ("KOSHA_LEGACY_ROUTES", "on")]);
     let mut child = cmd.spawn().unwrap();
     wait_healthy(&mut child, port);
     let body = r#"{"namespace":"x"}"#;
@@ -168,31 +238,57 @@ fn keyed_server_rejects_unkeyed_and_oversized_requests() {
 }
 
 #[test]
-fn legacy_routes_can_be_switched_off() {
+fn legacy_routes_require_an_explicit_opt_in() {
+    for (flag, expected) in [(None, 410), (Some("off"), 410), (Some("on"), 200)] {
+        let mut env = vec![("KOSHA_API_KEYS", "sk-tenant=acme")];
+        if let Some(flag) = flag {
+            env.push(("KOSHA_LEGACY_ROUTES", flag));
+        }
+        let (mut cmd, port) = server(&env);
+        let mut child = cmd.spawn().unwrap();
+        wait_healthy(&mut child, port);
+        let body = r#"{"namespace":"x"}"#;
+        let legacy = http(
+            port,
+            &format!(
+                "POST /flush HTTP/1.1\r\nx-api-key: sk-tenant\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .unwrap();
+        let v1 = http(
+            port,
+            "POST /v1/namespaces/x/flush HTTP/1.1\r\nx-api-key: sk-tenant\r\ncontent-length: 2\r\n\r\n{}",
+        )
+        .unwrap();
+        child.kill().ok();
+        child.wait().ok();
+        assert!(
+            legacy.starts_with(&format!("HTTP/1.1 {expected}")),
+            "{legacy}"
+        );
+        assert!(!v1.starts_with("HTTP/1.1 410"), "{v1}");
+    }
+}
+
+#[test]
+fn disabled_query_pod_does_not_forward_legacy_writes() {
     let (mut cmd, port) = server(&[
         ("KOSHA_API_KEYS", "sk-tenant=acme"),
-        ("KOSHA_LEGACY_ROUTES", "off"),
+        ("KOSHA_ROLE", "query"),
+        ("KOSHA_INGEST_HOST", "127.0.0.1:1"),
     ]);
     let mut child = cmd.spawn().unwrap();
     wait_healthy(&mut child, port);
-    let body = r#"{"namespace":"x"}"#;
     let legacy = http(
         port,
-        &format!(
-            "POST /flush HTTP/1.1\r\nx-api-key: sk-tenant\r\ncontent-length: {}\r\n\r\n{body}",
-            body.len()
-        ),
-    )
-    .unwrap();
-    let v1 = http(
-        port,
-        "POST /v1/namespaces/x/flush HTTP/1.1\r\nx-api-key: sk-tenant\r\ncontent-length: 2\r\n\r\n{}",
+        "POST /flush HTTP/1.1\r\nx-api-key: sk-tenant\r\ncontent-length: 2\r\n\r\n{}",
     )
     .unwrap();
     child.kill().ok();
     child.wait().ok();
     assert!(legacy.starts_with("HTTP/1.1 410"), "{legacy}");
-    assert!(!v1.starts_with("HTTP/1.1 410"), "{v1}");
+    assert!(legacy.contains("legacy_route_disabled"), "{legacy}");
 }
 
 /// #346: a typo in the switch for the bootstrap admin key must not leave
@@ -208,9 +304,12 @@ fn invalid_bootstrap_key_switch_refuses_to_start() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
     assert!(
-        stderr.contains("FATAL: invalid KOSHA_ADMIN_BOOTSTRAP_KEY 'disable'"),
+        stderr.contains("FATAL: invalid KOSHA_ADMIN_BOOTSTRAP_KEY"),
         "stderr: {stderr}"
     );
+    // The value is not echoed: the likeliest mistake is pasting the shared
+    // admin key into it, and a crash-looping pod would log it every time.
+    assert!(!stderr.contains("'disable'"), "stderr: {stderr}");
 }
 
 /// #346: `KOSHA_ADMIN_BOOTSTRAP_KEY=disabled` turns the shared admin key
@@ -820,6 +919,7 @@ mod scoped_keys {
             .revoke_operator_credentials(
                 kosha_control::OperatorCredentials::Operator(&carol),
                 "operator",
+                kosha_control::LockoutGuard::Off,
             )
             .unwrap();
         assert_eq!(revoked.len(), 1);
@@ -847,8 +947,11 @@ mod scoped_keys {
         );
         assert_eq!(code, 200, "{created}");
         // Clean up after this run: alice revokes dave's and then her own.
+        // With the bootstrap key off, revoking what may be the last usable
+        // credential in this (shared) database needs `force` (#346
+        // lock-out guard).
         for name in [&dave, &alice] {
-            let by_name = Some(json!({"name": name}));
+            let by_name = Some(json!({"name": name, "force": true}));
             let revoke = "/v1/admin/operators/revoke";
             assert_eq!(status(port, "POST", revoke, &alice_new, by_name), 200);
         }
@@ -856,5 +959,173 @@ mod scoped_keys {
         drop(server);
         let server = start(&database_url);
         assert_eq!(status(server.1, "GET", operators, ADMIN, None), 200);
+    }
+
+    /// Tenant self-service (#346), against the real binary: a key with the
+    /// `admin` scope manages its tenant's keys within its own grant, and
+    /// nothing beyond it; the admin credential and keys without `admin`
+    /// are refused; changes are audited under the calling key.
+    #[test]
+    #[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+    fn a_tenant_manages_its_own_keys_within_its_grant() {
+        let database_url =
+            std::env::var("KOSHA_TEST_DATABASE_URL").expect("set a dedicated test database URL");
+        let server = start(&database_url);
+        let port = server.1;
+        let tenant = format!("self{}x{port}", std::process::id());
+        let other = format!("{tenant}-other");
+        let expires = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            + 3600;
+        let keys = "/v1/api-keys";
+        use kosha_control::orgs::{self, Actor};
+        let registry = kosha_control::PgStore::new(&database_url).unwrap();
+        let org = {
+            let owner = orgs::create_user(
+                &registry,
+                &Actor::Operator,
+                &format!("{tenant}@example.test"),
+                "",
+            )
+            .unwrap();
+            let org = orgs::create_org(
+                &registry,
+                &Actor::Operator,
+                &format!("org-{tenant}"),
+                "Self-service",
+                Some(&owner.id),
+            )
+            .unwrap();
+            orgs::link_tenant(&registry, &Actor::Operator, &org.id, Some(&tenant), None).unwrap();
+            org
+        };
+
+        let (full, _) = create_key(port, json!({ "tenant_id": tenant }));
+        for ns in ["docs", "logs"] {
+            let body = Some(json!({ "namespace": ns }));
+            assert_eq!(status(port, "POST", "/v1/namespaces", &full, body), 200);
+        }
+        // The granting key: read + admin, docs only, expiring in an hour.
+        let (granter, granter_id) = create_key(
+            port,
+            json!({"tenant_id": tenant, "scopes": ["read", "admin"],
+                   "namespaces": ["docs"], "expires_at": expires}),
+        );
+        let (_, theirs_id) = create_key(port, json!({ "tenant_id": other }));
+
+        // Defaults are its own grant; the new key works at once.
+        let (code, created) = call(port, "POST", keys, &granter, Some(json!({})));
+        assert_eq!(code, 200, "{created}");
+        assert_eq!(created["scopes"], json!(["read", "admin"]));
+        assert_eq!(created["namespaces"], json!(["docs"]));
+        assert_eq!(created["expires_at"], json!(expires));
+        assert_eq!(created["tenant_id"], json!(tenant));
+        let child = created["api_key"].as_str().unwrap().to_string();
+        let child_id = created["key_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            status(port, "GET", "/v1/namespaces/docs/stats", &child, None),
+            200
+        );
+        // A restricted key lists only its namespaces.
+        let (code, listed) = call(port, "GET", "/v1/namespaces", &child, None);
+        assert_eq!(code, 200, "{listed}");
+        assert_eq!(
+            listed["namespaces"].as_array().unwrap().len(),
+            1,
+            "{listed}"
+        );
+        assert_eq!(listed["namespaces"][0]["name"], json!("docs"));
+
+        // Never more than it holds.
+        for body in [
+            json!({"scopes": ["write"]}),
+            json!({"namespaces": ["logs"]}),
+            json!({"expires_at": expires + 60}),
+        ] {
+            assert_eq!(
+                status(port, "POST", keys, &granter, Some(body.clone())),
+                403,
+                "{body}"
+            );
+        }
+        assert_eq!(
+            status(
+                port,
+                "POST",
+                keys,
+                &granter,
+                Some(json!({"tenant_id": other}))
+            ),
+            400
+        );
+
+        // It sees what it could have issued (itself and the child), not the
+        // full-access key, and nothing of another tenant.
+        let (code, listed) = call(port, "GET", keys, &granter, None);
+        assert_eq!(code, 200, "{listed}");
+        let mut ids: Vec<&str> = listed["api_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| k["key_id"].as_str().unwrap())
+            .collect();
+        ids.sort_unstable();
+        let mut expected = vec![granter_id.as_str(), child_id.as_str()];
+        expected.sort_unstable();
+        assert_eq!(ids, expected, "{listed}");
+        assert!(!listed.to_string().contains(&granter));
+        let theirs = Some(json!({ "key_id": theirs_id }));
+        assert_eq!(
+            status(port, "POST", "/v1/api-keys/revoke", &granter, theirs),
+            404
+        );
+
+        // Rotate the child, then revoke the replacement.
+        let (code, rotated) = call(
+            port,
+            "POST",
+            "/v1/api-keys/rotate",
+            &granter,
+            Some(json!({"key_id": child_id, "overlap_secs": 0})),
+        );
+        assert_eq!(code, 200, "{rotated}");
+        assert_eq!(rotated["expires_at"], json!(expires));
+        let replacement_id = rotated["key_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            status(port, "GET", "/v1/namespaces/docs/stats", &child, None),
+            401
+        );
+        let revoke = Some(json!({ "key_id": replacement_id }));
+        assert_eq!(
+            status(port, "POST", "/v1/api-keys/revoke", &granter, revoke),
+            200
+        );
+
+        // Without the admin scope, or with the admin credential: refused.
+        let (ro, _) = create_key(port, json!({"tenant_id": tenant, "scopes": ["read"]}));
+        assert_eq!(status(port, "GET", keys, &ro, None), 403);
+        assert_eq!(status(port, "GET", keys, ADMIN, None), 403);
+
+        // Audited under the calling key (read back through the
+        // organization the tenant is linked to; newest first).
+        let actor = format!("api_key:{}", &granter_id[..12]);
+        let mut rows: Vec<(String, String)> =
+            orgs::list_audit(&registry, &Actor::Operator, &org.id, None, None)
+                .unwrap()
+                .into_iter()
+                .filter(|entry| entry.actor.starts_with("api_key:"))
+                .map(|entry| (entry.actor, entry.action))
+                .collect();
+        rows.reverse();
+        assert_eq!(
+            rows,
+            vec![
+                (actor.clone(), "api_key.created".to_string()),
+                (actor.clone(), "api_key.rotated".to_string()),
+                (actor, "api_key.revoked".to_string()),
+            ]
+        );
     }
 }

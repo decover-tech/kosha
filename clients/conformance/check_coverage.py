@@ -29,6 +29,18 @@ EXCLUDED = {
     "KoshaService_DeleteBranch": "no typed SDK method in 0.x; reachable through request()",
     "KoshaService_ListBranches": "no typed SDK method in 0.x; reachable through request()",
     "KoshaService_PutShards": "no typed SDK method in 0.x; reachable through request()",
+    "KoshaService_ListTenantApiKeys": "key management (#346) needs Postgres, off in the test stack",
+    "KoshaService_CreateTenantApiKey": "key management (#346) needs Postgres, off in the test stack",
+    "KoshaService_RotateTenantApiKey": "key management (#346) needs Postgres, off in the test stack",
+    "KoshaService_RevokeTenantApiKey": "key management (#346) needs Postgres, off in the test stack",
+    "KoshaService_CreateCheckoutSession": "billing (#349) is deployment-specific and off in the test stack",
+    "KoshaService_CreateBillingPortalSession": "billing (#349) is deployment-specific and off in the test stack",
+    "KoshaService_HandleStripeWebhook": "Stripe's endpoint, not an SDK operation",
+    "KoshaService_CreateExport": "exports (#347) are off unless KOSHA_EXPORTS is set; reachable through request()",
+    "KoshaService_ListExports": "exports (#347) are off unless KOSHA_EXPORTS is set; reachable through request()",
+    "KoshaService_GetExport": "exports (#347) are off unless KOSHA_EXPORTS is set; reachable through request()",
+    "KoshaService_DeleteExport": "exports (#347) are off unless KOSHA_EXPORTS is set; reachable through request()",
+    "KoshaService_DownloadExport": "exports (#347) are off unless KOSHA_EXPORTS is set; reachable through request()",
 }
 
 
