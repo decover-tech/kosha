@@ -2749,9 +2749,9 @@ fn knn_global_rescore_max_from_env() -> Option<usize> {
 }
 
 /// `KOSHA_KNN_RESCORE_STATS` (#381): `1`, `true` or `on` counts, per kNN
-/// query, the quantized segments the default per-segment path probed and
-/// how many of them returned unrescored estimates (no whole local
-/// `doc_vectors.bin`), and logs them on the `search timing:` line. Off by
+/// query, exact per-segment rescores, quantized segments probed and
+/// segments that returned unrescored estimates, and logs them on the
+/// `search timing:` line. Off by
 /// default (no extra stat call, line unchanged). Always on with
 /// `KOSHA_KNN_GLOBAL_RESCORE`.
 fn knn_rescore_stats_from_env() -> bool {
@@ -3686,7 +3686,9 @@ pub struct SearchPhaseStats {
     /// Quantized candidates whose upper bound reached the global `k`-th
     /// lower bound, so needed their exact vector.
     pub knn_rescore_selected: usize,
-    /// Of those, rescored with their f32 vector from `doc_vectors.bin`.
+    /// Candidates rescored with their f32 vector from `doc_vectors.bin`:
+    /// from the global pass if it ran, or from per-segment rescoring
+    /// when its stats are enabled.
     pub knn_rescored: usize,
     /// Of those, with no readable exact vector: returned as estimates and
     /// their segments counted in `knn_degraded_segments`.
@@ -3823,6 +3825,7 @@ struct OpenStatsCollector {
     /// Vectors scored by exact filtered kNN — see
     /// [`SearchPhaseStats::knn_exact_vectors`].
     knn_exact_vectors: AtomicUsize,
+    knn_segment_rescored: AtomicUsize,
     /// See [`SearchPhaseStats::knn_seg_quantized`].
     knn_seg_quantized: AtomicUsize,
     /// See [`SearchPhaseStats::knn_seg_unrescored`].
@@ -7073,6 +7076,11 @@ impl Searcher {
                             }),
                     });
                     open_stats.add_knn_scan(&scan);
+                    if self.knn_rescore_stats_on() && scan.rescored > 0 {
+                        open_stats
+                            .knn_segment_rescored
+                            .fetch_add(scan.rescored, Ordering::Relaxed);
+                    }
                     match probe {
                         Some(Ok(results)) => results,
                         // As above: a client error is a 400.
@@ -7895,6 +7903,9 @@ impl Searcher {
         phase_stats.knn_exact_vectors = open_stats.knn_exact_vectors.load(Ordering::Relaxed);
         if query.knn.is_some() && self.knn_rescore_stats_on() {
             phase_stats.knn_rescore_stats = true;
+            if !phase_stats.knn_global_rescore {
+                phase_stats.knn_rescored = open_stats.knn_segment_rescored.load(Ordering::Relaxed);
+            }
             phase_stats.knn_seg_quantized = open_stats.knn_seg_quantized.load(Ordering::Relaxed);
             phase_stats.knn_seg_unrescored = open_stats.knn_seg_unrescored.load(Ordering::Relaxed);
         }
@@ -14804,7 +14815,9 @@ mod tests {
         use kosha_core::VectorQuantization::{F32, I8};
         let (dir, ns, manifest, corpus) = global_rescore_corpus("i8", &[F32, I8, I8, F32, I8, I8]);
         let global = Searcher::new(dir.clone()).with_knn_global_rescore(true);
-        let default = Searcher::new(dir.clone()).with_knn_global_rescore(false);
+        let default = Searcher::new(dir.clone())
+            .with_knn_global_rescore(false)
+            .with_knn_rescore_stats(false);
         let k = 10;
         for q_seed in 0..10u64 {
             let query = global_rescore_vector(900_000 + q_seed);
@@ -14831,6 +14844,31 @@ mod tests {
             assert_eq!(off.knn_rescore_candidates, 0);
             assert_eq!(off.knn_rescored, 0);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn knn_per_segment_rescore_stats_count_exact_shortlist_scores() {
+        use kosha_core::VectorQuantization::{F32, I8};
+
+        let (dir, ns, manifest, _) = global_rescore_corpus("per-segment-stats", &[I8, I8, F32]);
+        let q = global_rescore_query(global_rescore_vector(900_000), 10);
+        let search = |enabled| {
+            Searcher::new(dir.clone())
+                .with_knn_global_rescore(false)
+                .with_knn_rescore_stats(enabled)
+                .search_with_stats(&ns, &manifest, &q, None)
+                .unwrap()
+        };
+        let (_, disabled) = search(false);
+        assert!(!disabled.knn_rescore_stats);
+        assert_eq!(disabled.knn_rescored, 0);
+
+        let (_, local) = search(true);
+        let per_segment = (10 * kosha_segment::vector_rescore_factor()).min(300);
+        assert!(local.knn_rescore_stats);
+        assert_eq!(local.knn_seg_quantized, 2);
+        assert_eq!(local.knn_rescored, 2 * per_segment);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -14949,6 +14987,7 @@ mod tests {
         evict();
         let (silent, silent_stats) = Searcher::new(dir.clone())
             .with_knn_global_rescore(false)
+            .with_knn_rescore_stats(true)
             .search_with_hydrators(&ns, &manifest, &q, None, Some(&restore), None)
             .unwrap();
         assert_eq!(
@@ -14957,6 +14996,9 @@ mod tests {
             "today's per-segment path: estimates returned silently"
         );
         assert!(!silent_stats.knn_global_rescore);
+        assert!(silent_stats.knn_rescore_stats);
+        assert_eq!(silent_stats.knn_seg_unrescored, 2);
+        assert_eq!(silent_stats.knn_rescored, 0);
 
         evict();
         let (r, stats) = Searcher::new(dir.clone())

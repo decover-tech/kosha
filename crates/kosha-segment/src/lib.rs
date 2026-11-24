@@ -8120,8 +8120,7 @@ struct ProbedCandidates {
     postings: usize,
 }
 
-/// Where the time of a kNN probe's posting scans went (#435), summed over
-/// the postings scanned inside one [`with_knn_scan_stats`] scope.
+/// kNN probe metrics collected inside one [`with_knn_scan_stats`] scope.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct KnnScanStats {
     /// Reading posting bytes from local disk (idx file or span cache).
@@ -8145,6 +8144,8 @@ pub struct KnnScanStats {
     pub postings_scanned: usize,
     /// Budgeted postings `KOSHA_KNN_BOUND_STOP_ALPHA` skipped (#384).
     pub bound_skips: usize,
+    /// Quantized candidates successfully rescored from the local sidecar.
+    pub rescored: usize,
 }
 
 impl KnnScanStats {
@@ -10810,7 +10811,15 @@ impl SegmentReader {
         };
         let mut shortlist = top_k_by_score(scored, shortlist_len);
         if let Some(field) = vi.field.as_deref() {
-            self.rescore_exact(field, query, &mut shortlist);
+            let rescored = self.rescore_exact(field, query, &mut shortlist);
+            if rescored > 0 {
+                KNN_SCAN_STATS.with(|stats| {
+                    if let Some(mut total) = stats.get() {
+                        total.rescored += rescored;
+                        stats.set(Some(total));
+                    }
+                });
+            }
         }
         shortlist.sort_by(by_score_desc);
         shortlist.truncate(k);

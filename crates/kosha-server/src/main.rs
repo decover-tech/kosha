@@ -12735,6 +12735,9 @@ fn log_search_timing(
     // the flag above): quantized segments probed there, and how many of
     // them returned unrescored estimates.
     if phases.knn_rescore_stats {
+        if !phases.knn_global_rescore {
+            knn_rescore.push_str(&format!(" knn_rescored={}", phases.knn_rescored));
+        }
         knn_rescore.push_str(&format!(
             " knn_seg_quantized={} knn_seg_unrescored={}",
             phases.knn_seg_quantized, phases.knn_seg_unrescored,
