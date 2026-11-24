@@ -1383,6 +1383,7 @@ fn the_scheduler_closes_last_month_once_and_syncs_payments() {
     let flushes = AtomicU64::new(0);
     let flush = || {
         flushes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     };
 
     // During October, and in the first two hours of November, September
@@ -1399,8 +1400,14 @@ fn the_scheduler_closes_last_month_once_and_syncs_payments() {
     assert!(run.closed.is_none());
     assert!(f.store.invoices(None).unwrap().is_empty());
 
-    // Past the delay: October is closed and submitted, once.
+    // Past the delay, but this pod's usage cannot be delivered: October
+    // waits rather than being invoiced without it.
     f.now.store(oct.end_ms() + 3 * HOUR_MS, Ordering::SeqCst);
+    let run = f.billing().run_scheduled(|| Err("spool unwritable".into()));
+    assert!(run.closed.is_none());
+    assert!(f.store.invoices(None).unwrap().is_empty());
+
+    // Past the delay: October is closed and submitted, once.
     let run = f.billing().run_scheduled(flush);
     let closed = run.closed.expect("closes October");
     assert_eq!(closed.created, vec!["acme/2026-10".to_string()]);
@@ -1444,10 +1451,10 @@ fn the_scheduler_retries_a_close_that_failed() {
     );
     f.now.store(oct.end_ms() + 2 * HOUR_MS, Ordering::SeqCst);
     f.provider.set_failing(true);
-    let run = f.billing().run_scheduled(|| {});
+    let run = f.billing().run_scheduled(|| Ok(()));
     assert_eq!(run.closed.unwrap().errors.len(), 1);
     f.provider.set_failing(false);
-    let run = f.billing().run_scheduled(|| {});
+    let run = f.billing().run_scheduled(|| Ok(()));
     let closed = run.closed.expect("closed again after the failure");
     assert!(closed.errors.is_empty(), "{:?}", closed.errors);
     assert_eq!(f.provider.submitted().len(), 1);
@@ -1526,7 +1533,10 @@ fn stripe_test_mode_charges_a_month_of_synthetic_usage() {
     usage.record(&events).unwrap();
 
     now.store(oct.end_ms() + 2 * HOUR_MS, Ordering::SeqCst);
-    let closed = billing.run_scheduled(|| {}).closed.expect("closes October");
+    let closed = billing
+        .run_scheduled(|| Ok(()))
+        .closed
+        .expect("closes October");
     assert!(closed.errors.is_empty(), "{:?}", closed.errors);
     assert_eq!(closed.submitted, 1);
     const EXPECTED_CENTS: u64 = 2500 + 195 + 6200 + 66;
@@ -1564,6 +1574,6 @@ fn stripe_test_mode_charges_a_month_of_synthetic_usage() {
         .unwrap();
     assert_eq!(paid["status"], "paid", "{paid}");
     now.fetch_add(HOUR_MS, Ordering::SeqCst);
-    let synced = billing.run_scheduled(|| {}).synced.expect("synced");
+    let synced = billing.run_scheduled(|| Ok(())).synced.expect("synced");
     assert_eq!(synced.paid, vec![format!("{tenant}/2026-10")]);
 }

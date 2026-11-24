@@ -307,9 +307,11 @@ impl Billing {
     /// One scheduler run at the billing clock's now: close last month if
     /// it is `close_delay` over and this pod has not closed it cleanly
     /// yet, then sync payments. `flush` delivers this pod's spooled usage
-    /// before a close. Errors are in the reports (and logged); a period
-    /// closed with errors is closed again by the next run.
-    pub(crate) fn run_scheduled(&self, flush: impl FnOnce()) -> ScheduledRun {
+    /// before a close; when it fails the close waits for the next run, as
+    /// an invoice once made is never re-rated. Errors are in the reports
+    /// (and logged); a period closed with errors is closed again by the
+    /// next run.
+    pub(crate) fn run_scheduled(&self, flush: impl FnOnce() -> Result<(), String>) -> ScheduledRun {
         let Some(schedule) = self.schedule else {
             return ScheduledRun::default();
         };
@@ -319,8 +321,13 @@ impl Billing {
         let delay_ms = u64::try_from(schedule.close_delay.as_millis()).unwrap_or(u64::MAX);
         let due = now_ms >= this_month.start_ms().saturating_add(delay_ms);
         let mut run = ScheduledRun::default();
-        if due && *self.last_closed.lock().unwrap() != Some(period) {
-            flush();
+        let close = due && *self.last_closed.lock().unwrap() != Some(period);
+        let flushed = if close {
+            flush().map_err(|e| eprintln!("WARN: billing: not closing {period}: usage flush: {e}"))
+        } else {
+            Err(())
+        };
+        if flushed.is_ok() {
             match self.biller().close_period(period, now_ms) {
                 Ok(report) => {
                     if report.errors.is_empty() {
@@ -512,10 +519,9 @@ impl AppState {
             .name("kosha-billing-jobs".into())
             .spawn(move || loop {
                 if let Some(billing) = state.billing.as_ref() {
-                    billing.run_scheduled(|| {
-                        if let Some(meter) = state.usage.as_ref() {
-                            let _ = meter.flush();
-                        }
+                    billing.run_scheduled(|| match state.usage.as_ref() {
+                        Some(meter) => meter.flush().map(|_| ()),
+                        None => Ok(()),
                     });
                 }
                 std::thread::sleep(schedule.interval);
