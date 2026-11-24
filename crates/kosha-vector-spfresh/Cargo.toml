@@ -9,8 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-# Intentionally empty: pure std, in memory. kosha-segment owns the on-disk
-# format; keeping this crate dependency-free keeps that boundary.
+serde = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
