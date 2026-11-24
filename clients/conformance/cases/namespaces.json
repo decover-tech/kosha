@@ -14,6 +14,33 @@
     ]
   },
   {
+    "id": "namespaces.export_and_hard_delete",
+    "description": "Export a live namespace and require an exact confirmation before hard deletion.",
+    "covers": ["KoshaService_ExportNamespace", "KoshaService_HardDeleteNamespace"],
+    "setup": [{ "op": "create_namespace" }],
+    "steps": [
+      {
+        "op": "raw_request",
+        "args": { "method": "POST", "path": "/v1/namespaces/$NS/export", "body": { "format": "jsonl" } },
+        "expect": { "ok": true }
+      },
+      {
+        "op": "raw_request",
+        "args": { "method": "POST", "path": "/v1/namespaces/$NS/hard-delete", "body": {} },
+        "expect": { "error": { "kind": "http", "status": 400, "code": "invalid_argument", "retryable": false } }
+      },
+      {
+        "op": "raw_request",
+        "args": { "method": "POST", "path": "/v1/namespaces/$NS/hard-delete", "body": { "confirm": "$NS" } },
+        "expect": { "ok": true }
+      },
+      {
+        "op": "get_schema",
+        "expect": { "error": { "kind": "http", "status": 404, "code": "namespace_not_found", "retryable": false } }
+      }
+    ]
+  },
+  {
     "id": "namespaces.create_conflict",
     "description": "Creating a namespace twice is a 409 that is not retried.",
     "covers": ["KoshaService_CreateNamespace"],

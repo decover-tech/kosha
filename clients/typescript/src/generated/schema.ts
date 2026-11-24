@@ -180,6 +180,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/namespaces/{namespace}/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Export all live documents, including acknowledged unflushed writes,
+         *     as newline-delimited JSON to a short-lived signed S3 download URL.
+         */
+        post: operations["KoshaService_ExportNamespace"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/namespaces/{namespace}/flush": {
         parameters: {
             query?: never;
@@ -191,6 +211,26 @@ export interface paths {
         put?: never;
         /** Flush buffered documents to a segment. */
         post: operations["KoshaService_Flush"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/namespaces/{namespace}/hard-delete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Permanently delete a namespace after the caller confirms its name.
+         *     The legacy v1 DELETE operation is unchanged.
+         */
+        post: operations["KoshaService_HardDeleteNamespace"];
         delete?: never;
         options?: never;
         head?: never;
@@ -231,7 +271,9 @@ export interface paths {
         /**
          * Set a namespace's schema (issue #220): per-field analyzers for segments
          *     written from now on. Existing segments keep the analysis recorded in
-         *     their footers and stay searchable with it.
+         *     their footers and stay searchable with it. Fields can be added online;
+         *     changing or removing a declared type on a nonempty namespace returns
+         *     409 conflict with details.reason "reindex_required".
          */
         post: operations["KoshaService_PutNamespaceSchema"];
         delete?: never;
@@ -328,7 +370,15 @@ export interface components {
         KoshaServiceExistsBody: {
             ids: string[];
         };
+        KoshaServiceExportNamespaceBody: {
+            /** @description The only supported format is "jsonl"; omission defaults to it. */
+            format?: string;
+        };
         KoshaServiceFlushBody: Record<string, unknown>;
+        KoshaServiceHardDeleteNamespaceBody: {
+            /** @description Must equal the namespace name in the URL. */
+            confirm: string;
+        };
         KoshaServiceIndexDocumentsBody: {
             documents: components["schemas"]["v1Document"][];
         };
@@ -640,6 +690,16 @@ export interface components {
             missing?: string[];
             namespace?: string;
         };
+        v1ExportNamespaceResponse: {
+            /** Format: int64 */
+            document_count?: number;
+            /** @description A bearer URL: anyone with the URL can download the export until expiry. */
+            download_url?: string;
+            /** Format: int64 */
+            expires_in_seconds?: number;
+            format?: string;
+            namespace?: string;
+        };
         v1Field: {
             /**
              * @description The value's type, PascalCase: "Text", "Keyword", "Integer", "Float",
@@ -779,6 +839,12 @@ export interface components {
             to?: number;
             /** @description The counters summed over `namespaces`. */
             total?: Record<string, unknown>;
+        };
+        v1HardDeleteNamespaceResponse: {
+            acknowledged?: boolean;
+            deletion?: components["schemas"]["v1DeletionRecord"];
+            namespace?: string;
+            storage_reclaimed?: boolean;
         };
         v1HealthCheckResponse: {
             /** @description "ok". */
@@ -2809,6 +2875,168 @@ export interface operations {
             };
         };
     };
+    KoshaService_ExportNamespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                namespace: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["KoshaServiceExportNamespaceBody"];
+            };
+        };
+        responses: {
+            /** @description A successful response. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ExportNamespaceResponse"];
+                };
+            };
+            /** @description invalid_argument, invalid_query */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unauthenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payment_required (billing refuses the operation for the account's standing) */
+            402: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description permission_denied and quota codes */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_found, namespace_not_found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description method_not_allowed; the `Allow` header lists the methods the path takes */
+            405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description request_timeout */
+            408: {
+                headers: {
+                    /** @description Seconds to wait before retrying, when retryable. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description conflict; write_conflict is retryable */
+            409: {
+                headers: {
+                    /** @description Seconds to wait before retrying, when retryable. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payload_too_large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description tenant rate limits or overload */
+            429: {
+                headers: {
+                    /** @description Seconds to wait before retrying, when retryable. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description internal */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description upstream_error */
+            502: {
+                headers: {
+                    /** @description Seconds to wait before retrying, when retryable. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unavailable */
+            503: {
+                headers: {
+                    /** @description Seconds to wait before retrying, when retryable. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+        };
+    };
     KoshaService_Flush: {
         parameters: {
             query?: never;
@@ -2962,6 +3190,168 @@ export interface operations {
             503: {
                 headers: {
                     /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+        };
+    };
+    KoshaService_HardDeleteNamespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                namespace: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["KoshaServiceHardDeleteNamespaceBody"];
+            };
+        };
+        responses: {
+            /** @description A successful response. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1HardDeleteNamespaceResponse"];
+                };
+            };
+            /** @description invalid_argument, invalid_query */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unauthenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payment_required (billing refuses the operation for the account's standing) */
+            402: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description permission_denied and quota codes */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_found, namespace_not_found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description method_not_allowed; the `Allow` header lists the methods the path takes */
+            405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description request_timeout */
+            408: {
+                headers: {
+                    /** @description Seconds to wait before retrying, when retryable. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description conflict; write_conflict is retryable */
+            409: {
+                headers: {
+                    /** @description Seconds to wait before retrying, when retryable. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payload_too_large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description tenant rate limits or overload */
+            429: {
+                headers: {
+                    /** @description Seconds to wait before retrying, when retryable. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description internal */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description upstream_error */
+            502: {
+                headers: {
+                    /** @description Seconds to wait before retrying, when retryable. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unavailable */
+            503: {
+                headers: {
+                    /** @description Seconds to wait before retrying, when retryable. */
                     "Retry-After"?: number;
                     [name: string]: unknown;
                 };

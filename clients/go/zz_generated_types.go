@@ -126,8 +126,20 @@ type KoshaServiceExistsBody struct {
 	Ids []string `json:"ids"`
 }
 
+// KoshaServiceExportNamespaceBody defines model for KoshaServiceExportNamespaceBody.
+type KoshaServiceExportNamespaceBody struct {
+	// Format The only supported format is "jsonl"; omission defaults to it.
+	Format *string `json:"format,omitempty"`
+}
+
 // KoshaServiceFlushBody defines model for KoshaServiceFlushBody.
 type KoshaServiceFlushBody = map[string]interface{}
+
+// KoshaServiceHardDeleteNamespaceBody defines model for KoshaServiceHardDeleteNamespaceBody.
+type KoshaServiceHardDeleteNamespaceBody struct {
+	// Confirm Must equal the namespace name in the URL.
+	Confirm string `json:"confirm"`
+}
 
 // KoshaServiceIndexDocumentsBody defines model for KoshaServiceIndexDocumentsBody.
 type KoshaServiceIndexDocumentsBody struct {
@@ -438,6 +450,17 @@ type V1ExistsResponse struct {
 	Namespace *string   `json:"namespace,omitempty"`
 }
 
+// V1ExportNamespaceResponse defines model for v1ExportNamespaceResponse.
+type V1ExportNamespaceResponse struct {
+	DocumentCount *int64 `json:"document_count,omitempty"`
+
+	// DownloadUrl A bearer URL: anyone with the URL can download the export until expiry.
+	DownloadUrl      *string `json:"download_url,omitempty"`
+	ExpiresInSeconds *int64  `json:"expires_in_seconds,omitempty"`
+	Format           *string `json:"format,omitempty"`
+	Namespace        *string `json:"namespace,omitempty"`
+}
+
 // V1Field defines model for v1Field.
 type V1Field struct {
 	// FieldType The value's type, PascalCase: "Text", "Keyword", "Integer", "Float",
@@ -583,6 +606,17 @@ type V1GetUsageResponse struct {
 
 	// Total The counters summed over `namespaces`.
 	Total *map[string]interface{} `json:"total,omitempty"`
+}
+
+// V1HardDeleteNamespaceResponse defines model for v1HardDeleteNamespaceResponse.
+type V1HardDeleteNamespaceResponse struct {
+	Acknowledged *bool `json:"acknowledged,omitempty"`
+
+	// Deletion One hard delete of a namespace or a tenant, as the control store keeps it
+	// (kosha.deletion_records). Holds identifiers and counters only.
+	Deletion         *V1DeletionRecord `json:"deletion,omitempty"`
+	Namespace        *string           `json:"namespace,omitempty"`
+	StorageReclaimed *bool             `json:"storage_reclaimed,omitempty"`
 }
 
 // V1HealthCheckResponse defines model for v1HealthCheckResponse.
@@ -868,8 +902,14 @@ type KoshaServiceIndexDocumentsJSONRequestBody = KoshaServiceIndexDocumentsBody
 // KoshaServiceExistsJSONRequestBody defines body for KoshaServiceExists for application/json ContentType.
 type KoshaServiceExistsJSONRequestBody = KoshaServiceExistsBody
 
+// KoshaServiceExportNamespaceJSONRequestBody defines body for KoshaServiceExportNamespace for application/json ContentType.
+type KoshaServiceExportNamespaceJSONRequestBody = KoshaServiceExportNamespaceBody
+
 // KoshaServiceFlushJSONRequestBody defines body for KoshaServiceFlush for application/json ContentType.
 type KoshaServiceFlushJSONRequestBody = KoshaServiceFlushBody
+
+// KoshaServiceHardDeleteNamespaceJSONRequestBody defines body for KoshaServiceHardDeleteNamespace for application/json ContentType.
+type KoshaServiceHardDeleteNamespaceJSONRequestBody = KoshaServiceHardDeleteNamespaceBody
 
 // KoshaServiceReplaceDocumentsJSONRequestBody defines body for KoshaServiceReplaceDocuments for application/json ContentType.
 type KoshaServiceReplaceDocumentsJSONRequestBody = KoshaServiceReplaceDocumentsBody
