@@ -25,6 +25,7 @@ use kosha_core::{AnalysisConfig, AnalyzerSpec, SegmentAnalysis};
 pub use analysis::Analyzer;
 use doc_store_zstd::{compress_doc_store, parse_dict_trailer, rebuild_offsets, DocStoreDecoder};
 pub use doc_store_zstd::{DocStoreCompressionMode, DocStoreZstdConfig, DOC_STORE_DICT_MAGIC};
+pub use kosha_vector_spfresh::namespace_centroids;
 pub use multivec::{LateInteractionHits, LateInteractionParams};
 pub use reorder::{BpConfig, DocReorder};
 
@@ -2354,6 +2355,40 @@ fn decode_f32_entries_into(bytes: &[u8], dim: usize, ids: &mut Vec<u32>, vectors
         ids.push(u32::from_le_bytes([id[0], id[1], id[2], id[3]]));
         let (floats, _) = floats.as_chunks::<4>();
         vectors.extend(floats.iter().map(|b| f32::from_le_bytes(*b)));
+    }
+}
+
+/// A posting's f32 entries viewed in place, without decoding: entry `i` is
+/// `words[i * (dim + 1)]` (the id's bits) followed by its `dim` floats.
+/// `None` when `bytes` is not 4-byte aligned or the target is big endian;
+/// the caller then decodes with [`decode_f32_entries_into`]. Both give the
+/// same ids and the same float bits. Trailing bytes short of one entry are
+/// ignored.
+fn f32_entries_in_place(bytes: &[u8], dim: usize) -> Option<&[f32]> {
+    if !cfg!(target_endian = "little") {
+        return None;
+    }
+    let record_size = 4 + 4 * dim;
+    let whole = bytes.len() / record_size * record_size;
+    bytemuck::try_cast_slice(&bytes[..whole]).ok()
+}
+
+/// [`for_each_f32_similarity`] over entries viewed in place by
+/// [`f32_entries_in_place`].
+fn for_each_f32_similarity_in_place(
+    words: &[f32],
+    dim: usize,
+    accept: Option<&dyn Fn(u32) -> bool>,
+    f32_similarity: impl Fn(&[f32]) -> f32,
+    mut emit: impl FnMut(u32, f32, f32),
+) {
+    for entry in words.chunks_exact(dim + 1) {
+        let (id, vector) = entry.split_at(1);
+        let id = id[0].to_bits();
+        if accept.is_some_and(|accept| !accept(id)) {
+            continue;
+        }
+        emit(id, f32_similarity(vector), 0.0);
     }
 }
 
@@ -5063,6 +5098,22 @@ fn vector_postings_cache_max_bytes() -> usize {
     })
 }
 
+/// Per-segment byte budget for the decoded late-interaction (`.ivf`)
+/// postings LRU (`KOSHA_LATE_INTERACTION_POSTINGS_CACHE_MAX_BYTES`, default
+/// 32 MiB, `0` disables) — #205. Separate from the single-vector budget so
+/// a token-index working set (query tokens x `nprobe` postings per query)
+/// does not evict the single-vector one. Entries report to the same
+/// live-bytes account as every other postings cache.
+fn late_interaction_postings_cache_max_bytes() -> usize {
+    static BUDGET: OnceLock<usize> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("KOSHA_LATE_INTERACTION_POSTINGS_CACHE_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32 * 1024 * 1024)
+    })
+}
+
 /// Optional live-memory account the segment's per-segment postings LRU
 /// reports its resident bytes to (Tier 1 O6). The decoded form of postings
 /// lives outside the on-disk format (the per-query `PostingsCache`), so
@@ -7677,7 +7728,8 @@ struct ProbedCandidates {
 pub struct KnnScanStats {
     /// Reading posting bytes from local disk (idx file or span cache).
     pub read_nanos: u64,
-    /// Decoding those bytes into ids and vectors (or codes).
+    /// Decoding those bytes into ids and vectors (or codes). Zero for an
+    /// f32 posting scored in place from the read buffer.
     pub decode_nanos: u64,
     /// Scoring entries against the query, candidate collection included.
     pub score_nanos: u64,
@@ -7691,8 +7743,9 @@ pub struct KnnScanStats {
     /// Postings read and decoded into an owned posting (admitted to the
     /// cache, or a quantized column's).
     pub postings_decoded: usize,
-    /// f32 postings read and scored from the probe's reused buffers,
-    /// without building a posting.
+    /// f32 postings read and scored from the probe's reused buffers
+    /// (in place from the read buffer on little-endian targets), without
+    /// building a posting.
     pub postings_scanned: usize,
 }
 
@@ -7739,7 +7792,8 @@ struct PostingScan<'a> {
     probe: ProbeQuery<'a>,
     accept: Option<&'a dyn Fn(u32) -> bool>,
     reader: span_cache::LocalRangeReader,
-    /// Decode scratch for an f32 posting that is not kept.
+    /// Decode scratch for an f32 posting that is not kept and cannot be
+    /// scored in place (a big-endian target).
     ids: Vec<u32>,
     vectors: Vec<f32>,
     stats: KnnScanStats,
@@ -8030,6 +8084,11 @@ pub struct SegmentReader {
     /// Late-interaction fields (#205) opened so far, by footer index. Only
     /// success is cached, as for `doc_vectors`.
     multi_vectors: Mutex<HashMap<usize, Arc<multivec::MultiVectorIndex>>>,
+    /// Decoded `.ivf` postings of every late-interaction field, keyed by
+    /// `(field index, posting)` — the late-interaction twin of
+    /// `vector_cache`, budgeted by
+    /// `KOSHA_LATE_INTERACTION_POSTINGS_CACHE_MAX_BYTES`.
+    multi_vector_cache: multivec::IvfPostingCache,
 }
 
 /// Default of [`SegmentReader::with_vector_rescore_factor`]:
@@ -8165,11 +8224,15 @@ impl SegmentReader {
             vector_slots,
             vector_cache: shared_vector_cache(),
             vector_cache_owner: next_vector_cache_owner(),
-            postings_account,
+            postings_account: postings_account.clone(),
             doc_vectors: Mutex::new(None),
             field_lengths: Mutex::new(HashMap::new()),
             vector_rescore_factor: vector_rescore_factor(),
             multi_vectors: Mutex::new(HashMap::new()),
+            multi_vector_cache: PostingsCache::new(
+                late_interaction_postings_cache_max_bytes(),
+                postings_account,
+            ),
         })
     }
 
@@ -8273,6 +8336,22 @@ impl SegmentReader {
         self.vector_cache.resident_bytes_where(|(o, _)| *o == owner)
     }
 
+    /// Override the byte budget of the decoded late-interaction posting
+    /// cache (#205); `0` disables it. Readers default to
+    /// `KOSHA_LATE_INTERACTION_POSTINGS_CACHE_MAX_BYTES`. Call before the
+    /// first search: whatever the cache already holds is dropped.
+    pub fn with_late_interaction_postings_cache_max_bytes(mut self, max_bytes: usize) -> Self {
+        let account = self.multi_vector_cache.account.clone();
+        self.multi_vector_cache = PostingsCache::new(max_bytes, account);
+        self
+    }
+
+    /// Bytes the decoded late-interaction posting cache holds right now
+    /// (#205; also what it reports to the live-bytes account).
+    pub fn late_interaction_cache_resident_bytes(&self) -> usize {
+        self.multi_vector_cache.state.lock().unwrap().total_bytes
+    }
+
     /// The vector columns `footer` declares, or the single unnamed legacy
     /// index of a segment written before columns existed. No I/O.
     fn vector_slots(segment_dir: &Path, footer: &Footer) -> Vec<VectorFieldSlot> {
@@ -8346,7 +8425,7 @@ impl SegmentReader {
                 q
             })
             .collect();
-        index.search(&normalized, k, params, accept)
+        index.search(&normalized, k, params, accept, &self.multi_vector_cache)
     }
 
     fn doc_vectors(&self) -> Result<Arc<DocVectors>, KoshaError> {
@@ -8786,6 +8865,56 @@ impl SegmentReader {
         }))
     }
 
+    /// Reads namespace routing metadata from existing offsets sidecars,
+    /// without opening lexical files or hydrating any posting body.
+    pub fn namespace_centroids(
+        dir: &Path,
+    ) -> Result<Vec<kosha_vector_spfresh::namespace_centroids::Column>, KoshaError> {
+        Self::namespace_centroids_from(|name| Ok(fs::read(dir.join(name))?))
+    }
+
+    pub fn namespace_centroids_from(
+        read: impl Fn(&str) -> Result<Vec<u8>, KoshaError>,
+    ) -> Result<Vec<kosha_vector_spfresh::namespace_centroids::Column>, KoshaError> {
+        use kosha_vector_spfresh::namespace_centroids::{Centroid, Column};
+        let footer: Footer = serde_json::from_slice(&read("footer.json")?)?;
+        let Some(fields) = footer.vector_fields else {
+            return Ok(Vec::new()); // the planner falls back for legacy vector columns
+        };
+        fields
+            .into_iter()
+            .filter(|meta| meta.offsets)
+            .map(|meta| {
+                let file = meta.offsets_file();
+                let data = read(&file)?;
+                let invalid =
+                    || KoshaError::CorruptSegment(format!("{file}: invalid centroid offsets"));
+                let version =
+                    u32::from_le_bytes(data.get(4..8).ok_or_else(invalid)?.try_into().unwrap());
+                let postings = parse_vector_offsets(&data, meta.dim, version)
+                    .filter(|postings| {
+                        postings.iter().all(|p| {
+                            p.radius.is_finite() && p.centroid.iter().all(|x| x.is_finite())
+                        })
+                    })
+                    .ok_or_else(invalid)?;
+                let unit_norm = is_unit_norm_vector_index_version(version);
+                Ok(Column {
+                    field: meta.name,
+                    dim: meta.dim as usize,
+                    centroids: postings
+                        .into_iter()
+                        .map(|p| Centroid {
+                            vector: p.centroid,
+                            radius: p.radius,
+                            unit_norm,
+                        })
+                        .collect(),
+                })
+            })
+            .collect()
+    }
+
     /// The flat (legacy / missing-sidecar) vectors of this segment's first
     /// vector column — empty when it is served lazily or has none.
     pub fn vector_store(&self) -> VectorStore {
@@ -8806,11 +8935,13 @@ impl SegmentReader {
     ///
     /// * second touch (see below) of a posting the cache has room for, or
     ///   any quantized posting: decoded into an owned posting, as before;
-    /// * any other f32 posting: decoded into `scan`'s reused flat scratch
-    ///   and scored from it. No posting is built and nothing is allocated.
+    /// * any other f32 posting: scored in place from the read buffer, which
+    ///   is 4-byte aligned (on a big-endian target, decoded into `scan`'s
+    ///   reused flat scratch and scored from it). No posting is built,
+    ///   nothing is allocated and nothing is copied after the read.
     ///
-    /// Both paths decode the same bytes into the same floats and score
-    /// them with the same kernel in the same order, so the scores are
+    /// Every path reads the same bytes as the same floats and scores them
+    /// with the same kernel in the same order, so the scores are
     /// bit-identical.
     fn scan_posting(
         &self,
@@ -8879,6 +9010,18 @@ impl SegmentReader {
                     .vector_cache
                     .accepts(f32_posting_resident_bytes(count, vi.dim));
             if !keep {
+                if let Some(words) = f32_entries_in_place(bytes, vi.dim) {
+                    for_each_f32_similarity_in_place(
+                        words,
+                        vi.dim,
+                        scan.accept,
+                        f32_similarity,
+                        emit,
+                    );
+                    scan.stats.postings_scanned += 1;
+                    scan.stats.score_nanos += lap_nanos(&mut clock);
+                    return Ok(());
+                }
                 decode_f32_entries_into(bytes, vi.dim, &mut scan.ids, &mut scan.vectors);
                 scan.stats.decode_nanos += lap_nanos(&mut clock);
                 for_each_f32_similarity(
