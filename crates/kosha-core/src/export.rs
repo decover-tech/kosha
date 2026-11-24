@@ -187,8 +187,14 @@ pub struct ExportFilter {
     pub tenant_id: Option<String>,
     pub namespace: Option<String>,
     pub states: Vec<ExportState>,
-    /// At most this many, oldest first; `None` = 1000.
+    /// At most this many, oldest first (newest first with `newest_first`);
+    /// `None` = 1000.
     pub limit: Option<u32>,
+    /// Order by `(created_at_ms, id)` descending instead of ascending.
+    pub newest_first: bool,
+    /// Only exports strictly before this `(created_at_ms, id)` in the
+    /// newest-first order (the next page after that export).
+    pub before: Option<(u64, String)>,
 }
 
 impl ExportFilter {
@@ -201,16 +207,27 @@ impl ExportFilter {
                 .as_ref()
                 .is_none_or(|ns| &record.namespace == ns)
             && (self.states.is_empty() || self.states.contains(&record.state))
+            && self
+                .before
+                .as_ref()
+                .is_none_or(|(ms, id)| (record.created_at_ms, &record.id) < (*ms, id))
+    }
+
+    /// Where `record` sits in the listing order.
+    pub fn position(record: &ExportRecord) -> (u64, String) {
+        (record.created_at_ms, record.id.clone())
     }
 
     pub fn effective_limit(&self) -> u32 {
         self.limit.unwrap_or(1000).max(1)
     }
 
-    /// Pending and running exports: the ones whose pins hold.
+    /// Every pending and running export: the ones whose pins hold. No cap:
+    /// a pin GC did not read would let it delete what an export reads.
     pub fn active() -> Self {
         Self {
             states: vec![ExportState::Pending, ExportState::Running],
+            limit: Some(u32::MAX),
             ..Self::default()
         }
     }

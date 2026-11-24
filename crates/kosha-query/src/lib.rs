@@ -4035,7 +4035,12 @@ impl Searcher {
             let mut draining = self.draining.lock().unwrap();
             for (key, reader) in weak {
                 if reader.strong_count() > 0 {
-                    draining.entry(key).or_default().push(reader);
+                    let list = draining.entry(key).or_default();
+                    // Readers that ended since are dropped here, so a
+                    // segment forgotten again and again does not grow its
+                    // list (release_segment prunes the same way).
+                    list.retain(|w| w.strong_count() > 0);
+                    list.push(reader);
                 }
             }
         }

@@ -495,6 +495,23 @@ impl AppState {
                         std::thread::sleep(interval);
                     })
                     .expect("failed to spawn deletion purge thread");
+                // The heartbeat runs on its own, so a pass that takes longer
+                // than the liveness window (a large tenant sweep, a slow
+                // disk) does not make this live pod look dead.
+                let every = interval
+                    .min(settings.liveness / 4)
+                    .max(Duration::from_millis(100));
+                let weak = Arc::downgrade(self);
+                std::thread::Builder::new()
+                    .name("kosha-pod-heartbeat".into())
+                    .spawn(move || loop {
+                        std::thread::sleep(every);
+                        let Some(state) = weak.upgrade() else {
+                            return;
+                        };
+                        state.heartbeat();
+                    })
+                    .expect("failed to spawn pod heartbeat thread");
             }
         }
         let Some(interval) = settings.resume_interval else {
@@ -585,9 +602,13 @@ impl AppState {
                 .or_insert((record.scope, None, Vec::new(), Vec::new()));
             if *scope != DeletionScope::Tenant {
                 *floor = Some(floor.unwrap_or(0).max(record.last_version));
-            } else if !record.storage_done() {
-                // Read before the sweep below: a record seen done here was
-                // done before its subject is swept.
+            }
+            // Read before the sweep below: a record seen done here was done
+            // before its subject is swept. A tenant always waits for its
+            // reclaim (its namespaces are still listed until then); any
+            // other record only when this pod is to vouch for it: an
+            // acknowledgement covers storage verified by the writer too.
+            if !record.storage_done() && (*scope == DeletionScope::Tenant || record.acks_required) {
                 pending.push(record.id.clone());
             }
             if record.acks_required && !record.is_completed() {
@@ -603,7 +624,10 @@ impl AppState {
         for ((_, subject), (scope, floor, pending, unacked)) in subjects {
             let outcome = self.sweep_deleted_subject(scope, &subject, floor, tuning);
             self.note_sweep(&outcome, &subject, &mut report);
-            let unacked = if outcome.unfinished() {
+            // A recent deletion is acknowledged only after its settle
+            // sweep, which removes what a search or fetch already running
+            // during this one wrote afterwards.
+            let unacked = if outcome.unfinished() || recent.contains(subject.as_str()) {
                 unacked
             } else {
                 self.acknowledge_swept(&unacked, &pending)

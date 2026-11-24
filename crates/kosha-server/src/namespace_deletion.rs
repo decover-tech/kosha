@@ -396,39 +396,40 @@ impl AppState {
         let _lineage = self.branch_lock.lock().unwrap();
         let lock = self.publication_lock(&id);
         let _guard = lock.lock().unwrap();
-        let (objects, error) = self.retry_namespace_reclaim(&id);
+        let (objects, error) = self.retry_namespace_reclaim(&id, record);
         self.note_deletion_attempt(record, objects, error.as_deref())
     }
 
     /// Run `erase` (deleting a subject's exports) and add how many went to
-    /// `record`. Returns the error, if any.
+    /// `record`, also when some are left. Returns why any is left.
     pub(crate) fn erase_exports_for(
         &self,
         record: &DeletionRecord,
-        erase: impl FnOnce() -> Result<u64, String>,
+        erase: impl FnOnce() -> (u64, Option<String>),
     ) -> Option<String> {
-        match erase() {
-            Ok(0) => None,
-            Ok(count) => {
-                let noted = self
-                    .controller
-                    .lock()
-                    .unwrap()
-                    .note_deletion_exports(&record.id, count);
-                if let Err(e) = noted {
-                    eprintln!(
-                        "WARN: deletion {}: {count} export(s) deleted, but counting them on the \
-                         record failed: {e}",
-                        record.id
-                    );
-                }
-                None
+        let (count, error) = erase();
+        if count > 0 {
+            let noted = self
+                .controller
+                .lock()
+                .unwrap()
+                .note_deletion_exports(&record.id, count);
+            if let Err(e) = noted {
+                eprintln!(
+                    "WARN: deletion {}: {count} export(s) deleted, but counting them on the \
+                     record failed: {e}",
+                    record.id
+                );
             }
-            Err(e) => Some(e),
         }
+        error
     }
 
-    fn retry_namespace_reclaim(&self, id: &NamespaceId) -> (u64, Option<String>) {
+    fn retry_namespace_reclaim(
+        &self,
+        id: &NamespaceId,
+        record: &DeletionRecord,
+    ) -> (u64, Option<String>) {
         let stored = self.controller.lock().unwrap().manifest_versions();
         let stored = match stored {
             Ok(stored) => stored,
@@ -467,7 +468,7 @@ impl AppState {
             error.get_or_insert(format!("local segment cleanup failed: {e}"));
         }
         let (objects, remote_error) = self.reclaim_remote_prefix(&id.0);
-        let exports = self.delete_namespace_exports(id).err();
+        let exports = self.erase_exports_for(record, || self.delete_namespace_exports(id));
         (
             objects,
             error

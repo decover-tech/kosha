@@ -71,6 +71,7 @@ mod org_admin;
 #[cfg(all(test, feature = "s3"))]
 mod posting_presence_tests;
 mod posting_spans;
+mod public_url;
 mod rerank;
 mod role;
 #[cfg(feature = "s3")]
@@ -9263,36 +9264,37 @@ fn handle_delete(body: &[u8], state: &AppState) -> String {
         None => return json_error(400, "missing 'filter' or 'query'"),
     };
 
+    // Each (shard) namespace meters its own deletes as soon as they are
+    // applied (#348), so a later publish failure or another shard's error
+    // cannot drop deletes that did happen.
     let deleted = match state.indexer.shard_count(&ns) {
-        None => delete_in(state, &ns, &filter),
+        None => delete_in(state, &ns, &ns, &filter),
         // A sharded namespace (#207): delete in every shard that exists.
         Some(shards) => kosha_core::sharding::shard_namespaces(&ns, shards)
             .into_iter()
             .filter(|shard| state.indexer.manifest_version(shard).is_some())
             .try_fold((0, 0), |(count, bytes), shard| {
-                delete_in(state, &shard, &filter).map(|(c, b)| (count + c, bytes + b))
+                delete_in(state, &shard, &ns, &filter).map(|(c, b)| (count + c, bytes + b))
             }),
     };
     match deleted {
-        Ok((count, bytes)) => {
-            if let Some(meter) = state.usage.as_ref() {
-                meter.record_delete(&ns, count as u64, bytes);
-            }
-            json_ok(&serde_json::json!({
+        Ok((count, _bytes)) => json_ok(&serde_json::json!({
             "deleted": count,
             "namespace": ns.0,
-            }))
-        }
+        })),
         Err(response) => response,
     }
 }
 
 /// Delete by query in one (unsharded or shard) namespace and publish.
 /// `Ok` is the documents deleted and their doc-store bytes (#348); `Err`
-/// carries a ready-to-send error response.
+/// carries a ready-to-send error response. The deletes are metered under
+/// `metered_as` (the namespace the client named, the root of a shard) as
+/// soon as they are applied, before the publish, which can fail after.
 fn delete_in(
     state: &AppState,
     ns: &NamespaceId,
+    metered_as: &NamespaceId,
     filter: &kosha_core::FilterClause,
 ) -> Result<(usize, u64), String> {
     state.ensure_writable(ns)?;
@@ -9322,6 +9324,9 @@ fn delete_in(
             KoshaError::InvalidQuery(_) => json_error(400, &e.to_string()),
             e => json_error(500, &format!("delete error: {e}")),
         })?;
+    if let Some(meter) = state.usage.as_ref() {
+        meter.record_delete(metered_as, outcome.documents as u64, outcome.stored_bytes);
+    }
 
     if let Err(e) = state.publish_namespace(ns) {
         return Err(publication_error("deletion publication failed", &e));
@@ -14649,7 +14654,7 @@ mod tests {
         }
     }
 
-    struct FailingManifestStore(kosha_control::Controller);
+    pub(crate) struct FailingManifestStore(pub(crate) kosha_control::Controller);
     impl ControlStore for FailingManifestStore {
         fn create_namespace(&mut self, id: NamespaceId) -> Result<(), KoshaError> {
             self.0.create_namespace(id)

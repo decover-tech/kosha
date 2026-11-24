@@ -371,7 +371,7 @@ own document, or combine the two values into one leaf (`"name_org": "Ada|beta"`)
 
 - Per-retriever weights for RRF. Reranking over more than one field, and ES `text_similarity_reranker` retrievers in the Python client.
 - Multi-field scoring other than a boosted sum (`dis_max` / `best_fields` tie-breakers, turbopuffer `Product` / `Max` of fields), field-name patterns in `fields`, and block-max WAND for `fields` queries.
-- Analyzer features beyond the list in [Analyzers](#analyzers): per-language stemmers other than English, synonyms, n-grams, CJK dictionary segmentation (`standard@2` splits Han ideographs one per token), full Unicode case folding (`ß` and `SS` stay distinct). Other `FieldSchema` members (`type`, `indexed`, `stored`) are stored but not enforced — field types still come with each document.
+- Analyzer features beyond the list in [Analyzers](#analyzers): per-language stemmers other than English, synonyms, n-grams, CJK dictionary segmentation (`standard@2` splits Han ideographs one per token), full Unicode case folding (`ß` and `SS` stay distinct). Other `FieldSchema` members (`type`, `indexed`, `stored`) are stored but not enforced — field types still come with each document, and changing them is always online ([Schema evolution](#schema-evolution)).
 - Fuzzy: block-max WAND over expansions (fuzzy queries score every posting of every expansion), highlighting of fuzzy matches, fuzzy inside `fields` / `match_phrase`, bloom pruning for two-edit tokens.
 - Native embedding with a local model runtime (ONNX / candle): only the HTTP and mock providers exist. A model change does not reindex automatically, late-interaction bags are not embedded, and the original text of an embedded field is not kept.
 - gRPC — the service is defined in the proto, but HTTP/JSON is the only implemented transport.
@@ -497,7 +497,7 @@ the routes marked *write* to the ingest pod.
 | `POST /v1/namespaces/{ns}/flush` | → `FlushResponse` | *write*. Make buffered writes searchable. |
 | `POST /v1/namespaces/{ns}/delete` | `DeleteByQueryRequest` → `DeleteByQueryResponse` | *write*. Delete by query. |
 | `POST /v1/namespaces/{ns}/branch`, `GET /v1/namespaces/{ns}/branches`, `DELETE /v1/namespaces/{ns}/branch` | `{"name": "<branch>"}` → the branch; → its branches; → what was reclaimed and its `deletion` record | Create (*write*), list and delete (*write*) copy-on-write branches (#208). 409 if the name is taken, or for deleting a namespace that is not a branch. |
-| `POST /v1/namespaces/{ns}/exports`, `GET /v1/namespaces/{ns}/exports[/{id}]`, `GET /v1/namespaces/{ns}/exports/{id}/download[?part=N]`, `DELETE /v1/namespaces/{ns}/exports/{id}` | `{"include_vectors"?, "upload_url"?}` → the export (202) | *read* scope. Export everything the namespace stores as gzip JSON Lines; 404 unless `KOSHA_EXPORTS=on`. See [Exports](#exports). |
+| `POST /v1/namespaces/{ns}/exports`, `GET /v1/namespaces/{ns}/exports[/{id}]`, `GET /v1/namespaces/{ns}/exports/{id}/download[?part=N]`, `DELETE /v1/namespaces/{ns}/exports/{id}` | `{"include_vectors"?, "upload_url"?}` → the export (202) | *read* scope. Export everything the namespace stores as gzip JSON Lines; starting one is a 404 unless `KOSHA_EXPORTS=on`. See [Exports](#exports). |
 | `POST /v1/namespaces/{ns}/shards` | `{"shards": N}` → `{"namespace", "shards", "changed"}` | *write*. Create the namespace sharded (#207); see [Namespace sharding](#namespace-sharding). |
 | `POST /v1/namespaces/{ns}/schema`, `GET /v1/namespaces/{ns}/schema` | `NamespaceSchema` | Set (*write*) or read the namespace schema; see [Analyzers](#analyzers). A change existing documents cannot follow is a 409 naming the field and the rule; see [Schema evolution](#schema-evolution). The response lists the online `changes`. |
 | `POST /v1/namespaces/{ns}/search` | `SearchRequest` → `SearchResponse` | 404 for a missing namespace. |
@@ -575,7 +575,10 @@ store again under its locks before it removes anything.
 **Per-pod acknowledgement.** Every pod with the purge on keeps a row in the
 pod registry (`kosha.pods`, a heartbeat per pass) and, after a clean sweep of
 a deleted subject, writes an acknowledgement (`kosha.deletion_acks`) for each
-of its records that asks for one. With `KOSHA_DELETION_REQUIRE_ACKS=on` on the
+of its records that asks for one. A deletion under an hour old is
+acknowledged only after its settle sweep (60 s after the first), and only
+once the writer verified its storage. The heartbeat runs on its own timer,
+so a long pass does not make a live pod look dead. With `KOSHA_DELETION_REQUIRE_ACKS=on` on the
 writer pod, a record is written with `acks_required`: once storage is
 verified it stays `pending` (`storage_verified: true`) until every *live* pod
 has acknowledged it, and only then becomes `completed`. A pod is live while its
@@ -733,26 +736,37 @@ DELETE /v1/namespaces/docs/exports/{id}               delete it now
   export is pending or running, so a compaction mid-export cannot take a segment away. Deletes
   are applied as of the pinned version.
 - **Jobs**: the record (`kosha.exports`, migration 010) is durable. A writer pod claims and runs
-  it and refreshes the claim every 30 s; if that pod dies, a writer pod's sweep (every 60 s)
-  claims it after 10 minutes and runs it again from the start against the same pins. States:
+  it and refreshes the claim every 30 s on a timer of its own, while writing and while
+  delivering; if that pod dies, a writer pod's sweep (every 60 s) claims it after 10 minutes and
+  runs it again from the start against the same pins. Each attempt writes under its own
+  `attempt-{n}/` prefix, and a run that lost its claim removes only its own files. States:
   `pending`, `running`, `completed`, `failed` (objects deleted, `error` says why), `expired`.
   At most `KOSHA_EXPORT_MAX_ACTIVE` (default 2) pending or running exports per tenant (429).
-- **Delivery**: parts are stored under `_exports/{tenant}/{id}/` in the bucket (with the
+- **Delivery**: parts are stored under `_exports/{tenant}/{id}/attempt-{n}/` in the bucket (with the
   tenant's SSE key, #343), or under the data directory without S3. On S3 the status route returns
   a presigned `GET` URL per part valid for `KOSHA_EXPORT_PRESIGN_SECS`; any pod streams a part
   through `.../download`. An optional `upload_url` (a presigned PUT URL in the customer's bucket)
   receives the whole export as one object: it must be `https`, carry no credentials before the
   host, and every address its host resolves to must be public (loopback, private, link-local,
   CGNAT, multicast, reserved and documentation ranges are refused, for IPv4, IPv6 and
-  IPv4-mapped forms). The upload connects to the address that was checked and follows no
+  IPv4-mapped forms; 6to4, Teredo, local-use NAT64 and discard-only IPv6 are refused too). The
+  upload connects to the address that was checked, ignores `HTTP(S)_PROXY`, and follows no
   redirects. The URL is kept only until the delivery ends and is never returned; the record shows
   `delivery_host`, `delivery_state` and `delivery_error`. A failed delivery leaves the export
   completed and downloadable.
 - **Lifetime and erasure**: a completed export expires after `KOSHA_EXPORT_TTL_SECS` (default 7
   days): its objects are deleted and it reads `expired`. Deleting the namespace deletes its
   exports, deleting the tenant deletes all of them and the whole `_exports/{tenant}/` prefix, and
-  the deletion record counts them (`exports_deleted`). An export id is answered only together
-  with the caller's tenant and the namespace in the path; anything else is a 404.
+  the deletion record counts them (`exports_deleted`). A row is deleted only after its objects
+  are confirmed gone; until then it stays (`expired`, unpinned) and the deletion record stays
+  `pending`, so the retry finds it. Failed and expired rows are removed after 30 days. An export
+  id is answered only together with the caller's tenant and the namespace in the path; anything
+  else is a 404.
+- **Listing**: `GET .../exports` is newest first, at most `?limit=` (default and maximum 100)
+  per page; `next` is the `?before=` of the following page.
+- **Turned off**: with `KOSHA_EXPORTS` off only starting an export is refused (404); existing
+  exports can still be read, downloaded and deleted. A writer pod booting with exports off fails
+  any export still pending or running, so its pinned segments are released to GC.
 
 ## Schema evolution
 
@@ -766,18 +780,20 @@ schema applies.
 | --- | --- |
 | Add a field (any settings) | online |
 | Remove a field from the schema | online: new segments use the defaults |
-| Declare a `type` for a field that had none, or drop the declaration | online (types are declarative; documents keep the types they were sent with) |
+| Change `type`, `indexed` or `stored` (declare, change or drop) | online, reported as `declarative_changed`: the engine does not read them, so documents keep the types they were sent with and are indexed and stored as before |
 | Change `analyzer` / `stopwords` of a field, `default_analyzer`, `default_stopwords` | online, lazily: new segments use the new chain, existing segments answer with the chain their footer records until compaction re-analyzes them (`POST /v1/admin/compact-namespace` with `"mode": "full"`) or a reindex |
 | Declare an `embedding` on a field holding no vectors | online |
 | Drop a field's `embedding` | online: stored vectors stay, clients send vectors again |
-| Change a declared `type` | **reindex** (`type_change`) |
-| Change `indexed` or `stored` (absent means `true`) | **reindex** (`indexed_change`, `stored_change`) |
 | Change a field's embedding model or `dims` while it holds vectors | **reindex** (`embedding_change`) |
+| Declare an `embedding` whose model differs from the model the field's stored vectors were embedded with (also after dropping the old declaration in an earlier request) | **reindex** (`embedding_change`) |
 | Declare an `embedding` whose `dims` differ from the vectors the field holds | **reindex** (`vector_dims_change`) |
 
 A refused change is a **409** with `{"error", "field", "rule", "reindex_required": true}` and
 changes nothing; an invalid schema is still a 400. A successful response lists the online
-`changes` (`field`, `change`, `effect`).
+`changes` (`field`, `change`, `effect`). Only the embedding rules can refuse a change: they are
+judged against the models and dimensions the stored segments record, not only the previous
+schema, and buffered documents are flushed before an embedding declaration changes so their
+model is recorded first; removing a declaration and adding another one cannot get around them.
 
 Analyzer changes stay online, unlike in Elasticsearch, because every segment records the chains
 it was written with and queries are analyzed per segment ([Analyzers](#analyzers)), so no
