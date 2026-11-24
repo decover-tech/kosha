@@ -574,11 +574,12 @@ For a sharded namespace, the export reads a strong snapshot of each shard
 in turn, not a single point-in-time snapshot across shards. Pause writes
 to the namespace during export if you need that consistency.
 
-**Evolving a schema.** `POST /v1/namespaces/{ns}/schema` accepts new field
-declarations on a live namespace. Changing or removing a previously
-declared type from a populated namespace requires reindexing, and returns
-`409 conflict` with `details.reason: "reindex_required"` and the field name.
-An empty namespace can change types. Analyzer updates keep their existing
+**Evolving a schema.** `POST /v1/namespaces/{ns}/schema` preserves v1's
+schema replacement behavior by default. Add `?require_online_safe=true`
+to reject changes or removals of declared types on a populated namespace
+with `409 conflict`, `details.reason: "reindex_required"`, and the field
+name in the error message. The check allows new field declarations and
+type changes on empty namespaces. Analyzer updates keep their existing
 behavior: old segments are searched using their recorded analyzers; new
 segments use the new schema. [Embedding model changes](#native-embedding)
 still require reindexing when they would mix incompatible stored vectors.

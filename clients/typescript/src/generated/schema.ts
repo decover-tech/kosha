@@ -272,8 +272,8 @@ export interface paths {
          * Set a namespace's schema (issue #220): per-field analyzers for segments
          *     written from now on. Existing segments keep the analysis recorded in
          *     their footers and stay searchable with it. Fields can be added online;
-         *     changing or removing a declared type on a nonempty namespace returns
-         *     409 conflict with details.reason "reindex_required".
+         *     with require_online_safe=true, changing or removing a declared type on
+         *     a nonempty namespace returns 409 with details.reason "reindex_required".
          */
         post: operations["KoshaService_PutNamespaceSchema"];
         delete?: never;
@@ -3683,7 +3683,13 @@ export interface operations {
     };
     KoshaService_PutNamespaceSchema: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description Reject changes or removals of declared field types on a populated
+                 *     namespace. Defaults to false, preserving v1 schema replacement behavior.
+                 */
+                require_online_safe?: boolean;
+            };
             header?: never;
             path: {
                 namespace: string;

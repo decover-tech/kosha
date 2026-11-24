@@ -2464,14 +2464,20 @@ impl Indexer {
         &self,
         namespace: &NamespaceId,
         schema: kosha_core::NamespaceSchema,
+        require_online_safe: bool,
     ) -> Result<bool, KoshaError> {
         schema
             .resolve()
             .map_err(|e| KoshaError::InvalidQuery(format!("invalid schema: {e}")))?;
         let handle = self.ns_handle(namespace);
         let _mutation = handle.mutation.lock().unwrap();
-        if let Some(conflict) = self.schema_reindex_reason_in(namespace, &handle, &schema) {
-            return Err(KoshaError::SchemaReindexRequired(conflict));
+        if require_online_safe {
+            if let Some(conflict) = self.schema_reindex_reason_in(&handle, &schema) {
+                return Err(KoshaError::SchemaReindexRequired(conflict));
+            }
+        }
+        if let Some(conflict) = self.embedding_conflict_in(namespace, &handle, &schema) {
+            return Err(KoshaError::InvalidQuery(conflict));
         }
         let mut state = handle.state.lock().unwrap();
         if state.known && state.manifest.schema.as_ref() == Some(&schema) {
@@ -2491,35 +2497,38 @@ impl Indexer {
         schema: &kosha_core::NamespaceSchema,
     ) -> Option<String> {
         let handle = self.ns_handle(namespace);
-        self.schema_reindex_reason_in(namespace, &handle, schema)
+        self.schema_reindex_reason_in(&handle, schema)
     }
 
     fn schema_reindex_reason_in(
         &self,
-        namespace: &NamespaceId,
         handle: &NamespaceHandle,
         schema: &kosha_core::NamespaceSchema,
     ) -> Option<String> {
-        {
-            let state = handle.state.lock().unwrap();
-            let holds_data = state.manifest.segments.iter().any(|s| s.doc_count > 0)
-                || state
-                    .buffer
-                    .as_ref()
-                    .is_some_and(|b| !b.documents.is_empty())
-                || !state.flushing_docs.is_empty()
-                || !state.recovered.is_empty();
-            if let Some(reason) = state
-                .manifest
-                .schema
+        let state = handle.state.lock().unwrap();
+        let holds_data = state.manifest.segments.iter().any(|s| s.doc_count > 0)
+            || state
+                .buffer
                 .as_ref()
-                .filter(|_| holds_data)
-                .and_then(|old| old.field_type_conflict(schema))
-            {
-                return Some(reason);
-            }
-        }
-        self.embedding_conflict_in(namespace, handle, schema)
+                .is_some_and(|b| !b.documents.is_empty())
+            || !state.flushing_docs.is_empty()
+            || !state.recovered.is_empty();
+        state
+            .manifest
+            .schema
+            .as_ref()
+            .filter(|_| holds_data)
+            .and_then(|old| old.field_type_conflict(schema))
+    }
+
+    /// Why the proposed schema would mix incompatible embedding vectors.
+    pub fn embedding_conflict(
+        &self,
+        namespace: &NamespaceId,
+        schema: &kosha_core::NamespaceSchema,
+    ) -> Option<String> {
+        let handle = self.ns_handle(namespace);
+        self.embedding_conflict_in(namespace, &handle, schema)
     }
 
     fn embedding_conflict_in(
@@ -7167,7 +7176,7 @@ mod tests {
 
         // A schema set locally since the last publication wins over the
         // remote's (it is the newer admin action).
-        assert!(idx.set_schema(&ns, schema("whitespace")).unwrap());
+        assert!(idx.set_schema(&ns, schema("whitespace"), false).unwrap());
         let mut remote = published.clone();
         remote.version = published.version + 1;
         remote.schema = Some(schema("keyword"));

@@ -5156,6 +5156,14 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Reject changes or removals of declared field types on a populated\nnamespace. Defaults to false, preserving v1 schema replacement behavior.",
+            "in": "query",
+            "name": "require_online_safe",
+            "schema": {
+              "type": "boolean"
+            }
           }
         ],
         "requestBody": {
@@ -5362,7 +5370,7 @@
             }
           }
         },
-        "summary": "Set a namespace's schema (issue #220): per-field analyzers for segments\nwritten from now on. Existing segments keep the analysis recorded in\ntheir footers and stay searchable with it. Fields can be added online;\nchanging or removing a declared type on a nonempty namespace returns\n409 conflict with details.reason \"reindex_required\".",
+        "summary": "Set a namespace's schema (issue #220): per-field analyzers for segments\nwritten from now on. Existing segments keep the analysis recorded in\ntheir footers and stay searchable with it. Fields can be added online;\nwith require_online_safe=true, changing or removing a declared type on\na nonempty namespace returns 409 with details.reason \"reindex_required\".",
         "tags": [
           "KoshaService"
         ],

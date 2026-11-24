@@ -878,6 +878,13 @@ type V1WildcardQuery struct {
 	Pattern         string `json:"pattern"`
 }
 
+// KoshaServicePutNamespaceSchemaParams defines parameters for KoshaServicePutNamespaceSchema.
+type KoshaServicePutNamespaceSchemaParams struct {
+	// RequireOnlineSafe Reject changes or removals of declared field types on a populated
+	// namespace. Defaults to false, preserving v1 schema replacement behavior.
+	RequireOnlineSafe *bool `form:"require_online_safe,omitempty" json:"require_online_safe,omitempty"`
+}
+
 // KoshaServiceGetUsageParams defines parameters for KoshaServiceGetUsage.
 type KoshaServiceGetUsageParams struct {
 	// From Window start, Unix seconds (default: 30 days before `to`).

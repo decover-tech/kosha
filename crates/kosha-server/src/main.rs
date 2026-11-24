@@ -8106,8 +8106,17 @@ fn route_inner(
         return handle_exists_with_ns(&ns, tenant, body, state);
     }
 
-    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/schema") {
-        return handle_put_schema_with_ns(&ns, tenant, body, state);
+    if let Some(ns) = extract_namespace(no_query(request_line), "POST /v1/namespaces/", "/schema") {
+        let require_online_safe = parse_method_and_path(request_line)
+            .and_then(|(_, path)| path.split_once('?'))
+            .is_some_and(|(_, query)| {
+                query.split('&').any(|pair| {
+                    pair.split_once('=').is_some_and(|(key, value)| {
+                        url_decode(key) == "require_online_safe" && url_decode(value) == "true"
+                    })
+                })
+            });
+        return handle_put_schema_with_ns(&ns, tenant, body, require_online_safe, state);
     }
 
     if let Some(ns) = extract_namespace(request_line, "GET /v1/namespaces/", "/schema") {
@@ -8263,6 +8272,12 @@ fn route_inner(
     }
 
     api_error(ErrorCode::NotFound, "not found")
+}
+
+fn no_query(request_line: &str) -> &str {
+    request_line
+        .split_once('?')
+        .map_or(request_line, |(path, _)| path)
 }
 
 /// Extract a namespace from a v1 path: `METHOD /v1/namespaces/{ns}/suffix ...`
@@ -8504,7 +8519,7 @@ fn handle_create_namespace(body: &[u8], tenant: &str, state: &AppState) -> Strin
     drop(guard);
     let mut manifest = manifest;
     if typed_schema != kosha_core::NamespaceSchema::default() {
-        match state.indexer.set_schema(&id, typed_schema) {
+        match state.indexer.set_schema(&id, typed_schema, false) {
             Ok(true) => {
                 if let Err(e) = state.publish_namespace(&id) {
                     return api_error(
@@ -8519,9 +8534,6 @@ fn handle_create_namespace(body: &[u8], tenant: &str, state: &AppState) -> Strin
             Ok(false) => {}
             Err(KoshaError::InvalidQuery(message)) => {
                 return api_error(ErrorCode::InvalidArgument, &message)
-            }
-            Err(KoshaError::SchemaReindexRequired(message)) => {
-                return schema_conflict_response(&message)
             }
             Err(e) => return api_error(ErrorCode::Internal, &format!("schema update failed: {e}")),
         }
@@ -10630,17 +10642,18 @@ fn handle_replace_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &Ap
 
 /// `POST /v1/namespaces/{ns}/schema` — set the namespace schema (#220).
 /// The body is a proto `NamespaceSchema` (`{"fields": {...}}`), or one
-/// wrapped as `{"schema": {...}}` like `CreateNamespaceRequest`. Only the
-/// analysis settings and vector fields' `embedding` (#209) are honored. New
+/// wrapped as `{"schema": {...}}` like `CreateNamespaceRequest`. New
 /// segments use it; existing segments keep the analysis their footer
 /// records and stay searchable with it, so the change reaches old
 /// documents when compaction rewrites them. Changing the embedding model of
 /// a field that already holds vectors is a 409 (see
 /// `kosha_write::Indexer::embedding_conflict`).
+/// `require_online_safe=true` also rejects changes to existing field types.
 fn handle_put_schema_with_ns(
     namespace: &str,
     tenant: &str,
     body: &[u8],
+    require_online_safe: bool,
     state: &AppState,
 ) -> String {
     let ns = NamespaceId(tenant_namespace(tenant, namespace));
@@ -10659,16 +10672,18 @@ fn handle_put_schema_with_ns(
     if let Err(e) = schema.validate_embeddings() {
         return api_error(ErrorCode::InvalidArgument, &format!("invalid schema: {e}"));
     }
-    for (name, field) in &schema.fields {
-        if let Some(value) = field
-            .field_type
-            .as_ref()
-            .filter(|value| kosha_core::analysis::canonical_schema_field_type(value).is_none())
-        {
-            return api_error(
-                ErrorCode::InvalidArgument,
-                &format!("schema field '{name}' has unknown type {value}"),
-            );
+    if require_online_safe {
+        for (name, field) in &schema.fields {
+            if let Some(value) = field
+                .field_type
+                .as_ref()
+                .filter(|value| kosha_core::analysis::canonical_schema_field_type(value).is_none())
+            {
+                return api_error(
+                    ErrorCode::InvalidArgument,
+                    &format!("schema field '{name}' has unknown type {value}"),
+                );
+            }
         }
     }
     let mut pinned = vec![ns.clone()];
@@ -10676,11 +10691,19 @@ fn handle_put_schema_with_ns(
         pinned.extend(kosha_core::sharding::shard_namespaces(&ns, shards));
     }
     for target in &pinned {
-        if let Some(conflict) = state.indexer.schema_reindex_reason(target, &schema) {
-            return schema_conflict_response(&conflict);
+        if require_online_safe {
+            if let Some(conflict) = state.indexer.schema_reindex_reason(target, &schema) {
+                return schema_conflict_response(&conflict);
+            }
+        }
+        if let Some(conflict) = state.indexer.embedding_conflict(target, &schema) {
+            return api_error(ErrorCode::Conflict, &conflict);
         }
     }
-    let changed = match state.indexer.set_schema(&ns, schema.clone()) {
+    let changed = match state
+        .indexer
+        .set_schema(&ns, schema.clone(), require_online_safe)
+    {
         Ok(changed) => changed,
         Err(KoshaError::InvalidQuery(message)) => {
             return api_error(ErrorCode::InvalidArgument, &message)
@@ -10699,7 +10722,9 @@ fn handle_put_schema_with_ns(
     // shard's manifest carries the schema too. The root's copy is the one
     // `GET .../schema` reports.
     if let Some(shards) = state.indexer.shard_count(&ns) {
-        if let Err(response) = propagate_schema_to_shards(state, &ns, shards, &schema) {
+        if let Err(response) =
+            propagate_schema_to_shards(state, &ns, shards, &schema, require_online_safe)
+        {
             return response;
         }
     }
@@ -10723,11 +10748,12 @@ fn propagate_schema_to_shards(
     ns: &NamespaceId,
     shards: u32,
     schema: &kosha_core::NamespaceSchema,
+    require_online_safe: bool,
 ) -> Result<(), String> {
     for shard in kosha_core::sharding::shard_namespaces(ns, shards) {
         let changed = state
             .indexer
-            .set_schema(&shard, schema.clone())
+            .set_schema(&shard, schema.clone(), require_online_safe)
             .map_err(|e| match e {
                 KoshaError::SchemaReindexRequired(message) => schema_conflict_response(&message),
                 e => api_error(ErrorCode::Internal, &format!("schema update failed: {e}")),
@@ -10817,7 +10843,7 @@ fn handle_put_shards_with_ns(
         .manifest_shared(&ns)
         .and_then(|m| m.schema.clone())
     {
-        if let Err(response) = propagate_schema_to_shards(state, &ns, shards, &schema) {
+        if let Err(response) = propagate_schema_to_shards(state, &ns, shards, &schema, false) {
             return response;
         }
     }
@@ -21811,8 +21837,9 @@ mod tests {
     }
 
     #[test]
-    fn schema_type_changes_require_reindex_only_when_data_exists() {
+    fn schema_type_changes_require_reindex_only_when_opted_in_and_data_exists() {
         let state = test_state();
+        let strict = "schema?require_online_safe=true";
         let call = |action: &str, body: serde_json::Value| {
             route(
                 &format!("POST /v1/namespaces/shop/{action} HTTP/1.1"),
@@ -21826,7 +21853,7 @@ mod tests {
             serde_json::json!({"fields": {"price": {"type": "text"}}}),
             serde_json::json!({"fields": {"price": {"type": "integer"}}}),
         ] {
-            let response = call("schema", schema);
+            let response = call(strict, schema);
             assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         }
         let response = call(
@@ -21837,7 +21864,7 @@ mod tests {
         );
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         let response = call(
-            "schema",
+            strict,
             serde_json::json!({"fields": {
                 "price": {"field_type": 3}, "brand": {"type": "Keyword"}
             }}),
@@ -21847,7 +21874,7 @@ mod tests {
             serde_json::json!({"fields": {"price": {"type": "float"}, "brand": {"type": "Keyword"}}}),
             serde_json::json!({"fields": {"brand": {"type": "Keyword"}}}),
         ] {
-            let response = call("schema", schema);
+            let response = call(strict, schema);
             assert!(response.starts_with("HTTP/1.1 409"), "{response}");
             assert_eq!(
                 response_body_json(&response)["details"]["reason"],
@@ -21869,6 +21896,21 @@ mod tests {
         assert_eq!(
             response_body_json(&response)["schema"]["fields"]["brand"]["type"],
             "Keyword"
+        );
+        let response = call(
+            "schema?require_online_safe=false",
+            serde_json::json!({"fields": {"price": {"type": "float"}}}),
+        );
+        assert_eq!(status_of(&response), 200, "{response}");
+        assert_eq!(
+            body_of(&response)["schema"]["fields"]["price"]["type"],
+            "float"
+        );
+        let response = call("schema", serde_json::json!({"fields": {}}));
+        assert_eq!(status_of(&response), 200, "{response}");
+        assert_eq!(
+            body_of(&response)["schema"]["fields"],
+            serde_json::json!({})
         );
         fs::remove_dir_all(&state.data_dir).unwrap();
     }

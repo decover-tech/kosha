@@ -17,10 +17,10 @@ Sections: Added, Changed, Deprecated, Removed.
 - `POST /v1/namespaces/{namespace}/export` gives tenant administrators a
   signed URL to the namespace's complete live document snapshot as JSONL.
 
-### Changed
-
-- In-place changes to populated namespaces' declared field types are
-  rejected with `409 conflict` and `details.reason: "reindex_required"`.
+- `POST /v1/namespaces/{namespace}/schema?require_online_safe=true` opts in
+  to rejecting changes or removals of declared field types on populated
+  namespaces with `409 conflict` and `details.reason: "reindex_required"`.
+  Existing v1 schema replacements are unchanged by default.
 
 ## [1.0.0]
 

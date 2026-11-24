@@ -294,10 +294,10 @@ def run(spec: Dict, server: Server, seed: int, docs: int) -> Report:
     x("GetNamespaceSchema", "GET", nst + "/schema", base + "/schema")
     title = {"type": "text", "analyzer": ["standard"]}
     x(
-        "PutNamespaceSchema",
+        "PutNamespaceSchema[online field addition]",
         "POST",
         nst + "/schema",
-        base + "/schema",
+        base + "/schema?require_online_safe=true",
         {
             "fields": {
                 "title": title,
@@ -310,10 +310,11 @@ def run(spec: Dict, server: Server, seed: int, docs: int) -> Report:
         "PutNamespaceSchema[reindex required]",
         "POST",
         nst + "/schema",
-        base + "/schema",
+        base + "/schema?require_online_safe=true",
         {"fields": {"title": title}},
         want=409,
     )
+    x("PutNamespaceSchema", "POST", nst + "/schema", base + "/schema", {"fields": {"title": title}})
 
     # Every conformance search, with the keys the conformance runner adds.
     scratch = Oracle()

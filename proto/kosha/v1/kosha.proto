@@ -1293,8 +1293,8 @@ service KoshaService {
   // Set a namespace's schema (issue #220): per-field analyzers for segments
   // written from now on. Existing segments keep the analysis recorded in
   // their footers and stay searchable with it. Fields can be added online;
-  // changing or removing a declared type on a nonempty namespace returns
-  // 409 conflict with details.reason "reindex_required".
+  // with require_online_safe=true, changing or removing a declared type on
+  // a nonempty namespace returns 409 with details.reason "reindex_required".
   rpc PutNamespaceSchema(PutNamespaceSchemaRequest) returns (PutNamespaceSchemaResponse) {
     option (google.api.http) = {
       post: "/v1/namespaces/{namespace}/schema"
@@ -2181,6 +2181,9 @@ message PutNamespaceSchemaRequest {
   // The schema itself is the request body (`{"fields": {...}}`); a body
   // wrapped as `{"schema": {...}}` is accepted too.
   NamespaceSchema schema = 2;
+  // Reject changes or removals of declared field types on a populated
+  // namespace. Defaults to false, preserving v1 schema replacement behavior.
+  optional bool require_online_safe = 3;
 }
 
 message PutNamespaceSchemaResponse {
