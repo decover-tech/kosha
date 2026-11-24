@@ -39,6 +39,31 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  relevance-changes:
+    name: Detect relevance changes
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    outputs:
+      changed: ${{ steps.paths.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - id: paths
+        run: |
+          set -euo pipefail
+          changed="$(git diff --name-only --no-renames HEAD^1 HEAD -- \
+            crates/kosha-query crates/kosha-segment crates/kosha-vector-spfresh \
+            crates/kosha-core crates/kosha-write scripts/relevance Cargo.lock \
+            .github/workflows/bench-compare.yml .github/workflows/relevance-compare.yml)"
+          if [[ -n "$changed" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  relevance:
+    needs: relevance-changes
+    if: needs.relevance-changes.outputs.changed == 'true'
+    uses: ./.github/workflows/relevance-compare.yml
+
   compare-script-tests:
     name: compare_pr.py unit tests
     runs-on: blacksmith-4vcpu-ubuntu-2404
