@@ -70,8 +70,11 @@ Key ids are never logged.
 **Which key an object uses.** Every object under a namespace is
 `{namespace}/{segment}/{file}`, and a tenant-scoped namespace is `{tenant}/{name}` (branches
 and shards stay under the same tenant). The tenant is the namespace's first component, and its
-key comes from the tenant map, falling back to the default key. These objects have no tenant
-and always use the default key:
+key comes, in SSE-KMS mode, from `kosha.tenants.kms_key_id` in the Postgres control plane.
+If the tenant has no record or its key is NULL, Kosha uses the configured tenant map, then
+the default key. A lookup error stops the write instead of silently using another key.
+Operators can set or clear `kms_key_id` on an existing tenant row; this is not a tenant-facing API.
+These objects have no tenant and always use the default key:
 
 - objects of a bare namespace, such as `migrate` without `--namespace`;
 - **WAL objects** (`{prefix}/_wal/{writer_id}/...`). A WAL stream belongs to one ingest writer,
@@ -92,7 +95,9 @@ written with and stay readable (subject to the KMS permissions above).
 - **KMS automatic rotation** (recommended): enable rotation on the key in KMS. KMS keeps the
   old key material for decryption, so nothing is re-encrypted and no Kosha config changes.
 - **Switching to a different key** (a new `KOSHA_S3_SSE_KMS_KEY_ID` or a new tenant entry):
-  roll out the new value. New objects use the new key at once. Old objects keep the old key
+  give the pod role access to the new key, then update the tenant row's `kms_key_id` or roll out
+  the new configuration value. New writes resolve the control-plane key without a pod restart.
+  Old objects keep the old key
   and stay readable as long as the role can still `kms:Decrypt` with it, so keep the old key
   enabled and in the IAM policy. Compaction rewrites segments into new objects, so the old
   key's share of the data shrinks over time. The tenant map (including
@@ -204,15 +209,14 @@ each tenant before the queue is full.
 
 ## Tenant limits
 
-Per-tenant quotas and rate limits (#341, `tenant_limits.rs`). Without
-`KOSHA_TENANT_LIMITS_FILE` nothing is limited. Limits are enforced per pod: query limits on the
+Per-tenant quotas and rate limits (#341, `tenant_limits.rs`). Without a limits file or billing
+plan limits, nothing is limited. Limits are enforced per pod: query limits on the
 pod that serves the search, write limits on the pod that executes the write (the ingest pod; a
 query pod forwards writes first). Operator traffic (the admin and internal service credentials)
-is never limited. A request over a limit gets HTTP 429 with `Retry-After` and a JSON body
-`{"error", "reason", "limit", "retry_after_ms"}`, where `reason` is one of
-`tenant_qps_exceeded`, `tenant_concurrency_exceeded`, `tenant_write_rate_exceeded`,
-`namespace_quota_exceeded`, `doc_quota_exceeded`, `vector_dims_exceeded` or `body_too_large`.
-Rate limits give the time until the token bucket holds the request; quotas give 60 seconds.
+is never limited. Rate and concurrent-query limits return HTTP 429 with `Retry-After` and a
+machine-readable reason. Under the v1 API contract (#350), quotas return 403 and body limits
+return 413; neither is retryable. See [guarantees.md](guarantees.md#per-tenant-limits-opt-in)
+for the response details.
 Each refusal is counted in `kosha_tenant_rejections_total` (see `metrics.md`). A query pod
 relays a write refused by the ingest pod unchanged: the same status, `Retry-After` and body.
 A search shed by `KOSHA_SEARCH_QUEUE_DEPTH_PER_TENANT` is answered and counted the same way,
@@ -232,7 +236,8 @@ The file:
   "plans": {
     "standard": {"qps": 50, "concurrent_queries": 8, "write_docs_per_sec": 2000,
                  "write_bytes_per_sec": 16777216, "namespaces": 100,
-                 "docs_per_namespace": 10000000, "vector_dims": 4096,
+                 "docs_per_namespace": 10000000, "bytes_per_namespace": 10737418240,
+                 "vector_dims": 4096,
                  "max_body_bytes": 33554432, "weight": 1}
   },
   "tenants": {"acme": {"plan": "standard", "qps": 200, "weight": 4}}
@@ -250,14 +255,22 @@ startup it stops the pod, and a reload keeps the previous limits.
 | `concurrent_queries` | Searches in flight at once | each search |
 | `write_docs_per_sec` | Documents per second in index and replace requests. A batch bigger than one second's worth is admitted from a full bucket and paid for afterwards | each index or replace |
 | `write_bytes_per_sec` | Request body bytes per second on write routes | each write request |
-| `max_body_bytes` | Largest write request body, under the pod-wide `KOSHA_MAX_BODY_BYTES` | each write request |
+| `max_body_bytes` | Largest request body, under the pod-wide `KOSHA_MAX_BODY_BYTES` | each authenticated tenant request |
 | `namespaces` | Namespaces the tenant holds (shards not counted; a branch is a namespace and counts) | namespace creation, branch creation, and a write that would auto-create one |
 | `docs_per_namespace` | Documents in a namespace: committed and not deleted plus not yet flushed. An unflushed upsert of an existing id counts twice until flushed | each index or replace |
+| `bytes_per_namespace` | Estimated bytes of owned segments plus the unflushed tail and incoming documents (after embedding), summed across shards | each index or replace |
 | `vector_dims` | Widest vector a document may carry, supplied or produced by native embedding | each index or replace |
 | `weight` | Permits per round-robin turn in the search queue (default 1) | search admission |
 
-Limits stored in the control plane, cluster-wide rate limits across replicas and per-namespace
-storage quotas are not implemented yet (Phase H).
+Billing accounts in the control store select a tenant's billing plan defaults. Operator
+overrides remain in this file. Rate buckets are per pod, not shared across replicas.
+
+The storage quota is an admission estimate, not a hard cap on object-store usage. It counts
+live manifest segments owned by the namespace once (not segments inherited by a branch).
+It does not subtract deleted or replaced data until compaction reclaims it, and the actual
+segment storage after indexing can exceed the estimate. Enabling it requires looking up segment
+sizes at ingest, including listing the namespace's objects on S3; a size lookup failure returns
+503 rather than treating the namespace as empty.
 
 ## Query and relevance
 
@@ -596,7 +609,7 @@ mode, a missing or unparsable file, half a client identity, or a TLS setting whi
 
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
-| `KOSHA_INTERNAL_TLS` | `off`: plain `http://` to peers, as before. `on`: peers are fetched over `https://` and verified against `KOSHA_INTERNAL_TLS_CA_PATH`, and an `https://` `KOSHA_INGEST_HOST` is verified the same way (an `http://` one logs a warning). `required`: as `on`, and the pod refuses to start with an `http://` `KOSHA_INGEST_HOST`, without `KOSHA_TLS_CERT_PATH`, or with a `DATABASE_URL` that does not force TLS (see "TLS to Postgres" below) | `off` | enum |
+| `KOSHA_INTERNAL_TLS` | `off`: plain `http://` to peers, as before. `on`: peers are fetched over `https://` and verified against `KOSHA_INTERNAL_TLS_CA_PATH`, and an `https://` `KOSHA_INGEST_HOST` is verified the same way (an `http://` one logs a warning). `required`: as `on`, and the pod refuses to start with an `http://` `KOSHA_INGEST_HOST`, without `KOSHA_TLS_CERT_PATH`, with a `DATABASE_URL` that does not force TLS (see "TLS to Postgres" below), or with a plain-HTTP custom S3 endpoint (see "TLS to S3" below) | `off` | enum |
 | `KOSHA_INTERNAL_TLS_CA_PATH` | PEM CA bundle peer certificates must chain to. Required unless `off`. Only this bundle is trusted for internal traffic, not the platform roots | unset | path |
 | `KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH` | PEM client certificate chain, presented to peers that ask for one (their `KOSHA_TLS_CLIENT_CA_PATH`). Set it together with `KOSHA_INTERNAL_TLS_CLIENT_KEY_PATH` or not at all | unset (no client certificate) | path |
 | `KOSHA_INTERNAL_TLS_CLIENT_KEY_PATH` | PEM private key for `KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH` | unset | path |
@@ -646,6 +659,11 @@ For example:
 postgres://kosha:<password>@<host>:5432/kosha?sslmode=verify-full&sslrootcert=/etc/kosha/pg/ca.crt
 ```
 
+Query parameters are read the way the client reads them: keys and values are percent-decoded
+(`%XX`, and `+` as a space), values are not trimmed, and the last `sslmode` or `ssl-mode` wins.
+So `?sslmode=require&ssl%2Dmode=disable` counts as `disable`, and `sslmode=require+` is not
+`require`.
+
 `PGSSLMODE` and `PGSSLROOTCERT` are read when the URL does not name the parameter. The client
 ignores a `PGSSLMODE` it cannot parse, surrounding whitespace or a trailing newline included
 (a Secret made with `echo` has one), and uses `prefer`; the check below does not accept such a value
@@ -657,6 +675,25 @@ server, `migrate` and `migrate-namespace` exit before opening a connection unles
 none) logs one `WARN:` line at startup. With `off` nothing is checked. Neither message prints
 the URL. The check reads only the mode, so `migrate` and `migrate-namespace` do not need the
 `KOSHA_INTERNAL_TLS_*` files mounted.
+
+#### TLS to S3
+
+Segment files, deletion vectors and S3 WAL group commits hold tenant data. With no custom
+endpoint, the AWS SDK talks to S3 over HTTPS. A custom endpoint (MinIO, an S3-compatible store,
+a VPC endpoint URL) is used as written, so `http://` sends that data in plaintext. Kosha passes
+`KOSHA_S3_ENDPOINT` to the SDK, or `AWS_ENDPOINT_URL` when `KOSHA_S3_ENDPOINT` is unset; when the
+value passed is empty, the SDK picks `AWS_ENDPOINT_URL_S3`, then `AWS_ENDPOINT_URL`. The check
+below applies to whichever of these is in effect. An `endpoint_url` set only in an AWS
+config-file profile is not checked.
+
+`KOSHA_INTERNAL_TLS` holds this hop to the same rule. With `required`, the server, `migrate`,
+`migrate-namespace` and `reconcile-usage` exit at startup (`FATAL: invalid S3 encryption config:
+KOSHA_S3_ENDPOINT must use https:// ...`) unless that endpoint is `https://`. With `on`, any
+other endpoint logs one `WARN:` line. With `off` nothing is checked. Neither message prints the
+endpoint. Like the Postgres check, it reads only the mode. A local MinIO over plain HTTP (the
+`docker compose` stack) keeps working with the default `off`. For an `https://` endpoint with a
+private CA, the SDK verifies against the platform roots (`SSL_CERT_FILE`), not
+`KOSHA_INTERNAL_TLS_CA_PATH`.
 
 `GET /internal/segment/...` streams the cached file as raw `application/octet-stream`. Peers on
 builds from before #259 send base64 with `x-kosha-encoding: base64`; the client still decodes
@@ -756,6 +793,10 @@ seconds or a unit (`90s`, `5m`, `1h`).
 | `KOSHA_GC_ORPHAN_GRACE` | How old an object no manifest ever referenced must be before GC deletes it | `24h` | duration |
 | `KOSHA_LOCAL_GC_GRACE` | How long a retired segment's local files stay after the publish that dropped it (and after every search that could read them ends) | `5m` | duration |
 | `KOSHA_LOCAL_GC_INTERVAL_MS` | How often each pod reclaims retired local segments; `0` disables | `60000` | milliseconds |
+
+The Kubernetes `kosha-segment-gc` CronJob uses `KOSHA_GC_INGEST_SCHEME` as the URL scheme for
+`POST /v1/admin/gc`. The base manifest sets it to `http` for plaintext ingest; the
+`internal-tls` component sets it to `https` and mounts the CA for verification.
 
 ## Deleted namespaces (cache purge and retry)
 
