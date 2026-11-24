@@ -25,8 +25,8 @@ use kosha_core::{AnalyzerSpec, FieldBoost, Footer, SegmentAnalysis};
 use kosha_segment::namespace_centroids::{Snapshot as NamespaceCentroidSnapshot, FILE_NAME};
 pub use kosha_segment::VectorSpanFetch;
 use kosha_segment::{
-    tokenize, Analyzer, PostingsMemoryAccount, ScoringPosting, SegmentReader, VectorFieldStatus,
-    SCORING_BLOCK_LEN,
+    tokenize, Analyzer, PostingsMemoryAccount, ScoringPosting, SegmentReader,
+    ShortlistHydrationLimit, VectorFieldStatus, SCORING_BLOCK_LEN,
 };
 
 /// One segment of a materialize page, as handed to a [`DocStoreHydrator`]:
@@ -4223,6 +4223,7 @@ pub struct Searcher {
     /// [`Searcher::with_knn_global_rescore_max`]. Default from
     /// `KOSHA_KNN_GLOBAL_RESCORE_MAX`, none.
     knn_global_rescore_max: Option<usize>,
+    rrf_shortlist_hydration_limit: ShortlistHydrationLimit,
     /// Two-stage kNN planning over i8 centroid codes; see
     /// [`Searcher::with_knn_plan_i8`]. Default from `KOSHA_KNN_PLAN_I8`.
     knn_plan_i8: bool,
@@ -4434,6 +4435,7 @@ impl Searcher {
             knn_exact_cost_model: knn_exact_cost_model_from_env(),
             knn_global_rescore: knn_global_rescore_from_env(),
             knn_global_rescore_max: knn_global_rescore_max_from_env(),
+            rrf_shortlist_hydration_limit: ShortlistHydrationLimit::UNLIMITED,
             knn_plan_i8: kosha_segment::knn_plan_i8_from_env(),
             knn_segment_nprobe: std::env::var("KOSHA_KNN_SEGMENT_NPROBE")
                 .ok()
@@ -4584,6 +4586,16 @@ impl Searcher {
     /// `KOSHA_KNN_GLOBAL_RESCORE` and is off.
     pub fn with_knn_global_rescore(mut self, enabled: bool) -> Self {
         self.knn_global_rescore = enabled;
+        self
+    }
+
+    /// Set the cold hydration ceiling used to size optional RRF rescoring.
+    /// The same limit applies when the exact vectors are already cached.
+    pub fn with_rrf_shortlist_hydration_limit(mut self, max_bytes: u64, coalesce_gap: u64) -> Self {
+        self.rrf_shortlist_hydration_limit = ShortlistHydrationLimit {
+            max_bytes,
+            coalesce_gap,
+        };
         self
     }
 
@@ -6190,7 +6202,7 @@ impl Searcher {
         // Fetches the probed vector postings a segment does not hold
         // locally (#245); see `Searcher::search_with_hydrators`.
         vector_fetch: Option<VectorSpanFetch<'_>>,
-        fused_leg: bool,
+        fused_shortlist: Option<ShortlistHydrationLimit>,
         // Namespace-level BM25 statistics (issue #246); `None` scores this
         // segment with its own `N` / `df` / `avgdl`.
         corpus: Option<&Arc<CorpusStats>>,
@@ -7788,7 +7800,7 @@ impl Searcher {
                     open_stats.add_knn_scan(&scan);
                     match exact {
                         Some(Ok(exact))
-                            if fused_leg
+                            if fused_shortlist.is_some()
                                 && index.is_quantized()
                                 && reader.footer().doc_vectors
                                 && exact.source == kosha_segment::ExactKnnSource::Postings =>
@@ -7836,8 +7848,11 @@ impl Searcher {
                                 .fetch_add(1, Ordering::Relaxed);
                         }
                     }
-                    let (probe, scan) = kosha_segment::with_knn_scan_stats(|| match knn_cutoff {
-                        _ if fused_leg && index.is_quantized() && reader.footer().doc_vectors => {
+                    let fused = fused_shortlist
+                        .filter(|_| index.is_quantized() && reader.footer().doc_vectors);
+                    let probe_mode = (fused, knn_cutoff);
+                    let (probe, scan) = kosha_segment::with_knn_scan_stats(|| match probe_mode {
+                        (Some(limit), _) => {
                             let budget = match (knn_cutoff, knn_ranking) {
                                 (_, Some(ranking)) => kosha_segment::KnnProbeBudget::Planned {
                                     ranking,
@@ -7862,6 +7877,7 @@ impl Searcher {
                                     budget,
                                     knn_accept_dyn,
                                     vector_fetch,
+                                    limit,
                                 )
                                 .map(|r| {
                                     r.map(|(hits, probes)| {
@@ -7875,7 +7891,7 @@ impl Searcher {
                                     })
                                 })
                         }
-                        Some((cutoff, effective_budget)) => match knn_ranking {
+                        (None, Some((cutoff, effective_budget))) => match knn_ranking {
                             // The plan already ranked this segment's
                             // postings inside the cutoff (#436).
                             Some(ranking) => reader.knn_search_planned_fetching(
@@ -7907,7 +7923,7 @@ impl Searcher {
                                 results
                             })
                         }),
-                        None => reader
+                        (None, None) => reader
                             .knn_search_filtered_fetching(
                                 &knn.field,
                                 &knn.vector,
@@ -8483,7 +8499,7 @@ impl Searcher {
             query,
             tombstones,
             vector_fetch,
-            false,
+            None,
             permit.as_ref(),
             pruned,
         )?;
@@ -8544,7 +8560,7 @@ impl Searcher {
         query: &SearchQuery,
         tombstones: Option<&HashMap<kosha_core::SegmentId, HashSet<u32>>>,
         vector_fetch: Option<VectorSpanFetch<'_>>,
-        fused_leg: bool,
+        fused_shortlist: Option<ShortlistHydrationLimit>,
         permit: Option<&AdmissionPermit>,
         pruned: Option<&KnnPrunedSegments>,
     ) -> Result<(Vec<HitCandidate>, SearchResult, SearchPhaseStats), KoshaError> {
@@ -8555,6 +8571,18 @@ impl Searcher {
             let mut fused = HashMap::new();
             let mut stats = SearchPhaseStats::default();
             let mut vector_searched = false;
+            let vector_legs = rrf
+                .queries
+                .iter()
+                .filter(|q| leg_reads_vector_columns(&q.knn))
+                .count();
+            // Budget each leg/segment from the manifest, not from concurrent
+            // fetch order or which leg's ranges happen to be cached.
+            let shares = manifest.segments.len().saturating_mul(vector_legs).max(1);
+            let mut shortlist_limit = self.rrf_shortlist_hydration_limit;
+            if shortlist_limit.max_bytes != u64::MAX {
+                shortlist_limit.max_bytes /= shares as u64;
+            }
             for (i, subquery) in subqueries.enumerate() {
                 let (page, result, phase) = self.rank_inner(
                     namespace,
@@ -8562,7 +8590,7 @@ impl Searcher {
                     &subquery,
                     tombstones,
                     vector_fetch,
-                    true,
+                    Some(shortlist_limit),
                     permit,
                     None,
                 )?;
@@ -8821,7 +8849,7 @@ impl Searcher {
         // the cap far fewer groups (a dominant group can fill all of it).
         let knn_global: Option<GlobalKnnOutcome> = match query.knn {
             Some(ref knn)
-                if !fused_leg
+                if fused_shortlist.is_none()
                     && self.knn_global_rescore
                     && !knn.is_late_interaction()
                     && knn.filter.is_none()
@@ -8913,7 +8941,7 @@ impl Searcher {
                     .and_then(|global| global.segments.get(&entry.segment_id)),
                 &filter_keys,
                 vector_fetch,
-                fused_leg,
+                fused_shortlist,
                 corpus.as_ref(),
                 shared_wand,
             )

@@ -2195,6 +2195,21 @@ impl AppState {
             data_dir.clone(),
             posting_spans::config_from_env(),
         );
+        #[cfg(feature = "s3")]
+        let hydrate_request_max_bytes = std::env::var("KOSHA_HYDRATE_REQUEST_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(hydration_budget::DEFAULT_REQUEST_MAX_BYTES);
+        #[cfg(feature = "s3")]
+        let searcher = if s3_storage.is_some() {
+            searcher.with_rrf_shortlist_hydration_limit(
+                hydrate_request_max_bytes,
+                posting_span_hydrator.coalesce_gap(),
+            )
+        } else {
+            searcher
+        };
 
         let usage = options
             .usage
@@ -2282,11 +2297,7 @@ impl AppState {
                 hydration_budget::DEFAULT_BUDGET_WAIT,
             )),
             #[cfg(feature = "s3")]
-            hydrate_request_max_bytes: std::env::var("KOSHA_HYDRATE_REQUEST_MAX_BYTES")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .filter(|n| *n > 0)
-                .unwrap_or(hydration_budget::DEFAULT_REQUEST_MAX_BYTES),
+            hydrate_request_max_bytes,
             #[cfg(feature = "s3")]
             scoring_hydrate_concurrency: std::env::var("KOSHA_SCORING_HYDRATE_CONCURRENCY")
                 .ok()
@@ -4332,8 +4343,12 @@ impl AppState {
                 };
                 let outcome = {
                     let _permit = self.hydration_semaphore.acquire("page_docs");
-                    self.span_hydrator
-                        .hydrate(pages, &fetcher, &self.span_writes)
+                    self.span_hydrator.hydrate(
+                        pages,
+                        &fetcher,
+                        &self.span_writes,
+                        self.doc_read_mode == doc_spans::ReadMode::Ranged,
+                    )
                 };
                 request.hold_spans(outcome.held);
                 stats.rounds = outcome.rounds;
@@ -19038,6 +19053,14 @@ mod tests {
             },
         );
         state.doc_read_mode = doc_spans::ReadMode::Whole;
+        state.span_hydrator = doc_spans::SpanHydrator::new(
+            state.data_dir.clone(),
+            doc_spans::SpanConfig {
+                coalesce_gap: 0,
+                promote_after_gets: 1,
+                promote_after_bytes: 0,
+            },
+        );
         state.posting_read_mode = doc_spans::ReadMode::Whole;
         state.hydrate_request_max_bytes = 160 * 1024;
         state.searcher = Searcher::new(state.data_dir.clone()).with_knn_global_rescore(false);
@@ -19079,6 +19102,7 @@ mod tests {
             second.results[0].doc_id
         ]);
         assert!(search(&query).results.is_empty());
+        assert_eq!(state.doc_store_promotions.len(), 0);
     }
 
     /// A two-segment kNN node reading whole `vector.idx` files, with a

@@ -792,7 +792,7 @@ mod tests {
         held.lock().unwrap().append(&mut outcome.held);
         let docs = SpanHydrator::new(f.data.clone(), SpanConfig::default());
         let ensure = |pages: &[PageSegment<'_>]| {
-            let o = docs.hydrate(pages, store, writes);
+            let o = docs.hydrate(pages, store, writes, true);
             drain();
             held.lock().unwrap().extend([o.held]);
         };
@@ -1278,7 +1278,7 @@ mod tests {
                 let docs_h = SpanHydrator::new(f.data.clone(), SpanConfig::default());
                 let writes = writes();
                 let ensure = |pages: &[PageSegment<'_>]| {
-                    let _ = docs_h.hydrate(pages, &slow, &writes);
+                    let _ = docs_h.hydrate(pages, &slow, &writes, true);
                     writes.drain(&cache);
                 };
                 Searcher::new(f.data.clone())

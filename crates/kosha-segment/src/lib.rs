@@ -2381,6 +2381,21 @@ pub const VECTOR_IDX_FILE: &str = "vector.idx";
 pub type VectorSpanFetch<'a> =
     &'a (dyn Fn(&Path, &str, &[(u64, u64)]) -> span_cache::SpanHolds + Sync);
 
+/// Cold byte limit for optional exact shortlist expansion. The baseline
+/// shortlist is always scored, regardless of this limit.
+#[derive(Clone, Copy)]
+pub struct ShortlistHydrationLimit {
+    pub max_bytes: u64,
+    pub coalesce_gap: u64,
+}
+
+impl ShortlistHydrationLimit {
+    pub const UNLIMITED: Self = Self {
+        max_bytes: u64::MAX,
+        coalesce_gap: 0,
+    };
+}
+
 /// A kNN probe's restriction (filter, tombstones or both): `true` for a
 /// document that may be a hit. `Sync` because one probe's postings are
 /// scored on several threads (see [`KNN_PARALLEL_MIN_POSTINGS`]).
@@ -9657,6 +9672,22 @@ fn rabitq_bound_shortlist_len(scored: &[(u32, f64)], errors: &[f32], k: usize) -
         .count()
 }
 
+fn exact_shortlist_len(
+    scored: &[(u32, f64)],
+    errors: &[f32],
+    k: usize,
+    factor_len: usize,
+    rabitq: bool,
+) -> usize {
+    if rabitq && errors.len() == scored.len() {
+        factor_len
+            .max(rabitq_bound_shortlist_len(scored, errors, k))
+            .min(factor_len.saturating_mul(RABITQ_SHORTLIST_CAP))
+    } else {
+        factor_len
+    }
+}
+
 /// The `k` highest-scoring of `scored`, best first. Which of several
 /// candidates that tie at the `k`-th score are kept, and the order of equal
 /// scores, is whatever the unstable select leaves.
@@ -11501,42 +11532,7 @@ impl SegmentReader {
         if let Err(e) = Self::check_query_dim(vi, field, query) {
             return Some(Err(e));
         }
-        let probed = match budget {
-            KnnProbeBudget::Within {
-                max_distance,
-                max_probes,
-                refill,
-            } => self.probe_within_lazy(
-                vi,
-                query,
-                k,
-                max_distance,
-                max_probes,
-                accept,
-                refill,
-                fetch,
-                None,
-            ),
-            KnnProbeBudget::Planned { ranking, refill } => self.probe_within_lazy(
-                vi,
-                query,
-                k,
-                ranking.max_distance,
-                ranking.max_probes,
-                accept,
-                refill,
-                fetch,
-                Some(ranking),
-            ),
-            KnnProbeBudget::Nprobe(nprobe) => {
-                let mut unit = query.to_vec();
-                if vi.unit_norm {
-                    kosha_vector_spfresh::normalize_in_place(&mut unit);
-                }
-                self.probe_nprobe_lazy(vi, &unit, k, nprobe, accept, fetch)
-            }
-        };
-        let probed = match probed {
+        let probed = match self.probe_candidates(vi, query, k, budget, accept, fetch) {
             Ok(probed) => probed,
             Err(e) => return Some(Err(e)),
         };
@@ -11581,9 +11577,56 @@ impl SegmentReader {
         }))
     }
 
+    fn probe_candidates(
+        &self,
+        vi: &LazyVectorIndex,
+        query: &[f32],
+        k: usize,
+        budget: KnnProbeBudget<'_>,
+        accept: Option<KnnAccept<'_>>,
+        fetch: Option<VectorSpanFetch<'_>>,
+    ) -> Result<ProbedCandidates, KoshaError> {
+        match budget {
+            KnnProbeBudget::Within {
+                max_distance,
+                max_probes,
+                refill,
+            } => self.probe_within_lazy(
+                vi,
+                query,
+                k,
+                max_distance,
+                max_probes,
+                accept,
+                refill,
+                fetch,
+                None,
+            ),
+            KnnProbeBudget::Planned { ranking, refill } => self.probe_within_lazy(
+                vi,
+                query,
+                k,
+                ranking.max_distance,
+                ranking.max_probes,
+                accept,
+                refill,
+                fetch,
+                Some(ranking),
+            ),
+            KnnProbeBudget::Nprobe(nprobe) => {
+                let mut unit = query.to_vec();
+                if vi.unit_norm {
+                    kosha_vector_spfresh::normalize_in_place(&mut unit);
+                }
+                self.probe_nprobe_lazy(vi, &unit, k, nprobe, accept, fetch)
+            }
+        }
+    }
+
     /// Rescore a bounded quantized shortlist before returning a ranked list.
     /// A missing exact score fails the probe rather than mixing estimates
     /// into an order that can change when the sidecar becomes warm.
+    #[allow(clippy::too_many_arguments)]
     pub fn knn_rescore_shortlist_fetching(
         &self,
         field: &str,
@@ -11592,29 +11635,77 @@ impl SegmentReader {
         budget: KnnProbeBudget<'_>,
         accept: Option<KnnAccept<'_>>,
         fetch: Option<VectorSpanFetch<'_>>,
+        hydration_limit: ShortlistHydrationLimit,
     ) -> BudgetedKnnResult {
-        self.knn_candidates_fetching(field, query, k, budget, accept, fetch)
-            .map(|found| {
-                let mut found = found?;
-                found
-                    .candidates
-                    .truncate(k.saturating_mul(self.vector_rescore_factor.max(1)));
-                let mut seqs: Vec<_> = found.candidates.iter().map(|c| c.doc_seq).collect();
-                if seqs.is_empty() {
-                    return Ok((Vec::new(), found.postings));
-                }
-                seqs.sort_unstable();
-                let exact = self
-                    .knn_exact_from_sidecar(field, query, k, &seqs, fetch)
-                    .filter(|result| result.vectors_scored == seqs.len())
-                    .ok_or_else(|| {
-                        KoshaError::NotFound(format!(
-                            "{}: exact kNN shortlist unavailable",
-                            self.segment_dir.display()
-                        ))
-                    })?;
-                Ok((exact.hits, found.postings))
-            })
+        let index = match self.vector_field(field) {
+            Ok(index) => index?,
+            Err(e) => return Some(Err(e)),
+        };
+        let vi = index.lazy.as_ref()?;
+        Some((|| {
+            Self::check_query_dim(vi, field, query)?;
+            let probed = self.probe_candidates(vi, query, k, budget, accept, fetch)?;
+            self.rescore_probed_shortlist(
+                field,
+                query,
+                k,
+                vi.rabitq,
+                probed,
+                fetch,
+                hydration_limit,
+            )
+        })())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rescore_probed_shortlist(
+        &self,
+        field: &str,
+        query: &[f32],
+        k: usize,
+        rabitq: bool,
+        probed: ProbedCandidates,
+        fetch: Option<VectorSpanFetch<'_>>,
+        hydration_limit: ShortlistHydrationLimit,
+    ) -> Result<(Vec<(u32, f64)>, usize), KoshaError> {
+        let factor_len = k.saturating_mul(self.vector_rescore_factor.max(1));
+        let limit = exact_shortlist_len(&probed.scored, &probed.errors, k, factor_len, rabitq);
+        let mut seqs: Vec<_> = top_k_by_score(probed.scored, limit)
+            .into_iter()
+            .map(|(seq, _)| seq)
+            .collect();
+        if seqs.is_empty() {
+            return Ok((Vec::new(), probed.postings));
+        }
+        if seqs.len() > factor_len && hydration_limit.max_bytes != u64::MAX {
+            let mut sorted = seqs.clone();
+            sorted.sort_unstable();
+            let fits = self.local_doc_vectors().is_some_and(|dv| {
+                let ranges = dv.field_vector_ranges(field, &sorted);
+                // With no cache hits and no per-GET cap, coalescing gives
+                // an upper bound on what ranged hydration will charge.
+                span_cache::coalesce(ranges, hydration_limit.coalesce_gap)
+                    .into_iter()
+                    .fold(0u64, |bytes, (start, end)| {
+                        bytes.saturating_add(end - start)
+                    })
+                    <= hydration_limit.max_bytes
+            });
+            if !fits {
+                seqs.truncate(factor_len);
+            }
+        }
+        seqs.sort_unstable();
+        let exact = self
+            .knn_exact_from_sidecar(field, query, k, &seqs, fetch)
+            .filter(|result| result.vectors_scored == seqs.len())
+            .ok_or_else(|| {
+                KoshaError::NotFound(format!(
+                    "{}: exact kNN shortlist unavailable",
+                    self.segment_dir.display()
+                ))
+            })?;
+        Ok((exact.hits, probed.postings))
     }
 
     /// Exact cosine similarity of `query` with `field`'s full-precision
@@ -12329,13 +12420,7 @@ impl SegmentReader {
             return scored;
         }
         let factor_len = k.saturating_mul(self.vector_rescore_factor);
-        let shortlist_len = if vi.rabitq && errors.len() == scored.len() {
-            factor_len
-                .max(rabitq_bound_shortlist_len(&scored, errors, k))
-                .min(factor_len.saturating_mul(RABITQ_SHORTLIST_CAP))
-        } else {
-            factor_len
-        };
+        let shortlist_len = exact_shortlist_len(&scored, errors, k, factor_len, vi.rabitq);
         let mut shortlist = top_k_by_score(scored, shortlist_len);
         if let Some(field) = vi.field.as_deref() {
             let rescored = self.rescore_exact(field, query, &mut shortlist);
@@ -18561,6 +18646,227 @@ mod global_rescore_tests {
             "bounds held {held}/{total}"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ranged_shortlist_matches_local_rabitq_bound_expansion() {
+        let (dir, _) = segment("rabitq-shortlist", VectorQuantization::RaBitQ);
+        let reader = SegmentReader::open(dir.clone())
+            .unwrap()
+            .with_vector_rescore_factor(1);
+        let k = 10;
+        let mut used_expanded_candidates = false;
+        for seed in 700_000..700_020 {
+            let query = vector(seed);
+            let expected = reader
+                .knn_search_filtered_fetching("emb", &query, k, 1_000_000, None, None)
+                .unwrap()
+                .unwrap();
+            let (actual, _) = reader
+                .knn_rescore_shortlist_fetching(
+                    "emb",
+                    &query,
+                    k,
+                    ALL,
+                    None,
+                    None,
+                    ShortlistHydrationLimit::UNLIMITED,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(actual.len(), expected.len());
+            for (&(seq, score), &(expected_seq, expected_score)) in actual.iter().zip(&expected) {
+                assert_eq!(seq, expected_seq);
+                assert!((score - expected_score).abs() < 1e-6);
+            }
+            let estimated = reader
+                .knn_candidates_fetching("emb", &query, k, ALL, None, None)
+                .unwrap()
+                .unwrap();
+            let narrow: HashSet<_> = estimated
+                .candidates
+                .iter()
+                .take(k)
+                .map(|c| c.doc_seq)
+                .collect();
+            used_expanded_candidates |= actual.iter().any(|(seq, _)| !narrow.contains(seq));
+        }
+        assert!(used_expanded_candidates);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ranged_shortlist_fetches_the_full_rescore_window() {
+        let dir = scratch("bound-filter");
+        let mut writer = SegmentWriter::new(SegmentId("s".into()), dir.clone())
+            .with_vector_store_mode(VectorStoreMode::Sidecar)
+            .with_vector_quantization(VectorQuantizationConfig::all(VectorQuantization::I8));
+        let query = vector(1);
+        for i in 0..8 {
+            let v = if i == 0 {
+                query.clone()
+            } else {
+                query.iter().map(|&x| -x).collect()
+            };
+            writer.add_document(DocumentId(format!("d{i}")), vec![Field::vector("emb", v)]);
+        }
+        writer.finalize(Bm25Params::default()).unwrap();
+        let path = dir.join(DOC_VECTORS_FILE);
+        let dv = DocVectors::open(path.clone()).unwrap();
+        let wanted = dv.field_vector_ranges("emb", &[0, 1, 2, 3, 4, 5, 6, 7]);
+        let bytes = fs::read(&path).unwrap();
+        fs::remove_file(path).unwrap();
+        let spans = span_cache::spans_dir(&dir, DOC_VECTORS_FILE);
+        fs::create_dir_all(&spans).unwrap();
+        let put = |start: u64, end: u64| {
+            fs::write(
+                spans.join(span_cache::span_file_name(start, end)),
+                &bytes[start as usize..end as usize],
+            )
+            .unwrap();
+        };
+        put(0, doc_vectors_header_len(&bytes).unwrap().unwrap());
+        let fetch = |_: &Path, file: &str, ranges: &[(u64, u64)]| {
+            assert_eq!(file, DOC_VECTORS_FILE);
+            assert_eq!(ranges, wanted);
+            for &(start, end) in ranges {
+                put(start, end);
+            }
+            span_cache::SpanHolds::new()
+        };
+        let reader = SegmentReader::open(dir.clone())
+            .unwrap()
+            .with_vector_rescore_factor(8);
+        let (hits, _) = reader
+            .knn_rescore_shortlist_fetching(
+                "emb",
+                &query,
+                1,
+                ALL,
+                None,
+                Some(&fetch),
+                ShortlistHydrationLimit::UNLIMITED,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn misleading_bounds_do_not_exclude_the_exact_winner_inside_the_window() {
+        let (dir, vectors) = segment("misleading-bound", VectorQuantization::RaBitQ);
+        let reader = SegmentReader::open(dir.clone())
+            .unwrap()
+            .with_vector_rescore_factor(2);
+        let query = &vectors[1];
+        let candidates = [
+            KnnCandidate {
+                doc_seq: 0,
+                estimate: 0.8,
+                error: 0.1,
+            },
+            KnnCandidate {
+                doc_seq: 1,
+                estimate: 0.5,
+                error: 0.1,
+            },
+        ];
+        assert!(candidates[1].upper() < kth_lower_bound(&candidates, 1).unwrap());
+        for rabitq in [true, false] {
+            let probed = ProbedCandidates {
+                scored: candidates.iter().map(|c| (c.doc_seq, c.estimate)).collect(),
+                errors: vec![0.1, 0.1],
+                postings: 1,
+            };
+            let (hits, _) = reader
+                .rescore_probed_shortlist(
+                    "emb",
+                    query,
+                    1,
+                    rabitq,
+                    probed,
+                    None,
+                    ShortlistHydrationLimit::UNLIMITED,
+                )
+                .unwrap();
+            assert_eq!(hits[0].0, 1);
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rabitq_expansion_over_the_cold_byte_limit_uses_the_baseline_on_both_cache_states() {
+        let (dir, _) = segment("rabitq-ceiling", VectorQuantization::RaBitQ);
+        let reader = SegmentReader::open(dir.clone())
+            .unwrap()
+            .with_vector_rescore_factor(1);
+        let query = vector(700_000);
+        let k = 10;
+        let index = reader.vector_field("emb").unwrap().unwrap();
+        let vi = index.lazy.as_ref().unwrap();
+        let probed = reader
+            .probe_candidates(vi, &query, k, ALL, None, None)
+            .unwrap();
+        let expanded_len = exact_shortlist_len(&probed.scored, &probed.errors, k, k, true);
+        let mut expanded: Vec<_> = top_k_by_score(probed.scored, expanded_len)
+            .into_iter()
+            .map(|(seq, _)| seq)
+            .collect();
+        let mut baseline = expanded[..k].to_vec();
+        baseline.sort_unstable();
+        expanded.sort_unstable();
+        let path = dir.join(DOC_VECTORS_FILE);
+        let dv = DocVectors::open(path.clone()).unwrap();
+        let cost = |ranges: &[(u64, u64)]| ranges.iter().map(|(s, e)| e - s).sum::<u64>();
+        let ceiling = cost(&dv.field_vector_ranges("emb", &baseline));
+        assert!(cost(&dv.field_vector_ranges("emb", &expanded)) > ceiling);
+        let limit = ShortlistHydrationLimit {
+            max_bytes: ceiling,
+            coalesce_gap: 0,
+        };
+        let warm = reader
+            .knn_rescore_shortlist_fetching("emb", &query, k, ALL, None, None, limit)
+            .unwrap()
+            .unwrap()
+            .0;
+        let bytes = fs::read(&path).unwrap();
+        let header = doc_vectors_header_len(&bytes).unwrap().unwrap();
+        let spans = span_cache::spans_dir(&dir, DOC_VECTORS_FILE);
+        fs::create_dir_all(&spans).unwrap();
+        let put = |start: u64, end: u64| {
+            fs::write(
+                spans.join(span_cache::span_file_name(start, end)),
+                &bytes[start as usize..end as usize],
+            )
+            .unwrap();
+        };
+        put(0, header);
+        fs::remove_file(path).unwrap();
+        let cold_reader = SegmentReader::open(dir.clone())
+            .unwrap()
+            .with_vector_rescore_factor(1);
+        let remaining = std::sync::Mutex::new(ceiling);
+        let fetch = |_: &Path, file: &str, ranges: &[(u64, u64)]| {
+            assert_eq!(file, DOC_VECTORS_FILE);
+            let mut remaining = remaining.lock().unwrap();
+            if let Some(left) = remaining.checked_sub(cost(ranges)) {
+                *remaining = left;
+                for &(start, end) in ranges {
+                    put(start, end);
+                }
+            }
+            span_cache::SpanHolds::new()
+        };
+        let cold = cold_reader
+            .knn_rescore_shortlist_fetching("emb", &query, k, ALL, None, Some(&fetch), limit)
+            .unwrap()
+            .unwrap()
+            .0;
+        assert_eq!(cold, warm);
+        assert_eq!(remaining.into_inner().unwrap(), 0);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
