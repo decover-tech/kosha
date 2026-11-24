@@ -351,6 +351,7 @@ struct FlushCoord {
 /// `(field name, is a late-interaction bag)`: see
 /// [`NamespaceHandle::vector_dims`].
 type VectorDimKey = (String, bool);
+type NamespaceCentroidMetadataReader<'a> = dyn Fn(&str) -> Result<Vec<u8>, KoshaError> + 'a;
 
 /// The dimension a `Vector` field value carries, for the write-time check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3277,6 +3278,84 @@ impl Indexer {
             }
         }
         Ok(())
+    }
+
+    /// Advances routing metadata for a committed manifest without reading
+    /// offsets from retained segments. Missing checkpoints are bootstrapped
+    /// from the immutable offsets; a failed read leaves the old checkpoint
+    /// intact, so queries can fall back.
+    pub fn update_namespace_centroids(
+        &self,
+        namespace: &NamespaceId,
+        manifest: &Manifest,
+        previous: Option<&[u8]>,
+        read_metadata: Option<&NamespaceCentroidMetadataReader<'_>>,
+    ) -> Result<Option<Vec<u8>>, KoshaError> {
+        use kosha_segment::namespace_centroids::{Snapshot, FILE_NAME};
+
+        let path = self.data_dir.join(&namespace.0).join(FILE_NAME);
+        let local = std::fs::read(&path).ok();
+        let snapshot = [previous, local.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|bytes| Some((bytes, serde_json::from_slice::<Snapshot>(bytes).ok()?)))
+            .filter(|(_, s)| s.directory.is_supported())
+            .max_by_key(|(_, s)| s.version);
+        let ids = || {
+            manifest
+                .segments
+                .iter()
+                .map(|entry| entry.segment_id.0.as_str())
+        };
+        if let Some((bytes, current)) = &snapshot {
+            if current.matches(manifest.version, ids()) {
+                // An unchanged checkpoint needs no disk rewrite. Retry an
+                // earlier failed upload if it was only saved locally.
+                return Ok((previous != Some(*bytes)).then(|| bytes.to_vec()));
+            }
+        }
+        let mut snapshot = snapshot.map(|(_, s)| s).unwrap_or_else(|| Snapshot {
+            version: 0,
+            directory: Default::default(),
+        });
+        if snapshot.version > manifest.version {
+            return Ok(None);
+        }
+        let live: HashSet<_> = ids().collect();
+        let retired: Vec<_> = snapshot
+            .directory
+            .segment_ids()
+            .filter(|id| !live.contains(id))
+            .map(str::to_owned)
+            .collect();
+        for id in retired {
+            snapshot.directory.remove_segment(&id);
+        }
+        for entry in &manifest.segments {
+            let id = &entry.segment_id;
+            if snapshot.directory.contains_segment(&id.0) {
+                continue;
+            }
+            let dir = manifest.segment_dir(&self.data_dir, namespace, id);
+            let columns = match (
+                kosha_segment::SegmentReader::namespace_centroids(&dir),
+                read_metadata,
+            ) {
+                (Err(_), Some(read)) => {
+                    let relative = manifest.segment_rel_dir(namespace, id);
+                    kosha_segment::SegmentReader::namespace_centroids_from(|file| {
+                        read(&format!("{relative}/{file}"))
+                    })?
+                }
+                (local, _) => local?,
+            };
+            snapshot.directory.insert_segment(&id.0, columns);
+        }
+        snapshot.version = manifest.version;
+        let bytes = serde_json::to_vec(&snapshot)?;
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        kosha_core::atomic_write(&path, &bytes)?;
+        Ok(Some(bytes))
     }
 
     /// Replay this writer's unpublished delta on top of `remote`, the
