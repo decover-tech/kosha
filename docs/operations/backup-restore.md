@@ -160,7 +160,9 @@ enough to prove that the WAL chain is intact.
    verified and transferred one at a time. The tool requires `_COMMIT`
    markers (repair old unmarked segments before declaring them protected).
    It refuses unavailable objects, delete markers effective at the target,
-   ambiguous S3 timestamps, and checksum mismatches. Keep the same target
+   ambiguous S3 timestamps, and checksum mismatches. A tie between bitmap
+   uploads before the target is accepted only if there is no tied delete
+   marker and one version matches the manifest's SHA-256. Keep the same target
    across stores; to try a different timestamp, recover Postgres again.
 5. The tool reports the root and any shard manifest versions, object count
    and bytes. It transfers only live segment inventories and the referenced

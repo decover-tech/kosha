@@ -178,6 +178,34 @@ def test_corrupt_object_is_not_uploaded(tmp_path):
     assert f"{directory}/_COMMIT" not in destination.client.uploaded
 
 
+@pytest.mark.parametrize("delete_marker", [False, True])
+def test_tied_bitmap_uploads_use_manifest_hash_unless_a_delete_marker_is_tied(delete_marker):
+    bucket = Bucket()
+    directory = "tenant/index/seg-1"
+    segment(bucket, directory)
+    bitmap = b"deletion bitmap"
+    generation = hashlib.sha256(bitmap).hexdigest()
+    path = f"{directory}/deletes-{generation}.roaring"
+    bucket.add(path, "corrupt", BEFORE, b"wrong bitmap")
+    bucket.add(path, "bitmap", BEFORE, bitmap)
+    bucket.add(path, "duplicate", BEFORE, bitmap)
+    bucket.add(path, "after", AFTER, bitmap)
+    manifests = [row("tenant/index", 2, {
+        "segments": [{"segment_id": "seg-1", "doc_count": 10}],
+        "deletion_vectors": {"seg-1": {"generation": generation, "count": 1}},
+    })]
+    source = VersionedObjects(bucket, "source", "", TARGET)
+
+    if delete_marker:
+        bucket.add(path, "deleted", BEFORE)
+        with pytest.raises(RestoreError, match="do not uniquely order"):
+            source.plan(manifests)
+    else:
+        selected = source.plan(manifests)[path]
+        assert selected.version in {"bitmap", "duplicate"}
+        assert selected.sha256 == generation
+
+
 def test_current_ledger_blocks_post_target_or_pending_erasure():
     old = Database([("earlier", "completed")])
     check_deletion_ledger(old, Database([("earlier", "completed")]), ["tenant/index"])

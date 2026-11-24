@@ -131,23 +131,33 @@ class VersionedObjects:
                         continue
                     key = item["Key"]
                     prev = newest.get(key)
+                    version = None if collection == "DeleteMarkers" else ObjectVersion(
+                        key, item["VersionId"], item["Size"]
+                    )
                     if prev is None or modified > prev[0]:
-                        version = None if collection == "DeleteMarkers" else ObjectVersion(
-                            key, item["VersionId"], item["Size"]
-                        )
-                        newest[key] = (modified, version, modified == self.at)
+                        newest[key] = (modified, [version])
                     elif modified == prev[0]:
-                        newest[key] = (modified, prev[1], True)
+                        prev[1].append(version)
         return newest
 
-    def select(self, path, versions):
+    def select(self, path, versions, sha256=None):
         key = self.key(path)
-        _, version, ambiguous = versions.get(key, (None, None, False))
-        if ambiguous:
+        modified, candidates = versions.get(key, (None, [None]))
+        if modified != self.at and len(candidates) == 1:
+            version = candidates[0]
+            if version is None:
+                raise RestoreError(f"{key}: missing or deleted at the cutoff")
+            return replace(version, sha256=sha256) if sha256 is not None else version
+        if modified == self.at or sha256 is None or None in candidates:
             raise RestoreError(f"{key}: S3 timestamps do not uniquely order versions at the cutoff")
-        if version is None:
-            raise RestoreError(f"{key}: missing or deleted at the cutoff")
-        return version
+        for version in candidates:
+            digest = hashlib.sha256()
+            with self.open(version) as body:
+                while chunk := body.read(1024 * 1024):
+                    digest.update(chunk)
+            if digest.hexdigest() == sha256:
+                return replace(version, sha256=sha256)
+        raise RestoreError(f"{key}: no tied bitmap version matches the manifest checksum")
 
     def open(self, version):
         return closing(self.client.get_object(
@@ -183,8 +193,9 @@ class VersionedObjects:
                         raise RestoreError(f"{directory}: invalid deletion generation")
                     path = f"{home}/{segment}/{name}"
                     if path not in objects:
-                        version = self.select(path, self.versions(path))
-                        objects[path] = replace(version, sha256=vector["generation"].lower())
+                        objects[path] = self.select(
+                            path, self.versions(path), sha256=vector["generation"].lower()
+                        )
             if vectors.keys() - listed:
                 raise RestoreError(f"{row.namespace}: deletion vector references an absent segment")
         return objects
