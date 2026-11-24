@@ -1173,6 +1173,17 @@ impl Biller<'_> {
                     .map(String::as_str),
             );
         }
+        // A tenant invoiced by an earlier run is visited again, so an
+        // invoice that could not be handed to the provider is, even when
+        // that run created the tenant's account after the period.
+        let invoiced: Vec<String> = self
+            .store
+            .invoices(None)?
+            .into_iter()
+            .filter(|i| i.period_start_ms == start_ms)
+            .map(|i| i.tenant)
+            .collect();
+        tenants.extend(invoiced.iter().map(String::as_str));
         tenants.remove("");
 
         let mut report = CloseReport {
@@ -1331,10 +1342,18 @@ impl Biller<'_> {
         let Some(invoice) = invoice else {
             return Ok(None);
         };
-        if invoice.provider_invoice_id.as_deref() != Some(provider_invoice_id)
-            || invoice.status != InvoiceStatus::Open
-        {
+        if invoice.status != InvoiceStatus::Open {
             return Ok(None);
+        }
+        match invoice.provider_invoice_id.as_deref() {
+            Some(known) if known == provider_invoice_id => {}
+            // The provider can report on an invoice (paid from credit at
+            // finalization) before its id is stored; the event names ours.
+            None if id == Some(invoice.id.as_str()) => {
+                self.store
+                    .set_provider_invoice(&invoice.id, provider_invoice_id)?;
+            }
+            _ => return Ok(None),
         }
         self.apply_provider_status(&invoice, status, now_ms)
     }

@@ -1577,3 +1577,71 @@ fn stripe_test_mode_charges_a_month_of_synthetic_usage() {
     let synced = billing.run_scheduled(|| Ok(())).synced.expect("synced");
     assert_eq!(synced.paid, vec![format!("{tenant}/2026-10")]);
 }
+
+#[test]
+fn a_retry_hands_over_a_default_plan_invoice_the_provider_refused() {
+    let catalog = CATALOG.replace(r#""default_plan": "free""#, r#""default_plan": "payg""#);
+    let oct = oct();
+    let f = fixture(&catalog, true, oct.end_ms() + 2 * HOUR_MS);
+    f.record("solo", "q", oct.start_ms() + 1, &[(meter::QUERIES, 10)]);
+    f.provider.set_failing(true);
+    let first = f.admin_ok(
+        "POST /v1/admin/billing/close-period",
+        serde_json::Value::Null,
+    );
+    assert_eq!(first["created"], serde_json::json!(["solo/2026-10"]));
+    assert_eq!(first["submitted"], 0);
+    f.provider.set_failing(false);
+    f.advance(HOUR_MS);
+    let retry = f.admin_ok(
+        "POST /v1/admin/billing/close-period",
+        serde_json::Value::Null,
+    );
+    assert_eq!(retry["existing"], 1, "{retry}");
+    assert_eq!(retry["submitted"], 1, "{retry}");
+    assert_eq!(f.provider.submitted().len(), 1);
+}
+
+#[test]
+fn a_payment_reported_before_the_provider_id_is_stored_is_recorded() {
+    let oct = oct();
+    let f = fixture_with(CATALOG, true, oct.start_ms(), |b| {
+        b.stripe_webhook_secret = Some(WEBHOOK_SECRET.into());
+    });
+    f.admin_ok(
+        "POST /v1/admin/billing/accounts",
+        serde_json::json!({"tenant": "acme", "plan": "payg"}),
+    );
+    f.now.store(oct.end_ms() + HOUR_MS, Ordering::SeqCst);
+    f.provider.set_failing(true);
+    f.admin_ok(
+        "POST /v1/admin/billing/close-period",
+        serde_json::Value::Null,
+    );
+    assert_eq!(
+        f.store
+            .invoice("acme/2026-10")
+            .unwrap()
+            .unwrap()
+            .provider_invoice_id,
+        None
+    );
+    let now = f.now.load(Ordering::SeqCst);
+    // Without our id the event cannot be matched; with it, it is.
+    let anonymous = stripe_event("invoice.paid", "in_early", None);
+    let (_, body) = f.webhook(
+        &anonymous,
+        Some(&stripe_signature(&anonymous, WEBHOOK_SECRET, now)),
+    );
+    assert_eq!(body["invoice"], serde_json::Value::Null);
+    let paid = stripe_event("invoice.paid", "in_early", Some("acme/2026-10"));
+    let (status, body) = f.webhook(&paid, Some(&stripe_signature(&paid, WEBHOOK_SECRET, now)));
+    assert_eq!(
+        (status, body["status"].clone()),
+        (200, "paid".into()),
+        "{body}"
+    );
+    let invoice = f.store.invoice("acme/2026-10").unwrap().unwrap();
+    assert_eq!(invoice.status, InvoiceStatus::Paid);
+    assert_eq!(invoice.provider_invoice_id.as_deref(), Some("in_early"));
+}
