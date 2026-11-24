@@ -2180,6 +2180,21 @@ impl AppState {
             data_dir.clone(),
             posting_spans::config_from_env(),
         );
+        #[cfg(feature = "s3")]
+        let hydrate_request_max_bytes = std::env::var("KOSHA_HYDRATE_REQUEST_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(hydration_budget::DEFAULT_REQUEST_MAX_BYTES);
+        #[cfg(feature = "s3")]
+        let searcher = if s3_storage.is_some() {
+            searcher.with_rrf_shortlist_hydration_limit(
+                hydrate_request_max_bytes,
+                posting_span_hydrator.coalesce_gap(),
+            )
+        } else {
+            searcher
+        };
 
         let usage = options
             .usage
@@ -2267,11 +2282,7 @@ impl AppState {
                 hydration_budget::DEFAULT_BUDGET_WAIT,
             )),
             #[cfg(feature = "s3")]
-            hydrate_request_max_bytes: std::env::var("KOSHA_HYDRATE_REQUEST_MAX_BYTES")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .filter(|n| *n > 0)
-                .unwrap_or(hydration_budget::DEFAULT_REQUEST_MAX_BYTES),
+            hydrate_request_max_bytes,
             #[cfg(feature = "s3")]
             scoring_hydrate_concurrency: std::env::var("KOSHA_SCORING_HYDRATE_CONCURRENCY")
                 .ok()
