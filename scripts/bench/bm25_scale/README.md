@@ -361,6 +361,63 @@ Approximate times per stage:
 For comparison, `warm_gate=preload` on the original vector snapshot
 spends about 115 minutes in warmup alone, before its phases.
 
+### Codes-only vector tier comparison (#381)
+
+Use one commit, the same 10M MSMarco corpus and query workload, and equivalent
+starting caches (a fresh VM, or a wiped cache, for each arm). Build one
+sidecar snapshot per format using a fresh `vector_snapshot` name and
+`build_vector_snapshot=true`; pass `KOSHA_VECTOR_QUANTIZATION=f32`, `i8`,
+or `rabitq` in `server_env`. Reuse each snapshot for its flag-on/off pair.
+For every arm, use `suite=vector`, `warm_gate=queries`, `qps=8`,
+`duration=300`, `run_recall_check=true`, and `recall_sample=1000`.
+Include `KOSHA_KNN_RESCORE_STATS=1` in every arm. The bench enables search
+timing logs for all requests.
+
+| Arm | Format | Additional `server_env` |
+|---|---|---|
+| Control | f32 | none (repeat with global on to measure control overhead) |
+| i8 off | i8 | none |
+| i8 on | i8 | `KOSHA_KNN_GLOBAL_RESCORE=1` (strict bound by default; optional separate probabilistic-bound arm) |
+| RaBitQ off | rabitq | none |
+| RaBitQ on | rabitq | `KOSHA_KNN_GLOBAL_RESCORE=1` |
+
+The regular workflow recall step samples the *first* queries. For the #381
+success bar, use `keep_vm=true` and, before switching to the next arm, rerun
+`recall_check.py` against that arm with the same arguments as the workflow
+recall step plus `--sampling random --seed 384`. Save that JSON as
+`vector/recall.json` in the local copy of the archive. Use the same random
+sample and recall probe settings for every arm at a given comparison point.
+The standard warm latency phase uses the default query probe count (100);
+vary the probe settings consistently across arms for a curve, checking logged
+`knn_postings` for actual probe counts.
+
+From the repository root, point the report at downloaded run directories
+(each containing `meta.json` and `vector/`):
+
+```sh
+python3 scripts/bench/bm25_scale/rescore_report.py runs/f32-off runs/i8-off \
+    runs/i8-on runs/rabitq-off runs/rabitq-on
+```
+
+Add `--json` for per-counter distributions and sample counts. Compare recall
+against warm p50/p99 at matched probe settings; compare each arm to the f32
+sidecar control for the 0.01 recall tolerance, 2× warm p50 reduction, and 10×
+local vector byte reduction. Warm-gate time means time for the workload to
+become cached, not time to preload a namespace. The local byte total includes
+vector indexes, offsets, and exact-vector files or cached spans. S3 bytes are
+the server's `s3_bytes`; ranged GETs sum the reported vector, postings, and page
+range counts, not whole-file requests. Missing counters are not zero, and
+incomplete log coverage is marked separately.
+
+The default report checks for whole `doc_vectors.bin` files in a codes-only
+run. Flag-off quantized arms can return unrescored estimates in this cohort;
+that is not a comparison to local per-segment rescoring. To compare the two
+rescoring algorithms with whole vectors local, run a separate matched cohort
+with `KOSHA_DOC_STORE_READ_MODE=whole` and report with
+`--allow-whole-sidecar`. Verify actual locality and the
+`knn_seg_unrescored` / `knn_seg_quantized` counters; enabling whole page reads
+does not guarantee the sidecar is present on every probed segment.
+
 ### kNN probe-budget sweep (`knn_sweep`, #384)
 
 Recall@10 against p50/p99 and postings probed, one point per server
