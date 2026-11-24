@@ -169,3 +169,32 @@ fn stage_and_prod_do_not_include_the_component() {
         );
     }
 }
+
+#[test]
+fn segment_gc_tls_settings_live_in_the_component() {
+    let root = k8s();
+    let base = read(&root.join("base/cronjob-segment-gc.yaml"));
+    let base = code_lines(&base);
+    assert!(base.contains(&"- name: KOSHA_GC_INGEST_SCHEME"));
+    assert!(base.contains(&"value: http"));
+    assert!(base
+        .iter()
+        .any(|line| line.contains("${KOSHA_GC_INGEST_SCHEME}://")));
+    assert!(!base.iter().any(|line| line.contains("kosha-internal-tls")));
+
+    let component = root.join("components/internal-tls");
+    let kustomization = read(&component.join("kustomization.yaml"));
+    assert!(code_lines(&kustomization).contains(&"- path: segment-gc-patch.yaml"));
+    let patch = read(&component.join("segment-gc-patch.yaml"));
+    let patch = code_lines(&patch);
+    for line in [
+        "name: kosha-segment-gc",
+        "- name: KOSHA_GC_INGEST_SCHEME",
+        "value: https",
+        "- name: CURL_CA_BUNDLE",
+        "value: /etc/kosha/tls/ca.crt",
+        "secretName: kosha-internal-tls",
+    ] {
+        assert!(patch.contains(&line), "missing {line}");
+    }
+}

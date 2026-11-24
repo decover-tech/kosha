@@ -94,28 +94,35 @@ pub(crate) async fn release(
 }
 
 /// The fencing check of a fenced manifest CAS, inside its transaction:
-/// `Err(Fenced)` when a lease row exists for `id` under another token. The
+/// a conflict when a lease row exists for `id` under another token. The
 /// `FOR SHARE` lock holds off a concurrent takeover (an `UPDATE` of the
 /// row) until the CAS commits or rolls back.
-pub(crate) async fn check_fencing(
+pub(crate) async fn fencing_conflict(
     tx: &mut sqlx::PgConnection,
     id: &NamespaceId,
     token: u64,
-) -> Result<(), KoshaError> {
+) -> Result<Option<KoshaError>, sqlx::Error> {
     let row: Option<(i64,)> =
         sqlx::query_as("SELECT token FROM kosha.writer_leases WHERE namespace_id = $1 FOR SHARE")
             .bind(&id.0)
             .fetch_optional(&mut *tx)
-            .await
-            .map_err(control_plane_error)?;
-    match row {
-        Some((current,)) if current as u64 != token => Err(KoshaError::Fenced {
+            .await?;
+    Ok(match row {
+        Some((current,)) if current as u64 != token => Some(KoshaError::Fenced {
             namespace: id.clone(),
             token,
             current: current as u64,
         }),
-        _ => Ok(()),
-    }
+        _ => None,
+    })
+}
+
+pub(crate) async fn check_writable(pool: &sqlx::PgPool) -> Result<(), KoshaError> {
+    tokio::time::timeout(Duration::from_millis(500), pool.acquire())
+        .await
+        .map_err(|_| KoshaError::ControlPlane("Postgres write check timed out".into()))?
+        .map_err(control_plane_error)?;
+    Ok(())
 }
 
 /// Writer-lease client with its own small pool (see the module doc).
@@ -135,13 +142,18 @@ impl PgWriterLeaseStore {
             .map_err(|e| format!("failed to create tokio runtime: {e}"))?;
         let pool = rt
             .block_on(
-                sqlx::postgres::PgPoolOptions::new()
+                crate::postgres::writer_pool_options()
                     .max_connections(2)
                     .acquire_timeout(Duration::from_secs(5))
                     .connect(database_url),
             )
             .map_err(|e| format!("failed to connect to postgres: {e}"))?;
         Ok(Self { pool, rt })
+    }
+
+    /// Check the write endpoint without waiting behind the manifest store.
+    pub fn check_writable(&self) -> Result<(), KoshaError> {
+        self.rt.block_on(check_writable(&self.pool))
     }
 
     /// See `ControlStore::acquire_writer_lease`.
