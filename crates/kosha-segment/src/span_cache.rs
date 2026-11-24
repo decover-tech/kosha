@@ -738,7 +738,14 @@ pub struct LocalRangeReader {
     spans: Option<SpanIndex>,
     /// The span file the last span read came from.
     span_file: Option<((u64, u64), fs::File)>,
-    buf: Vec<u8>,
+    /// Words, not bytes, so every range read lands 4-byte aligned and a
+    /// caller can view an f32 posting in place (#435).
+    buf: Vec<u32>,
+}
+
+/// The first `n` bytes of `buf`, which holds at least that many.
+fn buf_bytes(buf: &mut [u32], n: usize) -> &mut [u8] {
+    &mut bytemuck::cast_slice_mut::<u32, u8>(buf)[..n]
 }
 
 impl LocalRangeReader {
@@ -756,21 +763,23 @@ impl LocalRangeReader {
     }
 
     /// The bytes `[start, start + len)` of the file, valid until the next
-    /// read. `None` when neither the whole file nor a cached span holds the
-    /// range; never a short or zero-filled slice.
+    /// read and starting at a 4-byte aligned address. `None` when neither
+    /// the whole file nor a cached span holds the range; never a short or
+    /// zero-filled slice.
     pub fn read(&mut self, complete_len: u64, start: u64, len: u64) -> Option<&[u8]> {
         let n = usize::try_from(len).ok()?;
         if n == 0 {
             return Some(&[]);
         }
         let end = start.checked_add(len)?;
-        if self.buf.len() < n {
-            self.buf.resize(n, 0);
+        let words = n.div_ceil(4);
+        if self.buf.len() < words {
+            self.buf.resize(words, 0);
         }
         let found = self.read_whole(complete_len, start, n, false)
             || self.read_span(start, end, n)
             || self.read_whole(complete_len, start, n, true);
-        found.then(|| &self.buf[..n])
+        found.then(|| &bytemuck::cast_slice::<u32, u8>(&self.buf)[..n])
     }
 
     fn read_whole(&mut self, complete_len: u64, start: u64, n: usize, reopen: bool) -> bool {
@@ -788,7 +797,7 @@ impl LocalRangeReader {
         if *file_len == 0 || *file_len < complete_len {
             return false;
         }
-        read_exact_at(file, &mut self.buf[..n], start)
+        read_exact_at(file, buf_bytes(&mut self.buf, n), start)
     }
 
     fn read_span(&mut self, start: u64, end: u64, n: usize) -> bool {
@@ -805,7 +814,7 @@ impl LocalRangeReader {
             return false;
         };
         if let Some(bytes) = spans.read_pending(start, end) {
-            self.buf[..n].copy_from_slice(bytes);
+            buf_bytes(&mut self.buf, n).copy_from_slice(bytes);
             return true;
         }
         let Some(span) = covering_in(&spans.on_disk, start, end) else {
@@ -823,7 +832,7 @@ impl LocalRangeReader {
         let Some((_, file)) = &self.span_file else {
             return false;
         };
-        if read_exact_at(file, &mut self.buf[..n], start - span.0) {
+        if read_exact_at(file, buf_bytes(&mut self.buf, n), start - span.0) {
             return true;
         }
         self.span_file = None;
@@ -1260,11 +1269,11 @@ mod tests {
         for start in (0..200u64).step_by(7) {
             for len in [0u64, 1, 9, 40, 90] {
                 let expect = read_local_range(&seg, "f.bin", start + len, start, len);
-                assert_eq!(
-                    reader.read(start + len, start, len).map(<[u8]>::to_vec),
-                    expect,
-                    "[{start}, +{len})"
-                );
+                let got = reader.read(start + len, start, len);
+                if let Some(got) = got.filter(|got| !got.is_empty()) {
+                    assert_eq!(got.as_ptr() as usize % 4, 0, "aligned [{start}, +{len})");
+                }
+                assert_eq!(got.map(<[u8]>::to_vec), expect, "[{start}, +{len})");
             }
         }
         let _ = fs::remove_dir_all(&seg);

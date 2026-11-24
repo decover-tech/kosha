@@ -216,3 +216,85 @@ fn late_interaction_request_errors() {
     assert!(matches!(err, KoshaError::InvalidQuery(_)), "{err:?}");
     cleanup(&c.dir);
 }
+
+/// A late-interaction kNN reads only the field's multivec files (#205
+/// follow-up): it answers with every single-vector column file gone, and
+/// opens segments as a lexical query does, sharing their cache entries.
+///
+/// `doc_vectors.bin` stays: it holds the documents' single vectors for
+/// `_source`, so materializing a page reads it whatever the query (a
+/// lexical one too). No kNN *scoring* path of a current-format segment
+/// reads it.
+#[test]
+fn late_interaction_needs_no_single_vector_files() {
+    let c = corpus("no-single");
+    let mut removed = 0;
+    for seg in ["s1", "s2"] {
+        let dir = c.dir.join(&c.ns.0).join(seg);
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            if kosha_core::is_vector_index_file(&name) {
+                std::fs::remove_file(dir.join(&name)).unwrap();
+                removed += 1;
+            }
+        }
+    }
+    assert!(
+        removed >= 2,
+        "the fixture had single-vector files to remove"
+    );
+
+    let searcher = Searcher::new(c.dir.clone());
+    // A lexical query opens (and caches) both segments first.
+    let lexical = query(serde_json::json!({"query_text": "alpha", "max_results": 3}));
+    let (_, stats) = searcher
+        .search_with_stats(&c.ns, &c.manifest, &lexical, None)
+        .unwrap();
+    assert_eq!(stats.open_cold, 2);
+
+    let q_tokens = vec![c.bags[12][0].clone(), c.bags[12][2].clone()];
+    let q = query(serde_json::json!({
+        "query_text": "", "max_results": 5,
+        "knn": {"field": "tokens", "vectors": q_tokens, "k": 5, "num_candidates": 1000}
+    }));
+    assert!(!kosha_query::query_reads_vector_columns(&q));
+    let (r, stats) = searcher
+        .search_with_stats(&c.ns, &c.manifest, &q, None)
+        .unwrap();
+    assert_eq!(
+        stats.open_cold, 0,
+        "late interaction reuses the lexical open of each segment"
+    );
+    assert_eq!(stats.open_cached, 2);
+    assert_eq!(r.knn_degraded_segments, Some(0));
+    let mut expected: Vec<(usize, f64)> = (0..80)
+        .map(|i| (i, maxsim(&q_tokens, &c.bags[i])))
+        .collect();
+    expected.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let expected: Vec<String> = expected[..5].iter().map(|(i, _)| format!("d{i}")).collect();
+    assert_eq!(ids(&r), expected);
+
+    // Hybrid with late interaction needs no vector column either.
+    let q = query(serde_json::json!({
+        "query_text": "alpha", "max_results": 5,
+        "knn": {"field": "tokens", "vectors": [c.bags[30][1]], "k": 5}
+    }));
+    assert!(!kosha_query::query_reads_vector_columns(&q));
+    let r = searcher.search(&c.ns, &c.manifest, &q, None).unwrap();
+    assert_eq!(r.results.len(), 5);
+    assert_eq!(r.knn_degraded_segments, Some(0));
+
+    // A single-vector kNN does read them: it opens its own (vector)
+    // readers, and the missing column degrades both segments.
+    let q = query(serde_json::json!({
+        "query_text": "", "max_results": 1,
+        "knn": {"field": "emb", "vector": c.bags[44][0], "k": 1}
+    }));
+    assert!(kosha_query::query_reads_vector_columns(&q));
+    let (r, stats) = searcher
+        .search_with_stats(&c.ns, &c.manifest, &q, None)
+        .unwrap();
+    assert_eq!(stats.open_cold, 2);
+    assert!(r.results.is_empty());
+    cleanup(&c.dir);
+}

@@ -69,6 +69,10 @@ pub(crate) const INTERNAL_CLIENT_POOL_IDLE: Duration = Duration::from_secs(10);
 
 // ─── Request / response ─────────────────────────────────────────────────────
 
+/// The pseudo-header carrying the TCP peer's IP address to the handler.
+/// Set by the server on every request; a client cannot supply it.
+pub(crate) const PEER_IP_HEADER: &str = "x-kosha-peer-ip";
+
 /// One parsed request, handed to the synchronous [`Handler`].
 #[derive(Debug, Clone)]
 pub(crate) struct Request {
@@ -604,21 +608,21 @@ async fn accept_loop(
         tokio::select! {
             () = &mut shutdown => break,
             accepted = listener.accept() => match accepted {
-                Ok((tcp, _peer)) => {
+                Ok((tcp, peer)) => {
                     tcp.set_nodelay(true).ok();
                     let shared = Arc::clone(&shared);
                     match Arc::clone(&connections).try_acquire_owned() {
                         Ok(permit) => {
                             let stop = stop_rx.clone();
                             tokio::spawn(async move {
-                                accept_connection(tcp, shared, Some(stop)).await;
+                                accept_connection(tcp, peer.ip(), shared, Some(stop)).await;
                                 drop(permit);
                             });
                         }
                         // Over the connection cap: one 503, then close.
                         // A task, not a thread, and short-lived.
                         Err(_) => {
-                            tokio::spawn(accept_connection(tcp, shared, None));
+                            tokio::spawn(accept_connection(tcp, peer.ip(), shared, None));
                         }
                     }
                 }
@@ -654,6 +658,7 @@ async fn accept_loop(
 /// `None` for an over-capacity connection, which only gets a 503.
 async fn accept_connection(
     tcp: tokio::net::TcpStream,
+    peer: std::net::IpAddr,
     shared: Arc<Shared>,
     stop: Option<watch::Receiver<bool>>,
 ) {
@@ -670,10 +675,10 @@ async fn accept_connection(
                     .1
                     .peer_certificates()
                     .is_some_and(|certs| !certs.is_empty());
-                serve_connection(tls, shared, stop, client_cert).await;
+                serve_connection(tls, shared, stop, client_cert, peer).await;
             }
         }
-        None => serve_connection(tcp, shared, stop, false).await,
+        None => serve_connection(tcp, shared, stop, false, peer).await,
     }
 }
 
@@ -682,6 +687,7 @@ async fn serve_connection<I>(
     shared: Arc<Shared>,
     stop: Option<watch::Receiver<bool>>,
     client_cert: bool,
+    peer: std::net::IpAddr,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -699,7 +705,7 @@ async fn serve_connection<I>(
                     )
                     .with_header("connection", "close")
                 } else {
-                    handle_request(request, &shared, client_cert).await
+                    handle_request(request, &shared, client_cert, peer).await
                 };
                 Ok::<_, Infallible>(response.into_hyper())
             }
@@ -763,9 +769,10 @@ async fn handle_request(
     request: hyper::Request<Incoming>,
     shared: &Shared,
     client_cert: bool,
+    peer: std::net::IpAddr,
 ) -> Response {
     let request_id = request_id_of(&request);
-    let response = answer(request, shared, client_cert, &request_id).await;
+    let response = answer(request, shared, client_cert, peer, &request_id).await;
     stamp_api_headers(response, &request_id)
 }
 
@@ -783,6 +790,7 @@ async fn answer(
     request: hyper::Request<Incoming>,
     shared: &Shared,
     client_cert: bool,
+    peer: std::net::IpAddr,
     request_id: &str,
 ) -> Response {
     let config = &shared.config;
@@ -856,6 +864,10 @@ async fn answer(
             String::from_utf8_lossy(value.as_bytes()).trim().to_string(),
         );
     }
+    // The connection's peer address, for the console's per-IP attempt
+    // limits (#345). Always the server's own value: one a client sent
+    // under this name is replaced.
+    headers.insert(PEER_IP_HEADER.to_string(), peer.to_string());
     // The handler (`dispatch`) takes its id from this header, so a request
     // that came without one keeps the id chosen here.
     headers.insert("x-request-id".to_string(), request_id.to_string());

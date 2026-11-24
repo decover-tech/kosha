@@ -23,7 +23,7 @@ data:
   # KOSHA_S3_SSE: "aws:kms"
   # KOSHA_S3_SSE_KMS_KEY_ID: arn:aws:kms:us-east-1:111122223333:key/DEFAULT-KEY-ID
   # KOSHA_S3_SSE_BUCKET_KEY: "true"
-  # Per-tenant keys (BYOK); a tenant not listed uses the default key.
+  # Fallback per-tenant keys (BYOK); kosha.tenants.kms_key_id takes precedence.
   # KOSHA_S3_TENANT_KMS_KEYS: acme=arn:aws:kms:us-east-1:111122223333:key/ACME-KEY-ID
   # ...or the same map as JSON from a mounted file:
   # KOSHA_S3_TENANT_KMS_KEYS_FILE: /etc/kosha/tenant-kms-keys.json

@@ -118,6 +118,52 @@ def test_exists_and_range_options():
     assert ranged == {"range": {"publishedAt": {"gte": "2024-01-01", "lte": "2024-12-31"}}}
 
 
+def test_exists_drops_boost_and_refuses_malformed_bodies():
+    assert KoshaClient._to_filter({"exists": {"field": "a", "boost": 2}}) == {
+        "exists": {"field": "a"}
+    }
+    assert KoshaClient._to_filter({"exists": {"field": "a", "_name": "has_a"}}) == {
+        "exists": {"field": "a"}
+    }
+    for spec in [None, "a", ["a"], {}, {"field": ""}, {"field": 7}, {"field": "a", "x": 1}]:
+        with pytest.raises(KoshaRequestError, match="exists"):
+            KoshaClient._to_filter({"exists": spec})
+
+
+def test_exists_survives_search_translation_in_query_and_bool_context():
+    exists = {"exists": {"field": "sentAt"}}
+    missing = {"bool": {"must_not": [exists]}}
+    assert translate({"query": exists})["filter"] == exists
+    assert translate({"query": missing})["filter"] == missing
+    assert translate({"query": {"bool": {"filter": [exists]}}})["filter"] == {
+        "bool": {"must": [exists]}
+    }
+
+
+def test_named_exists_ignores_metadata_without_changing_the_filter():
+    named = {"exists": {"field": "sentAt", "_name": "q1", "boost": 2.0}}
+    assert translate({"query": {"bool": {"must_not": [named]}}})["filter"] == {
+        "bool": {"must_not": [{"exists": {"field": "sentAt"}}]}
+    }
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        None,
+        {},
+        "sentAt",
+        ["sentAt"],
+        {"field": ""},
+        {"field": 1},
+        {"field": "sentAt", "extra": True},
+    ],
+)
+def test_malformed_exists_is_refused(spec):
+    message = refused({"query": {"bool": {"must_not": [{"exists": spec}]}}})
+    assert "exists clause" in message
+
+
 def test_prefix_short_and_long_forms():
     assert KoshaClient._to_filter({"prefix": {"path": "/matters/2026/"}}) == {
         "prefix": {"path": "/matters/2026/"}
@@ -470,6 +516,53 @@ def test_knn_query_text_is_passed_through_for_server_side_embedding():
         }
     )
     assert "query_text" in message
+
+
+def test_knn_vectors_and_scoring_are_passed_through_for_late_interaction():
+    bag = [[0.1] * 16, [0.2] * 16, [0.3] * 16]
+    kosha = translate(
+        {
+            "size": 10,
+            "query": {
+                "knn": {
+                    "tokens": {
+                        "vectors": bag,
+                        "scoring": "late_interaction",
+                        "k": 10,
+                        "num_candidates": 50,
+                        "filter": {"bool": {"must": [scope_filter()]}},
+                    }
+                }
+            },
+        }
+    )
+    knn = kosha["knn"]
+    assert knn["field"] == "tokens"
+    assert knn["vectors"] == bag
+    assert knn["scoring"] == "late_interaction"
+    assert "vector" not in knn and "query_text" not in knn
+    assert knn["k"] == 10 and knn["num_candidates"] == 50
+    assert knn["filter"] == {"bool": {"must": [SCOPE_KOSHA]}}
+
+    # Without `scoring` the server infers late interaction from `vectors`;
+    # tuples are sent as lists.
+    kosha = translate({"knn": {"tokens": {"vectors": [tuple(bag[0])]}}})
+    assert kosha["knn"]["vectors"] == [bag[0]]
+    assert "scoring" not in kosha["knn"]
+
+    # `scoring` with a single `vector` (a one-token bag) is passed as is.
+    kosha = translate(
+        {"query": {"knn": {"tokens": {"vector": bag[0], "scoring": "late_interaction"}}}}
+    )
+    assert kosha["knn"]["vector"] == bag[0]
+    assert kosha["knn"]["scoring"] == "late_interaction"
+
+    assert "vectors" in refused(
+        {"query": {"knn": {"tokens": {"vector": bag[0], "vectors": bag}}}}
+    )
+    assert "query_text" in refused(
+        {"query": {"knn": {"tokens": {"vectors": bag, "query_text": "x"}}}}
+    )
 
 
 def test_knn_filter_that_cannot_be_expressed_refuses_the_search():
