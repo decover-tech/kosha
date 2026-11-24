@@ -547,6 +547,55 @@
     }
   }
 
+  function showUsage() {
+    const month = el("input", { type: "month", required: true, value: new Date().toISOString().slice(0, 7) });
+    const out = el("div", { class: "panel" });
+    const columns = [
+      ["Queries", "queries"],
+      ["Bytes queried", "bytes_queried"],
+      ["Bytes fetched", "bytes_fetched"],
+      ["Bytes returned", "bytes_returned"],
+      ["Bytes written", "bytes_written"],
+      ["Documents written", "documents_written"],
+      ["Vector dimensions written", "vector_dimensions_written"],
+      ["Stored byte-hours", "stored_byte_hours"],
+      ["Latest stored bytes", "stored_bytes_latest"],
+    ];
+    const load = async () => {
+      const start = new Date(month.value + "-01T00:00:00Z");
+      if (!Number.isFinite(start.getTime())) return;
+      const end = new Date(start.getTime());
+      end.setUTCMonth(end.getUTCMonth() + 1);
+      month.disabled = true;
+      out.replaceChildren(el("p", { class: "muted", text: "Loading…" }));
+      try {
+        const data = await api("GET", "/v1/usage?from=" + start.getTime() / 1000 + "&to=" + end.getTime() / 1000);
+        const row = (tag, name, usage) => el(
+          "tr",
+          {},
+          el(tag, { text: name }),
+          columns.map(([, key]) => el("td", { class: "num", text: fmtNum(usage[key]) }))
+        );
+        out.replaceChildren(el(
+          "table",
+          {},
+          el("thead", {}, el("tr", {}, el("th", { text: "Namespace" }),
+            columns.map(([label]) => el("th", { class: "num", text: label }))
+          )),
+          el("tbody", {}, data.namespaces.map((usage) => row("td", usage.namespace, usage))),
+          el("tfoot", {}, row("th", "Tenant total", data.total))
+        ));
+      } catch (e) {
+        out.replaceChildren(errorBox(e.message));
+      } finally {
+        month.disabled = false;
+      }
+    };
+    month.addEventListener("change", load);
+    render(el("h1", { text: "Usage" }), el("p", {}, el("label", {}, "Month (UTC) ", month)), out);
+    return load();
+  }
+
   // ── Router ────────────────────────────────────────────────────────────
   function route() {
     const hash = location.hash.replace(/^#/, "") || "/";
@@ -554,11 +603,13 @@
     const section = parts[0] || "";
     const arg = parts[1] ? decodeURIComponent(parts[1]) : "";
     document.querySelectorAll("nav a").forEach((a) => {
-      const active = a.dataset.nav === (section === "console" ? "console" : "namespaces");
+      const nav = section === "console" || section === "usage" ? section : "namespaces";
+      const active = a.dataset.nav === nav;
       a.classList.toggle("active", active);
     });
     if (section === "ns" && arg) return showNamespace(arg);
     if (section === "console") return showConsole(arg);
+    if (section === "usage") return showUsage();
     return showNamespaces();
   }
 

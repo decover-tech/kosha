@@ -19,6 +19,8 @@ Then open `http://<host>:8080/dashboard`, paste an API key into the box at the t
   `POST /v1/namespaces/{ns}/search`. It shows each hit's id, score and highlighted snippet, the
   timing breakdown, and a red banner when `knn_degraded_segments` is above 0 (a 200 that may be
   missing neighbors).
+- **Usage**: monthly UTC tenant and namespace totals from `GET /v1/usage`, including reads,
+  writes, vector dimensions written and stored bytes. Requires `KOSHA_USAGE_METERING=on`.
 
 There are no admin actions.
 

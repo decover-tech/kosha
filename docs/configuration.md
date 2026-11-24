@@ -346,7 +346,9 @@ What is recorded:
   a warm or result-cached search). `bytes_fetched` measures cache misses and is for cost
   attribution, not billing.
 - An accepted document write (`/documents`, legacy `/index` and `/replace`): `bytes_written`
-  (each document's id plus every field's name and value, as submitted) and `documents_written`.
+  (each document's id plus every field's name and value, as submitted), `documents_written`,
+  and `vector_dimensions_written` (the sum of scalar coordinates across vector fields,
+  including vectors generated at ingest and all tokens in a late-interaction bag).
   Recorded on the pod that executes the write. Deletes are not metered.
 - Once an hour, on a pod that accepts writes: `stored_bytes`, the object bytes of every segment
   the namespace's manifest references. Shards are added up under their root namespace; a segment

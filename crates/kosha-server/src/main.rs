@@ -8660,18 +8660,23 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
         return response;
     }
     // Usage (#348) meters what the client sent, before embedding.
-    let logical_bytes = usage::documents_logical_bytes(&documents);
+    let write_usage = state
+        .usage
+        .as_ref()
+        .map(|meter| (meter, usage::documents_logical_bytes(&documents)));
     if let Err(response) = embed_documents(state, &ns, &mut documents) {
         return response;
     }
     if let Err(response) = check_embedded_dims(state, &ns, &documents) {
         return response;
     }
+    let write_usage = write_usage
+        .map(|(meter, bytes)| (meter, bytes, usage::documents_vector_dimensions(&documents)));
     match write_routed(state, &ns, documents, index_into) {
         Ok(count) => {
             state.metrics.record_indexed(count as u64);
-            if let Some(meter) = state.usage.as_ref() {
-                meter.record_write(&ns, logical_bytes, count as u64);
+            if let Some((meter, bytes, dimensions)) = write_usage {
+                meter.record_write(&ns, bytes, count as u64, dimensions);
             }
             json_ok(&IndexResponse {
                 indexed_count: count,
@@ -9047,18 +9052,23 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
     if let Err(response) = check_document_write(state, &namespace, &documents) {
         return response;
     }
-    let logical_bytes = usage::documents_logical_bytes(&documents);
+    let write_usage = state
+        .usage
+        .as_ref()
+        .map(|meter| (meter, usage::documents_logical_bytes(&documents)));
     if let Err(response) = embed_documents(state, &namespace, &mut documents) {
         return response;
     }
     if let Err(response) = check_embedded_dims(state, &namespace, &documents) {
         return response;
     }
+    let write_usage = write_usage
+        .map(|(meter, bytes)| (meter, bytes, usage::documents_vector_dimensions(&documents)));
     match write_routed(state, &namespace, documents, replace_into) {
         Ok(count) => {
             state.metrics.record_indexed(count as u64);
-            if let Some(meter) = state.usage.as_ref() {
-                meter.record_write(&namespace, logical_bytes, count as u64);
+            if let Some((meter, bytes, dimensions)) = write_usage {
+                meter.record_write(&namespace, bytes, count as u64, dimensions);
             }
             json_ok(&IndexResponse {
                 indexed_count: count,

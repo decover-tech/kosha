@@ -38,6 +38,8 @@ pub mod meter {
     pub const BYTES_WRITTEN: &str = "bytes_written";
     /// Documents in an accepted write.
     pub const DOCUMENTS_WRITTEN: &str = "documents_written";
+    /// Scalar coordinates across all vectors in an accepted write.
+    pub const VECTOR_DIMENSIONS_WRITTEN: &str = "vector_dimensions_written";
     /// Bytes of the objects of every segment the namespace's manifest
     /// references (segments a branch inherits are counted on the namespace
     /// that owns them). A gauge: one event per namespace per hour, with a
@@ -131,6 +133,7 @@ pub struct NamespaceUsage {
     pub bytes_queried: u64,
     pub bytes_written: u64,
     pub documents_written: u64,
+    pub vector_dimensions_written: u64,
     /// Sum of the hourly stored-bytes snapshots in the window: byte-hours.
     /// An hour without a snapshot (no writer running) contributes nothing;
     /// `stored_snapshots` says how many hours did.
@@ -155,6 +158,9 @@ impl NamespaceUsage {
         self.documents_written = self
             .documents_written
             .saturating_add(other.documents_written);
+        self.vector_dimensions_written = self
+            .vector_dimensions_written
+            .saturating_add(other.vector_dimensions_written);
         self.stored_byte_hours = self
             .stored_byte_hours
             .saturating_add(other.stored_byte_hours);
@@ -204,6 +210,9 @@ pub fn summarize(buckets: &[UsageBucket], carry_in: &[UsageGauge]) -> Vec<Namesp
             meter::BYTES_WRITTEN => usage.bytes_written = usage.bytes_written.saturating_add(q),
             meter::DOCUMENTS_WRITTEN => {
                 usage.documents_written = usage.documents_written.saturating_add(q)
+            }
+            meter::VECTOR_DIMENSIONS_WRITTEN => {
+                usage.vector_dimensions_written = usage.vector_dimensions_written.saturating_add(q)
             }
             meter::STORED_BYTES => {
                 usage.stored_byte_hours = usage.stored_byte_hours.saturating_add(q);

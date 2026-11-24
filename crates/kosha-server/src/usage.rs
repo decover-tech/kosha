@@ -9,7 +9,8 @@
 //!   served from the result cache emits the same event with
 //!   `bytes_fetched = 0`.
 //! - An accepted document write (`/documents`, legacy `/index` and
-//!   `/replace`) emits `bytes_written` and `documents_written`, on the pod
+//!   `/replace`) emits `bytes_written`, `documents_written` and
+//!   `vector_dimensions_written`, on the pod
 //!   that executed it (a query pod forwards writes and emits nothing).
 //! - A pod that accepts writes snapshots each namespace's `stored_bytes`
 //!   once an hour ([`run_snapshot_tick`]).
@@ -407,17 +408,30 @@ impl UsageMeter {
     }
 
     /// An accepted write of `documents` documents to `ns`.
-    pub(crate) fn record_write(&self, ns: &NamespaceId, bytes_written: u64, documents: u64) {
+    pub(crate) fn record_write(
+        &self,
+        ns: &NamespaceId,
+        bytes_written: u64,
+        documents: u64,
+        vector_dimensions: u64,
+    ) {
         let (tenant, namespace) = usage_identity(ns);
+        let mut meters = BTreeMap::from([
+            (meter::BYTES_WRITTEN.to_string(), bytes_written),
+            (meter::DOCUMENTS_WRITTEN.to_string(), documents),
+        ]);
+        if vector_dimensions != 0 {
+            meters.insert(
+                meter::VECTOR_DIMENSIONS_WRITTEN.to_string(),
+                vector_dimensions,
+            );
+        }
         self.emit(&UsageEvent {
             id: self.next_event_id(),
             tenant,
             namespace,
             at_ms: unix_millis(),
-            meters: BTreeMap::from([
-                (meter::BYTES_WRITTEN.to_string(), bytes_written),
-                (meter::DOCUMENTS_WRITTEN.to_string(), documents),
-            ]),
+            meters,
         });
     }
 
@@ -554,6 +568,28 @@ pub(crate) fn documents_logical_bytes(documents: &[kosha_core::Document]) -> u64
                     .sum::<u64>()
         })
         .sum()
+}
+
+pub(crate) fn documents_vector_dimensions(documents: &[kosha_core::Document]) -> u64 {
+    documents
+        .iter()
+        .flat_map(|doc| &doc.fields)
+        .filter(|field| field.field_type == kosha_core::FieldType::Vector)
+        .map(|field| {
+            if let Ok(vector) = serde_json::from_str::<Vec<f32>>(&field.value) {
+                return vector.len() as u64;
+            }
+            if let Ok(bag) = serde_json::from_str::<Vec<Vec<f32>>>(&field.value) {
+                return bag
+                    .first()
+                    .filter(|first| bag.iter().all(|vector| vector.len() == first.len()))
+                    .map_or(0, |first| {
+                        (first.len() as u64).saturating_mul(bag.len() as u64)
+                    });
+            }
+            0
+        })
+        .fold(0, u64::saturating_add)
 }
 
 /// Bytes of the objects of every segment `ns`'s manifest references and

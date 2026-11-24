@@ -306,7 +306,7 @@ fn events_spooled_by_a_dead_process_are_delivered_by_the_next() {
         assert!(dead.flush().is_err());
         // ...and these two are still in the active file at the "crash".
         dead.record_query(&ns, 20, 0);
-        dead.record_write(&ns, 300, 3);
+        dead.record_write(&ns, 300, 3, 0);
     }
     assert_eq!(store.inner.row_count(), 0);
     store.down.store(false, Ordering::SeqCst);

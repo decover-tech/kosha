@@ -1033,6 +1033,84 @@ fn a_real_snapshot_reconciles_exactly_with_the_data_directory() {
     assert_eq!(allowed["within_tolerance"], true, "{allowed:#}");
 }
 
+#[test]
+fn monthly_tenant_usage_replays_from_events_and_reconciles_with_inventory() {
+    let (state, _) = metered_state();
+    let now = unix_millis();
+    let month = kosha_control::billing::BillingPeriod::containing(now);
+    let (from, to) = (month.start_ms(), month.end_ms());
+    call(
+        &state,
+        "acme",
+        "POST /v1/namespaces/docs/documents",
+        serde_json::json!({"documents": [
+            {"id": "one", "fields": [
+                {"name": "title", "field_type": "Text", "value": "quick fox"},
+                {"name": "embedding", "field_type": "Vector", "value": "[1,2,3]"}
+            ]},
+            {"id": "two", "fields": [
+                {"name": "embedding", "field_type": "Vector", "value": "[4,5,6]"},
+                {"name": "tokens", "field_type": "Vector", "value": "[[1,2],[3,4]]"}
+            ]}
+        ]}),
+    );
+    call(
+        &state,
+        "acme",
+        "POST /v1/namespaces/docs/flush",
+        serde_json::json!({}),
+    );
+    let search = call(
+        &state,
+        "acme",
+        "POST /v1/namespaces/docs/search",
+        serde_json::json!({"query_text": "quick"}),
+    );
+    write_and_flush(&state, "globex", "docs", 0..1);
+    assert_eq!(usage::run_snapshot_tick(&state, now), 2);
+
+    let events: Vec<UsageEvent> = std::fs::read_dir(UsageConfig::under(&state.data_dir).spool_dir)
+        .unwrap()
+        .flat_map(|entry| {
+            let contents = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+            contents
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let replay = MemoryUsageStore::new();
+    assert!(replay.record(&events).unwrap() > 0);
+    assert_eq!(replay.record(&events).unwrap(), 0);
+    let summary = kosha_control::usage::usage_summary(&replay, Some("acme"), from, to).unwrap();
+    let [docs] = summary.as_slice() else {
+        panic!("expected one namespace: {summary:?}");
+    };
+    assert_eq!(docs.documents_written, 2);
+    assert_eq!(docs.vector_dimensions_written, 10);
+    assert_eq!(docs.queries, 1);
+    assert_eq!(
+        docs.bytes_returned,
+        search.split_once("\r\n\r\n").unwrap().1.len() as u64
+    );
+
+    let usage = body_of(&call(
+        &state,
+        "acme",
+        &format!("GET /v1/usage?from={}&to={}", from / 1000, to / 1000),
+        serde_json::Value::Null,
+    ));
+    assert_eq!(usage["namespaces"], serde_json::to_value(&summary).unwrap());
+    assert_eq!(usage["total"]["vector_dimensions_written"], 10);
+
+    let (status, report) = reconcile_route(&state, "?tenant=acme&tolerance=0&tolerance_bytes=0");
+    assert_eq!(status, 200);
+    assert_eq!(report["within_tolerance"], true, "{report:#}");
+    let inventory = &json_row(&report, "acme", "docs")["storage"]["referenced_bytes"];
+    assert_eq!(inventory.as_u64(), docs.stored_bytes_latest);
+    assert_eq!(inventory.as_u64(), Some(docs.stored_byte_hours));
+}
+
 /// Deleting a namespace (#347) leaves its last snapshots in the usage
 /// store. With its storage gone that is expected; with objects still under
 /// its prefix the run fails and names the deletion record.
