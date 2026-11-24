@@ -7906,6 +7906,26 @@ pub enum KnnProbeBudget<'a> {
 /// same `max_distance` and `max_probes`: ascending score, equal scores in
 /// posting order, the first `max_probes` of those at or under
 /// `max_distance`.
+/// One vector column's read costs, from its resident `vector.offsets`:
+/// see [`SegmentReader::knn_column_cost`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnnColumnCost {
+    /// Postings in the column.
+    pub postings: usize,
+    /// Live entries over all postings.
+    pub entries: u64,
+    /// Bytes of one `vector.idx` entry, id included: what a probe reads and
+    /// scores per vector (f32, i8 or RaBitQ).
+    pub entry_bytes: usize,
+    /// Entries are quantized, so a probe also rescores a shortlist from
+    /// `doc_vectors.bin`.
+    pub quantized: bool,
+    /// Bytes an exact scan reads per passing document from
+    /// `doc_vectors.bin`; `None` without that file, when an exact scan reads
+    /// every posting instead.
+    pub exact_vector_bytes: Option<usize>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct KnnSegmentRanking {
     /// One rank score per posting, in posting order. `None` when the plan
@@ -9775,6 +9795,24 @@ impl SegmentReader {
     /// computing them; `None` exactly when it returns `None`.
     pub fn knn_centroid_count(&self, field: &str, dim: usize) -> Option<usize> {
         self.with_knn_plan_index(field, dim, |vi| Some(vi.ranges.len()))
+    }
+
+    /// What a probe and an exact scan of `field`'s column read, for the
+    /// filtered-kNN cost model (#465); `None` exactly when
+    /// [`Self::knn_centroid_count`] is `None`.
+    pub fn knn_column_cost(&self, field: &str, dim: usize) -> Option<KnnColumnCost> {
+        let doc_vectors = self.footer.doc_vectors;
+        self.with_knn_plan_index(field, dim, |vi| {
+            let entry_bytes = vector_entry_size(vi.dim as u32, vi.version);
+            let bytes: u64 = vi.ranges.iter().map(|&(_, length)| length as u64).sum();
+            Some(KnnColumnCost {
+                postings: vi.ranges.len(),
+                entries: bytes / entry_bytes as u64,
+                entry_bytes,
+                quantized: vi.quantized,
+                exact_vector_bytes: doc_vectors.then_some(4 * vi.dim),
+            })
+        })
     }
 
     /// [`Self::knn_centroid_distances`] at an explicit radius weight

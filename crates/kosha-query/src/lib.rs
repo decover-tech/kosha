@@ -3072,6 +3072,75 @@ fn knn_exact_threshold_from_env() -> usize {
 /// threshold in absolute documents per segment.
 pub const DEFAULT_KNN_EXACT_FRACTION: f64 = 0.01;
 
+fn knn_exact_cost_model_from_env() -> bool {
+    matches!(
+        std::env::var("KOSHA_KNN_EXACT_COST_MODEL")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("1" | "true" | "on")
+    )
+}
+
+/// Default of `KOSHA_KNN_COST_POSTING_OVERHEAD_BYTES`: the fixed cost of one
+/// posting fetch in the cost model (#465), in bytes of sequential read it is
+/// worth — one 4 KiB page, the smallest read a posting fetch issues.
+pub const DEFAULT_KNN_COST_POSTING_OVERHEAD_BYTES: f64 = 4096.0;
+
+fn knn_cost_posting_overhead_bytes() -> f64 {
+    static BYTES: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("KOSHA_KNN_COST_POSTING_OVERHEAD_BYTES")
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|b| b.is_finite() && *b >= 0.0)
+            .unwrap_or(DEFAULT_KNN_COST_POSTING_OVERHEAD_BYTES)
+    })
+}
+
+/// Cost model for filtered kNN (#465): whether scoring a segment's
+/// `passing` documents exactly reads no more than probing it would.
+///
+/// A probe reads its share of the global budget (`budget_share` postings)
+/// widened by the filter's selectivity as [`filtered_knn_budget`] widens
+/// it, but never fewer postings than it takes, on average, to see `k`
+/// passing entries, nor more than the column holds; each posting costs its
+/// entries plus `posting_overhead` bytes. A quantized column also rescores
+/// `k × rescore_factor` exact vectors. An exact scan reads one exact vector
+/// per passing document from `doc_vectors.bin`, or, without it, every
+/// posting.
+pub fn knn_exact_is_cheaper(
+    cost: &kosha_segment::KnnColumnCost,
+    passing: usize,
+    budget_share: usize,
+    k: usize,
+    rescore_factor: usize,
+    posting_overhead: f64,
+) -> bool {
+    if passing == 0 || cost.postings == 0 || cost.entries == 0 {
+        return true;
+    }
+    let postings = cost.postings as f64;
+    let entries = cost.entries as f64;
+    let avg_len = entries / postings;
+    let selectivity = (passing as f64 / entries).min(1.0);
+    let per_posting = avg_len * cost.entry_bytes as f64 + posting_overhead;
+    let widened = filtered_knn_budget(budget_share.max(1), Some(selectivity)) as f64;
+    let to_find_k = (k.max(1) as f64 / (selectivity * avg_len)).ceil();
+    let probed = widened.max(to_find_k).min(postings);
+    let mut probe = probed * per_posting;
+    let exact = match cost.exact_vector_bytes {
+        Some(bytes) => {
+            if cost.quantized {
+                probe += (k.max(1) * rescore_factor).min(passing) as f64 * bytes as f64;
+            }
+            passing as f64 * bytes as f64
+        }
+        None => postings * per_posting,
+    };
+    exact <= probe
+}
+
 fn knn_exact_fraction_from_env() -> f64 {
     std::env::var("KOSHA_KNN_EXACT_FRACTION")
         .ok()
@@ -3852,6 +3921,10 @@ pub struct Searcher {
     knn_exact_threshold: usize,
     /// See [`DEFAULT_KNN_EXACT_FRACTION`].
     knn_exact_fraction: f64,
+    /// Cost-model exact selection (#465): see
+    /// [`Searcher::with_knn_exact_cost_model`]. Default from
+    /// `KOSHA_KNN_EXACT_COST_MODEL`, off.
+    knn_exact_cost_model: bool,
     /// Global bound-driven rescoring (#381): see
     /// [`Searcher::with_knn_global_rescore`]. Default from
     /// `KOSHA_KNN_GLOBAL_RESCORE`, off.
@@ -3985,6 +4058,7 @@ impl Searcher {
             draining: Mutex::new(HashMap::new()),
             knn_exact_threshold: knn_exact_threshold_from_env(),
             knn_exact_fraction: knn_exact_fraction_from_env(),
+            knn_exact_cost_model: knn_exact_cost_model_from_env(),
             knn_global_rescore: knn_global_rescore_from_env(),
             knn_global_rescore_max: knn_global_rescore_max_from_env(),
             knn_plan_i8: kosha_segment::knn_plan_i8_from_env(),
@@ -4076,6 +4150,16 @@ impl Searcher {
     pub fn with_knn_exact_policy(mut self, threshold: usize, fraction: f64) -> Self {
         self.knn_exact_threshold = threshold;
         self.knn_exact_fraction = fraction.max(0.0);
+        self
+    }
+
+    /// Experimental (#465): pick exact or probed per segment by estimated
+    /// bytes read ([`knn_exact_is_cheaper`]) instead of the fixed threshold
+    /// and fraction of [`Self::with_knn_exact_policy`]. A threshold of `0`
+    /// still turns the exact path off. Default from
+    /// `KOSHA_KNN_EXACT_COST_MODEL`, off.
+    pub fn with_knn_exact_cost_model(mut self, enabled: bool) -> Self {
+        self.knn_exact_cost_model = enabled;
         self
     }
 
@@ -4808,7 +4892,27 @@ impl Searcher {
                 .map(|(passing, _)| passing as u64)
                 .sum()
         });
-        let namespace_exact = exact_enabled && filtered_candidates.unwrap_or(0) <= threshold as u64;
+        let cost_model = self.knn_exact_cost_model;
+        let namespace_exact =
+            exact_enabled && !cost_model && filtered_candidates.unwrap_or(0) <= threshold as u64;
+        // The cost model splits the budget over the probeable columns by
+        // posting count, as the global cutoff spends it on average.
+        let costs: HashMap<&kosha_core::SegmentId, kosha_segment::KnnColumnCost> =
+            if exact_enabled && cost_model {
+                per_segment
+                    .iter()
+                    .filter(|info| info.probeable)
+                    .filter_map(|info| {
+                        let reader = info.reader.as_ref()?;
+                        let cost = reader.knn_column_cost(&knn.field, knn.vector.len())?;
+                        Some((info.segment_id, cost))
+                    })
+                    .collect()
+            } else {
+                HashMap::new()
+            };
+        let cost_postings: usize = costs.values().map(|c| c.postings).sum();
+        let cost_budget = effective_knn_budget(requested, cost_postings);
         let mut exact_segments = HashSet::new();
         let (mut exact_count, mut ann_count) = (0usize, 0usize);
         for info in per_segment.iter().filter(|info| info.probeable) {
@@ -4819,8 +4923,26 @@ impl Searcher {
             let exact = exact_enabled
                 && (passing == 0
                     || namespace_exact
-                    || (passing <= threshold
-                        && passing as f64 <= self.knn_exact_fraction * doc_count as f64));
+                    || match (cost_model, costs.get(info.segment_id)) {
+                        (true, Some(cost)) => knn_exact_is_cheaper(
+                            cost,
+                            passing,
+                            // Without global budgeting each segment probes
+                            // up to `num_candidates` on its own.
+                            if budgeted {
+                                (cost_budget * cost.postings).div_ceil(cost_postings.max(1))
+                            } else {
+                                requested
+                            },
+                            knn.k,
+                            kosha_segment::vector_rescore_factor(),
+                            knn_cost_posting_overhead_bytes(),
+                        ),
+                        _ => {
+                            passing <= threshold
+                                && passing as f64 <= self.knn_exact_fraction * doc_count as f64
+                        }
+                    });
             if exact {
                 exact_segments.insert(info.segment_id.clone());
             }
@@ -27290,6 +27412,78 @@ mod filtered_knn_tests {
             }
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #465: the cost model in place of the fixed threshold and fraction
+    /// keeps #252's bar — recall@10 >= 0.95 and `min(k, |filtered|)`
+    /// results at every selectivity — scanning the most selective exactly.
+    /// (These 5k-document segments are small enough that a probe of the
+    /// default budget reads most of each one, so exact wins throughout.)
+    #[test]
+    fn filtered_knn_cost_model_recall_at_every_selectivity() {
+        let dir = temp_dir("cost-model");
+        let corpus = corpus(&dir, 4, 5_000, VectorStoreMode::Sidecar);
+        let mut rng = Lcg(0xbeef);
+        let queries: Vec<Vec<f32>> = (0..10).map(|_| rng.vector()).collect();
+        let k = 10;
+        let searcher = Searcher::new(dir.clone())
+            .with_knn_exact_policy(DEFAULT_KNN_EXACT_THRESHOLD, DEFAULT_KNN_EXACT_FRACTION)
+            .with_knn_exact_cost_model(true);
+        let mut modes = Vec::new();
+        for (field, period) in SELECTIVITIES {
+            let passing = corpus.docs.len().div_ceil(period);
+            let mut total_recall = 0.0;
+            let mut mode = None;
+            for query in &queries {
+                let q = knn_query(query.clone(), k, Some(term(field)));
+                let r = searcher
+                    .search(&corpus.ns, &corpus.manifest, &q, None)
+                    .unwrap();
+                let truth = brute_force(&corpus, query, k, |i| i.is_multiple_of(period));
+                assert_eq!(r.results.len(), k.min(passing), "{field}");
+                assert_eq!(r.knn_filtered_candidates, Some(passing as u64));
+                mode = r.knn_mode.clone();
+                total_recall += recall(&ids(&r), &truth);
+            }
+            let mean = total_recall / queries.len() as f64;
+            eprintln!("filtered kNN cost-model {field}: mode {mode:?} recall@10 {mean:.3}");
+            assert!(mean >= 0.95, "cost-model {field}: recall@10 {mean:.3}");
+            modes.push(mode.unwrap());
+        }
+        assert_eq!(modes.last().map(String::as_str), Some("exact"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn knn_exact_cost_model_compares_bytes_read() {
+        // 100 postings of 100 f32 entries (dim 128: 516 bytes each).
+        let f32_col = kosha_segment::KnnColumnCost {
+            postings: 100,
+            entries: 10_000,
+            entry_bytes: 516,
+            quantized: false,
+            exact_vector_bytes: Some(512),
+        };
+        let cheaper = |cost, passing| knn_exact_is_cheaper(cost, passing, 10, 10, 4, 4096.0);
+        assert!(cheaper(&f32_col, 0), "nothing passes: exact (empty)");
+        assert!(cheaper(&f32_col, 50), "0.5%: a probe needs every posting");
+        assert!(!cheaper(&f32_col, 5_000), "50%: ten postings suffice");
+        // A probe never reads more than the column, so above the column's
+        // bytes per passing vector exact loses even at low selectivity.
+        let no_sidecar = kosha_segment::KnnColumnCost {
+            exact_vector_bytes: None,
+            ..f32_col
+        };
+        assert!(!cheaper(&no_sidecar, 5_000));
+        assert!(cheaper(&no_sidecar, 10), "0.1%: both read every posting");
+        // i8 entries make probing cheaper per posting, so exact wins later.
+        let i8_col = kosha_segment::KnnColumnCost {
+            entry_bytes: 136,
+            quantized: true,
+            ..f32_col
+        };
+        let crossover = |cost| (1..=10_000).find(|&p| !cheaper(cost, p)).unwrap();
+        assert!(crossover(&i8_col) < crossover(&f32_col));
     }
 
     #[test]
