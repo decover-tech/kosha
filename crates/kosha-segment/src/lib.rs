@@ -6064,7 +6064,7 @@ impl BlockedTermPostings {
             positions_buf = &[];
         }
         let mut deltas = [0u32; bitpack::BP_BLOCK];
-        let mut position_count = 0usize;
+        let mut position_capacity = 0usize;
         for block in 0..self.blocks.len() {
             if !self.read_block(block, &mut block_buf) {
                 return None;
@@ -6091,7 +6091,7 @@ impl BlockedTermPostings {
                             positions.push(prev_pos);
                         }
                     }
-                    position_count += positions.len();
+                    position_capacity += positions.capacity();
                     postings.push(Posting {
                         doc_id: sp.doc_id,
                         term_frequency: sp.term_frequency,
@@ -6116,7 +6116,7 @@ impl BlockedTermPostings {
                     prev_pos = pos;
                     positions.push(pos);
                 }
-                position_count += npos;
+                position_capacity += positions.capacity();
                 postings.push(Posting {
                     doc_id: sp.doc_id,
                     term_frequency: sp.term_frequency,
@@ -6127,7 +6127,8 @@ impl BlockedTermPostings {
         if v7 && !positions_buf.is_empty() {
             return None;
         }
-        let approx_bytes = postings.len() * std::mem::size_of::<Posting>() + position_count * 4;
+        let approx_bytes = postings.len() * std::mem::size_of::<Posting>()
+            + position_capacity * std::mem::size_of::<u32>();
         Some((postings, approx_bytes))
     }
 
@@ -14749,6 +14750,29 @@ mod bounded_build_tests {
                 assert_eq!(Some(postings), expected);
             }
             fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn v7_review_cache_charge_counts_allocated_positions() {
+        let dir = scratch("positions-cache-charge");
+        for version in [
+            SKIP_SPLIT_INVERTED_VERSION,
+            BITPACKED_SKIP_SPLIT_INVERTED_VERSION,
+            PACKED_POSITIONS_INVERTED_VERSION,
+        ] {
+            let mut encoder = TermEncoder::new(version, &dir, 4096);
+            encoder.push(0, 3, &[1, 2, 3], &[]).unwrap();
+            let mut bytes = Vec::new();
+            encoder.finish(&mut bytes).unwrap();
+            let parsed = BlockedTermPostings::parse(Arc::new(bytes), version).unwrap();
+            let (postings, charged) = parsed.decode_full().unwrap();
+            assert_eq!(
+                charged,
+                std::mem::size_of::<Posting>()
+                    + postings[0].positions.capacity() * std::mem::size_of::<u32>(),
+                "v{version}",
+            );
         }
     }
 
