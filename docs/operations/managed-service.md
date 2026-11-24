@@ -48,17 +48,18 @@ scrape health. Disable tenant labels if the cohort cannot be kept within the ser
 
 Create Grafana panels with the following PromQL, or use the same queries in Prometheus with literal
 values. Use single-select `cluster` and `tenant` variables from operator-maintained lists, with no
-“All” option. These filters are for navigation, not access control. There are no tenant-labelled
-latency or hydration counters; compare the tenant's cache pressure against the cluster hydration
-signal rather than attributing the latter to a tenant.
+“All” option. Use exact-match selectors and the Prometheus datasource's default interpolation so
+dots in label values are literal. These filters are for navigation, not access control. There are
+no tenant-labelled latency or hydration counters; compare the tenant's cache pressure against
+the cluster hydration signal rather than attributing the latter to a tenant.
 
 | Panel | PromQL |
 | --- | --- |
-| Cache footprint (bytes) | `sum by (cache) (kosha_cache_bytes{cluster=~"${cluster:regex}",tenant=~"${tenant:regex}",tenant!=""})` |
-| NVMe hit and miss rates (two queries) | `sum(rate(kosha_cache_hits_total{cluster=~"${cluster:regex}",tenant=~"${tenant:regex}",tenant!="",cache="nvme"}[5m]))` and `sum(rate(kosha_cache_misses_total{cluster=~"${cluster:regex}",tenant=~"${tenant:regex}",tenant!="",cache="nvme"}[5m]))` |
-| Evictions per second | `sum by (cache) (rate(kosha_cache_evictions_total{cluster=~"${cluster:regex}",tenant=~"${tenant:regex}",tenant!=""}[5m]))` |
-| Limit refusals per second | `sum by (reason) (rate(kosha_tenant_rejections_total{cluster=~"${cluster:regex}",tenant=~"${tenant:regex}",tenant!=""}[5m]))` |
-| Deployment hydration p95 (seconds) | `histogram_quantile(0.95, sum by (le) (rate(kosha_search_phase_seconds_bucket{cluster=~"${cluster:regex}",phase="hydrate"}[5m])))` |
+| Cache footprint (bytes) | `sum by (cache) (kosha_cache_bytes{cluster="${cluster}",tenant="${tenant}",tenant!=""})` |
+| NVMe hit and miss rates (two queries) | `sum(rate(kosha_cache_hits_total{cluster="${cluster}",tenant="${tenant}",tenant!="",cache="nvme"}[5m]))` and `sum(rate(kosha_cache_misses_total{cluster="${cluster}",tenant="${tenant}",tenant!="",cache="nvme"}[5m]))` |
+| Evictions per second | `sum by (cache) (rate(kosha_cache_evictions_total{cluster="${cluster}",tenant="${tenant}",tenant!=""}[5m]))` |
+| Limit refusals per second | `sum by (reason) (rate(kosha_tenant_rejections_total{cluster="${cluster}",tenant="${tenant}",tenant!=""}[5m]))` |
+| Deployment hydration p95 (seconds) | `histogram_quantile(0.95, sum by (le) (rate(kosha_search_phase_seconds_bucket{cluster="${cluster}",phase="hydrate"}[5m])))` |
 
 The rules are warning-level starting thresholds, not pages or statements of user impact. Group
 notifications by deployment and alert name and use a private destination for any tenant alert.
