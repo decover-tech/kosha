@@ -4138,7 +4138,6 @@ impl Searcher {
             || query.collapse.is_some()
             || query.rank_by.is_some()
             || !query.sort.is_empty()
-            || query.search_after.is_some()
             || query.exact_total_hits == Some(true)
         {
             return HashSet::new();
@@ -12077,6 +12076,30 @@ mod tests {
             .unwrap();
         assert_eq!(stats.knn_segments_pruned, 1);
         assert_eq!(result.results.len(), 10);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn knn_segment_pruning_uses_the_same_segments_after_a_cursor() {
+        let (dir, ns, manifest, mut query) = knn_segment_pruning_corpus("cursor");
+        let searcher = Searcher::new(dir.clone()).with_knn_segment_nprobe(1);
+        let knn = query.knn.as_mut().unwrap();
+        knn.vector[0] = -1.0;
+        knn.k = 30;
+        query.max_results = 24;
+        let (first, first_stats) = searcher
+            .search_with_stats(&ns, &manifest, &query, None)
+            .unwrap();
+        assert_eq!(first_stats.knn_segments_pruned, 1);
+        assert_eq!(first.results.len(), 24);
+        assert_eq!(first.results.last().unwrap().doc_id.0, "far-23");
+
+        query.search_after = Some(vec!["far-23".into()]);
+        let (second, second_stats) = searcher
+            .search_with_stats(&ns, &manifest, &query, None)
+            .unwrap();
+        assert_eq!(second_stats.knn_segments_pruned, 1);
+        assert!(second.results.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
