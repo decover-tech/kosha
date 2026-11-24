@@ -4161,6 +4161,12 @@ impl KnnProbeRadius {
     }
 }
 
+/// Whether `KOSHA_KNN_PROBE_RADIUS` ranks postings by a radius quantile
+/// (`p50`/`p90`) rather than the maximum radius every planner stores.
+pub fn knn_probe_radius_uses_quantiles() -> bool {
+    KnnProbeRadius::from_env() != KnnProbeRadius::Max
+}
+
 /// `KOSHA_KNN_PROBE_RADIUS_ALPHA` (#384, experimental; default 1.0, the
 /// pre-#384 ranking): the radius weight in [`centroid_probe_score`].
 /// Accepts a finite value `>= 0`; anything else keeps the default with a

@@ -5425,7 +5425,10 @@ impl Searcher {
         // Restricted searches may refill outside the posting budget and
         // legacy columns have no stable posting ids. Keep their existing
         // planner rather than silently dropping any of their candidates.
+        // The directory ranks by maximum radius, so a quantile probe radius
+        // (#458) keeps the per-segment planner too.
         if self.knn_namespace_centroids
+            && !kosha_segment::knn_probe_radius_uses_quantiles()
             && !restricted
             && !prunable
             && knn.vector.iter().all(|x| x.is_finite())
