@@ -184,13 +184,13 @@ fn plaintext_rows_from_before_the_migration_keep_working_and_can_be_scrubbed() {
 
 #[test]
 #[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
-fn rotation_does_not_round_a_fractional_deadline_up() {
+fn rotation_with_overlap_preserves_an_earlier_fractional_deadline() {
     let store = PgStore::new(&url()).unwrap();
     let old = store
         .create_api_key(&full_access(&tenant("rotate")))
         .unwrap();
     let expires = now() + 3600;
-    // Older rotations could leave a fractional expiry. It caps this rotation's overlap.
+    // A fractional expiry from a previous rotation caps the requested overlap.
     sql::<(i32,)>(
         "UPDATE kosha.api_keys \
          SET expires_at = to_timestamp($2::TEXT::DOUBLE PRECISION) + INTERVAL '750 milliseconds' \
@@ -198,13 +198,16 @@ fn rotation_does_not_round_a_fractional_deadline_up() {
         &[&old.record.key_hash, &expires.to_string()],
     );
 
-    let rotated = store
+    store
         .rotate_api_key(&old.record.key_hash, 7200, None)
         .unwrap()
-        .unwrap();
-    assert_eq!(rotated.old_expires_at, expires);
-    let listed = store.get_api_key(&old.record.key_hash).unwrap().unwrap();
-    assert_eq!(listed.expires_at, Some(expires));
+        .expect("active key rotates");
+    let deadline = sql::<(i64,)>(
+        "SELECT (EXTRACT(EPOCH FROM expires_at) * 1000)::BIGINT \
+         FROM kosha.api_keys WHERE key_hash = $1",
+        &[&old.record.key_hash],
+    );
+    assert_eq!(deadline, [(expires * 1000 + 750,)]);
 }
 
 #[test]
@@ -259,6 +262,15 @@ fn rotation_overlaps_then_the_old_key_expires() {
         .unwrap()
         .unwrap();
     assert_eq!(cut.new.record.expires_at, Some(started + 7200));
+    let deadline_matches_response = sql::<(bool,)>(
+        "SELECT expires_at = to_timestamp($2::TEXT::DOUBLE PRECISION) \
+         FROM kosha.api_keys WHERE key_hash = $1",
+        &[
+            &rotated.new.record.key_hash,
+            &cut.old_expires_at.to_string(),
+        ],
+    );
+    assert_eq!(deadline_matches_response, [(true,)]);
     assert_eq!(store.validate_api_key(&rotated.new.api_key), None);
     assert_eq!(store.validate_api_key(&cut.new.api_key), Some(t.clone()));
     assert!(store
