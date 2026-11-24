@@ -289,6 +289,8 @@ def run(spec: Dict, server: Server, seed: int, docs: int) -> Report:
         {"documents": [{"id": first["id"], "fields": first["fields"][:1]}]},
     )
     x("Exists", "POST", nst + "/exists", base + "/exists", {"ids": [first["id"], "no-such-doc"]})
+    x("ExportDocuments", "POST", nst + "/export", base + "/export", {"limit": 2, "consistency": "eventual"})
+    x("ExportDocuments[last]", "POST", nst + "/export", base + "/export", {"cursor": first["id"], "limit": docs + 1})
     x("ListNamespaces", "GET", "/v1/namespaces", "/v1/namespaces")
     x("GetStats", "GET", nst + "/stats", base + "/stats")
     x("GetNamespaceSchema", "GET", nst + "/schema", base + "/schema")

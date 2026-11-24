@@ -16,7 +16,7 @@ option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_swagger) = {
     // The contract revision (ADR-350 §a): 1.MINOR.PATCH now that v1 is GA
     // (0.9.x and 0.10.x were pre-GA). Independent of the crate version; kept
     // equal to `api_error::API_VERSION` by a test.
-    version: "1.0.0"
+    version: "1.1.0"
     description:
       "The public Kosha HTTP/JSON API. The OpenAPI document is the wire contract; "
       "proto3 canonical JSON is not (see docs/api/versioning.md). Every request carries "
@@ -827,6 +827,96 @@ service KoshaService {
   rpc Exists(ExistsRequest) returns (ExistsResponse) {
     option (google.api.http) = {
       post: "/v1/namespaces/{namespace}/exists"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "429"
+        value: {
+          description: "overloaded and tenant rate limits; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "503"
+        value: {
+          description: "unavailable; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "namespace_not_found"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
+      extensions: {
+        key: "x-stability-level"
+        value: {string_value: "stable"}
+      }
+    };
+  }
+
+  // Every live document of the namespace, a page at a time, sorted by id,
+  // in the shape IndexDocuments accepts (#347). Pass a page's next_cursor
+  // back as cursor until next_cursor is null.
+  rpc ExportDocuments(ExportDocumentsRequest) returns (ExportDocumentsResponse) {
+    option (google.api.http) = {
+      post: "/v1/namespaces/{namespace}/export"
       body: "*"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
@@ -2235,6 +2325,30 @@ message ExistsResponse {
   string namespace = 1;
   repeated string existing = 2;
   repeated string missing = 3;
+}
+
+// ─── Export ─────────────────────────────────────────────────────────────────
+
+message ExportDocumentsRequest {
+  string namespace = 1;
+  // Documents per page: default 1000, at most 10000.
+  optional uint32 limit = 2;
+  // The previous page's next_cursor; absent or empty for the first page.
+  optional string cursor = 3;
+  // "strong" (default) includes acknowledged writes not yet flushed.
+  optional string consistency = 4 [(grpc.gateway.protoc_gen_openapiv2.options.openapiv2_field) = {
+    enum: [
+      "strong",
+      "eventual"
+    ]
+  }];
+}
+
+message ExportDocumentsResponse {
+  string namespace = 1;
+  repeated Document documents = 2;
+  // The cursor for the next page; null once this page was the last.
+  optional string next_cursor = 3;
 }
 
 // ─── Flush ──────────────────────────────────────────────────────────────────

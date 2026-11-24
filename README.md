@@ -505,7 +505,7 @@ The public routes in brief:
 |---|---|
 | `POST`/`GET /v1/namespaces`, `DELETE /v1/namespaces/{ns}` | Create (*write*), list, delete (*write*; see below). |
 | `POST /v1/namespaces/{ns}/documents`, `/replace`, `/flush`, `/delete` | *write*. Upsert by id; replace by id merging partial documents; make buffered writes searchable; delete by query. |
-| `POST /v1/namespaces/{ns}/search`, `/exists`, `GET .../stats` | Reads. |
+| `POST /v1/namespaces/{ns}/search`, `/exists`, `/export`, `GET .../stats` | Reads. `/export` pages through every document (see below). |
 | `POST`/`GET /v1/namespaces/{ns}/schema`, `POST .../shards` | Schema (see [Analyzers](#analyzers)); sharding ([Namespace sharding](#namespace-sharding)). |
 | `POST .../branch`, `GET .../branches`, `DELETE .../branch` | Copy-on-write branches (#208). |
 | `GET /v1/usage`, `GET /v1/billing` | Usage metering and billing, when enabled. |
@@ -516,6 +516,24 @@ Operational endpoints, unversioned and outside the spec (see
 and `GET /readyz` (unauthenticated probes, also served as `/v1/healthz` and
 `/v1/readyz`), `GET /metrics` ([docs/metrics.md](docs/metrics.md)) and
 `GET /dashboard` ([docs/dashboard.md](docs/dashboard.md)).
+
+**Exporting a namespace** (`POST /v1/namespaces/{ns}/export`, *read*, #347)
+returns every live document a page at a time, sorted by id, in the shape
+`POST .../documents` accepts, so a page can be re-indexed as is. The body takes
+`limit` (default 1000, at most 10000), `cursor` (the previous page's
+`next_cursor`; omit it for the first page) and `consistency` (as for search;
+`strong` includes acknowledged writes not yet flushed). The response is
+`{"namespace", "documents": [{"id", "fields"}], "next_cursor"}`; `next_cursor`
+is `null` once the page was the last. Each page is a `match_all` search sorted
+by `_id` with `search_after`, so it counts as a search for metrics, tenant
+limits and billing. Pages are not a snapshot: a document written or deleted
+during an export is included or not depending on where its id falls relative
+to the cursor. Every stored field is returned, vectors included.
+
+```bash
+curl -s localhost:8080/v1/namespaces/docs/export -d '{"limit": 1000}'
+curl -s localhost:8080/v1/namespaces/docs/export -d '{"limit": 1000, "cursor": "<next_cursor>"}'
+```
 
 **Deleting a namespace** (`DELETE /v1/namespaces/{ns}`) runs on the ingest pod
 under the namespace's publication lock:

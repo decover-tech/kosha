@@ -130,6 +130,12 @@ pub(crate) static ROUTES: &[Route] = &[
     ),
     public(
         "POST",
+        "/v1/namespaces/{namespace}/export",
+        "KoshaService_ExportDocuments",
+        Search,
+    ),
+    public(
+        "POST",
         "/v1/namespaces/{namespace}/flush",
         "KoshaService_Flush",
         Write,
@@ -572,6 +578,7 @@ mod tests {
         ("POST /v1/namespaces/docs/documents HTTP/1.1", true, false),
         ("POST /v1/namespaces/docs/search HTTP/1.1", false, true),
         ("POST /v1/namespaces/docs/exists HTTP/1.1", false, false),
+        ("POST /v1/namespaces/docs/export HTTP/1.1", false, true),
         ("POST /v1/namespaces/docs/flush HTTP/1.1", true, false),
         ("POST /v1/namespaces/docs/delete HTTP/1.1", true, false),
         ("GET /v1/namespaces/docs/stats HTTP/1.1", false, false),

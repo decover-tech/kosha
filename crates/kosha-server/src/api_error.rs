@@ -28,7 +28,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// The contract revision (`info.version` of the checked-in OpenAPI
 /// documents), sent as `Kosha-Api-Version` on every response. A test keeps
 /// it equal to the spec.
-pub(crate) const API_VERSION: &str = "1.0.0";
+pub(crate) const API_VERSION: &str = "1.1.0";
 
 /// The delay a retryable error advertises when its call site knows no
 /// better one.

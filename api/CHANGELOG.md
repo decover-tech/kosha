@@ -7,6 +7,16 @@ independent of the server's crate version; see `docs/api/versioning.md`.
 
 Sections: Added, Changed, Deprecated, Removed.
 
+## [1.1.0]
+
+### Added
+
+- `POST /v1/namespaces/{namespace}/export` (`ExportDocuments`, #347): every
+  live document of a namespace, a page at a time, sorted by id, in the shape
+  `IndexDocuments` accepts. Request `limit` (default 1000, at most 10000),
+  `cursor` (the previous page's `next_cursor`) and `consistency`; response
+  `documents` and `next_cursor` (`null` after the last page). Read scope.
+
 ## [1.0.0]
 
 v1 is GA (#350, ADR-350 §a, §d). From this revision on, a breaking change

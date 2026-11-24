@@ -758,6 +758,7 @@ fn requests_are_classified_for_the_gate() {
         ("GET /v1/billing", Operation::Account),
         ("GET /v1/usage?from=1", Operation::Account),
         ("POST /v1/namespaces/a/search", Operation::Query),
+        ("POST /v1/namespaces/a/export", Operation::Query),
         ("GET /search?ns=a&q=b", Operation::Query),
         ("POST /search", Operation::Query),
         ("POST /v1/namespaces/a/documents", Operation::Write),

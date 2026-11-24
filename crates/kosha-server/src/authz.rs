@@ -88,7 +88,7 @@ pub fn requirement(method: &str, path: &str) -> Requirement {
         };
         let ns = crate::path_decode(ns);
         let scope = match (method, action) {
-            ("POST", "search" | "exists") => Read,
+            ("POST", "search" | "exists" | "export") => Read,
             ("GET", "schema" | "branches" | "stats") => Read,
             ("POST", "documents" | "replace" | "flush" | "delete") => Write,
             ("POST", "schema" | "shards") => Admin,
@@ -212,6 +212,7 @@ mod tests {
     const ROUTES: &[(&str, &str, Scope)] = &[
         ("POST", "/v1/namespaces/docs/search", Scope::Read),
         ("POST", "/v1/namespaces/docs/exists", Scope::Read),
+        ("POST", "/v1/namespaces/docs/export", Scope::Read),
         ("GET", "/v1/namespaces/docs/schema", Scope::Read),
         ("GET", "/v1/namespaces/docs/branches", Scope::Read),
         ("GET", "/v1/namespaces/docs/stats", Scope::Read),

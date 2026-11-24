@@ -15,7 +15,7 @@ option java_package = "com.decover.kosha.v1";
 option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_swagger) = {
   info: {
     title: "Kosha Admin API"
-    version: "1.0.0"
+    version: "1.1.0"
     description:
       "The operator API. Every route needs the admin credential (KOSHA_ADMIN_API_KEY) as `Authorization: Bearer <key>` or `X-Api-Key: <key>`. Beta: bodies are free-form JSON objects."
   }

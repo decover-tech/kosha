@@ -50,6 +50,7 @@ mod doc_store_fallback_tests;
 mod embedding;
 #[cfg(test)]
 mod embedding_server_tests;
+mod export;
 mod fair_admission;
 mod http;
 #[cfg(feature = "s3")]
@@ -8096,6 +8097,10 @@ fn route_inner(
 
     if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/exists") {
         return handle_exists_with_ns(&ns, tenant, body, state);
+    }
+
+    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/export") {
+        return export::handle_export_with_ns(&ns, tenant, body, state);
     }
 
     if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/schema") {
