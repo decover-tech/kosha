@@ -3058,7 +3058,9 @@ message DeletionRecord {
   string scope = 2 [(grpc.gateway.protoc_gen_openapiv2.options.openapiv2_field) = {
     enum: [
       "namespace",
-      "tenant"
+      "tenant",
+      "branch",
+      "migrated"
     ]
   }];
   // Internal namespace id ("<tenant>/<name>") or tenant id, per `scope`.
@@ -3095,6 +3097,16 @@ message DeletionRecord {
     type: INTEGER
     format: "int64"
   }];
+  // Purge pods must acknowledge their cache purge before the record
+  // completes (#347, KOSHA_DELETION_REQUIRE_ACKS).
+  bool acks_required = 13;
+  // Storage reclaim finished and the prefix listed empty.
+  bool storage_verified = 14;
+  // Exports (#347) of the subject deleted with it.
+  uint64 exports_deleted = 15 [(grpc.gateway.protoc_gen_openapiv2.options.openapiv2_field) = {
+    type: INTEGER
+    format: "int64"
+  }];
 }
 
 message PutNamespaceSchemaRequest {
@@ -3109,6 +3121,20 @@ message PutNamespaceSchemaResponse {
   NamespaceSchema schema = 2;
   // False when the stored schema was already identical.
   bool changed = 3;
+  // The online changes applied, per field (#347).
+  repeated SchemaChange changes = 4;
+}
+
+// One online schema change (#347).
+message SchemaChange {
+  // The field, or "*" for the namespace-wide defaults.
+  string field = 1;
+  // "field_added", "field_removed", "declarative_changed",
+  // "analyzer_changed", "embedding_declared", "embedding_removed" or
+  // "settings_changed".
+  string change = 2;
+  // What happens to existing documents.
+  string effect = 3;
 }
 
 message GetNamespaceSchemaRequest {
@@ -3233,6 +3259,8 @@ message DeleteBranchResponse {
     format: "int64"
   }];
   BranchReclaim reclaimed = 4;
+  // The durable record of this deletion (#347).
+  DeletionRecord deletion = 5;
 }
 
 // ─── Document model ─────────────────────────────────────────────────────────

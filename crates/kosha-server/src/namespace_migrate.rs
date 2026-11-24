@@ -599,7 +599,7 @@ mod s3_objects {
             // back to the bucket default rather than keeping the source's
             // encryption. Resolve from the destination path, so a namespace
             // moved into `<tenant>/...` lands under that tenant's KMS key.
-            let sse = self.s3.sse().for_path(to);
+            let sse = self.s3.sse_for_path(to).map_err(|e| e.to_string())?;
             self.rt.block_on(async move {
                 if size > SINGLE_COPY_MAX {
                     return Self::multipart_copy(
@@ -1984,7 +1984,8 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         let mut stdout = std::io::stdout();
         #[cfg(feature = "s3")]
         if let Some(config) = crate::s3_storage::S3Config::from_env() {
-            let s3 = connect_s3(config)?;
+            let mut s3 = connect_s3(config)?;
+            s3.set_tenant_kms_key_store(ctrl.clone());
             let objects = s3_objects::S3Objects::new(&s3)?;
             // `--verify` only reads the control plane and the segments.
             let wal = if args.verify {

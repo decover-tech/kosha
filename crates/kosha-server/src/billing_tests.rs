@@ -25,7 +25,7 @@ const CATALOG: &str = r#"{
   "plans": {
     "free": {"kind": "free",
              "meters": {"queries": {"included": 3}},
-             "limits": {"namespaces": 1, "qps": 1000}},
+             "limits": {"namespaces": 1, "qps": 1000, "bytes_per_namespace": 1048576}},
     "payg": {"kind": "usage", "base_fee_cents": 2500,
              "meters": {
                "queries": {"included": 1000000, "unit": 1000000, "unit_price_cents": 400},
@@ -677,7 +677,7 @@ fn a_tenant_without_a_plan_is_left_alone() {
 fn limits_file_overrides_plan_quotas_field_by_field() {
     let f = fixture(CATALOG, false, oct().start_ms());
     let file = tenant_limits::LimitsConfig::parse(
-        r#"{"tenants": {"acme": {"qps": 50, "vector_dims": 8}}}"#,
+        r#"{"tenants": {"acme": {"qps": 50, "vector_dims": 8, "bytes_per_namespace": 2097152}}}"#,
         None,
     )
     .unwrap();
@@ -707,6 +707,8 @@ fn limits_file_overrides_plan_quotas_field_by_field() {
         (Some(50.0), Some(1), Some(8))
     );
     let other = limiter.limits("globex").unwrap();
+    assert_eq!(acme.bytes_per_namespace, Some(2097152));
+    assert_eq!(other.bytes_per_namespace, Some(1048576));
     assert_eq!(
         (other.qps, other.namespaces, other.vector_dims),
         (Some(1000.0), Some(1), None)

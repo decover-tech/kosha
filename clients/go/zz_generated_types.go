@@ -35,6 +35,8 @@ const (
 
 // Defines values for V1DeletionRecordScope.
 const (
+	V1DeletionRecordScopeBranch    V1DeletionRecordScope = "branch"
+	V1DeletionRecordScopeMigrated  V1DeletionRecordScope = "migrated"
 	V1DeletionRecordScopeNamespace V1DeletionRecordScope = "namespace"
 	V1DeletionRecordScopeTenant    V1DeletionRecordScope = "tenant"
 )
@@ -343,10 +345,14 @@ type V1CreateTenantApiKeyResponse struct {
 
 // V1DeleteBranchResponse defines model for v1DeleteBranchResponse.
 type V1DeleteBranchResponse struct {
-	Deleted   *string          `json:"deleted,omitempty"`
-	Parent    *string          `json:"parent,omitempty"`
-	Reclaimed *V1BranchReclaim `json:"reclaimed,omitempty"`
-	Version   *int64           `json:"version,omitempty"`
+	Deleted *string `json:"deleted,omitempty"`
+
+	// Deletion One hard delete of a namespace or a tenant, as the control store keeps it
+	// (kosha.deletion_records). Holds identifiers and counters only.
+	Deletion  *V1DeletionRecord `json:"deletion,omitempty"`
+	Parent    *string           `json:"parent,omitempty"`
+	Reclaimed *V1BranchReclaim  `json:"reclaimed,omitempty"`
+	Version   *int64            `json:"version,omitempty"`
 }
 
 // V1DeleteByQueryResponse defines model for v1DeleteByQueryResponse.
@@ -379,10 +385,17 @@ type V1DeleteNamespaceResponse struct {
 // V1DeletionRecord One hard delete of a namespace or a tenant, as the control store keeps it
 // (kosha.deletion_records). Holds identifiers and counters only.
 type V1DeletionRecord struct {
+	// AcksRequired Purge pods must acknowledge their cache purge before the record
+	// completes (#347, KOSHA_DELETION_REQUIRE_ACKS).
+	AcksRequired *bool `json:"acks_required,omitempty"`
+
 	// Attempts Storage-reclaim attempts so far.
-	Attempts      *int64  `json:"attempts,omitempty"`
-	CompletedAtMs *int64  `json:"completed_at_ms,omitempty"`
-	Id            *string `json:"id,omitempty"`
+	Attempts      *int64 `json:"attempts,omitempty"`
+	CompletedAtMs *int64 `json:"completed_at_ms,omitempty"`
+
+	// ExportsDeleted Exports (#347) of the subject deleted with it.
+	ExportsDeleted *int64  `json:"exports_deleted,omitempty"`
+	Id             *string `json:"id,omitempty"`
 
 	// LastError Why the last attempt did not complete.
 	LastError *string `json:"last_error,omitempty"`
@@ -402,6 +415,9 @@ type V1DeletionRecord struct {
 
 	// State "pending" (rows gone, stored objects may remain) or "completed".
 	State *V1DeletionRecordState `json:"state,omitempty"`
+
+	// StorageVerified Storage reclaim finished and the prefix listed empty.
+	StorageVerified *bool `json:"storage_verified,omitempty"`
 
 	// Subject Internal namespace id ("<tenant>/<name>") or tenant id, per `scope`.
 	Subject  *string `json:"subject,omitempty"`
@@ -754,7 +770,10 @@ type V1NamespaceSchema struct {
 // V1PutNamespaceSchemaResponse defines model for v1PutNamespaceSchemaResponse.
 type V1PutNamespaceSchemaResponse struct {
 	// Changed False when the stored schema was already identical.
-	Changed   *bool              `json:"changed,omitempty"`
+	Changed *bool `json:"changed,omitempty"`
+
+	// Changes The online changes applied, per field (#347).
+	Changes   *[]V1SchemaChange  `json:"changes,omitempty"`
 	Namespace *string            `json:"namespace,omitempty"`
 	Schema    *V1NamespaceSchema `json:"schema,omitempty"`
 }
@@ -831,6 +850,20 @@ type V1RrfRank struct {
 	// RankWindowSize Per-retriever list length and fused list length. Default: max_results;
 	// must be >= max_results.
 	RankWindowSize *int64 `json:"rank_window_size,omitempty"`
+}
+
+// V1SchemaChange One online schema change (#347).
+type V1SchemaChange struct {
+	// Change "field_added", "field_removed", "declarative_changed",
+	// "analyzer_changed", "embedding_declared", "embedding_removed" or
+	// "settings_changed".
+	Change *string `json:"change,omitempty"`
+
+	// Effect What happens to existing documents.
+	Effect *string `json:"effect,omitempty"`
+
+	// Field The field, or "*" for the namespace-wide defaults.
+	Field *string `json:"field,omitempty"`
 }
 
 // V1ScoredDocument defines model for v1ScoredDocument.

@@ -668,6 +668,24 @@ pub(crate) fn documents_logical_bytes(documents: &[kosha_core::Document]) -> u64
 /// than a wrong one.
 pub(crate) fn namespace_stored_bytes(state: &AppState, ns: &NamespaceId) -> Option<u64> {
     let manifest = state.indexer.manifest_shared(ns)?;
+    owned_segment_bytes(state, ns, &manifest, false)
+}
+
+pub(crate) fn owned_segment_bytes(
+    state: &AppState,
+    ns: &NamespaceId,
+    manifest: &kosha_core::Manifest,
+    require_size: bool,
+) -> Option<u64> {
+    let owned = || {
+        manifest
+            .segments
+            .iter()
+            .filter(|entry| !manifest.is_inherited_segment(ns, &entry.segment_id))
+    };
+    if owned().next().is_none() {
+        return Some(0);
+    }
     #[cfg_attr(not(feature = "s3"), allow(unused_mut))]
     let mut remote: HashMap<String, u64> = HashMap::new();
     #[cfg(feature = "s3")]
@@ -675,35 +693,25 @@ pub(crate) fn namespace_stored_bytes(state: &AppState, ns: &NamespaceId) -> Opti
         match s3.segment_sizes(&ns.0, |_| true) {
             Ok(sizes) => remote = sizes,
             Err(e) => {
-                eprintln!(
-                    "WARN: usage metering: size listing failed for {}: {e}",
-                    ns.0
-                );
+                eprintln!("WARN: segment size listing failed for {}: {e}", ns.0);
                 return None;
             }
         }
     }
-    Some(
-        manifest
-            .segments
-            .iter()
-            .filter(|entry| !manifest.is_inherited_segment(ns, &entry.segment_id))
-            .map(|entry| {
-                remote
-                    .get(&entry.segment_id.0)
-                    .copied()
-                    .filter(|bytes| *bytes > 0)
-                    .or_else(|| {
-                        local_dir_bytes(&manifest.segment_dir(
-                            &state.data_dir,
-                            ns,
-                            &entry.segment_id,
-                        ))
-                    })
-                    .unwrap_or(0)
-            })
-            .sum(),
-    )
+    owned().try_fold(0u64, |total, entry| {
+        let bytes = remote
+            .get(&entry.segment_id.0)
+            .copied()
+            .filter(|bytes| *bytes > 0)
+            .or_else(|| {
+                local_dir_bytes(&manifest.segment_dir(&state.data_dir, ns, &entry.segment_id))
+            });
+        match bytes {
+            Some(bytes) => Some(total.saturating_add(bytes)),
+            None if require_size => None,
+            None => Some(total),
+        }
+    })
 }
 
 /// Vector dimensions stored by the segment `footer` describes: `dim x

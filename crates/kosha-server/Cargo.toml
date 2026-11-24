@@ -12,6 +12,7 @@ workspace = true
 default = []
 s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
 postgres = ["kosha-control/postgres"]
+onnx = ["dep:tract-onnx", "dep:tokenizers"]
 migrate = [
     "s3",
     "postgres",
@@ -54,6 +55,8 @@ reqwest = { version = "0.13.4", default-features = false, features = ["blocking"
 # Gzip for namespace exports (#347, exports.rs): JSON Lines parts are gzip
 # members. The pure-Rust `miniz_oxide` backend only; no C zlib, no OpenSSL.
 flate2 = { version = "=1.1.11", default-features = false, features = ["rust_backend"] }
+tract-onnx = { version = "0.23.10", optional = true }
+tokenizers = { version = "0.22.2", default-features = false, features = ["fancy-regex"], optional = true }
 aws-sigv4 = { version = "1.5.1", optional = true }
 aws-credential-types = { version = "1.3.0", optional = true }
 aws-smithy-runtime-api = { version = "1.14.0", optional = true }
@@ -62,6 +65,9 @@ http = { version = "1.5.0", optional = true }
 # an older build answers with `x-kosha-encoding: base64`; `fetch_from_peer`
 # decodes that so a rolling upgrade with mixed peers keeps working.
 base64 = "0.22"
+# Decodes `DATABASE_URL` query parameters exactly as the Postgres client
+# (sqlx, through `url`) does, for the internal-TLS sslmode check.
+form_urlencoded = "1"
 # Per-file checksums in the segment `_COMMIT` marker (segment_commit.rs).
 crc32fast = "1"
 # `GET /metrics` (#223): Prometheus text exposition. Forbids unsafe code

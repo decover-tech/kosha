@@ -391,3 +391,100 @@ fn corrupt_bag_store_fails_loudly() {
     assert!(matches!(err, KoshaError::CorruptSegment(_)), "{err:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The `.ivf` posting cache: a repeated query is served without reading
+/// any posting from disk, and scores exactly as the uncached first run.
+#[test]
+fn repeated_query_reads_no_ivf_postings_from_disk() {
+    let dir = temp_dir("ivf-cache");
+    let (bags, centers) = fixture(31, 200, 8);
+    write(&dir, &bags);
+    let reader = SegmentReader::open(dir.clone())
+        .unwrap()
+        .with_late_interaction_postings_cache_max_bytes(32 << 20);
+    let query = query_bag(4, &centers, 4);
+    let params = LateInteractionParams {
+        nprobe: 4,
+        num_candidates: 20,
+    };
+    assert_eq!(reader.late_interaction_cache_resident_bytes(), 0);
+    let first = reader
+        .late_interaction_search("tokens", &tokens(&query), 10, params, None)
+        .unwrap();
+    assert!(first.postings_probed > 0);
+    // A cold cache reads each distinct posting once; query tokens that
+    // probe a posting another token already read share it.
+    assert!(first.postings_read > 0 && first.postings_read <= first.postings_probed);
+    assert!(reader.late_interaction_cache_resident_bytes() > 0);
+
+    let second = reader
+        .late_interaction_search("tokens", &tokens(&query), 10, params, None)
+        .unwrap();
+    assert_eq!(second.postings_probed, first.postings_probed);
+    assert_eq!(second.postings_read, 0, "every probe served from the cache");
+    assert_eq!(second.hits, first.hits);
+
+    // Remove the token index: still answered, entirely from the cache.
+    std::fs::remove_file(dir.join(ivf_file(0))).unwrap();
+    let third = reader
+        .late_interaction_search("tokens", &tokens(&query), 10, params, None)
+        .unwrap();
+    assert_eq!(third.postings_read, 0);
+    assert_eq!(third.hits, first.hits);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_zero_budget_disables_the_ivf_posting_cache() {
+    let dir = temp_dir("ivf-nocache");
+    let (bags, centers) = fixture(37, 120, 6);
+    write(&dir, &bags);
+    let reader = SegmentReader::open(dir.clone())
+        .unwrap()
+        .with_late_interaction_postings_cache_max_bytes(0);
+    let query = query_bag(2, &centers, 3);
+    let params = LateInteractionParams {
+        nprobe: 3,
+        num_candidates: 20,
+    };
+    let mut hits = Vec::new();
+    for _ in 0..2 {
+        let got = reader
+            .late_interaction_search("tokens", &tokens(&query), 5, params, None)
+            .unwrap();
+        assert!(got.postings_probed > 0);
+        assert_eq!(got.postings_read, got.postings_probed);
+        hits.push(got.hits);
+    }
+    assert_eq!(hits[0], hits[1]);
+    assert_eq!(reader.late_interaction_cache_resident_bytes(), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A budget smaller than the working set keeps the cache within it (LRU
+/// eviction), and results never depend on what was evicted.
+#[test]
+fn the_ivf_posting_cache_stays_within_its_budget() {
+    let dir = temp_dir("ivf-budget");
+    let (bags, centers) = fixture(41, 400, 10);
+    write(&dir, &bags);
+    let budget = 4096;
+    let reader = SegmentReader::open(dir.clone())
+        .unwrap()
+        .with_late_interaction_postings_cache_max_bytes(budget);
+    let uncached = SegmentReader::open(dir.clone())
+        .unwrap()
+        .with_late_interaction_postings_cache_max_bytes(0);
+    for seed in 1..=6u64 {
+        let query = query_bag(seed, &centers, 4);
+        let got = reader
+            .late_interaction_search("tokens", &tokens(&query), 10, exhaustive(), None)
+            .unwrap();
+        let reference = uncached
+            .late_interaction_search("tokens", &tokens(&query), 10, exhaustive(), None)
+            .unwrap();
+        assert_eq!(got.hits, reference.hits, "seed {seed}");
+        assert!(reader.late_interaction_cache_resident_bytes() <= budget);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

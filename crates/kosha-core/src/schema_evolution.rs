@@ -332,6 +332,7 @@ mod tests {
             model: model.into(),
             dims,
             provider: None,
+            distance_metric: None,
         }
     }
 

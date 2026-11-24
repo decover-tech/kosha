@@ -509,6 +509,26 @@ fn booting_twice_on_one_database_creates_every_table_once() {
         );
     }
     assert!(after_first.1.contains(&"idx_api_keys_key_hash".to_string()));
+    assert!(after_first
+        .0
+        .contains(&("tenants".into(), "kms_key_id".into())));
+    admin_exec(
+        &fresh,
+        "INSERT INTO kosha.organizations (id, slug, name) VALUES ('kms-org', 'kms-org', 'KMS');
+         INSERT INTO kosha.tenants (tenant_id, org_id)
+         VALUES ('kms-tenant', 'kms-org'), ('kms-other', 'kms-org');",
+    );
+    assert_eq!(first.tenant_kms_key_id("kms-tenant").unwrap(), None);
+    assert_eq!(first.tenant_kms_key_id("unknown-tenant").unwrap(), None);
+    admin_exec(
+        &fresh,
+        "UPDATE kosha.tenants SET kms_key_id = 'alias/tenant-key' WHERE tenant_id = 'kms-tenant';",
+    );
+    assert_eq!(
+        first.tenant_kms_key_id("kms-tenant").unwrap().as_deref(),
+        Some("alias/tenant-key")
+    );
+    assert_eq!(first.tenant_kms_key_id("kms-other").unwrap(), None);
 
     // Rows written between the boots survive the second one.
     let tenant = format!("boot-{}", uuid::Uuid::new_v4());

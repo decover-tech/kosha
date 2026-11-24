@@ -351,6 +351,7 @@ struct FlushCoord {
 /// `(field name, is a late-interaction bag)`: see
 /// [`NamespaceHandle::vector_dims`].
 type VectorDimKey = (String, bool);
+type NamespaceCentroidMetadataReader<'a> = dyn Fn(&str) -> Result<Vec<u8>, KoshaError> + 'a;
 
 /// The dimension a `Vector` field value carries, for the write-time check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1243,6 +1244,78 @@ impl Indexer {
         self.upsert_documents(namespace, documents, true)
     }
 
+    /// Estimate the complete documents a partial replacement would write.
+    /// This is a read-only preflight so a namespace-level quota can check
+    /// all shards before the first shard is written.
+    pub fn merged_replacement_bytes(
+        &self,
+        namespace: &NamespaceId,
+        documents: Vec<Document>,
+    ) -> Result<u64, KoshaError> {
+        let handle = self.ns_handle(namespace);
+        let _compact = handle.compact.lock().unwrap();
+        let _mutation = handle.mutation.lock().unwrap();
+        self.ensure_id_index(namespace, &handle)?;
+        let snapshot = handle.state.lock().unwrap().clone();
+        dedupe_documents_last_wins(documents)
+            .into_iter()
+            .try_fold(0u64, |bytes, mut doc| {
+                let latest = Self::live_upsert_locations(&snapshot, &doc.id)
+                    .next_back()
+                    .filter(|_| !snapshot.recovered_deletes.contains(&doc.id));
+                self.merge_replacement(namespace, &snapshot, &mut doc, latest)?;
+                Ok(bytes.saturating_add(approx_document_bytes(&doc)))
+            })
+    }
+
+    fn live_upsert_locations<'a>(
+        snapshot: &'a NamespaceState,
+        id: &DocumentId,
+    ) -> impl DoubleEndedIterator<Item = &'a (SegmentId, u32)> {
+        snapshot
+            .id_index
+            .as_ref()
+            .unwrap()
+            .get(id)
+            .into_iter()
+            .flatten()
+            .filter(|(seg, seq)| {
+                !snapshot
+                    .tombstones
+                    .get(seg)
+                    .is_some_and(|ids| ids.contains(seq))
+            })
+    }
+
+    fn merge_replacement(
+        &self,
+        namespace: &NamespaceId,
+        snapshot: &NamespaceState,
+        doc: &mut Document,
+        latest: Option<&(SegmentId, u32)>,
+    ) -> Result<(), KoshaError> {
+        let buffered = snapshot
+            .buffer
+            .as_ref()
+            .and_then(|b| b.documents.iter().rev().find(|d| d.id == doc.id));
+        let fields = if let Some(buffered) = buffered {
+            buffered.fields.clone()
+        } else if let Some((seg, seq)) = latest {
+            let path = snapshot
+                .manifest
+                .segment_dir(&self.data_dir, namespace, seg);
+            let reader = kosha_segment::SegmentReader::open_with_options(path, false)?;
+            reader
+                .doc_record_full(*seq)?
+                .ok_or_else(|| KoshaError::NotFound("replacement document missing".into()))?
+                .fields
+        } else {
+            return Ok(());
+        };
+        doc.fields = merge_fields(fields, std::mem::take(&mut doc.fields));
+        Ok(())
+    }
+
     /// Mark prior copies deleted and write only the incoming documents. When `merge` is true, patch fields onto the latest existing
     /// copy (`/replace`); when false, the incoming document fully replaces it
     /// (`/index` upsert).
@@ -1282,52 +1355,14 @@ impl Indexer {
         let snapshot = handle.state.lock().unwrap().clone();
         before_io();
         fail::fail_point!("upsert.before_io");
-        let index = snapshot.id_index.as_ref().unwrap();
         let mut locations = Vec::new();
         let mut replacements = Vec::with_capacity(count);
         for mut doc in documents {
-            let live: Vec<_> = index
-                .get(&doc.id)
-                .into_iter()
-                .flatten()
-                .filter(|(seg, seq)| {
-                    !snapshot
-                        .tombstones
-                        .get(seg)
-                        .is_some_and(|ids| ids.contains(seq))
-                })
-                .cloned()
-                .collect();
+            let from = locations.len();
+            locations.extend(Self::live_upsert_locations(&snapshot, &doc.id).cloned());
             if merge {
-                let buffered = snapshot
-                    .buffer
-                    .as_ref()
-                    .and_then(|b| b.documents.iter().rev().find(|d| d.id == doc.id));
-                let fields = if let Some(buffered) = buffered {
-                    Some(buffered.fields.clone())
-                } else if let Some((seg, seq)) = live.last() {
-                    let reader = kosha_segment::SegmentReader::open_with_options(
-                        snapshot
-                            .manifest
-                            .segment_dir(&self.data_dir, &namespace, seg),
-                        false,
-                    )?;
-                    Some(
-                        reader
-                            .doc_record_full(*seq)?
-                            .ok_or_else(|| {
-                                KoshaError::NotFound("replacement document missing".into())
-                            })?
-                            .fields,
-                    )
-                } else {
-                    None
-                };
-                if let Some(fields) = fields {
-                    doc.fields = merge_fields(fields, doc.fields);
-                }
+                self.merge_replacement(&namespace, &snapshot, &mut doc, locations[from..].last())?;
             }
-            locations.extend(live);
             replacements.push(doc);
         }
         // WAL fsync and segment I/O happen with state unlocked. The operation
@@ -3058,6 +3093,13 @@ impl Indexer {
         Some(manifest)
     }
 
+    /// The committed version the writer's local manifest is based on.
+    pub fn published_version(&self, namespace: &NamespaceId) -> Option<u64> {
+        let handle = self.namespaces.lock().unwrap().get(namespace).cloned()?;
+        let state = handle.state.lock().unwrap();
+        state.known.then_some(state.published_version)
+    }
+
     /// Capture the CAS anchor and candidate under one namespace lock. The
     /// anchor advances only after a successful control-store commit.
     pub fn publication_snapshot(&self, namespace: &NamespaceId) -> Option<(u64, Manifest)> {
@@ -3121,6 +3163,33 @@ impl Indexer {
         flushing.chain(buffered).fold((0, 0), |(docs, bytes), doc| {
             (docs + 1, bytes + approx_document_bytes(doc))
         })
+    }
+
+    /// Approximate bytes not yet represented by a segment, including WAL
+    /// records awaiting replay after recovery.
+    pub fn pending_storage_bytes(&self, namespace: &NamespaceId) -> u64 {
+        let Some(handle) = self.namespaces.lock().unwrap().get(namespace).cloned() else {
+            return 0;
+        };
+        let state = handle.state.lock().unwrap();
+        state
+            .flushing_docs
+            .iter()
+            .flat_map(|chunk| chunk.iter())
+            .chain(
+                state
+                    .buffer
+                    .iter()
+                    .flat_map(|buffer| buffer.documents.iter()),
+            )
+            .chain(
+                state
+                    .recovered
+                    .iter()
+                    .flat_map(|(_, record)| record.documents.iter()),
+            )
+            .map(approx_document_bytes)
+            .fold(0, u64::saturating_add)
     }
 
     /// The namespace's unindexed tail (#255): every acknowledged write that
@@ -3392,6 +3461,84 @@ impl Indexer {
             }
         }
         Ok(())
+    }
+
+    /// Advances routing metadata for a committed manifest without reading
+    /// offsets from retained segments. Missing checkpoints are bootstrapped
+    /// from the immutable offsets; a failed read leaves the old checkpoint
+    /// intact, so queries can fall back.
+    pub fn update_namespace_centroids(
+        &self,
+        namespace: &NamespaceId,
+        manifest: &Manifest,
+        previous: Option<&[u8]>,
+        read_metadata: Option<&NamespaceCentroidMetadataReader<'_>>,
+    ) -> Result<Option<Vec<u8>>, KoshaError> {
+        use kosha_segment::namespace_centroids::{Snapshot, FILE_NAME};
+
+        let path = self.data_dir.join(&namespace.0).join(FILE_NAME);
+        let local = std::fs::read(&path).ok();
+        let snapshot = [previous, local.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|bytes| Some((bytes, serde_json::from_slice::<Snapshot>(bytes).ok()?)))
+            .filter(|(_, s)| s.directory.is_supported())
+            .max_by_key(|(_, s)| s.version);
+        let ids = || {
+            manifest
+                .segments
+                .iter()
+                .map(|entry| entry.segment_id.0.as_str())
+        };
+        if let Some((bytes, current)) = &snapshot {
+            if current.matches(manifest.version, ids()) {
+                // An unchanged checkpoint needs no disk rewrite. Retry an
+                // earlier failed upload if it was only saved locally.
+                return Ok((previous != Some(*bytes)).then(|| bytes.to_vec()));
+            }
+        }
+        let mut snapshot = snapshot.map(|(_, s)| s).unwrap_or_else(|| Snapshot {
+            version: 0,
+            directory: Default::default(),
+        });
+        if snapshot.version > manifest.version {
+            return Ok(None);
+        }
+        let live: HashSet<_> = ids().collect();
+        let retired: Vec<_> = snapshot
+            .directory
+            .segment_ids()
+            .filter(|id| !live.contains(id))
+            .map(str::to_owned)
+            .collect();
+        for id in retired {
+            snapshot.directory.remove_segment(&id);
+        }
+        for entry in &manifest.segments {
+            let id = &entry.segment_id;
+            if snapshot.directory.contains_segment(&id.0) {
+                continue;
+            }
+            let dir = manifest.segment_dir(&self.data_dir, namespace, id);
+            let columns = match (
+                kosha_segment::SegmentReader::namespace_centroids(&dir),
+                read_metadata,
+            ) {
+                (Err(_), Some(read)) => {
+                    let relative = manifest.segment_rel_dir(namespace, id);
+                    kosha_segment::SegmentReader::namespace_centroids_from(|file| {
+                        read(&format!("{relative}/{file}"))
+                    })?
+                }
+                (local, _) => local?,
+            };
+            snapshot.directory.insert_segment(&id.0, columns);
+        }
+        snapshot.version = manifest.version;
+        let bytes = serde_json::to_vec(&snapshot)?;
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        kosha_core::atomic_write(&path, &bytes)?;
+        Ok(Some(bytes))
     }
 
     /// Replay this writer's unpublished delta on top of `remote`, the

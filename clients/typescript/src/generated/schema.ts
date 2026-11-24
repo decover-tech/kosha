@@ -721,6 +721,7 @@ export interface components {
         };
         v1DeleteBranchResponse: {
             deleted?: string;
+            deletion?: components["schemas"]["v1DeletionRecord"];
             parent?: string;
             reclaimed?: components["schemas"]["v1BranchReclaim"];
             /** Format: int64 */
@@ -752,12 +753,22 @@ export interface components {
          */
         v1DeletionRecord: {
             /**
+             * @description Purge pods must acknowledge their cache purge before the record
+             *     completes (#347, KOSHA_DELETION_REQUIRE_ACKS).
+             */
+            acks_required?: boolean;
+            /**
              * Format: int64
              * @description Storage-reclaim attempts so far.
              */
             attempts?: number;
             /** Format: int64 */
             completed_at_ms?: number;
+            /**
+             * Format: int64
+             * @description Exports (#347) of the subject deleted with it.
+             */
+            exports_deleted?: number;
             id?: string;
             /** @description Why the last attempt did not complete. */
             last_error?: string;
@@ -779,12 +790,14 @@ export interface components {
              * @description "namespace" or "tenant".
              * @enum {string}
              */
-            scope?: "namespace" | "tenant";
+            scope?: "namespace" | "tenant" | "branch" | "migrated";
             /**
              * @description "pending" (rows gone, stored objects may remain) or "completed".
              * @enum {string}
              */
             state?: "pending" | "completed";
+            /** @description Storage reclaim finished and the prefix listed empty. */
+            storage_verified?: boolean;
             /** @description Internal namespace id ("<tenant>/<name>") or tenant id, per `scope`. */
             subject?: string;
             tenant_id?: string;
@@ -1112,6 +1125,8 @@ export interface components {
         v1PutNamespaceSchemaResponse: {
             /** @description False when the stored schema was already identical. */
             changed?: boolean;
+            /** @description The online changes applied, per field (#347). */
+            changes?: components["schemas"]["v1SchemaChange"][];
             namespace?: string;
             schema?: components["schemas"]["v1NamespaceSchema"];
         };
@@ -1190,6 +1205,19 @@ export interface components {
              *     must be >= max_results.
              */
             rank_window_size?: number;
+        };
+        /** @description One online schema change (#347). */
+        v1SchemaChange: {
+            /**
+             * @description "field_added", "field_removed", "declarative_changed",
+             *     "analyzer_changed", "embedding_declared", "embedding_removed" or
+             *     "settings_changed".
+             */
+            change?: string;
+            /** @description What happens to existing documents. */
+            effect?: string;
+            /** @description The field, or "*" for the namespace-wide defaults. */
+            field?: string;
         };
         v1ScoredDocument: {
             doc_id?: string;

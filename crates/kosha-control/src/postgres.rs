@@ -19,9 +19,10 @@ use std::time::Duration;
 /// pool's connections are tied to the runtime that created them, and dropping
 /// that runtime causes subsequent acquires to hang until `acquire_timeout`
 /// ("pool timed out while waiting for an open connection").
+#[derive(Clone)]
 pub struct PgStore {
     pool: sqlx::PgPool,
-    rt: tokio::runtime::Runtime,
+    rt: std::sync::Arc<tokio::runtime::Runtime>,
 }
 
 /// JSON-serialisable segment entry stored inside the manifest text column.
@@ -102,7 +103,7 @@ fn is_migration_race(e: &sqlx::Error) -> bool {
         .is_some_and(|code| MIGRATION_RACE_SQLSTATES.contains(&code.as_ref()))
 }
 
-/// Apply the embedded migrations (001, both 003 files, 004, 005, 006, 007, 008, 009, 010, then 011) in one transaction on one
+/// Apply the embedded migrations in one transaction on one
 /// connection, holding a transaction-scoped advisory lock for its duration.
 ///
 /// Concurrent constructors against a fresh database (several pods booting
@@ -183,6 +184,10 @@ async fn migrate_once(pool: &sqlx::PgPool) -> Result<(), (sqlx::Error, &'static 
         .execute(&mut *tx)
         .await
         .map_err(|e| (e, "migration 007 failed"))?;
+    sqlx::raw_sql(include_str!("../migrations/008_tenant_kms_keys.sql"))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (e, "migration 008 failed"))?;
     // Sign-up, sessions, identities, SSO (#345 part 2): additive, idempotent.
     let migration = include_str!("../migrations/008_identity_sessions.sql");
     sqlx::raw_sql(migration)
@@ -356,7 +361,10 @@ impl PgStore {
         static CHECKED: std::sync::Once = std::sync::Once::new();
         CHECKED.call_once(|| rt.block_on(warn_about_unusable_relations(&pool)));
 
-        Ok(Self { pool, rt })
+        Ok(Self {
+            pool,
+            rt: std::sync::Arc::new(rt),
+        })
     }
 
     /// The tables and sequences of schema `kosha` this store's role cannot
@@ -940,6 +948,20 @@ impl ControlStore for PgStore {
 }
 
 impl PgStore {
+    /// Returns the operator-configured KMS key, if the tenant has one.
+    pub fn tenant_kms_key_id(&self, tenant_id: &str) -> Result<Option<String>, KoshaError> {
+        self.rt
+            .block_on(
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT kms_key_id FROM kosha.tenants WHERE tenant_id = $1",
+                )
+                .bind(tenant_id)
+                .fetch_optional(&self.pool),
+            )
+            .map(Option::flatten)
+            .map_err(control_plane_error)
+    }
+
     /// The pool and the runtime that owns it, for sibling modules that
     /// run their own transactions (`namespace_rename`).
     pub(crate) fn pool_and_runtime(&self) -> (&sqlx::PgPool, &tokio::runtime::Runtime) {

@@ -75,6 +75,9 @@ spec:
     - kosha-ingest-service.kosha.svc.cluster.local
     - kosha-ingest-service.kosha.svc
     - kosha-ingest-service
+    - kosha-service.kosha.svc.cluster.local
+    - kosha-service.kosha.svc
+    - kosha-service
   issuerRef:
     name: kosha-internal-ca
     kind: Issuer

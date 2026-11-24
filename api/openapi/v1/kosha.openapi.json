@@ -427,6 +427,9 @@
           "deleted": {
             "type": "string"
           },
+          "deletion": {
+            "$ref": "#/components/schemas/v1DeletionRecord"
+          },
           "parent": {
             "type": "string"
           },
@@ -482,12 +485,21 @@
       "v1DeletionRecord": {
         "description": "One hard delete of a namespace or a tenant, as the control store keeps it\n(kosha.deletion_records). Holds identifiers and counters only.",
         "properties": {
+          "acks_required": {
+            "description": "Purge pods must acknowledge their cache purge before the record\ncompletes (#347, KOSHA_DELETION_REQUIRE_ACKS).",
+            "type": "boolean"
+          },
           "attempts": {
             "description": "Storage-reclaim attempts so far.",
             "format": "int64",
             "type": "integer"
           },
           "completed_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "exports_deleted": {
+            "description": "Exports (#347) of the subject deleted with it.",
             "format": "int64",
             "type": "integer"
           },
@@ -520,7 +532,9 @@
             "description": "\"namespace\" or \"tenant\".",
             "enum": [
               "namespace",
-              "tenant"
+              "tenant",
+              "branch",
+              "migrated"
             ],
             "type": "string"
           },
@@ -531,6 +545,10 @@
               "completed"
             ],
             "type": "string"
+          },
+          "storage_verified": {
+            "description": "Storage reclaim finished and the prefix listed empty.",
+            "type": "boolean"
           },
           "subject": {
             "description": "Internal namespace id (\"<tenant>/<name>\") or tenant id, per `scope`.",
@@ -1171,6 +1189,13 @@
             "description": "False when the stored schema was already identical.",
             "type": "boolean"
           },
+          "changes": {
+            "description": "The online changes applied, per field (#347).",
+            "items": {
+              "$ref": "#/components/schemas/v1SchemaChange"
+            },
+            "type": "array"
+          },
           "namespace": {
             "type": "string"
           },
@@ -1308,6 +1333,24 @@
             "description": "Per-retriever list length and fused list length. Default: max_results;\nmust be >= max_results.",
             "format": "int64",
             "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "v1SchemaChange": {
+        "description": "One online schema change (#347).",
+        "properties": {
+          "change": {
+            "description": "\"field_added\", \"field_removed\", \"declarative_changed\",\n\"analyzer_changed\", \"embedding_declared\", \"embedding_removed\" or\n\"settings_changed\".",
+            "type": "string"
+          },
+          "effect": {
+            "description": "What happens to existing documents.",
+            "type": "string"
+          },
+          "field": {
+            "description": "The field, or \"*\" for the namespace-wide defaults.",
+            "type": "string"
           }
         },
         "type": "object"

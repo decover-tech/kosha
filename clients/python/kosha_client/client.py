@@ -850,7 +850,7 @@ class KoshaClient:
 
     @classmethod
     def _knn(cls, spec: dict) -> dict:
-        """``{"knn": {field: {vector | query_text, k, filter}}}`` → Kosha's kNN.
+        """``{"knn": {field: {vector | vectors | query_text, k, filter}}}`` → Kosha's kNN.
 
         The filter is carried into the vector search itself. It used to be
         dropped here, so a project-scoped semantic search returned the
@@ -859,25 +859,38 @@ class KoshaClient:
         ``query_text`` instead of ``vector`` asks the server to embed the
         text with the model the namespace schema declares for the field
         (native embedding, #209).
+
+        ``vectors`` (a list of query token vectors) asks for late-interaction
+        (ColBERT-style MaxSim) scoring against a field indexed with token
+        bags (#205); ``scoring`` (``"cosine"`` or ``"late_interaction"``) is
+        passed through as given. The server validates both.
         """
         for field, options in (spec or {}).items():
             if not isinstance(options, dict):
                 continue
             unknown = set(options) - {
-                "vector", "query_text", "k", "filter", "num_candidates", "boost",
+                "vector", "vectors", "scoring", "query_text", "k", "filter",
+                "num_candidates", "boost",
             }
             if unknown:
                 raise cls._unsupported(f"knn option(s) {sorted(unknown)}")
             k = int(options.get("k", 10))
             knn = {"field": field}
+            vectors = options.get("vectors")
             if options.get("query_text") is not None:
-                if options.get("vector"):
+                if options.get("vector") or vectors is not None:
                     raise cls._unsupported(
-                        "knn with both vector and query_text"
+                        "knn with both vector(s) and query_text"
                     )
                 knn["query_text"] = str(options["query_text"])
+            elif vectors is not None:
+                if options.get("vector"):
+                    raise cls._unsupported("knn with both vector and vectors")
+                knn["vectors"] = [list(token) for token in vectors]
             else:
                 knn["vector"] = options.get("vector", [])
+            if options.get("scoring") is not None:
+                knn["scoring"] = str(options["scoring"])
             knn["k"] = k
             knn["num_candidates"] = int(options.get("num_candidates", max(100, k)))
             if options.get("filter"):
@@ -1234,6 +1247,32 @@ class KoshaClient:
     # queries to rebuild an HNSW graph they never needed.
     _MIN_VECTOR_DIM = 8
 
+    @classmethod
+    def _is_numeric_vector(cls, v: Any) -> bool:
+        """A list of at least ``_MIN_VECTOR_DIM`` numbers (no booleans)."""
+        return (
+            isinstance(v, (list, tuple))
+            and len(v) >= cls._MIN_VECTOR_DIM
+            and all(
+                isinstance(x, (int, float)) and not isinstance(x, bool) for x in v
+            )
+        )
+
+    @classmethod
+    def _is_token_bag(cls, v: Any) -> bool:
+        """A late-interaction bag (#205): a non-empty list of numeric
+        vectors, all the same length and each at least ``_MIN_VECTOR_DIM``
+        long — per-token embeddings, as ColBERT-style models output.
+
+        Ragged lists, lists of short tuples (polygons, bounding boxes) and
+        anything non-numeric are not bags; they stay ``Keyword``.
+        """
+        if not isinstance(v, (list, tuple)) or not v:
+            return False
+        if not all(cls._is_numeric_vector(t) for t in v):
+            return False
+        return len({len(t) for t in v}) == 1
+
     @staticmethod
     def _decode_field_value(value: str, field_type: str | None) -> Any:
         """Reverse of ``_field_to_kosha``.
@@ -1287,18 +1326,26 @@ class KoshaClient:
                 fields.append(cls._field_to_kosha(k, str(v).lower(), "Boolean"))
             elif isinstance(v, (int, float)):
                 fields.append(cls._field_to_kosha(k, str(v), "Float"))
-            elif (
-                isinstance(v, (list, tuple))
-                and len(v) >= cls._MIN_VECTOR_DIM
-                and all(
-                    isinstance(x, (int, float)) and not isinstance(x, bool) for x in v
-                )
-            ):
+            elif cls._is_numeric_vector(v):
                 fields.append(cls._field_to_kosha(k, json.dumps(list(v)), "Vector"))
+            elif cls._is_token_bag(v):
+                # A bag of token vectors (late interaction, #205): one
+                # Vector field holding the JSON bag, which the server
+                # indexes for MaxSim. Decoded back to a list of lists by
+                # _decode_field_value.
+                # A field read back as Keyword (stored before #205, e.g.
+                # rewritten by update_by_query) keeps its type so exact-match
+                # filters on it still work.
+                bag_type = "Keyword" if declared_type == "Keyword" else "Vector"
+                fields.append(
+                    cls._field_to_kosha(
+                        k, json.dumps([list(t) for t in v]), bag_type
+                    )
+                )
             elif isinstance(v, (list, tuple)):
                 # Everything else list-shaped: short numeric tuples (below
-                # _MIN_VECTOR_DIM), empty lists, string lists (labels),
-                # mixed content. JSON-encode as Keyword — stored verbatim
+                # _MIN_VECTOR_DIM), ragged or short nested numeric lists,
+                # empty lists, string lists (labels), mixed content. JSON-encode as Keyword — stored verbatim
                 # and filterable by exact match, but never tokenized and
                 # never inserted into the shared Vector store. Decoded back
                 # to a Python list by _decode_field_value.

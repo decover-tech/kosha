@@ -195,6 +195,20 @@ alongside. If the provider times out or fails, hits come back in search order an
 
 ## Changelog
 
+### 0.3.1
+
+- **Behavior change (type inference):** a `_source` value that is a list of equal-length numeric
+  lists, each at least 8 long (per-token embeddings from a ColBERT-style model), is now sent as
+  one `Vector` field holding the JSON bag, which the server indexes for late-interaction
+  (MaxSim) search (issue #205). It used to be sent as a `Keyword` holding the same JSON. Ragged
+  lists, lists of shorter tuples (polygons, bounding-box pairs) and non-numeric nested lists keep
+  the `Keyword` mapping. Documents read back unchanged either way. If you index such values
+  today and filter on them by exact match (a `Keyword` behavior), keep that field out of the
+  upgrade or reindex: new writes send it as `Vector`, which is not filterable.
+- `knn` passes `vectors` (a bag of query token vectors) and `scoring` (`"cosine"` or
+  `"late_interaction"`) through to the server. `vector` with `vectors`, or either with
+  `query_text`, is refused.
+
 ### 0.3.0
 
 - Calls only the `/v1` API (see "Current state").

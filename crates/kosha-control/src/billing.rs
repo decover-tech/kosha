@@ -272,6 +272,7 @@ pub struct PlanQuotas {
     pub write_bytes_per_sec: Option<f64>,
     pub namespaces: Option<u64>,
     pub docs_per_namespace: Option<u64>,
+    pub bytes_per_namespace: Option<u64>,
     pub vector_dims: Option<u32>,
     pub max_body_bytes: Option<u64>,
     pub weight: Option<u32>,
