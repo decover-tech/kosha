@@ -149,3 +149,39 @@ fn shards_local_and_ranged_presence_agree_after_a_failed_span_write() {
         "the ranged confirmation was not wiped"
     );
 }
+
+/// #197: the first lookup of a segment misses the presence cache, the
+/// repeat hits it, both counted for the namespace's tenant and exported as
+/// `kosha_cache_{hits,misses}_total{cache="posting_blob_presence"}`.
+#[test]
+fn presence_lookups_are_counted_for_metrics() {
+    let (_s3, manifest, state, seg) = node_with_local_shards();
+    let presence = |state: &AppState| {
+        cache_tenant_samples(state)
+            .into_iter()
+            .filter(|s| s.cache == "posting_blob_presence")
+            .map(|s| (s.stats.hits, s.stats.misses))
+            .fold((0, 0), |(h, m), (sh, sm)| (h + sh, m + sm))
+    };
+    assert_eq!(presence(&state), (0, 0));
+
+    assert!(ensure(&state, &manifest, &seg).missing.is_empty());
+    assert_eq!(presence(&state), (0, 1), "first lookup misses");
+    assert!(ensure(&state, &manifest, &seg).missing.is_empty());
+    assert_eq!(presence(&state), (1, 1), "the repeat hits");
+
+    let samples = metrics::tests::parse_exposition(&state.metrics.render(&metrics::Scrape {
+        cache_tenants: cache_tenant_samples(&state),
+        ..Default::default()
+    }))
+    .unwrap();
+    let presence = [("cache", "posting_blob_presence")];
+    assert_eq!(
+        metrics::tests::value(&samples, "kosha_cache_hits_total", &presence),
+        Some(1.0)
+    );
+    assert_eq!(
+        metrics::tests::value(&samples, "kosha_cache_misses_total", &presence),
+        Some(1.0)
+    );
+}

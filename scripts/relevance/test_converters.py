@@ -156,6 +156,14 @@ class SyntheticFixtureTest(unittest.TestCase):
         grades = {line.split()[3] for line in (fixture / "qrels.txt").read_text().splitlines()}
         self.assertEqual(grades, {"1", "2"})
 
+    def test_ood_vectors_are_a_separate_unjudged_cohort(self):
+        _, queries, qrels = generate.generate()
+        judged = {qid for qid, _, _ in qrels}
+        ood = [q for q in queries if q.get("distribution") == "ood"]
+        self.assertEqual(len(ood), generate.OOD_QUERIES)
+        self.assertTrue(all(len(q["vector"]) == generate.DIM for q in ood))
+        self.assertTrue(judged.isdisjoint(q["qid"] for q in ood))
+
 
 if __name__ == "__main__":
     unittest.main()
