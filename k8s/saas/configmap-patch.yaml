@@ -1,0 +1,42 @@
+# Multi-tenant defaults, applied after components/internal-tls. Every key is
+# documented in docs/configuration.md. Per-cell values (bucket, prefix,
+# region, KOSHA_CONSOLE_PUBLIC_URL, KOSHA_S3_SSE_KMS_KEY_ID) are added at
+# install time by scripts/kosha_cluster.py, not committed.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kosha-config
+  namespace: kosha
+data:
+  # Public API (#350): only /v1. List tenants that still need the
+  # unversioned routes in KOSHA_LEGACY_ROUTES_TENANTS.
+  KOSHA_LEGACY_ROUTES: "off"
+  # Quotas and rate limits (#341) from the mounted plans file.
+  KOSHA_TENANT_LIMITS_FILE: /etc/kosha/plans/tenant-limits.json
+  # Fair admission (#341, #342): one tenant cannot fill the search queue or
+  # take all live segment memory while another tenant waits.
+  KOSHA_SEARCH_QUEUE_DEPTH_PER_TENANT: "8"
+  KOSHA_ADMISSION_TENANT_SHARES: "on"
+  # Encryption at rest (#343). A key on kosha.tenants.kms_key_id gives a
+  # tenant its own key; others use KOSHA_S3_SSE_KMS_KEY_ID (set by the
+  # installer) or the AWS-managed aws/s3 key.
+  KOSHA_S3_SSE: aws:kms
+  KOSHA_S3_SSE_BUCKET_KEY: "true"
+  # TLS between pods is required, not just preferred: a peer on plain HTTP
+  # or a DATABASE_URL without sslmode=require|verify-ca|verify-full stops
+  # the pod at startup.
+  KOSHA_INTERNAL_TLS: required
+  # Acknowledged writes survive losing the ingest node (#354).
+  KOSHA_WAL_MODE: s3
+  # Metering and billing (#348, #349).
+  KOSHA_USAGE_METERING: "on"
+  KOSHA_BILLING: "on"
+  KOSHA_BILLING_PLANS_FILE: /etc/kosha/plans/billing-plans.json
+  KOSHA_BILLING_PLANS_WATCH: "on"
+  KOSHA_BILLING_PROVIDER: stripe
+  KOSHA_BILLING_SCHEDULER: "on"
+  # Organizations and the console (#345). Sign-up stays closed until a mailer
+  # is configured (KOSHA_MAILER=smtp, KOSHA_SMTP_*, KOSHA_MAIL_FROM); until
+  # then accounts come from invites or the operator.
+  KOSHA_CONSOLE: "on"
+  KOSHA_SIGNUP: "off"

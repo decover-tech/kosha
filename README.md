@@ -27,6 +27,16 @@ latency guarantees and the limits Kosha enforces.
 | Go SDK (preview) | `github.com/decover-tech/kosha/clients/go` ([clients/go](clients/go)) | `go get github.com/decover-tech/kosha/clients/go` |
 | CLI | not published to crates.io yet | `cargo install --path crates/kosha-cli` |
 
+### Deployment model
+
+Kosha runs as a **multi-tenant SaaS**: shared cells deployed with
+[`k8s/saas`](k8s/saas), customers onboarded as organizations through the
+control-plane APIs. See [docs/deployment-model.md](docs/deployment-model.md) and
+[k8s/README.md](k8s/README.md#multi-tenant-saas-cells) for installing, upgrading
+(`scripts/kosha_cluster.py upgrade` enforces the manifest/WAL upgrade order in
+"S3 WAL" below) and checking the health of a cell. A standalone single-customer
+stack still installs from `k8s/base`.
+
 ## Supported features
 
 ### Query
