@@ -924,9 +924,11 @@ impl<'de> Deserialize<'de> for FilterClause {
                         "`exists` takes an object: {\"exists\": {\"field\": \"name\"}}",
                     ));
                 }
-                Ok(FilterClause::Exists {
-                    exists: body(inner)?,
-                })
+                let exists: ExistsFilter = body(inner)?;
+                if exists.field.is_empty() {
+                    return Err(D::Error::custom("`exists` field must be non-empty"));
+                }
+                Ok(FilterClause::Exists { exists })
             }
             "geo_distance" => Ok(FilterClause::GeoDistance {
                 geo_distance: body(inner)?,
@@ -4669,6 +4671,7 @@ mod filter_clause_parsing {
             r#"{"exists": {"field": ["a", "b"]}}"#,
             r#"{"exists": {"field": "a", "boost": 2}}"#,
             r#"{"exists": {"fields": ["a"]}}"#,
+            r#"{"exists": {"field": ""}}"#,
             r#"{"bool": {"must_not": [{"exists": {}}]}}"#,
         ] {
             assert!(parse(body).is_err(), "{body} must be rejected");
