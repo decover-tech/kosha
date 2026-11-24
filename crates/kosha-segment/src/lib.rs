@@ -4223,7 +4223,9 @@ fn parse_bound_stop_alpha(raw: Option<&str>) -> Option<f32> {
 /// For an f32 column `theta` is the exact `k`-th score; for a RaBitQ one
 /// it is the `k`-th largest `estimate - error` (the posting's best case is
 /// below the `k`-th candidate's worst). `alpha = 1` skips only postings
-/// that cannot change the top `k`; `alpha < 1` trades recall for postings.
+/// that cannot change the top `k` on an f32 column; on a RaBitQ one the
+/// error bound is probabilistic (`RABITQ_EPSILON0`), so a rare miss is
+/// possible. `alpha < 1` trades recall for postings.
 fn bound_stop(theta: f64, distance: f32, radius: f32, alpha: f32) -> bool {
     let angle = |d: f32| (1.0 - d as f64).clamp(-1.0, 1.0).acos();
     let ceiling = (angle(distance) - angle(radius)).max(0.0).cos();
