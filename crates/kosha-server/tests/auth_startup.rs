@@ -172,7 +172,7 @@ fn a_malformed_env_key_attribute_refuses_to_start_without_echoing_the_key() {
 
 #[test]
 fn explicit_opt_out_starts_with_auth_disabled() {
-    let (mut cmd, port) = server(&[("KOSHA_AUTH", "disabled")]);
+    let (mut cmd, port) = server(&[("KOSHA_AUTH", "disabled"), ("KOSHA_LEGACY_ROUTES", "on")]);
     let mut child = cmd.spawn().unwrap();
     wait_healthy(&mut child, port);
     let body = r#"{"namespace":"x"}"#;
@@ -238,31 +238,57 @@ fn keyed_server_rejects_unkeyed_and_oversized_requests() {
 }
 
 #[test]
-fn legacy_routes_can_be_switched_off() {
+fn legacy_routes_require_an_explicit_opt_in() {
+    for (flag, expected) in [(None, 410), (Some("off"), 410), (Some("on"), 200)] {
+        let mut env = vec![("KOSHA_API_KEYS", "sk-tenant=acme")];
+        if let Some(flag) = flag {
+            env.push(("KOSHA_LEGACY_ROUTES", flag));
+        }
+        let (mut cmd, port) = server(&env);
+        let mut child = cmd.spawn().unwrap();
+        wait_healthy(&mut child, port);
+        let body = r#"{"namespace":"x"}"#;
+        let legacy = http(
+            port,
+            &format!(
+                "POST /flush HTTP/1.1\r\nx-api-key: sk-tenant\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .unwrap();
+        let v1 = http(
+            port,
+            "POST /v1/namespaces/x/flush HTTP/1.1\r\nx-api-key: sk-tenant\r\ncontent-length: 2\r\n\r\n{}",
+        )
+        .unwrap();
+        child.kill().ok();
+        child.wait().ok();
+        assert!(
+            legacy.starts_with(&format!("HTTP/1.1 {expected}")),
+            "{legacy}"
+        );
+        assert!(!v1.starts_with("HTTP/1.1 410"), "{v1}");
+    }
+}
+
+#[test]
+fn disabled_query_pod_does_not_forward_legacy_writes() {
     let (mut cmd, port) = server(&[
         ("KOSHA_API_KEYS", "sk-tenant=acme"),
-        ("KOSHA_LEGACY_ROUTES", "off"),
+        ("KOSHA_ROLE", "query"),
+        ("KOSHA_INGEST_HOST", "127.0.0.1:1"),
     ]);
     let mut child = cmd.spawn().unwrap();
     wait_healthy(&mut child, port);
-    let body = r#"{"namespace":"x"}"#;
     let legacy = http(
         port,
-        &format!(
-            "POST /flush HTTP/1.1\r\nx-api-key: sk-tenant\r\ncontent-length: {}\r\n\r\n{body}",
-            body.len()
-        ),
-    )
-    .unwrap();
-    let v1 = http(
-        port,
-        "POST /v1/namespaces/x/flush HTTP/1.1\r\nx-api-key: sk-tenant\r\ncontent-length: 2\r\n\r\n{}",
+        "POST /flush HTTP/1.1\r\nx-api-key: sk-tenant\r\ncontent-length: 2\r\n\r\n{}",
     )
     .unwrap();
     child.kill().ok();
     child.wait().ok();
     assert!(legacy.starts_with("HTTP/1.1 410"), "{legacy}");
-    assert!(!v1.starts_with("HTTP/1.1 410"), "{v1}");
+    assert!(legacy.contains("legacy_route_disabled"), "{legacy}");
 }
 
 /// #346: a typo in the switch for the bootstrap admin key must not leave

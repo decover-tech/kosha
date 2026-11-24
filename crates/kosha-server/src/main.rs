@@ -7014,14 +7014,20 @@ fn dispatch_authenticated(
                  /v1/admin/compact* and /v1/admin/compaction-*",
             ))
         }
-        (Ok(_), Some(ingest_host), Some(client)) if is_write_path(request_line) => {
-            http::Response::from_raw(forward_to_ingest(
-                client,
-                ingest_host,
-                request_line,
-                headers,
-                body,
-            ))
+        (Ok(tenant), Some(ingest_host), Some(client)) if is_write_path(request_line) => {
+            if let Some((_, path)) =
+                legacy_route(request_line).filter(|_| !auth::legacy_routes_enabled_for(tenant))
+            {
+                http::Response::from_raw(with_legacy_deprecation(legacy_route_disabled(path)))
+            } else {
+                http::Response::from_raw(forward_to_ingest(
+                    client,
+                    ingest_host,
+                    request_line,
+                    headers,
+                    body,
+                ))
+            }
         }
         // Pod-to-pod segment transfer streams the file instead of building
         // a `String` (#259). Any other credential falls through to `route`,
@@ -7913,6 +7919,10 @@ fn route(
     if legacy_route(request_line).is_none() {
         return response;
     }
+    with_legacy_deprecation(response)
+}
+
+fn with_legacy_deprecation(response: String) -> String {
     let response = with_header(
         response,
         "link",
@@ -8130,7 +8140,7 @@ fn legacy_replacement(path: &str) -> &'static str {
         "/search" => "POST /v1/namespaces/{namespace}/search",
         "/flush" => "POST /v1/namespaces/{namespace}/flush",
         "/delete" => "POST /v1/namespaces/{namespace}/delete",
-        "/stats" => "GET /v1/namespaces/{namespace}/stats",
+        "/stats" => "GET /v1/stats",
         _ => "/v1/namespaces/{namespace}/...",
     }
 }
@@ -8140,9 +8150,7 @@ fn legacy_route_disabled(path: &str) -> String {
     let replacement = legacy_replacement(path);
     ApiError::new(
         ErrorCode::LegacyRouteDisabled,
-        format!(
-            "unversioned route {path} is disabled (KOSHA_LEGACY_ROUTES=off); use {replacement}"
-        ),
+        format!("unversioned route {path} is disabled; use {replacement}"),
     )
     .detail("route", path)
     .detail("replacement", replacement)
@@ -16896,6 +16904,7 @@ mod tests {
 
     #[test]
     fn regression_admin_credential_is_distinct_from_tenant_and_peer_keys() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let mut state = test_state();
         state.admin_auth_key = Some("admin-secret".into());
         state.internal_service_key = Some("peer-secret".into());
@@ -17192,6 +17201,7 @@ mod tests {
 
     #[test]
     fn regression_legacy_routes_cannot_read_another_tenant() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let state = test_state();
         let ns = NamespaceId("victim/private".into());
         state
@@ -20718,6 +20728,7 @@ mod tests {
 
     #[test]
     fn index_endpoint_works() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let state = test_state();
         let req = IndexRequest {
             namespace: NamespaceId("test-ns".into()),
@@ -20740,6 +20751,7 @@ mod tests {
 
     #[test]
     fn exists_endpoint_reports_present_and_missing() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let state = test_state();
         let ns = NamespaceId("exists-ns".into());
         let req = IndexRequest {
@@ -20783,6 +20795,7 @@ mod tests {
 
     #[test]
     fn compact_namespace_endpoint_merges_segments_and_preserves_docs() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let state = test_state();
         let ns = NamespaceId("compact-ns".into());
 
@@ -20861,6 +20874,7 @@ mod tests {
 
     #[test]
     fn gc_endpoint_dry_runs_then_collects_compaction_retired_segments() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let state = test_state();
         let ns = NamespaceId(tenant_namespace("test", "gc-ns"));
         for i in 0..3 {
@@ -21022,6 +21036,7 @@ mod tests {
 
     #[test]
     fn local_gc_keeps_compacted_inputs_until_searches_release_them() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let state = test_state();
         let ns = NamespaceId(tenant_namespace("test", "lgc-ns"));
         for i in 0..2 {
@@ -21111,6 +21126,7 @@ mod tests {
 
     /// Index `n` single-doc segments into `test/<name>` via index+flush.
     fn seed_segments(state: &AppState, name: &str, n: usize) -> NamespaceId {
+        let _legacy = auth::override_legacy_policy(true, "");
         for i in 0..n {
             let req = IndexRequest {
                 namespace: NamespaceId(name.into()),
@@ -21248,6 +21264,7 @@ mod tests {
     /// next tick must leave it alone.
     #[test]
     fn scheduler_tick_compacts_namespaces_past_the_trigger() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let state = test_shared_state();
         let trigger = state.indexer.compaction_policy().trigger_mergeable_segments;
         let busy = seed_segments(&state, "sched-busy", trigger);
@@ -21466,6 +21483,7 @@ mod tests {
     /// unknown, and lose no document.
     #[test]
     fn full_pass_hydrates_one_capped_group_at_a_time_and_evicts_inputs() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let state = test_state();
         let n = 10;
         let ns = seed_segments(&state, "bounded-disk", n);
@@ -21726,6 +21744,7 @@ mod tests {
 
     #[test]
     fn replace_endpoint_removes_old_document_version() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let state = test_state();
         let namespace = NamespaceId("test-replace".into());
         let initial = IndexRequest {
@@ -21780,6 +21799,7 @@ mod tests {
 
     #[test]
     fn index_then_search() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let state = test_state();
         let ns = "test-ns-search";
 
@@ -22073,6 +22093,7 @@ mod tests {
 
     #[test]
     fn search_missing_namespace_returns_404() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let state = test_state();
         let response = route(
             "GET /search?ns=nonexistent&q=test HTTP/1.1\r\n",
@@ -22086,6 +22107,7 @@ mod tests {
 
     #[test]
     fn search_missing_params_returns_400() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let state = test_state();
         let response = route(
             "GET /search HTTP/1.1\r\n",
@@ -22099,6 +22121,7 @@ mod tests {
 
     #[test]
     fn flush_persists_manifest_to_control_store() {
+        let _legacy = auth::override_legacy_policy(true, "");
         // Regression: manifests were only kept in the in-process indexer map
         // and never written to the control store, so a restart made every
         // namespace vanish from search.
@@ -22142,6 +22165,7 @@ mod tests {
 
     #[test]
     fn auto_flush_during_index_persists_manifest() {
+        let _legacy = auth::override_legacy_policy(true, "");
         // Regression: index_documents auto-flushes when the buffer hits the
         // flush threshold (1000) — that manifest update was never persisted.
         let state = test_state();
@@ -23413,6 +23437,7 @@ mod tests {
     /// hydration, as before.
     #[test]
     fn rewarm_makes_a_compacted_segment_local_before_the_next_search() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let shared = shared_store();
         let ingest = warm_ingest(&shared, &["hot", "idle"]);
         let ns = seed_segments(&ingest, "hot", 3);
@@ -23614,6 +23639,7 @@ mod tests {
     /// budget has left.
     #[test]
     fn warmup_honors_the_byte_budget_and_reports_warmed_and_skipped() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let shared = shared_store();
         let ingest = warm_ingest(&shared, &["big"]);
         let ns = seed_segments(&ingest, "big", 3);
@@ -24933,6 +24959,7 @@ mod tests {
 
     #[test]
     fn tenant_over_its_qps_gets_429_while_another_tenant_is_served() {
+        let _legacy = auth::override_legacy_policy(true, "");
         let state = limited_state(
             r#"{"default_plan": "free", "plans": {"free": {"qps": 2}},
                 "tenants": {"big": {"qps": 1000}}}"#,

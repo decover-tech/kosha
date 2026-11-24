@@ -979,8 +979,9 @@ and the server logs a warning at startup for any in `KOSHA_API_KEYS`.
   `KOSHA_AUTH=disabled` is set explicitly (local development only). Postgres keys
   are re-read every `KOSHA_API_KEY_REFRESH_SECS` (default 30), request bodies are
   capped at `KOSHA_MAX_BODY_BYTES` (default 64 MiB, 413 above it), and
-  `KOSHA_LEGACY_ROUTES=off` turns the unversioned routes into 410s
-  (`KOSHA_LEGACY_ROUTES_TENANTS` keeps them for named tenants; see
+  the deprecated unversioned routes return 410 by default.
+  `KOSHA_LEGACY_ROUTES=on` opts in all tenants, or
+  `KOSHA_LEGACY_ROUTES_TENANTS` opts in named tenants (see
   [docs/api/versioning.md](docs/api/versioning.md#legacy-routes)).
 
 ### Scoped API keys (Postgres key registry)
