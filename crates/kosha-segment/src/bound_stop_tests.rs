@@ -168,3 +168,13 @@ fn bound_stop_never_fires_before_k_candidates() {
     assert_eq!((on, on_probes), (off, off_probes));
     assert_eq!(on_probes, postings);
 }
+
+#[test]
+fn bound_stop_keeps_postings_whose_radius_rounded_to_zero() {
+    // A member just off the centroid can beat the centroid's own score;
+    // a stored radius of 0 must not let alpha = 1 skip it.
+    let distance = 0.1f32;
+    let theta = 1.0 - distance as f64;
+    assert!(!bound_stop(theta, distance, 0.0, 1.0));
+    assert!(bound_stop(1.0, distance, 0.0, 1.0));
+}

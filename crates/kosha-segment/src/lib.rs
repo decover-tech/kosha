@@ -4277,6 +4277,9 @@ fn with_bound_stop_alpha<T>(alpha: Option<f32>, f: impl FnOnce() -> T) -> T {
     out
 }
 
+/// Rounding allowance for the f32 cosine distances [`bound_stop`] reads.
+const BOUND_STOP_DISTANCE_SLACK: f64 = 1e-5;
+
 fn parse_bound_stop_alpha(raw: Option<&str>) -> Option<f32> {
     raw.map(str::trim)
         .filter(|s| !s.is_empty())
@@ -4299,9 +4302,16 @@ fn parse_bound_stop_alpha(raw: Option<&str>) -> Option<f32> {
 /// that cannot change the top `k` on an f32 column; on a RaBitQ one the
 /// error bound is probabilistic (`RABITQ_EPSILON0`), so a rare miss is
 /// possible. `alpha < 1` trades recall for postings.
+///
+/// Both distances are f32, and a radius near 0 can round to 0 while members
+/// still sit off the centroid, so they are widened by
+/// [`BOUND_STOP_DISTANCE_SLACK`] before the angles are taken.
 fn bound_stop(theta: f64, distance: f32, radius: f32, alpha: f32) -> bool {
-    let angle = |d: f32| (1.0 - d as f64).clamp(-1.0, 1.0).acos();
-    let ceiling = (angle(distance) - angle(radius)).max(0.0).cos();
+    let angle = |d: f64| (1.0 - d).clamp(-1.0, 1.0).acos();
+    let slack = BOUND_STOP_DISTANCE_SLACK;
+    let ceiling = (angle(distance as f64 - slack) - angle(radius as f64 + slack))
+        .max(0.0)
+        .cos();
     theta >= alpha as f64 * ceiling
 }
 
