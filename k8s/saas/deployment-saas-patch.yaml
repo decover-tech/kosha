@@ -48,3 +48,18 @@
         name: kosha-secret
         key: admin-api-key
         optional: true
+# CA for DATABASE_URL's sslrootcert=/etc/kosha/pg/ca.crt (sslmode=verify-full),
+# from the optional ConfigMap kosha-pg-ca (key ca.crt).
+- op: add
+  path: /spec/template/spec/volumes/-
+  value:
+    name: pg-ca
+    configMap:
+      name: kosha-pg-ca
+      optional: true
+- op: add
+  path: /spec/template/spec/containers/0/volumeMounts/-
+  value:
+    name: pg-ca
+    mountPath: /etc/kosha/pg
+    readOnly: true
