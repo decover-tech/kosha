@@ -576,7 +576,7 @@ class KoshaClient:
     # Options of OpenSearch's long-form ``prefix`` that only affect scoring
     # or query rewriting, never which documents match.
     _IGNORED_PREFIX_KEYS = frozenset({"boost", "rewrite"})
-    _IGNORED_EXISTS_KEYS = frozenset({"boost"})
+    _IGNORED_EXISTS_KEYS = frozenset({"boost", "_name"})
 
     @classmethod
     def _prefix_filter(cls, clause: dict, spec: Any) -> dict:

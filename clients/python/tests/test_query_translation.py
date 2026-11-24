@@ -122,6 +122,9 @@ def test_exists_drops_boost_and_refuses_malformed_bodies():
     assert KoshaClient._to_filter({"exists": {"field": "a", "boost": 2}}) == {
         "exists": {"field": "a"}
     }
+    assert KoshaClient._to_filter({"exists": {"field": "a", "_name": "has_a"}}) == {
+        "exists": {"field": "a"}
+    }
     for spec in [None, "a", ["a"], {}, {"field": ""}, {"field": 7}, {"field": "a", "x": 1}]:
         with pytest.raises(KoshaRequestError, match="exists"):
             KoshaClient._to_filter({"exists": spec})
