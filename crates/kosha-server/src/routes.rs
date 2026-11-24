@@ -9,7 +9,7 @@
 //! - whether a `/v1` path exists at all (`route` answers 404 for one that
 //!   is not here, and 405 with `Allow` for a known path with the wrong
 //!   method);
-//! - `is_write_path` / `is_search_route` for `/v1` paths, so a new route
+//! - forwarding, write admission and search admission for `/v1` paths, so a new route
 //!   cannot be forwarded or limited differently from what it declares;
 //! - the spec: `public_routes_match_spec` asserts the table and the spec
 //!   describe the same operations, and that every operation reaches a
@@ -29,7 +29,7 @@ pub(crate) enum Class {
     /// Mutates state; a query pod forwards it to the ingest pod.
     Write,
     /// Read-only, but the state it reads lives on the writer pod
-    /// (compaction jobs), so a query pod forwards it like a write.
+    /// (e.g., unflushed documents or compaction jobs), so a query pod forwards it.
     WriterRead,
 }
 
@@ -126,7 +126,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "POST",
         "/v1/namespaces/{namespace}/exists",
         "KoshaService_Exists",
-        Read,
+        WriterRead,
     ),
     public(
         "POST",
@@ -561,9 +561,7 @@ mod tests {
         assert!(allowed_methods("/v1/namespaces/docs/nope").is_empty());
     }
 
-    /// Recorded from `is_write_path` / `is_search_route` before they were
-    /// driven by [`ROUTES`] (#350), and required to hold unchanged after:
-    /// `(request line, forwarded to ingest, search route)`.
+    /// Pinned routing behavior: `(request line, forwarded to ingest, search route)`.
     const PINNED: &[(&str, bool, bool)] = &[
         ("GET /v1/healthz HTTP/1.1", false, false),
         ("POST /v1/namespaces HTTP/1.1", true, false),
@@ -571,7 +569,7 @@ mod tests {
         ("DELETE /v1/namespaces/docs HTTP/1.1", true, false),
         ("POST /v1/namespaces/docs/documents HTTP/1.1", true, false),
         ("POST /v1/namespaces/docs/search HTTP/1.1", false, true),
-        ("POST /v1/namespaces/docs/exists HTTP/1.1", false, false),
+        ("POST /v1/namespaces/docs/exists HTTP/1.1", true, false),
         ("POST /v1/namespaces/docs/flush HTTP/1.1", true, false),
         ("POST /v1/namespaces/docs/delete HTTP/1.1", true, false),
         ("GET /v1/namespaces/docs/stats HTTP/1.1", false, false),
@@ -657,7 +655,7 @@ mod tests {
         ("POST /replace HTTP/1.1", true, false),
         ("POST /flush HTTP/1.1", true, false),
         ("POST /delete HTTP/1.1", true, false),
-        ("POST /exists HTTP/1.1", false, false),
+        ("POST /exists HTTP/1.1", true, false),
         ("POST /search HTTP/1.1", false, true),
         ("GET /search?ns=docs&q=x HTTP/1.1", false, true),
         ("GET /stats HTTP/1.1", false, false),
@@ -666,8 +664,12 @@ mod tests {
 
     #[test]
     fn route_table_pins_today() {
-        for &(line, write, search) in PINNED {
-            assert_eq!(crate::is_write_path(line), write, "is_write_path({line})");
+        for &(line, ingest, search) in PINNED {
+            assert_eq!(
+                crate::is_ingest_path(line),
+                ingest,
+                "is_ingest_path({line})"
+            );
             assert_eq!(
                 crate::is_search_route(line),
                 search,
