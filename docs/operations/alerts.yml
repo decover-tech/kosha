@@ -1,0 +1,69 @@
+groups:
+  - name: kosha-managed-service
+    interval: 1m
+    rules:
+      - alert: KoshaSearchSaturation
+        expr: |
+          sum by (cluster) (rate(kosha_search_requests_total{outcome=~"rejected|timeout"}[5m]))
+          / sum by (cluster) (rate(kosha_search_requests_total[5m])) > 0.01
+          and sum by (cluster) (rate(kosha_search_requests_total[5m])) >= 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Kosha is shedding more than 1% of searches
+
+      - alert: KoshaColdHydration
+        expr: |
+          histogram_quantile(0.95, sum by (cluster, le) (
+            rate(kosha_search_phase_seconds_bucket{phase="hydrate"}[5m])
+          )) > 1
+          and sum by (cluster) (rate(kosha_hydrations_total{source="s3"}[5m])) > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Slow search hydration coincides with sustained object-store fetches
+
+      - alert: KoshaNvmeCacheChurn
+        expr: |
+          sum by (cluster) (rate(kosha_cache_misses_total{cache="nvme"}[5m]))
+          / (
+            sum by (cluster) (rate(kosha_cache_hits_total{cache="nvme"}[5m]))
+            + sum by (cluster) (rate(kosha_cache_misses_total{cache="nvme"}[5m]))
+          ) > 0.25
+          and sum by (cluster) (rate(kosha_cache_evictions_total{cache="nvme"}[5m])) > 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: High NVMe cache misses coincide with sustained evictions
+
+      - alert: KoshaTenantNvmeCacheChurn
+        expr: |
+          sum by (cluster, tenant) (rate(kosha_cache_misses_total{cache="nvme",tenant!=""}[5m]))
+          / (
+            sum by (cluster, tenant) (rate(kosha_cache_hits_total{cache="nvme",tenant!=""}[5m]))
+            + sum by (cluster, tenant) (rate(kosha_cache_misses_total{cache="nvme",tenant!=""}[5m]))
+          ) > 0.25
+          and sum by (cluster, tenant) (rate(kosha_cache_evictions_total{cache="nvme",tenant!=""}[5m])) > 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: A tenant has high NVMe cache misses and sustained evictions
+
+      - alert: KoshaSpanCacheInlineWrites
+        expr: sum by (cluster) (increase(kosha_span_writes_total{outcome="inline"}[5m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: The span cache is forcing inline writes on fetching threads
+
+      - alert: KoshaCompactionBacklog
+        expr: max by (cluster) (kosha_ops_compaction_namespaces_needing_compaction) > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: Compaction has outstanding work for at least 30 minutes
