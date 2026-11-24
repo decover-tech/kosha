@@ -351,6 +351,7 @@ struct FlushCoord {
 /// `(field name, is a late-interaction bag)`: see
 /// [`NamespaceHandle::vector_dims`].
 type VectorDimKey = (String, bool);
+type NamespaceCentroidMetadataReader<'a> = dyn Fn(&str) -> Result<Vec<u8>, KoshaError> + 'a;
 
 /// The dimension a `Vector` field value carries, for the write-time check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3288,7 +3289,7 @@ impl Indexer {
         namespace: &NamespaceId,
         manifest: &Manifest,
         previous: Option<&[u8]>,
-        ensure_metadata: impl Fn(&str) -> Result<(), KoshaError>,
+        read_metadata: Option<&NamespaceCentroidMetadataReader<'_>>,
     ) -> Result<Option<Vec<u8>>, KoshaError> {
         use kosha_segment::namespace_centroids::{Snapshot, FILE_NAME};
 
@@ -3336,13 +3337,17 @@ impl Indexer {
                 continue;
             }
             let dir = manifest.segment_dir(&self.data_dir, namespace, id);
-            let columns = match kosha_segment::SegmentReader::namespace_centroids(&dir) {
-                Ok(columns) => columns,
-                Err(_) => {
+            let columns = match (
+                kosha_segment::SegmentReader::namespace_centroids(&dir),
+                read_metadata,
+            ) {
+                (Err(_), Some(read)) => {
                     let relative = manifest.segment_rel_dir(namespace, id);
-                    ensure_metadata(&relative)?;
-                    kosha_segment::SegmentReader::namespace_centroids(&dir)?
+                    kosha_segment::SegmentReader::namespace_centroids_from(|file| {
+                        read(&format!("{relative}/{file}"))
+                    })?
                 }
+                (local, _) => local?,
             };
             snapshot.directory.insert_segment(&id.0, columns);
         }

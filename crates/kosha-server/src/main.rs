@@ -3658,24 +3658,12 @@ impl AppState {
         #[cfg(feature = "s3")]
         if let Some(s3) = &self.s3_storage {
             let path = format!("{}/{}", ns.0, kosha_segment::namespace_centroids::FILE_NAME);
-            let previous = s3.refresh_namespace_centroids(&path).ok();
+            let previous = s3.read_uncached(&path).ok();
             let bytes = self.indexer.update_namespace_centroids(
                 ns,
                 manifest,
                 previous.as_deref(),
-                |segment| {
-                    let footer = s3.read(&format!("{segment}/footer.json"))?;
-                    let footer: kosha_core::Footer = serde_json::from_slice(&footer)?;
-                    for field in footer
-                        .vector_fields
-                        .into_iter()
-                        .flatten()
-                        .filter(|f| f.offsets)
-                    {
-                        s3.read(&format!("{segment}/{}", field.offsets_file()))?;
-                    }
-                    Ok(())
-                },
+                Some(&|file| s3.read_uncached(file)),
             )?;
             if let Some(bytes) = bytes {
                 s3.upload_namespace_centroids(&path, bytes)?;
@@ -3683,7 +3671,7 @@ impl AppState {
             return Ok(());
         }
         self.indexer
-            .update_namespace_centroids(ns, manifest, None, |_| Ok(()))?;
+            .update_namespace_centroids(ns, manifest, None, None)?;
         Ok(())
     }
 

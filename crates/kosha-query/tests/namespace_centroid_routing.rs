@@ -27,9 +27,12 @@ fn commit(indexer: &Indexer, ns: &NamespaceId) -> Manifest {
     let (_, manifest) = indexer.prepare_publication(ns).unwrap().unwrap();
     indexer.acknowledge_manifest(ns, &manifest).unwrap();
     indexer
-        .update_namespace_centroids(ns, &manifest, None, |_| {
-            panic!("routing opened metadata outside the locally flushed segment set")
-        })
+        .update_namespace_centroids(
+            ns,
+            &manifest,
+            None,
+            Some(&|_| panic!("routing opened metadata outside the locally flushed segment set")),
+        )
         .unwrap();
     manifest
 }
@@ -79,6 +82,34 @@ fn flush_and_compaction_maintain_the_same_directory_as_rebuilding() {
     assert_eq!(checkpoint.version, compacted.version);
     assert_eq!(compacted.segments.len(), 1);
     assert_eq!(checkpoint.directory, rebuild(root.path(), &ns, &compacted));
+}
+
+#[test]
+fn directory_can_bootstrap_from_metadata_without_writing_segment_files() {
+    let root = tempfile::tempdir().unwrap();
+    let replica = tempfile::tempdir().unwrap();
+    let ns = NamespaceId("cold".into());
+    let idx = Indexer::new(root.path().into()).with_wal(false);
+    append(&idx, &ns, 0..20);
+    let manifest = commit(&idx, &ns);
+    let cold = Indexer::new(replica.path().into()).with_wal(false);
+    cold.update_namespace_centroids(
+        &ns,
+        &manifest,
+        None,
+        Some(&|file| {
+            assert!(file.ends_with("/footer.json") || file.ends_with("/vector.offsets"));
+            Ok(std::fs::read(root.path().join(file))?)
+        }),
+    )
+    .unwrap();
+
+    assert_eq!(
+        snapshot(replica.path(), &ns).directory,
+        snapshot(root.path(), &ns).directory
+    );
+    let segment = &manifest.segments[0].segment_id;
+    assert!(!manifest.segment_dir(replica.path(), &ns, segment).exists());
 }
 
 fn query(vector: Vec<f32>) -> SearchQuery {

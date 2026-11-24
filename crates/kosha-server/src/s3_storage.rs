@@ -837,7 +837,7 @@ impl S3Storage {
         join_s3_key(&self.prefix, path)
     }
 
-    pub(crate) fn refresh_namespace_centroids(&self, path: &str) -> Result<Vec<u8>, KoshaError> {
+    pub(crate) fn read_uncached(&self, path: &str) -> Result<Vec<u8>, KoshaError> {
         self.rt.block_on(Self::read_remote_bytes(
             &self.client,
             &self.bucket,
