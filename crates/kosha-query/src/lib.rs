@@ -4169,10 +4169,10 @@ impl NamespaceCentroidCache {
         snapshot: Option<Arc<NamespaceCentroidSnapshot>>,
         bytes: usize,
     ) {
+        self.retain(|entry| entry.key.0 != key.0);
         if bytes > NAMESPACE_CENTROID_CACHE_BYTES {
             return;
         }
-        self.retain(|entry| entry.key != key);
         while self.bytes + bytes > NAMESPACE_CENTROID_CACHE_BYTES
             || self.entries.len() >= NAMESPACE_CENTROID_CACHE_ENTRIES
         {

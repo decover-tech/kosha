@@ -193,7 +193,23 @@ fn alternating_namespaces_fetch_each_routing_snapshot_once() {
     search(&b, &b_v1);
     assert_eq!(
         *fetches.lock().unwrap(),
-        HashMap::from([(a_key, 2), (b_key, 1)])
+        HashMap::from([(a_key.clone(), 2), (b_key.clone(), 1)])
+    );
+
+    let churn = 64;
+    for i in 3..3 + churn {
+        append(&idx, &a, (i * 20)..((i + 1) * 20));
+        let current = commit(&idx, &a);
+        snapshots
+            .lock()
+            .unwrap()
+            .insert(a_key.clone(), take_snapshot(&a));
+        search(&a, &current);
+    }
+    search(&b, &b_v1);
+    assert_eq!(
+        *fetches.lock().unwrap(),
+        HashMap::from([(a_key, 2 + churn), (b_key, 1)])
     );
 }
 
