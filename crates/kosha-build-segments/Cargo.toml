@@ -20,12 +20,17 @@ path = "src/bin/vector_quant_eval.rs"
 name = "kosha-cluster-eval"
 path = "src/bin/cluster_eval.rs"
 
+[[bin]]
+name = "kosha-boundary-replication-eval"
+path = "src/bin/boundary_replication_eval.rs"
+
 [lints]
 workspace = true
 
 [dependencies]
 kosha-core = { path = "../kosha-core" }
 kosha-segment = { path = "../kosha-segment" }
+kosha-vector-spfresh = { path = "../kosha-vector-spfresh" }
 clap = { version = "4", features = ["derive"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

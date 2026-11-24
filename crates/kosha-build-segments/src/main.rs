@@ -22,14 +22,12 @@
 //! documents to segments by vector region instead of input order: see
 //! [`head`] (default) and [`cluster`]. The segment format is the same either way.
 
-mod cluster;
-mod head;
-
 use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use clap::Parser;
+use kosha_build_segments::{cluster, head};
 use kosha_core::{Bm25Params, DocumentId, Field, SegmentId};
 use kosha_segment::{BpConfig, DocReorder, SegmentWriter, VectorQuantizationConfig};
 
