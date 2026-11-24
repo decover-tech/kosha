@@ -7674,19 +7674,37 @@ impl Searcher {
         // requests may have finished. Cheap when already under budget.
         self.segment_cache.enforce_budget();
 
+        let local_pruned;
+        let pruned = match pruned {
+            Some(pruned) => pruned,
+            None => {
+                local_pruned =
+                    self.knn_pruned_segments(manifest, query, effective_tombstones, |entry| {
+                        let dir =
+                            manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id);
+                        if !dir.exists() {
+                            return None;
+                        }
+                        manifest.footer_or_read(&entry.segment_id, || {
+                            SegmentReader::read_footer(&dir).ok()
+                        })
+                    });
+                &local_pruned
+            }
+        };
+        phase_stats.knn_segments_pruned = pruned.len();
+
         // ── Admission (see `MemoryLedger`) ──
         // Estimate the incremental live bytes this search can add: the
-        // on-disk footprint of every manifest segment that's present
-        // locally but not already in the in-memory cache. Deliberately
-        // conservative — bloom pruning may skip some of these without ever
-        // opening them; the unconsumed reservation is returned when the
-        // permit drops at the end of this search. The broad, unfiltered
-        // queries this gate exists for prune nothing, so for exactly the
-        // dangerous case the estimate is accurate.
+        // on-disk footprint of surviving segments that are present locally
+        // but not already in the in-memory cache. Bloom pruning may still
+        // skip some of these; any unconsumed reservation is returned when
+        // the permit drops.
         let load_vectors = query.knn.is_some();
         let estimate: u64 = manifest
             .segments
             .iter()
+            .filter(|entry| !pruned.contains(&entry.segment_id))
             .map(|entry| {
                 let seg_dir = manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id);
                 let key = (
@@ -7782,25 +7800,6 @@ impl Searcher {
         // Late interaction (#205) probes its own per-field token index;
         // none of this applies to it.
         let t_knn_plan = Instant::now();
-        let local_pruned;
-        let pruned = match pruned {
-            Some(pruned) => pruned,
-            None => {
-                local_pruned =
-                    self.knn_pruned_segments(manifest, query, effective_tombstones, |entry| {
-                        let dir =
-                            manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id);
-                        if !dir.exists() {
-                            return None;
-                        }
-                        manifest.footer_or_read(&entry.segment_id, || {
-                            SegmentReader::read_footer(&dir).ok()
-                        })
-                    });
-                &local_pruned
-            }
-        };
-        phase_stats.knn_segments_pruned = pruned.len();
         let knn_plan = match query.knn {
             Some(ref knn) if !knn.is_late_interaction() => {
                 let plan = self.knn_plan(
@@ -12057,6 +12056,27 @@ mod tests {
             .results
             .iter()
             .all(|hit| hit.doc_id.0.starts_with("far-")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn knn_segment_pruning_reserves_memory_only_for_surviving_segments() {
+        let (dir, ns, manifest, query) = knn_segment_pruning_corpus("admission");
+        let near_bytes = approx_segment_bytes(&dir.join("test/near"), true);
+        assert!(approx_segment_bytes(&dir.join("test/far"), true) > 0);
+        let searcher =
+            Searcher::with_memory_limits(dir.clone(), 10, u64::MAX, near_bytes + 1, Duration::ZERO);
+        let _outstanding = searcher.ledger.admit("_legacy", 1, |_, _| {}).unwrap();
+        assert!(matches!(
+            searcher.search(&ns, &manifest, &query, None),
+            Err(KoshaError::Overloaded(_))
+        ));
+        let searcher = searcher.with_knn_segment_nprobe(1);
+        let (result, stats) = searcher
+            .search_with_stats(&ns, &manifest, &query, None)
+            .unwrap();
+        assert_eq!(stats.knn_segments_pruned, 1);
+        assert_eq!(result.results.len(), 10);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
