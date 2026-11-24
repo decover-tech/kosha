@@ -1132,7 +1132,9 @@ pub fn approx_segment_bytes(seg_dir: &std::path::Path, load_vectors: bool) -> u6
     };
 
     // Always resident: the parsed footer and the inverted index's TOC.
-    let mut total = size("footer.json").saturating_add(size("inverted.idx"));
+    let mut total = size("footer.json")
+        .saturating_add(size("inverted.idx"))
+        .saturating_add(kosha_segment::tier_metadata_heap_bytes(seg_dir));
 
     // Resident: the offsets index (lazy) or the whole store (legacy eager).
     let doc_offsets = size("doc_store.offsets");

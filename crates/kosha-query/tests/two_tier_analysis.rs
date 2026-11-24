@@ -135,6 +135,26 @@ fn tiered_search_certifies_or_fetches_and_matches_full_postings() {
     let seg = tiered.join(&ns.0).join("seg0");
     let version = std::fs::read(seg.join("inverted.idx")).unwrap();
     assert_eq!(&version[4..8], &8u32.to_le_bytes());
+    let tier_heap = kosha_segment::tier_metadata_heap_bytes(&seg);
+    assert!(tier_heap > 0);
+    let pre_tier_estimate: u64 = seg
+        .read_dir()
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str().unwrap();
+            matches!(
+                name,
+                "footer.json" | "inverted.idx" | "doc_store.offsets" | "filters.bin"
+            ) || kosha_core::is_filter_column_file(name)
+        })
+        .map(|entry| entry.metadata().unwrap().len())
+        .sum();
+    assert_eq!(
+        kosha_query::approx_segment_bytes(&seg, false),
+        pre_tier_estimate + tier_heap
+    );
     assert!(kosha_segment::tier_files_present(&seg));
     let remote = std::fs::read(seg.join(TIER_TAIL_FILE)).unwrap();
     std::fs::remove_file(seg.join(TIER_TAIL_FILE)).unwrap();

@@ -4740,6 +4740,7 @@ pub const POSTING_BLOB_SHARDS: usize = 256;
 /// Experimental split TOC with separate head and tail spans using v5 encoding.
 pub const TIERED_SPLIT_INVERTED_VERSION: u32 = 8;
 pub const TIER_TAIL_FILE: &str = "tail-00.bin";
+const TIER_TERM_HEADER_LEN: usize = 20;
 
 /// Strictly increasing (field length, term frequency) points not dominated
 /// by any shorter document with the same or higher frequency.
@@ -4811,6 +4812,39 @@ pub fn tier_files_present(segment_dir: &Path) -> bool {
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .all(|blob| segment_dir.join(posting_blob_file_for_id(blob)).is_file())
+}
+
+/// Resident tier metadata in addition to the raw TOC bytes. Reads only
+/// the TOC header and its first entry, not the frontier points.
+pub fn tier_metadata_heap_bytes(segment_dir: &Path) -> u64 {
+    fn measure(mut toc: fs::File) -> Option<u64> {
+        let mut header = [0; INVERTED_HEADER_LEN];
+        toc.read_exact(&mut header).ok()?;
+        if header[..4] != INVERTED_MAGIC.to_le_bytes()
+            || header[4..8] != TIERED_SPLIT_INVERTED_VERSION.to_le_bytes()
+        {
+            return None;
+        }
+        let terms = u64::from(u32::from_le_bytes(header[8..12].try_into().ok()?));
+        if terms == 0 {
+            return Some(0);
+        }
+        let mut entry = [0; SPLIT_INVERTED_TABLE_ENTRY_LEN];
+        toc.read_exact(&mut entry).ok()?;
+        let start = u64::from(u32::from_le_bytes(entry[28..32].try_into().ok()?));
+        let table_end = INVERTED_HEADER_LEN as u64 + terms * SPLIT_INVERTED_TABLE_ENTRY_LEN as u64;
+        if start < table_end {
+            return None;
+        }
+        let metadata_bytes = toc.metadata().ok()?.len().checked_sub(start)?;
+        let frontier_bytes = metadata_bytes.checked_sub(terms * TIER_TERM_HEADER_LEN as u64)?;
+        Some(terms * std::mem::size_of::<TierTerm>() as u64 + frontier_bytes)
+    }
+
+    fs::File::open(segment_dir.join("inverted.idx"))
+        .ok()
+        .and_then(measure)
+        .unwrap_or(0)
 }
 
 /// Shards actually referenced by a split index's TOC. Empty shard files
@@ -6302,7 +6336,7 @@ impl SplitInvertedIndex {
                 let count = cursor.u32()? as usize;
                 let record_len = count
                     .checked_mul(8)
-                    .and_then(|n| n.checked_add(20))
+                    .and_then(|n| n.checked_add(TIER_TERM_HEADER_LEN))
                     .filter(|&n| n <= metadata.len())
                     .ok_or_else(|| corrupt("truncated tier metadata"))?;
                 if start != tail_end || df == 0 || (len == 0) != (count == 0) {
@@ -14762,6 +14796,14 @@ mod bounded_build_tests {
         ));
         let reader = SegmentReader::open(dir.clone()).unwrap();
         assert_eq!(reader.postings("test").unwrap().len(), 1);
+        let InvertedAccess::Split(index) = &reader.inverted else {
+            panic!("expected a split reader");
+        };
+        let terms = index.tier_terms.as_ref().unwrap();
+        assert_eq!(
+            tier_metadata_heap_bytes(&dir),
+            (terms.capacity() * std::mem::size_of::<TierTerm>()) as u64,
+        );
         assert!(!dir.join(TIER_TAIL_FILE).exists());
         fs::remove_dir_all(dir).unwrap();
     }
