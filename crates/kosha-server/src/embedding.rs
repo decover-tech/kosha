@@ -485,10 +485,11 @@ impl EmbedderRegistry {
             }
         };
         let key = (provider.clone(), spec.model.clone(), spec.dims);
-        let mut built = self.built.lock().unwrap();
-        if let Some(embedder) = built.get(&key) {
+        if let Some(embedder) = self.built.lock().unwrap().get(&key) {
             return Ok(Arc::clone(embedder));
         }
+        // Built without the lock held: a slow or failing model load must not
+        // block embeddings for other models on this pod.
         let embedder: Arc<dyn Embedder> = match provider.as_str() {
             PROVIDER_MOCK if self.mock => {
                 Arc::new(MockEmbedder::new(&spec.model, spec.dims as usize))
@@ -511,8 +512,9 @@ impl EmbedderRegistry {
             }
             _ => return Err(not_enabled(spec, &provider)),
         };
-        built.insert(key, Arc::clone(&embedder));
-        Ok(embedder)
+        Ok(Arc::clone(
+            self.built.lock().unwrap().entry(key).or_insert(embedder),
+        ))
     }
 }
 
