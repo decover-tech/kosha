@@ -23,6 +23,7 @@ path = "src/bin/two_tier_eval.rs"
 
 [dev-dependencies]
 cap = "0.1.2"
+kosha-vector-spfresh = { path = "../kosha-vector-spfresh" }
 # Test-only, one-directional (kosha-write never depends on kosha-query):
 # tests/lire_compaction_recall.rs compacts through the real Indexer, and
 # benches/relevance builds its fixture with it.

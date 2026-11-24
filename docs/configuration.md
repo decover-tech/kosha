@@ -864,7 +864,19 @@ bench's header comment documents its own knobs. The common ones:
 | `KOSHA_RELEVANCE_JSON` | Write the `relevance` bench's report (used by the `relevance-compare` CI job and for `scripts/relevance/baseline.json`) |
 | `KOSHA_RELEVANCE_FIXTURE` | Fixture directory for the `relevance` bench when no argument is given (default `scripts/relevance/fixtures/synthetic`) |
 | `KOSHA_RELEVANCE_NUM_CANDIDATES` | kNN `num_candidates` in the `relevance` bench (default 1: the engine's `KOSHA_KNN_BUDGET_FRACTION` floor sets the probe budget) |
-| `KOSHA_PLAN_BENCH_SEGS`, `KOSHA_PLAN_BENCH_CENTROIDS`, `KOSHA_PLAN_BENCH_DIM`, `KOSHA_PLAN_BENCH_QUERIES`, `KOSHA_PLAN_BENCH_ITERS`, `KOSHA_PLAN_BENCH_NUM_CANDIDATES` | Size of the kNN planning microbench (`knn_plan_microbench`, an ignored test in `crates/kosha-query/src/tests/knn_plan_two_stage.rs`, run in release mode): segments, centroids per segment, dimensions, distinct queries, timed passes over them, and the query's `num_candidates`. Defaults 196, 582, 1024, 16, 20, 100: the 10M vector bench's centroid count |
+| `KOSHA_PLAN_BENCH_SEGS`, `KOSHA_PLAN_BENCH_CENTROIDS`, `KOSHA_PLAN_BENCH_DIM`, `KOSHA_PLAN_BENCH_QUERIES`, `KOSHA_PLAN_BENCH_ITERS`, `KOSHA_PLAN_BENCH_NUM_CANDIDATES` | Size of the kNN planning microbenches (`knn_plan_microbench`, `knn_plan_rabitq_microbench`, ignored tests run in release mode): segments, centroids per segment, dimensions, distinct queries, timed passes over them, and the query's `num_candidates`. Defaults 196, 582, 1024, 16, 20, 100: the 10M vector bench's centroid count |
+
+To compare 1-bit RaBitQ shortlists of 1k, 5k and 20k against the full f32 scan
+and the default i8 planner, run:
+
+```sh
+KOSHA_KNN_PLAN_I8=1 cargo test --release -p kosha-query --lib knn_plan_rabitq_microbench -- --ignored --nocapture
+```
+
+This measures scoring and ranking over synthetic centroids, not end-to-end search.
+Posting overlap is the fraction of the exact plan's selected postings retained
+after the 1-bit shortlist and f32 rerank. A shortlist smaller than the exact plan
+cannot reach full overlap. The RaBitQ confidence margin is not a guaranteed bound.
 | `KOSHA_BENCH_BATCH_SIZE`, `KOSHA_BENCH_BACKLOG_DOCS`, `KOSHA_BENCH_FLUSH_THRESHOLD`, `KOSHA_BENCH_MAX_CONCURRENT_FLUSH_WRITERS`, `KOSHA_BENCH_MIN_DOCS_PER_FLUSH_WRITER`, `KOSHA_BENCH_WAL_APPENDS`, `KOSHA_BENCH_WAL_ENABLED` | Write-path benches (`kosha-write`) |
 
 ## Other environment variables

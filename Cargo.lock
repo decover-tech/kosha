@@ -2174,6 +2174,7 @@ dependencies = [
  "instant-distance",
  "kosha-core",
  "kosha-segment",
+ "kosha-vector-spfresh",
  "kosha-write",
  "rayon",
  "serde",
