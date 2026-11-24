@@ -143,17 +143,11 @@ impl AppState {
     /// Erase remote data under `prefix`, then verify the prefix is empty.
     /// Returns how many objects or versions were deleted and, when the
     /// prefix is not verified empty, why.
-    fn reclaim_remote_prefix(&self, prefix: &str, scope: DeletionScope) -> (u64, Option<String>) {
+    fn reclaim_remote_prefix(&self, prefix: &str) -> (u64, Option<String>) {
         let Some(store) = self.remote_prefix_store() else {
             return (0, None);
         };
-        let erasure = scope == DeletionScope::Namespace;
-        let deletion = if erasure {
-            store.erase_prefix(prefix)
-        } else {
-            store.delete_prefix(prefix)
-        };
-        let deleted = match deletion {
+        let deleted = match store.erase_prefix(prefix) {
             Ok(deleted) => deleted as u64,
             Err(e) => {
                 return (
@@ -162,12 +156,7 @@ impl AppState {
                 )
             }
         };
-        let remaining = if erasure {
-            store.count_erasure_entries(prefix)
-        } else {
-            store.count_prefix(prefix)
-        };
-        match remaining {
+        match store.count_erasure_entries(prefix) {
             Ok(0) => (deleted, None),
             Ok(left) => (
                 deleted,
@@ -399,7 +388,7 @@ impl AppState {
             );
             storage_error = Some(format!("local segment cleanup failed: {e}"));
         }
-        let (objects, remote_error) = self.reclaim_remote_prefix(&id.0, DeletionScope::Namespace);
+        let (objects, remote_error) = self.reclaim_remote_prefix(&id.0);
         if let Some(e) = &remote_error {
             eprintln!("WARN: namespace {} deleted, but {e}", id.0);
         }
@@ -512,7 +501,7 @@ impl AppState {
         if let Err(e) = local_cleanup {
             error.get_or_insert(format!("local segment cleanup failed: {e}"));
         }
-        let (objects, remote_error) = self.reclaim_remote_prefix(&id.0, DeletionScope::Namespace);
+        let (objects, remote_error) = self.reclaim_remote_prefix(&id.0);
         let exports = self.erase_exports_for(record, || self.delete_namespace_exports(id));
         (
             objects,
@@ -665,8 +654,7 @@ impl AppState {
                 {
                     errors.push(format!("deleting the tenant's exports failed: {e}"));
                 }
-                let (deleted, remote_error) =
-                    self.reclaim_remote_prefix(tenant, DeletionScope::Tenant);
+                let (deleted, remote_error) = self.reclaim_remote_prefix(tenant);
                 objects = deleted;
                 errors.extend(remote_error);
                 // The sweep holds no namespace lock, so a write with a key
