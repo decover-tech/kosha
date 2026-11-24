@@ -2943,6 +2943,13 @@ impl Indexer {
         Some(manifest)
     }
 
+    /// The committed version the writer's local manifest is based on.
+    pub fn published_version(&self, namespace: &NamespaceId) -> Option<u64> {
+        let handle = self.namespaces.lock().unwrap().get(namespace).cloned()?;
+        let state = handle.state.lock().unwrap();
+        state.known.then_some(state.published_version)
+    }
+
     /// Capture the CAS anchor and candidate under one namespace lock. The
     /// anchor advances only after a successful control-store commit.
     pub fn publication_snapshot(&self, namespace: &NamespaceId) -> Option<(u64, Manifest)> {

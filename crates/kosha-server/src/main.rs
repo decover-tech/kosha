@@ -3329,6 +3329,41 @@ impl AppState {
             .clone()
     }
 
+    /// Bring a quota-checked writer up to date without waiting for a
+    /// publication conflict. Rebasing keeps unpublished writes intact.
+    fn refresh_write_manifest(&self, ns: &NamespaceId) -> Result<(), KoshaError> {
+        let lock = self.publication_lock(ns);
+        let _guard = lock.lock().unwrap();
+        let stored = self.controller.lock().unwrap().manifest_version(ns)?;
+        if stored <= self.indexer.published_version(ns) {
+            return Ok(());
+        }
+        let Some(remote) = self.hydrated_remote_manifest(ns)? else {
+            return Err(KoshaError::ManifestConflict {
+                namespace: ns.clone(),
+                expected: stored.unwrap_or_default(),
+                actual: None,
+            });
+        };
+        self.rebase_write_manifest(ns, remote).map(|_| ())
+    }
+
+    fn rebase_write_manifest(
+        &self,
+        ns: &NamespaceId,
+        remote: kosha_core::Manifest,
+    ) -> Result<kosha_write::RebaseOutcome, KoshaError> {
+        #[cfg(feature = "s3")]
+        {
+            // Committed segments are already durable and need no upload.
+            let mut synced = self.synced_segments.lock().unwrap();
+            for entry in &remote.segments {
+                synced.insert(synced_key(&remote, ns, &entry.segment_id));
+            }
+        }
+        self.indexer.rebase_onto(ns, remote)
+    }
+
     /// Drop the cached hydration verdict for one manifest version, so the
     /// next search re-checks its scoring set on disk instead of trusting a
     /// verdict that a failed search just proved stale.
@@ -3593,17 +3628,8 @@ impl AppState {
                          found {}): rebasing, attempt {rebases}/{MANIFEST_REBASE_ATTEMPTS}",
                         ns.0, remote.version
                     );
-                    #[cfg(feature = "s3")]
-                    {
-                        // The committed manifest's segments are durable by
-                        // the publish protocol; the other writer uploaded
-                        // them and this node has nothing local to send.
-                        let mut synced = self.synced_segments.lock().unwrap();
-                        for entry in &remote.segments {
-                            synced.insert(synced_key(&remote, ns, &entry.segment_id));
-                        }
-                    }
-                    if self.indexer.rebase_onto(ns, remote)? == kosha_write::RebaseOutcome::Adopted
+                    if self.rebase_write_manifest(ns, remote)?
+                        == kosha_write::RebaseOutcome::Adopted
                     {
                         return Ok(());
                     }
@@ -7217,6 +7243,12 @@ fn check_namespace_storage(
         .map(kosha_write::approx_document_bytes)
         .fold(0, u64::saturating_add);
     for member in members {
+        state
+            .refresh_write_manifest(&member)
+            .map_err(|error| match error {
+                KoshaError::ControlPlane(_) => control_store_unavailable(&error.to_string()),
+                _ => publication_error("namespace storage manifest refresh failed", &error),
+            })?;
         bytes = bytes.saturating_add(state.indexer.pending_storage_bytes(&member));
         if let Some(manifest) = state.indexer.manifest_shared(&member) {
             let Some(stored) = usage::owned_segment_bytes(state, &member, &manifest, true) else {
@@ -24971,6 +25003,63 @@ mod tests {
             );
             assert_eq!(status_of(&response), 200, "{response}");
         }
+    }
+
+    #[test]
+    fn namespace_storage_quota_adopts_remote_compaction_before_admission() {
+        let shared = shared_store();
+        let ns = NamespaceId("acme/one".into());
+        let compactor = test_state();
+        *compactor.controller.lock().unwrap() = Box::new(shared.clone());
+        write_and_flush(&compactor, &ns, "a");
+        write_and_flush(&compactor, &ns, "b");
+        compactor.publish_namespace(&ns).unwrap();
+        let before = shared.manifest_cloned(&ns).unwrap();
+        let old_bytes = usage::owned_segment_bytes(&compactor, &ns, &before, true).unwrap();
+        let ingest = test_state();
+        copy_dir(
+            &compactor.data_dir.join(&ns.0),
+            &ingest.data_dir.join(&ns.0),
+        );
+        ingest.indexer.restore_manifest(ns.clone(), before.clone());
+
+        assert!(
+            compactor
+                .indexer
+                .compact_namespace_with_options(&ns, kosha_write::CompactOptions::full())
+                .unwrap()
+                .merged
+        );
+        compactor.publish_namespace(&ns).unwrap();
+        let after = shared.manifest_cloned(&ns).unwrap();
+        let max = usage::owned_segment_bytes(&compactor, &ns, &after, true).unwrap() + 64;
+        assert!(
+            old_bytes > max,
+            "old {old_bytes} must exceed new quota {max}"
+        );
+        copy_dir(
+            &compactor.data_dir.join(&ns.0),
+            &ingest.data_dir.join(&ns.0),
+        );
+        let config = tenant_limits::LimitsConfig::parse(
+            &format!(r#"{{"tenants":{{"acme":{{"bytes_per_namespace":{max}}}}}}}"#),
+            None,
+        )
+        .unwrap();
+        let mut ingest = ingest;
+        ingest.tenant_limits = tenant_limits::TenantLimiter::new(Arc::new(
+            tenant_limits::ConfigLimitsProvider::from_config(config),
+        ));
+        *ingest.controller.lock().unwrap() = Box::new(shared);
+        assert_eq!(ingest.indexer.manifest_version(&ns), Some(before.version));
+        let response = as_tenant(
+            &ingest,
+            "acme",
+            "POST /v1/namespaces/one/documents",
+            one_doc("c", "z"),
+        );
+        assert_eq!(status_of(&response), 200, "{response}");
+        assert_eq!(ingest.indexer.published_version(&ns), Some(after.version));
     }
 
     #[test]
