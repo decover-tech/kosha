@@ -880,8 +880,20 @@ its detail carries `"via": "operator:<name>"`.
 |---|---|
 | `POST /v1/admin/operators` | Issue a credential: `{"name": "alice", "description", "expires_in_secs": 7776000}`. Only `name` is required (1 to 64 of letters, digits, `. _ - @ +`). The credential is in the response and is never shown again. `409` if that operator already holds a usable one: rotate it |
 | `GET /v1/admin/operators` | List credentials that are not revoked: id, name, `expires_at`, `last_used_at`. No secrets |
-| `POST /v1/admin/operators/revoke` | `{"key_id"}` revokes one credential, `{"name"}` every credential of that operator. The pod that answers refuses them at once, the others within `KOSHA_API_KEY_REFRESH_SECS` |
+| `POST /v1/admin/operators/revoke` | `{"key_id"}` revokes one credential, `{"name"}` every credential of that operator, including a replacement a rotation is issuing at the same moment. The pod that answers refuses them at once, the others on their next successful key refresh (every `KOSHA_API_KEY_REFRESH_SECS`; see below) |
 | `POST /v1/admin/operators/rotate` | `{"key_id", "overlap_secs": 86400}`. Issues a replacement for the same operator; the old credential keeps working for the overlap (default one day) |
+
+The CLI wraps these routes: `kosha admin create-operator`, `list-operators`,
+`rotate-operator` and `revoke-operator` (see
+[crates/kosha-cli/README.md](crates/kosha-cli/README.md)).
+
+**Revocation and a failing refresh.** A pod that cannot reach Postgres when it
+refreshes keeps its previous key snapshot, with no maximum age, so a credential
+revoked meanwhile keeps working on that pod until a refresh succeeds. Expiry is
+checked locally and is not affected. This holds for tenant keys and operator
+credentials alike; when revoking an admin credential in an incident, check that
+every pod's refresh is succeeding (its log reports a failed refresh), or
+restart the pods.
 
 Operator credentials are stored in the key registry like tenant keys (hashed,
 same expiry, rotation and refresh), but the two never mix: an operator

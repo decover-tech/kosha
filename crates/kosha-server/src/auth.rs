@@ -434,9 +434,13 @@ pub fn parse_bootstrap_admin_key_flag(value: Option<&str>) -> Result<bool, Strin
     match value.to_ascii_lowercase().as_str() {
         "" | "enabled" | "on" | "true" | "1" => Ok(true),
         "disabled" | "off" | "false" | "0" => Ok(false),
-        _ => Err(format!(
-            "invalid KOSHA_ADMIN_BOOTSTRAP_KEY '{value}' (expected 'enabled' or 'disabled')"
-        )),
+        // The value is not echoed: the likeliest mistake is putting the
+        // admin key itself here, and the error goes to the log.
+        _ => Err(
+            "invalid KOSHA_ADMIN_BOOTSTRAP_KEY (expected 'enabled' or 'disabled'; \
+                  the value given is not shown in case it is a secret)"
+                .to_string(),
+        ),
     }
 }
 
@@ -1047,11 +1051,22 @@ mod tests {
         for flag in ["disable", "no", "yes", "2"] {
             let e = parse_bootstrap_admin_key_flag(Some(flag)).unwrap_err();
             assert!(e.contains("KOSHA_ADMIN_BOOTSTRAP_KEY"), "{e}");
+            assert!(!e.contains(&format!("'{flag}'")), "{e}");
             assert_eq!(bootstrap_admin_key_from(Some("sk-admin"), Some(flag)), None);
         }
         // No key configured is no credential, whatever the flag.
         assert_eq!(bootstrap_admin_key_from(None, None), None);
         assert_eq!(bootstrap_admin_key_from(Some(""), Some("enabled")), None);
+    }
+
+    #[test]
+    fn a_bad_bootstrap_key_switch_is_not_echoed() {
+        // The shared admin key pasted into the switch by mistake must not
+        // reach the log of every crash-looping restart.
+        let secret = "sk-3f9c2a17-admin-key";
+        let e = parse_bootstrap_admin_key_flag(Some(secret)).unwrap_err();
+        assert!(!e.contains(secret), "{e}");
+        assert!(!e.contains("3f9c2a17"), "{e}");
     }
 
     #[test]

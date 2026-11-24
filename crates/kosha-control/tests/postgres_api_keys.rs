@@ -669,3 +669,147 @@ fn create_rotate_and_revoke_are_audited_without_secrets() {
         }
     }
 }
+
+/// Hold the advisory lock that serialises one operator's credential
+/// changes in a transaction of our own, run `change` on another thread
+/// meanwhile, and check it waits for the lock. `while_locked` runs inside
+/// the lock-holding transaction before it commits: what a concurrent
+/// rotation would have written but not yet committed.
+fn waits_for_operator_lock<T: Send + 'static>(
+    name: &str,
+    while_locked: impl FnOnce(&mut sqlx::PgConnection, &tokio::runtime::Runtime),
+    change: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    use kosha_control::api_keys::operator_tenant_id;
+    use std::time::Duration;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut conn = rt.block_on(async {
+        use sqlx::Connection;
+        let mut conn = sqlx::PgConnection::connect(&url()).await.unwrap();
+        sqlx::query("BEGIN").execute(&mut conn).await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(operator_tenant_id(name))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        conn
+    });
+    let (done, finished) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let out = change();
+        done.send(()).unwrap();
+        out
+    });
+    assert!(
+        finished.recv_timeout(Duration::from_millis(750)).is_err(),
+        "the change did not wait for the operator's lock"
+    );
+    while_locked(&mut conn, &rt);
+    rt.block_on(async {
+        sqlx::query("COMMIT").execute(&mut conn).await.unwrap();
+    });
+    finished
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the change finished once the lock was released");
+    worker.join().unwrap()
+}
+
+/// Offboarding while a rotation is in flight on another pod: the revoke by
+/// name waits for the rotation and revokes its replacement too, instead of
+/// returning success with the replacement still usable.
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn revoke_by_name_waits_for_an_in_flight_rotation() {
+    use kosha_control::api_keys::operator_name;
+    use kosha_control::OperatorCredentials;
+    let alice = operator("alice");
+    let first = PgStore::new(&url())
+        .unwrap()
+        .create_operator_credential(&alice, "laptop", None, "operator")
+        .unwrap()
+        .unwrap();
+    let replacement = hash_api_key(&format!("sk-{}", uuid::Uuid::new_v4()));
+    let revoker = alice.clone();
+    let mut revoked = waits_for_operator_lock(
+        &alice,
+        |conn, rt| {
+            // The replacement row a rotation inserts, not yet committed.
+            rt.block_on(async {
+                sqlx::query(
+                    "INSERT INTO kosha.api_keys (api_key, key_hash, tenant_id, description, scopes) \
+                     SELECT ' sha256:' || $2, $2, tenant_id, description, scopes \
+                     FROM kosha.api_keys WHERE key_hash = $1",
+                )
+                .bind(&first.record.key_hash)
+                .bind(&replacement)
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+            });
+        },
+        move || {
+            PgStore::new(&url())
+                .unwrap()
+                .revoke_operator_credentials(OperatorCredentials::Operator(&revoker), "operator")
+                .unwrap()
+        },
+    );
+    revoked.sort();
+    let mut expected = vec![
+        (first.record.key_hash.clone(), alice.clone()),
+        (replacement, alice.clone()),
+    ];
+    expected.sort();
+    assert_eq!(revoked, expected);
+    assert!(PgStore::new(&url())
+        .unwrap()
+        .list_operator_credentials()
+        .unwrap()
+        .iter()
+        .all(|c| operator_name(&c.tenant_id) != Some(alice.as_str())));
+}
+
+/// A rotation takes the same lock, so it cannot slip a replacement past a
+/// revoke by name that is running; once the revoke has committed there is
+/// nothing left to rotate.
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn rotation_waits_for_a_running_revoke_by_name() {
+    let alice = operator("alice");
+    let first = PgStore::new(&url())
+        .unwrap()
+        .create_operator_credential(&alice, "laptop", None, "operator")
+        .unwrap()
+        .unwrap();
+    let key_hash = first.record.key_hash.clone();
+    let rotated = waits_for_operator_lock(
+        &alice,
+        |conn, rt| {
+            // What the revoke by name holding the lock writes.
+            rt.block_on(async {
+                sqlx::query("UPDATE kosha.api_keys SET revoked_at = NOW() WHERE key_hash = $1")
+                    .bind(&first.record.key_hash)
+                    .execute(&mut *conn)
+                    .await
+                    .unwrap();
+            });
+        },
+        move || {
+            PgStore::new(&url())
+                .unwrap()
+                .rotate_operator_credential(&key_hash, 600, None, "operator")
+                .unwrap()
+        },
+    );
+    assert!(rotated.is_none(), "rotated a credential being revoked");
+    // Rotating an id that is not an operator credential takes no lock and
+    // finds nothing.
+    assert!(PgStore::new(&url())
+        .unwrap()
+        .rotate_operator_credential(&hash_api_key("sk-unknown"), 600, None, "operator")
+        .unwrap()
+        .is_none());
+}

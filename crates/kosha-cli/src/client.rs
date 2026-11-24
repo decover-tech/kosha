@@ -301,6 +301,35 @@ impl Client {
         self.request(Method::POST, "/v1/admin/api-keys/scrub-plaintext", None)
     }
 
+    /// `POST /v1/admin/operators`. `body` names the operator and,
+    /// optionally, a description and expiry.
+    pub fn create_operator(&self, body: Value) -> Result<Value, RequestError> {
+        self.request(Method::POST, "/v1/admin/operators", Some(body))
+    }
+
+    /// `GET /v1/admin/operators`: operator credentials that are not
+    /// revoked, without secrets.
+    pub fn list_operators(&self) -> Result<Value, RequestError> {
+        self.request(Method::GET, "/v1/admin/operators", None)
+    }
+
+    /// `POST /v1/admin/operators/revoke`. `body` is `{"key_id"}` (one
+    /// credential) or `{"name"}` (every credential of that operator).
+    pub fn revoke_operator(&self, body: Value) -> Result<Value, RequestError> {
+        self.request(Method::POST, "/v1/admin/operators/revoke", Some(body))
+    }
+
+    /// `POST /v1/admin/operators/rotate`. `body` names the credential and,
+    /// optionally, the overlap window and the new credential's expiry.
+    pub fn rotate_operator(&self, body: Value) -> Result<Value, RequestError> {
+        self.request(Method::POST, "/v1/admin/operators/rotate", Some(body))
+    }
+
+    /// `GET /v1/admin/api-keys/plaintext-count`.
+    pub fn count_plaintext_api_keys(&self) -> Result<Value, RequestError> {
+        self.request(Method::GET, "/v1/admin/api-keys/plaintext-count", None)
+    }
+
     pub fn curl(
         &self,
         method: Method,

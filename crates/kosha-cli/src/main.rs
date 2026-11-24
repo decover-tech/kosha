@@ -321,6 +321,55 @@ enum AdminCommands {
     /// hold in the database. Run once every server is upgraded: the keys
     /// keep working, but an older server build can no longer read them
     ScrubPlaintextApiKeys,
+    /// Report how many keys still hold plaintext in the database, i.e. what
+    /// `scrub-plaintext-api-keys` would rewrite (read-only)
+    CountPlaintextApiKeys,
+    /// Issue a named admin credential for one operator (Postgres control
+    /// plane only). It opens what KOSHA_ADMIN_API_KEY opens and is audited
+    /// as operator:<name>
+    ///
+    /// The credential is printed once, on stdout; store it now.
+    CreateOperator {
+        /// The operator: 1 to 64 ASCII letters, digits, '.', '_', '-', '@'
+        /// or '+', starting with a letter or digit (an email works)
+        name: String,
+        /// Free-text note stored with the credential
+        #[arg(long, default_value = "")]
+        description: String,
+        /// Make the credential expire this many seconds from now; never
+        /// when omitted
+        #[arg(long, value_name = "SECS")]
+        expires_in_secs: Option<u64>,
+    },
+    /// List operator credentials that are not revoked (never shows a
+    /// credential itself)
+    ListOperators,
+    /// Revoke one operator credential by id, or every credential of an
+    /// operator with --name; servers stop accepting them within their key
+    /// refresh interval
+    RevokeOperator {
+        /// The credential's id, from `list-operators` or its creation
+        #[arg(required_unless_present = "name", conflicts_with = "name")]
+        key_id: Option<String>,
+        /// Revoke every credential of this operator instead
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Replace an operator credential without downtime: issue a new one for
+    /// the same operator and keep the old one working for an overlap window
+    ///
+    /// The new credential is printed once, on stdout; store it now.
+    RotateOperator {
+        /// The id of the credential to replace
+        key_id: String,
+        /// How long the old credential keeps working (server default: one
+        /// day)
+        #[arg(long, value_name = "SECS")]
+        overlap_secs: Option<u64>,
+        /// Make the new credential expire this many seconds from now
+        #[arg(long, value_name = "SECS")]
+        expires_in_secs: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -360,6 +409,69 @@ fn create_api_key_body(
         body["expires_in_secs"] = serde_json::json!(secs);
     }
     body
+}
+
+/// The `POST /v1/admin/operators` body. Fields left out take the server's
+/// defaults: no description, no expiry.
+fn create_operator_body(name: &str, description: &str, expires_in_secs: Option<u64>) -> Value {
+    let mut body = serde_json::json!({"name": name});
+    if !description.is_empty() {
+        body["description"] = serde_json::json!(description);
+    }
+    if let Some(secs) = expires_in_secs {
+        body["expires_in_secs"] = serde_json::json!(secs);
+    }
+    body
+}
+
+/// The body of a rotate request (`/v1/admin/api-keys/rotate` or
+/// `/v1/admin/operators/rotate`).
+fn rotate_body(key_id: &str, overlap_secs: Option<u64>, expires_in_secs: Option<u64>) -> Value {
+    let mut body = serde_json::json!({ "key_id": key_id });
+    if let Some(secs) = overlap_secs {
+        body["overlap_secs"] = serde_json::json!(secs);
+    }
+    if let Some(secs) = expires_in_secs {
+        body["expires_in_secs"] = serde_json::json!(secs);
+    }
+    body
+}
+
+/// One line per credential of a `GET /v1/admin/operators` response.
+fn operator_lines(value: &Value) -> Vec<String> {
+    let text = |v: &Value, field: &str| {
+        v.get(field)
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let time = |v: &Value, field: &str| match v.get(field).and_then(|t| t.as_i64()) {
+        Some(at) => at.to_string(),
+        None => "never".to_string(),
+    };
+    value
+        .get("operators")
+        .and_then(|k| k.as_array())
+        .map(|credentials| {
+            credentials
+                .iter()
+                .map(|c| {
+                    let expired = c.get("expired").and_then(|e| e.as_bool()).unwrap_or(false);
+                    format!(
+                        "{}  name={}  expires_at={}{}  last_used_at={}  {}",
+                        text(c, "key_id"),
+                        text(c, "name"),
+                        time(c, "expires_at"),
+                        if expired { " (expired)" } else { "" },
+                        time(c, "last_used_at"),
+                        text(c, "description"),
+                    )
+                    .trim_end()
+                    .to_string()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// One line per key of a `GET /v1/admin/api-keys` response.
@@ -688,14 +800,9 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
                     expires_in_secs,
                 },
         } => {
-            let mut body = serde_json::json!({ "key_id": key_id });
-            if let Some(secs) = overlap_secs {
-                body["overlap_secs"] = serde_json::json!(secs);
-            }
-            if let Some(secs) = expires_in_secs {
-                body["expires_in_secs"] = serde_json::json!(secs);
-            }
-            let value = client.rotate_api_key(body).map_err(admin_error)?;
+            let value = client
+                .rotate_api_key(rotate_body(&key_id, overlap_secs, expires_in_secs))
+                .map_err(admin_error)?;
             let key = value
                 .get("api_key")
                 .and_then(|k| k.as_str())
@@ -727,6 +834,117 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 );
                 Ok(())
             })?;
+        }
+        Commands::Admin {
+            command: AdminCommands::CountPlaintextApiKeys,
+        } => {
+            let value = client.count_plaintext_api_keys().map_err(admin_error)?;
+            print_value(&value, cli.json, |v| {
+                let rows = v
+                    .get("plaintext_rows")
+                    .and_then(|n| n.as_u64())
+                    .unwrap_or(0);
+                if rows == 0 {
+                    println!("no API key holds plaintext in the database");
+                } else {
+                    println!(
+                        "{rows} API key(s) still hold plaintext in the database; run \
+                         `kosha admin scrub-plaintext-api-keys` once every server is upgraded"
+                    );
+                }
+                Ok(())
+            })?;
+        }
+        Commands::Admin {
+            command:
+                AdminCommands::CreateOperator {
+                    name,
+                    description,
+                    expires_in_secs,
+                },
+        } => {
+            let value = client
+                .create_operator(create_operator_body(&name, &description, expires_in_secs))
+                .map_err(admin_error)?;
+            let credential = value
+                .get("api_key")
+                .and_then(|k| k.as_str())
+                .ok_or("server response has no api_key")?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                eprintln!("created admin credential for operator {name:?}:");
+                println!("{credential}");
+                eprintln!("this is the only time the credential is shown; store it now.");
+            }
+        }
+        Commands::Admin {
+            command: AdminCommands::ListOperators,
+        } => {
+            let value = client.list_operators().map_err(admin_error)?;
+            print_value(&value, cli.json, |v| {
+                let lines = operator_lines(v);
+                if lines.is_empty() {
+                    eprintln!("no operator credentials");
+                }
+                for line in lines {
+                    println!("{line}");
+                }
+                Ok(())
+            })?;
+        }
+        Commands::Admin {
+            command: AdminCommands::RevokeOperator { key_id, name },
+        } => {
+            let body = match (&key_id, &name) {
+                (Some(key_id), _) => serde_json::json!({ "key_id": key_id }),
+                (None, Some(name)) => serde_json::json!({ "name": name }),
+                (None, None) => return Err("give a credential id or --name".into()),
+            };
+            let value = client.revoke_operator(body).map_err(admin_error)?;
+            print_value(&value, cli.json, |v| {
+                let revoked = v
+                    .get("revoked")
+                    .and_then(|r| r.as_array())
+                    .map(Vec::len)
+                    .unwrap_or(0);
+                println!(
+                    "revoked {revoked} operator credential(s); servers stop accepting them \
+                     within their key refresh interval"
+                );
+                Ok(())
+            })?;
+        }
+        Commands::Admin {
+            command:
+                AdminCommands::RotateOperator {
+                    key_id,
+                    overlap_secs,
+                    expires_in_secs,
+                },
+        } => {
+            let value = client
+                .rotate_operator(rotate_body(&key_id, overlap_secs, expires_in_secs))
+                .map_err(admin_error)?;
+            let credential = value
+                .get("api_key")
+                .and_then(|k| k.as_str())
+                .ok_or("server response has no api_key")?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                let old_expires = value
+                    .pointer("/replaces/expires_at")
+                    .and_then(|t| t.as_i64())
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "?".into());
+                eprintln!(
+                    "replacement for operator credential {key_id} (which keeps working until \
+                     unix time {old_expires}):"
+                );
+                println!("{credential}");
+                eprintln!("this is the only time the credential is shown; store it now.");
+            }
         }
         Commands::Admin {
             command:
@@ -1906,6 +2124,113 @@ mod tests {
                 command: AdminCommands::ScrubPlaintextApiKeys
             }
         ));
+    }
+
+    #[test]
+    fn admin_operator_commands_parse() {
+        let Commands::Admin {
+            command:
+                AdminCommands::CreateOperator {
+                    name,
+                    description,
+                    expires_in_secs,
+                },
+        } = parse(&[
+            "admin",
+            "create-operator",
+            "alice@example.com",
+            "--description",
+            "on call",
+            "--expires-in-secs",
+            "7776000",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("expected create-operator");
+        };
+        assert_eq!(
+            create_operator_body(&name, &description, expires_in_secs),
+            serde_json::json!({
+                "name": "alice@example.com",
+                "description": "on call",
+                "expires_in_secs": 7776000,
+            })
+        );
+        assert_eq!(
+            create_operator_body("bob", "", None),
+            serde_json::json!({"name": "bob"})
+        );
+        assert!(parse(&["admin", "create-operator"]).is_err());
+
+        assert!(matches!(
+            parse(&["admin", "list-operators"]).unwrap().command,
+            Commands::Admin {
+                command: AdminCommands::ListOperators
+            }
+        ));
+        assert!(matches!(
+            parse(&["admin", "revoke-operator", "abc"]).unwrap().command,
+            Commands::Admin {
+                command: AdminCommands::RevokeOperator { key_id: Some(k), name: None }
+            } if k == "abc"
+        ));
+        assert!(matches!(
+            parse(&["admin", "revoke-operator", "--name", "alice"]).unwrap().command,
+            Commands::Admin {
+                command: AdminCommands::RevokeOperator { key_id: None, name: Some(n) }
+            } if n == "alice"
+        ));
+        // One credential or every credential of a name, never neither or both.
+        assert!(parse(&["admin", "revoke-operator"]).is_err());
+        assert!(parse(&["admin", "revoke-operator", "abc", "--name", "alice"]).is_err());
+
+        let Commands::Admin {
+            command:
+                AdminCommands::RotateOperator {
+                    key_id,
+                    overlap_secs,
+                    expires_in_secs,
+                },
+        } = parse(&["admin", "rotate-operator", "abc", "--overlap-secs", "60"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected rotate-operator");
+        };
+        assert_eq!(
+            rotate_body(&key_id, overlap_secs, expires_in_secs),
+            serde_json::json!({"key_id": "abc", "overlap_secs": 60})
+        );
+        assert!(parse(&["admin", "rotate-operator"]).is_err());
+
+        assert!(matches!(
+            parse(&["admin", "count-plaintext-api-keys"])
+                .unwrap()
+                .command,
+            Commands::Admin {
+                command: AdminCommands::CountPlaintextApiKeys
+            }
+        ));
+    }
+
+    #[test]
+    fn operator_listing_reads_one_line_per_credential() {
+        let lines = operator_lines(&serde_json::json!({"operators": [
+            {"key_id": "aa11", "name": "alice", "description": "on call",
+             "expires_at": 1900000000, "expired": true, "last_used_at": 1800000000},
+            {"key_id": "bb22", "name": "segment-gc", "description": "",
+             "expires_at": null, "expired": false, "last_used_at": null},
+        ]}));
+        assert_eq!(
+            lines,
+            [
+                "aa11  name=alice  expires_at=1900000000 (expired)  \
+                 last_used_at=1800000000  on call",
+                "bb22  name=segment-gc  expires_at=never  last_used_at=never",
+            ]
+        );
+        assert!(operator_lines(&serde_json::json!({})).is_empty());
     }
 
     #[test]

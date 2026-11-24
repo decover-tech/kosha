@@ -264,6 +264,40 @@ async fn rotate(
     }))
 }
 
+/// Serialise changes to one operator's credentials: create, rotate and
+/// revoke all take this lock, so a revoke by name cannot run while a
+/// rotation has inserted a replacement it would not yet see.
+async fn lock_operator(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(tenant_id)
+        .execute(&mut **tx)
+        .await
+        .map(|_| ())
+}
+
+/// Lock the operator that the credential `key_hash` belongs to; `false`
+/// when no operator credential has that hash.
+async fn lock_operator_of(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    key_hash: &str,
+) -> Result<bool, sqlx::Error> {
+    let sql = format!(
+        "SELECT tenant_id FROM kosha.api_keys WHERE {KEY_HASH} = $1 AND {}",
+        Kind::Operator.condition()
+    );
+    let owner: Option<(String,)> = sqlx::query_as(&sql)
+        .bind(key_hash)
+        .fetch_optional(&mut **tx)
+        .await?;
+    match owner {
+        Some((tenant_id,)) => lock_operator(tx, &tenant_id).await.map(|()| true),
+        None => Ok(false),
+    }
+}
+
 /// Append the audit row of a change to the operator `name`'s credentials.
 async fn audit_operator(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -469,11 +503,7 @@ impl PgStore {
         rt.block_on(async {
             let mut tx = pool.begin().await.map_err(db_error)?;
             // Two creates for one name must not both find it free.
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-                .bind(&tenant_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(db_error)?;
+            lock_operator(&mut tx, &tenant_id).await.map_err(db_error)?;
             let taken: Option<(i32,)> = sqlx::query_as(
                 "SELECT 1 FROM kosha.api_keys \
                  WHERE tenant_id = $1 AND revoked_at IS NULL \
@@ -542,6 +572,17 @@ impl PgStore {
         );
         rt.block_on(async {
             let mut tx = pool.begin().await.map_err(db_error)?;
+            // Taken before the UPDATE, whose snapshot then includes any
+            // replacement a concurrent rotation committed.
+            match (&key_hash, &tenant_id) {
+                (Some(hash), _) => {
+                    lock_operator_of(&mut tx, hash).await.map_err(db_error)?;
+                }
+                (None, Some(tenant_id)) => {
+                    lock_operator(&mut tx, tenant_id).await.map_err(db_error)?;
+                }
+                (None, None) => {}
+            }
             let rows: Vec<(String, String)> = sqlx::query_as(&sql)
                 .bind(key_hash)
                 .bind(tenant_id)
@@ -580,6 +621,12 @@ impl PgStore {
         let (pool, rt) = self.pool_and_runtime();
         rt.block_on(async {
             let mut tx = pool.begin().await.map_err(db_error)?;
+            if !lock_operator_of(&mut tx, key_hash)
+                .await
+                .map_err(db_error)?
+            {
+                return Ok(None);
+            }
             let Some(rotated) = rotate(
                 &mut tx,
                 Kind::Operator,

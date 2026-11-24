@@ -208,9 +208,11 @@ fn invalid_bootstrap_key_switch_refuses_to_start() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
     assert!(
-        stderr.contains("FATAL: invalid KOSHA_ADMIN_BOOTSTRAP_KEY 'disable'"),
+        stderr.contains("FATAL: invalid KOSHA_ADMIN_BOOTSTRAP_KEY"),
         "stderr: {stderr}"
     );
+    // A mistyped value may be a secret: it is not echoed.
+    assert!(!stderr.contains("'disable'"), "stderr: {stderr}");
 }
 
 /// #346: `KOSHA_ADMIN_BOOTSTRAP_KEY=disabled` turns the shared admin key

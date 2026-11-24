@@ -72,6 +72,11 @@ selected profile → default `http://localhost:8080`.
 | `kosha admin rotate-api-key KEY_ID [--overlap-secs N] [--expires-in-secs N]` | Replace a key; the old one keeps working for the overlap (admin) |
 | `kosha admin revoke-api-key KEY_ID` | Revoke a key (admin) |
 | `kosha admin scrub-plaintext-api-keys` | Remove plaintext held by keys created before scoped keys (admin) |
+| `kosha admin count-plaintext-api-keys` | How many keys still hold plaintext, i.e. what the scrub would rewrite (admin, read-only) |
+| `kosha admin create-operator NAME [--description D] [--expires-in-secs N]` | Issue a named admin credential for one operator (admin, Postgres only) |
+| `kosha admin list-operators` | List operator credentials: id, name, expiry, last use (admin) |
+| `kosha admin rotate-operator KEY_ID [--overlap-secs N] [--expires-in-secs N]` | Replace an operator credential; the old one keeps working for the overlap (admin) |
+| `kosha admin revoke-operator KEY_ID` / `--name NAME` | Revoke one operator credential, or every credential of an operator (admin) |
 | `kosha rebuild-filter-blooms -n NS` | Rebuild segment filter blooms (admin) |
 | `kosha backfill-offset-tables -n NS` | Backfill `doc_store.offsets` (admin) |
 | `kosha curl METHOD PATH [--body @file]` | Raw REST escape hatch |
@@ -188,6 +193,20 @@ kosha admin revoke-api-key "$KEY_ID"             # or cut it off now
 Without `--scope`, `--namespace` or `--expires-in-secs` a key has every scope,
 reaches every namespace of its tenant and never expires. `rotate-api-key`
 prints the replacement key the same way `create-api-key` does.
+
+Operator credentials replace the shared `KOSHA_ADMIN_API_KEY` with one named
+admin credential per person or job (see
+[Operator admin credentials](../../README.md#operator-admin-credentials)).
+They print the same way:
+
+```bash
+# Issue a credential for alice, valid for 90 days; it is shown only once.
+ALICE=$(kosha admin create-operator alice@example.com --expires-in-secs 7776000)
+
+kosha admin list-operators                       # first column is the credential id
+kosha --api-key "$ALICE" admin rotate-operator "$CRED_ID" --overlap-secs 3600
+kosha admin revoke-operator --name alice@example.com   # offboarding: every credential
+```
 
 `compact --wait` polls `GET /v1/admin/compaction-jobs/{id}` every
 `--poll-interval` seconds (default 2) and gives up after `--timeout` seconds
