@@ -3079,6 +3079,12 @@ pub const PACKED_POSITIONS_INVERTED_VERSION: u32 = 7;
 const NO_POSITIONS_MARKER: u8 = 34;
 const EXPLICIT_POSITION_COUNTS_MARKER: u8 = 35;
 
+fn is_field_norms_key(term: &str) -> bool {
+    term.strip_prefix('\0')
+        .and_then(|s| s.strip_suffix('\0'))
+        .is_some_and(kosha_core::fields::is_indexable_field_name)
+}
+
 /// THE canonical "is this a split-format inverted TOC?" predicate. Every
 /// site that dispatches on split-ness (the server's posting-blob hydration
 /// gate, `SplitInvertedIndex::detect`, format probes) must call this
@@ -3757,11 +3763,8 @@ impl TermEncoder {
     fn start_term(&mut self, term: &str) {
         // Norms and NUL-containing analyzer tokens can share a key, so
         // tf is not a position count for every posting on these keys.
-        self.explicit_position_counts = self.version == PACKED_POSITIONS_INVERTED_VERSION
-            && term
-                .strip_prefix('\0')
-                .and_then(|s| s.strip_suffix('\0'))
-                .is_some_and(kosha_core::fields::is_indexable_field_name);
+        self.explicit_position_counts =
+            self.version == PACKED_POSITIONS_INVERTED_VERSION && is_field_norms_key(term);
         if self.explicit_position_counts {
             self.positions.mem.push(EXPLICIT_POSITION_COUNTS_MARKER);
         }
@@ -6047,19 +6050,21 @@ impl BlockedTermPostings {
     /// Full decode — scoring and positions sections zipped by ordinal into
     /// the classic `Vec<Posting>`. This is the phrase-query / compat path;
     /// scoring never calls it.
-    fn decode_full(&self) -> Option<(Vec<Posting>, usize)> {
+    fn decode_full(&self, term: &str) -> Option<(Vec<Posting>, usize)> {
         let mut postings: Vec<Posting> = Vec::with_capacity(self.doc_count as usize);
         let mut block_buf: Vec<ScoringPosting> = Vec::with_capacity(SCORING_BLOCK_LEN);
         let mut positions_buf = self.span.get(self.positions_base as usize..)?;
         let v7 = self.version == PACKED_POSITIONS_INVERTED_VERSION;
+        let allow_position_markers = v7 && is_field_norms_key(term);
         let mut packed = v7;
-        if v7 {
+        if allow_position_markers {
             if let Some(rest) = positions_buf.strip_prefix(&[EXPLICIT_POSITION_COUNTS_MARKER]) {
                 positions_buf = rest;
                 packed = false;
             }
         }
-        let positionless = packed && positions_buf == [NO_POSITIONS_MARKER];
+        let positionless =
+            packed && allow_position_markers && positions_buf == [NO_POSITIONS_MARKER];
         if positionless {
             positions_buf = &[];
         }
@@ -6311,7 +6316,7 @@ impl SplitInvertedIndex {
                     self.note_blob_read_failure();
                     continue;
                 };
-                let Some((postings, approx_bytes)) = self.decode_term(&bytes) else {
+                let Some((postings, approx_bytes)) = self.decode_term(term, &bytes) else {
                     self.note_blob_read_failure();
                     continue;
                 };
@@ -6342,17 +6347,17 @@ impl SplitInvertedIndex {
         let (_, _, blob_id, p_off, p_len) = self.raw_entry(i);
         let blob = self.open_posting_blob(blob_id)?;
         let bytes = self.term_bytes(&blob, blob_id, p_off, p_len)?;
-        self.decode_term(&bytes)
+        self.decode_term(self.term_at(i), &bytes)
     }
 
     /// Full decode of one term's span, in this index's encoding.
-    fn decode_term(&self, bytes: &[u8]) -> Option<(Vec<Posting>, usize)> {
+    fn decode_term(&self, term: &str, bytes: &[u8]) -> Option<(Vec<Posting>, usize)> {
         match self.encoding {
             SplitPostingsEncoding::Fixed32 => decode_postings_bytes(bytes),
             SplitPostingsEncoding::VarintDelta => decode_postings_varint_delta_bytes(bytes),
             SplitPostingsEncoding::SkipSplit(version) => {
                 BlockedTermPostings::parse(Arc::new(bytes.to_vec()), version)
-                    .and_then(|b| b.decode_full())
+                    .and_then(|b| b.decode_full(term))
             }
         }
     }
@@ -12206,7 +12211,10 @@ mod tests {
             .unwrap();
         let mut buf = Vec::new();
         assert!(clean.read_block(0, &mut buf), "clean block must decode");
-        assert!(clean.decode_full().is_some(), "clean span must full-decode");
+        assert!(
+            clean.decode_full("term").is_some(),
+            "clean span must full-decode"
+        );
 
         // Corrupt one byte in the middle of block 0's scoring bytes. The
         // skip table still parses; only the decoded doc chain breaks.
@@ -12224,7 +12232,7 @@ mod tests {
                 }
             }
             assert!(
-                any_block_failed || parsed.decode_full().is_none(),
+                any_block_failed || parsed.decode_full("term").is_none(),
                 "a corrupted span must fail some decode closed, never \
                  return shifted doc_ids as success"
             );
@@ -12265,7 +12273,7 @@ mod tests {
 
         let clean = BlockedTermPostings::parse(Arc::new(span.clone()), SKIP_SPLIT_INVERTED_VERSION)
             .unwrap();
-        let (decoded, _) = clean.decode_full().unwrap();
+        let (decoded, _) = clean.decode_full("term").unwrap();
         assert_eq!(decoded.len(), 4);
 
         // The positions section trails the span; overwrite its first
@@ -12284,7 +12292,7 @@ mod tests {
         let parsed = BlockedTermPostings::parse(Arc::new(corrupted), SKIP_SPLIT_INVERTED_VERSION)
             .expect("skip table untouched — parse must still succeed");
         assert!(
-            parsed.decode_full().is_none(),
+            parsed.decode_full("term").is_none(),
             "oversized position count must fail closed, not allocate"
         );
     }
@@ -13876,7 +13884,7 @@ mod tests {
             assert_eq!(buf, expected, "block {b} scoring mismatch");
         }
 
-        let (full, _) = parsed.decode_full().expect("full decode");
+        let (full, _) = parsed.decode_full("term").expect("full decode");
         assert_eq!(full, postings, "positions must survive the round trip");
 
         // find_block: exact hits, between-blocks targets, and past-the-end.
@@ -13926,7 +13934,7 @@ mod tests {
             for b in 0..parsed.block_count() {
                 let _ = parsed.read_block(b, &mut buf); // must not panic
             }
-            let _ = parsed.decode_full(); // must not panic
+            let _ = parsed.decode_full("term"); // must not panic
         }
     }
 
@@ -14766,7 +14774,7 @@ mod bounded_build_tests {
             let mut bytes = Vec::new();
             encoder.finish(&mut bytes).unwrap();
             let parsed = BlockedTermPostings::parse(Arc::new(bytes), version).unwrap();
-            let (postings, charged) = parsed.decode_full().unwrap();
+            let (postings, charged) = parsed.decode_full("term").unwrap();
             assert_eq!(
                 charged,
                 std::mem::size_of::<Posting>()
@@ -14812,7 +14820,7 @@ mod bounded_build_tests {
                 PACKED_POSITIONS_INVERTED_VERSION,
             )
             .unwrap();
-            assert_eq!(parsed.decode_full().unwrap().0, postings);
+            assert_eq!(parsed.decode_full("term").unwrap().0, postings);
             assert_eq!(
                 parsed.blocks.last().unwrap().scoring_start,
                 parsed.blocks.last().unwrap().scoring_end
@@ -14823,11 +14831,29 @@ mod bounded_build_tests {
                     PACKED_POSITIONS_INVERTED_VERSION,
                 )
                 .unwrap();
-                assert!(corrupt.decode_full().is_none());
+                assert!(corrupt.decode_full("term").is_none());
             }
         }
         assert!(encoder.spilled_total() > 0);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn v7_rejects_explicit_position_marker_on_ordinary_term() {
+        let dir = scratch("v7corrupt-position-mode");
+        let version = PACKED_POSITIONS_INVERTED_VERSION;
+        let mut encoder = TermEncoder::new(version, &dir, 4096);
+        let positions = [3, 4, 5, 2053];
+        encoder.push(0, 4, &positions, &[]).unwrap();
+        let mut bytes = Vec::new();
+        encoder.finish(&mut bytes).unwrap();
+        let clean = BlockedTermPostings::parse(Arc::new(bytes.clone()), version).unwrap();
+        assert_eq!(clean.decode_full("term").unwrap().0[0].positions, positions);
+        let marker = &mut bytes[clean.positions_base as usize];
+        assert_eq!(*marker, 33);
+        *marker = EXPLICIT_POSITION_COUNTS_MARKER;
+        let corrupt = BlockedTermPostings::parse(Arc::new(bytes), version).unwrap();
+        assert!(corrupt.decode_full("term").is_none());
     }
 
     #[test]
