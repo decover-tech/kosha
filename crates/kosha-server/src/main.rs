@@ -458,6 +458,10 @@ struct AppState {
     /// posting blobs of in-flight warm segments — the cache is sized for
     /// that today, but the invariant is not enforced.
     posting_blob_presence: Mutex<PostingBlobPresenceCache>,
+    /// Per-tenant hits and misses of `posting_blob_presence`, counted per
+    /// segment looked up, for `kosha_cache_{hits,misses}_total{cache=
+    /// "posting_blob_presence"}` (#197).
+    posting_presence_stats: Mutex<kosha_core::tenancy::TenantLedger>,
     /// Readiness-gated warmup (Tier 1 O2): when `KOSHA_WARMUP_NAMESPACES`
     /// is set, a background thread prefetches the scoring-set files
     /// (`footer.json` + `inverted.idx` + `doc_store.offsets` [+ `filters.bin`/
@@ -2298,6 +2302,7 @@ impl AppState {
             rerankers: rerank::RerankRegistry::from_env(),
             embedders: embedding::EmbedderRegistry::from_env(),
             posting_blob_presence: Mutex::new(HashMap::new()),
+            posting_presence_stats: Mutex::new(Default::default()),
             // Warmup starts ready; `spawn_warmup` flips `false` only when
             // there's configured work to do (and back to `true` on
             // completion / fail-open). See the field's doc comment.
@@ -2954,6 +2959,18 @@ impl AppState {
             .last_run_ms
             .store(unix_millis(), std::sync::atomic::Ordering::Relaxed);
         reports
+    }
+
+    /// Count posting-blob presence lookups for `ns`'s tenant (#197).
+    #[cfg(feature = "s3")]
+    fn record_presence_lookups(&self, ns: &NamespaceId, hits: u64, misses: u64) {
+        let tenant = kosha_core::tenancy::tenant_of_namespace(&ns.0);
+        let mut stats = self
+            .posting_presence_stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        stats.hits(tenant, hits);
+        stats.misses(tenant, misses);
     }
 
     /// The generation `posting_blob_presence` entries are stamped with and
@@ -5716,6 +5733,7 @@ impl AppState {
         let mut ranged: Vec<PathBuf> = Vec::new();
         let mut whole: Vec<PathBuf> = Vec::new();
         let mut shards_local: Vec<(String, String)> = Vec::new();
+        let (mut presence_hits, mut presence_misses) = (0u64, 0u64);
         for seg in seg_paths {
             let Ok(rel) = seg.strip_prefix(&self.data_dir) else {
                 continue;
@@ -5728,8 +5746,10 @@ impl AppState {
                 keys.iter().all(|k| set.contains(k))
                     || posting_files.iter().all(|f| set.contains(f))
             }) {
+                presence_hits += 1;
                 continue;
             }
+            presence_misses += 1;
             // Every shard the terms hash to is already a whole local file
             // (warmed, promoted, or fetched whole): the postings are local,
             // confirmed by name with one stat per shard. Without this, a
@@ -5760,6 +5780,8 @@ impl AppState {
                 whole.push(seg.clone());
             }
         }
+
+        self.record_presence_lookups(ns, presence_hits, presence_misses);
 
         if !shards_local.is_empty() {
             // The same generation every other presence stamp uses: a stamp
@@ -6067,6 +6089,15 @@ impl AppState {
             kosha_segment::inverted_uses_posting_blobs,
             file_present_nonempty,
         );
+        let (hits, misses) = presence_lookup_counts(
+            seg_paths,
+            posting_files,
+            &self.data_dir,
+            &cached,
+            &logical_paths,
+            &newly_confirmed,
+        );
+        self.record_presence_lookups(ns, hits, misses);
 
         let mut outcome = HydrationOutcome::default();
         match prune_unwritten_posting_blobs(&self.data_dir, &mut logical_paths) {
@@ -6484,6 +6515,36 @@ fn plan_posting_blob_fetch(
     }
 
     (logical_paths, newly_confirmed)
+}
+
+/// Presence-cache `(hits, misses)` of one [`plan_posting_blob_fetch`],
+/// counted per segment: a hit is a segment whose every shard the cache had
+/// already confirmed; a miss is a split segment the plan had to stat. A
+/// segment without posting shards is neither, as it never enters the cache.
+#[cfg(feature = "s3")]
+fn presence_lookup_counts(
+    seg_paths: &[PathBuf],
+    posting_files: &[String],
+    data_dir: &Path,
+    cached: &HashMap<String, std::collections::HashSet<String>>,
+    logical_paths: &[(String, u64)],
+    newly_confirmed: &[(String, String)],
+) -> (u64, u64) {
+    let hits = seg_paths
+        .iter()
+        .filter_map(|seg| seg.strip_prefix(data_dir).ok())
+        .filter(|rel| {
+            cached
+                .get(rel.to_string_lossy().as_ref())
+                .is_some_and(|set| posting_files.iter().all(|f| set.contains(f.as_str())))
+        })
+        .count() as u64;
+    let planned: std::collections::HashSet<&str> = logical_paths
+        .iter()
+        .filter_map(|(path, _)| path.rsplit_once('/').map(|(seg, _)| seg))
+        .chain(newly_confirmed.iter().map(|(seg, _)| seg.as_str()))
+        .collect();
+    (hits, planned.len() as u64)
 }
 
 /// Cache a TOC-proven absence as resolved, just like a present shard:
@@ -6990,6 +7051,14 @@ fn cache_tenant_samples(state: &AppState) -> Vec<metrics::CacheTenantSample> {
             state.searcher.corpus_stats_cache_tenant_stats(),
         ),
         ("ceiling", state.searcher.ceiling_cache_tenant_stats()),
+        (
+            "posting_blob_presence",
+            state
+                .posting_presence_stats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .stats(),
+        ),
     ]
     .into_iter()
     .flat_map(|(cache, stats)| {
@@ -17513,6 +17582,44 @@ mod tests {
     /// A non-split-format segment must be skipped entirely — no stat calls,
     /// no fetch, no cache entries — matching the pre-cache
     /// `inverted_uses_posting_blobs` gate this wraps.
+    /// #197: a segment the cache fully covered is a hit, a split segment
+    /// the plan had to stat or fetch is one miss however many shards it
+    /// planned, and a segment without shards is neither.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn presence_lookup_counts_hits_and_misses_per_segment() {
+        let segs: Vec<PathBuf> = ["seg-1", "seg-2", "seg-3", "seg-legacy"]
+            .iter()
+            .map(|s| PathBuf::from(format!("/data/ns/{s}")))
+            .collect();
+        let files = vec!["postings-00.bin".to_string(), "postings-01.bin".to_string()];
+        let mut cached = HashMap::new();
+        cached.insert(
+            "ns/seg-1".to_string(),
+            std::collections::HashSet::from(["postings-00.bin".into(), "postings-01.bin".into()]),
+        );
+        cached.insert(
+            "ns/seg-2".to_string(),
+            std::collections::HashSet::from(["postings-00.bin".into()]),
+        );
+        let fetch = vec![
+            ("ns/seg-2/postings-01.bin".to_string(), 0),
+            ("ns/seg-3/postings-00.bin".to_string(), 0),
+        ];
+        let confirmed = vec![("ns/seg-3".to_string(), "postings-01.bin".to_string())];
+        assert_eq!(
+            presence_lookup_counts(
+                &segs,
+                &files,
+                Path::new("/data"),
+                &cached,
+                &fetch,
+                &confirmed
+            ),
+            (1, 2)
+        );
+    }
+
     #[cfg(feature = "s3")]
     #[test]
     fn plan_posting_blob_fetch_skips_non_split_segments() {
