@@ -547,6 +547,12 @@ under the namespace's publication lock:
    `s3:ListBucketMultipartUploads`, and `s3:AbortMultipartUpload` in addition
    to its existing S3 permissions.
 
+The S3 check covers the namespace or tenant prefix, not the separate
+`_wal/{writer_id}/` streams. Versioned S3 WAL objects can retain prior
+versions after reclamation, and shared WAL files can retain the deleted
+namespace's bytes until other namespaces in the file are checkpointed.
+A completed deletion does not certify erasure from those streams.
+
 **Exporting a namespace.** Send `{"format":"jsonl"}` (or `{}`) to
 `POST /v1/namespaces/{ns}/export`. With S3 configured, the ingest pod builds
 a snapshot of all live documents, including acknowledged unflushed writes,
@@ -558,6 +564,10 @@ namespace's `_exports/` prefix, with the namespace's normal S3 encryption
 settings. Hard delete removes these objects too; URL expiry does not delete
 the objects. Use a bucket lifecycle rule to expire the export prefix sooner
 if needed. Only JSONL is supported.
+
+For a sharded namespace, the export reads a strong snapshot of each shard
+in turn, not a single point-in-time snapshot across shards. Pause writes
+to the namespace during export if you need that consistency.
 
 **Evolving a schema.** `POST /v1/namespaces/{ns}/schema` accepts new field
 declarations on a live namespace. Changing or removing a previously
