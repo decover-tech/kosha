@@ -19833,7 +19833,7 @@ mod tests {
     #[cfg(all(feature = "s3", feature = "postgres"))]
     #[test]
     fn fetch_from_peer_streams_a_500_mb_file_intact() {
-        const TEST_ROOT: &str = "KOSHA_TEST_PEER_TRANSFER_ROOT";
+        const TEST_ROOT: &str = "TEST_KOSHA_PEER_TRANSFER_ROOT";
         let Some(root) = std::env::var_os(TEST_ROOT) else {
             // Peak RSS includes both peers but no parallel tests. The parent
             // owns cleanup even if the child fails or its server is still up.
