@@ -948,7 +948,7 @@ export interface components {
              */
             top_n?: number;
         };
-        /** @description score(d) = sum over retrievers r of 1 / (rank_constant + rank_r(d)). */
+        /** @description score(d) = sum over retrievers r of weight_r / (rank_constant + rank_r(d)). */
         v1RrfRank: {
             /**
              * Format: int64
@@ -961,6 +961,20 @@ export interface components {
              *     must be >= max_results.
              */
             rank_window_size?: number;
+            weights?: components["schemas"]["v1RrfWeights"];
+        };
+        /** @description Each weight defaults to 1 and must be finite and > 0. */
+        v1RrfWeights: {
+            /**
+             * Format: double
+             * @description Weight of the knn retriever's list.
+             */
+            knn?: number;
+            /**
+             * Format: double
+             * @description Weight of the lexical retriever's list.
+             */
+            lexical?: number;
         };
         v1ScoredDocument: {
             doc_id?: string;

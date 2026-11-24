@@ -648,7 +648,9 @@ indexed segments, with the flush-interval lag. See §11.
 5. **Fusion**: candidate sets from lexical and semantic retrieval are merged via Reciprocal Rank
    Fusion, `score(d) = Σ_r 1/(rank_constant + rank_r(d))`, matching `ranking/rrf.py`'s existing
    behavior — ported in, not reinvented. Request shape is Elasticsearch's
-   `"rank": {"rrf": {"rank_window_size", "rank_constant"}}` (defaults: `max_results`, 60); every
+   `"rank": {"rrf": {"rank_window_size", "rank_constant", "weights"}}` (defaults: `max_results`,
+   60, and weight 1 for each retriever; `weights: {lexical, knn}` makes the sum
+   `Σ_r weight_r/(rank_constant + rank_r(d))`, issue #203); every
    request with both a lexical query and `knn` is fused this way (implemented, issue #228). Ranks
    are **global**: each segment returns its best `rank_window_size` BM25 hits and its nearest `k`
    vectors, and only after every segment has answered are both lists ordered across the whole

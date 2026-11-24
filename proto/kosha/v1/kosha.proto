@@ -16,7 +16,7 @@ option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_swagger) = {
     // The contract revision (ADR-350 §a): 1.MINOR.PATCH now that v1 is GA
     // (0.9.x and 0.10.x were pre-GA). Independent of the crate version; kept
     // equal to `api_error::API_VERSION` by a test.
-    version: "1.0.0"
+    version: "1.1.0"
     description:
       "The public Kosha HTTP/JSON API. The OpenAPI document is the wire contract; "
       "proto3 canonical JSON is not (see docs/api/versioning.md). Every request carries "
@@ -2404,13 +2404,23 @@ message Rank {
   optional RrfRank rrf = 1;
 }
 
-// score(d) = sum over retrievers r of 1 / (rank_constant + rank_r(d)).
+// score(d) = sum over retrievers r of weight_r / (rank_constant + rank_r(d)).
 message RrfRank {
   // Per-retriever list length and fused list length. Default: max_results;
   // must be >= max_results.
   optional uint32 rank_window_size = 1;
   // Default 60; must be >= 1.
   optional uint32 rank_constant = 2;
+  // Per-retriever weights. Default: every weight 1 (unweighted RRF).
+  optional RrfWeights weights = 3;
+}
+
+// Each weight defaults to 1 and must be finite and > 0.
+message RrfWeights {
+  // Weight of the lexical retriever's list.
+  optional double lexical = 1;
+  // Weight of the knn retriever's list.
+  optional double knn = 2;
 }
 
 message FuzzyQuery {

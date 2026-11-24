@@ -3611,8 +3611,8 @@ pub struct RankSpec {
 }
 
 /// Reciprocal Rank Fusion parameters (Elasticsearch-compatible names and
-/// defaults): `score(d) = Σ_r 1 / (rank_constant + rank_r(d))` over the
-/// retrievers `r` whose top-`rank_window_size` list contains `d`.
+/// defaults): `score(d) = Σ_r weight_r / (rank_constant + rank_r(d))` over
+/// the retrievers `r` whose top-`rank_window_size` list contains `d`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RrfSpec {
@@ -3624,16 +3624,37 @@ pub struct RrfSpec {
     /// Damps the advantage of the very top ranks. Default 60; must be ≥ 1.
     #[serde(default)]
     pub rank_constant: Option<u32>,
+    /// Per-retriever weights (issue #203). Omitted, every weight is 1 and
+    /// the fused score is the unweighted sum, bit for bit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weights: Option<RrfWeights>,
+}
+
+/// Weighted RRF: `score(d) = Σ_r weight_r / (rank_constant + rank_r(d))`.
+/// Each weight defaults to 1 and must be finite and > 0.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RrfWeights {
+    /// Weight of the lexical retriever's list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lexical: Option<f64>,
+    /// Weight of the `knn` retriever's list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knn: Option<f64>,
 }
 
 /// Default `rank_constant` (Elasticsearch and the original RRF paper).
 pub const DEFAULT_RRF_RANK_CONSTANT: u32 = 60;
 
 /// Resolved RRF parameters for one request; see [`SearchQuery::rrf`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RrfParams {
     pub rank_window_size: usize,
     pub rank_constant: u32,
+    /// `rank.rrf.weights.lexical`, default 1.
+    pub lexical_weight: f64,
+    /// `rank.rrf.weights.knn`, default 1.
+    pub knn_weight: f64,
 }
 
 /// Per-retriever ranks of a fused hit (`ScoredDocument.rank_details`).
@@ -3803,6 +3824,17 @@ impl SearchQuery {
                 return Err(KoshaError::InvalidQuery(
                     "rank.rrf.rank_constant must be >= 1".into(),
                 ));
+            }
+            if let Some(ref weights) = rrf.weights {
+                for (name, weight) in [("lexical", weights.lexical), ("knn", weights.knn)] {
+                    if let Some(w) = weight {
+                        if !w.is_finite() || w <= 0.0 {
+                            return Err(KoshaError::InvalidQuery(format!(
+                                "rank.rrf.weights.{name} must be a finite number > 0, got {w}"
+                            )));
+                        }
+                    }
+                }
             }
             if let Some(window) = rrf.rank_window_size {
                 if window == 0 || window < self.max_results {
@@ -3995,6 +4027,7 @@ impl SearchQuery {
             return None;
         }
         let spec = self.rank.as_ref().and_then(|r| r.rrf.as_ref());
+        let weights = spec.and_then(|s| s.weights.as_ref());
         Some(RrfParams {
             rank_window_size: spec
                 .and_then(|s| s.rank_window_size)
@@ -4004,6 +4037,8 @@ impl SearchQuery {
                 .and_then(|s| s.rank_constant)
                 .unwrap_or(DEFAULT_RRF_RANK_CONSTANT)
                 .max(1),
+            lexical_weight: weights.and_then(|w| w.lexical).unwrap_or(1.0),
+            knn_weight: weights.and_then(|w| w.knn).unwrap_or(1.0),
         })
     }
 

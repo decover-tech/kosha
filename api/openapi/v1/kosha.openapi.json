@@ -1189,7 +1189,7 @@
         "type": "object"
       },
       "v1RrfRank": {
-        "description": "score(d) = sum over retrievers r of 1 / (rank_constant + rank_r(d)).",
+        "description": "score(d) = sum over retrievers r of weight_r / (rank_constant + rank_r(d)).",
         "properties": {
           "rank_constant": {
             "description": "Default 60; must be >= 1.",
@@ -1200,6 +1200,25 @@
             "description": "Per-retriever list length and fused list length. Default: max_results;\nmust be >= max_results.",
             "format": "int64",
             "type": "integer"
+          },
+          "weights": {
+            "$ref": "#/components/schemas/v1RrfWeights"
+          }
+        },
+        "type": "object"
+      },
+      "v1RrfWeights": {
+        "description": "Each weight defaults to 1 and must be finite and > 0.",
+        "properties": {
+          "knn": {
+            "description": "Weight of the knn retriever's list.",
+            "format": "double",
+            "type": "number"
+          },
+          "lexical": {
+            "description": "Weight of the lexical retriever's list.",
+            "format": "double",
+            "type": "number"
           }
         },
         "type": "object"
@@ -1372,7 +1391,7 @@
   "info": {
     "description": "The public Kosha HTTP/JSON API. The OpenAPI document is the wire contract; proto3 canonical JSON is not (see docs/api/versioning.md). Every request carries a tenant API key (`Authorization: Bearer <key>` or `X-Api-Key: <key>`), and every namespace in a path is relative to that key's tenant.",
     "title": "Kosha API",
-    "version": "1.0.0"
+    "version": "1.1.0"
   },
   "openapi": "3.0.3",
   "paths": {

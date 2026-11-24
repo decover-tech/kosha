@@ -8923,7 +8923,9 @@ struct FusedLists {
 }
 
 /// Rank both retrievers across the whole namespace and fuse them with
-/// Reciprocal Rank Fusion: `score(d) = Σ_r 1 / (rank_constant + rank_r(d))`.
+/// Reciprocal Rank Fusion:
+/// `score(d) = Σ_r weight_r / (rank_constant + rank_r(d))`, every weight 1
+/// unless `rank.rrf.weights` says otherwise.
 ///
 /// `lexical` holds every segment's best `rank_window_size` BM25 hits, which
 /// is a superset of the namespace's best `rank_window_size`; `vector` every
@@ -8961,7 +8963,8 @@ fn rrf_fuse(
     vector.truncate(window.min(knn_k));
 
     let constant = f64::from(params.rank_constant);
-    let contribution = |rank: usize| 1.0 / (constant + rank as f64);
+    let contribution = |weight: f64, rank: usize| weight / (constant + rank as f64);
+    let (lexical_weight, knn_weight) = (params.lexical_weight, params.knn_weight);
     let mut fused: Vec<HitCandidate> = Vec::with_capacity(lexical.len() + vector.len());
     let mut position: HashMap<String, usize> = HashMap::with_capacity(lexical.len());
     for (i, mut cand) in lexical.into_iter().enumerate() {
@@ -8971,7 +8974,7 @@ fn rrf_fuse(
             lexical_score: Some(cand.score),
             ..RankDetails::default()
         });
-        cand.score = contribution(rank);
+        cand.score = contribution(lexical_weight, rank);
         position.insert(cand.doc_id.0.clone(), fused.len());
         fused.push(cand);
     }
@@ -8984,7 +8987,7 @@ fn rrf_fuse(
         match position.get(&cand.doc_id.0) {
             Some(&at) => {
                 let hit = &mut fused[at];
-                hit.score += contribution(rank);
+                hit.score += contribution(knn_weight, rank);
                 let details = hit.rank_details.get_or_insert_with(RankDetails::default);
                 details.knn_rank = Some(rank as u32);
                 details.knn_score = Some(cand.score);
@@ -8995,7 +8998,7 @@ fn rrf_fuse(
                     knn_score: Some(cand.score),
                     ..RankDetails::default()
                 });
-                cand.score = contribution(rank);
+                cand.score = contribution(knn_weight, rank);
                 fused.push(cand);
             }
         }
@@ -20511,6 +20514,7 @@ mod rrf_tests {
         Some(RrfSpec {
             rank_window_size: window,
             rank_constant: constant,
+            weights: None,
         })
     }
 
@@ -20831,7 +20835,9 @@ mod rrf_tests {
             q.rrf(),
             Some(RrfParams {
                 rank_window_size: 100,
-                rank_constant: 60
+                rank_constant: 60,
+                lexical_weight: 1.0,
+                knn_weight: 1.0,
             })
         );
         assert!(serde_json::from_value::<SearchQuery>(serde_json::json!({
@@ -20879,6 +20885,167 @@ mod rrf_tests {
         }
         assert_eq!(walked, full_ids);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn weighted(window: usize, lexical: Option<f64>, knn: Option<f64>) -> Option<RrfSpec> {
+        Some(RrfSpec {
+            rank_window_size: Some(window),
+            rank_constant: None,
+            weights: Some(kosha_core::RrfWeights { lexical, knn }),
+        })
+    }
+
+    /// Weighted RRF written out longhand from the definition, over
+    /// rankings given as id lists (best first): `Σ_r w_r / (c + rank_r)`,
+    /// ordered by score descending then `_id`, cut to `window`.
+    fn reference_rrf(
+        rankings: &[(&[String], f64)],
+        constant: u32,
+        window: usize,
+    ) -> Vec<(String, f64)> {
+        let mut scores: Vec<(String, f64)> = Vec::new();
+        for (ranking, weight) in rankings {
+            for (i, id) in ranking.iter().enumerate() {
+                let add = weight / (f64::from(constant) + (i + 1) as f64);
+                match scores.iter_mut().find(|(seen, _)| seen == id) {
+                    Some((_, score)) => *score += add,
+                    None => scores.push((id.clone(), add)),
+                }
+            }
+        }
+        scores.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        scores.truncate(window);
+        scores
+    }
+
+    #[test]
+    fn weighted_rrf_matches_the_reference_on_fixed_rankings() {
+        // The reference itself, on hand-written rankings: "b" is second on
+        // both lists, "a" first on the lexical one, "c" first on the vector.
+        let lex: Vec<String> = ["a", "b", "d"].map(String::from).to_vec();
+        let vec: Vec<String> = ["c", "b"].map(String::from).to_vec();
+        let got = reference_rrf(&[(&lex, 1.0), (&vec, 1.0)], 60, 10);
+        assert_eq!(got[0], ("b".into(), 2.0 / 62.0));
+        assert_eq!(got[1], ("a".into(), 1.0 / 61.0));
+        assert_eq!(got[2], ("c".into(), 1.0 / 61.0));
+        let got = reference_rrf(&[(&lex, 1.0), (&vec, 3.0)], 60, 10);
+        assert_eq!(got[0], ("b".into(), 1.0 / 62.0 + 3.0 / 62.0));
+        assert_eq!(got[1], ("c".into(), 3.0 / 61.0));
+
+        // The engine, against the reference fed each retriever's own
+        // namespace-wide ranking (asked for on its own), across segments.
+        let dir = scratch("weighted");
+        let mut rng = Rng(0x5eed_0203);
+        let docs = random_corpus(&mut rng, 200);
+        let groups = random_split(&mut rng, &docs);
+        let (manifest, _) = write(&dir, "s", &groups);
+        let searcher = Searcher::new(dir.clone());
+        for (text, window, k) in [("gamma", 25, 20), ("alpha beta", 40, 60)] {
+            let base = hybrid(text, window, k, None);
+            let mut lexical: SearchQuery = serde_json::from_value(serde_json::json!({
+                "query_text": text, "max_results": window, "operator": "or"}))
+            .unwrap();
+            lexical.exact_total_hits = Some(true);
+            let lex_ids = ids(&searcher.search(&ns(), &manifest, &lexical, None).unwrap());
+            let mut vector = base.clone();
+            vector.query_text.clear();
+            vector.max_results = window.min(k);
+            if let Some(ref mut knn) = vector.knn {
+                knn.k = window.min(k);
+            }
+            let vec_ids = ids(&searcher.search(&ns(), &manifest, &vector, None).unwrap());
+            assert!(!lex_ids.is_empty() && !vec_ids.is_empty(), "{text}");
+
+            for (wl, wk) in [(1.0, 1.0), (2.0, 0.5), (0.25, 3.0), (1.0, 1e-3)] {
+                let mut q = hybrid(text, window, k, weighted(window, Some(wl), Some(wk)));
+                q.operator = Some(kosha_core::QueryOperator::Or);
+                let r = searcher.search(&ns(), &manifest, &q, None).unwrap();
+                let want = reference_rrf(&[(&lex_ids, wl), (&vec_ids, wk)], 60, window);
+                let label = format!("{text:?} weights ({wl}, {wk})");
+                assert_eq!(
+                    ids(&r),
+                    want.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+                    "{label}"
+                );
+                for (hit, (_, score)) in r.results.iter().zip(&want) {
+                    assert!(
+                        (hit.score - score).abs() < 1e-12,
+                        "{label}: {}",
+                        hit.doc_id.0
+                    );
+                }
+            }
+
+            // Omitted weights and explicit 1s give the same scores, bit for bit.
+            let mut plain = hybrid(text, window, k, rrf(Some(window), None));
+            plain.operator = Some(kosha_core::QueryOperator::Or);
+            let mut ones = hybrid(text, window, k, weighted(window, Some(1.0), None));
+            ones.operator = Some(kosha_core::QueryOperator::Or);
+            assert_same_fusion(
+                &format!("{text:?} unit weights"),
+                &searcher.search(&ns(), &manifest, &plain, None).unwrap(),
+                &searcher.search(&ns(), &manifest, &ones, None).unwrap(),
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn weighted_fused_list_pages_each_document_exactly_once() {
+        let dir = scratch("weighted-paging");
+        let mut rng = Rng(203);
+        let docs = random_corpus(&mut rng, 150);
+        let groups = random_split(&mut rng, &docs);
+        let (manifest, _) = write(&dir, "s", &groups);
+        let searcher = Searcher::new(dir.clone());
+        let mut q = hybrid("beta", 40, 30, weighted(40, Some(0.5), Some(2.0)));
+        q.operator = Some(kosha_core::QueryOperator::Or);
+        let full = ids(&searcher.search(&ns(), &manifest, &q, None).unwrap());
+        assert_eq!(full.len(), 40);
+
+        let mut p = q.clone();
+        p.max_results = 6;
+        p.sort = serde_json::from_value(
+            serde_json::json!([{"_score": {"order": "desc"}}, {"_id": {"order": "asc"}}]),
+        )
+        .unwrap();
+        let mut walked = Vec::new();
+        loop {
+            let r = searcher.search(&ns(), &manifest, &p, None).unwrap();
+            let Some(last) = r.results.last() else { break };
+            p.search_after = Some(vec![last.score.to_string(), last.doc_id.0.clone()]);
+            walked.extend(ids(&r));
+        }
+        let unique: HashSet<&String> = walked.iter().collect();
+        assert_eq!(unique.len(), walked.len(), "a document was repeated");
+        assert_eq!(walked, full);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_rrf_weights_are_rejected() {
+        let bad = |q: SearchQuery| matches!(q.validate(), Err(KoshaError::InvalidQuery(_)));
+        for w in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(bad(hybrid("x", 10, 10, weighted(10, Some(w), None))), "{w}");
+            assert!(bad(hybrid("x", 10, 10, weighted(10, None, Some(w)))), "{w}");
+        }
+        let q = hybrid("x", 10, 10, weighted(10, Some(2.0), Some(0.5)));
+        assert!(q.validate().is_ok());
+        let params = q.rrf().unwrap();
+        assert_eq!((params.lexical_weight, params.knn_weight), (2.0, 0.5));
+        let params = hybrid("x", 10, 10, weighted(10, None, None)).rrf().unwrap();
+        assert_eq!((params.lexical_weight, params.knn_weight), (1.0, 1.0));
+
+        let q: SearchQuery = serde_json::from_value(serde_json::json!({
+            "query_text": "x",
+            "knn": {"field": "emb", "vector": [1.0, 0.0, 0.0, 0.0], "k": 10},
+            "rank": {"rrf": {"weights": {"lexical": 0.7, "knn": 1.3}}}}))
+        .unwrap();
+        let params = q.rrf().unwrap();
+        assert_eq!((params.lexical_weight, params.knn_weight), (0.7, 1.3));
+        assert!(serde_json::from_value::<SearchQuery>(serde_json::json!({
+            "query_text": "x", "rank": {"rrf": {"weights": {"vector": 1.0}}}}))
+        .is_err());
     }
 
     #[test]
@@ -21153,6 +21320,7 @@ mod rrf_tests {
                         rrf: Some(RrfSpec {
                             rank_window_size: Some(window),
                             rank_constant: None,
+                            weights: None,
                         }),
                     });
                     q

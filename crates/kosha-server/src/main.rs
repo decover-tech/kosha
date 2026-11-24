@@ -16237,11 +16237,27 @@ mod tests {
             ));
             let fused1 = v1["results"][0]["score"].as_f64().unwrap();
             assert!((fused1 - 2.0 / 3.0).abs() < 1e-12, "{v1}");
+
+            // Weighted RRF (#203): a heavy vector weight lifts the vector
+            // winner above the doc both retrievers rank second.
+            let vw = parse(&post(
+                r#","rank":{"rrf":{"rank_window_size":3,"weights":{"lexical":0.01,"knn":4}}}"#,
+            ));
+            let hits = vw["results"].as_array().unwrap();
+            assert_eq!(hits[0]["doc_id"], "vec_top", "{vw}");
+            let top = hits[0]["score"].as_f64().unwrap();
+            assert!((top - 4.0 / 61.0).abs() < 1e-12, "{vw}");
+            assert_eq!(hits[1]["doc_id"], "both", "{vw}");
+            let second = hits[1]["score"].as_f64().unwrap();
+            assert!((second - (0.01 / 62.0 + 4.0 / 62.0)).abs() < 1e-12, "{vw}");
         }
         for bad in [
             r#","rank":{"rrf":{"rank_window_size":2}}"#,
             r#","rank":{"rrf":{"rank_constant":0}}"#,
             r#","rank":{"rrf":{"bogus":1}}"#,
+            r#","rank":{"rrf":{"weights":{"knn":0}}}"#,
+            r#","rank":{"rrf":{"weights":{"lexical":-1.5}}}"#,
+            r#","rank":{"rrf":{"weights":{"vector":2}}}"#,
             r#","mode":"lexical""#,
         ] {
             let resp = post(bad);
@@ -22393,6 +22409,15 @@ mod tests {
         let w50 = hybrid(serde_json::json!({"rrf": {"rank_window_size": 50}}));
         assert_ne!(c60, c1, "rank_constant must be part of the key");
         assert_ne!(c60, w50, "rank_window_size must be part of the key");
+        let weighted = hybrid(serde_json::json!({"rrf": {"weights": {"knn": 2.0}}}));
+        assert_ne!(
+            weighted, default_rrf,
+            "rank.rrf.weights must be part of the key"
+        );
+        assert_ne!(
+            weighted,
+            hybrid(serde_json::json!({"rrf": {"weights": {"lexical": 2.0}}}))
+        );
         assert_ne!(default_rrf, c1);
         let mut moded = with_vec(vec![0.1_f32; 1024], 10);
         moded.query_text = "breach".into();

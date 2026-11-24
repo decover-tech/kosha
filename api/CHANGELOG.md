@@ -7,6 +7,16 @@ independent of the server's crate version; see `docs/api/versioning.md`.
 
 Sections: Added, Changed, Deprecated, Removed.
 
+## [1.1.0]
+
+### Added
+
+- `rank.rrf.weights` (`{"lexical": w, "knn": w}`, issue #203): weighted
+  Reciprocal Rank Fusion, `score(d) = Σ_r weight_r / (rank_constant +
+  rank_r(d))`. Each weight defaults to 1 and must be finite and > 0.
+  Omitting it fuses exactly as before. `rrf` is a strict object, so a
+  server before 1.1.0 answers a request that sets `weights` with 400.
+
 ## [1.0.0]
 
 v1 is GA (#350, ADR-350 §a, §d). From this revision on, a breaking change

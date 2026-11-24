@@ -709,7 +709,7 @@ type V1PutShardsResponse struct {
 
 // V1Rank defines model for v1Rank.
 type V1Rank struct {
-	// Rrf score(d) = sum over retrievers r of 1 / (rank_constant + rank_r(d)).
+	// Rrf score(d) = sum over retrievers r of weight_r / (rank_constant + rank_r(d)).
 	Rrf *V1RrfRank `json:"rrf,omitempty"`
 }
 
@@ -751,7 +751,7 @@ type V1Rerank struct {
 	TopN *int64 `json:"top_n,omitempty"`
 }
 
-// V1RrfRank score(d) = sum over retrievers r of 1 / (rank_constant + rank_r(d)).
+// V1RrfRank score(d) = sum over retrievers r of weight_r / (rank_constant + rank_r(d)).
 type V1RrfRank struct {
 	// RankConstant Default 60; must be >= 1.
 	RankConstant *int64 `json:"rank_constant,omitempty"`
@@ -759,6 +759,18 @@ type V1RrfRank struct {
 	// RankWindowSize Per-retriever list length and fused list length. Default: max_results;
 	// must be >= max_results.
 	RankWindowSize *int64 `json:"rank_window_size,omitempty"`
+
+	// Weights Each weight defaults to 1 and must be finite and > 0.
+	Weights *V1RrfWeights `json:"weights,omitempty"`
+}
+
+// V1RrfWeights Each weight defaults to 1 and must be finite and > 0.
+type V1RrfWeights struct {
+	// Knn Weight of the knn retriever's list.
+	Knn *float64 `json:"knn,omitempty"`
+
+	// Lexical Weight of the lexical retriever's list.
+	Lexical *float64 `json:"lexical,omitempty"`
 }
 
 // V1ScoredDocument defines model for v1ScoredDocument.
