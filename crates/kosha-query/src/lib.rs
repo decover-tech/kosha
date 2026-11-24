@@ -4126,6 +4126,7 @@ impl Searcher {
         &self,
         manifest: &Manifest,
         query: &SearchQuery,
+        tombstones: &HashMap<kosha_core::SegmentId, HashSet<u32>>,
         mut footer: impl FnMut(&ManifestEntry) -> Option<std::borrow::Cow<'a, Footer>>,
     ) -> KnnPrunedSegments {
         let nprobe = self.knn_segment_nprobe;
@@ -4150,7 +4151,13 @@ impl Searcher {
         }
         let footers: Vec<_> = manifest.segments.iter().map(&mut footer).collect();
         let centroids = footers.iter().enumerate().filter_map(|(i, footer)| {
-            if kosha_core::is_tail_segment_id(&manifest.segments[i].segment_id.0) {
+            let entry = &manifest.segments[i];
+            if kosha_core::is_tail_segment_id(&entry.segment_id.0)
+                || tombstones.get(&entry.segment_id).is_some_and(|deleted| {
+                    deleted.len() >= entry.doc_count as usize
+                        && (0..entry.doc_count).all(|seq| deleted.contains(&seq))
+                })
+            {
                 return None;
             }
             let footer = footer.as_deref()?;
@@ -7636,7 +7643,8 @@ impl Searcher {
         } else {
             manifest
         };
-        let tombstones = tombstones.or(Some(&manifest.tombstones));
+        let effective_tombstones = tombstones.unwrap_or(&manifest.tombstones);
+        let tombstones = Some(effective_tombstones);
         let mut phase_stats = SearchPhaseStats::default();
         if manifest.segments.is_empty() {
             return Ok((
@@ -7778,14 +7786,17 @@ impl Searcher {
         let pruned = match pruned {
             Some(pruned) => pruned,
             None => {
-                local_pruned = self.knn_pruned_segments(manifest, query, |entry| {
-                    let dir = manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id);
-                    if !dir.exists() {
-                        return None;
-                    }
-                    manifest
-                        .footer_or_read(&entry.segment_id, || SegmentReader::read_footer(&dir).ok())
-                });
+                local_pruned =
+                    self.knn_pruned_segments(manifest, query, effective_tombstones, |entry| {
+                        let dir =
+                            manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id);
+                        if !dir.exists() {
+                            return None;
+                        }
+                        manifest.footer_or_read(&entry.segment_id, || {
+                            SegmentReader::read_footer(&dir).ok()
+                        })
+                    });
                 &local_pruned
             }
         };
@@ -12030,6 +12041,56 @@ mod tests {
         assert!(stats.knn_plan_ms >= 0.0);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn knn_segment_pruning_does_not_spend_a_probe_on_fully_deleted_segments() {
+        let (dir, ns, manifest, query) = knn_segment_pruning_corpus("tombstones");
+        let searcher = Searcher::new(dir.clone()).with_knn_segment_nprobe(1);
+        let deletes = HashMap::from([(SegmentId("near".into()), (0..24).collect())]);
+        let (result, stats) = searcher
+            .search_with_stats(&ns, &manifest, &query, Some(&deletes))
+            .unwrap();
+        assert_eq!(stats.knn_segments_pruned, 0);
+        assert_eq!(result.results.len(), 10);
+        assert!(result
+            .results
+            .iter()
+            .all(|hit| hit.doc_id.0.starts_with("far-")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn knn_segment_pruning_corpus(case: &str) -> (PathBuf, NamespaceId, Manifest, SearchQuery) {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-knn-segment-pruning-{case}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let mut manifest = Manifest::empty(1);
+        for (name, x) in [("near", 1.0), ("far", -1.0)] {
+            let segment_id = SegmentId(name.into());
+            let mut writer = SegmentWriter::new(segment_id.clone(), dir.join("test").join(name))
+                .with_knn_segment_summaries(true);
+            for i in 0..24 {
+                writer.add_document(
+                    DocumentId(format!("{name}-{i:02}")),
+                    vec![Field::vector("emb", vec![x, i as f32 * 0.01])],
+                );
+            }
+            let footer = writer.finalize(Bm25Params::default()).unwrap();
+            manifest.segments.push(ManifestEntry {
+                segment_id,
+                doc_count: footer.doc_count,
+            });
+        }
+        let query = serde_json::from_value(serde_json::json!({
+            "max_results": 10,
+            "exact_total_hits": false,
+            "knn": {"field": "emb", "vector": [1.0, 0.0], "k": 10, "num_candidates": 100}
+        }))
+        .unwrap();
+        (dir, ns, manifest, query)
     }
 
     #[test]

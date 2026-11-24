@@ -3140,6 +3140,7 @@ impl AppState {
                 ns,
                 manifest,
                 &query,
+                &manifest.tombstones,
                 &RequestHydration::unlimited(),
                 None,
             );
@@ -4735,6 +4736,7 @@ impl AppState {
         ns: &NamespaceId,
         manifest: &kosha_core::Manifest,
         query: &SearchQuery,
+        tombstones: &HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
         request: &Arc<RequestHydration>,
         // A search's pins (see `AppState::pin_search_footers`): the
         // segments chosen below are added before any of their files is
@@ -4773,9 +4775,10 @@ impl AppState {
                 .or_else(|| fetched_footers.get(&entry.segment_id).map(Arc::as_ref))
         };
         let knn_pruned = pins.is_some().then(|| {
-            self.searcher.knn_pruned_segments(manifest, query, |entry| {
-                segment_footer(entry).map(std::borrow::Cow::Borrowed)
-            })
+            self.searcher
+                .knn_pruned_segments(manifest, query, tombstones, |entry| {
+                    segment_footer(entry).map(std::borrow::Cow::Borrowed)
+                })
         });
         // Path -> the segment's footer, borrowed: the manifest's cached copy,
         // else the one just parsed from local footer.json. Having one means
@@ -9758,6 +9761,7 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
                 &ns,
                 manifest,
                 search_query,
+                &searched.tombstones,
                 &hydration_request,
                 Some(&mut segment_pins),
             );
@@ -10429,6 +10433,7 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
                 &ns,
                 manifest,
                 &query,
+                &searched.tombstones,
                 &hydration_request,
                 Some(&mut segment_pins),
             );
@@ -18341,6 +18346,7 @@ mod tests {
             &NamespaceId(NS.into()),
             &manifest,
             &serde_json::from_value(query.clone()).unwrap(),
+            &manifest.tombstones,
             &Arc::new(RequestHydration::new(u64::MAX)),
             None,
         );
@@ -19521,6 +19527,7 @@ mod tests {
             &NamespaceId(NS.into()),
             &manifest,
             &serde_json::from_value(query.clone()).unwrap(),
+            &manifest.tombstones,
             &Arc::new(RequestHydration::new(u64::MAX)),
             None,
         );
@@ -19636,6 +19643,7 @@ mod tests {
             &ns,
             &manifest,
             &base_query,
+            &manifest.tombstones,
             &RequestHydration::unlimited(),
             None,
         );
@@ -19653,6 +19661,7 @@ mod tests {
             &ns,
             &manifest,
             &filtered_query,
+            &manifest.tombstones,
             &RequestHydration::unlimited(),
             None,
         );
@@ -19987,6 +19996,7 @@ mod tests {
             &ns,
             &manifest,
             &warmup_like,
+            &manifest.tombstones,
             &RequestHydration::unlimited(),
             None,
         );
@@ -20061,6 +20071,7 @@ mod tests {
             &ns,
             &manifest,
             &sorted_unfiltered,
+            &manifest.tombstones,
             &RequestHydration::unlimited(),
             None,
         );
