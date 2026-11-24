@@ -74,7 +74,7 @@ def test_install_configures_existing_base_and_waits_for_all_roles(kubectl):
     assert rendered["patches"][4]["target"]["kind"] == "Deployment"
     assert admin[0]["value"]["name"] == "KOSHA_ADMIN_API_KEY"
     assert admin[0]["value"]["valueFrom"]["secretKeyRef"] == {
-        "name": "kosha-secret", "key": "admin-api-key", "optional": True,
+        "name": "kosha-secret", "key": "admin-bootstrap-key", "optional": True,
     }
     assert config["data"] == {
         "KOSHA_S3_BUCKET": "test-bucket",
@@ -151,7 +151,7 @@ TLS_SECRET = ["get", "secret/kosha-internal-tls", "-o", f"go-template={KEY_NAMES
 
 def saas_secrets(responses):
     responses[tuple(SAAS_SECRET)] = (
-        "admin-api-key\nbootstrap-api-key\ndatabase-url\ninternal-api-key\nstripe-api-key\n"
+        "admin-bootstrap-key\nbootstrap-api-key\ndatabase-url\ninternal-api-key\nstripe-api-key\n"
     )
     responses[tuple(TLS_SECRET)] = "ca.crt\ntls.crt\ntls.key\n"
 
@@ -179,7 +179,7 @@ def test_saas_install_refuses_missing_secret_keys(kubectl, capsys):
     assert invoke(*SAAS_INSTALL) == 1
     assert calls == [LOOKUP, ACCOUNT, SAAS_SECRET]
     err = capsys.readouterr().err
-    assert "admin-api-key, internal-api-key, stripe-api-key" in err
+    assert "admin-bootstrap-key, internal-api-key, stripe-api-key" in err
 
 
 def test_saas_install_requires_console_url(kubectl):
@@ -212,7 +212,8 @@ def test_saas_overlay_renders_with_kustomize(tmp_path):
     assert "KOSHA_CONSOLE_PUBLIC_URL: https://console.example.com" in out
     assert "https://kosha-ingest-service.kosha.svc:8080" in out
     assert "image: kosha:1.2.3" in out
-    assert out.count("key: admin-api-key") == 4  # 3 Deployments + segment GC
+    assert out.count("key: admin-bootstrap-key") == 3  # Deployments
+    assert out.count("key: admin-api-key") == 1  # segment GC
     assert out.count("name: KOSHA_ADMIN_API_KEY") == 4  # 3 Deployments + segment GC
 
 

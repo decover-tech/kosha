@@ -48,7 +48,7 @@
     valueFrom:
       secretKeyRef:
         name: kosha-secret
-        key: admin-api-key
+        key: admin-bootstrap-key
 # CA for DATABASE_URL's sslrootcert=/etc/kosha/pg/ca.crt (sslmode=verify-full),
 # from the optional ConfigMap kosha-pg-ca (key ca.crt).
 - op: add

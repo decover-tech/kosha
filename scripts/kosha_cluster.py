@@ -29,18 +29,20 @@ DEPLOYMENTS = ("deployment/kosha", "deployment/kosha-query", "deployment/kosha-i
 ROLLOUT_ORDER = ("kosha-query", "kosha", "kosha-indexer")
 ROLE = {"kosha": "ingest", "kosha-query": "query", "kosha-indexer": "indexer"}
 SAAS_SECRET_KEYS = (
-    "database-url", "bootstrap-api-key", "admin-api-key", "internal-api-key",
+    "database-url", "bootstrap-api-key", "admin-bootstrap-key", "internal-api-key",
     "stripe-api-key",
 )
 # Admin bootstrap credential (KOSHA_ADMIN_API_KEY) for /v1/admin/*. Required
-# by k8s/saas; a base install wires it when kosha-secret has the key.
+# by k8s/saas; a base install wires it when kosha-secret has the key. It is a
+# separate key from `admin-api-key`, which the segment-GC CronJob reads and
+# may hold a revocable per-operator credential.
 ADMIN_KEY_PATCH = [{
     "op": "add",
     "path": "/spec/template/spec/containers/0/env/-",
     "value": {
         "name": "KOSHA_ADMIN_API_KEY",
         "valueFrom": {"secretKeyRef": {
-            "name": "kosha-secret", "key": "admin-api-key", "optional": True,
+            "name": "kosha-secret", "key": "admin-bootstrap-key", "optional": True,
         }},
     },
 }]
@@ -294,14 +296,18 @@ def plan_upgrade(deployments: dict[str, dict], target: str, wal_mode: str,
     return list(ROLLOUT_ORDER[done:])
 
 
-def stale_cronjobs(jobs: dict, target: str) -> list[tuple[str, str]]:
-    """(cronjob, container) pairs running another tag of the target image."""
+def stale_cronjobs(
+    jobs: dict, target: str, current: set[str] = frozenset(),
+) -> list[tuple[str, str]]:
+    """(cronjob, container) pairs running another tag of the target image, or
+    an image the Deployments run (so a registry switch still finds them)."""
     repo = image_repo(target)
     return [
         (job["metadata"]["name"], box["name"])
         for job in jobs.get("items", [])
         for box in job["spec"]["jobTemplate"]["spec"]["template"]["spec"].get("containers", [])
-        if image_repo(box.get("image", "")) == repo and box.get("image") != target
+        if box.get("image") != target
+        and (image_repo(box.get("image", "")) == repo or box.get("image") in current)
     ]
 
 
@@ -313,7 +319,10 @@ def upgrade(kubectl: list[str], args: argparse.Namespace) -> None:
         kubectl, "get", "configmap/kosha-config", "-o", "jsonpath={.data.KOSHA_WAL_MODE}",
     )
     pending = plan_upgrade(deployments, target, wal_mode, args)
-    jobs = stale_cronjobs(json.loads(read(kubectl, "get", "cronjob", "-o", "json")), target)
+    current = {container(d)["image"] for d in deployments.values()}
+    jobs = stale_cronjobs(
+        json.loads(read(kubectl, "get", "cronjob", "-o", "json")), target, current,
+    )
     indexer = deployments["kosha-indexer"]
     stopped = indexer["spec"].get("replicas", 1) == 0
     replicas = indexer["spec"].get("replicas", 1) or args.indexer_replicas
