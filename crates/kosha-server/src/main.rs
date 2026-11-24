@@ -4098,10 +4098,11 @@ impl AppState {
         pages: &[PageSegment<'_>],
         request: &Arc<RequestHydration>,
         rid: &str,
+        mode: doc_spans::ReadMode,
     ) -> doc_spans::PageFetchStats {
         let mut stats = doc_spans::PageFetchStats::default();
         let mut fallback_error = None;
-        let whole: Vec<PathBuf> = match (self.doc_read_mode, &self.s3_storage) {
+        let whole: Vec<PathBuf> = match (mode, &self.s3_storage) {
             (_, None) => return stats,
             (doc_spans::ReadMode::Whole, Some(_)) => {
                 pages.iter().map(|p| p.segment_dir.to_path_buf()).collect()
@@ -4739,6 +4740,19 @@ impl AppState {
         // fetched. `None` for warm-up, which reads nothing afterwards.
         pins: Option<&mut SegmentPins<'_>>,
     ) -> HydrationOutcome {
+        self.hydrate_search_scoring_set(ns, manifest, query, request, pins, false)
+    }
+
+    #[cfg(feature = "s3")]
+    fn hydrate_search_scoring_set(
+        &self,
+        ns: &NamespaceId,
+        manifest: &kosha_core::Manifest,
+        query: &SearchQuery,
+        request: &Arc<RequestHydration>,
+        pins: Option<&mut SegmentPins<'_>>,
+        exact_quantized_vectors: bool,
+    ) -> HydrationOutcome {
         // The query is analyzed per segment with the chains its footer
         // records (#220), so which terms (and posting-blob shards) a
         // segment needs depends on its footer.
@@ -4844,13 +4858,16 @@ impl AppState {
             &posting_files,
             request,
         );
-        if let (Some(field), false) = (knn_field, filter_files.is_empty()) {
+        if let Some(field) =
+            knn_field.filter(|_| !filter_files.is_empty() || exact_quantized_vectors)
+        {
             self.fetch_exact_knn_headers(
                 &to_hydrate,
                 field,
                 &manifest_footers,
                 request,
                 &mut outcome,
+                filter_files.is_empty(),
             );
         }
         outcome.files_fetched += postings_outcome.files_fetched;
@@ -5069,6 +5086,7 @@ impl AppState {
         manifest_footers: &HashMap<PathBuf, &kosha_core::Footer>,
         request: &Arc<RequestHydration>,
         outcome: &mut HydrationOutcome,
+        quantized_only: bool,
     ) {
         let Some(ref s3) = self.s3_storage else {
             return;
@@ -5083,9 +5101,12 @@ impl AppState {
                     local_footer.as_ref()
                 }
             };
-            if !exact_knn_wants_doc_vectors_header(footer, field)
-                || doc_spans::doc_vectors_header_local(seg)
-            {
+            let needs_header = if quantized_only {
+                knn_wants_doc_vectors_header_with(footer, field, true)
+            } else {
+                exact_knn_wants_doc_vectors_header(footer, field)
+            };
+            if !needs_header || doc_spans::doc_vectors_header_local(seg) {
                 continue;
             }
             let (Some(footer), Ok(rel)) = (footer, seg.strip_prefix(&self.data_dir)) else {
@@ -5129,8 +5150,7 @@ impl AppState {
                 doc_spans::HeaderStatus::Failed => {
                     outcome.exact_knn_headers_missing += 1;
                     eprintln!(
-                        "WARN: doc_vectors.bin header of {} could not be fetched for a filtered \
-                         kNN on '{field}': its exact path scans the column's vector postings",
+                        "WARN: doc_vectors.bin header of {} could not be fetched for kNN on '{field}'",
                         dir.display()
                     );
                 }
@@ -8763,11 +8783,8 @@ fn resolve_knn_query_text(
     state: &AppState,
     ns: &NamespaceId,
     max_staleness: Option<Duration>,
-    query: &mut kosha_core::SearchQuery,
+    knn: &mut kosha_core::KnnQuery,
 ) -> Result<(), String> {
-    let Some(knn) = query.knn.as_mut() else {
-        return Ok(());
-    };
     let Some(text) = knn.query_text.take() else {
         return Ok(());
     };
@@ -9511,7 +9528,7 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
 fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String {
     let t_request = Instant::now();
     // Parse the full JSON body that includes namespace alongside SearchQuery fields.
-    let body_val: serde_json::Value = match serde_json::from_slice(body) {
+    let mut body_val: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => return api_error(ErrorCode::InvalidArgument, &format!("invalid JSON: {e}")),
     };
@@ -9544,6 +9561,9 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
         Err(e) => return api_error(ErrorCode::InvalidArgument, &e),
     };
 
+    if body_val.pointer("/rank_by/rrf").is_some() && body_val.get("query_text").is_none() {
+        body_val["query_text"] = serde_json::Value::String(String::new());
+    }
     let mut query: kosha_core::SearchQuery = match serde_json::from_value(body_val) {
         Ok(q) => q,
         Err(e) => {
@@ -9560,8 +9580,18 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     }
     // `knn.query_text` becomes `knn.vector` here (#209), before the cache
     // key and the searcher see the query.
-    if let Err(response) = resolve_knn_query_text(state, &ns, max_staleness, &mut query) {
-        return response;
+    let subqueries = match &mut query.rank_by {
+        Some(kosha_core::RankBy::Fusion(fusion)) => fusion.rrf.queries.as_mut_slice(),
+        _ => &mut [],
+    };
+    for knn in query.knn.iter_mut().chain(
+        subqueries
+            .iter_mut()
+            .filter_map(|subquery| subquery.knn.as_mut()),
+    ) {
+        if let Err(response) = resolve_knn_query_text(state, &ns, max_staleness, knn) {
+            return response;
+        }
     }
     let query = query;
     // A reranked request searches for its first stage (top `top_n` from
@@ -9617,14 +9647,14 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     // A `rank_by` decaying from `"now"` (#212) answers differently a moment
     // later on an unchanged manifest, so it is never cached.
     let time_dependent = query
-        .rank_by
-        .as_ref()
+        .score_modifiers()
         .is_some_and(|rank_by| rank_by.is_time_dependent());
     // A search that included unindexed writes (#255) answers for more than
     // `manifest.version`, so it neither reads nor fills the cache.
     let cache_key = if result_cache_budget() > 0
         && !query.no_cache.unwrap_or(false)
         && !time_dependent
+        && query.multi_rrf().is_none()
         && view.is_plain()
     {
         canonical_query_for_cache(&query).map(|mut canonical| {
@@ -9694,7 +9724,7 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     // Footer-first hydrate: bloom-prune before downloading full segments.
     let t_hydrate = Instant::now();
     #[cfg(feature = "s3")]
-    let hydration = {
+    let mut hydrate = |search_query: &SearchQuery, fused| {
         // Namespace-level cached hydration verdict (Tier 1 O2): skip
         // `hydrate_segments_for_search` entirely when we've already
         // confirmed — for this `(namespace, manifest_version)` pair — that
@@ -9713,14 +9743,23 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
         // need one of them; `covers` enforces that per-file-class check
         // instead of trusting a flat "namespace hydrated" bool.
         let needs_filters = query_filter_fields(search_query);
+        let exact_quantized_vectors = fused
+            && state.s3_storage.is_some()
+            && search_query
+                .knn
+                .as_ref()
+                .is_some_and(|knn| !knn.is_late_interaction());
         let needs_vectors_key = knn_verdict_key(search_query);
         let needs_vectors = needs_vectors_key.as_deref();
-        let cached_covers = state
-            .completed_hydrations
-            .lock()
-            .unwrap()
-            .get(&verdict_key)
-            .is_some_and(|v| v.covers(needs_filters.as_ref(), needs_vectors));
+        // Exact shortlist rescoring needs its header even if a previous
+        // non-fusion query marked the scoring set warm.
+        let cached_covers = !exact_quantized_vectors
+            && state
+                .completed_hydrations
+                .lock()
+                .unwrap()
+                .get(&verdict_key)
+                .is_some_and(|v| v.covers(needs_filters.as_ref(), needs_vectors));
         let outcome = if cached_covers {
             // The cached verdict can only ever cover the *static* scoring
             // set (footers/TOCs/offsets/filters). Posting blobs are fetched
@@ -9740,12 +9779,13 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
                 &mut segment_pins,
             )
         } else {
-            let outcome = state.hydrate_segments_for_search(
+            let outcome = state.hydrate_search_scoring_set(
                 &ns,
                 manifest,
                 search_query,
                 &hydration_request,
                 Some(&mut segment_pins),
+                exact_quantized_vectors,
             );
             // Cache what this pass verified: the static scoring set is
             // local for this manifest version, so future warm queries with
@@ -9784,9 +9824,29 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
             outcome
         };
         if let Some(error) = hydration_error_response(&outcome) {
-            return error;
+            return Err(error);
         }
-        outcome
+        Ok(outcome)
+    };
+    #[cfg(feature = "s3")]
+    let hydration = if let Some(subqueries) = search_query.rrf_subqueries() {
+        let mut combined = HydrationOutcome::default();
+        for subquery in subqueries {
+            let outcome = match hydrate(&subquery, true) {
+                Ok(outcome) => outcome,
+                Err(error) => return error,
+            };
+            combined.files_fetched += outcome.files_fetched;
+            combined.bytes_fetched += outcome.bytes_fetched;
+            combined.rounds += outcome.rounds;
+            combined.postings.add(&outcome.postings);
+        }
+        combined
+    } else {
+        match hydrate(search_query, false) {
+            Ok(outcome) => outcome,
+            Err(error) => return error,
+        }
     };
     #[cfg(not(feature = "s3"))]
     let hydration = HydrationOutcome::default();
@@ -9818,7 +9878,12 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     let ensure_doc_store = |pages: &[PageSegment<'_>]| {
         // Same accountant as the scoring-set fetch above: the request pays
         // for its page's bytes, so the request's ceiling has to cover them.
-        let stats = state.hydrate_page_docs(pages, &hydration_request, &rid);
+        let mode = if search_query.multi_rrf().is_some() && pages.iter().any(|page| page.vectors) {
+            doc_spans::ReadMode::Ranged
+        } else {
+            state.doc_read_mode
+        };
+        let stats = state.hydrate_page_docs(pages, &hydration_request, &rid, mode);
         page_fetch.lock().unwrap().add(&stats);
     };
     #[cfg(feature = "s3")]
@@ -10460,7 +10525,7 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
     let ensure_doc_store = |pages: &[PageSegment<'_>]| {
         // Same accountant as the scoring-set fetch above: the request pays
         // for its page's bytes, so the request's ceiling has to cover them.
-        let stats = state.hydrate_page_docs(pages, &hydration_request, &rid);
+        let stats = state.hydrate_page_docs(pages, &hydration_request, &rid, state.doc_read_mode);
         page_fetch.lock().unwrap().add(&stats);
     };
     #[cfg(feature = "s3")]
@@ -16251,6 +16316,134 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
     }
 
+    #[test]
+    fn weighted_multi_rrf_pages_and_reranks_the_fused_union() {
+        let mut state = test_state();
+        let provider = Arc::new(CountingReranker {
+            name: "mock",
+            term: "beta",
+            delay: Duration::ZERO,
+            calls: Default::default(),
+        });
+        state.rerankers = rerank::RerankRegistry::with_providers(vec![provider.clone()]);
+        let ns = NamespaceId("multirrf".into());
+        let doc = |id: &str, text: &str, v: [f32; 2]| Document {
+            id: DocumentId(id.into()),
+            fields: vec![
+                Field::text("text", text),
+                Field::vector("emb", v.to_vec()),
+                Field::keyword("tag", id),
+            ],
+        };
+        for batch in [
+            vec![
+                doc("a", "alpha alpha", [-1.0, 0.0]),
+                doc("c", "alpha beta", [0.99, 0.1]),
+            ],
+            vec![
+                doc("b", "beta beta", [-1.0, 0.0]),
+                doc(
+                    "d",
+                    "beta beta beta marker marker marker marker marker",
+                    [1.0, 0.0],
+                ),
+                doc("e", "alpha muted muted muted", [0.0, 1.0]),
+            ],
+        ] {
+            state.indexer.index_documents(ns.clone(), batch).unwrap();
+            state.indexer.flush_namespace(&ns).unwrap();
+        }
+        state.publish_namespace(&ns).unwrap();
+        let mut body = serde_json::json!({
+            "namespace": "multirrf",
+            "rank_by": {"rrf": {
+                "queries": [
+                    {"query_text": "alpha"},
+                    {"query_text": "beta", "filter": {"terms": {"tag": ["b", "c"]}}},
+                    {"knn": {"field": "emb", "vector": [1.0, 0.0], "k": 2, "num_candidates": 1000}}
+                ],
+                "weights": [1.0, 1.0, 0.5],
+                "rank_window_size": 2
+            }},
+            "exact_total_hits": false,
+            "total_hits_cap": 3
+        });
+        let post =
+            |body: &serde_json::Value| handle_search_post(body.to_string().as_bytes(), &state);
+        let search = |body: &serde_json::Value| -> kosha_core::SearchResult {
+            let response = post(body);
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap()
+        };
+        let full = search(&body);
+        assert_eq!(full.total_hits, 3);
+        assert_eq!(full.total_hits_relation, kosha_core::TotalHitsRelation::Gte);
+        let ids = |result: &kosha_core::SearchResult| {
+            result
+                .results
+                .iter()
+                .map(|hit| hit.doc_id.0.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&full), ["c", "a", "b", "d"]);
+        body["max_results"] = serde_json::json!(2);
+        body["from"] = serde_json::json!(1);
+        assert_eq!(ids(&search(&body)), ["a", "b"]);
+
+        body["from"] = serde_json::json!(0);
+        body["max_results"] = serde_json::json!(1);
+        let mut paged = Vec::new();
+        for _ in 0..=full.results.len() {
+            let page = search(&body);
+            assert_eq!(page.total_hits, full.total_hits);
+            assert_eq!(page.total_hits_relation, full.total_hits_relation);
+            let Some(last) = page.results.last() else {
+                break;
+            };
+            body["search_after"] = serde_json::json!([last.score.to_string(), last.doc_id.0]);
+            paged.extend(ids(&page));
+        }
+        assert_eq!(paged, ids(&full));
+        assert!(search(&body).results.is_empty());
+
+        let mut by_id = body.clone();
+        by_id["sort"] = serde_json::json!([{"_id": {"order": "asc"}}]);
+        by_id.as_object_mut().unwrap().remove("search_after");
+        for id in ["a", "b", "c", "d"] {
+            assert_eq!(ids(&search(&by_id)), [id]);
+            by_id["search_after"] = serde_json::json!([id]);
+        }
+        assert!(search(&by_id).results.is_empty());
+
+        body.as_object_mut().unwrap().remove("search_after");
+        body["exact_total_hits"] = serde_json::json!(true);
+        body["source_includes"] = serde_json::json!(["tag"]);
+        body["rerank"] = serde_json::json!({
+            "provider": "mock", "query": "beta", "field": "text", "top_n": 3
+        });
+        let reranked = search(&body);
+        assert_eq!(ids(&reranked), ["b"]);
+        assert_eq!(reranked.total_hits, 4);
+        assert_eq!(
+            reranked.total_hits_relation,
+            kosha_core::TotalHitsRelation::Eq
+        );
+        assert_eq!(reranked.results[0].rerank_score, Some(2.0));
+        assert_eq!(reranked.results[0].fused_score, Some(full.results[2].score));
+        assert_eq!(reranked.results[0].fields.len(), 1);
+        assert_eq!(reranked.results[0].fields[0].name, "tag");
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        body["rerank"].as_object_mut().unwrap().remove("top_n");
+        assert_eq!(ids(&search(&body)), ["d"]);
+        body["from"] = serde_json::json!(1);
+        assert_eq!(ids(&search(&body)), ["b"]);
+
+        body["rank_by"]["rrf"]["weights"] = serde_json::json!([1.0]);
+        let response = post(&body);
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    }
+
     /// Scores a document by how often `term` occurs in it, after `delay`.
     struct CountingReranker {
         name: &'static str,
@@ -18333,6 +18526,74 @@ mod tests {
             serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..]).unwrap();
         assert_eq!(body["reason"], "knn_segments_unavailable", "{body}");
         assert_eq!(body["knn_failed_segments"], 2, "{body}");
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn weighted_rrf_quantized_cursor_is_stable_after_cold_whole_file_hydration() {
+        const NS: &str = "weighted-rrf-cold-i8";
+        let (s3, mut state, _, paths) = single_flight_node(
+            NS,
+            |w| {
+                w.with_vector_store_mode(kosha_segment::VectorStoreMode::Sidecar)
+                    .with_vector_quantization(kosha_segment::VectorQuantizationConfig::all(
+                        kosha_core::VectorQuantization::I8,
+                    ))
+            },
+            |i| {
+                if i == 0 {
+                    vec![
+                        Field::vector("emb", vec![-1.0, 0.0, 0.0, 0.0]),
+                        Field::vector("padding", vec![1.0; 24_000]),
+                        Field::vector("more_padding", vec![1.0; 24_000]),
+                    ]
+                } else {
+                    vec![Field::vector("emb", vec![1.0, i as f32 * 0.001, 0.0, 0.0])]
+                }
+            },
+        );
+        state.doc_read_mode = doc_spans::ReadMode::Whole;
+        state.posting_read_mode = doc_spans::ReadMode::Whole;
+        state.hydrate_request_max_bytes = 160 * 1024;
+        state.searcher = Searcher::new(state.data_dir.clone()).with_knn_global_rescore(false);
+        let sidecar = kosha_segment::DOC_VECTORS_FILE;
+        for path in &paths {
+            let relative = path.strip_prefix(&state.data_dir).unwrap();
+            let len = fs::metadata(s3.root.join(relative).join(sidecar))
+                .unwrap()
+                .len();
+            assert!(len > state.hydrate_request_max_bytes);
+        }
+        assert!(paths.iter().all(|p| !p.join(sidecar).exists()));
+        let search = |query: &serde_json::Value| {
+            let response = handle_search_post(query.to_string().as_bytes(), &state);
+            assert_eq!(status_of(&response), 200, "{response}");
+            serde_json::from_str::<kosha_core::SearchResult>(
+                response.split_once("\r\n\r\n").unwrap().1,
+            )
+            .unwrap()
+        };
+        let mut query = serde_json::json!({
+            "namespace": NS,
+            "query_text": "",
+            "max_results": 1,
+            "rank_by": {"rrf": {"queries": [{"knn": {
+                "field": "emb", "vector": [1.0, 0.01, 0.0, 0.0], "k": 2
+            }}]}}
+        });
+        let first = search(&query);
+        assert_eq!(first.results[0].doc_id.0, "d0-5");
+        assert_eq!(first.results[0].fields[0].name, "emb");
+        assert!(paths.iter().all(|p| !p.join(sidecar).exists()));
+        query["search_after"] =
+            serde_json::json!([first.results[0].score.to_string(), first.results[0].doc_id]);
+        let second = search(&query);
+        assert_eq!(second.results[0].doc_id.0, "d1-5");
+        query["search_after"] = serde_json::json!([
+            second.results[0].score.to_string(),
+            second.results[0].doc_id
+        ]);
+        assert!(search(&query).results.is_empty());
     }
 
     /// A two-segment kNN node reading whole `vector.idx` files, with a

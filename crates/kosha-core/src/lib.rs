@@ -3546,13 +3546,81 @@ pub struct SearchQuery {
     /// the filter columns and re-sorted, and only those are returned. See
     /// [`rank::RankBySpec`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rank_by: Option<RankBySpec>,
+    pub rank_by: Option<RankBy>,
     /// Rerank the top `rerank.top_n` first-stage hits (the fused list for a
     /// hybrid request) with an external model before paging. The searcher
     /// itself never calls a provider: see `kosha_query::rerank`. Part of
     /// the serialized query, so part of every result-cache key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rerank: Option<RerankSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RankBy {
+    Modifiers(RankBySpec),
+    Fusion(RrfRankBy),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RrfRankBy {
+    pub rrf: MultiRrfSpec,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MultiRrfSpec {
+    pub queries: Vec<RrfSubquery>,
+    #[serde(default = "default_rrf_constant")]
+    pub k: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weights: Option<Vec<f64>>,
+    #[serde(default = "default_rrf_window")]
+    pub rank_window_size: usize,
+}
+
+fn default_rrf_constant() -> u32 {
+    DEFAULT_RRF_RANK_CONSTANT
+}
+
+fn default_rrf_window() -> usize {
+    100
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RrfSubquery {
+    #[serde(default)]
+    pub query_text: String,
+    #[serde(default)]
+    pub fields: Vec<String>,
+    #[serde(default)]
+    pub operator: Option<QueryOperator>,
+    #[serde(default)]
+    pub wildcard: Option<WildcardQuery>,
+    #[serde(default)]
+    pub match_phrase: Option<MatchPhraseQuery>,
+    #[serde(default)]
+    pub fuzzy: Option<FuzzyQuery>,
+    #[serde(default)]
+    pub knn: Option<KnnQuery>,
+    #[serde(default)]
+    pub filter: Option<FilterClause>,
+}
+
+fn intersect_filters(a: Option<FilterClause>, b: Option<FilterClause>) -> Option<FilterClause> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(FilterClause::Bool {
+            bool: BoolFilter {
+                must: vec![a, b],
+                must_not: Vec::new(),
+                should: Vec::new(),
+                minimum_should_match: 0,
+            },
+        }),
+        (a, b) => a.or(b),
+    }
 }
 
 /// See `SearchQuery.rerank`.
@@ -3589,6 +3657,7 @@ pub const DEFAULT_RERANK_TIMEOUT_MS: u64 = 2_000;
 pub const MAX_RERANK_TIMEOUT_MS: u64 = 60_000;
 /// Upper bound on `rerank.top_n` (Cohere's per-request document limit).
 pub const MAX_RERANK_TOP_N: usize = 1_000;
+const DEFAULT_MULTI_RRF_RERANK_TOP_N: usize = 100;
 
 /// Proto `RetrievalMode`, as the JSON API spells it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3673,12 +3742,129 @@ pub struct LimitPerSpec {
 }
 
 impl SearchQuery {
+    pub fn score_modifiers(&self) -> Option<&RankBySpec> {
+        match self.rank_by.as_ref()? {
+            RankBy::Modifiers(spec) => Some(spec),
+            RankBy::Fusion(_) => None,
+        }
+    }
+
+    pub fn multi_rrf(&self) -> Option<&MultiRrfSpec> {
+        match self.rank_by.as_ref()? {
+            RankBy::Fusion(spec) => Some(&spec.rrf),
+            RankBy::Modifiers(_) => None,
+        }
+    }
+
+    /// Independent, namespace-wide ranked lists, never paged by the outer request.
+    pub fn rrf_subqueries(&self) -> Option<impl Iterator<Item = SearchQuery> + '_> {
+        let rrf = self.multi_rrf()?;
+        let mut base = self.clone();
+        base.rank_by = None;
+        base.rerank = None;
+        base.from = 0;
+        base.max_results = rrf.rank_window_size;
+        base.search_after = None;
+        base.sort.clear();
+        base.exact_total_hits = Some(false);
+        base.total_hits_cap = None;
+        Some(rrf.queries.iter().map(move |subquery| {
+            let mut leg = base.clone();
+            leg.query_text.clone_from(&subquery.query_text);
+            leg.fields.clone_from(&subquery.fields);
+            leg.operator = subquery.operator;
+            leg.wildcard.clone_from(&subquery.wildcard);
+            leg.match_phrase.clone_from(&subquery.match_phrase);
+            leg.fuzzy.clone_from(&subquery.fuzzy);
+            leg.knn.clone_from(&subquery.knn);
+            leg.filter = intersect_filters(self.filter.clone(), subquery.filter.clone());
+            if let Some(knn) = &mut leg.knn {
+                knn.filter = intersect_filters(knn.filter.take(), leg.filter.take());
+                leg.max_results = leg.max_results.min(knn.k);
+            }
+            leg
+        }))
+    }
+
+    fn validate_multi_rrf(&self, rrf: &MultiRrfSpec) -> Result<(), KoshaError> {
+        let invalid = |message: &str| KoshaError::InvalidQuery(format!("rank_by.rrf {message}"));
+        if !(1..=16).contains(&rrf.queries.len()) {
+            return Err(invalid("requires between 1 and 16 queries"));
+        }
+        if rrf.k == 0 || !(1..=1000).contains(&rrf.rank_window_size) {
+            return Err(invalid(
+                "requires k >= 1 and rank_window_size between 1 and 1000",
+            ));
+        }
+        if let Some(weights) = &rrf.weights {
+            let sum: f64 = weights.iter().sum();
+            if weights.len() != rrf.queries.len()
+                || weights.iter().any(|w| !w.is_finite() || *w < 0.0)
+                || !sum.is_finite()
+                || sum == 0.0
+            {
+                return Err(invalid(
+                    "requires one finite nonnegative weight per query, with a positive finite sum",
+                ));
+            }
+        }
+        if self.has_lexical_query()
+            || self.knn.is_some()
+            || !self.fields.is_empty()
+            || self.operator.is_some()
+            || self.rank.is_some()
+            || self.mode.is_some()
+            || self.collapse.is_some()
+            || self.limit_per.is_some()
+            || self.highlight.is_some()
+            || !self.aggs.is_empty()
+        {
+            return Err(invalid("cannot be combined with outer retrievers, rank, mode, collapse, limit_per, highlight or aggs"));
+        }
+        let sort_by_id = self.multi_rrf_sorts_by_id();
+        if !sort_by_id && !sort_is_by_score(&self.sort) {
+            return Err(invalid(
+                "only sorts by _score descending then _id ascending, or by _id ascending alone",
+            ));
+        }
+        if let Some(after) = &self.search_after {
+            if sort_by_id {
+                if after.len() != 1 {
+                    return Err(invalid("ID-only search_after requires [document ID]"));
+                }
+            } else if !matches!(after.as_slice(), [score, _] if score.parse::<f64>().is_ok_and(f64::is_finite))
+            {
+                return Err(invalid("search_after requires [score, document ID]"));
+            }
+        }
+        for (i, leg) in self.rrf_subqueries().into_iter().flatten().enumerate() {
+            if leg.has_lexical_query() == leg.knn.is_some()
+                || (!leg.has_lexical_query() && (!leg.fields.is_empty() || leg.operator.is_some()))
+            {
+                return Err(invalid(&format!(
+                    "queries[{i}] needs one lexical or knn retriever"
+                )));
+            }
+            leg.validate()
+                .map_err(|err| invalid(&format!("queries[{i}]: {err}")))?;
+        }
+        Ok(())
+    }
+
+    pub fn multi_rrf_sorts_by_id(&self) -> bool {
+        matches!(self.sort.as_slice(), [spec] if spec.fields.len() == 1
+            && spec.fields.get("_id").is_some_and(|order| order.order == "asc"))
+    }
+
     /// Request-level checks that do not need any segment: currently the
     /// BM25 parameter ranges. An `Err` is a client error (HTTP 400).
     pub fn validate(&self) -> Result<(), KoshaError> {
         self.bm25_params
             .validate()
             .map_err(KoshaError::InvalidQuery)?;
+        if let Some(rrf) = self.multi_rrf() {
+            self.validate_multi_rrf(rrf)?;
+        }
         if let Some(ref fuzzy) = self.fuzzy {
             fuzzy.validate().map_err(KoshaError::InvalidQuery)?;
             if !self.query_text.trim().is_empty()
@@ -3733,7 +3919,7 @@ impl SearchQuery {
                 ));
             }
         }
-        if let Some(ref rank_by) = self.rank_by {
+        if let Some(rank_by) = self.score_modifiers() {
             rank_by
                 .compile(self.max_results, 0)
                 .map_err(KoshaError::InvalidQuery)?;
@@ -3821,7 +4007,7 @@ impl SearchQuery {
     /// current time. `None` without `rank_by`; an invalid one is an error
     /// ([`Self::validate`] reports it first).
     pub fn compiled_rank_by(&self) -> Result<Option<CompiledRankBy>, KoshaError> {
-        let Some(ref rank_by) = self.rank_by else {
+        let Some(rank_by) = self.score_modifiers() else {
             return Ok(None);
         };
         let now_ms = std::time::SystemTime::now()
@@ -3840,8 +4026,8 @@ impl SearchQuery {
     /// is returned, so nothing is rescored).
     pub fn collect_depth(&self) -> usize {
         let page = self.from.saturating_add(self.max_results);
-        match self.rank_by {
-            Some(ref rank_by) if page > 0 => page.max(rank_by.window(self.max_results)),
+        match self.score_modifiers() {
+            Some(rank_by) if page > 0 => page.max(rank_by.window(self.max_results)),
             _ => page,
         }
     }
@@ -3907,15 +4093,16 @@ impl SearchQuery {
         Ok(())
     }
 
-    /// Resolved `rerank.top_n` (default `from + max_results`), or `None`
-    /// when the request does not rerank.
+    /// The fixed weighted RRF default keeps offset pages in the same rerank window.
     pub fn rerank_top_n(&self) -> Option<usize> {
         let rerank = self.rerank.as_ref()?;
-        Some(
-            rerank
-                .top_n
-                .unwrap_or_else(|| self.from.saturating_add(self.max_results)),
-        )
+        Some(rerank.top_n.unwrap_or_else(|| {
+            if self.multi_rrf().is_some() {
+                DEFAULT_MULTI_RRF_RERANK_TOP_N
+            } else {
+                self.from.saturating_add(self.max_results)
+            }
+        }))
     }
 
     /// The text a reranker scores candidates against: `rerank.query`,
@@ -4058,7 +4245,7 @@ impl SearchQuery {
         self.filter.is_some()
             || self.collapse.is_some()
             || self.limit_per.is_some()
-            || self.rank_by.is_some()
+            || self.score_modifiers().is_some()
             || self.knn.as_ref().is_some_and(|k| k.filter.is_some())
             || !self.aggs.is_empty()
             || self.sort.iter().any(|spec| {
@@ -4098,7 +4285,7 @@ impl SearchQuery {
         if let Some(limit_per) = &self.limit_per {
             add(&limit_per.field);
         }
-        if let Some(rank_by) = &self.rank_by {
+        if let Some(rank_by) = self.score_modifiers() {
             rank_by.fields().for_each(&mut add);
         }
         for spec in &self.sort {

@@ -84,8 +84,9 @@ This document describes the target architecture, which was built in phases.
 > what was deferred to Phase 2 has shipped too: segments now carry a posting-based
 > `vector.idx` (cluster-and-posting ANN with centroid probing and triangle-inequality bounds),
 > requests take a `knn` clause with `knn.filter`, and a lexical query plus `knn` is fused with
-> RRF (§8 step 5). Still not implemented: the rerank hook (§8 step 6) and per-retriever RRF
-> weights. The phase plan below is kept as the historical record of how the work was ordered.
+> RRF (§8 step 5). Weighted multi-query RRF is opt-in via `rank_by.rrf`, and both
+> fusion paths support the rerank hook (§8 step 6). The phase plan below is kept
+> as the historical record of how the work was ordered.
 
 Phase 1 was BM25 lexical search only — no vector index, no ANN, no fusion, no rerank hook.
 Concretely, Phase 1 included:
@@ -100,7 +101,7 @@ Concretely, Phase 1 included:
 - Multi-tenancy (§10), migration approach (§14), and operational model (§15) — none of them
   are vector-specific.
 
-**Deferred to Phase 2** (since implemented, except the rerank hook): `vector.idx`, ANN
+**Deferred to Phase 2** (since implemented): `vector.idx`, ANN
 retrieval, RRF fusion, the rerank hook, and embedding-dependent parts of the namespace schema.
 The segment footer reserved a slot for the vector index so Phase 2 could add it without a
 segment format migration.
