@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use crate::http_routes::legacy_route_disabled;
 use crate::routes::{self, Surface};
 use crate::*;
 
