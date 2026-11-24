@@ -4,6 +4,9 @@ Kustomize layout for running `kosha-server` in its own **`kosha`**
 namespace. Manifests stay product-generic: no customer account names,
 bucket names, or IAM role ARNs are committed here.
 
+For segment bucket versioning, PostgreSQL PITR and the quarterly namespace
+recovery drill, see [Backups and namespace point-in-time recovery](../docs/operations/backup-restore.md).
+
     k8s/
       base/     Namespace, ServiceAccount, ConfigMap, three Deployments
                 (kosha = ingest, kosha-query = query, kosha-indexer =
@@ -51,6 +54,13 @@ ConfigMap). The role is validated at startup (#254): `query` requires
   cluster's metrics-server to actually be healthy (`kubectl top pods -n
   kosha` returning real numbers, not `FailedGetResourceMetric`) or the HPA
   is a no-op.
+
+  The deployment and HPA start at three replicas. Zone spread requires
+  eligible worker capacity across three AZs to place one replica in each;
+  hostname anti-affinity prefers distinct nodes. The PDB keeps two query
+  replicas available during voluntary evictions. See the
+  [HA deployment and failover runbook](../docs/high-availability.md)
+  before rolling this out or changing the ingest replica count.
 
 **Clients only ever need `kosha-service`** — for both reads and writes,
 exactly like a single OpenSearch cluster endpoint. `kosha-service` selects
@@ -144,7 +154,9 @@ vars, which key an object uses, key rotation) is in
 **S3.** Set `KOSHA_S3_SSE=aws:kms` (and optionally
 `KOSHA_S3_SSE_KMS_KEY_ID`, `KOSHA_S3_SSE_BUCKET_KEY=true` and per-tenant
 `KOSHA_S3_TENANT_KMS_KEYS` / `KOSHA_S3_TENANT_KMS_KEYS_FILE`) in the
-ConfigMap; see the commented example in `base/configmap.yaml`. Every pod
+ConfigMap; see the commented example in `base/configmap.yaml`. A key on the
+control-plane tenant record (`kosha.tenants.kms_key_id`) takes precedence over
+the configured tenant map. Every pod
 that reads or writes S3 (ingest, query, indexer, the GC CronJob and
 `migrate`) runs as the `kosha` service account, so its IRSA role needs KMS
 access to every key in use, the old key included until a rotation's hard
@@ -203,7 +215,7 @@ reclaimPolicy: Delete
 ## Encryption in transit
 
 The reference for every setting is `docs/configuration.md`, "TLS between
-pods" and "TLS to Postgres". Neither is turned on by the stage or prod
+pods", "TLS to Postgres" and "TLS to S3". Neither is turned on by the stage or prod
 overlays; turning them on is a per-cluster step.
 
 **Between pods.** `components/internal-tls` is an opt-in kustomize
@@ -232,10 +244,11 @@ Before applying it:
    `/etc/kosha/tls`.
 2. Move every other client of port 8080 to `https://` in the same change:
    HTTPS is per port, so a pod with a certificate no longer answers plain
-   HTTP. In this repo that is the `curl` URL in `base/cronjob-segment-gc.yaml`
-   and `stage/cronjob-compaction.yaml` (they also need the CA, for example
-   `--cacert` with the Secret mounted); the component does not patch them.
-   Outside it, that is every service calling `kosha-service`.
+   HTTP. The component switches `base/cronjob-segment-gc.yaml` to HTTPS and
+   mounts the CA for it. It does not patch `stage/cronjob-compaction.yaml`
+   (switch its `curl` URL to `https://` and add `--cacert` with the Secret
+   mounted). Outside this repo, that is every service calling `kosha-service`;
+   add their hostnames to the certificate SANs.
 3. Check the Prometheus scrape job. `/metrics` is on the same port, so it
    is HTTPS-only too (it needs no client certificate). The component adds
    `prometheus.io/scheme: https` next to the existing `prometheus.io/*`
@@ -293,6 +306,52 @@ With `KOSHA_INTERNAL_TLS=required`, a URL whose `sslmode` is anything else
 than `require`, `verify-ca` or `verify-full` stops the pod at startup.
 
 ## Deploying
+
+### Fresh install on an existing cluster
+
+Use `scripts/kosha_cluster.py` from this checkout with Python 3.10+ and
+`kubectl`. Before installing:
+
+- Set up a kubeconfig context and permissions to deploy the base manifests.
+  The cluster needs the [Kosha NVMe node pool](#the-kosha-node-pool-karpenter-nvme-instance-store)
+  for ingest. The base manifests include the query PodDisruptionBudget, so
+  the deploying identity also needs `policy/poddisruptionbudgets` (see
+  `base/rbac-query-pdb.yaml`), and the three query replicas need schedulable
+  capacity in three availability zones, or the install waits on the query
+  rollout ([HA deployment](../docs/high-availability.md)).
+- Provision an empty Postgres database and an unused S3 bucket/prefix.
+  Give the Kosha service account access to S3 (and KMS if required). On
+  EKS with IRSA, pass the role ARN below; the role must trust
+  `system:serviceaccount:kosha:kosha` in this cluster. Leave creation of
+  that service account to the installer.
+- In namespace `kosha`, provision the Secret `kosha-secret` with keys
+  `database-url` and `bootstrap-api-key` using your usual secret tooling.
+  The installer neither creates nor overwrites that Secret.
+
+```sh
+python3 scripts/kosha_cluster.py --context customer-eks install \
+  --image "ravidecoverai/kosha:${KOSHA_RELEASE_TAG}" \
+  --s3-bucket customer-kosha --s3-prefix segments/ --aws-region us-east-1 \
+  --irsa-role-arn arn:aws:iam::123456789012:role/kosha \
+  --confirm-empty-storage
+python3 scripts/kosha_cluster.py --context customer-eks status
+```
+
+Set `KOSHA_RELEASE_TAG` to a published tag or specify the image by digest.
+The installer creates the `k8s/base` workloads and supporting resources
+with cluster-specific S3, image, and optional IRSA settings, then waits
+for ingest, query, and indexer to roll out. `status` is a read-only snapshot
+of the three Deployments' images and readiness counts.
+
+**Install only.** The command refuses to run if any Kosha Deployment
+already exists, including after a partial install. Do not use it with
+storage from a previous installation, even on a new Kubernetes cluster:
+`--confirm-empty-storage` is your confirmation, not a storage check. For
+upgrades or rollbacks, follow the [manifest and WAL compatibility
+rules](../README.md#s3-wal-kosha_wal_modes3) in the main README before
+resuming writes; old binaries cannot read the new formats.
+
+### Stage and production workflows
 
 `.github/workflows/release.yml` / `deploy.yml` call
 `.github/actions/deploy-eks`, which:

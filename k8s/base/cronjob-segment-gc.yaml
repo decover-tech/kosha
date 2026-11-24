@@ -62,6 +62,8 @@ spec:
             - name: gc
               image: curlimages/curl:8.11.1
               env:
+                - name: KOSHA_GC_INGEST_SCHEME
+                  value: http
                 # "true" lists what would be deleted; "false" deletes it.
                 - name: DRY_RUN
                   value: "true"
@@ -76,7 +78,7 @@ spec:
                 - |
                   set -eu
                   case "${DRY_RUN}" in true|false) ;; *) echo "DRY_RUN must be true or false"; exit 2;; esac
-                  URL="http://kosha-ingest-service.kosha.svc.cluster.local:8080/v1/admin/gc"
+                  URL="${KOSHA_GC_INGEST_SCHEME}://kosha-ingest-service.kosha.svc.cluster.local:8080/v1/admin/gc"
                   # No namespace: every namespace the control plane knows.
                   # The handler deletes object by object; --max-time is
                   # generous for a first run over a large backlog.

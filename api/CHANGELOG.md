@@ -7,6 +7,28 @@ independent of the server's crate version; see `docs/api/versioning.md`.
 
 Sections: Added, Changed, Deprecated, Removed.
 
+## [1.1.0]
+
+Phase H control plane (#345–#349). All new operations are beta.
+
+### Added
+
+- Self-serve tenant API keys (#346): `GET`/`POST /v1/api-keys`,
+  `POST /v1/api-keys/rotate`, `POST /v1/api-keys/revoke` (an
+  `admin`-scoped key manages its own tenant's keys).
+- Namespace exports (#347): `POST`/`GET /v1/namespaces/{namespace}/exports`,
+  `GET`/`DELETE /v1/namespaces/{namespace}/exports/{id}` and
+  `GET /v1/namespaces/{namespace}/exports/{id}/download` (JSONL parts).
+- Billing self-service (#349): `POST /v1/billing/checkout`,
+  `POST /v1/billing/portal`, and Stripe's
+  `POST /v1/billing/webhooks/stripe` (signed by Stripe, no API key).
+- Response fields (#347): `changes` on `PUT /v1/namespaces/{namespace}/schema`
+  (the online changes applied); `deletion` on `DELETE .../branch`;
+  `acks_required`, `storage_verified` and `exports_deleted` on deletion
+  records, whose `scope` may also be `branch` or `migrated`.
+- Admin document: `POST /v1/admin/billing/dunning` and
+  `POST /v1/admin/billing/catalog/reload`.
+
 ## [1.0.0]
 
 v1 is GA (#350, ADR-350 §a, §d). From this revision on, a breaking change

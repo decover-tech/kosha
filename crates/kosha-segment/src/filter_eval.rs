@@ -738,6 +738,64 @@ mod tests {
     }
 
     #[test]
+    fn exists_matches_indexed_values_and_must_not_matches_the_complement() {
+        use serde_json::json;
+
+        let dir = temp_dir("exists");
+        let docs = [
+            (
+                DocumentId("present".into()),
+                vec![
+                    Field::text("body", ""),
+                    Field::keyword("tag", ""),
+                    Field::integer("page", 0),
+                    Field::float_val("confidence", 0.0),
+                    Field::boolean("active", false),
+                    Field::date_val("sentAt", "2026-01-01"),
+                    Field::geo_point("location", 0.0, 0.0),
+                ],
+            ),
+            (
+                DocumentId("missing".into()),
+                vec![Field::keyword("other", "value")],
+            ),
+            (
+                DocumentId("empty_list".into()),
+                vec![Field::keyword("tag", "[]")],
+            ),
+        ];
+        for version in [1, 2] {
+            let reader = build(&dir.join(format!("v{version}")), version, &docs);
+            let matches = |filter| {
+                let clause = serde_json::from_value(filter).unwrap();
+                reader
+                    .evaluate_filter(&clause)
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>()
+            };
+            for field in [
+                "body",
+                "tag",
+                "page",
+                "confidence",
+                "active",
+                "sentAt",
+                "location",
+            ] {
+                let exists = json!({"exists": {"field": field}});
+                assert_eq!(matches(exists.clone()), [0], "v{version}, {field}");
+                assert_eq!(
+                    matches(json!({"bool": {"must_not": [exists]}})),
+                    [1, 2],
+                    "v{version}, {field}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn clauses_select_documents() {
         // Guard against a vacuous differential test: the corpus must make
         // the interesting clauses non-trivial.
@@ -776,6 +834,52 @@ mod tests {
             count(json!({"range": {"codes": {"gte": "c-00100", "lt": "c-09000"}}})),
             8900 - 8 + 8
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #194: the columnar `exists` agrees with the row scan on the
+    /// edge values: `""` is present, `[]` / `[null]` / an absent field are
+    /// not.
+    #[test]
+    fn exists_edge_values_agree_across_formats() {
+        let dir = temp_dir("exists-edges");
+        let values: [Option<&str>; 6] = [
+            Some(""),
+            Some("x"),
+            Some("[]"),
+            Some("[null]"),
+            None,
+            Some(""),
+        ];
+        let docs: Vec<(DocumentId, Vec<Field>)> = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let mut fields = vec![Field::text("t", format!("word {i}"))];
+                if let Some(v) = v {
+                    fields.push(Field::keyword("code", *v));
+                }
+                (DocumentId(format!("d{i}")), fields)
+            })
+            .collect();
+        let legacy = build(&dir.join("v1"), 1, &docs);
+        let columnar = build(&dir.join("v2"), 2, &docs);
+        for (json, want) in [
+            (
+                serde_json::json!({"exists": {"field": "code"}}),
+                vec![0, 1, 5],
+            ),
+            (
+                serde_json::json!({"bool": {"must_not": [{"exists": {"field": "code"}}]}}),
+                vec![2, 3, 4],
+            ),
+        ] {
+            let clause: FilterClause = serde_json::from_value(json.clone()).unwrap();
+            for (name, segment) in [("v1", &legacy), ("v2", &columnar)] {
+                let got: Vec<u32> = segment.evaluate_filter(&clause).unwrap().iter().collect();
+                assert_eq!(got, want, "{name}: {json}");
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

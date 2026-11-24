@@ -25,6 +25,7 @@ use kosha_core::{AnalysisConfig, AnalyzerSpec, SegmentAnalysis};
 pub use analysis::Analyzer;
 use doc_store_zstd::{compress_doc_store, parse_dict_trailer, rebuild_offsets, DocStoreDecoder};
 pub use doc_store_zstd::{DocStoreCompressionMode, DocStoreZstdConfig, DOC_STORE_DICT_MAGIC};
+pub use kosha_vector_spfresh::namespace_centroids;
 pub use multivec::{LateInteractionHits, LateInteractionParams};
 pub use reorder::{BpConfig, DocReorder};
 
@@ -1807,6 +1808,19 @@ pub const VECTOR_IDX_FILE: &str = "vector.idx";
 pub type VectorSpanFetch<'a> =
     &'a (dyn Fn(&Path, &str, &[(u64, u64)]) -> span_cache::SpanHolds + Sync);
 
+/// A kNN probe's restriction (filter, tombstones or both): `true` for a
+/// document that may be a hit. `Sync` because one probe's postings are
+/// scored on several threads (see [`KNN_PARALLEL_MIN_POSTINGS`]).
+pub type KnnAccept<'a> = &'a (dyn Fn(u32) -> bool + Sync);
+
+/// The fewest postings one task of a budgeted kNN probe scans; a probe
+/// with fewer than twice this many is scanned serially on its caller's
+/// thread. A 1536-d f32 posting of ~90 vectors scores in ~50 µs (staging,
+/// `evalruns/exp-knn-groups-segments`), so a task is at least ~0.8 ms of
+/// work: far above rayon's per-task cost, and small enough that a
+/// 1,600-posting probe splits across every core of the pool.
+const KNN_PARALLEL_MIN_POSTINGS: usize = 16;
+
 /// Postings fetched per call when a restricted kNN probe runs past its
 /// budget (see `knn_search_within_filtered`).
 const VECTOR_PREFETCH_CHUNK: usize = 8;
@@ -2472,13 +2486,47 @@ fn decode_f32_entries_into(bytes: &[u8], dim: usize, ids: &mut Vec<u32>, vectors
     }
 }
 
+/// A posting's f32 entries viewed in place, without decoding: entry `i` is
+/// `words[i * (dim + 1)]` (the id's bits) followed by its `dim` floats.
+/// `None` when `bytes` is not 4-byte aligned or the target is big endian;
+/// the caller then decodes with [`decode_f32_entries_into`]. Both give the
+/// same ids and the same float bits. Trailing bytes short of one entry are
+/// ignored.
+fn f32_entries_in_place(bytes: &[u8], dim: usize) -> Option<&[f32]> {
+    if !cfg!(target_endian = "little") {
+        return None;
+    }
+    let record_size = 4 + 4 * dim;
+    let whole = bytes.len() / record_size * record_size;
+    bytemuck::try_cast_slice(&bytes[..whole]).ok()
+}
+
+/// [`for_each_f32_similarity`] over entries viewed in place by
+/// [`f32_entries_in_place`].
+fn for_each_f32_similarity_in_place(
+    words: &[f32],
+    dim: usize,
+    accept: Option<KnnAccept<'_>>,
+    f32_similarity: impl Fn(&[f32]) -> f32,
+    mut emit: impl FnMut(u32, f32, f32),
+) {
+    for entry in words.chunks_exact(dim + 1) {
+        let (id, vector) = entry.split_at(1);
+        let id = id[0].to_bits();
+        if accept.is_some_and(|accept| !accept(id)) {
+            continue;
+        }
+        emit(id, f32_similarity(vector), 0.0);
+    }
+}
+
 /// Calls `emit(id, similarity, 0.0)` for each flat f32 entry `accept` lets
 /// through (see [`decode_f32_entries_into`] for the layout).
 fn for_each_f32_similarity(
     ids: &[u32],
     vectors: &[f32],
     dim: usize,
-    accept: Option<&dyn Fn(u32) -> bool>,
+    accept: Option<KnnAccept<'_>>,
     f32_similarity: impl Fn(&[f32]) -> f32,
     mut emit: impl FnMut(u32, f32, f32),
 ) {
@@ -2535,7 +2583,7 @@ struct ProbeQuery<'q> {
     /// score against a unit query); the raw query otherwise, unused there.
     unit: std::borrow::Cow<'q, [f32]>,
     /// The rotated query lookup table, for a RaBitQ column.
-    rabitq: Option<std::rc::Rc<kosha_vector_spfresh::RaBitQQuery>>,
+    rabitq: Option<std::sync::Arc<kosha_vector_spfresh::RaBitQQuery>>,
     /// An i8 entry's error bound per unit of its `scale` (#381): the
     /// estimate `scale * <q, code>` is off from the exact `<q, x>` by at
     /// most `scale * i8_error_per_scale`. See [`i8_error_per_scale`].
@@ -2733,8 +2781,8 @@ fn format_vector_kernels_summary(
 /// the same rotation), so each thread keeps the last one it built: a query
 /// probing many segments builds its lookup table once per scoring thread,
 /// not once per segment.
-fn rabitq_query_for(unit_query: &[f32]) -> std::rc::Rc<kosha_vector_spfresh::RaBitQQuery> {
-    type Last = Option<(Vec<f32>, std::rc::Rc<kosha_vector_spfresh::RaBitQQuery>)>;
+fn rabitq_query_for(unit_query: &[f32]) -> std::sync::Arc<kosha_vector_spfresh::RaBitQQuery> {
+    type Last = Option<(Vec<f32>, std::sync::Arc<kosha_vector_spfresh::RaBitQQuery>)>;
     thread_local! {
         static LAST: std::cell::RefCell<Last> = const { std::cell::RefCell::new(None) };
     }
@@ -2742,16 +2790,16 @@ fn rabitq_query_for(unit_query: &[f32]) -> std::rc::Rc<kosha_vector_spfresh::RaB
         let mut last = last.borrow_mut();
         if let Some((query, built)) = last.as_ref() {
             if query.as_slice() == unit_query {
-                return std::rc::Rc::clone(built);
+                return std::sync::Arc::clone(built);
             }
         }
         let rotation = kosha_vector_spfresh::RaBitQRotation::new(unit_query.len());
-        let built = std::rc::Rc::new(kosha_vector_spfresh::RaBitQQuery::with_estimator(
+        let built = std::sync::Arc::new(kosha_vector_spfresh::RaBitQQuery::with_estimator(
             &rotation,
             unit_query,
             rabitq_estimator(),
         ));
-        *last = Some((unit_query.to_vec(), std::rc::Rc::clone(&built)));
+        *last = Some((unit_query.to_vec(), std::sync::Arc::clone(&built)));
         built
     })
 }
@@ -2786,7 +2834,7 @@ impl VectorPosting {
     /// report a bound of `0`.
     fn for_each_similarity(
         &self,
-        accept: Option<&dyn Fn(u32) -> bool>,
+        accept: Option<KnnAccept<'_>>,
         f32_similarity: impl Fn(&[f32]) -> f32,
         probe: &ProbeQuery<'_>,
         centroid: &[f32],
@@ -2869,6 +2917,9 @@ mod posting_scan_tests;
 
 #[cfg(test)]
 mod centroid_codes_tests;
+
+#[cfg(test)]
+mod centroid_cap_tests;
 
 #[cfg(test)]
 mod vector_index_v2_tests {
@@ -5274,6 +5325,22 @@ fn vector_postings_cache_max_bytes() -> usize {
     })
 }
 
+/// Per-segment byte budget for the decoded late-interaction (`.ivf`)
+/// postings LRU (`KOSHA_LATE_INTERACTION_POSTINGS_CACHE_MAX_BYTES`, default
+/// 32 MiB, `0` disables) — #205. Separate from the single-vector budget so
+/// a token-index working set (query tokens x `nprobe` postings per query)
+/// does not evict the single-vector one. Entries report to the same
+/// live-bytes account as every other postings cache.
+fn late_interaction_postings_cache_max_bytes() -> usize {
+    static BUDGET: OnceLock<usize> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("KOSHA_LATE_INTERACTION_POSTINGS_CACHE_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32 * 1024 * 1024)
+    })
+}
+
 /// Optional live-memory account the segment's per-segment postings LRU
 /// reports its resident bytes to (Tier 1 O6). The decoded form of postings
 /// lives outside the on-disk format (the per-query `PostingsCache`), so
@@ -7091,6 +7158,10 @@ struct LazyVectorIndex {
     /// unit-norm, with `KOSHA_KNN_PLAN_I8=0`, or when a centroid is not a
     /// sane unit-scale vector: planning then scores the f32 centroids.
     centroid_codes: Option<CentroidCodes>,
+    /// A spherical cap holding every centroid, for a floor on the column's
+    /// rank scores (see [`CentroidCap`]). Built at load like the codes;
+    /// `None` for a column that is not unit-norm or has no sane centroids.
+    centroid_cap: Option<CentroidCap>,
     /// `(offset, length)` into `vector.idx`, one per posting.
     ranges: Vec<(u64, u32)>,
     /// Parallel to `ranges` — max cosine distance from each posting's
@@ -7142,6 +7213,9 @@ impl LazyVectorIndex {
         let centroid_codes = (unit_norm && knn_plan_i8_from_env())
             .then(|| CentroidCodes::build(&centroids, dim))
             .flatten();
+        let centroid_cap = unit_norm
+            .then(|| CentroidCap::build(&centroids, dim, &radii))
+            .flatten();
         LazyVectorIndex {
             vector_idx_path: idx_path.to_path_buf(),
             idx_file: idx_path.file_name().map_or_else(
@@ -7152,6 +7226,7 @@ impl LazyVectorIndex {
             dim,
             centroids,
             centroid_codes,
+            centroid_cap,
             ranges,
             radii,
             unit_norm,
@@ -7300,6 +7375,179 @@ impl CentroidCodes {
     }
 }
 
+/// The smallest-known spherical cap around a unit-norm column's
+/// centroids: a centre direction `m` and an angle `theta` with
+/// `angle(m, c) <= theta` for every centroid `c`, plus the largest centroid
+/// norm and the largest radius. One per loaded column (`dim` f64s), built
+/// from the resident centroids; nothing on disk changes.
+///
+/// It gives the kNN plan a floor on every posting's rank score from one
+/// dot product per segment ([`SegmentReader::knn_centroid_score_floor`]),
+/// so a segment whose centroids all lie far from the query can be left out
+/// of the plan without scoring them (#253). Segments that each cover the
+/// whole space (hash- or time-partitioned) get a floor of `0` and are
+/// scored as before; the floor only pays off once segments are spatially
+/// clustered.
+#[derive(Debug)]
+struct CentroidCap {
+    /// Unit centre, in f64.
+    center: Vec<f64>,
+    /// Upper bound on the angle from `center` to any centroid, radians.
+    theta: f64,
+    /// Upper bound on any centroid's L2 norm.
+    max_norm: f64,
+    /// Lower bound on any centroid's L2 norm.
+    min_norm: f64,
+    /// The largest radius of any posting.
+    max_radius: f32,
+}
+
+impl CentroidCap {
+    /// Angular slack for f64 rounding in `acos` (ill-conditioned near 0).
+    const ANGLE_PAD: f64 = 1e-6;
+
+    /// `None` when there is nothing to bound or the bound's assumptions do
+    /// not hold: no centroids, a centroid or radius that is not finite, a
+    /// centroid far from unit length (a damaged or foreign sidecar), or
+    /// centroids that cancel out so there is no meaningful centre.
+    fn build(centroids: &[f32], dim: usize, radii: &[f32]) -> Option<Self> {
+        if dim == 0 || centroids.is_empty() || centroids.len() != dim * radii.len() {
+            return None;
+        }
+        if radii.iter().any(|r| !r.is_finite()) {
+            return None;
+        }
+        let mut center = vec![0f64; dim];
+        let mut max_norm = 0f64;
+        let mut min_norm = f64::INFINITY;
+        for row in centroids.chunks_exact(dim) {
+            if row.iter().any(|x| !x.is_finite()) {
+                return None;
+            }
+            let norm = row
+                .iter()
+                .map(|&x| f64::from(x).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            if !(0.5..=2.0).contains(&norm) {
+                return None;
+            }
+            max_norm = max_norm.max(norm);
+            min_norm = min_norm.min(norm);
+            for (m, &x) in center.iter_mut().zip(row) {
+                *m += f64::from(x) / norm;
+            }
+        }
+        let rows = radii.len() as f64;
+        let len = center.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if len.is_nan() || len <= 1e-6 * rows {
+            return None;
+        }
+        for m in &mut center {
+            *m /= len;
+        }
+        let mut theta = 0f64;
+        for row in centroids.chunks_exact(dim) {
+            let norm = row
+                .iter()
+                .map(|&x| f64::from(x).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            let cos = center
+                .iter()
+                .zip(row)
+                .map(|(m, &x)| m * f64::from(x))
+                .sum::<f64>()
+                / norm;
+            theta = theta.max(cos.clamp(-1.0, 1.0).acos());
+        }
+        Some(Self {
+            center,
+            theta: theta + Self::ANGLE_PAD,
+            max_norm: max_norm * (1.0 + 1e-9),
+            min_norm: min_norm * (1.0 - 1e-9),
+            max_radius: radii.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+        })
+    }
+
+    /// A floor on [`SegmentReader::centroid_score`] for every posting of
+    /// the column, given `unit`, the query as [`SegmentReader::unit_query`]
+    /// scales it. `None` for a query that is not finite or a radius weight
+    /// that is not finite and `>= 0`.
+    ///
+    /// Why it holds, for posting `i` with f32 centroid `c` and radius `r`:
+    ///
+    /// 1. Angles between directions are a metric on the sphere, so with
+    ///    `phi = angle(unit, m)` and `angle(m, c) <= theta`,
+    ///    `angle(unit, c) >= max(0, phi - theta)` and, in real arithmetic,
+    ///    `dot(unit, c) <= |unit| * |c| * cos(max(0, phi - theta))`
+    ///    (cos is decreasing on `[0, pi]`), and `|c|` is at most
+    ///    `max_norm` when that cosine is positive, at least `min_norm`
+    ///    when it is negative. `phi` gets `ANGLE_PAD` taken off for its own
+    ///    `acos` rounding.
+    /// 2. The f32 dot the score is computed from is within
+    ///    `gamma_n * |unit| * |c|` of the real one (Higham, section 3.1);
+    ///    `(dim + 8) * 2^-23 * |unit| * max_norm` is more than that.
+    /// 3. `d = fl(1 - clamp(x))` is non-increasing in `x` (so the bound on
+    ///    `x` is clamped the same way) and rounds a value
+    ///    in `[0, 2]` by at most `2^-23`.
+    /// 4. [`centroid_probe_score`] is `max(fl(d - fl(alpha * r)), 0)`,
+    ///    non-decreasing in `d` and, for `alpha >= 0`, non-increasing in
+    ///    `r`, so `max_radius` gives the smallest score; the last
+    ///    subtraction rounds by at most a half ulp of a value under
+    ///    `2 + alpha * max_radius`.
+    ///
+    /// The result is computed in f64 with that slack (and `PAD` more) and
+    /// only then rounded to f32, so the floor is never above any score.
+    fn score_floor(&self, unit: &[f32], alpha: f32) -> Option<f32> {
+        const PAD: f64 = 4e-6;
+        if !(alpha.is_finite() && alpha >= 0.0) || unit.len() != self.center.len() {
+            return None;
+        }
+        if unit.iter().any(|x| !x.is_finite()) {
+            return None;
+        }
+        let norm = unit
+            .iter()
+            .map(|&x| f64::from(x).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let dim = unit.len() as f64;
+        let rounding = (dim + 8.0) * f64::from(f32::EPSILON) * norm * self.max_norm;
+        let real_max = if norm == 0.0 {
+            0.0
+        } else {
+            let cos = self
+                .center
+                .iter()
+                .zip(unit)
+                .map(|(m, &x)| m * f64::from(x))
+                .sum::<f64>()
+                / norm;
+            let phi = cos.clamp(-1.0, 1.0).acos() - Self::ANGLE_PAD;
+            let gap = (phi - self.theta).max(0.0);
+            // `gap` can exceed pi only through the pads' arithmetic; cos is
+            // not monotone past pi, so cap it there.
+            let cos = gap.min(std::f64::consts::PI).cos();
+            let c_norm = if cos >= 0.0 {
+                self.max_norm
+            } else {
+                self.min_norm
+            };
+            norm * c_norm * cos
+        };
+        let x = (real_max + rounding).clamp(-1.0, 1.0);
+        let distance = 1.0 - x - f64::from(f32::EPSILON);
+        let radius_term = f64::from(alpha * self.max_radius);
+        let rounding = f64::from(f32::EPSILON) * (2.0 + radius_term.abs());
+        let floor = distance - radius_term - rounding - PAD;
+        if !floor.is_finite() {
+            return None;
+        }
+        Some(if floor <= 0.0 { 0.0 } else { floor as f32 })
+    }
+}
+
 /// Resident bytes of the centroid codes a segment open builds for the
 /// vector column whose `vector.offsets` sidecar is at `offsets_path` (see
 /// [`CentroidCodes`]): zero when the column gets none (not unit-norm,
@@ -7312,19 +7560,38 @@ pub fn vector_centroid_code_bytes(offsets_path: &Path) -> u64 {
     if !knn_plan_i8_from_env() {
         return 0;
     }
+    unit_norm_offsets_shape(offsets_path).map_or(0, |(dim, postings)| {
+        postings.saturating_mul(dim + CENTROID_CODE_ROW_OVERHEAD as u64)
+    })
+}
+
+/// Resident bytes of the [`CentroidCap`] a segment open builds for the
+/// vector column whose `vector.offsets` sidecar is at `offsets_path`: its
+/// `f64` centre, or zero when the column is not unit-norm or has no
+/// readable sidecar header. Derived at load like the centroid codes, so
+/// `approx_segment_bytes` adds it too. A unit-norm column whose centroids
+/// give no cap is still charged, the conservative direction.
+pub fn vector_centroid_cap_bytes(offsets_path: &Path) -> u64 {
+    unit_norm_offsets_shape(offsets_path).map_or(0, |(dim, _)| {
+        dim.saturating_mul(std::mem::size_of::<f64>() as u64)
+    })
+}
+
+/// `(dim, postings)` from the header of a unit-norm column's
+/// `vector.offsets` sidecar; `None` for any other column or an unreadable
+/// header. Only the 16-byte header is read.
+fn unit_norm_offsets_shape(offsets_path: &Path) -> Option<(u64, u64)> {
     let mut header = [0u8; VECTOR_OFFSETS_HEADER_LEN];
     let read = fs::File::open(offsets_path).and_then(|mut f| f.read_exact(&mut header));
     if read.is_err() || header[0..4] != VECTOR_OFFSETS_MAGIC.to_le_bytes() {
-        return 0;
+        return None;
     }
     let mut cursor = &header[4..];
     let version = read_u32_le(&mut cursor);
     let dim = read_u32_le(&mut cursor) as u64;
     let postings = read_u32_le(&mut cursor) as u64;
-    if !is_known_vector_index_version(version) || !is_unit_norm_vector_index_version(version) {
-        return 0;
-    }
-    postings.saturating_mul(dim + CENTROID_CODE_ROW_OVERHEAD as u64)
+    (is_known_vector_index_version(version) && is_unit_norm_vector_index_version(version))
+        .then_some((dim, postings))
 }
 
 /// `KOSHA_KNN_PLAN_I8` (default on): `0`, `false` or `off` turns off the
@@ -7402,6 +7669,11 @@ impl KnnCentroidMatrix {
     /// See [`SegmentReader::knn_centroid_score_bounds`].
     pub fn score_bounds(&self, query: &[f32], alpha: f32) -> Option<KnnCentroidScoreBounds> {
         SegmentReader::centroid_score_bounds(&self.0, query, alpha)
+    }
+
+    /// See [`SegmentReader::knn_centroid_score_floor`].
+    pub fn score_floor(&self, query: &[f32], alpha: f32) -> Option<f32> {
+        SegmentReader::centroid_score_floor(&self.0, query, alpha)
     }
 }
 
@@ -7776,7 +8048,8 @@ struct ProbedCandidates {
 pub struct KnnScanStats {
     /// Reading posting bytes from local disk (idx file or span cache).
     pub read_nanos: u64,
-    /// Decoding those bytes into ids and vectors (or codes).
+    /// Decoding those bytes into ids and vectors (or codes). Zero for an
+    /// f32 posting scored in place from the read buffer.
     pub decode_nanos: u64,
     /// Scoring entries against the query, candidate collection included.
     pub score_nanos: u64,
@@ -7790,8 +8063,9 @@ pub struct KnnScanStats {
     /// Postings read and decoded into an owned posting (admitted to the
     /// cache, or a quantized column's).
     pub postings_decoded: usize,
-    /// f32 postings read and scored from the probe's reused buffers,
-    /// without building a posting.
+    /// f32 postings read and scored from the probe's reused buffers
+    /// (in place from the read buffer on little-endian targets), without
+    /// building a posting.
     pub postings_scanned: usize,
 }
 
@@ -7835,10 +8109,11 @@ pub fn with_knn_scan_stats<R>(f: impl FnOnce() -> R) -> (R, KnnScanStats) {
 /// when the probe returns, so none of it outlives the segment visit.
 struct PostingScan<'a> {
     vi: &'a LazyVectorIndex,
-    probe: ProbeQuery<'a>,
-    accept: Option<&'a dyn Fn(u32) -> bool>,
+    probe: &'a ProbeQuery<'a>,
+    accept: Option<KnnAccept<'a>>,
     reader: span_cache::LocalRangeReader,
-    /// Decode scratch for an f32 posting that is not kept.
+    /// Decode scratch for an f32 posting that is not kept and cannot be
+    /// scored in place (a big-endian target).
     ids: Vec<u32>,
     vectors: Vec<f32>,
     stats: KnnScanStats,
@@ -7850,10 +8125,23 @@ impl<'a> PostingScan<'a> {
     fn new(
         segment_dir: &Path,
         vi: &'a LazyVectorIndex,
-        probe: ProbeQuery<'a>,
-        accept: Option<&'a dyn Fn(u32) -> bool>,
+        probe: &'a ProbeQuery<'a>,
+        accept: Option<KnnAccept<'a>>,
     ) -> Self {
         let timed = KNN_SCAN_STATS.with(|stats| stats.get().is_some());
+        Self::with_timing(segment_dir, vi, probe, accept, timed)
+    }
+
+    /// A scan of the same column for another thread (see
+    /// [`SegmentReader::scan_budgeted_postings`]): its own reader and
+    /// scratch, timed as the probe it belongs to is.
+    fn with_timing(
+        segment_dir: &Path,
+        vi: &'a LazyVectorIndex,
+        probe: &'a ProbeQuery<'a>,
+        accept: Option<KnnAccept<'a>>,
+        timed: bool,
+    ) -> Self {
         Self {
             vi,
             probe,
@@ -7964,6 +8252,11 @@ impl CandidateSink {
         }
     }
 
+    /// A sink of the same kind and `k`, with nothing in it.
+    fn empty_like(&self) -> Self {
+        Self::with_running_top_k(self.k, self.top.is_some())
+    }
+
     fn push(&mut self, id: u32, similarity: f32, error: f32) {
         let score = similarity as f64;
         let seq = self.count as u64;
@@ -7973,12 +8266,49 @@ impl CandidateSink {
             self.errors.push(error);
             return;
         };
-        if top.len() < self.k {
-            top.push(TopKEntry { score, seq, id });
+        Self::offer(top, self.k, TopKEntry { score, seq, id });
+    }
+
+    /// Keeps `entry` if it belongs in the running top `k`. Entries must
+    /// arrive in increasing `seq`: a tie with the current `k`-th is then
+    /// always the later-seen one, which does not displace it.
+    fn offer(top: &mut std::collections::BinaryHeap<TopKEntry>, k: usize, entry: TopKEntry) {
+        if top.len() < k {
+            top.push(entry);
         } else if let Some(mut worst) = top.peek_mut() {
-            if score > worst.score {
-                *worst = TopKEntry { score, seq, id };
+            if entry.score > worst.score {
+                *worst = entry;
             }
+        }
+    }
+
+    /// Appends `part`, a sink (from [`Self::empty_like`]) of the candidates
+    /// scored right after everything in `self`, as if they had been pushed
+    /// here one by one.
+    ///
+    /// A quantized column's candidates are concatenated. For a running
+    /// top `k`, `part` kept the best `k` of its own candidates by (score
+    /// descending, position ascending); offering those, at their position
+    /// offset by `self`'s count and in position order, keeps exactly what
+    /// pushing every candidate would have: anything `part` dropped was
+    /// beaten by `k` of its own, which also beat it here.
+    fn absorb(&mut self, part: CandidateSink) {
+        let base = self.count as u64;
+        self.count += part.count;
+        match (self.top.as_mut(), part.top) {
+            (Some(top), Some(part_top)) => {
+                let mut kept = part_top.into_vec();
+                kept.sort_unstable_by_key(|entry| entry.seq);
+                for entry in kept {
+                    let seq = base + entry.seq;
+                    Self::offer(top, self.k, TopKEntry { seq, ..entry });
+                }
+            }
+            (None, None) => {
+                self.scored.extend(part.scored);
+                self.errors.extend(part.errors);
+            }
+            _ => unreachable!("absorb takes a sink from empty_like"),
         }
     }
 
@@ -8135,6 +8465,11 @@ pub struct SegmentReader {
     /// Late-interaction fields (#205) opened so far, by footer index. Only
     /// success is cached, as for `doc_vectors`.
     multi_vectors: Mutex<HashMap<usize, Arc<multivec::MultiVectorIndex>>>,
+    /// Decoded `.ivf` postings of every late-interaction field, keyed by
+    /// `(field index, posting)` — the late-interaction twin of
+    /// `vector_cache`, budgeted by
+    /// `KOSHA_LATE_INTERACTION_POSTINGS_CACHE_MAX_BYTES`.
+    multi_vector_cache: multivec::IvfPostingCache,
 }
 
 /// Default of [`SegmentReader::with_vector_rescore_factor`]:
@@ -8270,11 +8605,15 @@ impl SegmentReader {
             vector_slots,
             vector_cache: shared_vector_cache(),
             vector_cache_owner: next_vector_cache_owner(),
-            postings_account,
+            postings_account: postings_account.clone(),
             doc_vectors: Mutex::new(None),
             field_lengths: Mutex::new(HashMap::new()),
             vector_rescore_factor: vector_rescore_factor(),
             multi_vectors: Mutex::new(HashMap::new()),
+            multi_vector_cache: PostingsCache::new(
+                late_interaction_postings_cache_max_bytes(),
+                postings_account,
+            ),
         })
     }
 
@@ -8378,6 +8717,22 @@ impl SegmentReader {
         self.vector_cache.resident_bytes_where(|(o, _)| *o == owner)
     }
 
+    /// Override the byte budget of the decoded late-interaction posting
+    /// cache (#205); `0` disables it. Readers default to
+    /// `KOSHA_LATE_INTERACTION_POSTINGS_CACHE_MAX_BYTES`. Call before the
+    /// first search: whatever the cache already holds is dropped.
+    pub fn with_late_interaction_postings_cache_max_bytes(mut self, max_bytes: usize) -> Self {
+        let account = self.multi_vector_cache.account.clone();
+        self.multi_vector_cache = PostingsCache::new(max_bytes, account);
+        self
+    }
+
+    /// Bytes the decoded late-interaction posting cache holds right now
+    /// (#205; also what it reports to the live-bytes account).
+    pub fn late_interaction_cache_resident_bytes(&self) -> usize {
+        self.multi_vector_cache.state.lock().unwrap().total_bytes
+    }
+
     /// The vector columns `footer` declares, or the single unnamed legacy
     /// index of a segment written before columns existed. No I/O.
     fn vector_slots(segment_dir: &Path, footer: &Footer) -> Vec<VectorFieldSlot> {
@@ -8411,7 +8766,7 @@ impl SegmentReader {
         query: &[&[f32]],
         k: usize,
         params: LateInteractionParams,
-        accept: Option<&dyn Fn(u32) -> bool>,
+        accept: Option<KnnAccept<'_>>,
     ) -> Result<LateInteractionHits, KoshaError> {
         let Some(i) = self
             .footer
@@ -8451,7 +8806,7 @@ impl SegmentReader {
                 q
             })
             .collect();
-        index.search(&normalized, k, params, accept)
+        index.search(&normalized, k, params, accept, &self.multi_vector_cache)
     }
 
     fn doc_vectors(&self) -> Result<Arc<DocVectors>, KoshaError> {
@@ -8891,6 +9246,56 @@ impl SegmentReader {
         }))
     }
 
+    /// Reads namespace routing metadata from existing offsets sidecars,
+    /// without opening lexical files or hydrating any posting body.
+    pub fn namespace_centroids(
+        dir: &Path,
+    ) -> Result<Vec<kosha_vector_spfresh::namespace_centroids::Column>, KoshaError> {
+        Self::namespace_centroids_from(|name| Ok(fs::read(dir.join(name))?))
+    }
+
+    pub fn namespace_centroids_from(
+        read: impl Fn(&str) -> Result<Vec<u8>, KoshaError>,
+    ) -> Result<Vec<kosha_vector_spfresh::namespace_centroids::Column>, KoshaError> {
+        use kosha_vector_spfresh::namespace_centroids::{Centroid, Column};
+        let footer: Footer = serde_json::from_slice(&read("footer.json")?)?;
+        let Some(fields) = footer.vector_fields else {
+            return Ok(Vec::new()); // the planner falls back for legacy vector columns
+        };
+        fields
+            .into_iter()
+            .filter(|meta| meta.offsets)
+            .map(|meta| {
+                let file = meta.offsets_file();
+                let data = read(&file)?;
+                let invalid =
+                    || KoshaError::CorruptSegment(format!("{file}: invalid centroid offsets"));
+                let version =
+                    u32::from_le_bytes(data.get(4..8).ok_or_else(invalid)?.try_into().unwrap());
+                let postings = parse_vector_offsets(&data, meta.dim, version)
+                    .filter(|postings| {
+                        postings.iter().all(|p| {
+                            p.radius.is_finite() && p.centroid.iter().all(|x| x.is_finite())
+                        })
+                    })
+                    .ok_or_else(invalid)?;
+                let unit_norm = is_unit_norm_vector_index_version(version);
+                Ok(Column {
+                    field: meta.name,
+                    dim: meta.dim as usize,
+                    centroids: postings
+                        .into_iter()
+                        .map(|p| Centroid {
+                            vector: p.centroid,
+                            radius: p.radius,
+                            unit_norm,
+                        })
+                        .collect(),
+                })
+            })
+            .collect()
+    }
+
     /// The flat (legacy / missing-sidecar) vectors of this segment's first
     /// vector column — empty when it is served lazily or has none.
     pub fn vector_store(&self) -> VectorStore {
@@ -8911,17 +9316,34 @@ impl SegmentReader {
     ///
     /// * second touch (see below) of a posting the cache has room for, or
     ///   any quantized posting: decoded into an owned posting, as before;
-    /// * any other f32 posting: decoded into `scan`'s reused flat scratch
-    ///   and scored from it. No posting is built and nothing is allocated.
+    /// * any other f32 posting: scored in place from the read buffer, which
+    ///   is 4-byte aligned (on a big-endian target, decoded into `scan`'s
+    ///   reused flat scratch and scored from it). No posting is built,
+    ///   nothing is allocated and nothing is copied after the read.
     ///
-    /// Both paths decode the same bytes into the same floats and score
-    /// them with the same kernel in the same order, so the scores are
+    /// Every path reads the same bytes as the same floats and scores them
+    /// with the same kernel in the same order, so the scores are
     /// bit-identical.
     fn scan_posting(
         &self,
         scan: &mut PostingScan<'_>,
         held: &PrefetchHolds<'_>,
         range_idx: usize,
+        f32_similarity: impl Fn(&[f32]) -> f32,
+        emit: impl FnMut(u32, f32, f32),
+    ) -> Result<(), KoshaError> {
+        self.scan_posting_with(scan, held, range_idx, None, f32_similarity, emit)
+    }
+
+    /// [`Self::scan_posting`], with the second-touch decision for a miss
+    /// already taken by the caller when `admission` is `Some` (see
+    /// [`Self::second_touch_admissions`]); `None` takes it here.
+    fn scan_posting_with(
+        &self,
+        scan: &mut PostingScan<'_>,
+        held: &PrefetchHolds<'_>,
+        range_idx: usize,
+        admission: Option<bool>,
         f32_similarity: impl Fn(&[f32]) -> f32,
         emit: impl FnMut(u32, f32, f32),
     ) -> Result<(), KoshaError> {
@@ -8935,7 +9357,7 @@ impl SegmentReader {
             None => self.vector_cache.get(key),
         };
         if let Some(hit) = hit {
-            hit.for_each_similarity(scan.accept, f32_similarity, &scan.probe, centroid, emit);
+            hit.for_each_similarity(scan.accept, f32_similarity, scan.probe, centroid, emit);
             scan.stats.postings_cached += 1;
             scan.stats.score_nanos += lap_nanos(&mut clock);
             return Ok(());
@@ -8975,8 +9397,10 @@ impl SegmentReader {
         // probes (a cold namespace scanned once) pass through without
         // evicting a hot working set; probes that recur across queries get
         // cached on their second hydration, however many one query makes.
-        let window = self.vector_cache.vector_miss_window(bytes.len());
-        let admit = self.vector_cache.admit_on_miss_within(key, window);
+        let admit = match admission {
+            Some(admit) => admit,
+            None => self.admit_vector_miss(key, bytes.len()),
+        };
         if !vi.quantized {
             let count = bytes.len() / vector_entry_size(vi.dim as u32, vi.version);
             let keep = admit
@@ -8984,6 +9408,18 @@ impl SegmentReader {
                     .vector_cache
                     .accepts(f32_posting_resident_bytes(count, vi.dim));
             if !keep {
+                if let Some(words) = f32_entries_in_place(bytes, vi.dim) {
+                    for_each_f32_similarity_in_place(
+                        words,
+                        vi.dim,
+                        scan.accept,
+                        f32_similarity,
+                        emit,
+                    );
+                    scan.stats.postings_scanned += 1;
+                    scan.stats.score_nanos += lap_nanos(&mut clock);
+                    return Ok(());
+                }
                 decode_f32_entries_into(bytes, vi.dim, &mut scan.ids, &mut scan.vectors);
                 scan.stats.decode_nanos += lap_nanos(&mut clock);
                 for_each_f32_similarity(
@@ -9010,9 +9446,132 @@ impl SegmentReader {
             );
         }
         scan.stats.decode_nanos += lap_nanos(&mut clock);
-        decoded.for_each_similarity(scan.accept, f32_similarity, &scan.probe, centroid, emit);
+        decoded.for_each_similarity(scan.accept, f32_similarity, scan.probe, centroid, emit);
         scan.stats.postings_decoded += 1;
         scan.stats.score_nanos += lap_nanos(&mut clock);
+        Ok(())
+    }
+
+    /// Second-touch admission of a missed vector posting of `length`
+    /// bytes (see [`PostingsCache::vector_miss_window`]).
+    fn admit_vector_miss(&self, key: (u64, usize), length: usize) -> bool {
+        let window = self.vector_cache.vector_miss_window(length);
+        self.vector_cache.admit_on_miss_within(key, window)
+    }
+
+    /// The second-touch decision for each of `postings`, taken in their
+    /// order, as a serial scan takes it: `None` for a posting cached now
+    /// or pinned by the prefetch in `held` (decided at scan time, should a
+    /// cached one be evicted before then).
+    ///
+    /// The miss history is ordered by when misses are recorded. Recorded
+    /// from several threads, that order would change from one run of a
+    /// probe to the next, so a posting at the end of one run's list could
+    /// be missed again within the window by the next run, and a probe
+    /// larger than the cache's reach would admit postings it can only
+    /// churn (`a_probe_larger_than_the_cache_reach_passes_through`).
+    fn second_touch_admissions(
+        &self,
+        vi: &LazyVectorIndex,
+        held: &PrefetchHolds<'_>,
+        postings: &[u32],
+    ) -> Vec<Option<bool>> {
+        postings
+            .iter()
+            .map(|&range_idx| {
+                let range_idx = range_idx as usize;
+                let key = self.vector_cache_key(vi.slot, range_idx);
+                (held.pinned(range_idx).is_none() && !self.vector_cache.contains(key))
+                    .then(|| self.admit_vector_miss(key, vi.ranges[range_idx].1 as usize))
+            })
+            .collect()
+    }
+
+    /// Scores `postings` (a budgeted probe's, nearest first) into `sink`,
+    /// exactly as calling [`Self::scan_posting`] on each in order would.
+    ///
+    /// A large probe of one segment is split into contiguous runs of at
+    /// least [`KNN_PARALLEL_MIN_POSTINGS`] postings scored on the current
+    /// rayon pool, so a query whose matter is one big segment uses more
+    /// than one core. It joins the pool the caller runs on (the query
+    /// layer's per-segment `par_iter`), never a pool of its own: an idle
+    /// worker steals a run, a busy pool scans the runs back to back on the
+    /// caller's thread, and no thread is added.
+    ///
+    /// The result does not depend on the split. Each run collects into a
+    /// sink of its own, and runs are merged in posting order with their
+    /// candidates' positions offset by the candidates scored before them
+    /// (see [`CandidateSink::absorb`]). An error is the one the serial
+    /// scan would have returned: the first failing posting in order. The
+    /// cache's second-touch decisions are taken in posting order before
+    /// the split (see [`Self::second_touch_admissions`]); only the order
+    /// in which admitted postings are inserted, and so their relative
+    /// recency, can differ from a serial scan.
+    fn scan_budgeted_postings(
+        &self,
+        scan: &mut PostingScan<'_>,
+        held: &PrefetchHolds<'_>,
+        sink: &mut CandidateSink,
+        postings: &[u32],
+        similarity: &(dyn Fn(&[f32]) -> f32 + Sync),
+    ) -> Result<(), KoshaError> {
+        if postings.len() < 2 * KNN_PARALLEL_MIN_POSTINGS || rayon::current_num_threads() < 2 {
+            for &range_idx in postings {
+                self.scan_posting(
+                    scan,
+                    held,
+                    range_idx as usize,
+                    similarity,
+                    |id, sim, err| sink.push(id, sim, err),
+                )?;
+            }
+            return Ok(());
+        }
+        use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+        let (vi, probe, accept, timed) = (scan.vi, scan.probe, scan.accept, scan.timed);
+        let empty = sink.empty_like();
+        let admissions = self.second_touch_admissions(vi, held, postings);
+        // While this thread waits for the runs it may run other rayon jobs
+        // (a run of this probe, another segment, another query). Those
+        // must not count into this thread's stats scope: the runs report
+        // their stats here explicitly, and anything else opens its own.
+        let scope = KNN_SCAN_STATS.take();
+        let runs: Vec<(CandidateSink, KnnScanStats, Option<KoshaError>)> = postings
+            .par_iter()
+            .zip(admissions.par_iter())
+            .with_min_len(KNN_PARALLEL_MIN_POSTINGS)
+            .fold(
+                || {
+                    let scan =
+                        PostingScan::with_timing(&self.segment_dir, vi, probe, accept, timed);
+                    (scan, empty.empty_like(), None::<KoshaError>)
+                },
+                |(mut scan, mut sink, mut failed), (&range_idx, &admission)| {
+                    if failed.is_none() {
+                        failed = self
+                            .scan_posting_with(
+                                &mut scan,
+                                held,
+                                range_idx as usize,
+                                admission,
+                                similarity,
+                                |id, s, e| sink.push(id, s, e),
+                            )
+                            .err();
+                    }
+                    (scan, sink, failed)
+                },
+            )
+            .map(|(mut scan, sink, failed)| (sink, std::mem::take(&mut scan.stats), failed))
+            .collect();
+        KNN_SCAN_STATS.set(scope);
+        for (part, stats, failed) in runs {
+            scan.stats.add(&stats);
+            if let Some(e) = failed {
+                return Err(e);
+            }
+            sink.absorb(part);
+        }
         Ok(())
     }
 
@@ -9043,7 +9602,7 @@ impl SegmentReader {
         query: &[f32],
         k: usize,
         nprobe: usize,
-        accept: Option<&dyn Fn(u32) -> bool>,
+        accept: Option<KnnAccept<'_>>,
     ) -> Option<Result<Vec<(u32, f64)>, KoshaError>> {
         self.knn_search_filtered_fetching(field, query, k, nprobe, accept, None)
     }
@@ -9056,7 +9615,7 @@ impl SegmentReader {
         query: &[f32],
         k: usize,
         nprobe: usize,
-        accept: Option<&dyn Fn(u32) -> bool>,
+        accept: Option<KnnAccept<'_>>,
         fetch: Option<VectorSpanFetch<'_>>,
     ) -> Option<Result<Vec<(u32, f64)>, KoshaError>> {
         let index = match self.vector_field(field) {
@@ -9299,6 +9858,12 @@ impl SegmentReader {
         finite.then_some(bounds)
     }
 
+    /// See [`CentroidCap::score_floor`].
+    fn centroid_score_floor(vi: &LazyVectorIndex, query: &[f32], alpha: f32) -> Option<f32> {
+        let cap = vi.centroid_cap.as_ref()?;
+        cap.score_floor(&Self::unit_query(vi, query)?, alpha)
+    }
+
     /// `query` scaled to unit length when `vi` stores unit vectors, so a
     /// stored f32 vector's cosine similarity is a bare dot product; `None`
     /// for a column that stores raw magnitudes. A zero query stays zero and
@@ -9427,6 +9992,18 @@ impl SegmentReader {
         })
     }
 
+    /// A floor on every score [`Self::knn_centroid_distances_with_alpha`]
+    /// would return, from one comparison against a cap around the
+    /// column's centroids (see [`CentroidCap`]): the kNN plan leaves a
+    /// segment out without scoring its centroids when this is above the
+    /// probe cutoff. `None` when the column has no cap (not unit-norm, no
+    /// lazy index, a dimension mismatch) or the query is not finite.
+    pub fn knn_centroid_score_floor(&self, field: &str, query: &[f32], alpha: f32) -> Option<f32> {
+        self.with_knn_plan_index(field, query.len(), |vi| {
+            Self::centroid_score_floor(vi, query, alpha)
+        })
+    }
+
     /// Score only the postings of the segment's first vector column whose
     /// centroid distance is `<= max_distance`, capped at `max_probes`
     /// regardless (a tie at the cutoff, or a degenerate all-zero-distance
@@ -9487,7 +10064,7 @@ impl SegmentReader {
         k: usize,
         max_distance: f32,
         max_probes: usize,
-        accept: Option<&dyn Fn(u32) -> bool>,
+        accept: Option<KnnAccept<'_>>,
     ) -> BudgetedKnnResult {
         self.knn_search_within_filtered_fetching(
             field,
@@ -9514,7 +10091,7 @@ impl SegmentReader {
         k: usize,
         max_distance: f32,
         max_probes: usize,
-        accept: Option<&dyn Fn(u32) -> bool>,
+        accept: Option<KnnAccept<'_>>,
         refill: KnnRefill,
         fetch: Option<VectorSpanFetch<'_>>,
     ) -> BudgetedKnnResult {
@@ -9554,7 +10131,7 @@ impl SegmentReader {
         query: &[f32],
         k: usize,
         ranking: &KnnSegmentRanking,
-        accept: Option<&dyn Fn(u32) -> bool>,
+        accept: Option<KnnAccept<'_>>,
         refill: KnnRefill,
         fetch: Option<VectorSpanFetch<'_>>,
     ) -> BudgetedKnnResult {
@@ -9610,7 +10187,7 @@ impl SegmentReader {
         query: &[f32],
         k: usize,
         budget: KnnProbeBudget<'_>,
-        accept: Option<&dyn Fn(u32) -> bool>,
+        accept: Option<KnnAccept<'_>>,
         fetch: Option<VectorSpanFetch<'_>>,
     ) -> Option<Result<KnnCandidates, KoshaError>> {
         let index = match self.vector_field(field) {
@@ -9699,6 +10276,42 @@ impl SegmentReader {
             postings,
             exact: false,
         }))
+    }
+
+    /// Rescore a bounded quantized shortlist before returning a ranked list.
+    /// A missing exact score fails the probe rather than mixing estimates
+    /// into an order that can change when the sidecar becomes warm.
+    pub fn knn_rescore_shortlist_fetching(
+        &self,
+        field: &str,
+        query: &[f32],
+        k: usize,
+        budget: KnnProbeBudget<'_>,
+        accept: Option<&dyn Fn(u32) -> bool>,
+        fetch: Option<VectorSpanFetch<'_>>,
+    ) -> BudgetedKnnResult {
+        self.knn_candidates_fetching(field, query, k, budget, accept, fetch)
+            .map(|found| {
+                let mut found = found?;
+                found
+                    .candidates
+                    .truncate(k.saturating_mul(self.vector_rescore_factor.max(1)));
+                let mut seqs: Vec<_> = found.candidates.iter().map(|c| c.doc_seq).collect();
+                if seqs.is_empty() {
+                    return Ok((Vec::new(), found.postings));
+                }
+                seqs.sort_unstable();
+                let exact = self
+                    .knn_exact_from_sidecar(field, query, k, &seqs, fetch)
+                    .filter(|result| result.vectors_scored == seqs.len())
+                    .ok_or_else(|| {
+                        KoshaError::NotFound(format!(
+                            "{}: exact kNN shortlist unavailable",
+                            self.segment_dir.display()
+                        ))
+                    })?;
+                Ok((exact.hits, found.postings))
+            })
     }
 
     /// Exact cosine similarity of `query` with `field`'s full-precision
@@ -9900,12 +10513,8 @@ impl SegmentReader {
         let is_candidate = |id: u32| candidates.binary_search(&id).is_ok();
         let lanes = DotLanes::from_env();
         let unit = Self::unit_query(vi, query);
-        let mut scan = PostingScan::new(
-            &self.segment_dir,
-            vi,
-            Self::probe_query(vi, query),
-            Some(&is_candidate),
-        );
+        let probe = Self::probe_query(vi, query);
+        let mut scan = PostingScan::new(&self.segment_dir, vi, &probe, Some(&is_candidate));
         for range_idx in 0..vi.ranges.len() {
             let scanned = self.scan_posting(
                 &mut scan,
@@ -10008,7 +10617,7 @@ impl SegmentReader {
         } else {
             let ranges = dv.field_vector_ranges(field, candidates);
             let mut spans = span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE);
-            if let Some(fetch) = fetch {
+            let _held = if let Some(fetch) = fetch {
                 let missing: Vec<(u64, u64)> = ranges
                     .iter()
                     .copied()
@@ -10019,8 +10628,13 @@ impl SegmentReader {
                     // index sees what the fetch left only in memory.
                     let _held = fetch(&self.segment_dir, DOC_VECTORS_FILE, &missing);
                     spans = span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE);
+                    Some(_held)
+                } else {
+                    None
                 }
-            }
+            } else {
+                None
+            };
             dv.visit_field_vectors_cached(&spans, field, candidates, score)
         };
         match visited {
@@ -10052,7 +10666,7 @@ impl SegmentReader {
         k: usize,
         max_distance: f32,
         max_probes: usize,
-        accept: Option<&dyn Fn(u32) -> bool>,
+        accept: Option<KnnAccept<'_>>,
         refill: KnnRefill,
         fetch: Option<VectorSpanFetch<'_>>,
     ) -> Result<(Vec<(u32, f64)>, usize), KoshaError> {
@@ -10089,7 +10703,7 @@ impl SegmentReader {
         k: usize,
         max_distance: f32,
         max_probes: usize,
-        accept: Option<&dyn Fn(u32) -> bool>,
+        accept: Option<KnnAccept<'_>>,
         refill: KnnRefill,
         fetch: Option<VectorSpanFetch<'_>>,
         planned: Option<&KnnSegmentRanking>,
@@ -10124,23 +10738,15 @@ impl SegmentReader {
         let mut held =
             self.prefetch_vector_postings(vi, ranking.budgeted.iter().map(|&i| i as usize), fetch);
 
-        let mut probes = 0usize;
         let mut sink = CandidateSink::new(vi, k);
         let lanes = DotLanes::from_env();
         let unit = Self::unit_query(vi, query);
-        let mut scan =
-            PostingScan::new(&self.segment_dir, vi, Self::probe_query(vi, query), accept);
+        let similarity = |v: &[f32]| Self::f32_similarity(lanes, unit.as_deref(), query, v);
+        let probe = Self::probe_query(vi, query);
+        let mut scan = PostingScan::new(&self.segment_dir, vi, &probe, accept);
         scan.stats.rank_nanos += rank_nanos;
-        for &range_idx in &ranking.budgeted {
-            probes += 1;
-            self.scan_posting(
-                &mut scan,
-                &held,
-                range_idx as usize,
-                |v| Self::f32_similarity(lanes, unit.as_deref(), query, v),
-                |id, sim, err| sink.push(id, sim, err),
-            )?;
-        }
+        self.scan_budgeted_postings(&mut scan, &held, &mut sink, &ranking.budgeted, &similarity)?;
+        let mut probes = budgeted;
         // Past the budget. Without a restriction this is where the probe
         // ends. With one, keep going only while the page is still short
         // (see the doc comment on the public wrapper), and, when the
@@ -10185,7 +10791,7 @@ impl SegmentReader {
                     &mut scan,
                     &held,
                     ranked[position].0 as usize,
-                    |v| Self::f32_similarity(lanes, unit.as_deref(), query, v),
+                    similarity,
                     |id, sim, err| sink.push(id, sim, err),
                 )?;
             }
@@ -10212,7 +10818,7 @@ impl SegmentReader {
         query: &[f32],
         k: usize,
         nprobe: usize,
-        accept: Option<&dyn Fn(u32) -> bool>,
+        accept: Option<KnnAccept<'_>>,
         fetch: Option<VectorSpanFetch<'_>>,
     ) -> Result<Vec<(u32, f64)>, KoshaError> {
         // Unit-norm segments: normalize the query once, then every stored
@@ -10240,7 +10846,7 @@ impl SegmentReader {
         query: &[f32],
         k: usize,
         nprobe: usize,
-        accept: Option<&dyn Fn(u32) -> bool>,
+        accept: Option<KnnAccept<'_>>,
         fetch: Option<VectorSpanFetch<'_>>,
     ) -> Result<ProbedCandidates, KoshaError> {
         // With a restriction, rank every posting so the probe can continue
@@ -10272,8 +10878,8 @@ impl SegmentReader {
         let mut sink = CandidateSink::new(vi, k);
         // `query` is already unit-normalized for every unit-norm column,
         // which includes every quantized one.
-        let mut scan =
-            PostingScan::new(&self.segment_dir, vi, Self::probe_query(vi, query), accept);
+        let probe = Self::probe_query(vi, query);
+        let mut scan = PostingScan::new(&self.segment_dir, vi, &probe, accept);
         let mut postings = 0usize;
         let lanes = DotLanes::from_env();
         for (position, &range_idx) in candidates.iter().enumerate() {

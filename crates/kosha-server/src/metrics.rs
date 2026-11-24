@@ -513,7 +513,7 @@ pub(crate) struct Metrics {
     lease_outcomes: [Counter; 3],
     knn_degraded_segments: Counter,
     tenant_rejections: Family<Labels, Counter>,
-    tenant_rejection_reasons: [Counter; 8],
+    tenant_rejection_reasons: [Counter; crate::tenant_limits::RejectReason::ALL.len()],
     legacy_requests: Family<Labels, Counter>,
 }
 
@@ -773,6 +773,12 @@ impl Metrics {
 
     pub(crate) fn record_lease(&self, outcome: LeaseOutcome) {
         self.lease_outcomes[outcome as usize].inc();
+    }
+
+    /// Add a collector read at scrape time: the usage pipeline's and
+    /// billing's families (`pipeline_metrics.rs`, #348/#349).
+    pub(crate) fn register_collector(&mut self, collector: Box<dyn Collector>) {
+        self.registry.register_collector(collector);
     }
 
     /// The registry in Prometheus text format (0.0.4), with `scrape` as
