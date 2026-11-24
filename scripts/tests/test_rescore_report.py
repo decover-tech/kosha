@@ -111,6 +111,17 @@ def test_restored_snapshot_format_does_not_depend_on_run_env(archive):
     assert "| restored | unknown | off |" in report(root)
 
 
+@pytest.mark.parametrize(("value", "enabled"), [("TRUE", False), ("true", True), ("on", True)])
+def test_global_rescore_flag_matches_server(archive, value, enabled):
+    root = archive("configured")
+    meta = root / "meta.json"
+    config = json.loads(meta.read_text())
+    config["server_env_args"] += f" -e KOSHA_KNN_GLOBAL_RESCORE={value}"
+    meta.write_text(json.dumps(config))
+    row, = json.loads(report("--json", root))
+    assert row["global_rescore"] is enabled
+
+
 def test_whole_sidecar_is_not_codes_only(archive):
     root = archive("whole", counts=(8, 8), whole_bytes=200)
     row, = json.loads(report("--json", root))

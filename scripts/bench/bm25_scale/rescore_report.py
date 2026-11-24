@@ -61,7 +61,7 @@ def run_row(root, allow_whole_sidecar=False):
     env_args = meta.get("server_env_args")
     env = dict(word.split("=", 1) for word in (env_args or "").split() if "=" in word)
     global_rescore = (
-        env.get("KOSHA_KNN_GLOBAL_RESCORE", "").lower() in {"1", "true", "on"}
+        env.get("KOSHA_KNN_GLOBAL_RESCORE", "").strip() in {"1", "true", "on"}
         if env_args is not None else None
     )
     log = vector / "server" / f"{PHASE}.log.gz"
