@@ -625,7 +625,14 @@ indexed segments, with the flush-interval lag. See §11.
      scorer lies on that frontier, and a warm query computes all ceilings from memory (~10 µs
      for 200 segments); a new term costs one pass reading skip summaries, decoding no posting. Counts are unaffected:
      exact counting still visits every match, and capped counting stops a segment only once its
-     own count reaches the cap. A legacy segment without stored summaries has an infinite
+     own count reaches the cap. In an AND join, the stop also needs the sum of every term's
+     suffix-max block ceiling (the best block still ahead) to fall below the page floor. Postings
+     are stored in ingestion order, so a term's best remaining block is usually late in its list,
+     and on real corpora this exit rarely fires before the end of the walk (#114). Checking the
+     bound before the cap is reached would not help, and every early stop reports `gte`, so the
+     gate stays at the cap. Making the exit useful needs impact-ordered postings for the join, a
+     format change. `SearchPhaseStats` reports `and_join_early_exits` and
+     `and_join_members_past_cap` (members walked after the budget was met). A legacy segment without stored summaries has an infinite
      ceiling (visited first, never skipped). A segment that publishes and then abandons its WAND
      walk for the general path (a corrupt block found mid-walk) poisons the floor and the search
      is rescored with per-segment floors. Hybrid (RRF) requests are untouched: their lexical

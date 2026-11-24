@@ -3732,6 +3732,17 @@ pub struct SearchPhaseStats {
     /// `score_wall_ms`. Microseconds once the query's terms are cached for
     /// the manifest version; zero when the floor was not used.
     pub wand_bounds_ms: f64,
+    /// Segments whose capped multi-term AND join stopped early: the summed
+    /// per-term suffix-max ceilings fell below the page floor once the
+    /// segment's count budget was met (#103). Zero in exact counting mode.
+    pub and_join_early_exits: usize,
+    /// Intersection members the capped AND join walked after its segment's
+    /// count budget was already met, summed over segments: the work the
+    /// early exit exists to save. Postings are in ingestion order, so a
+    /// term's best remaining block usually sits late in its list and the
+    /// exit rarely fires (#114); this counter is then close to `total_hits
+    /// - cap` per segment. Zero in exact counting mode.
+    pub and_join_members_past_cap: usize,
     /// Segments whose kNN search failed and contributed no vector hits:
     /// the subset of `SearchResult::knn_degraded_segments` lost to an
     /// error rather than skipped by design (another embedding model). The
@@ -3816,6 +3827,10 @@ struct OpenStatsCollector {
     wand_docs_scored: AtomicUsize,
     /// See [`SearchPhaseStats::wand_segments_skipped`].
     wand_segments_skipped: AtomicUsize,
+    /// See [`SearchPhaseStats::and_join_early_exits`].
+    and_join_early_exits: AtomicUsize,
+    /// See [`SearchPhaseStats::and_join_members_past_cap`].
+    and_join_members_past_cap: AtomicUsize,
     /// Vectors scored by exact filtered kNN — see
     /// [`SearchPhaseStats::knn_exact_vectors`].
     knn_exact_vectors: AtomicUsize,
@@ -5783,11 +5798,12 @@ impl Searcher {
             // OpenSearch-style capped/`gte` reporting callers actually see
             // is applied once, centrally, in `search_inner` after these
             // exact per-segment totals are already summed — see
-            // `resolve_total_hits`. This v1 caps only the *reported*
-            // number; the join above still walks to completion regardless
-            // of the cap, since safely stopping the walk itself needs a
-            // per-term suffix-max upper bound the postings v5 skip table
-            // doesn't carry yet (tracked as follow-up work).
+            // `resolve_total_hits`. The one exception is the capped
+            // multi-term joins below: the AND join may stop once its own
+            // count reaches the budget and the per-term suffix-max bounds
+            // (built from the v5 skip table) prove the page is settled, and
+            // the OR join may skip candidates past the budget; either sets
+            // `hits_capped`, which turns the relation into `gte`.
             // True when some document of the segment may be ruled out, by
             // the filter or by a tombstone. The single-term arm then has to
             // count the accepted postings instead of taking the term's
@@ -5836,6 +5852,10 @@ impl Searcher {
                 let published = std::cell::Cell::new(false);
                 let docs_scored = std::cell::Cell::new(0usize);
                 let count_scored = || docs_scored.set(docs_scored.get() + 1);
+                // The capped AND join's early-exit outcome (#114), reported
+                // only when the WAND attempt's output is used.
+                let and_join_exited = std::cell::Cell::new(false);
+                let and_join_past_cap = std::cell::Cell::new(0usize);
                 let wand_attempt = || -> Option<SegmentOutput> {
                     // Required AND terms were verified in the TOC above;
                     // absent optional OR terms can be omitted here.
@@ -6329,6 +6349,16 @@ impl Searcher {
                     // skip table already in memory; a term without stored
                     // summaries (legacy format) disables the exit and the
                     // walk stays exact, v1-style.
+                    //
+                    // Postings are in doc_seq (ingestion) order, so a
+                    // term's suffix max stays at its best block until the
+                    // walk passes that block, usually late in the list:
+                    // the exit only fires when the competitive documents
+                    // are front-loaded (#114). Checking the bound before
+                    // the budget is met would not change that, and every
+                    // early stop marks the count `gte`, so the gate stays
+                    // `total_hits >= cap`. `and_join_members_past_cap` in
+                    // `SearchPhaseStats` measures the walk the exit missed.
                     let mut early_exit_enabled = count_budget.is_some();
                     let mut hits_capped = false;
                     'join: loop {
@@ -6374,6 +6404,9 @@ impl Searcher {
                             continue 'join;
                         }
                         total_hits += 1;
+                        if count_budget.is_some_and(|cap| total_hits > cap) {
+                            and_join_past_cap.set(and_join_past_cap.get() + 1);
+                        }
                         if effective_k > 0 {
                             if let Some(meta) = reader.doc_meta(candidate) {
                                 let threshold = topk.threshold(global);
@@ -6431,6 +6464,7 @@ impl Searcher {
                                 // doc_id). total_hits is now a lower
                                 // bound >= the budget.
                                 hits_capped = true;
+                                and_join_exited.set(true);
                                 break;
                             }
                         }
@@ -6464,6 +6498,16 @@ impl Searcher {
                 open_stats
                     .wand_docs_scored
                     .fetch_add(docs_scored.get(), Ordering::Relaxed);
+                if attempt.is_some() {
+                    if and_join_exited.get() {
+                        open_stats
+                            .and_join_early_exits
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    open_stats
+                        .and_join_members_past_cap
+                        .fetch_add(and_join_past_cap.get(), Ordering::Relaxed);
+                }
                 if let Some(output) = attempt {
                     return Ok(Some(output));
                 }
@@ -8047,6 +8091,10 @@ impl Searcher {
                 phase_stats.wand_global_threshold = false;
                 open_stats.wand_docs_scored.store(0, Ordering::Relaxed);
                 open_stats.wand_segments_skipped.store(0, Ordering::Relaxed);
+                open_stats.and_join_early_exits.store(0, Ordering::Relaxed);
+                open_stats
+                    .and_join_members_past_cap
+                    .store(0, Ordering::Relaxed);
             } else {
                 shared_outputs = Some(outputs);
             }
@@ -8072,6 +8120,9 @@ impl Searcher {
         phase_stats.wand_docs_scored = open_stats.wand_docs_scored.load(Ordering::Relaxed);
         phase_stats.wand_segments_skipped =
             open_stats.wand_segments_skipped.load(Ordering::Relaxed);
+        phase_stats.and_join_early_exits = open_stats.and_join_early_exits.load(Ordering::Relaxed);
+        phase_stats.and_join_members_past_cap =
+            open_stats.and_join_members_past_cap.load(Ordering::Relaxed);
         phase_stats.score_wall_ms = t_score.elapsed().as_secs_f64() * 1e3;
         // A segment the `df` pass or the ceiling pass opened cold, and the
         // scoring pass then found cached, is reported once, as cold; their
@@ -11655,14 +11706,26 @@ mod tests {
 
         let mut exact_q = mk_query("alpha beta", 10);
         exact_q.exact_total_hits = Some(true);
-        let exact = searcher.search(&ns, &manifest, &exact_q, None).unwrap();
+        let (exact, exact_stats) = searcher
+            .search_with_stats(&ns, &manifest, &exact_q, None)
+            .unwrap();
         assert_eq!(exact.total_hits, 600);
         assert_eq!(exact.total_hits_relation, TotalHitsRelation::Eq);
+        assert_eq!(exact_stats.and_join_early_exits, 0);
+        assert_eq!(exact_stats.and_join_members_past_cap, 0);
 
         let mut capped_q = mk_query("alpha beta", 10);
         capped_q.exact_total_hits = Some(false);
         capped_q.total_hits_cap = Some(50);
-        let capped = searcher.search(&ns, &manifest, &capped_q, None).unwrap();
+        let (capped, capped_stats) = searcher
+            .search_with_stats(&ns, &manifest, &capped_q, None)
+            .unwrap();
+        assert_eq!(capped_stats.and_join_early_exits, 1);
+        assert!(
+            capped_stats.and_join_members_past_cap < 550,
+            "the exit must stop the walk before the last member: {}",
+            capped_stats.and_join_members_past_cap
+        );
         assert_eq!(
             page_ids(&capped),
             page_ids(&exact),
@@ -11700,6 +11763,80 @@ mod tests {
         assert_eq!(roomy.total_hits, 600);
         assert_eq!(roomy.total_hits_relation, TotalHitsRelation::Eq);
         assert_eq!(page_ids(&roomy), page_ids(&exact));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capped_mode_early_exit_does_not_fire_on_late_competitive_docs() {
+        // #114: postings are in ingestion order, and the AND join's exit
+        // bound is each term's suffix max over its remaining blocks. One
+        // competitive document late in the list keeps that bound above the
+        // floor until the walk passes it, so the whole intersection is
+        // walked. Same corpus shape as the test above, but the strong
+        // documents are spread through the list (every 100th doc) instead
+        // of leading it — the last one sits in the final block.
+        let dir = std::env::temp_dir().join("kosha-test-cap-early-exit-late");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir);
+        for i in 0..600 {
+            let tf = if i % 100 == 99 { 7 } else { 1 };
+            let text = format!("{} beta{}", "alpha ".repeat(tf), " pad".repeat(4 + i % 7));
+            w.add_document(
+                DocumentId(format!("doc-{i:04}")),
+                vec![Field::text("t", text)],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 600,
+            }],
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            branch: None,
+            schema: None,
+            retired: Default::default(),
+            shards: None,
+        };
+        let searcher = Searcher::new(dir.clone());
+
+        let mut exact_q = mk_query("alpha beta", 5);
+        exact_q.exact_total_hits = Some(true);
+        let exact = searcher.search(&ns, &manifest, &exact_q, None).unwrap();
+        assert_eq!(exact.total_hits, 600);
+        let top: Vec<String> = (0..6).map(|j| format!("doc-{:04}", j * 100 + 99)).collect();
+        assert!(
+            page_ids(&exact).iter().all(|id| top.contains(id)),
+            "the page is the tf=7 docs: {:?}",
+            page_ids(&exact)
+        );
+
+        let mut capped_q = mk_query("alpha beta", 5);
+        capped_q.exact_total_hits = Some(false);
+        capped_q.total_hits_cap = Some(50);
+        let (capped, stats) = searcher
+            .search_with_stats(&ns, &manifest, &capped_q, None)
+            .unwrap();
+        assert_eq!(page_ids(&capped), page_ids(&exact));
+        assert_eq!(capped.total_hits, 50);
+        assert_eq!(capped.total_hits_relation, TotalHitsRelation::Gte);
+        assert_eq!(
+            stats.and_join_early_exits, 0,
+            "the last strong doc is in the final block, so the bound never drops"
+        );
+        assert_eq!(
+            stats.and_join_members_past_cap, 550,
+            "every member past the budget is walked"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
