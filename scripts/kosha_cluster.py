@@ -49,6 +49,13 @@ ADMIN_KEY_PATCH = [{
 TLS_SECRET_KEYS = ("tls.crt", "tls.key", "ca.crt")
 KEY_NAMES = '{{range $k, $v := .data}}{{$k}}{{"\\n"}}{{end}}'
 UPGRADE_NOTE = "See README.md, \"S3 WAL\", for the manifest/WAL upgrade note."
+WAL_SWITCH_NOTE = (
+    "upgrade reads KOSHA_WAL_MODE from configmap/kosha-config, not from the running "
+    "ingest pod. Switch the WAL mode as its own drained step before any upgrade: stop "
+    "writes, flush every namespace (POST /flush), restart ingest on the current release "
+    "with the new mode, and confirm it is healthy; only then run upgrade. See "
+    "k8s/README.md, \"Switching the WAL mode\"."
+)
 
 
 def image_override(image: str) -> dict[str, str]:
@@ -271,7 +278,8 @@ def plan_upgrade(deployments: dict[str, dict], target: str, wal_mode: str,
         raise ValueError(
             "KOSHA_WAL_MODE is not s3: the ingest WAL lives on the node's disk and "
             "must be preserved across the restart. Pass --allow-local-wal only if "
-            "the ingest pod will come back on the same node."
+            "the ingest pod will come back on the same node. If you are moving to "
+            "S3 WAL, do not combine it with this upgrade. " + WAL_SWITCH_NOTE
         )
     ingest = deployments["kosha"]["spec"]
     if ingest.get("replicas", 1) > 1 or ingest.get("strategy", {}).get("type") != "Recreate":
@@ -516,6 +524,8 @@ def main() -> int:
     move = commands.add_parser(
         "upgrade",
         help="roll every role forward to one release, readers before the writer",
+        description="Roll every role forward to one release, readers before the "
+        "writer. " + WAL_SWITCH_NOTE,
     )
     move.add_argument("--image", required=True, type=image_override)
     move.add_argument("--dry-run", action="store_true", help="print the plan only")

@@ -450,6 +450,8 @@ It enforces the [manifest/WAL rules](../README.md#s3-wal-kosha_wal_modes3):
   and requires ingest to run one replica with `Recreate` (one WAL writer).
 - It refuses a local WAL (`KOSHA_WAL_MODE` not `s3`) unless
   `--allow-local-wal` confirms the ingest pod keeps its node and WAL directory.
+  The check reads `configmap/kosha-config`, not the running ingest pod, so
+  never change the WAL mode in the same step as an upgrade (see below).
 - Order: stop the indexer (it also writes manifests), roll query, then
   ingest, then restart the indexer on the new image and move CronJobs on the
   old image. Readers are always at least as new as the writer.
@@ -457,6 +459,24 @@ It enforces the [manifest/WAL rules](../README.md#s3-wal-kosha_wal_modes3):
   failed ingest rollout is not rolled back: fix forward by rerunning
   `upgrade` with the same or a newer fixed release. A rerun also restores a
   stopped indexer and CronJobs left on another tag.
+
+#### Switching the WAL mode
+
+Change `KOSHA_WAL_MODE` as its own drained step, never together with an image
+upgrade. `upgrade` only sees the ConfigMap: if it says `s3` while the ingest
+pod still runs a local WAL, the upgrade restart could come back elsewhere and
+lose acknowledged writes that were never flushed.
+
+1. Stop writes to the cell and flush every namespace (`POST /flush`) so the
+   WAL checkpoint covers every record.
+2. Change `KOSHA_WAL_MODE` in `kosha-config` and restart ingest on the
+   **current** release (`kubectl -n kosha rollout restart deployment/kosha`).
+   For local → s3 the pod must come back on the same node: on first start it
+   copies the local `_wal` into the S3 stream. For s3 → local, check the
+   stream is empty first (see the root README, "S3 WAL").
+3. Wait for `kosha_cluster.py status` to report the cell healthy and resume
+   writes.
+4. Only then run `upgrade`.
 
 Changing a segment format setting (`KOSHA_POSTINGS_WRITE_VERSION`,
 `KOSHA_VECTOR_QUANTIZATION`, ...) is a separate step after the upgrade: see

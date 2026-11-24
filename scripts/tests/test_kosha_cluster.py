@@ -345,6 +345,23 @@ def test_upgrade_local_wal_needs_explicit_opt_in(kubectl):
     assert invoke("upgrade", "--image", NEW, "--allow-local-wal", "--dry-run") == 0
 
 
+def test_upgrade_local_wal_refusal_says_to_switch_modes_separately(kubectl, capsys):
+    invoke, calls, responses, _ = kubectl
+    prime(responses, wal="local")
+    assert invoke("upgrade", "--image", NEW) == 1
+    err = capsys.readouterr().err
+    assert "own drained step before any upgrade" in err
+    assert "POST /flush" in err
+    assert calls == [UP_LOOKUP, WAL]
+
+
+def test_upgrade_help_documents_the_wal_switch(capsys, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["kosha_cluster.py", "upgrade", "--help"])
+    with pytest.raises(SystemExit):
+        kosha_cluster.main()
+    assert "drained step" in " ".join(capsys.readouterr().out.split())
+
+
 def test_upgrade_digest_needs_forward_only_confirmation(kubectl, capsys):
     invoke, _, responses, _ = kubectl
     prime(responses)
