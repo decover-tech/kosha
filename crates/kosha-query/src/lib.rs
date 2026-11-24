@@ -4838,7 +4838,7 @@ impl Searcher {
                     .and_then(|t| t.get(&entry.segment_id))
                     .filter(|seqs| !seqs.is_empty());
                 let accept = |doc_seq: u32| dead.is_none_or(|seqs| !seqs.contains(&doc_seq));
-                let accept_dyn: Option<&dyn Fn(u32) -> bool> =
+                let accept_dyn: Option<kosha_segment::KnnAccept<'_>> =
                     if dead.is_some() { Some(&accept) } else { None };
                 let (found, scan) = kosha_segment::with_knn_scan_stats(|| {
                     reader.knn_candidates_fetching(
@@ -7245,7 +7245,7 @@ impl Searcher {
             } else {
                 kosha_segment::KnnRefill::BudgetedSegments
             };
-            let knn_accept_dyn: Option<&dyn Fn(u32) -> bool> = if knn_restricted {
+            let knn_accept_dyn: Option<kosha_segment::KnnAccept<'_>> = if knn_restricted {
                 Some(&knn_accept)
             } else {
                 None
