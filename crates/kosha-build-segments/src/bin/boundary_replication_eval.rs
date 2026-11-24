@@ -175,7 +175,8 @@ fn corpus(cli: &Cli) -> io::Result<Corpus> {
 
 fn segments(corpus: &Corpus, size: usize, namespace: bool) -> Vec<Vec<u32>> {
     let count = corpus.vectors.len();
-    let leaves = count.div_ceil(size);
+    let n = count.min(131_072);
+    let leaves = count.div_ceil(size).min((n / 2).max(1));
     if !namespace || leaves == 1 {
         return (0..count as u32)
             .collect::<Vec<_>>()
@@ -183,12 +184,7 @@ fn segments(corpus: &Corpus, size: usize, namespace: bool) -> Vec<Vec<u32>> {
             .map(<[u32]>::to_vec)
             .collect();
     }
-    let n = count.min(131_072);
     let clusters = (leaves * 16).min(n / 2);
-    assert!(
-        clusters >= leaves,
-        "namespace layout needs at least two samples per segment"
-    );
     let sample: Vec<_> = (0..n)
         .map(|i| corpus.vectors[i * count / n].clone())
         .collect();
@@ -542,6 +538,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn namespace_caps_leaves_at_half_the_sample() {
+        let corpus = Corpus {
+            dim: 2,
+            vectors: fixtures::gen_clustered_dataset(2, 1, 101, 1)
+                .into_iter()
+                .map(|(_, mut v)| {
+                    normalize_in_place(&mut v);
+                    v
+                })
+                .collect(),
+            queries: Vec::new(),
+        };
+        assert_eq!(segments(&corpus, 2, false).len(), 51);
+        let groups = segments(&corpus, 2, true);
+        assert!((2..=50).contains(&groups.len()));
+        let mut ids: Vec<_> = groups.into_iter().flatten().collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (0..101).collect::<Vec<_>>());
+    }
 
     #[test]
     fn duplicated_entries_count_as_scan_work_not_extra_results() {
