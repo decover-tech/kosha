@@ -783,7 +783,7 @@ impl ControlStore for PgStore {
             // a subsequent publication might already have superseded it.
             Ok(tx.commit().await.map_err(control_plane_error))
         }))
-        .map_err(control_plane_error)?
+        .map_err(|error| KoshaError::ManifestCommitNotAttempted(error.to_string()))?
     }
 
     fn delete_namespace(

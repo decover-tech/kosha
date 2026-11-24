@@ -75,6 +75,18 @@ fn candidate(segment: &str, version: u64) -> Manifest {
 
 #[test]
 #[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn postgres_cas_reports_a_failed_statement_separately_from_commit() {
+    let url = std::env::var("KOSHA_TEST_DATABASE_URL").expect("set a dedicated test database URL");
+    let mut store = PgStore::new(&url).unwrap();
+    let invalid = NamespaceId("invalid\0namespace".into());
+    assert!(matches!(
+        store.compare_and_swap_manifest(&invalid, 0, candidate("uncommitted", 1)),
+        Err(KoshaError::ManifestCommitNotAttempted(_))
+    ));
+}
+
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
 fn postgres_cas_race_and_ambiguous_commit_retry() {
     let url = std::env::var("KOSHA_TEST_DATABASE_URL").expect("set a dedicated test database URL");
     // Initialize schema before opening independent concurrent connections.

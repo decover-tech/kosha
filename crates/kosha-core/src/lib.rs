@@ -4331,6 +4331,8 @@ pub enum KoshaError {
     /// callers that can (query replicas) keep serving their last-known-good
     /// manifest instead of failing (DESIGN.md §17).
     ControlPlane(String),
+    /// A manifest CAS hit a database error before it attempted to commit.
+    ManifestCommitNotAttempted(String),
     /// The request itself is malformed or out of range (e.g. BM25 `b`
     /// outside `[0, 1]`). A client error: maps to HTTP 400.
     InvalidQuery(String),
@@ -4363,6 +4365,7 @@ impl std::fmt::Display for KoshaError {
             Self::CorruptSegment(msg) => write!(f, "corrupt segment data: {msg}"),
             Self::Overloaded(msg) => write!(f, "overloaded: {msg}"),
             Self::ControlPlane(msg) => write!(f, "control plane unavailable: {msg}"),
+            Self::ManifestCommitNotAttempted(msg) => write!(f, "manifest commit not attempted: {msg}"),
             Self::InvalidQuery(msg) => write!(f, "invalid query: {msg}"),
             Self::Fenced { namespace, token, current } => write!(f,
                 "writer fenced for {}: presented fencing token {token}, current token {current}; \

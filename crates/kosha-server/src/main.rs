@@ -1394,12 +1394,14 @@ fn publication_error(context: &str, error: &KoshaError) -> String {
                 .retry_after(ttl.max(Duration::from_secs(1)))
                 .into_raw()
         }
-        KoshaError::ControlPlane(_) => ApiError::new(ErrorCode::Unavailable, message)
-            .redact(format!("{context}: the control store could not be reached"))
-            .detail("reason", "control_store")
-            .detail("outcome", "unknown")
-            .not_retryable()
-            .into_raw(),
+        KoshaError::ControlPlane(_) | KoshaError::ManifestCommitNotAttempted(_) => {
+            ApiError::new(ErrorCode::Unavailable, message)
+                .redact(format!("{context}: the control store could not be reached"))
+                .detail("reason", "control_store")
+                .detail("outcome", "unknown")
+                .not_retryable()
+                .into_raw()
+        }
         _ => api_error(ErrorCode::Internal, &message),
     }
 }
@@ -12878,7 +12880,7 @@ fn search_error_response(e: &KoshaError) -> String {
         KoshaError::Overloaded(_) => {
             overload_shed_response("search_overloaded", &format!("search overloaded: {e}"))
         }
-        KoshaError::ControlPlane(_) => {
+        KoshaError::ControlPlane(_) | KoshaError::ManifestCommitNotAttempted(_) => {
             ApiError::new(ErrorCode::Unavailable, format!("search unavailable: {e}"))
                 .redact("search unavailable: the control store could not be reached")
                 .detail("reason", "control_store")
@@ -13158,11 +13160,17 @@ mod tests {
     #[derive(Clone)]
     pub(crate) struct SharedManifestStore {
         inner: Arc<Mutex<kosha_control::Controller>>,
+        branch_commit_failure: Arc<Mutex<Option<(NamespaceId, BranchCommitFailure)>>>,
         lose_next_commit_reply: Arc<std::sync::atomic::AtomicBool>,
         /// Commit this manifest (over the stored version) right after the
         /// next `manifest_version` read: a writer racing the reader.
         commit_on_next_version_read: Arc<Mutex<Option<kosha_core::Manifest>>>,
     }
+    enum BranchCommitFailure {
+        BeforeCommit,
+        LostReply,
+    }
+
     impl ControlStore for SharedManifestStore {
         fn create_namespace(&mut self, id: NamespaceId) -> Result<(), KoshaError> {
             self.inner.lock().unwrap().create_namespace(id)
@@ -13205,10 +13213,28 @@ mod tests {
             expected: u64,
             manifest: kosha_core::Manifest,
         ) -> Result<(), KoshaError> {
+            let failure = {
+                let mut failure = self.branch_commit_failure.lock().unwrap();
+                if failure.as_ref().is_some_and(|(ns, _)| ns == id) {
+                    failure.take().map(|(_, failure)| failure)
+                } else {
+                    None
+                }
+            };
+            if matches!(failure, Some(BranchCommitFailure::BeforeCommit)) {
+                return Err(KoshaError::ManifestCommitNotAttempted(
+                    "injected pre-commit failure".into(),
+                ));
+            }
             self.inner
                 .lock()
                 .unwrap()
                 .compare_and_swap_manifest(id, expected, manifest)?;
+            if matches!(failure, Some(BranchCommitFailure::LostReply)) {
+                return Err(KoshaError::ControlPlane(
+                    "injected lost commit reply".into(),
+                ));
+            }
             if self
                 .lose_next_commit_reply
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -13304,6 +13330,7 @@ mod tests {
         pub(crate) fn new(inner: Arc<Mutex<kosha_control::Controller>>) -> Self {
             Self {
                 inner,
+                branch_commit_failure: Default::default(),
                 lose_next_commit_reply: Default::default(),
                 commit_on_next_version_read: Default::default(),
             }
@@ -14358,6 +14385,7 @@ mod tests {
     pub(crate) fn shared_store() -> SharedManifestStore {
         SharedManifestStore {
             inner: Arc::new(Mutex::new(kosha_control::Controller::new())),
+            branch_commit_failure: Default::default(),
             lose_next_commit_reply: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             commit_on_next_version_read: Arc::new(Mutex::new(None)),
         }
@@ -14834,6 +14862,51 @@ mod tests {
         let recovered = send();
         assert!(recovered.starts_with("HTTP/1.1 200"), "{recovered}");
         assert_eq!(ingest.indexer.pending_doc_count(&ns), 1);
+    }
+
+    #[test]
+    fn branch_creation_retries_only_when_the_commit_was_not_attempted() {
+        let store = shared_store();
+        let state = test_state();
+        *state.controller.lock().unwrap() = Box::new(store.clone());
+        index_text_and_publish(&state, &NamespaceId("tenant/parent".into()), &["a"]);
+        let branch = |name| {
+            v1(
+                &state,
+                "tenant",
+                "POST /v1/namespaces/parent/branch",
+                serde_json::json!({"name": name}),
+            )
+        };
+        let version = |name| {
+            store
+                .manifest_version(&NamespaceId(format!("tenant/{name}")))
+                .unwrap()
+        };
+
+        *store.branch_commit_failure.lock().unwrap() = Some((
+            NamespaceId("tenant/refused".into()),
+            BranchCommitFailure::BeforeCommit,
+        ));
+        let refused = branch("refused");
+        assert_eq!(status_of(&refused), 503, "{refused}");
+        assert_eq!(body_of(&refused)["retryable"], true);
+        assert_eq!(header_of(&refused, "retry-after").as_deref(), Some("1"));
+        assert_eq!(version("refused"), None);
+        let retried = branch("refused");
+        assert_eq!(status_of(&retried), 200, "{retried}");
+        assert_eq!(version("refused"), Some(1));
+
+        *store.branch_commit_failure.lock().unwrap() = Some((
+            NamespaceId("tenant/ambiguous".into()),
+            BranchCommitFailure::LostReply,
+        ));
+        let ambiguous = branch("ambiguous");
+        assert_eq!(status_of(&ambiguous), 503, "{ambiguous}");
+        assert_eq!(body_of(&ambiguous)["retryable"], false);
+        assert_eq!(body_of(&ambiguous)["details"]["outcome"], "unknown");
+        assert_eq!(header_of(&ambiguous, "retry-after"), None);
+        assert_eq!(version("ambiguous"), Some(1));
     }
 
     /// `KOSHA_MANIFEST_REFRESH_MS=0`: no refresher, so every search checks
