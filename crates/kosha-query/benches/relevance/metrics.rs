@@ -91,6 +91,24 @@ pub fn recall_at(ranked: &[String], judged: &HashMap<String, u32>, k: usize) -> 
     Some(found.len() as f64 / relevant as f64)
 }
 
+/// Reciprocal rank of the first judged-relevant hit within `k`.
+pub fn reciprocal_rank_at(
+    ranked: &[String],
+    judged: &HashMap<String, u32>,
+    k: usize,
+) -> Option<f64> {
+    if !judged.values().any(|g| *g > 0) {
+        return None;
+    }
+    Some(
+        ranked
+            .iter()
+            .take(k)
+            .position(|id| judged.get(id).is_some_and(|g| *g > 0))
+            .map_or(0.0, |rank| 1.0 / (rank + 1) as f64),
+    )
+}
+
 /// Fraction of `truth` (the exact neighbours) that `found` contains. An
 /// empty truth (nothing passes the filter) is `None`.
 pub fn set_recall(found: &[String], truth: &[String]) -> Option<f64> {
@@ -144,11 +162,65 @@ pub fn brute_force_top_k<'a>(
     candidates: impl Iterator<Item = (&'a str, &'a [f32])>,
     k: usize,
 ) -> Vec<String> {
-    let mut scored: Vec<(f64, &str)> = candidates.map(|(id, v)| (cosine(q, v), id)).collect();
-    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(b.1)));
-    scored
+    exact_scores(q, candidates)
         .into_iter()
         .take(k)
         .map(|(_, id)| id.to_string())
         .collect()
+}
+
+fn exact_scores<'a>(
+    q: &[f32],
+    candidates: impl Iterator<Item = (&'a str, &'a [f32])>,
+) -> Vec<(f64, &'a str)> {
+    let mut scored: Vec<_> = candidates.map(|(id, v)| (cosine(q, v), id)).collect();
+    scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    scored
+}
+
+pub struct ExactNeighbors<'a> {
+    // All candidates at or above the k-th cosine, not just the first k ids.
+    eligible: HashSet<&'a str>,
+    truth_len: usize,
+    k: usize,
+}
+
+impl<'a> ExactNeighbors<'a> {
+    pub fn new(
+        q: &[f32],
+        candidates: impl Iterator<Item = (&'a str, &'a [f32])>,
+        k: usize,
+    ) -> Self {
+        let scores = exact_scores(q, candidates);
+        let truth_len = scores.len().min(k);
+        let eligible = if truth_len == 0 {
+            HashSet::new()
+        } else {
+            // Tolerate only round-off in the f64 ground truth.
+            let cutoff = scores[truth_len - 1].0 - 1e-12;
+            scores
+                .into_iter()
+                .take_while(|(score, _)| *score >= cutoff)
+                .map(|(_, id)| id)
+                .collect()
+        };
+        Self {
+            eligible,
+            truth_len,
+            k,
+        }
+    }
+
+    pub fn recall(&self, found: &[String]) -> Option<f64> {
+        if self.truth_len == 0 {
+            return None;
+        }
+        let hits: HashSet<_> = found
+            .iter()
+            .take(self.k)
+            .map(String::as_str)
+            .filter(|id| self.eligible.contains(id))
+            .collect();
+        Some(hits.len().min(self.truth_len) as f64 / self.truth_len as f64)
+    }
 }

@@ -15,12 +15,12 @@
         "args": { "documents": { "generate": { "count": 3, "id": "d{i:04}", "fields": { "title": { "type": "Text", "value": "hello number {i}" }, "tag": { "type": "Keyword", "value": "t{i%2}" } } } } },
         "expect": { "indexed": 3 }
       },
+      { "op": "exists", "args": { "ids": ["d0001", "nope"] }, "expect": { "ids": ["d0001"] } },
       {
         "op": "search",
         "args": { "body": { "query_text": "hello", "sort": [{ "_id": { "order": "asc" } }], "max_results": 10 } },
         "expect": { "ids": ["d0000", "d0001", "d0002"], "total_hits": 3 }
-      },
-      { "op": "exists", "args": { "ids": ["d0001", "nope"] }, "expect": { "ids": ["d0001"] } }
+      }
     ]
   },
   {

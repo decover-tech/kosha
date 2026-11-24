@@ -12,6 +12,8 @@ use kosha_core::{Bm25Params, DocumentId, Field, SegmentId};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+static TEST_POSTINGS_COUNTERS: PostingsCacheCounters = PostingsCacheCounters::new();
+
 const DIM: usize = 24;
 const DOCS: usize = 900;
 const FIELD: &str = "emb";
@@ -109,7 +111,8 @@ impl Fixture {
     /// Give the reader a cache of its own with this budget (the shared
     /// one is process-wide and other tests use it concurrently).
     fn set_cache_budget(&mut self, max_bytes: usize) {
-        self.reader.vector_cache = Arc::new(PostingsCache::new(max_bytes, None));
+        self.reader.vector_cache =
+            Arc::new(PostingsCache::new(max_bytes, None, &TEST_POSTINGS_COUNTERS));
     }
 
     /// Move `vector.idx` into the span cache: `per_span` consecutive
@@ -1572,7 +1575,11 @@ impl CountingAccount {
 fn a_probe_of_more_postings_than_the_text_ring_is_admitted_on_its_second_run() {
     let dir = write_vector_segment("wide", 60_000, 4);
     let mut reader = SegmentReader::open_with_options(dir.clone(), true).unwrap();
-    reader.vector_cache = Arc::new(PostingsCache::new(usize::MAX / 2, None));
+    reader.vector_cache = Arc::new(PostingsCache::new(
+        usize::MAX / 2,
+        None,
+        &TEST_POSTINGS_COUNTERS,
+    ));
     let postings = {
         let index = reader.vector_field(FIELD).unwrap().unwrap();
         index.lazy.as_ref().unwrap().ranges.len()
@@ -1617,7 +1624,11 @@ fn a_probe_larger_than_the_cache_reach_passes_through() {
         )
     };
     // Room for at most 128 postings, far fewer than one probe touches.
-    reader.vector_cache = Arc::new(PostingsCache::new(largest * 128, None));
+    reader.vector_cache = Arc::new(PostingsCache::new(
+        largest * 128,
+        None,
+        &TEST_POSTINGS_COUNTERS,
+    ));
     assert!(postings > 4 * 128, "{postings} postings");
     let query = [0.25f32, -0.5, 0.75, 0.1];
     for _ in 0..3 {
@@ -1663,7 +1674,7 @@ fn vector_postings_of_all_segments_stay_under_one_budget() {
     // …here a private one, about one segment's worth: four segments'
     // working sets cannot all fit.
     let budget = largest * 60;
-    let cache = Arc::new(PostingsCache::new(budget, None));
+    let cache = Arc::new(PostingsCache::new(budget, None, &TEST_POSTINGS_COUNTERS));
     let accounts: Vec<Arc<CountingAccount>> = (0..dirs.len()).map(|_| Arc::default()).collect();
     let mut readers: Vec<SegmentReader> = dirs
         .iter()
@@ -1722,7 +1733,7 @@ fn vector_postings_of_all_segments_stay_under_one_budget() {
 #[test]
 fn postings_cache_evicts_in_exact_lru_order() {
     const CAP: usize = 40;
-    let cache = PostingsCache::<usize, usize>::new(CAP, None);
+    let cache = PostingsCache::<usize, usize>::new(CAP, None, &TEST_POSTINGS_COUNTERS);
     let mut model: VecDeque<usize> = VecDeque::new();
     let mut rng = Lcg(42);
     for step in 0..200_000 {
@@ -1764,7 +1775,7 @@ fn postings_cache_evicts_in_exact_lru_order() {
 /// not.
 #[test]
 fn text_second_touch_ring_is_unchanged() {
-    let cache = PostingsCache::<usize, u8>::new(usize::MAX, None);
+    let cache = PostingsCache::<usize, u8>::new(usize::MAX, None, &TEST_POSTINGS_COUNTERS);
     for k in 0..POSTINGS_CACHE_MISS_RING {
         assert!(!cache.admit_on_miss(k));
     }
@@ -1788,7 +1799,7 @@ fn text_second_touch_ring_is_unchanged() {
 fn per_hit_cost_at_five_thousand_entries() {
     const N: usize = 5_000;
     const HITS: usize = 2_000_000;
-    let cache = PostingsCache::<usize, Arc<u8>>::new(usize::MAX / 2, None);
+    let cache = PostingsCache::<usize, Arc<u8>>::new(usize::MAX / 2, None, &TEST_POSTINGS_COUNTERS);
     let value = Arc::new(0u8);
     for k in 0..N {
         cache.insert(k, Arc::clone(&value), 1);
@@ -1843,7 +1854,7 @@ fn evicted_and_removed_entries_are_freed_outside_the_cache_lock() {
             }
         }
     }
-    let cache = CACHE.get_or_init(|| PostingsCache::new(4, None));
+    let cache = CACHE.get_or_init(|| PostingsCache::new(4, None, &TEST_POSTINGS_COUNTERS));
     let account: Arc<CountingAccount> = Arc::default();
     let shared: SharedAccount = Arc::clone(&account) as SharedAccount;
     // Evictions: each insert past four entries evicts the oldest.
@@ -1959,7 +1970,7 @@ fn a_probe_split_across_threads_returns_what_one_thread_returns() {
                 seed,
             );
             let mut reader = SegmentReader::open_with_options(dir.clone(), true).unwrap();
-            reader.vector_cache = Arc::new(PostingsCache::new(0, None));
+            reader.vector_cache = Arc::new(PostingsCache::new(0, None, &TEST_POSTINGS_COUNTERS));
             let index = reader.vector_field(FIELD).unwrap().unwrap();
             let vi = index.lazy.as_ref().unwrap();
             let postings = vi.ranges.len();
@@ -2091,7 +2102,11 @@ fn a_split_probe_admits_to_the_cache_as_a_serial_one_does() {
     let query: Vec<f32> = (0..16).map(|i| (i as f32 * 0.37).sin()).collect();
     let runs = |threads: usize| {
         let mut reader = SegmentReader::open_with_options(dir.clone(), true).unwrap();
-        reader.vector_cache = Arc::new(PostingsCache::new(usize::MAX / 2, None));
+        reader.vector_cache = Arc::new(PostingsCache::new(
+            usize::MAX / 2,
+            None,
+            &TEST_POSTINGS_COUNTERS,
+        ));
         let pool = pool(threads);
         let budget = KnnProbeBudget::Within {
             max_distance: f32::INFINITY,
@@ -2115,7 +2130,7 @@ fn a_split_probe_admits_to_the_cache_as_a_serial_one_does() {
 fn one_segment_probe_is_scored_on_more_than_one_thread() {
     let (dir, _) = write_split_segment("spread", 20_000, 16, VectorQuantization::F32, 0x5A7E);
     let mut reader = SegmentReader::open_with_options(dir.clone(), true).unwrap();
-    reader.vector_cache = Arc::new(PostingsCache::new(0, None));
+    reader.vector_cache = Arc::new(PostingsCache::new(0, None, &TEST_POSTINGS_COUNTERS));
     let query: Vec<f32> = (0..16).map(|i| (i as f32 * 0.61).cos()).collect();
     let threads = Mutex::new(HashSet::new());
     // The filter runs on whichever thread scores the posting.
@@ -2157,7 +2172,7 @@ fn one_segment_probe_is_scored_on_more_than_one_thread() {
 fn a_split_probe_fails_on_its_earliest_unreadable_posting() {
     let (dir, _) = write_split_segment("fail", 8_000, 16, VectorQuantization::F32, 0xFA11);
     let mut reader = SegmentReader::open_with_options(dir.clone(), true).unwrap();
-    reader.vector_cache = Arc::new(PostingsCache::new(0, None));
+    reader.vector_cache = Arc::new(PostingsCache::new(0, None, &TEST_POSTINGS_COUNTERS));
     let index = reader.vector_field(FIELD).unwrap().unwrap();
     let vi = index.lazy.as_ref().unwrap();
     let idx = fs::read(dir.join(VECTOR_IDX_FILE)).unwrap();
@@ -2224,7 +2239,11 @@ fn a_split_probe_over_a_partly_warm_cache_returns_what_one_thread_returns() {
         let runs =
             |threads: usize| {
                 let mut reader = SegmentReader::open_with_options(dir.clone(), true).unwrap();
-                reader.vector_cache = Arc::new(PostingsCache::new(usize::MAX / 2, None));
+                reader.vector_cache = Arc::new(PostingsCache::new(
+                    usize::MAX / 2,
+                    None,
+                    &TEST_POSTINGS_COUNTERS,
+                ));
                 let within = |max_probes| KnnProbeBudget::Within {
                     max_distance: f32::INFINITY,
                     max_probes,
@@ -2289,7 +2308,7 @@ fn one_large_segment_probe_by_pool_size() {
     sizes.sort_unstable();
     sizes.dedup();
     for (mode, budget) in [("cache off", 0usize), ("cache warm", usize::MAX / 2)] {
-        reader.vector_cache = Arc::new(PostingsCache::new(budget, None));
+        reader.vector_cache = Arc::new(PostingsCache::new(budget, None, &TEST_POSTINGS_COUNTERS));
         let mut serial_ms = 0.0;
         for &threads in &sizes {
             let pool = pool(threads);
