@@ -8360,7 +8360,6 @@ fn parse_namespace_schema(value: &serde_json::Value) -> Result<serde_json::Value
                     }
                     seen_type = true;
                     field_type = canonical_schema_field_type(v)
-                        .filter(|ty| *ty != "FIELD_TYPE_GEO_POINT")
                         .ok_or_else(|| format!("schema field '{name}' has unknown type {v}"))?;
                 }
                 "indexed" | "stored" => {
@@ -13672,6 +13671,7 @@ mod tests {
                 "body": {"type": "text", "indexed": true, "analyzer": ["standard"]},
                 "sku": {"type": "FIELD_TYPE_KEYWORD", "stored": true},
                 "qty": {"field_type": 3},
+                "location": {"type": "geo_point"},
             }}}),
         );
         assert_eq!(status_of(&with_schema), 200, "{with_schema}");
@@ -13681,10 +13681,10 @@ mod tests {
                 "body": {"type": "FIELD_TYPE_TEXT", "indexed": true, "stored": false, "analyzer": ["standard"]},
                 "sku": {"type": "FIELD_TYPE_KEYWORD", "indexed": false, "stored": true, "analyzer": []},
                 "qty": {"type": "FIELD_TYPE_INTEGER", "indexed": false, "stored": false, "analyzer": []},
+                "location": {"type": "FIELD_TYPE_GEO_POINT", "indexed": false, "stored": false, "analyzer": []},
             }})
         );
         for bad_schema in [
-            serde_json::json!({"fields": {"x": {"type": "geo_point"}}}),
             serde_json::json!({"fields": {"x": {"type": 99}}}),
             serde_json::json!({"fields": {"x": {"typo": true}}}),
             serde_json::json!({"fields": {"x": {"indexed": "yes"}}}),
