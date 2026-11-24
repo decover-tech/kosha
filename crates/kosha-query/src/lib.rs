@@ -5958,9 +5958,11 @@ impl Searcher {
 
         // Columnar segments (#244) aggregate and sort straight from their
         // columns; only `filters.bin` segments need the row-shaped store.
+        let pure_knn = query.is_pure_knn();
+        let aggregate_in_segment = !query.aggs.is_empty() && !pure_knn;
         let columnar_filters = reader.has_filter_columns();
         let needs_filter_store =
-            !columnar_filters && (!sort_value_fields.is_empty() || !query.aggs.is_empty());
+            !columnar_filters && (!sort_value_fields.is_empty() || aggregate_in_segment);
         let filter_store = if needs_filter_store {
             // Only the columns this query names (#244). A damaged column
             // fails the request closed.
@@ -7553,7 +7555,7 @@ impl Searcher {
         // docs in this segment — decoupled from the (possibly truncated)
         // candidate list built below, mirroring the WAND paths'
         // total_hits/candidates split (see `SegmentOutput`).
-        let aggs = if query.aggs.is_empty() {
+        let aggs = if !aggregate_in_segment {
             HashMap::new()
         } else {
             if columnar_filters {
@@ -7616,7 +7618,9 @@ impl Searcher {
             .map(|(doc_seq, score)| (doc_seq, score, seg_hits.contains_key(&doc_seq)))
             .collect();
         let mut ranked: Vec<(f64, u32)> = seg_hits.into_iter().map(|(d, s)| (s, d)).collect();
-        if score_ranked && !diversified_rrf {
+        // Pure kNN needs its namespace-wide top k before sorting or paging.
+        // Keep the vector probe's candidates for that merge.
+        if !pure_knn && score_ranked && !diversified_rrf {
             // Cut to this segment's top `effective_k` by score *before*
             // paying the `DocumentId` allocation — the same discipline
             // `BoundedTopK` applies on the WAND paths.
@@ -7729,7 +7733,7 @@ impl Searcher {
         // only has to hand back its own first `k` under that order. These
         // requests used to hand back every hit they had, and the reduce
         // step sorted the whole lot to keep one page.
-        if !score_ranked && rrf.is_none() {
+        if !pure_knn && !score_ranked && rrf.is_none() {
             let rank = |a: &HitCandidate, b: &HitCandidate| {
                 compare_candidates(a, b, &query.sort, sort_value_fields)
             };
@@ -8347,26 +8351,18 @@ impl Searcher {
             // vector retriever's window: lexical matches are already
             // counted, so only vector-only window members are added.
             total_hits += fused.vector_only.len();
-            if !query.aggs.is_empty() && !fused.vector_only.is_empty() {
-                for (name, state) in aggregate_vector_only(query, &fused.vector_only)? {
-                    all_aggs.entry(name).or_default().merge(state);
-                }
+            if !query.aggs.is_empty() {
+                merge_vector_aggregations(
+                    query,
+                    fused.vector_only.iter().map(|(reader, seq)| (reader, *seq)),
+                    &mut all_aggs,
+                )?;
             }
         }
 
-        // ── total_hits capping (OpenSearch-style, opt out per query) ──
-        // Every segment above counted its intersection exactly (see the
-        // `can_block_max_wand` doc comment) — this is the one place that
-        // number is turned into what callers actually see. Default: capped
-        // at `total_hits_cap` with `relation: gte` beyond it, because exact
-        // AND total_hits forces the join to visit every intersection member
-        // even long after the top-k page is settled — for a broad query
-        // intersecting millions of docs that's the difference between
-        // walking ~10⁶ candidates and reporting "at least 10,000" for free.
-        // `exact_total_hits: true` (per query, or `KOSHA_EXACT_TOTAL_HITS`
-        // engine-wide) restores the old unconditional-exact behavior.
-        let (mut total_hits, total_hits_relation) =
-            resolve_total_hits(total_hits, exact, cap, any_capped);
+        let sort_cmp = |a: &HitCandidate, b: &HitCandidate| {
+            compare_candidates(a, b, &query.sort, &sort_value_fields)
+        };
 
         // A vector-only query asks for the `k` nearest documents. Each
         // segment answers with its own nearest `k`, so the union holds up
@@ -8374,21 +8370,37 @@ impl Searcher {
         // many. The sum of the per-segment counts (`k` times the number of
         // segments) said nothing about the query.
         //
-        // Under `limit_per` that is the nearest `k` with at most `max` per
-        // group: segments probed deeper than `k` for this (see
-        // `score_segment`), and the cap is taken before the cut so the set
-        // stays `k` long when the probe found enough groups.
-        if let Some(knn) = query.knn.as_ref().filter(|_| query.is_pure_knn()) {
-            if let Some(cap) = pre_rescore_cap {
-                candidates.sort_by(by_score_then_id);
-                cap.apply(&mut candidates, |c| c);
-            }
-            if candidates.len() > knn.k {
-                candidates.sort_by(by_score_then_id);
+        // Diversify before the cut so duplicate group members do not
+        // crowd out another group the probe found. A field sort can choose
+        // a different representative for a selected group but cannot
+        // change which groups are nearest. With rank_by, the group cap
+        // instead applies after rescoring.
+        let (total_hits, total_hits_relation) =
+            if let Some(knn) = query.knn.as_ref().filter(|_| query.is_pure_knn()) {
+                if let Some(cap) = group_cap.filter(|_| rank_by.is_none()) {
+                    candidates.sort_by(by_score_then_id);
+                    if query.collapse.is_some() && !sort_is_default_ranking(&query.sort) {
+                        cap.retain_top_groups(&mut candidates, knn.k);
+                        candidates.sort_by(sort_cmp);
+                    }
+                    cap.apply(&mut candidates, |c| c);
+                } else if candidates.len() > knn.k {
+                    candidates.sort_by(by_score_then_id);
+                }
                 candidates.truncate(knn.k);
-            }
-            total_hits = candidates.len();
-        }
+                if !query.aggs.is_empty() {
+                    merge_vector_aggregations(
+                        query,
+                        candidates.iter().map(|hit| (&hit.reader, hit.doc_seq)),
+                        &mut all_aggs,
+                    )?;
+                }
+                (candidates.len(), TotalHitsRelation::Eq)
+            } else {
+                // Lexical totals may be capped, with relation `gte` if
+                // counting stopped early or the match count exceeded the cap.
+                resolve_total_hits(total_hits, exact, cap, any_capped)
+            };
 
         // ── rank_by: rescore the window (issue #212) ──
         // Everything above ranked by the query's own score (BM25, fused
@@ -8402,11 +8414,6 @@ impl Searcher {
             candidates.truncate(rank_by.window);
             rescore_candidates(rank_by, &query.filter_column_fields(), &mut candidates)?;
         }
-
-        // ── Sort (score-only / sort-key candidates — no full field payloads) ──
-        let sort_cmp = |a: &HitCandidate, b: &HitCandidate| -> std::cmp::Ordering {
-            compare_candidates(a, b, &query.sort, &sort_value_fields)
-        };
 
         // ── collapse / limit_per: at most `max` hits per group ──
         // Each segment already capped its own hits; the same group can
@@ -9405,51 +9412,50 @@ fn rrf_fuse(
     }
 }
 
-/// Aggregations over the vector-only members of a hybrid request's vector
-/// window, grouped by segment: a hybrid request aggregates over the same
-/// documents its `total_hits` counts (lexical matches plus the vector
-/// window), and the per-segment pass only saw the lexical matches.
+/// Aggregate vector matches selected at the namespace merge: the nearest
+/// k for pure kNN, or the hybrid vector window's non-lexical members.
 ///
 /// Reads each segment the way the per-segment pass does: a columnar
 /// segment (#244) from its columns, a `filters.bin` segment from the
 /// columns of the row store this query names. A damaged column fails the
 /// request closed instead of silently dropping these documents from the
 /// buckets (issue #215).
-fn aggregate_vector_only(
+fn merge_vector_aggregations<'a>(
     query: &SearchQuery,
-    vector_only: &[(Arc<TrackedSegment>, u32)],
-) -> Result<Vec<(String, AggregationState)>, KoshaError> {
+    matches: impl Iterator<Item = (&'a Arc<TrackedSegment>, u32)>,
+    aggs: &mut HashMap<String, AggregationState>,
+) -> Result<(), KoshaError> {
     let mut by_segment: Vec<(&Arc<TrackedSegment>, HashSet<u32>)> = Vec::new();
-    for (reader, doc_seq) in vector_only {
+    for (reader, doc_seq) in matches {
         match by_segment
             .iter_mut()
             .find(|(seen, _)| Arc::ptr_eq(seen, reader))
         {
             Some((_, seqs)) => {
-                seqs.insert(*doc_seq);
+                seqs.insert(doc_seq);
             }
-            None => by_segment.push((reader, HashSet::from([*doc_seq]))),
+            None => by_segment.push((reader, HashSet::from([doc_seq]))),
         }
     }
-    let mut out = Vec::new();
     for (reader, wanted) in by_segment {
         if reader.has_filter_columns() {
             let mut wanted: Vec<u32> = wanted.into_iter().collect();
             wanted.sort_unstable();
             for (name, agg) in &query.aggs {
-                out.push((
-                    name.clone(),
-                    aggregate_matches_columnar(reader, &wanted, agg)?,
-                ));
+                aggs.entry(name.clone())
+                    .or_default()
+                    .merge(aggregate_matches_columnar(reader, &wanted, agg)?);
             }
         } else {
             let store = reader.filter_store_for(&query.filter_column_fields())?;
             for (name, agg) in &query.aggs {
-                out.push((name.clone(), aggregate_matches(&store, &wanted, agg)));
+                aggs.entry(name.clone())
+                    .or_default()
+                    .merge(aggregate_matches(&store, &wanted, agg));
             }
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 fn sort_fields_needing_values(sort: &[SortSpec]) -> Vec<String> {
@@ -9779,6 +9785,13 @@ struct GroupCap {
     cap_missing: bool,
 }
 
+#[derive(PartialEq, Eq, Hash)]
+enum GroupValue {
+    Text(String),
+    Number(u64),
+    Missing,
+}
+
 impl GroupCap {
     /// The request's cap, if any. `sort_value_fields` must already include
     /// the group field (see `search_inner`).
@@ -9796,22 +9809,34 @@ impl GroupCap {
         })
     }
 
+    fn group_value(&self, candidate: &HitCandidate) -> Option<GroupValue> {
+        match candidate.sort_values.get(self.index) {
+            Some(SortValue::Text(value)) => Some(GroupValue::Text(value.clone())),
+            Some(SortValue::Number(value)) => Some(GroupValue::Number(value.to_bits())),
+            Some(SortValue::Missing) | None if self.cap_missing => Some(GroupValue::Missing),
+            Some(SortValue::Missing) | None => None,
+        }
+    }
+
+    /// Keep all members of the first `k` collapse groups in score order
+    /// so field sorting can still choose their representatives.
+    fn retain_top_groups(&self, candidates: &mut Vec<HitCandidate>, k: usize) {
+        let mut groups = HashSet::new();
+        candidates.retain(|candidate| {
+            let group = self
+                .group_value(candidate)
+                .expect("collapse includes the missing-value group");
+            groups.contains(&group) || (groups.len() < k && groups.insert(group))
+        });
+    }
+
     /// Drop every item that has `max` items of its group ahead of it.
     /// `items` must already be in result order.
     fn apply<T>(&self, items: &mut Vec<T>, candidate: impl Fn(&T) -> &HitCandidate) {
-        #[derive(PartialEq, Eq, Hash)]
-        enum Group {
-            Text(String),
-            Number(u64),
-            Missing,
-        }
-        let mut seen: HashMap<Group, usize> = HashMap::new();
+        let mut seen: HashMap<GroupValue, usize> = HashMap::new();
         items.retain(|item| {
-            let group = match candidate(item).sort_values.get(self.index) {
-                Some(SortValue::Text(value)) => Group::Text(value.clone()),
-                Some(SortValue::Number(value)) => Group::Number(value.to_bits()),
-                Some(SortValue::Missing) | None if !self.cap_missing => return true,
-                Some(SortValue::Missing) | None => Group::Missing,
+            let Some(group) = self.group_value(candidate(item)) else {
+                return true;
             };
             let count = seen.entry(group).or_insert(0);
             *count += 1;
