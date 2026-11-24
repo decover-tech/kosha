@@ -3140,7 +3140,6 @@ impl AppState {
                 ns,
                 manifest,
                 &query,
-                &manifest.tombstones,
                 &RequestHydration::unlimited(),
                 None,
             );
@@ -4736,12 +4735,13 @@ impl AppState {
         ns: &NamespaceId,
         manifest: &kosha_core::Manifest,
         query: &SearchQuery,
-        tombstones: &HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
         request: &Arc<RequestHydration>,
         // A search's pins (see `AppState::pin_search_footers`): the
         // segments chosen below are added before any of their files is
-        // fetched. `None` for warm-up, which reads nothing afterwards.
-        pins: Option<&mut SegmentPins<'_>>,
+        // fetched. The searched manifest supplies any strong-consistency
+        // tombstones in addition to the base manifest's deletions.
+        // `None` for warm-up, which reads nothing afterwards.
+        search: Option<(&mut SegmentPins<'_>, &kosha_core::Manifest)>,
     ) -> HydrationOutcome {
         // The query is analyzed per segment with the chains its footer
         // records (#220), so which terms (and posting-blob shards) a
@@ -4774,9 +4774,9 @@ impl AppState {
                 .segment_footer(&entry.segment_id)
                 .or_else(|| fetched_footers.get(&entry.segment_id).map(Arc::as_ref))
         };
-        let knn_pruned = pins.is_some().then(|| {
+        let knn_pruned = search.as_ref().map(|(_, searched)| {
             self.searcher
-                .knn_pruned_segments(manifest, query, tombstones, |entry| {
+                .knn_pruned_segments(manifest, query, &searched.tombstones, |entry| {
                     segment_footer(entry).map(std::borrow::Cow::Borrowed)
                 })
         });
@@ -4826,7 +4826,7 @@ impl AppState {
                 })
                 .map(|(path, entry)| (path, segment_footer(entry))),
         );
-        if let Some(pins) = pins {
+        if let Some((pins, _)) = search {
             pins.hold_all(to_hydrate.iter().chain(&stats_only));
         }
         // The filter files each segment needs for this query (#244): its
@@ -9761,9 +9761,8 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
                 &ns,
                 manifest,
                 search_query,
-                &searched.tombstones,
                 &hydration_request,
-                Some(&mut segment_pins),
+                Some((&mut segment_pins, searched)),
             );
             // Cache what this pass verified: the static scoring set is
             // local for this manifest version, so future warm queries with
@@ -10433,9 +10432,8 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
                 &ns,
                 manifest,
                 &query,
-                &searched.tombstones,
                 &hydration_request,
-                Some(&mut segment_pins),
+                Some((&mut segment_pins, searched)),
             );
             // Only merge when unfiltered — see `HydrationOutcome::bloom_pruned`
             // and `handle_search_post` for the full rationale.
@@ -18346,7 +18344,6 @@ mod tests {
             &NamespaceId(NS.into()),
             &manifest,
             &serde_json::from_value(query.clone()).unwrap(),
-            &manifest.tombstones,
             &Arc::new(RequestHydration::new(u64::MAX)),
             None,
         );
@@ -19527,7 +19524,6 @@ mod tests {
             &NamespaceId(NS.into()),
             &manifest,
             &serde_json::from_value(query.clone()).unwrap(),
-            &manifest.tombstones,
             &Arc::new(RequestHydration::new(u64::MAX)),
             None,
         );
@@ -19643,7 +19639,6 @@ mod tests {
             &ns,
             &manifest,
             &base_query,
-            &manifest.tombstones,
             &RequestHydration::unlimited(),
             None,
         );
@@ -19661,7 +19656,6 @@ mod tests {
             &ns,
             &manifest,
             &filtered_query,
-            &manifest.tombstones,
             &RequestHydration::unlimited(),
             None,
         );
@@ -19996,7 +19990,6 @@ mod tests {
             &ns,
             &manifest,
             &warmup_like,
-            &manifest.tombstones,
             &RequestHydration::unlimited(),
             None,
         );
@@ -20071,7 +20064,6 @@ mod tests {
             &ns,
             &manifest,
             &sorted_unfiltered,
-            &manifest.tombstones,
             &RequestHydration::unlimited(),
             None,
         );
