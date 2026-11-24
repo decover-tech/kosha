@@ -95,6 +95,8 @@ pub(crate) fn build(
         owner_map,
         rng,
         defer_cascade_splits: false,
+        #[cfg(test)]
+        deferred_reassign: None,
     };
 
     if refine {

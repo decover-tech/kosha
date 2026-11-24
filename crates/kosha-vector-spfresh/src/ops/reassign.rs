@@ -119,6 +119,19 @@ pub(crate) fn run_reassign(
         }
 
         if best_pid != cur_pid {
+            #[cfg(test)]
+            if let Some(deferred) = &mut index.deferred_reassign {
+                if deferred.should_skip(entry_id) {
+                    deferred.record(
+                        entry_id,
+                        cur_pid,
+                        &posting.centroid,
+                        best_pid,
+                        &index.postings[best_pid].as_ref().unwrap().centroid,
+                    );
+                    continue;
+                }
+            }
             if let Some(p) = index.postings[cur_pid].as_mut() {
                 if let Some(e) = p
                     .entries

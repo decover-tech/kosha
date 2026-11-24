@@ -27,6 +27,11 @@ mod rabitq;
 mod rng;
 mod search;
 
+#[cfg(test)]
+extern crate self as kosha_vector_spfresh;
+#[cfg(test)]
+mod lazy_npa;
+
 use std::collections::{HashMap, HashSet};
 
 pub use centroid_probe::{
@@ -226,6 +231,8 @@ pub struct ClusterIndex {
     /// at once (just after `absorb_postings`), cascades would otherwise
     /// chain from one oversized neighbour to the next.
     pub(crate) defer_cascade_splits: bool,
+    #[cfg(test)]
+    deferred_reassign: Option<lazy_npa::DeferredReassign>,
 }
 
 impl ClusterIndex {
@@ -589,6 +596,8 @@ impl ClusterIndex {
             owner_map: HashMap::new(),
             rng,
             defer_cascade_splits: false,
+            #[cfg(test)]
+            deferred_reassign: None,
         }
     }
 
