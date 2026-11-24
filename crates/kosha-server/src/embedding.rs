@@ -349,6 +349,8 @@ pub const PROVIDER_MOCK: &str = "mock";
 
 /// `(provider, model, dims)` of an embedder the registry built.
 type BuiltKey = (String, String, u32);
+/// An embedder built on first use; `None` until a load succeeds.
+type BuiltSlot = Arc<Mutex<Option<Arc<dyn Embedder>>>>;
 pub const PROVIDER_HTTP: &str = "http";
 #[cfg(feature = "onnx")]
 const PROVIDER_ONNX: &str = "onnx";
@@ -366,7 +368,9 @@ pub struct EmbedderRegistry {
     /// Embedders registered up front (tests), by model id. Consulted
     /// before the providers.
     fixed: HashMap<String, Arc<dyn Embedder>>,
-    built: Mutex<HashMap<BuiltKey, Arc<dyn Embedder>>>,
+    /// One slot per key: a load holds only its own slot's lock, so loads of
+    /// one model are not duplicated and do not block other models.
+    built: Mutex<HashMap<BuiltKey, BuiltSlot>>,
 }
 
 impl EmbedderRegistry {
@@ -485,11 +489,11 @@ impl EmbedderRegistry {
             }
         };
         let key = (provider.clone(), spec.model.clone(), spec.dims);
-        if let Some(embedder) = self.built.lock().unwrap().get(&key) {
+        let slot = Arc::clone(self.built.lock().unwrap().entry(key).or_default());
+        let mut slot = slot.lock().unwrap();
+        if let Some(embedder) = slot.as_ref() {
             return Ok(Arc::clone(embedder));
         }
-        // Built without the lock held: a slow or failing model load must not
-        // block embeddings for other models on this pod.
         let embedder: Arc<dyn Embedder> = match provider.as_str() {
             PROVIDER_MOCK if self.mock => {
                 Arc::new(MockEmbedder::new(&spec.model, spec.dims as usize))
@@ -512,9 +516,8 @@ impl EmbedderRegistry {
             }
             _ => return Err(not_enabled(spec, &provider)),
         };
-        Ok(Arc::clone(
-            self.built.lock().unwrap().entry(key).or_insert(embedder),
-        ))
+        *slot = Some(Arc::clone(&embedder));
+        Ok(embedder)
     }
 }
 
