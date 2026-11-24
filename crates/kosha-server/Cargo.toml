@@ -52,6 +52,9 @@ tokio-rustls = { version = "=0.26.4", default-features = false, features = ["tls
 # (see main.rs's is_write_path/forward_to_ingest), a core server feature
 # independent of the `migrate` CLI subcommand.
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "rustls"] }
+# Gzip for namespace exports (#347, exports.rs): JSON Lines parts are gzip
+# members. The pure-Rust `miniz_oxide` backend only; no C zlib, no OpenSSL.
+flate2 = { version = "=1.1.11", default-features = false, features = ["rust_backend"] }
 tract-onnx = { version = "0.23.10", optional = true }
 tokenizers = { version = "0.22.2", default-features = false, features = ["fancy-regex"], optional = true }
 aws-sigv4 = { version = "1.5.1", optional = true }
@@ -71,6 +74,14 @@ crc32fast = "1"
 # itself, like this workspace.
 prometheus-client = "0.26"
 fail = "0.5"
+# The self-service console (#345): ID-token signatures (RS256/ES256), PKCE
+# and token randomness, and sealing organizations' OIDC client secrets
+# (AES-256-GCM). Already in the tree as rustls's crypto provider; no
+# default features, so nothing new is built.
+aws-lc-rs = { version = "=1.17.3", default-features = false, features = ["aws-lc-sys"] }
+# Certificate verification for the console's SMTP mailer (STARTTLS or
+# implicit TLS), the same OS-trust verifier reqwest already uses.
+rustls-platform-verifier = "=0.7.0"
 
 # Cache writeback control (writeback.rs): start writing a freshly filled
 # cache range to disk without waiting, and `syncfs` before the pod reports

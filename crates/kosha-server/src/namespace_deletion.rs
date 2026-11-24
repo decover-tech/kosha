@@ -17,12 +17,21 @@
 //! short of that (an S3 error, a leftover object, a crash) leaves the record
 //! pending with the reason, and a resume finishes it later.
 //!
-//! What a completed record does not cover: the caches of *other* pods.
-//! Query replicas stop serving a deleted namespace within one manifest
-//! refresh. Their memory and local copies of its segment files are purged
-//! by each pod for itself, from the records, when
+//! The deleting pod drops its own parsed segments, corpus statistics and
+//! ceilings in the request, and the subject's exports are deleted and
+//! counted on the record (#347).
+//!
+//! What a completed record does not cover, unless it was written with
+//! `acks_required` (`KOSHA_DELETION_REQUIRE_ACKS`): the caches of *other*
+//! pods. Query replicas stop serving a deleted namespace within one
+//! manifest refresh. Their memory and local copies of its segment files
+//! are purged by each pod for itself, from the records, when
 //! `KOSHA_DELETION_PURGE_INTERVAL_MS` is set (see `deletion_purge.rs` for
-//! the window); otherwise they go only when the LRU evicts them.
+//! the window and the acknowledgements); otherwise they go only when the
+//! LRU evicts them.
+//!
+//! `DELETE /v1/namespaces/{ns}` needs `?confirm=<ns>` only with
+//! `KOSHA_NAMESPACE_DELETE_CONFIRM=on` ([`check_delete_confirmation`]).
 
 use super::*;
 use kosha_core::deletion::{
@@ -149,7 +158,7 @@ impl AppState {
     /// Record a reclaim attempt. If the control store cannot be written the
     /// record simply stays pending (a resume repeats the attempt), so the
     /// record as last known is returned.
-    fn note_deletion_attempt(
+    pub(crate) fn note_deletion_attempt(
         &self,
         record: &DeletionRecord,
         objects_deleted: u64,
@@ -271,7 +280,8 @@ impl AppState {
         let lock = self.publication_lock(id);
         let _guard = lock.lock().unwrap();
         let local_version = self.indexer.manifest_version(id);
-        let request = NewDeletion::namespace(&id.0, namespace_tenant(&id.0), parent);
+        let request = NewDeletion::namespace(&id.0, namespace_tenant(&id.0), parent)
+            .with_acks(self.deletion_requires_acks());
         let deleted = self.controller.lock().unwrap().delete_namespace_recorded(
             id,
             local_version.unwrap_or(0),
@@ -350,6 +360,10 @@ impl AppState {
             }
         }
         self.forget_namespace_caches(id);
+        // Parsed segments, corpus statistics and score ceilings go now on
+        // this pod, not at its next purge pass (#347). Other pods purge
+        // theirs from the record.
+        self.purge_deleted_from_memory(&id.0);
         let mut storage_error = None;
         if let Err(e) = local_cleanup {
             eprintln!(
@@ -362,7 +376,12 @@ impl AppState {
         if let Some(e) = &remote_error {
             eprintln!("WARN: namespace {} deleted, but {e}", id.0);
         }
-        let storage_error = storage_error.or(remote_error);
+        let mut storage_error = storage_error.or(remote_error);
+        // Its exports go with it, and the record counts them.
+        if let Some(e) = self.erase_exports_for(&record, || self.delete_namespace_exports(id)) {
+            eprintln!("WARN: namespace {} deleted, but its exports: {e}", id.0);
+            storage_error.get_or_insert(format!("deleting its exports failed: {e}"));
+        }
         let error = failure.clone().or_else(|| storage_error.clone());
         let record = self.note_deletion_attempt(&record, objects, error.as_deref());
         println!(
@@ -395,11 +414,40 @@ impl AppState {
         let _lineage = self.branch_lock.lock().unwrap();
         let lock = self.publication_lock(&id);
         let _guard = lock.lock().unwrap();
-        let (objects, error) = self.retry_namespace_reclaim(&id);
+        let (objects, error) = self.retry_namespace_reclaim(&id, record);
         self.note_deletion_attempt(record, objects, error.as_deref())
     }
 
-    fn retry_namespace_reclaim(&self, id: &NamespaceId) -> (u64, Option<String>) {
+    /// Run `erase` (deleting a subject's exports) and add how many went to
+    /// `record`, also when some are left. Returns why any is left.
+    pub(crate) fn erase_exports_for(
+        &self,
+        record: &DeletionRecord,
+        erase: impl FnOnce() -> (u64, Option<String>),
+    ) -> Option<String> {
+        let (count, error) = erase();
+        if count > 0 {
+            let noted = self
+                .controller
+                .lock()
+                .unwrap()
+                .note_deletion_exports(&record.id, count);
+            if let Err(e) = noted {
+                eprintln!(
+                    "WARN: deletion {}: {count} export(s) deleted, but counting them on the \
+                     record failed: {e}",
+                    record.id
+                );
+            }
+        }
+        error
+    }
+
+    fn retry_namespace_reclaim(
+        &self,
+        id: &NamespaceId,
+        record: &DeletionRecord,
+    ) -> (u64, Option<String>) {
         let stored = self.controller.lock().unwrap().manifest_versions();
         let stored = match stored {
             Ok(stored) => stored,
@@ -438,7 +486,13 @@ impl AppState {
             error.get_or_insert(format!("local segment cleanup failed: {e}"));
         }
         let (objects, remote_error) = self.reclaim_remote_prefix(&id.0);
-        (objects, error.or(remote_error))
+        let exports = self.erase_exports_for(record, || self.delete_namespace_exports(id));
+        (
+            objects,
+            error
+                .or(remote_error)
+                .or(exports.map(|e| format!("deleting its exports failed: {e}"))),
+        )
     }
 
     /// Every namespace id under `tenant/` that the control store or this
@@ -512,7 +566,7 @@ impl AppState {
                     let stored = self.controller.lock().unwrap().try_manifest_cloned(ns);
                     match stored {
                         Ok(Some(manifest)) if manifest.branch.is_some() => {
-                            let outcome = self.delete_branch(ns);
+                            let outcome = self.delete_branch_recorded(ns, Some(&record.id));
                             if let Err(response) = &outcome {
                                 errors.push(format!(
                                     "branch '{}': {}",
@@ -577,6 +631,13 @@ impl AppState {
                 if let Err(e) = self.cache.evict_prefix(tenant) {
                     errors.push(format!("local cleanup of {tenant}/ failed: {e}"));
                 }
+                // Every export of the tenant, and whatever else is under
+                // `_exports/{tenant}/` (#347).
+                if let Some(e) =
+                    self.erase_exports_for(record, || self.delete_tenant_exports(tenant))
+                {
+                    errors.push(format!("deleting the tenant's exports failed: {e}"));
+                }
                 let (deleted, remote_error) = self.reclaim_remote_prefix(tenant);
                 objects = deleted;
                 errors.extend(remote_error);
@@ -617,12 +678,57 @@ impl AppState {
         }
     }
 
-    /// Retry one pending record.
+    /// Retry one pending record. A record whose storage is already verified
+    /// waits only for acknowledgements: it is completed if they are in.
     fn resume_deletion(&self, auth: &auth::Auth, record: &DeletionRecord) -> DeletionRecord {
+        if record.storage_done() {
+            return self
+                .finalize_deletion_if_acked(&record.id, self.pod_liveness_ms())
+                .unwrap_or_else(|| record.clone());
+        }
         match record.scope {
             DeletionScope::Namespace => self.resume_namespace_deletion(record),
+            DeletionScope::Branch => self.resume_branch_deletion(record),
             DeletionScope::Tenant => self.delete_tenant(auth, record).record,
+            // Finished by the tool that wrote it.
+            DeletionScope::Migrated => self.note_deletion_attempt(
+                record,
+                0,
+                Some(
+                    "a migrated namespace's source objects are deleted by \
+                     `kosha-server migrate-namespace`; re-run it for this pair to finish",
+                ),
+            ),
         }
+    }
+
+    /// A record as the admin API shows it: with who acknowledged it, when
+    /// it waits for acknowledgements.
+    pub(crate) fn deletion_json(&self, record: &DeletionRecord) -> serde_json::Value {
+        let mut value = record_json(record);
+        if record.acks_required {
+            let status = self
+                .controller
+                .lock()
+                .unwrap()
+                .deletion_ack_status(&record.id, self.pod_liveness_ms());
+            value["acks"] = match status {
+                Ok(status) => serde_json::json!({
+                    "complete": status.complete(),
+                    "live_pods": status.live,
+                    "acknowledged": status
+                        .acked
+                        .iter()
+                        .map(|(pod, at)| serde_json::json!({"pod": pod, "at_ms": at}))
+                        .collect::<Vec<_>>(),
+                    "missing": status.missing,
+                    "expired": status.expired,
+                    "liveness_ms": self.pod_liveness_ms(),
+                }),
+                Err(e) => serde_json::json!({"error": e.to_string()}),
+            };
+        }
+        value
     }
 }
 
@@ -644,6 +750,30 @@ pub(crate) fn namespace_deleted_response(name: &str, deleted: &NamespaceDeleted)
         "storage_reclaimed": deleted.storage_reclaimed,
         "deletion": record_json(&deleted.record),
     }))
+}
+
+/// `KOSHA_NAMESPACE_DELETE_CONFIRM=on`: `DELETE /v1/namespaces/{ns}` must
+/// carry `?confirm=<ns>` (the unqualified name). `Err` is the 400. Off (the
+/// default), every existing caller keeps working unchanged.
+pub(crate) fn check_delete_confirmation(
+    request_line: &str,
+    name: &str,
+    state: &AppState,
+) -> Result<(), String> {
+    if !state.namespace_delete_needs_confirm() {
+        return Ok(());
+    }
+    let path = parse_method_and_path(request_line).map_or("", |(_, path)| path);
+    if query_param(path, "confirm").as_deref() == Some(name) {
+        return Ok(());
+    }
+    Err(api_error_status(
+        400,
+        &format!(
+            "deleting a namespace is permanent: confirm it with \
+             DELETE /v1/namespaces/{name}?confirm={name}"
+        ),
+    ))
 }
 
 /// Dispatch the admin routes of this module; `None` for any other request.
@@ -743,6 +873,16 @@ pub(crate) fn handle_delete_tenant(
     };
     let done = state.delete_tenant(auth, &record);
     let completed = done.record.is_completed();
+    // #345: audited for a tenant an organization owns.
+    crate::console::audit_tenant_event(
+        state,
+        tenant,
+        "operator",
+        "tenant.deleted",
+        "tenant",
+        tenant,
+        serde_json::json!({ "deletion_id": done.record.id, "completed": completed }),
+    );
     let body = serde_json::json!({
         "tenant": tenant,
         "acknowledged": true,
@@ -844,8 +984,13 @@ fn handle_list_deletions(path: &str, state: &AppState) -> String {
     }
     let listed = state.controller.lock().unwrap().deletions(&filter);
     match listed {
-        Ok(records) => json_ok(&serde_json::json!({ "deletions": records })),
-        Err(e) => crate::control_store_unavailable(&format!("control store: {e}")),
+        Ok(records) => json_ok(&serde_json::json!({
+            "deletions": records
+                .iter()
+                .map(|record| state.deletion_json(record))
+                .collect::<Vec<_>>(),
+        })),
+        Err(e) => api_error_status(503, &format!("control store: {e}")),
     }
 }
 
@@ -853,9 +998,9 @@ fn handle_list_deletions(path: &str, state: &AppState) -> String {
 fn handle_get_deletion(id: &str, state: &AppState) -> String {
     let found = state.controller.lock().unwrap().deletion(id);
     match found {
-        Ok(Some(record)) => json_ok(&record),
-        Ok(None) => api_error(ErrorCode::NotFound, &format!("deletion '{id}' not found")),
-        Err(e) => crate::control_store_unavailable(&format!("control store: {e}")),
+        Ok(Some(record)) => json_ok(&state.deletion_json(&record)),
+        Ok(None) => api_error_status(404, &format!("deletion '{id}' not found")),
+        Err(e) => api_error_status(503, &format!("control store: {e}")),
     }
 }
 
@@ -1406,10 +1551,16 @@ mod tests {
         assert_eq!(remote.under("globex").len(), 1);
         assert_eq!(remote.under("acme-eu").len(), 1);
 
-        // One tenant record, and a child record per namespace.
+        // One tenant record, and a child record per namespace and per
+        // branch (#347).
         let records = listed(&state, "?tenant=acme");
         let tenant_id = body["deletion"]["id"].as_str().unwrap();
-        assert_eq!(records.len(), 3, "{records:?}");
+        assert_eq!(records.len(), 4, "{records:?}");
+        let branches: Vec<&serde_json::Value> =
+            records.iter().filter(|r| r["scope"] == "branch").collect();
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0]["subject"], "acme/exp");
+        assert_eq!(branches[0]["parent_id"], tenant_id);
         assert!(records.iter().all(|r| r["state"] == "completed"));
         let children: Vec<&serde_json::Value> = records
             .iter()

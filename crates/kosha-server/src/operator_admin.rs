@@ -26,11 +26,18 @@
 //!   `{"key_id": "...", "overlap_secs": 86400}` issues a replacement for
 //!   the same operator; the old credential keeps working for the overlap.
 //!
-//! Also here, because it is read-only reporting an operator needs before
-//! the manual plaintext scrub:
+//! **Lock-out guard.** While the shared bootstrap key is off
+//! (`KOSHA_ADMIN_BOOTSTRAP_KEY=disabled`, or `KOSHA_ADMIN_API_KEY` unset),
+//! a revoke or rotate that would leave no usable operator credential, or
+//! make the last one lapse within a day, is refused with 409 and changes
+//! nothing (`kosha_control::api_keys::check_lockout`). `"force": true` in
+//! the body overrides it; the way back in is then re-enabling the
+//! bootstrap key and restarting.
+//!
+//! Also here, because it is read-only reporting on the plaintext scrub:
 //!
 //! - `GET /v1/admin/api-keys/plaintext-count` reports how many registry
-//!   rows still hold a plaintext key.
+//!   rows still hold a plaintext key (the automatic scrub removes it).
 
 use crate::api_error::api_error_status;
 use crate::api_key_admin::{bad_request, parse_expiry, parse_key_ref, parse_overlap, Rejection};
@@ -59,13 +66,27 @@ enum Action {
         expires_at: Option<i64>,
     },
     List,
-    Revoke(Target),
+    Revoke {
+        target: Target,
+        /// Override the lock-out guard.
+        force: bool,
+    },
     Rotate {
         key_hash: String,
         overlap_secs: u64,
         expires_at: Option<i64>,
+        force: bool,
     },
     PlaintextCount,
+}
+
+/// The request's `force` flag: `true` overrides the lock-out guard.
+fn parse_force(req: &serde_json::Value) -> Result<bool, Rejection> {
+    match req.get("force") {
+        None | Some(serde_json::Value::Null) => Ok(false),
+        Some(serde_json::Value::Bool(force)) => Ok(*force),
+        Some(_) => Err(bad_request("'force' must be true or false")),
+    }
 }
 
 /// Answer an operator-credential request (or the plaintext count); `None`
@@ -129,14 +150,18 @@ fn parse_operators(method: &str, sub: &str, body: &[u8], now: i64) -> Result<Act
         ("POST", "/revoke") => {
             let req = json()?;
             let by_key = req.get("key_id").is_some() || req.get("api_key").is_some();
-            match parse_name(&req)? {
-                Some(_) if by_key => Err(bad_request(
-                    "give 'name' (every credential of that operator) or 'key_id' (one \
-                     credential), not both",
-                )),
-                Some(name) => Ok(Action::Revoke(Target::Operator(name))),
-                None => Ok(Action::Revoke(Target::KeyHash(parse_key_ref(&req)?))),
-            }
+            let force = parse_force(&req)?;
+            let target = match parse_name(&req)? {
+                Some(_) if by_key => {
+                    return Err(bad_request(
+                        "give 'name' (every credential of that operator) or 'key_id' (one \
+                         credential), not both",
+                    ))
+                }
+                Some(name) => Target::Operator(name),
+                None => Target::KeyHash(parse_key_ref(&req)?),
+            };
+            Ok(Action::Revoke { target, force })
         }
         ("POST", "/rotate") => {
             let req = json()?;
@@ -144,6 +169,7 @@ fn parse_operators(method: &str, sub: &str, body: &[u8], now: i64) -> Result<Act
                 key_hash: parse_key_ref(&req)?,
                 overlap_secs: parse_overlap(&req)?,
                 expires_at: parse_expiry(&req, now)?,
+                force: parse_force(&req)?,
             })
         }
         _ => Err((404, "not found".into())),
@@ -185,10 +211,34 @@ fn execute(_action: Action, _actor: &str) -> String {
     )
 }
 
+/// Whether a change may be refused for locking operators out: only while
+/// the shared bootstrap key is not a way in, and only when not forced.
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+fn lockout_guard(bootstrap_key_usable: bool, force: bool) -> bool {
+    !bootstrap_key_usable && !force
+}
+
+#[cfg(feature = "postgres")]
+fn credential_error(what: &str, e: kosha_control::CredentialError) -> String {
+    match e {
+        kosha_control::CredentialError::WouldLockOut(message) => api_error_status(409, &message),
+        kosha_control::CredentialError::Store(e) => {
+            api_error_status(500, &format!("failed to {what}: {e}"))
+        }
+    }
+}
+
 #[cfg(feature = "postgres")]
 fn execute(action: Action, actor: &str) -> String {
     use crate::{auth, json_ok};
-    use kosha_control::OperatorCredentials;
+    use kosha_control::{LockoutGuard, OperatorCredentials};
+    let guard = |force: bool| {
+        if lockout_guard(auth::bootstrap_admin_key().is_some(), force) {
+            LockoutGuard::On
+        } else {
+            LockoutGuard::Off
+        }
+    };
     let auth::Auth::Keys(store) = auth::global() else {
         return api_error_status(501, "API keys are disabled (KOSHA_AUTH=disabled)");
     };
@@ -235,12 +285,12 @@ fn execute(action: Action, actor: &str) -> String {
             }
             Err(e) => api_error_status(500, &format!("failed to list operator credentials: {e}")),
         },
-        Action::Revoke(target) => {
+        Action::Revoke { target, force } => {
             let which = match &target {
                 Target::KeyHash(hash) => OperatorCredentials::KeyHash(hash),
                 Target::Operator(name) => OperatorCredentials::Operator(name),
             };
-            match pg.revoke_operator_credentials(which, actor) {
+            match pg.revoke_operator_credentials(which, actor, guard(force)) {
                 Ok(revoked) if revoked.is_empty() => {
                     api_error_status(404, "no active operator credential matches")
                 }
@@ -256,16 +306,21 @@ fn execute(action: Action, actor: &str) -> String {
                         .collect();
                     json_ok(&serde_json::json!({ "revoked": revoked }))
                 }
-                Err(e) => {
-                    api_error_status(500, &format!("failed to revoke operator credential: {e}"))
-                }
+                Err(e) => credential_error("revoke operator credential", e),
             }
         }
         Action::Rotate {
             key_hash,
             overlap_secs,
             expires_at,
-        } => match pg.rotate_operator_credential(&key_hash, overlap_secs, expires_at, actor) {
+            force,
+        } => match pg.rotate_operator_credential(
+            &key_hash,
+            overlap_secs,
+            expires_at,
+            actor,
+            guard(force),
+        ) {
             Ok(Some(rotated)) => {
                 store.upsert_db_key(rotated.new.record.clone());
                 // The old credential keeps its operator and gains the deadline.
@@ -282,7 +337,7 @@ fn execute(action: Action, actor: &str) -> String {
                 json_ok(&value)
             }
             Ok(None) => api_error_status(404, "no active operator credential with that id"),
-            Err(e) => api_error_status(500, &format!("failed to rotate operator credential: {e}")),
+            Err(e) => credential_error("rotate operator credential", e),
         },
         Action::PlaintextCount => match pg.count_plaintext_api_keys() {
             Ok(rows) => json_ok(&serde_json::json!({
@@ -377,7 +432,10 @@ mod tests {
                 "/v1/admin/operators/revoke",
                 &format!(r#"{{"key_id": "{id}"}}"#)
             ),
-            Action::Revoke(Target::KeyHash(id.clone()))
+            Action::Revoke {
+                target: Target::KeyHash(id.clone()),
+                force: false
+            }
         );
         assert_eq!(
             ok(
@@ -385,16 +443,27 @@ mod tests {
                 "/v1/admin/operators/revoke",
                 r#"{"api_key": "sk-alice"}"#
             ),
-            Action::Revoke(Target::KeyHash(id.clone()))
+            Action::Revoke {
+                target: Target::KeyHash(id.clone()),
+                force: false
+            }
         );
         assert_eq!(
-            ok("POST", "/v1/admin/operators/revoke", r#"{"name": "alice"}"#),
-            Action::Revoke(Target::Operator("alice".into()))
+            ok(
+                "POST",
+                "/v1/admin/operators/revoke",
+                r#"{"name": "alice", "force": true}"#
+            ),
+            Action::Revoke {
+                target: Target::Operator("alice".into()),
+                force: true
+            }
         );
         for body in [
             r#"{}"#.to_string(),
             r#"{"key_id": "short"}"#.to_string(),
             r#"{"name": "al ice"}"#.to_string(),
+            r#"{"name": "alice", "force": "yes"}"#.to_string(),
             format!(r#"{{"name": "alice", "key_id": "{id}"}}"#),
         ] {
             assert_eq!(
@@ -418,18 +487,23 @@ mod tests {
                 key_hash: id.clone(),
                 overlap_secs: 24 * 60 * 60,
                 expires_at: None,
+                force: false,
             }
         );
         assert_eq!(
             ok(
                 "POST",
                 "/v1/admin/operators/rotate",
-                &format!(r#"{{"key_id": "{id}", "overlap_secs": 0, "expires_in_secs": 10}}"#)
+                &format!(
+                    r#"{{"key_id": "{id}", "overlap_secs": 0, "expires_in_secs": 10,
+                         "force": true}}"#
+                )
             ),
             Action::Rotate {
                 key_hash: id.clone(),
                 overlap_secs: 0,
                 expires_at: Some(NOW + 10),
+                force: true,
             }
         );
         assert_eq!(
@@ -492,6 +566,14 @@ mod tests {
         assert!(!text.contains("sk-alice"), "{text}");
         assert!(!text.contains("_operator/"), "{text}");
         assert!(shown.get("tenant_id").is_none() && shown.get("scopes").is_none());
+    }
+
+    #[test]
+    fn the_lockout_guard_applies_only_without_a_bootstrap_key_and_without_force() {
+        assert!(lockout_guard(false, false));
+        assert!(!lockout_guard(false, true));
+        assert!(!lockout_guard(true, false));
+        assert!(!lockout_guard(true, true));
     }
 
     #[test]
