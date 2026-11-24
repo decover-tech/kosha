@@ -326,17 +326,6 @@ mod tests {
             source: Some((include_str!("billing.rs"), "\npub(crate) fn route(")),
         },
         Delegate {
-            call: "api_key_admin::handle(request_line, body, || admin_label(headers, state))",
-            routes: &[
-                ("POST", "/v1/admin/api-keys"),
-                ("GET", "/v1/admin/api-keys"),
-                ("POST", "/v1/admin/api-keys/revoke"),
-                ("POST", "/v1/admin/api-keys/rotate"),
-                ("POST", "/v1/admin/api-keys/scrub-plaintext"),
-            ],
-            source: Some((include_str!("api_key_admin.rs"), "\npub(crate) fn handle(")),
-        },
-        Delegate {
             call: "namespace_deletion::route_admin(request_line, body, state)",
             routes: &[
                 ("DELETE", "/v1/admin/tenants/acme"),
