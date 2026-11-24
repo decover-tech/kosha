@@ -467,34 +467,15 @@ impl AppState {
         }
         #[cfg(feature = "s3")]
         if let Some(ref s3) = self.s3_storage {
-            match s3.list_child_dirs(&ns.0) {
-                Ok(dirs) => {
-                    for dir in dirs {
-                        let rel = format!("{}/{}", ns.0, dir);
-                        let files = match s3.list_remote_with_sizes(&rel) {
-                            Ok(files) => files.into_iter().map(|(name, _)| name).collect(),
-                            Err(e) => {
-                                out.errors.push(format!("list {rel}/: {e}"));
-                                continue;
-                            }
-                        };
-                        let files: Vec<String> = files;
-                        let doomed = refs.reclaimable_files(&rel, &files);
-                        out.kept += files.len() - doomed.len();
-                        // Deleting `_COMMIT` first would leave a prefix that
-                        // looks uncommitted, never one that looks complete
-                        // while files are missing.
-                        let mut doomed = doomed;
-                        doomed.sort_by_key(|path| !path.ends_with(segment_commit::COMMIT_FILE));
-                        for path in doomed {
-                            match s3.delete_remote(&path) {
-                                Ok(()) => out.remote_objects += 1,
-                                Err(e) => out.errors.push(e.to_string()),
-                            }
-                        }
-                    }
+            match s3.list_objects_remote(&format!("{}/", ns.0)) {
+                Ok(objects) => {
+                    out.kept += objects.iter().filter(|o| refs.holds_file(&o.path)).count()
                 }
                 Err(e) => out.errors.push(format!("list {}/: {e}", ns.0)),
+            }
+            match s3.erase_unreferenced_prefix(&ns.0, refs) {
+                Ok(deleted) => out.remote_objects += deleted,
+                Err(e) => out.errors.push(e.to_string()),
             }
         }
         out

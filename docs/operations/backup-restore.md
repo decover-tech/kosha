@@ -43,13 +43,15 @@ aws s3api get-bucket-lifecycle-configuration --bucket "$SEGMENT_BUCKET"
 Allow AWS's recommended 15 minutes after first enabling versioning before
 writing objects for the first protected checkpoint. The rule keeps noncurrent
 versions for 40 days (a 5-day margin), cleans up expired delete markers, and
-does not expire live segments. Limit explicit version deletion, lifecycle edits,
-and versioning suspension to separate operator roles, not the application role.
+does not expire live segments. Limit lifecycle edits and versioning suspension
+to separate operator roles. If the application role must preserve all versions
+for recovery, withhold version deletion from it: namespace S3 reclamation will
+remain pending until erasure is allowed.
 Retain KMS keys and decrypt grants for the entire window.
 
-**Erasure prerequisite:** Kosha's ordinary deletes on a versioned bucket
-create delete markers. Its online deletion status does not prove that S3
-noncurrent versions or Postgres backups have been physically erased. Get
+**Erasure prerequisite:** Namespace deletion erases versions and delete
+markers under the namespace prefix when the application role has the required
+permissions. It does not purge versioned S3 WAL objects or Postgres backups. Get
 approval for the backup retention period and restricted recovery access before
 enabling this policy. Where policy requires earlier erasure, explicitly purge
 the affected retained versions (coordinated with branch references), account

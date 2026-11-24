@@ -44,8 +44,16 @@ pub(crate) trait RemotePrefixStore: Send + Sync {
     /// Delete every object under the logical directory `prefix`,
     /// recursively. Returns how many went.
     fn delete_prefix(&self, prefix: &str) -> Result<usize, KoshaError>;
-    /// How many objects are under the logical directory `prefix` right now.
+    /// How many current objects are under the logical directory `prefix`.
     fn count_prefix(&self, prefix: &str) -> Result<usize, KoshaError>;
+
+    fn erase_prefix(&self, prefix: &str) -> Result<usize, KoshaError> {
+        self.delete_prefix(prefix)
+    }
+
+    fn count_erasure_entries(&self, prefix: &str) -> Result<usize, KoshaError> {
+        self.count_prefix(prefix)
+    }
 }
 
 #[cfg(feature = "s3")]
@@ -59,6 +67,14 @@ impl RemotePrefixStore for s3_storage::S3Storage {
         // for `acme/docs`.
         let dir = format!("{}/", prefix.trim_matches('/'));
         Ok(self.list_objects_remote(&dir)?.len())
+    }
+
+    fn erase_prefix(&self, prefix: &str) -> Result<usize, KoshaError> {
+        s3_storage::S3Storage::erase_prefix(self, prefix)
+    }
+
+    fn count_erasure_entries(&self, prefix: &str) -> Result<usize, KoshaError> {
+        self.count_erasure_page(prefix)
     }
 }
 
@@ -112,7 +128,7 @@ fn query_param(path: &str, name: &str) -> Option<String> {
 
 impl AppState {
     /// The object store deletions reclaim from, if this node has one.
-    fn remote_prefix_store(&self) -> Option<&dyn RemotePrefixStore> {
+    pub(crate) fn remote_prefix_store(&self) -> Option<&dyn RemotePrefixStore> {
         #[cfg(test)]
         if let Some(store) = &self.remote_prefix_override {
             return Some(store.as_ref());
@@ -124,14 +140,14 @@ impl AppState {
         None
     }
 
-    /// Delete every remote object under `prefix`, then list the prefix
-    /// again: only an empty listing counts. Returns how many objects were
-    /// deleted and, when the prefix is not verified empty, why.
+    /// Erase remote data under `prefix`, then verify the prefix is empty.
+    /// Returns how many objects or versions were deleted and, when the
+    /// prefix is not verified empty, why.
     fn reclaim_remote_prefix(&self, prefix: &str) -> (u64, Option<String>) {
         let Some(store) = self.remote_prefix_store() else {
             return (0, None);
         };
-        let deleted = match store.delete_prefix(prefix) {
+        let deleted = match store.erase_prefix(prefix) {
             Ok(deleted) => deleted as u64,
             Err(e) => {
                 return (
@@ -140,12 +156,12 @@ impl AppState {
                 )
             }
         };
-        match store.count_prefix(prefix) {
+        match store.count_erasure_entries(prefix) {
             Ok(0) => (deleted, None),
             Ok(left) => (
                 deleted,
                 Some(format!(
-                    "{left} object(s) remain under {prefix}/ after the delete"
+                    "At least {left} object(s) remain under {prefix}/ after the delete"
                 )),
             ),
             Err(e) => (

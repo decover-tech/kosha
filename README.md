@@ -611,6 +611,21 @@ With `KOSHA_NAMESPACE_DELETE_CONFIRM=on` (off by default, so existing callers
 keep working) the request must name the namespace again:
 `DELETE /v1/namespaces/docs?confirm=docs`; anything else is a 400.
 
+**S3 erasure.** Deletion aborts unfinished multipart uploads and permanently
+removes all object versions and delete markers under the namespace's S3
+prefix. It checks again for versions, markers, and uploads before reporting
+storage reclaimed. The S3 role needs `s3:ListBucketVersions`,
+`s3:DeleteObjectVersion`, `s3:ListBucketMultipartUploads`, and
+`s3:AbortMultipartUpload`. If multipart listing is denied, versions and
+markers are still removed, but the deletion record stays pending and the
+response reports `storage_reclaimed: false`.
+
+With a custom S3 endpoint, multipart listing scans the bucket and filters
+keys by the namespace prefix. Some MinIO versions only expose uploads known
+to the running server in this listing, so it cannot verify erasure of uploads
+left by an earlier MinIO process. Hard delete does not purge versioned S3 WAL
+objects under the separate `_wal/{writer_id}/` prefix.
+
 **Cached copies on every pod.** With `KOSHA_DELETION_PURGE_INTERVAL_MS` set
 (off by default), each pod of any role reads the deletion records it has not
 handled yet, at boot and then on that interval, and for every deleted
