@@ -1,7 +1,7 @@
-//! Distance-kernel microbenchmarks for #382: the f32 dot (the current
-//! 8-lane [`dot`] vs wider accumulators) and the RaBitQ estimator (the
-//! per-byte lookup table vs 4-bit-query AND + popcount), at the 1024-dim
-//! shape of the MSMarco bench corpus.
+//! Distance-kernel microbenchmarks for #382: the f32 dot (a serial sum,
+//! the current 8-lane [`dot`], and wider accumulators) and the RaBitQ
+//! estimator (the per-byte lookup table vs 4-bit-query AND + popcount),
+//! at the 1024-dim shape of the MSMarco bench corpus.
 //!
 //! Each case scores one query against a posting-sized batch of
 //! [`POSTING`] entries, the unit of work in `for_each_similarity`, so the
@@ -31,6 +31,10 @@ fn unit(rng: &mut DeterministicRng, dim: usize) -> Vec<f32> {
     v
 }
 
+fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
 fn bench_dot(c: &mut Criterion) {
     let mut rng = DeterministicRng::new(1);
     let q = unit(&mut rng, DIM);
@@ -50,6 +54,7 @@ fn bench_dot(c: &mut Criterion) {
             });
         };
     }
+    case!("dot_scalar", dot_scalar);
     case!("dot_current_8_lanes", dot);
     case!("dot_lanes_8", dot_lanes::<8>);
     case!("dot_lanes_16", dot_lanes::<16>);
