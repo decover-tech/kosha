@@ -604,6 +604,12 @@ pub(crate) fn documents_vector_dimensions(documents: &[kosha_core::Document]) ->
 /// predates per-column vector metadata (#204) and so records no count.
 fn namespace_stored_vector_dimensions(state: &AppState, ns: &NamespaceId) -> Option<u64> {
     let manifest = state.indexer.manifest_shared(ns)?;
+    // Persisted manifests carry no footers: a writer started on an empty
+    // cache fetches the ones it lacks, as the warm run does.
+    #[cfg(feature = "s3")]
+    if state.s3_storage.is_some() {
+        state.fetch_missing_footers(ns, &manifest, &RequestHydration::unlimited());
+    }
     let mut total: u64 = 0;
     for entry in &manifest.segments {
         if manifest.is_inherited_segment(ns, &entry.segment_id) {
