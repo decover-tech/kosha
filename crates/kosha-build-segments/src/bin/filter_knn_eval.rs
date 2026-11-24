@@ -274,8 +274,19 @@ fn run(
                 .collect()
         })
         .collect();
+    // Search plans a segment where the filter matches nothing as exact: it
+    // neither shares the probe budget nor counts toward selectivity.
+    let live: Vec<bool> = passes.iter().map(|p| p.iter().any(|&n| n > 0)).collect();
     let bounds: Vec<Vec<f32>> = match strategy {
-        Strategy::Baseline => distances.to_vec(),
+        Strategy::Baseline => distances
+            .iter()
+            .zip(&live)
+            .map(|(d, &l)| {
+                d.iter()
+                    .map(|&d| if l { d } else { f32::INFINITY })
+                    .collect()
+            })
+            .collect(),
         Strategy::PassAware => distances
             .iter()
             .zip(&passes)
@@ -288,7 +299,7 @@ fn run(
             .collect(),
     };
     let (mut members, mut passing) = (0usize, 0usize);
-    for (seg, p) in segments.iter().zip(&passes) {
+    for ((seg, p), _) in segments.iter().zip(&passes).zip(&live).filter(|(_, &l)| l) {
         for (m, &n) in seg.members.iter().zip(p) {
             if strategy == Strategy::Baseline || n > 0 {
                 members += m.len();
@@ -313,11 +324,13 @@ fn run(
     };
     let mut hits: Vec<(f64, usize)> = Vec::new();
     let (mut fetched, mut empty) = (0usize, 0usize);
-    for ((seg, b), p) in segments.iter().zip(&bounds).zip(&passes) {
-        // Search skips a segment where the filter matches nothing.
-        if p.iter().all(|&n| n == 0) {
-            continue;
-        }
+    for (((seg, b), p), _) in segments
+        .iter()
+        .zip(&bounds)
+        .zip(&passes)
+        .zip(&live)
+        .filter(|(_, &l)| l)
+    {
         let accept = |seq: u32| pass[seg.corpus_index[seq as usize]];
         let ranking = KnnSegmentRanking::new(b.clone(), cutoff, widened);
         let (seg_hits, probes) = seg
