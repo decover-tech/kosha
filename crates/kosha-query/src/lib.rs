@@ -5686,7 +5686,7 @@ impl Searcher {
         // A segment without them (written before #249) takes the paths
         // below and answers from its combined index instead.
         let field_query = analysis.fields().filter(|fields| {
-            (analysis.has_text() || (has_query && fields.iter().any(|field| !field.is_all())))
+            (analysis.has_text() || (has_query && fields.iter().all(|field| !field.is_all())))
                 && !is_wildcard_mode
                 && reader.field_index().is_some()
         });
@@ -22797,7 +22797,7 @@ mod field_tests {
             },
             vec![doc("keyword", "...", "ordinary text")],
         );
-        for fields in [&[][..], &["_all"], &["_all^2"]] {
+        for fields in [&[][..], &["_all"], &["_all^2"], &["_all", "content"]] {
             assert_eq!(
                 hits(&root, &manifest, &query("...", fields)),
                 ["keyword"],
