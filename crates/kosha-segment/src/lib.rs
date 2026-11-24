@@ -2757,6 +2757,9 @@ mod posting_scan_tests;
 mod centroid_codes_tests;
 
 #[cfg(test)]
+mod centroid_cap_tests;
+
+#[cfg(test)]
 mod vector_index_v2_tests {
     use super::*;
 
@@ -6801,6 +6804,10 @@ struct LazyVectorIndex {
     /// unit-norm, with `KOSHA_KNN_PLAN_I8=0`, or when a centroid is not a
     /// sane unit-scale vector: planning then scores the f32 centroids.
     centroid_codes: Option<CentroidCodes>,
+    /// A spherical cap holding every centroid, for a floor on the column's
+    /// rank scores (see [`CentroidCap`]). Built at load like the codes;
+    /// `None` for a column that is not unit-norm or has no sane centroids.
+    centroid_cap: Option<CentroidCap>,
     /// `(offset, length)` into `vector.idx`, one per posting.
     ranges: Vec<(u64, u32)>,
     /// Parallel to `ranges` — max cosine distance from each posting's
@@ -6852,6 +6859,9 @@ impl LazyVectorIndex {
         let centroid_codes = (unit_norm && knn_plan_i8_from_env())
             .then(|| CentroidCodes::build(&centroids, dim))
             .flatten();
+        let centroid_cap = unit_norm
+            .then(|| CentroidCap::build(&centroids, dim, &radii))
+            .flatten();
         LazyVectorIndex {
             vector_idx_path: idx_path.to_path_buf(),
             idx_file: idx_path.file_name().map_or_else(
@@ -6862,6 +6872,7 @@ impl LazyVectorIndex {
             dim,
             centroids,
             centroid_codes,
+            centroid_cap,
             ranges,
             radii,
             unit_norm,
@@ -7010,6 +7021,179 @@ impl CentroidCodes {
     }
 }
 
+/// The smallest-known spherical cap around a unit-norm column's
+/// centroids: a centre direction `m` and an angle `theta` with
+/// `angle(m, c) <= theta` for every centroid `c`, plus the largest centroid
+/// norm and the largest radius. One per loaded column (`dim` f64s), built
+/// from the resident centroids; nothing on disk changes.
+///
+/// It gives the kNN plan a floor on every posting's rank score from one
+/// dot product per segment ([`SegmentReader::knn_centroid_score_floor`]),
+/// so a segment whose centroids all lie far from the query can be left out
+/// of the plan without scoring them (#253). Segments that each cover the
+/// whole space (hash- or time-partitioned) get a floor of `0` and are
+/// scored as before; the floor only pays off once segments are spatially
+/// clustered.
+#[derive(Debug)]
+struct CentroidCap {
+    /// Unit centre, in f64.
+    center: Vec<f64>,
+    /// Upper bound on the angle from `center` to any centroid, radians.
+    theta: f64,
+    /// Upper bound on any centroid's L2 norm.
+    max_norm: f64,
+    /// Lower bound on any centroid's L2 norm.
+    min_norm: f64,
+    /// The largest radius of any posting.
+    max_radius: f32,
+}
+
+impl CentroidCap {
+    /// Angular slack for f64 rounding in `acos` (ill-conditioned near 0).
+    const ANGLE_PAD: f64 = 1e-6;
+
+    /// `None` when there is nothing to bound or the bound's assumptions do
+    /// not hold: no centroids, a centroid or radius that is not finite, a
+    /// centroid far from unit length (a damaged or foreign sidecar), or
+    /// centroids that cancel out so there is no meaningful centre.
+    fn build(centroids: &[f32], dim: usize, radii: &[f32]) -> Option<Self> {
+        if dim == 0 || centroids.is_empty() || centroids.len() != dim * radii.len() {
+            return None;
+        }
+        if radii.iter().any(|r| !r.is_finite()) {
+            return None;
+        }
+        let mut center = vec![0f64; dim];
+        let mut max_norm = 0f64;
+        let mut min_norm = f64::INFINITY;
+        for row in centroids.chunks_exact(dim) {
+            if row.iter().any(|x| !x.is_finite()) {
+                return None;
+            }
+            let norm = row
+                .iter()
+                .map(|&x| f64::from(x).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            if !(0.5..=2.0).contains(&norm) {
+                return None;
+            }
+            max_norm = max_norm.max(norm);
+            min_norm = min_norm.min(norm);
+            for (m, &x) in center.iter_mut().zip(row) {
+                *m += f64::from(x) / norm;
+            }
+        }
+        let rows = radii.len() as f64;
+        let len = center.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if len.is_nan() || len <= 1e-6 * rows {
+            return None;
+        }
+        for m in &mut center {
+            *m /= len;
+        }
+        let mut theta = 0f64;
+        for row in centroids.chunks_exact(dim) {
+            let norm = row
+                .iter()
+                .map(|&x| f64::from(x).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            let cos = center
+                .iter()
+                .zip(row)
+                .map(|(m, &x)| m * f64::from(x))
+                .sum::<f64>()
+                / norm;
+            theta = theta.max(cos.clamp(-1.0, 1.0).acos());
+        }
+        Some(Self {
+            center,
+            theta: theta + Self::ANGLE_PAD,
+            max_norm: max_norm * (1.0 + 1e-9),
+            min_norm: min_norm * (1.0 - 1e-9),
+            max_radius: radii.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+        })
+    }
+
+    /// A floor on [`SegmentReader::centroid_score`] for every posting of
+    /// the column, given `unit`, the query as [`SegmentReader::unit_query`]
+    /// scales it. `None` for a query that is not finite or a radius weight
+    /// that is not finite and `>= 0`.
+    ///
+    /// Why it holds, for posting `i` with f32 centroid `c` and radius `r`:
+    ///
+    /// 1. Angles between directions are a metric on the sphere, so with
+    ///    `phi = angle(unit, m)` and `angle(m, c) <= theta`,
+    ///    `angle(unit, c) >= max(0, phi - theta)` and, in real arithmetic,
+    ///    `dot(unit, c) <= |unit| * |c| * cos(max(0, phi - theta))`
+    ///    (cos is decreasing on `[0, pi]`), and `|c|` is at most
+    ///    `max_norm` when that cosine is positive, at least `min_norm`
+    ///    when it is negative. `phi` gets `ANGLE_PAD` taken off for its own
+    ///    `acos` rounding.
+    /// 2. The f32 dot the score is computed from is within
+    ///    `gamma_n * |unit| * |c|` of the real one (Higham, section 3.1);
+    ///    `(dim + 8) * 2^-23 * |unit| * max_norm` is more than that.
+    /// 3. `d = fl(1 - clamp(x))` is non-increasing in `x` (so the bound on
+    ///    `x` is clamped the same way) and rounds a value
+    ///    in `[0, 2]` by at most `2^-23`.
+    /// 4. [`centroid_probe_score`] is `max(fl(d - fl(alpha * r)), 0)`,
+    ///    non-decreasing in `d` and, for `alpha >= 0`, non-increasing in
+    ///    `r`, so `max_radius` gives the smallest score; the last
+    ///    subtraction rounds by at most a half ulp of a value under
+    ///    `2 + alpha * max_radius`.
+    ///
+    /// The result is computed in f64 with that slack (and `PAD` more) and
+    /// only then rounded to f32, so the floor is never above any score.
+    fn score_floor(&self, unit: &[f32], alpha: f32) -> Option<f32> {
+        const PAD: f64 = 4e-6;
+        if !(alpha.is_finite() && alpha >= 0.0) || unit.len() != self.center.len() {
+            return None;
+        }
+        if unit.iter().any(|x| !x.is_finite()) {
+            return None;
+        }
+        let norm = unit
+            .iter()
+            .map(|&x| f64::from(x).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let dim = unit.len() as f64;
+        let rounding = (dim + 8.0) * f64::from(f32::EPSILON) * norm * self.max_norm;
+        let real_max = if norm == 0.0 {
+            0.0
+        } else {
+            let cos = self
+                .center
+                .iter()
+                .zip(unit)
+                .map(|(m, &x)| m * f64::from(x))
+                .sum::<f64>()
+                / norm;
+            let phi = cos.clamp(-1.0, 1.0).acos() - Self::ANGLE_PAD;
+            let gap = (phi - self.theta).max(0.0);
+            // `gap` can exceed pi only through the pads' arithmetic; cos is
+            // not monotone past pi, so cap it there.
+            let cos = gap.min(std::f64::consts::PI).cos();
+            let c_norm = if cos >= 0.0 {
+                self.max_norm
+            } else {
+                self.min_norm
+            };
+            norm * c_norm * cos
+        };
+        let x = (real_max + rounding).clamp(-1.0, 1.0);
+        let distance = 1.0 - x - f64::from(f32::EPSILON);
+        let radius_term = f64::from(alpha * self.max_radius);
+        let rounding = f64::from(f32::EPSILON) * (2.0 + radius_term.abs());
+        let floor = distance - radius_term - rounding - PAD;
+        if !floor.is_finite() {
+            return None;
+        }
+        Some(if floor <= 0.0 { 0.0 } else { floor as f32 })
+    }
+}
+
 /// Resident bytes of the centroid codes a segment open builds for the
 /// vector column whose `vector.offsets` sidecar is at `offsets_path` (see
 /// [`CentroidCodes`]): zero when the column gets none (not unit-norm,
@@ -7022,19 +7206,38 @@ pub fn vector_centroid_code_bytes(offsets_path: &Path) -> u64 {
     if !knn_plan_i8_from_env() {
         return 0;
     }
+    unit_norm_offsets_shape(offsets_path).map_or(0, |(dim, postings)| {
+        postings.saturating_mul(dim + CENTROID_CODE_ROW_OVERHEAD as u64)
+    })
+}
+
+/// Resident bytes of the [`CentroidCap`] a segment open builds for the
+/// vector column whose `vector.offsets` sidecar is at `offsets_path`: its
+/// `f64` centre, or zero when the column is not unit-norm or has no
+/// readable sidecar header. Derived at load like the centroid codes, so
+/// `approx_segment_bytes` adds it too. A unit-norm column whose centroids
+/// give no cap is still charged, the conservative direction.
+pub fn vector_centroid_cap_bytes(offsets_path: &Path) -> u64 {
+    unit_norm_offsets_shape(offsets_path).map_or(0, |(dim, _)| {
+        dim.saturating_mul(std::mem::size_of::<f64>() as u64)
+    })
+}
+
+/// `(dim, postings)` from the header of a unit-norm column's
+/// `vector.offsets` sidecar; `None` for any other column or an unreadable
+/// header. Only the 16-byte header is read.
+fn unit_norm_offsets_shape(offsets_path: &Path) -> Option<(u64, u64)> {
     let mut header = [0u8; VECTOR_OFFSETS_HEADER_LEN];
     let read = fs::File::open(offsets_path).and_then(|mut f| f.read_exact(&mut header));
     if read.is_err() || header[0..4] != VECTOR_OFFSETS_MAGIC.to_le_bytes() {
-        return 0;
+        return None;
     }
     let mut cursor = &header[4..];
     let version = read_u32_le(&mut cursor);
     let dim = read_u32_le(&mut cursor) as u64;
     let postings = read_u32_le(&mut cursor) as u64;
-    if !is_known_vector_index_version(version) || !is_unit_norm_vector_index_version(version) {
-        return 0;
-    }
-    postings.saturating_mul(dim + CENTROID_CODE_ROW_OVERHEAD as u64)
+    (is_known_vector_index_version(version) && is_unit_norm_vector_index_version(version))
+        .then_some((dim, postings))
 }
 
 /// `KOSHA_KNN_PLAN_I8` (default on): `0`, `false` or `off` turns off the
@@ -7112,6 +7315,11 @@ impl KnnCentroidMatrix {
     /// See [`SegmentReader::knn_centroid_score_bounds`].
     pub fn score_bounds(&self, query: &[f32], alpha: f32) -> Option<KnnCentroidScoreBounds> {
         SegmentReader::centroid_score_bounds(&self.0, query, alpha)
+    }
+
+    /// See [`SegmentReader::knn_centroid_score_floor`].
+    pub fn score_floor(&self, query: &[f32], alpha: f32) -> Option<f32> {
+        SegmentReader::centroid_score_floor(&self.0, query, alpha)
     }
 }
 
@@ -9078,6 +9286,12 @@ impl SegmentReader {
         finite.then_some(bounds)
     }
 
+    /// See [`CentroidCap::score_floor`].
+    fn centroid_score_floor(vi: &LazyVectorIndex, query: &[f32], alpha: f32) -> Option<f32> {
+        let cap = vi.centroid_cap.as_ref()?;
+        cap.score_floor(&Self::unit_query(vi, query)?, alpha)
+    }
+
     /// `query` scaled to unit length when `vi` stores unit vectors, so a
     /// stored f32 vector's cosine similarity is a bare dot product; `None`
     /// for a column that stores raw magnitudes. A zero query stays zero and
@@ -9203,6 +9417,18 @@ impl SegmentReader {
     ) -> Option<KnnCentroidScoreBounds> {
         self.with_knn_plan_index(field, query.len(), |vi| {
             Self::centroid_score_bounds(vi, query, alpha)
+        })
+    }
+
+    /// A floor on every score [`Self::knn_centroid_distances_with_alpha`]
+    /// would return, from one comparison against a cap around the
+    /// column's centroids (see [`CentroidCap`]): the kNN plan leaves a
+    /// segment out without scoring its centroids when this is above the
+    /// probe cutoff. `None` when the column has no cap (not unit-norm, no
+    /// lazy index, a dimension mismatch) or the query is not finite.
+    pub fn knn_centroid_score_floor(&self, field: &str, query: &[f32], alpha: f32) -> Option<f32> {
+        self.with_knn_plan_index(field, query.len(), |vi| {
+            Self::centroid_score_floor(vi, query, alpha)
         })
     }
 

@@ -111,6 +111,12 @@ ANN structure when a segment is opened.
   lower bound `max(0, distance(query, centroid) - radius)` instead of raw
   centroid distance, so a posting with an unremarkable centroid but a close
   member still gets probed.
+- **Segment pruning.** Each unit-norm column keeps a spherical cap around all
+  its centroids (in memory, built at load). It gives a guaranteed floor under
+  every rank score in the segment, so the plan leaves out, unscored, every
+  segment whose floor is above the budget's cutoff (`KOSHA_KNN_SEGMENT_PRUNE`,
+  default on, #253). The plan is unchanged; the saving is in centroid scoring
+  and grows the more each segment's vectors are clustered in one region.
 - **i8 rescoring.** An i8 column scores with an i8 dot product, then rescores
   its best `k * KOSHA_VECTOR_RESCORE_FACTOR` candidates with the f32 vectors in
   `doc_vectors.bin`.
