@@ -779,6 +779,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Issue #194: the columnar `exists` agrees with the row scan on the
+    /// edge values: `""` is present, `[]` / `[null]` / an absent field are
+    /// not.
+    #[test]
+    fn exists_edge_values_agree_across_formats() {
+        let dir = temp_dir("exists-edges");
+        let values: [Option<&str>; 6] = [
+            Some(""),
+            Some("x"),
+            Some("[]"),
+            Some("[null]"),
+            None,
+            Some(""),
+        ];
+        let docs: Vec<(DocumentId, Vec<Field>)> = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let mut fields = vec![Field::text("t", format!("word {i}"))];
+                if let Some(v) = v {
+                    fields.push(Field::keyword("code", *v));
+                }
+                (DocumentId(format!("d{i}")), fields)
+            })
+            .collect();
+        let legacy = build(&dir.join("v1"), 1, &docs);
+        let columnar = build(&dir.join("v2"), 2, &docs);
+        for (json, want) in [
+            (
+                serde_json::json!({"exists": {"field": "code"}}),
+                vec![0, 1, 5],
+            ),
+            (
+                serde_json::json!({"bool": {"must_not": [{"exists": {"field": "code"}}]}}),
+                vec![2, 3, 4],
+            ),
+        ] {
+            let clause: FilterClause = serde_json::from_value(json.clone()).unwrap();
+            for (name, segment) in [("v1", &legacy), ("v2", &columnar)] {
+                let got: Vec<u32> = segment.evaluate_filter(&clause).unwrap().iter().collect();
+                assert_eq!(got, want, "{name}: {json}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn missing_and_damaged_columns() {
         let dir = temp_dir("missing");

@@ -118,6 +118,18 @@ def test_exists_and_range_options():
     assert ranged == {"range": {"publishedAt": {"gte": "2024-01-01", "lte": "2024-12-31"}}}
 
 
+def test_exists_drops_boost_and_refuses_malformed_bodies():
+    assert KoshaClient._to_filter({"exists": {"field": "a", "boost": 2}}) == {
+        "exists": {"field": "a"}
+    }
+    assert KoshaClient._to_filter({"exists": {"field": "a", "_name": "has_a"}}) == {
+        "exists": {"field": "a"}
+    }
+    for spec in [None, "a", ["a"], {}, {"field": ""}, {"field": 7}, {"field": "a", "x": 1}]:
+        with pytest.raises(KoshaRequestError, match="exists"):
+            KoshaClient._to_filter({"exists": spec})
+
+
 def test_prefix_short_and_long_forms():
     assert KoshaClient._to_filter({"prefix": {"path": "/matters/2026/"}}) == {
         "prefix": {"path": "/matters/2026/"}
