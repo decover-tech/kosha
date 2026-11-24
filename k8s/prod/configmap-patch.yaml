@@ -1,6 +1,15 @@
 # Env-specific S3/region values are NOT committed here — the deploy action
 # writes them at apply time from GitHub Environment secrets (see
 # .github/actions/deploy-eks).
+#
+# Legacy routes (#350, ADR-350 §c): prod still serves the unversioned Phase 1
+# routes, with Deprecation/Sunset headers and kosha_legacy_requests_total.
+# The prod flip follows the stage flip (see k8s/stage/configmap-patch.yaml):
+# once prod shows 7 days of zero legacy
+# requests, or the stragglers are known, add
+#   KOSHA_LEGACY_ROUTES: "off"
+#   KOSHA_LEGACY_ROUTES_TENANTS: "<tenants still migrating>"
+# here (docs/api/versioning.md, "Legacy routes").
 apiVersion: v1
 kind: ConfigMap
 metadata:

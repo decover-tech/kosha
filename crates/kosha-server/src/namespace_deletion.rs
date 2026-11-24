@@ -238,8 +238,8 @@ impl AppState {
         match branches_referencing(self, id) {
             Ok(branches) if branches.is_empty() => {}
             Ok(branches) => {
-                return Err(json_error(
-                    409,
+                return Err(api_error(
+                    ErrorCode::Conflict,
                     &format!(
                         "namespace '{name}' has branches that share its segments ({}); delete \
                          them first (DELETE /v1/namespaces/{{branch}}/branch)",
@@ -251,15 +251,19 @@ impl AppState {
                     ),
                 ))
             }
-            Err(e) => return Err(json_error(503, &format!("control store: {e}"))),
+            Err(e) => {
+                return Err(crate::control_store_unavailable(&format!(
+                    "control store: {e}"
+                )))
+            }
         }
         // A branch goes through DELETE .../branch, which also reclaims the
         // prefixes of deleted ancestor branches only it kept alive; deleting
         // it here would leak those for good.
         match self.controller.lock().unwrap().try_manifest_cloned(id) {
             Ok(Some(manifest)) if manifest.branch.is_some() => {
-                return Err(json_error(
-                    409,
+                return Err(api_error(
+                    ErrorCode::Conflict,
                     &format!(
                         "namespace '{name}' is a branch; delete it with \
                          DELETE /v1/namespaces/{name}/branch"
@@ -267,7 +271,11 @@ impl AppState {
                 ))
             }
             Ok(_) => {}
-            Err(e) => return Err(json_error(503, &format!("control store: {e}"))),
+            Err(e) => {
+                return Err(crate::control_store_unavailable(&format!(
+                    "control store: {e}"
+                )))
+            }
         }
         let lock = self.publication_lock(id);
         let _guard = lock.lock().unwrap();
@@ -290,7 +298,9 @@ impl AppState {
                     .lock()
                     .unwrap()
                     .begin_deletion(&request, last)
-                    .map_err(|e| json_error(503, &format!("control store: {e}")))?;
+                    .map_err(|e| {
+                        crate::control_store_unavailable(&format!("control store: {e}"))
+                    })?;
                 (
                     self.indexer
                         .manifest_cloned(id)
@@ -299,10 +309,18 @@ impl AppState {
                     record,
                 )
             }
+            // The same code every other route gives a missing namespace
+            // (ADR-350 §b), so an SDK's `namespace_not_found` branch fires
+            // on delete too.
             Err(KoshaError::NamespaceNotFound(_)) => {
-                return Err(json_error(404, &format!("namespace '{name}' not found")));
+                return Err(crate::namespace_not_found(name));
             }
-            Err(e) => return Err(json_error(500, &format!("delete namespace failed: {e}"))),
+            Err(e) => {
+                return Err(api_error(
+                    ErrorCode::Internal,
+                    &format!("delete namespace failed: {e}"),
+                ))
+            }
         };
         // From here on the namespace is gone from the control store and the
         // record exists. Every remaining step runs even if an earlier one
@@ -376,7 +394,7 @@ impl AppState {
             record.state.as_str()
         );
         if let Some(message) = failure {
-            return Err(json_error(500, &message));
+            return Err(api_error(ErrorCode::Internal, &message));
         }
         Ok(NamespaceDeleted {
             storage_reclaimed: storage_error.is_none(),
@@ -749,7 +767,7 @@ pub(crate) fn check_delete_confirmation(
     if query_param(path, "confirm").as_deref() == Some(name) {
         return Ok(());
     }
-    Err(json_error(
+    Err(api_error_status(
         400,
         &format!(
             "deleting a namespace is permanent: confirm it with \
@@ -758,20 +776,13 @@ pub(crate) fn check_delete_confirmation(
     ))
 }
 
-/// True for the admin routes here that change state, which a query pod
-/// forwards to the ingest pod (`is_write_path`). `POST` ones are covered by
-/// the blanket `POST /v1/admin/` rule already.
-pub(crate) fn is_write_route(request_line: &str) -> bool {
-    request_line.starts_with("DELETE /v1/admin/tenants/")
-}
-
 /// Dispatch the admin routes of this module; `None` for any other request.
 pub(crate) fn route_admin(request_line: &str, body: &[u8], state: &AppState) -> Option<String> {
     let (method, path) = parse_method_and_path(request_line)?;
     let bare = path.split('?').next().unwrap_or(path);
     match (method, bare) {
         ("DELETE", _) if bare.starts_with("/v1/admin/tenants/") => {
-            let tenant = url_decode(&bare["/v1/admin/tenants/".len()..]);
+            let tenant = crate::path_decode(&bare["/v1/admin/tenants/".len()..]);
             Some(handle_delete_tenant(&tenant, body, state, auth::global()))
         }
         ("POST", "/v1/admin/deletions/resume") => {
@@ -779,7 +790,7 @@ pub(crate) fn route_admin(request_line: &str, body: &[u8], state: &AppState) -> 
         }
         ("GET", "/v1/admin/deletions") => Some(handle_list_deletions(path, state)),
         ("GET", _) if bare.starts_with("/v1/admin/deletions/") => {
-            let id = url_decode(&bare["/v1/admin/deletions/".len()..]);
+            let id = crate::path_decode(&bare["/v1/admin/deletions/".len()..]);
             Some(handle_get_deletion(&id, state))
         }
         _ => None,
@@ -801,8 +812,8 @@ pub(crate) fn handle_delete_tenant(
     // Ids starting with `_` or `.` are not tenants of their own (#342), and
     // `_wal` under the storage root is the write-ahead log.
     if !valid_new_tenant_id(tenant) {
-        return json_error(
-            400,
+        return api_error(
+            ErrorCode::InvalidArgument,
             "invalid tenant id (must be non-empty, without '/', '\\' or control characters, \
              and not start with '_' or '.')",
         );
@@ -811,8 +822,7 @@ pub(crate) fn handle_delete_tenant(
         .ok()
         .and_then(|v| v.get("confirm").and_then(|c| c.as_str()).map(String::from));
     if confirmed.as_deref() != Some(tenant) {
-        return json_error(
-            400,
+        return api_error(ErrorCode::InvalidArgument,
             &format!(
                 "deleting a tenant is permanent: confirm it by sending {{\"confirm\": \"{tenant}\"}}"
             ),
@@ -824,8 +834,8 @@ pub(crate) fn handle_delete_tenant(
     match state.controller.lock().unwrap().manifest_version(&bare) {
         Ok(None) => {}
         Ok(Some(_)) => {
-            return json_error(
-                409,
+            return api_error(
+                ErrorCode::Conflict,
                 &format!(
                     "an unscoped namespace named '{tenant}' stores its segments under the \
                      tenant's prefix; migrate it (kosha-server migrate-namespace) or delete it \
@@ -833,7 +843,7 @@ pub(crate) fn handle_delete_tenant(
                 ),
             )
         }
-        Err(e) => return json_error(503, &format!("control store: {e}")),
+        Err(e) => return crate::control_store_unavailable(&format!("control store: {e}")),
     }
     // A retry of an unfinished deletion continues its record.
     let pending = state.controller.lock().unwrap().deletions(&DeletionFilter {
@@ -845,7 +855,7 @@ pub(crate) fn handle_delete_tenant(
         Ok(records) => records
             .into_iter()
             .find(|r| r.scope == DeletionScope::Tenant && r.subject == tenant),
-        Err(e) => return json_error(503, &format!("control store: {e}")),
+        Err(e) => return crate::control_store_unavailable(&format!("control store: {e}")),
     };
     let record = match existing {
         Some(record) => record,
@@ -857,7 +867,7 @@ pub(crate) fn handle_delete_tenant(
                 .begin_deletion(&NewDeletion::tenant(tenant), 0);
             match begun {
                 Ok(record) => record,
-                Err(e) => return json_error(503, &format!("control store: {e}")),
+                Err(e) => return crate::control_store_unavailable(&format!("control store: {e}")),
             }
         }
     };
@@ -899,14 +909,16 @@ pub(crate) fn handle_resume_deletions(body: &[u8], state: &AppState, auth: &auth
     } else {
         match serde_json::from_slice::<serde_json::Value>(body) {
             Ok(v) => v.get("id").and_then(|id| id.as_str()).map(String::from),
-            Err(_) => return json_error(400, "invalid JSON"),
+            Err(_) => return api_error(ErrorCode::InvalidArgument, "invalid JSON"),
         }
     };
     let mut pending = match &only {
         Some(id) => match state.controller.lock().unwrap().deletion(id) {
             Ok(Some(record)) => vec![record],
-            Ok(None) => return json_error(404, &format!("deletion '{id}' not found")),
-            Err(e) => return json_error(503, &format!("control store: {e}")),
+            Ok(None) => {
+                return api_error(ErrorCode::NotFound, &format!("deletion '{id}' not found"))
+            }
+            Err(e) => return crate::control_store_unavailable(&format!("control store: {e}")),
         },
         None => {
             let listed = state
@@ -916,7 +928,7 @@ pub(crate) fn handle_resume_deletions(body: &[u8], state: &AppState, auth: &auth
                 .deletions(&DeletionFilter::pending());
             match listed {
                 Ok(records) => records,
-                Err(e) => return json_error(503, &format!("control store: {e}")),
+                Err(e) => return crate::control_store_unavailable(&format!("control store: {e}")),
             }
         }
     };
@@ -950,14 +962,24 @@ fn handle_list_deletions(path: &str, state: &AppState) -> String {
     if let Some(raw) = query_param(path, "state") {
         match DeletionState::parse(&raw) {
             Some(parsed) => filter.state = Some(parsed),
-            None => return json_error(400, "invalid 'state' (pending or completed)"),
+            None => {
+                return api_error(
+                    ErrorCode::InvalidArgument,
+                    "invalid 'state' (pending or completed)",
+                )
+            }
         }
     }
     filter.tenant_id = query_param(path, "tenant");
     if let Some(raw) = query_param(path, "limit") {
         match raw.parse::<u32>() {
             Ok(limit) if limit > 0 => filter.limit = Some(limit),
-            _ => return json_error(400, "invalid 'limit' (a positive integer)"),
+            _ => {
+                return api_error(
+                    ErrorCode::InvalidArgument,
+                    "invalid 'limit' (a positive integer)",
+                )
+            }
         }
     }
     let listed = state.controller.lock().unwrap().deletions(&filter);
@@ -968,7 +990,7 @@ fn handle_list_deletions(path: &str, state: &AppState) -> String {
                 .map(|record| state.deletion_json(record))
                 .collect::<Vec<_>>(),
         })),
-        Err(e) => json_error(503, &format!("control store: {e}")),
+        Err(e) => api_error_status(503, &format!("control store: {e}")),
     }
 }
 
@@ -977,8 +999,8 @@ fn handle_get_deletion(id: &str, state: &AppState) -> String {
     let found = state.controller.lock().unwrap().deletion(id);
     match found {
         Ok(Some(record)) => json_ok(&state.deletion_json(&record)),
-        Ok(None) => json_error(404, &format!("deletion '{id}' not found")),
-        Err(e) => json_error(503, &format!("control store: {e}")),
+        Ok(None) => api_error_status(404, &format!("deletion '{id}' not found")),
+        Err(e) => api_error_status(503, &format!("control store: {e}")),
     }
 }
 

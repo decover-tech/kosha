@@ -80,8 +80,8 @@ use kosha_core::KoshaError;
 
 use crate::tenant_limits::{LimitsProvider, TenantLimits};
 use crate::{
-    is_search_route, is_write_path, json_error, json_ok, parse_method_and_path, unix_millis,
-    valid_name_component, AppState, SERVICE_TENANT,
+    api_error, api_error_status, is_search_route, is_write_path, json_ok, parse_method_and_path,
+    unix_millis, valid_name_component, AppState, ErrorCode, SERVICE_TENANT,
 };
 
 /// The time source: Unix milliseconds. Tests substitute their own.
@@ -722,23 +722,25 @@ pub(crate) fn operation(request_line: &str) -> Operation {
 
 /// The `402 Payment Required` for a request billing refuses.
 fn payment_required(standing: &TenantStanding, block: &Block) -> String {
-    // Logged once, by `log_request`, from the body's reason/plan fields.
-    let mut body = serde_json::json!({
-        "error": block.message(),
-        "reason": block.reason(),
-        "plan": standing.plan,
-        "state": standing.state,
-    });
+    // Logged once, by `log_request`, from the body's reason/plan aliases.
+    let mut error = crate::ApiError::new(ErrorCode::PaymentRequired, block.message())
+        .detail("reason", block.reason())
+        .detail("plan", standing.plan.clone())
+        .detail("state", serde_json::json!(standing.state))
+        // Pre-#350 top-level fields, kept for existing clients.
+        .alias("reason", block.reason())
+        .alias("plan", standing.plan.clone())
+        .alias("state", serde_json::json!(standing.state));
     if let Block::FreeTier(excess) = block {
-        body["meter"] = serde_json::json!(excess.meter);
-        body["used"] = serde_json::json!(excess.used);
-        body["included"] = serde_json::json!(excess.included);
+        error = error
+            .detail("meter", serde_json::json!(excess.meter))
+            .detail("used", serde_json::json!(excess.used))
+            .detail("included", serde_json::json!(excess.included))
+            .alias("meter", serde_json::json!(excess.meter))
+            .alias("used", serde_json::json!(excess.used))
+            .alias("included", serde_json::json!(excess.included));
     }
-    let body = body.to_string();
-    format!(
-        "HTTP/1.1 402 Payment Required\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{body}",
-        body.len()
-    )
+    error.into_raw()
 }
 
 /// The billing check on an authenticated request: `Some(response)` when
@@ -786,9 +788,12 @@ impl AppState {
 fn unavailable(error: &KoshaError, admin: bool) -> String {
     eprintln!("WARN: billing: {error}");
     match (error, admin) {
-        (KoshaError::InvalidQuery(message), _) => json_error(400, message),
-        (_, true) => json_error(503, &format!("billing unavailable: {error}")),
-        (_, false) => json_error(503, "billing unavailable"),
+        (KoshaError::InvalidQuery(message), _) => api_error(ErrorCode::InvalidArgument, message),
+        (_, true) => api_error(
+            ErrorCode::Unavailable,
+            &format!("billing unavailable: {error}"),
+        ),
+        (_, false) => api_error(ErrorCode::Unavailable, "billing unavailable"),
     }
 }
 
@@ -796,7 +801,12 @@ fn json_body(body: &[u8]) -> Result<serde_json::Value, String> {
     if body.iter().all(u8::is_ascii_whitespace) {
         return Ok(serde_json::json!({}));
     }
-    serde_json::from_slice(body).map_err(|e| json_error(400, &format!("invalid JSON body: {e}")))
+    serde_json::from_slice(body).map_err(|e| {
+        api_error(
+            ErrorCode::InvalidArgument,
+            &format!("invalid JSON body: {e}"),
+        )
+    })
 }
 
 /// `POST`: a tenant starts a self-service checkout.
@@ -834,8 +844,8 @@ pub(crate) fn route(
         return None;
     }
     let Some(billing) = state.billing.as_deref() else {
-        return Some(json_error(
-            404,
+        return Some(api_error(
+            ErrorCode::NotFound,
             "billing is off on this pod (KOSHA_BILLING=on enables it)",
         ));
     };
@@ -854,8 +864,10 @@ pub(crate) fn route(
         },
         ("POST", "/v1/admin/billing/catalog/reload") => match billing.reload_catalog() {
             Ok(true) => json_ok(&serde_json::json!({"reloaded": true})),
-            Ok(false) => json_error(409, "no plans file to reload (KOSHA_BILLING_PLANS_FILE)"),
-            Err(e) => json_error(422, &e),
+            Ok(false) => {
+                api_error_status(409, "no plans file to reload (KOSHA_BILLING_PLANS_FILE)")
+            }
+            Err(e) => api_error_status(422, &e),
         },
         _ => handle_mark_paid(billing, body),
     })
@@ -870,10 +882,16 @@ fn handle_tenant_billing(billing: &Billing, tenant: &str) -> String {
     let now_ms = billing.now_ms();
     let catalog = billing.catalog();
     let Some(plan_name) = billing.plan_name(tenant) else {
-        return json_error(404, "no billing plan applies to this tenant");
+        return api_error(
+            ErrorCode::NotFound,
+            "no billing plan applies to this tenant",
+        );
     };
     let Some(plan) = catalog.plan(&plan_name) else {
-        return json_error(404, "no billing plan applies to this tenant");
+        return api_error(
+            ErrorCode::NotFound,
+            "no billing plan applies to this tenant",
+        );
     };
     let read = || -> Result<_, KoshaError> {
         Ok((
@@ -951,13 +969,19 @@ fn handle_put_account(billing: &Billing, body: &[u8]) -> String {
         Err(response) => return response,
     };
     let (Some(tenant), Some(plan)) = (body["tenant"].as_str(), body["plan"].as_str()) else {
-        return json_error(400, "expected {\"tenant\": ..., \"plan\": ...}");
+        return api_error(
+            ErrorCode::InvalidArgument,
+            "expected {\"tenant\": ..., \"plan\": ...}",
+        );
     };
     if !valid_name_component(tenant) || tenant == SERVICE_TENANT {
-        return json_error(400, "invalid tenant");
+        return api_error(ErrorCode::InvalidArgument, "invalid tenant");
     }
     if billing.catalog().plan(plan).is_none() {
-        return json_error(400, &format!("unknown plan {plan:?}"));
+        return api_error(
+            ErrorCode::InvalidArgument,
+            &format!("unknown plan {plan:?}"),
+        );
     }
     // Recorded as a plan change, so the month it happens in is prorated.
     let put = || {
@@ -1005,8 +1029,13 @@ fn handle_close_period(billing: &Billing, body: &[u8], state: &AppState) -> Stri
         None | Some(serde_json::Value::Null) => BillingPeriod::containing(now_ms).previous(),
         Some(value) => match value.as_str().map(BillingPeriod::parse) {
             Some(Ok(period)) => period,
-            Some(Err(e)) => return json_error(400, &e),
-            None => return json_error(400, "'period' must be a string: YYYY-MM"),
+            Some(Err(e)) => return api_error(ErrorCode::InvalidArgument, &e),
+            None => {
+                return api_error(
+                    ErrorCode::InvalidArgument,
+                    "'period' must be a string: YYYY-MM",
+                )
+            }
         },
     };
     // Deliver what this pod has spooled first. Events still spooled on
@@ -1044,7 +1073,7 @@ fn handle_mark_paid(billing: &Billing, body: &[u8]) -> String {
         Err(response) => return response,
     };
     let Some(id) = body["invoice_id"].as_str() else {
-        return json_error(400, "expected {\"invoice_id\": ...}");
+        return api_error(ErrorCode::InvalidArgument, "expected {\"invoice_id\": ...}");
     };
     let mark = || -> Result<Option<Invoice>, KoshaError> {
         let Some(invoice) = billing.store.invoice(id)? else {
@@ -1058,10 +1087,11 @@ fn handle_mark_paid(billing: &Billing, body: &[u8]) -> String {
         billing.store.invoice(id)
     };
     match mark() {
-        Ok(None) => json_error(404, "no such invoice"),
-        Ok(Some(invoice)) if invoice.status != InvoiceStatus::Paid => {
-            json_error(409, "the invoice is void and cannot be paid")
-        }
+        Ok(None) => api_error(ErrorCode::NotFound, "no such invoice"),
+        Ok(Some(invoice)) if invoice.status != InvoiceStatus::Paid => api_error(
+            ErrorCode::Conflict,
+            "the invoice is void and cannot be paid",
+        ),
         Ok(Some(invoice)) => {
             billing.refresh_logged();
             json_ok(&serde_json::json!({"invoice": invoice_json(&invoice)}))
@@ -1089,7 +1119,7 @@ impl SelfServiceError {
     }
 
     fn response(&self) -> String {
-        json_error(self.status, &self.message)
+        api_error_status(self.status, &self.message)
     }
 }
 
@@ -1293,10 +1323,10 @@ pub(crate) fn webhook_response(
         return None;
     }
     let Some(billing) = state.billing.as_deref() else {
-        return Some(json_error(404, "billing is off on this pod"));
+        return Some(api_error_status(404, "billing is off on this pod"));
     };
     let Some(config) = &billing.webhook else {
-        return Some(json_error(
+        return Some(api_error_status(
             404,
             "Stripe webhooks are off on this pod (KOSHA_STRIPE_WEBHOOK_SECRET enables them)",
         ));
@@ -1326,14 +1356,14 @@ fn handle_stripe_webhook(
     ) {
         stats.webhooks_bad_signature.fetch_add(1, Ordering::Relaxed);
         eprintln!("WARN: billing: Stripe webhook refused: {e}");
-        return json_error(400, &e.to_string());
+        return api_error_status(400, &e.to_string());
     }
     let event = match stripe_webhook::parse_event(body) {
         Ok(event) => event,
         Err(e) => {
             stats.webhooks_invalid.fetch_add(1, Ordering::Relaxed);
             eprintln!("WARN: billing: Stripe webhook refused: {e}");
-            return json_error(400, &e);
+            return api_error_status(400, &e);
         }
     };
     let catalog = billing.catalog();
@@ -1372,7 +1402,7 @@ fn handle_stripe_webhook(
                 "WARN: billing: Stripe event {} not applied, Stripe will deliver it again: {e}",
                 event.id
             );
-            json_error(503, "event not applied; retry later")
+            api_error_status(503, "event not applied; retry later")
         }
     }
 }

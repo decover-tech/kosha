@@ -40,10 +40,10 @@
 //! explicitly, so another front end (the organization console) can call
 //! them with a user's authority and `user:<id>` as the actor.
 
+use crate::api_error::api_error_status;
 use crate::api_key_admin::{
     bad_request, parse_expiry, parse_grant, parse_key_ref, parse_overlap, Rejection,
 };
-use crate::json_error;
 use kosha_control::{KeyAuthority, Scopes};
 
 /// Longest description stored with a key created here.
@@ -87,10 +87,10 @@ pub(crate) fn handle(request_line: &str, body: &[u8]) -> Option<String> {
     }
     let action = match parse(method, sub, body, crate::auth::unix_now()) {
         Ok(action) => action,
-        Err((status, message)) => return Some(json_error(status, &message)),
+        Err((status, message)) => return Some(api_error_status(status, &message)),
     };
     let Some(caller) = crate::authz::current_principal() else {
-        return Some(json_error(
+        return Some(api_error_status(
             403,
             "these routes take a tenant API key with the 'admin' scope; operators manage \
              any tenant's keys through /v1/admin/api-keys",
@@ -99,7 +99,10 @@ pub(crate) fn handle(request_line: &str, body: &[u8]) -> Option<String> {
     // `authz` refuses a key without the scope before the request is
     // routed; this keeps a route that skipped it from granting anything.
     if !caller.scopes.contains(kosha_control::Scope::Admin) {
-        return Some(json_error(403, "this API key lacks the 'admin' scope"));
+        return Some(api_error_status(
+            403,
+            "this API key lacks the 'admin' scope",
+        ));
     }
     Some(execute(
         action,
@@ -310,7 +313,7 @@ fn execute(
     _actor: &str,
     _caller_key: Option<&str>,
 ) -> String {
-    json_error(
+    api_error_status(
         400,
         "API key management requires the postgres feature (compile with --features postgres)",
     )
@@ -326,13 +329,13 @@ fn execute(
     use crate::api_key_admin::record_json;
     use crate::{auth, json_ok};
     let auth::Auth::Keys(keys) = auth::global() else {
-        return json_error(400, "API keys are disabled (KOSHA_AUTH=disabled)");
+        return api_error_status(400, "API keys are disabled (KOSHA_AUTH=disabled)");
     };
     if std::env::var("DATABASE_URL").is_err() {
-        return json_error(400, "Postgres not configured (DATABASE_URL not set)");
+        return api_error_status(400, "Postgres not configured (DATABASE_URL not set)");
     }
     let Some(pg) = keys.pg() else {
-        return json_error(500, "failed to connect to postgres");
+        return api_error_status(500, "failed to connect to postgres");
     };
     let now = auth::unix_now();
     let issued_json = |issued: &kosha_control::IssuedApiKey| {
@@ -382,7 +385,7 @@ fn execute(
     };
     match result {
         Ok(value) => json_ok(&value),
-        Err((status, message)) => json_error(status, &message),
+        Err((status, message)) => api_error_status(status, &message),
     }
 }
 

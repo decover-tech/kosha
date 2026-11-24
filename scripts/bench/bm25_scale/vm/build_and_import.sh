@@ -190,7 +190,7 @@ sudo rm -rf "/data/segments-out/$NS"
 sudo docker stop kosha >/dev/null
 wipe_namespace_cache "$NS" "$TENANT"
 sudo docker start kosha >/dev/null
-for i in $(seq 60); do curl -sf http://127.0.0.1:8080/healthz >/dev/null && break; sleep 3
+for i in $(seq 60); do curl -sf http://127.0.0.1:8080/v1/healthz >/dev/null && break; sleep 3
   [ "$i" -eq 60 ] && { echo "::error::kosha /healthz never responded after restart"; exit 1; }; done
 
 curl -sf -X POST http://127.0.0.1:8080/v1/admin/import-namespace \

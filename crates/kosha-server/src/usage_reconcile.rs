@@ -1250,20 +1250,20 @@ fn query_params(request_line: &str) -> Vec<(String, String)> {
 /// events are delivered first, as for `GET /v1/admin/usage`.
 pub(crate) fn handle_admin_reconcile(request_line: &str, state: &AppState) -> String {
     let Some(meter) = state.usage.as_ref() else {
-        return json_error(
+        return api_error_status(
             404,
             "usage metering is off on this pod (KOSHA_USAGE_METERING=on enables it)",
         );
     };
     let mut options = match Options::from_env(unix_millis()) {
         Ok(options) => options,
-        Err(e) => return json_error(500, &e),
+        Err(e) => return api_error_status(500, &e),
     };
     for (key, value) in query_params(request_line) {
         match options.set(&key, &value) {
             Ok(true) => {}
-            Ok(false) => return json_error(400, &format!("unknown parameter '{key}'")),
-            Err(e) => return json_error(400, &format!("invalid '{key}': {e}")),
+            Ok(false) => return api_error_status(400, &format!("unknown parameter '{key}'")),
+            Err(e) => return api_error_status(400, &format!("invalid '{key}': {e}")),
         }
     }
     let _ = meter.flush();
@@ -1275,7 +1275,7 @@ pub(crate) fn handle_admin_reconcile(request_line: &str, state: &AppState) -> St
         Ok(report) => json_ok(&report),
         Err(e) => {
             eprintln!("WARN: usage reconciliation failed: {e}");
-            json_error(503, &format!("usage reconciliation could not run: {e}"))
+            api_error_status(503, &format!("usage reconciliation could not run: {e}"))
         }
     }
 }

@@ -39,8 +39,8 @@
 //! - `GET /v1/admin/api-keys/plaintext-count` reports how many registry
 //!   rows still hold a plaintext key (the automatic scrub removes it).
 
+use crate::api_error::api_error_status;
 use crate::api_key_admin::{bad_request, parse_expiry, parse_key_ref, parse_overlap, Rejection};
-use crate::json_error;
 use kosha_control::api_keys::{operator_name, valid_operator_name};
 use kosha_control::orgs::Actor;
 use kosha_control::ApiKeyRecord;
@@ -96,12 +96,12 @@ pub(crate) fn handle(method: &str, path: &str, body: &[u8], actor: &Actor) -> Op
     let bare = path.split('?').next().unwrap_or(path);
     let action = match parse(method, bare, body, crate::auth::unix_now())? {
         Ok(action) => action,
-        Err((status, message)) => return Some(json_error(status, &message)),
+        Err((status, message)) => return Some(api_error_status(status, &message)),
     };
     // `route` refuses a request that names a user before it gets here; a
     // user must never manage operator credentials even if that changes.
     if actor.user_id().is_some() {
-        return Some(json_error(403, "this route is operator-only"));
+        return Some(api_error_status(403, "this route is operator-only"));
     }
     Some(execute(action, &actor.label()))
 }
@@ -205,7 +205,7 @@ fn record_json(record: &ApiKeyRecord, now: i64) -> serde_json::Value {
 
 #[cfg(not(feature = "postgres"))]
 fn execute(_action: Action, _actor: &str) -> String {
-    json_error(
+    api_error_status(
         400,
         "admin API requires postgres feature (compile with --features postgres)",
     )
@@ -221,9 +221,9 @@ fn lockout_guard(bootstrap_key_usable: bool, force: bool) -> bool {
 #[cfg(feature = "postgres")]
 fn credential_error(what: &str, e: kosha_control::CredentialError) -> String {
     match e {
-        kosha_control::CredentialError::WouldLockOut(message) => json_error(409, &message),
+        kosha_control::CredentialError::WouldLockOut(message) => api_error_status(409, &message),
         kosha_control::CredentialError::Store(e) => {
-            json_error(500, &format!("failed to {what}: {e}"))
+            api_error_status(500, &format!("failed to {what}: {e}"))
         }
     }
 }
@@ -240,13 +240,13 @@ fn execute(action: Action, actor: &str) -> String {
         }
     };
     let auth::Auth::Keys(store) = auth::global() else {
-        return json_error(400, "API keys are disabled (KOSHA_AUTH=disabled)");
+        return api_error_status(501, "API keys are disabled (KOSHA_AUTH=disabled)");
     };
     if std::env::var("DATABASE_URL").is_err() {
-        return json_error(400, "Postgres not configured (DATABASE_URL not set)");
+        return api_error_status(501, "Postgres not configured (DATABASE_URL not set)");
     }
     let Some(pg) = store.pg() else {
-        return json_error(500, "failed to connect to postgres");
+        return api_error_status(500, "failed to connect to postgres");
     };
     let now = auth::unix_now();
     // Held until the change is in this pod's snapshot, so a key refresh
@@ -269,21 +269,21 @@ fn execute(action: Action, actor: &str) -> String {
                 store.upsert_db_key(issued.record.clone());
                 json_ok(&issued_json(&issued))
             }
-            Ok(None) => json_error(
+            Ok(None) => api_error_status(
                 409,
                 &format!(
                     "operator '{name}' already has a usable credential; rotate it \
                      (POST /v1/admin/operators/rotate) or revoke it first"
                 ),
             ),
-            Err(e) => json_error(500, &format!("failed to create operator credential: {e}")),
+            Err(e) => api_error_status(500, &format!("failed to create operator credential: {e}")),
         },
         Action::List => match pg.list_operator_credentials() {
             Ok(credentials) => {
                 let operators: Vec<_> = credentials.iter().map(|c| record_json(c, now)).collect();
                 json_ok(&serde_json::json!({ "operators": operators }))
             }
-            Err(e) => json_error(500, &format!("failed to list operator credentials: {e}")),
+            Err(e) => api_error_status(500, &format!("failed to list operator credentials: {e}")),
         },
         Action::Revoke { target, force } => {
             let which = match &target {
@@ -292,7 +292,7 @@ fn execute(action: Action, actor: &str) -> String {
             };
             match pg.revoke_operator_credentials(which, actor, guard(force)) {
                 Ok(revoked) if revoked.is_empty() => {
-                    json_error(404, "no active operator credential matches")
+                    api_error_status(404, "no active operator credential matches")
                 }
                 Ok(revoked) => {
                     for (key_hash, _) in &revoked {
@@ -336,7 +336,7 @@ fn execute(action: Action, actor: &str) -> String {
                 });
                 json_ok(&value)
             }
-            Ok(None) => json_error(404, "no active operator credential with that id"),
+            Ok(None) => api_error_status(404, "no active operator credential with that id"),
             Err(e) => credential_error("rotate operator credential", e),
         },
         Action::PlaintextCount => match pg.count_plaintext_api_keys() {
@@ -344,7 +344,7 @@ fn execute(action: Action, actor: &str) -> String {
                 "plaintext_rows": rows,
                 "scrub_due": rows > 0,
             })),
-            Err(e) => json_error(500, &format!("failed to count plaintext keys: {e}")),
+            Err(e) => api_error_status(500, &format!("failed to count plaintext keys: {e}")),
         },
     }
 }

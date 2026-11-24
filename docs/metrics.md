@@ -58,7 +58,8 @@ plus `+Inf`.
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `kosha_tenant_rejections_total` | counter | `reason` | Requests refused with HTTP 429 by a per-tenant limit or quota (#341, `KOSHA_TENANT_LIMITS_FILE`). `reason`: `tenant_qps_exceeded`, `tenant_concurrency_exceeded`, `tenant_write_rate_exceeded`, `namespace_quota_exceeded`, `doc_quota_exceeded`, `vector_dims_exceeded`, `body_too_large` or `tenant_queue_full`, the same code as the response body's `reason`. A search refused by a limit from the file never reaches the scoring queue, so it is not counted in `kosha_search_requests_total`. `tenant_queue_full` is a search the scoring queue shed because its tenant already had `KOSHA_SEARCH_QUEUE_DEPTH_PER_TENANT` searches waiting; it is also counted in `kosha_search_queue_rejections_total` and as `rejected` in `kosha_search_requests_total`. Every other reason stays at zero without a limits file |
+| `kosha_tenant_rejections_total` | counter | `reason` | Requests refused by a per-tenant limit or quota (#341, `KOSHA_TENANT_LIMITS_FILE`): rates with 429, quotas with 403, the tenant body cap with 413 (#350). `reason`: `tenant_qps_exceeded`, `tenant_concurrency_exceeded`, `tenant_write_rate_exceeded`, `namespace_quota_exceeded`, `doc_quota_exceeded`, `vector_dims_exceeded`, `body_too_large` or `tenant_queue_full`, the same code as the response body's `reason`. A search refused by a limit from the file never reaches the scoring queue, so it is not counted in `kosha_search_requests_total`. `tenant_queue_full` is a search the scoring queue shed because its tenant already had `KOSHA_SEARCH_QUEUE_DEPTH_PER_TENANT` searches waiting; it is also counted in `kosha_search_queue_rejections_total` and as `rejected` in `kosha_search_requests_total`. Every other reason stays at zero without a limits file |
+| `kosha_legacy_requests_total` | counter | `route` | Requests served on a deprecated unversioned route (`/index`, `/search`, ...; #350). Watch it reach zero before turning `KOSHA_LEGACY_ROUTES` off; see docs/api/versioning.md |
 
 ### Caches and hydration
 
@@ -180,7 +181,7 @@ Per-namespace dashboards are tracked separately (#214).
 
 ## Tenant labels
 
-`KOSHA_METRICS_TENANT_LABELS=on` adds a `tenant` label to `kosha_tenant_rejections_total`
+`KOSHA_METRICS_TENANT_LABELS=on` adds a `tenant` label to `kosha_legacy_requests_total` and `kosha_tenant_rejections_total`
 and to the `kosha_cache_bytes`, `kosha_cache_hits_total`, `kosha_cache_misses_total` and
 `kosha_cache_evictions_total` families, and to no other metric. The same trade-off as
 namespace labels applies: one series per tenant and reason (or cache), every scraper sees

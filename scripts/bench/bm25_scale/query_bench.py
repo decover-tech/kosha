@@ -103,17 +103,17 @@ def payload_for(namespace: str, query_text: str, topk: int, qidx: int = 0) -> di
 
 
 def read_blocks_decoded(session, host: str, admin_key: str | None) -> int | None:
-    """The server's scoring_blocks_decoded counter from GET /stats (#385);
+    """The server's scoring_blocks_decoded counter from GET /v1/stats (#385);
     None when not asked for, unreachable, or an older server without it."""
     if not admin_key:
         return None
     try:
-        resp = session.get(f"{host}/stats", headers=auth_headers(admin_key), timeout=60)
+        resp = session.get(f"{host}/v1/stats", headers=auth_headers(admin_key), timeout=60)
         resp.raise_for_status()
         value = resp.json().get("scoring_blocks_decoded")
         return int(value) if value is not None else None
     except Exception as e:  # noqa: BLE001 - reporting only, never fails a run
-        print(f"WARN: could not read scoring_blocks_decoded from /stats: {e}")
+        print(f"WARN: could not read scoring_blocks_decoded from /v1/stats: {e}")
         return None
 
 
@@ -204,7 +204,7 @@ def run_query(
         }
     try:
         resp = session.post(
-            f"{host}/search",
+            f"{host}/v1/namespaces/{namespace}/search",
             json=payload_for(namespace, query_text, topk, qidx),
             headers=headers,
             timeout=timeout,
@@ -341,7 +341,7 @@ def main() -> None:
     ap.add_argument(
         "--stats-api-key",
         default=None,
-        help="admin key for GET /stats: if set, read the server's "
+        help="admin key for GET /v1/stats: if set, read the server's "
         "scoring_blocks_decoded counter before and after the phase and report "
         "the delta and blocks decoded per successful request (#385). The "
         "counter is process wide, so it is only per-query when nothing else "

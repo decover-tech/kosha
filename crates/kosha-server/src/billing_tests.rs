@@ -571,7 +571,9 @@ fn free_tier_is_enforced_in_dispatch_and_an_upgrade_lifts_it() {
         None,
         docs("d1"),
     );
-    assert_eq!(status_of(&second), 429, "{second}");
+    // A quota, not a rate: 403 since #350.
+    assert_eq!(status_of(&second), 403, "{second}");
+    assert_eq!(body_of(&second)["code"], "namespace_quota_exceeded");
     assert_eq!(body_of(&second)["reason"], "namespace_quota_exceeded");
 
     // A tenant key cannot change its own plan.

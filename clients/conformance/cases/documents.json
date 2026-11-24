@@ -1,0 +1,86 @@
+[
+  {
+    "id": "documents.upsert_visible",
+    "description": "Upserted documents are searchable on return (strong reads) and exist.",
+    "covers": ["KoshaService_IndexDocuments", "KoshaService_Search", "KoshaService_Exists"],
+    "setup": [
+      {
+        "op": "create_namespace",
+        "args": { "schema": { "fields": { "title": { "type": "text", "stored": true, "indexed": true }, "tag": { "type": "keyword", "stored": true, "indexed": true } } } }
+      }
+    ],
+    "steps": [
+      {
+        "op": "upsert",
+        "args": { "documents": { "generate": { "count": 3, "id": "d{i:04}", "fields": { "title": { "type": "Text", "value": "hello number {i}" }, "tag": { "type": "Keyword", "value": "t{i%2}" } } } } },
+        "expect": { "indexed": 3 }
+      },
+      {
+        "op": "search",
+        "args": { "body": { "query_text": "hello", "sort": [{ "_id": { "order": "asc" } }], "max_results": 10 } },
+        "expect": { "ids": ["d0000", "d0001", "d0002"], "total_hits": 3 }
+      },
+      { "op": "exists", "args": { "ids": ["d0001", "nope"] }, "expect": { "ids": ["d0001"] } }
+    ]
+  },
+  {
+    "id": "documents.merge_partial",
+    "description": "Merge replaces the fields it names and keeps the rest.",
+    "covers": ["KoshaService_ReplaceDocuments", "KoshaService_IndexDocuments", "KoshaService_Search"],
+    "setup": [
+      {
+        "op": "create_namespace",
+        "args": { "schema": { "fields": { "title": { "type": "text", "stored": true, "indexed": true }, "tag": { "type": "keyword", "stored": true, "indexed": true } } } }
+      },
+      {
+        "op": "upsert",
+        "args": { "documents": [{ "id": "a", "fields": [{ "name": "title", "field_type": "Text", "value": "kept title" }, { "name": "tag", "field_type": "Keyword", "value": "old" }] }] }
+      }
+    ],
+    "steps": [
+      {
+        "op": "merge",
+        "args": { "documents": [{ "id": "a", "fields": [{ "name": "tag", "field_type": "Keyword", "value": "new" }] }] },
+        "expect": { "indexed": 1 }
+      },
+      { "op": "search", "args": { "body": { "query_text": "kept", "filter": { "term": { "tag": "new" } } } }, "expect": { "ids": ["a"] } },
+      { "op": "search", "args": { "body": { "query_text": "", "filter": { "term": { "tag": "old" } } } }, "expect": { "count": 0 } }
+    ]
+  },
+  {
+    "id": "documents.flush_stats",
+    "description": "Flush succeeds and stats count the documents.",
+    "covers": ["KoshaService_Flush", "KoshaService_GetStats", "KoshaService_IndexDocuments"],
+    "setup": [
+      { "op": "create_namespace", "args": { "schema": { "fields": { "title": { "type": "text", "stored": true, "indexed": true } } } } },
+      { "op": "upsert", "args": { "documents": { "generate": { "count": 5, "id": "s{i}", "fields": { "title": { "type": "Text", "value": "doc {i}" } } } } } }
+    ],
+    "steps": [
+      { "op": "flush", "expect": { "ok": true } },
+      { "op": "stats", "expect": { "count": 5 } }
+    ]
+  },
+  {
+    "id": "documents.delete_by_query",
+    "description": "Delete by filter removes exactly the matching documents.",
+    "covers": ["KoshaService_DeleteByQuery", "KoshaService_Search"],
+    "setup": [
+      {
+        "op": "create_namespace",
+        "args": { "schema": { "fields": { "title": { "type": "text", "stored": true, "indexed": true }, "tag": { "type": "keyword", "stored": true, "indexed": true } } } }
+      },
+      {
+        "op": "upsert",
+        "args": { "documents": { "generate": { "count": 10, "id": "x{i:02}", "fields": { "title": { "type": "Text", "value": "item {i}" }, "tag": { "type": "Keyword", "value": "t{i%2}" } } } } }
+      }
+    ],
+    "steps": [
+      { "op": "delete_by_query", "args": { "body": { "filter": { "term": { "tag": "t0" } } } }, "expect": { "count": 5 } },
+      {
+        "op": "search",
+        "args": { "body": { "query_text": "", "filter": { "exists": { "field": "tag" } }, "sort": [{ "_id": { "order": "asc" } }], "max_results": 20 } },
+        "expect": { "ids": ["x01", "x03", "x05", "x07", "x09"], "total_hits": 5 }
+      }
+    ]
+  }
+]

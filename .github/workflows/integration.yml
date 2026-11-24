@@ -30,14 +30,7 @@ jobs:
         run: $COMPOSE up --build -d
 
       - name: Wait for both pods
-        run: |
-          for port in 8080 8081; do
-            for i in $(seq 1 90); do
-              curl -fsS "http://localhost:$port/readyz" >/dev/null && break
-              [ "$i" = 90 ] && { echo "pod on :$port not ready"; exit 1; }
-              sleep 2
-            done
-          done
+        run: scripts/integration/wait_ready.sh 8080 8081
 
       - name: Self-test the runner
         run: python3 scripts/integration/run.py --self-test

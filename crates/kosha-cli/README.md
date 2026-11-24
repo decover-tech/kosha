@@ -62,7 +62,7 @@ selected profile → default `http://localhost:8080`.
 | `kosha search -n NS "query" [flags]` | BM25, kNN or hybrid search (see [Search](#search)) |
 | `kosha search -n NS --body @query.json` | Full `SearchQuery` JSON |
 | `kosha exists -n NS DOC_ID…` | `POST /v1/namespaces/{ns}/exists`; exit status 1 if any id is missing |
-| `kosha flush [-n NS]` | Flush buffer (omit ns = flush all via legacy `/flush`) |
+| `kosha flush [-n NS]` | Flush buffer (omit ns = flush every namespace `GET /v1/namespaces` lists) |
 | `kosha delete -n NS --filter '{…}'` | Delete by filter |
 | `kosha compact -n TENANT/NS [--mode tiered\|full] [--wait]` | Start a compaction job (admin) |
 | `kosha compaction-status [--job ID]` | Scheduler overview, or one job (admin) |

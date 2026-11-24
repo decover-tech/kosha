@@ -354,3 +354,39 @@ jobs:
           s3_prefix: ${{ secrets.KOSHA_S3_PREFIX }}
           irsa_role_arn: ${{ secrets.KOSHA_IRSA_ROLE_ARN }}
           aws_region: ${{ secrets.KOSHA_AWS_REGION }}
+
+  # The API contract as release assets (#350, ADR-350 §d "Publishing"): on a
+  # `v*` tag, create the GitHub Release if none exists yet and attach both
+  # checked-in OpenAPI documents, the changelog and a Redoc HTML build.
+  api-spec:
+    name: Attach API spec to the release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Build Redoc HTML
+        run: |
+          mkdir -p build/api-docs
+          npx --yes @redocly/cli@1.25.15 build-docs api/openapi/v1/kosha.openapi.json \
+            --output build/api-docs/kosha-api.html
+          npx --yes @redocly/cli@1.25.15 build-docs api/openapi/v1/kosha-admin.openapi.json \
+            --output build/api-docs/kosha-admin-api.html
+      - name: Create the release if needed and upload the spec
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --verify-tag --title "$TAG" \
+                 --notes "API contract changes: see api/CHANGELOG.md."
+          gh release upload "$TAG" --clobber \
+            api/openapi/v1/kosha.openapi.json \
+            api/openapi/v1/kosha-admin.openapi.json \
+            api/CHANGELOG.md \
+            build/api-docs/kosha-api.html \
+            build/api-docs/kosha-admin-api.html

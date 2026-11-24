@@ -35,7 +35,7 @@ use kosha_control::orgs::{self, Actor, MemoryOrgStore, OrgError, OrgStore, Role}
 use serde_json::{json, Value};
 
 use crate::auth::KeyStore;
-use crate::{json_error, json_ok, url_decode};
+use crate::{api_error, api_error_status, json_ok, url_decode, ErrorCode};
 
 /// The header naming the user a request acts for.
 const ACTOR_HEADER: &str = "x-kosha-actor";
@@ -143,7 +143,7 @@ fn error_response(e: &OrgError) -> String {
         OrgError::Conflict(_) => 409,
         OrgError::Store(_) => 500,
     };
-    json_error(status, &e.to_string())
+    api_error_status(status, &e.to_string())
 }
 
 fn respond<T>(result: Result<T, OrgError>, body: impl FnOnce(T) -> Value) -> String {
@@ -389,7 +389,7 @@ fn dispatch(
                 },
             )
         }
-        _ => json_error(404, "not found"),
+        _ => api_error(ErrorCode::NotFound, "not found"),
     })
 }
 
@@ -715,7 +715,8 @@ mod tests {
             api.status(None, "GET", &format!("{base}/nope"), Value::Null),
             404
         );
-        assert_eq!(api.status(None, "PUT", &base, json!({})), 404);
+        // A known path with the wrong method is a 405 (#350).
+        assert_eq!(api.status(None, "PUT", &base, json!({})), 405);
         // 409: duplicates and the last owner.
         assert_eq!(
             api.status(None, "POST", users, json!({ "email": "ADA@example.com" })),
@@ -796,7 +797,6 @@ mod tests {
             ("POST", "/v1/admin/gc"),
             ("POST", "/v1/admin/compact-namespace"),
             ("GET", "/v1/admin/compaction-status"),
-            ("POST", "/v1/admin/no-such-route"),
         ] {
             let body = json!({ "tenant_id": "someone-elses-tenant" });
             for actor in [ada.as_str(), ""] {

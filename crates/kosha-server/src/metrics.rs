@@ -514,6 +514,7 @@ pub(crate) struct Metrics {
     knn_degraded_segments: Counter,
     tenant_rejections: Family<Labels, Counter>,
     tenant_rejection_reasons: [Counter; 8],
+    legacy_requests: Family<Labels, Counter>,
 }
 
 impl Default for Metrics {
@@ -621,7 +622,7 @@ impl Metrics {
         let tenant_rejections = Family::<Labels, Counter>::default();
         registry.register(
             "kosha_tenant_rejections",
-            "Requests refused with 429 by a per-tenant limit or quota, by reason",
+            "Requests refused by a per-tenant limit or quota, by reason",
             tenant_rejections.clone(),
         );
         // Like the search outcomes: resolved once unless tenant labels are
@@ -635,6 +636,13 @@ impl Metrics {
                     .clone()
             }
         });
+
+        let legacy_requests = Family::<Labels, Counter>::default();
+        registry.register(
+            "kosha_legacy_requests",
+            "Requests served on a deprecated unversioned route, by route (#350)",
+            legacy_requests.clone(),
+        );
 
         let scrape = Arc::new(ScrapeCollector {
             tenant_labels: config.tenant_labels,
@@ -662,7 +670,20 @@ impl Metrics {
             knn_degraded_segments,
             tenant_rejections,
             tenant_rejection_reasons,
+            legacy_requests,
         }
+    }
+
+    /// One request served on a legacy unversioned route (#350), so the
+    /// cutover to `/v1` can be watched until it reads zero. `tenant`
+    /// labels the series only with `KOSHA_METRICS_TENANT_LABELS=on`.
+    pub(crate) fn record_legacy_request(&self, route: &str, tenant: &str) {
+        let series = if self.config.tenant_labels {
+            labels(&[("route", route), ("tenant", tenant)])
+        } else {
+            labels(&[("route", route)])
+        };
+        self.legacy_requests.get_or_create(&series).inc();
     }
 
     /// One request refused by a per-tenant limit (#341). `tenant` labels

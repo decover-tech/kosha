@@ -868,8 +868,10 @@ fn search_usage_error(message: String) -> clap::Error {
 
 /// Explain an admin route's failure in plain words. The server answers 403
 /// when the request's key is neither an operator credential nor its
-/// `KOSHA_ADMIN_API_KEY` (or it has none configured), and 400 when the route needs a backend this server was
-/// not built or configured with (Postgres for API keys, S3 for import).
+/// `KOSHA_ADMIN_API_KEY` (or it has none configured), and 501
+/// `not_implemented` when the route needs a backend this server was not
+/// built or configured with (Postgres for API keys, S3 for import). Servers
+/// before API contract 1.0.0 answered that with a 400.
 fn admin_error(error: RequestError) -> ClientError {
     match error {
         RequestError::Http(http) if http.status == 403 => ClientError(format!(
@@ -879,7 +881,9 @@ fn admin_error(error: RequestError) -> ClientError {
              server with no usable admin credential refuses every admin route.",
             http.method, http.path, http.message
         )),
-        RequestError::Http(http) if http.status == 400 && backend_unsupported(&http.message) => {
+        RequestError::Http(http)
+            if http.status == 501 || (http.status == 400 && backend_unsupported(&http.message)) =>
+        {
             ClientError(format!(
                 "this server does not support {}: {}",
                 http.path, http.message
@@ -890,8 +894,9 @@ fn admin_error(error: RequestError) -> ClientError {
     }
 }
 
-/// The 400 messages an admin route gives when the server lacks the
-/// backend it needs, as opposed to a malformed request.
+/// The 400 messages a pre-#350 server's admin route gives when it lacks
+/// the backend it needs, as opposed to a malformed request. Current servers
+/// send 501 `not_implemented` instead.
 fn backend_unsupported(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     [
@@ -2024,6 +2029,12 @@ mod tests {
         let s3 =
             admin_error(http_error(400, "import-namespace requires the s3 feature")).to_string();
         assert!(s3.starts_with("this server does not support"), "{s3}");
+        let not_implemented =
+            admin_error(http_error(501, "import-namespace requires the s3 feature")).to_string();
+        assert!(
+            not_implemented.starts_with("this server does not support"),
+            "{not_implemented}"
+        );
 
         // An ordinary 400 keeps the server's message as is.
         let other = admin_error(http_error(400, "missing 'tenant_id'")).to_string();

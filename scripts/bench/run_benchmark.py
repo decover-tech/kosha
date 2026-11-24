@@ -11,8 +11,8 @@ set against both, reporting:
   - Indexing time for the full corpus into each engine.
 
 Modes
-  lexical  — BM25 keyword search  (GET  /search for Kosha)
-  semantic — kNN vector search    (POST /search for Kosha, knn field)
+  lexical  — BM25 keyword search  (POST /v1/namespaces/{ns}/search for Kosha)
+  semantic — kNN vector search    (POST /v1/namespaces/{ns}/search, knn)
   both     — runs both modes on the same corpus
 
 Semantic mode expects a ``vector`` field (array of floats) on each
@@ -195,9 +195,9 @@ def search_kosha_lexical(
     host: str, namespace: str, query: str, size: int
 ) -> tuple[list[tuple[str, float]], float]:
     start = time.monotonic()
-    resp = requests.get(
-        f"{host}/search",
-        params={"ns": namespace, "q": query, "max_results": size},
+    resp = requests.post(
+        f"{host}/v1/namespaces/{namespace}/search",
+        json={"query_text": query, "max_results": size},
     )
     elapsed_ms = (time.monotonic() - start) * 1000
     resp.raise_for_status()
@@ -243,13 +243,12 @@ def search_kosha_semantic(
     host: str, namespace: str, vector: list[float], size: int
 ) -> tuple[list[tuple[str, float]], float]:
     body = {
-        "namespace": namespace,
         "query_text": "",
         "max_results": size,
-        "knn": {"vector": {"vector": vector, "k": size}},
+        "knn": {"field": "vector", "vector": vector, "k": size},
     }
     start = time.monotonic()
-    resp = requests.post(f"{host}/search", json=body)
+    resp = requests.post(f"{host}/v1/namespaces/{namespace}/search", json=body)
     elapsed_ms = (time.monotonic() - start) * 1000
     resp.raise_for_status()
     results = resp.json()["results"]
@@ -287,13 +286,13 @@ def setup_kosha(host: str, namespace: str, docs: list[dict]) -> float:
         documents.append({"id": doc["id"], "fields": fields})
 
     resp = requests.post(
-        f"{host}/index",
-        json={"namespace": namespace, "documents": documents},
+        f"{host}/v1/namespaces/{namespace}/documents",
+        json={"documents": documents},
         timeout=120,
     )
     resp.raise_for_status()
 
-    requests.post(f"{host}/flush", json={"namespace": namespace}).raise_for_status()
+    requests.post(f"{host}/v1/namespaces/{namespace}/flush", json={}).raise_for_status()
     return time.monotonic() - start
 
 

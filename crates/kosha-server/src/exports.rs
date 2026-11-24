@@ -269,15 +269,6 @@ fn route_of(request_line: &str) -> Option<ExportRoute> {
     parse_route(method, path)
 }
 
-/// The export routes that a query pod forwards to the ingest pod
-/// (`is_write_path`): starting and deleting one.
-pub(crate) fn is_write_route(request_line: &str) -> bool {
-    matches!(
-        route_of(request_line),
-        Some(ExportRoute::Create(_) | ExportRoute::Delete(..))
-    )
-}
-
 /// Whether this is the streaming download, which `dispatch` answers with a
 /// file body instead of a `String`.
 pub(crate) fn is_download_route(request_line: &str) -> bool {
@@ -296,7 +287,7 @@ pub(crate) fn route(
     // Off, only starting an export is refused: what exists stays readable
     // and, above all, deletable.
     if !state.exports.settings().enabled && matches!(found, ExportRoute::Create(_)) {
-        return Some(json_error(
+        return Some(api_error_status(
             404,
             "exports are not enabled on this deployment (KOSHA_EXPORTS)",
         ));
@@ -312,7 +303,11 @@ pub(crate) fn route(
         ExportRoute::Delete(ns, id) => handle_delete(&ns, &id, tenant, state),
         // `GET /v1/namespaces/{ns}/exports/{id}/download` streams; see
         // `download_response`.
-        ExportRoute::Download(..) => json_error(404, "not found"),
+        // An in-process caller of the router cannot take a file body.
+        ExportRoute::Download(..) => api_error(
+            ErrorCode::NotImplemented,
+            "export downloads are streamed by the HTTP dispatcher",
+        ),
     })
 }
 
@@ -335,8 +330,8 @@ fn owned_export(
     let found = state.controller.lock().unwrap().export(id);
     match found {
         Ok(Some(record)) if record.tenant_id == tenant && record.namespace == ns.0 => Ok(record),
-        Ok(_) => Err(json_error(404, &format!("export '{id}' not found"))),
-        Err(e) => Err(json_error(503, &format!("control store: {e}"))),
+        Ok(_) => Err(api_error_status(404, &format!("export '{id}' not found"))),
+        Err(e) => Err(api_error_status(503, &format!("control store: {e}"))),
     }
 }
 
@@ -423,31 +418,31 @@ impl AppState {
 fn handle_create(name: &str, tenant: &str, body: &[u8], state: &AppState) -> String {
     let ns = NamespaceId(tenant_namespace(tenant, name));
     if state.follows_only() || state.role == role::Role::Indexer {
-        return json_error(503, "exports run on the ingest (writer) pod");
+        return api_error_status(503, "exports run on the ingest (writer) pod");
     }
     let request: serde_json::Value = if body.iter().all(u8::is_ascii_whitespace) {
         serde_json::json!({})
     } else {
         match serde_json::from_slice(body) {
             Ok(value @ serde_json::Value::Object(_)) => value,
-            _ => return json_error(400, "invalid JSON (expected an object)"),
+            _ => return api_error_status(400, "invalid JSON (expected an object)"),
         }
     };
     let include_vectors = match request.get("include_vectors") {
         None | Some(serde_json::Value::Null) => true,
         Some(serde_json::Value::Bool(b)) => *b,
-        Some(_) => return json_error(400, "'include_vectors' must be a boolean"),
+        Some(_) => return api_error_status(400, "'include_vectors' must be a boolean"),
     };
     let settings = state.exports.settings();
     let upload_url = match request.get("upload_url") {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(raw)) => {
             if let Err(e) = validate_upload_url(raw, settings.allow_insecure_upload) {
-                return json_error(400, &e);
+                return api_error_status(400, &e);
             }
             Some(raw.clone())
         }
-        Some(_) => return json_error(400, "'upload_url' must be a string"),
+        Some(_) => return api_error_status(400, "'upload_url' must be a string"),
     };
     let active = state.controller.lock().unwrap().exports(&ExportFilter {
         tenant_id: Some(tenant.to_string()),
@@ -455,7 +450,7 @@ fn handle_create(name: &str, tenant: &str, body: &[u8], state: &AppState) -> Str
     });
     match active {
         Ok(active) if active.len() >= settings.max_active => {
-            return json_error(
+            return api_error_status(
                 429,
                 &format!(
                     "tenant has {} export(s) pending or running (KOSHA_EXPORT_MAX_ACTIVE={}); \
@@ -466,15 +461,15 @@ fn handle_create(name: &str, tenant: &str, body: &[u8], state: &AppState) -> Str
             )
         }
         Ok(_) => {}
-        Err(e) => return json_error(503, &format!("control store: {e}")),
+        Err(e) => return api_error_status(503, &format!("control store: {e}")),
     }
     // Everything acknowledged so far is in the export.
     let stored = state.controller.lock().unwrap().try_manifest_cloned(&ns);
     match stored {
         Ok(Some(_)) => {}
         Ok(None) if state.indexer.manifest_version(&ns).is_some() => {}
-        Ok(None) => return json_error(404, &format!("namespace '{name}' not found")),
-        Err(e) => return json_error(503, &format!("control store: {e}")),
+        Ok(None) => return api_error_status(404, &format!("namespace '{name}' not found")),
+        Err(e) => return api_error_status(503, &format!("control store: {e}")),
     }
     if let Err(response) = flush_and_publish_namespace(state, &ns) {
         return response;
@@ -488,8 +483,8 @@ fn handle_create(name: &str, tenant: &str, body: &[u8], state: &AppState) -> Str
         let root = state.controller.lock().unwrap().try_manifest_cloned(&ns);
         let root = match root {
             Ok(Some(root)) => root,
-            Ok(None) => return json_error(404, &format!("namespace '{name}' not found")),
-            Err(e) => return json_error(503, &format!("control store: {e}")),
+            Ok(None) => return api_error_status(404, &format!("namespace '{name}' not found")),
+            Err(e) => return api_error_status(503, &format!("control store: {e}")),
         };
         if let Some(shards) = root.shards.filter(|&n| n > 1) {
             for shard in kosha_core::sharding::shard_namespaces(&ns, shards) {
@@ -497,7 +492,7 @@ fn handle_create(name: &str, tenant: &str, body: &[u8], state: &AppState) -> Str
                 match manifest {
                     Ok(Some(manifest)) => pins.push((shard, manifest)),
                     Ok(None) => {}
-                    Err(e) => return json_error(503, &format!("control store: {e}")),
+                    Err(e) => return api_error_status(503, &format!("control store: {e}")),
                 }
             }
         }
@@ -512,7 +507,7 @@ fn handle_create(name: &str, tenant: &str, body: &[u8], state: &AppState) -> Str
         });
         match created {
             Ok(record) => record,
-            Err(e) => return json_error(503, &format!("control store: {e}")),
+            Err(e) => return api_error_status(503, &format!("control store: {e}")),
         }
     };
     state.exports.started.fetch_add(1, Ordering::Relaxed);
@@ -534,7 +529,7 @@ fn handle_list(name: &str, request_line: &str, tenant: &str, state: &AppState) -
         None => MAX_PAGE,
         Some(raw) => match raw.parse::<u32>() {
             Ok(n) if n > 0 => n.min(MAX_PAGE),
-            _ => return json_error(400, "invalid 'limit' (a positive integer)"),
+            _ => return api_error_status(400, "invalid 'limit' (a positive integer)"),
         },
     };
     let before = match namespace_deletion_query_param(path, "before") {
@@ -566,7 +561,7 @@ fn handle_list(name: &str, request_line: &str, tenant: &str, state: &AppState) -
                 "next": next,
             }))
         }
-        Err(e) => json_error(503, &format!("control store: {e}")),
+        Err(e) => api_error_status(503, &format!("control store: {e}")),
     }
 }
 
@@ -585,7 +580,7 @@ fn handle_delete(name: &str, id: &str, tenant: &str, state: &AppState) -> String
         Err(response) => return response,
     };
     if let Err(e) = state.remove_export_objects(&record) {
-        return json_error(503, &format!("deleting the export's objects failed: {e}"));
+        return api_error_status(503, &format!("deleting the export's objects failed: {e}"));
     }
     let update = ExportUpdate {
         state: Some(ExportState::Expired),
@@ -600,8 +595,8 @@ fn handle_delete(name: &str, id: &str, tenant: &str, state: &AppState) -> String
             state.exports.deleted.fetch_add(1, Ordering::Relaxed);
             json_ok(&state.export_json(&record, name))
         }
-        Ok(None) => json_error(404, &format!("export '{id}' not found")),
-        Err(e) => json_error(503, &format!("control store: {e}")),
+        Ok(None) => api_error_status(404, &format!("export '{id}' not found")),
+        Err(e) => api_error_status(503, &format!("control store: {e}")),
     }
 }
 
@@ -612,7 +607,8 @@ pub(crate) fn download_response(
     tenant: &str,
     state: &AppState,
 ) -> http::Response {
-    let error = |status: u16, message: &str| http::Response::from_raw(json_error(status, message));
+    let error =
+        |status: u16, message: &str| http::Response::from_raw(api_error_status(status, message));
     let Some(ExportRoute::Download(name, id)) = route_of(request_line) else {
         return error(404, "not found");
     };

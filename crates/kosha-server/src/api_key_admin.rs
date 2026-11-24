@@ -33,7 +33,9 @@
 //! A tenant's own keys can also be managed by the tenant, with a key that
 //! holds the `admin` scope: `tenant_key_admin.rs` (`/v1/api-keys`).
 
-use crate::{json_error, valid_namespace_component, valid_new_tenant_id};
+use crate::{
+    api_error, api_error_status, valid_namespace_component, valid_new_key_tenant_id, ErrorCode,
+};
 use kosha_control::orgs::Actor;
 use kosha_control::{hash_api_key, ApiKeyRecord, NewApiKey, Scopes};
 
@@ -70,11 +72,11 @@ pub(crate) fn handle(method: &str, path: &str, body: &[u8], operator: &Actor) ->
     }
     let action = match parse(method, sub, query, body, crate::auth::unix_now()) {
         Ok(action) => action,
-        Err((status, message)) => return Some(json_error(status, &message)),
+        Err((status, message)) => return Some(api_error_status(status, &message)),
     };
     // `route` refuses a request that names a user before it gets here.
     if operator.user_id().is_some() {
-        return Some(json_error(403, "this route is operator-only"));
+        return Some(api_error_status(403, "this route is operator-only"));
     }
     Some(execute(action, &operator.label()))
 }
@@ -119,9 +121,9 @@ fn parse_create(req: &serde_json::Value, now: i64) -> Result<NewApiKey, Rejectio
         .get("tenant_id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| bad_request("missing 'tenant_id'"))?;
-    if !valid_new_tenant_id(tenant_id) {
+    if !valid_new_key_tenant_id(tenant_id) {
         return Err(bad_request(
-            "invalid 'tenant_id' (must be non-empty, without '/', '\\' or control \
+            "invalid 'tenant_id' (must be 1 to 80 bytes, without '/', '\\' or control \
              characters, and not start with '_' or '.')",
         ));
     }
@@ -258,8 +260,8 @@ pub(crate) fn record_json(record: &ApiKeyRecord, now: i64) -> serde_json::Value 
 
 #[cfg(not(feature = "postgres"))]
 fn execute(_action: Action, _actor: &str) -> String {
-    json_error(
-        400,
+    api_error(
+        ErrorCode::NotImplemented,
         "admin API requires postgres feature (compile with --features postgres)",
     )
 }
@@ -268,13 +270,19 @@ fn execute(_action: Action, _actor: &str) -> String {
 fn execute(action: Action, actor: &str) -> String {
     use crate::{auth, json_ok};
     let auth::Auth::Keys(store) = auth::global() else {
-        return json_error(400, "API keys are disabled (KOSHA_AUTH=disabled)");
+        return api_error(
+            ErrorCode::NotImplemented,
+            "API keys are disabled (KOSHA_AUTH=disabled)",
+        );
     };
     if std::env::var("DATABASE_URL").is_err() {
-        return json_error(400, "Postgres not configured (DATABASE_URL not set)");
+        return api_error(
+            ErrorCode::NotImplemented,
+            "Postgres not configured (DATABASE_URL not set)",
+        );
     }
     let Some(pg) = store.pg() else {
-        return json_error(500, "failed to connect to postgres");
+        return api_error(ErrorCode::Internal, "failed to connect to postgres");
     };
     let now = auth::unix_now();
     // Held until the change is in this pod's snapshot, so a key refresh
@@ -293,22 +301,22 @@ fn execute(action: Action, actor: &str) -> String {
                 store.upsert_db_key(issued.record.clone());
                 json_ok(&issued_json(&issued))
             }
-            Err(e) => json_error(500, &format!("failed to create key: {e}")),
+            Err(e) => api_error(ErrorCode::Internal, &format!("failed to create key: {e}")),
         },
         Action::List { tenant_id } => match pg.list_api_keys(tenant_id.as_deref()) {
             Ok(keys) => {
                 let keys: Vec<_> = keys.iter().map(|k| record_json(k, now)).collect();
                 json_ok(&serde_json::json!({ "api_keys": keys }))
             }
-            Err(e) => json_error(500, &format!("failed to list keys: {e}")),
+            Err(e) => api_error(ErrorCode::Internal, &format!("failed to list keys: {e}")),
         },
         Action::Revoke { key_hash } => match pg.revoke_api_key_as(&key_hash, None, actor) {
             Ok(true) => {
                 store.remove_db_key(&key_hash);
                 json_ok(&serde_json::json!({ "revoked": true, "key_id": key_hash }))
             }
-            Ok(false) => json_error(404, "no active API key with that id"),
-            Err(e) => json_error(500, &format!("failed to revoke key: {e}")),
+            Ok(false) => api_error(ErrorCode::NotFound, "no active API key with that id"),
+            Err(e) => api_error(ErrorCode::Internal, &format!("failed to revoke key: {e}")),
         },
         Action::Rotate {
             key_hash,
@@ -330,8 +338,8 @@ fn execute(action: Action, actor: &str) -> String {
                 });
                 json_ok(&value)
             }
-            Ok(None) => json_error(404, "no active API key with that id"),
-            Err(e) => json_error(500, &format!("failed to rotate key: {e}")),
+            Ok(None) => api_error(ErrorCode::NotFound, "no active API key with that id"),
+            Err(e) => api_error(ErrorCode::Internal, &format!("failed to rotate key: {e}")),
         },
         Action::ScrubPlaintext => match pg.scrub_plaintext_api_keys() {
             Ok(scrubbed) => {
@@ -350,7 +358,7 @@ fn execute(action: Action, actor: &str) -> String {
                 }
                 json_ok(&serde_json::json!({ "scrubbed": scrubbed }))
             }
-            Err(e) => json_error(500, &format!("failed to scrub plaintext keys: {e}")),
+            Err(e) => api_error_status(500, &format!("failed to scrub plaintext keys: {e}")),
         },
     }
 }

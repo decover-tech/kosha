@@ -4448,8 +4448,8 @@ pub enum KoshaError {
     /// The server is shedding load: admitting this request would push live
     /// segment memory past the configured watermark and it did not free up
     /// within the admission timeout (see `kosha_query::MemoryLedger`).
-    /// Transient by construction — callers should retry with backoff, which
-    /// the Python `kosha_client` already does. Maps to HTTP 429.
+    /// Transient by construction: maps to HTTP 429 `overloaded` with
+    /// `retryable: true` and `Retry-After`, and clients should retry then.
     Overloaded(String),
     /// The control store (Postgres) could not be reached or returned an
     /// error. Says nothing about whether a namespace or manifest exists —

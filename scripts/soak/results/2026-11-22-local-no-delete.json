@@ -1,0 +1,809 @@
+{
+ "config": {
+  "self_test": false,
+  "smoke": true,
+  "write_url": "http://localhost:8080",
+  "query_url": null,
+  "tenant_keys": "sk-kosha-dev=default,sk-tenant-a=tenant-a,sk-tenant-b=tenant-b",
+  "metrics_key": null,
+  "prefix": "soak",
+  "run_id": "local-20261122-nodelete",
+  "seed": 357,
+  "duration": 180.0,
+  "namespaces": 20,
+  "large_docs": 20000,
+  "zipf_docs": 10000,
+  "zipf_s": 1.1,
+  "no_preload": false,
+  "preload_batch": 500,
+  "preload_threads": 8,
+  "docs_per_s": 300,
+  "writers": 4,
+  "write_batch": 50,
+  "update_frac": 0.3,
+  "delete_frac": 0.0,
+  "write_retry_s": 300,
+  "qps_start": 4,
+  "qps_end": 12,
+  "mix": [
+   [
+    "bm25",
+    0.4
+   ],
+   [
+    "knn",
+    0.3
+   ],
+   [
+    "filtered",
+    0.3
+   ]
+  ],
+  "query_concurrency": 64,
+  "dim": 8,
+  "request_timeout": 60,
+  "visible_every": 2.0,
+  "visible_timeout": 120,
+  "flush_every": 0.0,
+  "compact_every": 0.0,
+  "sample_every": 10,
+  "window": 60,
+  "replace_cmd": null,
+  "replace_every": 3600,
+  "final_timeout": 300,
+  "progress_every": 30,
+  "max_p99_ms": 1000,
+  "max_visible_p99_s": 30,
+  "max_5xx_rate": 0.001,
+  "max_conn_error_rate": 0.01,
+  "max_segments": 0,
+  "flood_tenant_key": null,
+  "flood_qps": 0,
+  "flood_multiplier": 10,
+  "flood_concurrency": 64,
+  "victim_p99_ms": -1,
+  "victim_max_429_rate": 0,
+  "victim_max_error_rate": 0,
+  "out": "scripts/soak/results/2026-11-22-local-no-delete.json"
+ },
+ "duration_s": 185.5,
+ "namespaces": 21,
+ "latency": {
+  "bm25": {
+   "count": 561,
+   "p50_ms": 6.43,
+   "p99_ms": 11.58,
+   "max_ms": 33.4
+  },
+  "filtered": {
+   "count": 439,
+   "p50_ms": 6.25,
+   "p99_ms": 10.26,
+   "max_ms": 12.02
+  },
+  "knn": {
+   "count": 440,
+   "p50_ms": 6.17,
+   "p99_ms": 10.46,
+   "max_ms": 28.24
+  }
+ },
+ "latency_windows": [
+  {
+   "window": 0,
+   "start_s": 0,
+   "class": "bm25",
+   "count": 132,
+   "p50_ms": 5.85,
+   "p99_ms": 17.02,
+   "max_ms": 33.4
+  },
+  {
+   "window": 0,
+   "start_s": 0,
+   "class": "filtered",
+   "count": 82,
+   "p50_ms": 5.94,
+   "p99_ms": 11.08,
+   "max_ms": 11.08
+  },
+  {
+   "window": 0,
+   "start_s": 0,
+   "class": "knn",
+   "count": 105,
+   "p50_ms": 5.92,
+   "p99_ms": 12.8,
+   "max_ms": 17.46
+  },
+  {
+   "window": 1,
+   "start_s": 60,
+   "class": "bm25",
+   "count": 191,
+   "p50_ms": 6.56,
+   "p99_ms": 12.77,
+   "max_ms": 17.16
+  },
+  {
+   "window": 1,
+   "start_s": 60,
+   "class": "filtered",
+   "count": 147,
+   "p50_ms": 6.17,
+   "p99_ms": 10.11,
+   "max_ms": 11.06
+  },
+  {
+   "window": 1,
+   "start_s": 60,
+   "class": "knn",
+   "count": 142,
+   "p50_ms": 6.27,
+   "p99_ms": 10.31,
+   "max_ms": 11.76
+  },
+  {
+   "window": 2,
+   "start_s": 120,
+   "class": "bm25",
+   "count": 238,
+   "p50_ms": 6.62,
+   "p99_ms": 11.24,
+   "max_ms": 11.56
+  },
+  {
+   "window": 2,
+   "start_s": 120,
+   "class": "filtered",
+   "count": 209,
+   "p50_ms": 6.42,
+   "p99_ms": 10.13,
+   "max_ms": 12.02
+  },
+  {
+   "window": 2,
+   "start_s": 120,
+   "class": "knn",
+   "count": 193,
+   "p50_ms": 6.2,
+   "p99_ms": 10.46,
+   "max_ms": 28.24
+  },
+  {
+   "window": 3,
+   "start_s": 180,
+   "class": "filtered",
+   "count": 1,
+   "p50_ms": 9.41,
+   "p99_ms": 9.41,
+   "max_ms": 9.41
+  }
+ ],
+ "visibility": {
+  "samples": 70,
+  "timeouts": 0,
+  "p50_s": 0.46,
+  "p99_s": 4.642,
+  "max_s": 4.642
+ },
+ "requests": {
+  "total": 2013,
+  "5xx": 0,
+  "conn": 0,
+  "429": 0,
+  "4xx": 0
+ },
+ "requests_by_kind": {
+  "preload": {
+   "ok": 71
+  },
+  "flush": {
+   "ok": 42
+  },
+  "insert": {
+   "ok": 337
+  },
+  "query:filtered": {
+   "ok": 439
+  },
+  "query:bm25": {
+   "ok": 561
+  },
+  "upsert": {
+   "ok": 123
+  },
+  "query:knn": {
+   "ok": 440
+  }
+ },
+ "dropped_queries": 0,
+ "writes": {
+  "inserted": 16850,
+  "updated": 6143,
+  "deleted": 0,
+  "retries": 0,
+  "delete_count_mismatches": 0,
+  "uncertain_namespaces": []
+ },
+ "timeline": [
+  {
+   "t": 0.0,
+   "pods": {
+    "http://localhost:8080": {
+     "kosha_search_queue_depth": 0.0,
+     "kosha_cache_bytes{cache=\"segment\"}": 0.0,
+     "kosha_cache_bytes{cache=\"nvme\"}": 0.0,
+     "kosha_index_documents_total": 29999.0,
+     "kosha_flush_total": 21.0,
+     "kosha_writer_fenced_total": 0.0
+    }
+   },
+   "large": {
+    "documents": 20000,
+    "segments": 20,
+    "manifest_version": 20
+   },
+   "segments_total": 43,
+   "namespaces_listed": 21,
+   "requests": {
+    "total": 92,
+    "5xx": 0,
+    "conn": 0,
+    "429": 0,
+    "4xx": 0
+   }
+  },
+  {
+   "t": 10.0,
+   "pods": {
+    "http://localhost:8080": {
+     "kosha_search_queue_depth": 0.0,
+     "kosha_cache_bytes{cache=\"segment\"}": 11918998.0,
+     "kosha_cache_bytes{cache=\"nvme\"}": 0.0,
+     "kosha_index_documents_total": 32599.0,
+     "kosha_flush_total": 21.0,
+     "kosha_writer_fenced_total": 0.0
+    }
+   },
+   "large": {
+    "documents": 21999,
+    "segments": 43,
+    "manifest_version": 43
+   },
+   "segments_total": 76,
+   "namespaces_listed": 21,
+   "requests": {
+    "total": 186,
+    "5xx": 0,
+    "conn": 0,
+    "429": 0,
+    "4xx": 0
+   }
+  },
+  {
+   "t": 20.0,
+   "pods": {
+    "http://localhost:8080": {
+     "kosha_search_queue_depth": 0.0,
+     "kosha_cache_bytes{cache=\"segment\"}": 12812636.0,
+     "kosha_cache_bytes{cache=\"nvme\"}": 0.0,
+     "kosha_index_documents_total": 34699.0,
+     "kosha_flush_total": 21.0,
+     "kosha_writer_fenced_total": 0.0
+    }
+   },
+   "large": {
+    "documents": 23546,
+    "segments": 53,
+    "manifest_version": 53
+   },
+   "segments_total": 95,
+   "namespaces_listed": 21,
+   "requests": {
+    "total": 274,
+    "5xx": 0,
+    "conn": 0,
+    "429": 0,
+    "4xx": 0
+   }
+  },
+  {
+   "t": 30.0,
+   "pods": {
+    "http://localhost:8080": {
+     "kosha_search_queue_depth": 0.0,
+     "kosha_cache_bytes{cache=\"segment\"}": 14536130.0,
+     "kosha_cache_bytes{cache=\"nvme\"}": 0.0,
+     "kosha_index_documents_total": 36349.0,
+     "kosha_flush_total": 21.0,
+     "kosha_writer_fenced_total": 0.0
+    }
+   },
+   "large": {
+    "documents": 24686,
+    "segments": 34,
+    "manifest_version": 66
+   },
+   "segments_total": 82,
+   "namespaces_listed": 21,
+   "requests": {
+    "total": 359,
+    "5xx": 0,
+    "conn": 0,
+    "429": 0,
+    "4xx": 0
+   }
+  },
+  {
+   "t": 40.0,
+   "pods": {
+    "http://localhost:8080": {
+     "kosha_search_queue_depth": 0.0,
+     "kosha_cache_bytes{cache=\"segment\"}": 15797308.0,
+     "kosha_cache_bytes{cache=\"nvme\"}": 0.0,
+     "kosha_index_documents_total": 38349.0,
+     "kosha_flush_total": 21.0,
+     "kosha_writer_fenced_total": 0.0
+    }
+   },
+   "large": {
+    "documents": 25934,
+    "segments": 47,
+    "manifest_version": 79
+   },
+   "segments_total": 109,
+   "namespaces_listed": 21,
+   "requests": {
+    "total": 454,
+    "5xx": 0,
+    "conn": 0,
+    "429": 0,
+    "4xx": 0
+   }
+  },
+  {
+   "t": 50.1,
+   "pods": {
+    "http://localhost:8080": {
+     "kosha_search_queue_depth": 0.0,
+     "kosha_cache_bytes{cache=\"segment\"}": 17081027.0,
+     "kosha_cache_bytes{cache=\"nvme\"}": 0.0,
+     "kosha_index_documents_total": 40042.0,
+     "kosha_flush_total": 21.0,
+     "kosha_writer_fenced_total": 0.0
+    }
+   },
+   "large": {
+    "documents": 26984,
+    "segments": 53,
+    "manifest_version": 85
+   },
+   "segments_total": 127,
+   "namespaces_listed": 21,
+   "requests": {
+    "total": 548,
+    "5xx": 0,
+    "conn": 0,
+    "429": 0,
+    "4xx": 0
+   }
+  },
+  {
+   "t": 60.1,
+   "pods": {
+    "http://localhost:8080": {
+     "kosha_search_queue_depth": 0.0,
+     "kosha_cache_bytes{cache=\"segment\"}": 18583287.0,
+     "kosha_cache_bytes{cache=\"nvme\"}": 0.0,
+     "kosha_index_documents_total": 41442.0,
+     "kosha_flush_total": 21.0,
+     "kosha_writer_fenced_total": 0.0
+    }
+   },
+   "large": {
+    "documents": 28033,
+    "segments": 64,
+    "manifest_version": 96
+   },
+   "segments_total": 129,
+   "namespaces_listed": 21,
+   "requests": {
+    "total": 641,
+    "5xx": 0,
+    "conn": 0,
+    "429": 0,
+    "4xx": 0
+   }
+  },
+  {
+   "t": 70.1,
+   "pods": {
+    "http://localhost:8080": {
+     "kosha_search_queue_depth": 0.0,
+     "kosha_cache_bytes{cache=\"segment\"}": 20090680.0,
+     "kosha_cache_bytes{cache=\"nvme\"}": 0.0,
+     "kosha_index_documents_total": 42892.0,
+     "kosha_flush_total": 21.0,
+     "kosha_writer_fenced_total": 0.0
+    }
+   },
+   "large": {
+    "documents": 28982,
+    "segments": 71,
+    "manifest_version": 103
+   },
+   "segments_total": 148,
+   "namespaces_listed": 21,
+   "requests": {
+    "total": 739,
+    "5xx": 0,
+    "conn": 0,
+    "429": 0,
+    "4xx": 0
+   }
+  },
+  {
+   "t": 80.1,
+   "pods": {
+    "http://localhost:8080": {
+     "kosha_search_queue_depth": 0.0,
+     "kosha_cache_bytes{cache=\"segment\"}": 20802831.0,
+     "kosha_cache_bytes{cache=\"nvme\"}": 0.0,
+     "kosha_index_documents_total": 43992.0,
+     "kosha_flush_total": 21.0,
+     "kosha_writer_fenced_total": 0.0
+    }
+   },
+   "large": {
+    "documents": 29532,
+    "segments": 74,
+    "manifest_version": 106
+   },
+   "segments_total": 155,
+   "namespaces_listed": 21,
+   "requests": {
+    "total": 834,
+    "5xx": 0,
+    "conn": 0,
+    "429": 0,
+    "4xx": 0
+   }
+  },
+  {
+   "t": 90.1,
+   "pods": {
+    "http://localhost:8080": {
+     "kosha_search_queue_depth": 0.0,
+     "kosha_cache_bytes{cache=\"segment\"}": 21344012.0,
+     "kosha_cache_bytes{cache=\"nvme\"}": 0.0,
+     "kosha_index_documents_total": 44892.0,
+     "kosha_flush_total": 21.0,
+     "kosha_writer_fenced_total": 0.0
+    }
+   },
+   "large": {
+    "documents": 30182,
+    "segments": 78,
+    "manifest_version": 110
+   },
+   "segments_total": 160,
+   "namespaces_listed": 21,
+   "requests": {
+    "total": 930,
+    "5xx": 0,
+    "conn": 0,
+    "429": 0,
+    "4xx": 0
+   }
+  },
+  {
+   "t": 100.1,
+   "pods": {
+    "http://localhost:8080": {
+     "kosha_search_queue_depth": 0.0,
+     "kosha_cache_bytes{cache=\"segment\"}": 22336487.0,
+     "kosha_cache_bytes{cache=\"nvme\"}": 0.0,
+     "kosha_index_documents_total": 45942.0,
+     "kosha_flush_total": 21.0,
+     "kosha_writer_fenced_total": 0.0
+    }
+   },
+   "large": {
+    "documents": 30781,
+    "segments": 82,
+    "manifest_version": 114
+   },
+   "segments_total": 170,
+   "namespaces_listed": 21,
+   "requests": {
+    "total": 1034,
+    "5xx": 0,
+    "conn": 0,
+    "429": 0,
+    "4xx": 0
+   }
+  },
+  {
+   "t": 110.1,
+   "pods": {
+    "http://localhost:8080": {
+     "kosha_search_queue_depth": 0.0,
+     "kosha_cache_bytes{cache=\"segment\"}": 23128821.0,
+     "kosha_cache_bytes{cache=\"nvme\"}": 0.0,
+     "kosha_index_documents_total": 46992.0,
+     "kosha_flush_total": 21.0,
+     "kosha_writer_fenced_total": 0.0
+    }
+   },
+   "large": {
+    "documents": 31681,
+    "segments": 88,
+    "manifest_version": 120
+   },
+   "segments_total": 184,
+   "namespaces_listed": 21,
+   "requests": {
+    "total": 1141,
+    "5xx": 0,
+    "conn": 0,
+    "429": 0,
+    "4xx": 0
+   }
+  },
+  {
+   "t": 120.2,
+   "pods": {
+    "http://localhost:8080": {
+     "kosha_search_queue_depth": 0.0,
+     "kosha_cache_bytes{cache=\"segment\"}": 23562557.0,
+     "kosha_cache_bytes{cache=\"nvme\"}": 0.0,
+     "kosha_index_documents_total": 47992.0,
+     "kosha_flush_total": 21.0,
+     "kosha_writer_fenced_total": 0.0
+    }
+   },
+   "large": {
+    "documents": 32281,
+    "segments": 93,
+    "manifest_version": 125
+   },
+   "segments_total": 186,
+   "namespaces_listed": 21,
+   "requests": {
+    "total": 1253,
+    "5xx": 0,
+    "conn": 0,
+    "429": 0,
+    "4xx": 0
+   }
+  },
+  {
+   "t": 130.2,
+   "pods": {
+    "http://localhost:8080": {
+     "kosha_search_queue_depth": 0.0,
+     "kosha_cache_bytes{cache=\"segment\"}": 24082874.0,
+     "kosha_cache_bytes{cache=\"nvme\"}": 0.0,
+     "kosha_index_documents_total": 48642.0,
+     "kosha_flush_total": 21.0,
+     "kosha_writer_fenced_total": 0.0
+    }
+   },
+   "large": {
+    "documents": 32830,
+    "segments": 98,
+    "manifest_version": 130
+   },
+   "segments_total": 194,
+   "namespaces_listed": 21,
+   "requests": {
+    "total": 1361,
+    "5xx": 0,
+    "conn": 0,
+    "429": 0,
+    "4xx": 0
+   }
+  },
+  {
+   "t": 140.2,
+   "pods": {
+    "http://localhost:8080": {
+     "kosha_search_queue_depth": 0.0,
+     "kosha_cache_bytes{cache=\"segment\"}": 24826431.0,
+     "kosha_cache_bytes{cache=\"nvme\"}": 0.0,
+     "kosha_index_documents_total": 49692.0,
+     "kosha_flush_total": 21.0,
+     "kosha_writer_fenced_total": 0.0
+    }
+   },
+   "large": {
+    "documents": 33380,
+    "segments": 101,
+    "manifest_version": 133
+   },
+   "segments_total": 205,
+   "namespaces_listed": 21,
+   "requests": {
+    "total": 1483,
+    "5xx": 0,
+    "conn": 0,
+    "429": 0,
+    "4xx": 0
+   }
+  },
+  {
+   "t": 150.2,
+   "pods": {
+    "http://localhost:8080": {
+     "kosha_search_queue_depth": 0.0,
+     "kosha_cache_bytes{cache=\"segment\"}": 25525036.0,
+     "kosha_cache_bytes{cache=\"nvme\"}": 0.0,
+     "kosha_index_documents_total": 50542.0,
+     "kosha_flush_total": 21.0,
+     "kosha_writer_fenced_total": 0.0
+    }
+   },
+   "large": {
+    "documents": 33879,
+    "segments": 105,
+    "manifest_version": 137
+   },
+   "segments_total": 201,
+   "namespaces_listed": 21,
+   "requests": {
+    "total": 1604,
+    "5xx": 0,
+    "conn": 0,
+    "429": 0,
+    "4xx": 0
+   }
+  },
+  {
+   "t": 160.2,
+   "pods": {
+    "http://localhost:8080": {
+     "kosha_search_queue_depth": 0.0,
+     "kosha_cache_bytes{cache=\"segment\"}": 25941864.0,
+     "kosha_cache_bytes{cache=\"nvme\"}": 0.0,
+     "kosha_index_documents_total": 51192.0,
+     "kosha_flush_total": 21.0,
+     "kosha_writer_fenced_total": 0.0
+    }
+   },
+   "large": {
+    "documents": 34479,
+    "segments": 109,
+    "manifest_version": 141
+   },
+   "segments_total": 207,
+   "namespaces_listed": 21,
+   "requests": {
+    "total": 1726,
+    "5xx": 0,
+    "conn": 0,
+    "429": 0,
+    "4xx": 0
+   }
+  },
+  {
+   "t": 170.2,
+   "pods": {
+    "http://localhost:8080": {
+     "kosha_search_queue_depth": 0.0,
+     "kosha_cache_bytes{cache=\"segment\"}": 26373357.0,
+     "kosha_cache_bytes{cache=\"nvme\"}": 0.0,
+     "kosha_index_documents_total": 51842.0,
+     "kosha_flush_total": 21.0,
+     "kosha_writer_fenced_total": 0.0
+    }
+   },
+   "large": {
+    "documents": 34978,
+    "segments": 114,
+    "manifest_version": 146
+   },
+   "segments_total": 216,
+   "namespaces_listed": 21,
+   "requests": {
+    "total": 1853,
+    "5xx": 0,
+    "conn": 0,
+    "429": 0,
+    "4xx": 0
+   }
+  },
+  {
+   "t": 184.2,
+   "pods": {
+    "http://localhost:8080": {
+     "kosha_search_queue_depth": 0.0,
+     "kosha_cache_bytes{cache=\"segment\"}": 27374247.0,
+     "kosha_cache_bytes{cache=\"nvme\"}": 0.0,
+     "kosha_index_documents_total": 52992.0,
+     "kosha_flush_total": 21.0,
+     "kosha_writer_fenced_total": 0.0
+    }
+   },
+   "large": {
+    "documents": 35478,
+    "segments": 118,
+    "manifest_version": 150
+   },
+   "segments_total": 213,
+   "namespaces_listed": 21,
+   "requests": {
+    "total": 1992,
+    "5xx": 0,
+    "conn": 0,
+    "429": 0,
+    "4xx": 0
+   }
+  }
+ ],
+ "events": [],
+ "final": {
+  "checked": 42,
+  "mismatches": [],
+  "large_segments": 118,
+  "live_docs": 46849
+ },
+ "verdicts": [
+  {
+   "check": "p99:bm25",
+   "ok": true,
+   "detail": "p99 11.58 ms, bound 1000 ms over 561 queries"
+  },
+  {
+   "check": "p99:filtered",
+   "ok": true,
+   "detail": "p99 10.26 ms, bound 1000 ms over 439 queries"
+  },
+  {
+   "check": "p99:knn",
+   "ok": true,
+   "detail": "p99 10.46 ms, bound 1000 ms over 440 queries"
+  },
+  {
+   "check": "ran:bm25",
+   "ok": true,
+   "detail": "561 queries"
+  },
+  {
+   "check": "ran:knn",
+   "ok": true,
+   "detail": "440 queries"
+  },
+  {
+   "check": "ran:filtered",
+   "ok": true,
+   "detail": "439 queries"
+  },
+  {
+   "check": "visible-p99",
+   "ok": true,
+   "detail": "p99 4.642 s over 70 samples, 0 never visible, bound 30 s"
+  },
+  {
+   "check": "5xx-rate",
+   "ok": true,
+   "detail": "0 of 2013 requests (0.00000), bound 0.001"
+  },
+  {
+   "check": "conn-error-rate",
+   "ok": true,
+   "detail": "0 of 2013 requests (0.00000), bound 0.01"
+  },
+  {
+   "check": "exact-count",
+   "ok": true,
+   "detail": "42 namespace/pod counts checked, mismatches []"
+  },
+  {
+   "check": "no-uncertain-writes",
+   "ok": true,
+   "detail": "namespaces with an unacknowledged write: []"
+  }
+ ],
+ "pass": true
+}

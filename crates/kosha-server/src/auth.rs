@@ -41,7 +41,7 @@
 //! Then every request is tenant `dev` (local development only). Before this,
 //! an empty key table or a failed Postgres connect silently turned auth off.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
@@ -1025,11 +1025,91 @@ pub fn max_body_bytes() -> usize {
     })
 }
 
-/// `KOSHA_LEGACY_ROUTES=off` disables the unversioned Phase 1 routes.
+/// `KOSHA_LEGACY_ROUTES=off` disables the unversioned Phase 1 routes: the
+/// pod default (ADR-350 §c).
 pub fn legacy_routes_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| !env_flag_disabled("KOSHA_LEGACY_ROUTES"))
 }
+
+/// `KOSHA_LEGACY_ROUTES_TENANTS`: tenants that keep the legacy routes while
+/// the pod default is off. Read once at startup.
+fn legacy_routes_tenants() -> &'static HashSet<String> {
+    static TENANTS: OnceLock<HashSet<String>> = OnceLock::new();
+    TENANTS.get_or_init(|| {
+        parse_tenant_list(std::env::var("KOSHA_LEGACY_ROUTES_TENANTS").ok().as_deref())
+    })
+}
+
+/// A comma-separated tenant list; blanks are ignored.
+pub fn parse_tenant_list(raw: Option<&str>) -> HashSet<String> {
+    raw.unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether `tenant` may use the legacy routes: the pod default, or the
+/// tenant is on the allowlist. A managed deployment sets the default off
+/// and lists only the tenants still migrating.
+pub fn legacy_routes_enabled_for(tenant: &str) -> bool {
+    #[cfg(test)]
+    if let Some(allowed) = LEGACY_POLICY_OVERRIDE.with(|policy| {
+        policy
+            .borrow()
+            .as_ref()
+            .map(|(default_on, allowlist)| legacy_routes_allowed(*default_on, allowlist, tenant))
+    }) {
+        return allowed;
+    }
+    legacy_routes_allowed(legacy_routes_enabled(), legacy_routes_tenants(), tenant)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A per-thread stand-in for `KOSHA_LEGACY_ROUTES` and
+    /// `KOSHA_LEGACY_ROUTES_TENANTS` (both read once per process), so a
+    /// test can drive `route()` with the flag off without touching other
+    /// tests.
+    static LEGACY_POLICY_OVERRIDE: std::cell::RefCell<Option<(bool, HashSet<String>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` as if the pod default were `default_on` and the allowlist
+/// `allowlist`, on this thread only.
+#[cfg(test)]
+pub fn with_legacy_policy<T>(default_on: bool, allowlist: &str, f: impl FnOnce() -> T) -> T {
+    let policy = (default_on, parse_tenant_list(Some(allowlist)));
+    LEGACY_POLICY_OVERRIDE.with(|p| *p.borrow_mut() = Some(policy));
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            LEGACY_POLICY_OVERRIDE.with(|p| *p.borrow_mut() = None);
+        }
+    }
+    let _reset = Reset;
+    f()
+}
+
+/// The decision behind [`legacy_routes_enabled_for`], for tests.
+pub fn legacy_routes_allowed(default_on: bool, allowlist: &HashSet<String>, tenant: &str) -> bool {
+    default_on || allowlist.contains(tenant)
+}
+
+/// When the legacy routes were deprecated (RFC 9745 `Deprecation`): the
+/// release that ships #350's 350c, 2026-12-15T00:00:00Z.
+pub const LEGACY_DEPRECATED_AT: u64 = 1_797_292_800;
+
+/// When the legacy routes are removed (RFC 8594 `Sunset`). Pushed later,
+/// never earlier; gated on `kosha_legacy_requests_total` reading zero on
+/// managed deployments (docs/api/versioning.md).
+pub const LEGACY_SUNSET: &str = "Tue, 01 Jun 2027 00:00:00 GMT";
+
+/// Where the deprecation is documented (`Link: <...>; rel="deprecation"`).
+pub const LEGACY_DEPRECATION_LINK: &str =
+    "https://github.com/decover-tech/kosha/blob/main/docs/api/versioning.md#legacy-routes";
 
 /// The unversioned Phase 1 routes, as `record_legacy_use` counts them.
 const LEGACY_ROUTES: [&str; 7] = [

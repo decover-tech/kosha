@@ -32,8 +32,10 @@ use kosha_core::EmbeddingSpec;
 /// Why an embedding could not be produced. Each maps to an HTTP status.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EmbedError {
-    /// This pod has no provider for the declared model (503: another pod,
-    /// or this one once configured, can serve it).
+    /// This pod has no provider for the declared model (501
+    /// `not_implemented`, not retryable: the identical request fails the
+    /// same way until an operator configures one, so a client that retries
+    /// on `retryable:true` must not loop on it; ADR-350 §b).
     NotConfigured(String),
     /// The provider could not be reached or timed out (503).
     Unavailable(String),
@@ -44,7 +46,8 @@ pub enum EmbedError {
 impl EmbedError {
     pub fn status(&self) -> u16 {
         match self {
-            Self::NotConfigured(_) | Self::Unavailable(_) => 503,
+            Self::NotConfigured(_) => 501,
+            Self::Unavailable(_) => 503,
             Self::Provider(_) => 502,
         }
     }
@@ -556,7 +559,11 @@ mod tests {
         let empty = EmbedderRegistry::from_lookup(|_| None);
         assert!(empty.providers().is_empty());
         let err = empty.get(&spec("m", 8, None)).err().unwrap();
-        assert_eq!(err.status(), 503);
+        assert_eq!(err.status(), 501);
+        // 501 is `not_implemented`: not retryable, so an SDK does not loop.
+        let code = crate::api_error::ErrorCode::from_status(err.status());
+        assert_eq!(code.as_str(), "not_implemented");
+        assert!(!code.retryable());
 
         let mock = EmbedderRegistry::from_lookup(|k| {
             (k == "KOSHA_EMBEDDING_PROVIDERS").then(|| "mock".to_string())
@@ -569,7 +576,7 @@ mod tests {
                 .err()
                 .unwrap()
                 .status(),
-            503
+            501
         );
 
         // http without a URL stays disabled.
@@ -583,7 +590,7 @@ mod tests {
         assert!(fixed.get(&spec("fixed", 4, None)).is_ok());
         assert_eq!(
             fixed.get(&spec("fixed", 5, None)).err().unwrap().status(),
-            503
+            501
         );
     }
 

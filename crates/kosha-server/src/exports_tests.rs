@@ -179,12 +179,11 @@ fn routes_parse_and_only_create_and_delete_are_writes() {
         None
     );
     assert_eq!(parse_route("PUT", "/v1/namespaces/docs/exports"), None);
-    assert!(is_write_route("POST /v1/namespaces/docs/exports HTTP/1.1"));
-    assert!(is_write_route(
-        "DELETE /v1/namespaces/docs/exports/x HTTP/1.1"
+    assert!(crate::is_write_path(
+        "DELETE /v1/namespaces/docs/exports/x HTTP/1.1\r\n"
     ));
-    assert!(!is_write_route(
-        "GET /v1/namespaces/docs/exports/x HTTP/1.1"
+    assert!(!crate::is_write_path(
+        "GET /v1/namespaces/docs/exports/x HTTP/1.1\r\n"
     ));
     assert!(crate::is_write_path(
         "POST /v1/namespaces/docs/exports HTTP/1.1\r\n"
