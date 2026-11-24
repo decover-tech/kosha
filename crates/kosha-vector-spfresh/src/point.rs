@@ -30,11 +30,10 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// reduced pairwise. Experimental (#382): used only when
 /// `KOSHA_VECTOR_DOT_LANES` is set to 16/32/64 (kosha-segment's posting
 /// scans), and by `benches/distance_kernels.rs`, to measure whether a
-/// wider accumulator helps. With AVX2 + FMA (`-C target-cpu=x86-64-v3`) one
-/// 8-lane accumulator is a single register, so every iteration waits on
-/// the previous FMA (~4 cycles latency, 2 per cycle throughput); 32-64
-/// lanes give the core enough independent chains. Summation order differs
-/// from [`dot`], so results differ in the last float bits.
+/// wider accumulator helps. With AVX2 one 8-lane accumulator fits in one
+/// register, so its additions form a single dependency chain. Wider
+/// accumulators allow independent chains. Summation order differs from
+/// [`dot`], so results differ in the last float bits.
 pub fn dot_lanes<const L: usize>(a: &[f32], b: &[f32]) -> f32 {
     const { assert!(L.is_power_of_two(), "dot_lanes: L must be a power of two") };
     debug_assert_eq!(a.len(), b.len(), "dot_lanes: dimension mismatch");

@@ -527,6 +527,57 @@ Details and caveats:
   four and dispatches fine).
   Further experiment knobs go in `server_env` rather than new inputs.
 
+### Distance kernels and x86-64-v3 (#382, experimental)
+
+For a kernel-only check on a v3-capable x86 host, run the same benchmark
+with the default target and with v3 codegen:
+
+```bash
+cargo bench --locked -p kosha-vector-spfresh --bench distance_kernels
+RUSTFLAGS="-C target-cpu=x86-64-v3" cargo bench --locked -p kosha-vector-spfresh --bench distance_kernels
+```
+
+Compare the scalar reference, the current 8-lane dot, and the wider
+dots on the same synthetic f32 posting. Compare LUT and popcount on the
+same RaBitQ posting; query preparation is timed separately. These
+numbers do not include the cost of the real posting scan.
+
+Use one revision that contains the experiment and the zero-copy posting
+scan (#435). The old `research/382-bench-integration` ref predates the
+scan. Keep the host type, 10M snapshots, cache policy, query order, QPS,
+and duration fixed within each comparison. Use `mode=restore`,
+`warm_gate=queries`, `return_fields=ids`, and `run_recall_check=true`;
+compare the warm result-cache-off phases after the warm gate reports ready.
+
+| Comparison | `suite` | Vector snapshot | `rustflags` | `server_env` |
+|---|---|---|---|---|
+| A: baseline | both | `msmarco-10m-vec` (f32) | empty | `KOSHA_VECTOR_DOT_LANES=8` |
+| B: codegen only | both | same f32 | `-C target-cpu=x86-64-v3` | `KOSHA_VECTOR_DOT_LANES=8` |
+| C: wider dot | both | same f32 | same v3 | `KOSHA_VECTOR_DOT_LANES=16` (or `32`/`64`) |
+| D: RaBitQ LUT | vector | dedicated RaBitQ | same v3 | `KOSHA_VECTOR_RABITQ_ESTIMATOR=lut` |
+| E: RaBitQ popcount | vector | same RaBitQ | same v3 | `KOSHA_VECTOR_RABITQ_ESTIMATOR=popcount` |
+
+Compare B to A for BM25 and kNN codegen, C to B for widening, and E to D
+for the estimator. Only run C if the kernel bench on the target host
+shows a wider dot beating 8 lanes. For D and E, use the same snapshot
+built with `KOSHA_VECTOR_QUANTIZATION=rabitq`; changing the estimator on
+an f32 snapshot does not exercise either RaBitQ kernel.
+
+Before comparing, check `meta.json` for the inputs and
+`zgrep 'vector kernels (#382' server/full.log.gz` for the effective
+lanes and estimator and for `x86_features=baseline` (A) or
+`x86_features=popcnt,avx2,fma,bmi2` (B–E). A sets the default lane count
+explicitly so it also emits this line.
+
+Use `knn_log_stats.py` on each `vector/server/knn_warm_nocache.log.gz`
+for `score_ms` and the read/decode/dot split. Judge the 2× `score_ms`
+target using the best f32 candidate vs A, not the isolated dot benchmark.
+Use `topk_parity.py` on the matching f32 request logs to check ranked IDs
+and scores within float tolerance. For E vs D use recall@10 against the same ground truth:
+4-bit query rounding changes approximate scores, not the on-disk format.
+Record recall@10 against warm p50/p99 latency, local bytes, S3 bytes,
+and GETs/query; report the warm BM25 p50/p90/p99 side effect separately.
+
 ### Docid reordering and blocks decoded (#385, experimental)
 
 `KOSHA_DOC_REORDER=bp` makes `kosha-build-segments` (and compaction)
