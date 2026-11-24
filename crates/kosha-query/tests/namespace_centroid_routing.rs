@@ -1,5 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use kosha_core::{Document, DocumentId, Field, KnnQuery, Manifest, NamespaceId, SearchQuery};
 use kosha_query::Searcher;
@@ -130,6 +131,70 @@ fn query(vector: Vec<f32>) -> SearchQuery {
         vectors: None,
     });
     query
+}
+
+#[test]
+fn alternating_namespaces_fetch_each_routing_snapshot_once() {
+    let root = tempfile::tempdir().unwrap();
+    let idx = Indexer::new(root.path().into()).with_wal(false);
+    let a = NamespaceId("routing-a".into());
+    let b = NamespaceId("routing-b".into());
+    let snapshot_key = |ns: &NamespaceId| format!("{}/{FILE_NAME}", ns.0);
+    let take_snapshot = |ns: &NamespaceId| {
+        let path = root.path().join(snapshot_key(ns));
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        bytes
+    };
+    append(&idx, &a, 0..20);
+    append(&idx, &b, 20..40);
+    let a_v1 = commit(&idx, &a);
+    let b_v1 = commit(&idx, &b);
+    let a_key = snapshot_key(&a);
+    let b_key = snapshot_key(&b);
+    let snapshots = Arc::new(Mutex::new(HashMap::from([
+        (a_key.clone(), take_snapshot(&a)),
+        (b_key.clone(), take_snapshot(&b)),
+    ])));
+    let fetches = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
+    let routed = Searcher::new(root.path().into())
+        .with_knn_namespace_centroids(true)
+        .with_namespace_centroid_source({
+            let snapshots = Arc::clone(&snapshots);
+            let fetches = Arc::clone(&fetches);
+            move |key| {
+                *fetches.lock().unwrap().entry(key.to_owned()).or_default() += 1;
+                snapshots.lock().unwrap().get(key).cloned()
+            }
+        });
+    let q = query(vec![1.0, 0.0713, 0.0, 0.0]);
+    let search = |ns: &NamespaceId, manifest: &Manifest| {
+        routed.search_with_stats(ns, manifest, &q, None).unwrap()
+    };
+    for (ns, manifest) in [(&a, &a_v1), (&b, &b_v1), (&a, &a_v1), (&b, &b_v1)] {
+        let (result, stats) = search(ns, manifest);
+        assert_eq!(result.results.len(), 10);
+        assert_eq!(stats.knn_postings_probed, 1);
+    }
+    assert_eq!(
+        *fetches.lock().unwrap(),
+        HashMap::from([(a_key.clone(), 1), (b_key.clone(), 1)])
+    );
+
+    append(&idx, &a, 40..60);
+    let a_v2 = commit(&idx, &a);
+    assert_ne!(a_v1.version, a_v2.version);
+    snapshots
+        .lock()
+        .unwrap()
+        .insert(a_key.clone(), take_snapshot(&a));
+    let (_, stats) = search(&a, &a_v2);
+    assert_eq!(stats.knn_postings_probed, 2);
+    search(&b, &b_v1);
+    assert_eq!(
+        *fetches.lock().unwrap(),
+        HashMap::from([(a_key, 2), (b_key, 1)])
+    );
 }
 
 #[test]

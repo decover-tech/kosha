@@ -22,6 +22,7 @@ use kosha_core::{
     TermBloomMode, TotalHitsRelation,
 };
 use kosha_core::{AnalyzerSpec, FieldBoost, Footer, SegmentAnalysis};
+use kosha_segment::namespace_centroids::{Snapshot as NamespaceCentroidSnapshot, FILE_NAME};
 pub use kosha_segment::VectorSpanFetch;
 use kosha_segment::{
     tokenize, Analyzer, PostingsMemoryAccount, ScoringPosting, SegmentReader, VectorFieldStatus,
@@ -4109,7 +4110,7 @@ pub struct Searcher {
     /// [`Searcher::with_knn_plan_i8`]. Default from `KOSHA_KNN_PLAN_I8`.
     knn_plan_i8: bool,
     knn_namespace_centroids: bool,
-    namespace_centroids: Mutex<Option<CachedNamespaceCentroids>>,
+    namespace_centroids: Mutex<NamespaceCentroidCache>,
     namespace_centroid_source: Option<Box<NamespaceCentroidSource>>,
     /// Leaving segments out of the kNN plan by their score floors; see
     /// [`Searcher::with_knn_segment_prune`]. Default from
@@ -4125,11 +4126,77 @@ pub struct Searcher {
 type DrainingReaders = Vec<std::sync::Weak<TrackedSegment>>;
 type NamespaceCentroidSource = dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync;
 
+const NAMESPACE_CENTROID_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const NAMESPACE_CENTROID_CACHE_ENTRIES: usize = 64;
+const NAMESPACE_CENTROID_MISS_TTL: Duration = Duration::from_secs(1);
+
 struct CachedNamespaceCentroids {
-    namespace: NamespaceId,
-    version: u64,
+    key: CorpusKey,
     loaded_at: Instant,
-    snapshot: Option<Arc<kosha_segment::namespace_centroids::Snapshot>>,
+    snapshot: Option<Arc<NamespaceCentroidSnapshot>>,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct NamespaceCentroidCache {
+    entries: VecDeque<CachedNamespaceCentroids>,
+    bytes: usize,
+}
+
+impl NamespaceCentroidCache {
+    fn get(
+        &mut self,
+        key: &CorpusKey,
+        matches: impl Fn(&NamespaceCentroidSnapshot) -> bool,
+    ) -> Option<Option<Arc<NamespaceCentroidSnapshot>>> {
+        let index = self.entries.iter().position(|entry| &entry.key == key)?;
+        let entry = self.entries.remove(index)?;
+        let hit = match &entry.snapshot {
+            Some(snapshot) if matches(snapshot) => Some(Arc::clone(snapshot)),
+            None if entry.loaded_at.elapsed() < NAMESPACE_CENTROID_MISS_TTL => None,
+            _ => {
+                self.bytes -= entry.bytes;
+                return None;
+            }
+        };
+        self.entries.push_front(entry);
+        Some(hit)
+    }
+
+    fn insert(
+        &mut self,
+        key: CorpusKey,
+        snapshot: Option<Arc<NamespaceCentroidSnapshot>>,
+        bytes: usize,
+    ) {
+        if bytes > NAMESPACE_CENTROID_CACHE_BYTES {
+            return;
+        }
+        self.retain(|entry| entry.key != key);
+        while self.bytes + bytes > NAMESPACE_CENTROID_CACHE_BYTES
+            || self.entries.len() >= NAMESPACE_CENTROID_CACHE_ENTRIES
+        {
+            self.bytes -= self.entries.pop_back().unwrap().bytes;
+        }
+        self.entries.push_front(CachedNamespaceCentroids {
+            key,
+            loaded_at: Instant::now(),
+            snapshot,
+            bytes,
+        });
+        self.bytes += bytes;
+    }
+
+    fn retain(&mut self, keep: impl Fn(&CachedNamespaceCentroids) -> bool) {
+        self.entries.retain(|entry| {
+            if keep(entry) {
+                true
+            } else {
+                self.bytes -= entry.bytes;
+                false
+            }
+        });
+    }
 }
 
 /// Result of a [`Searcher::warm_segments`] pass — how many segments were
@@ -4249,7 +4316,7 @@ impl Searcher {
             knn_global_rescore_max: knn_global_rescore_max_from_env(),
             knn_plan_i8: kosha_segment::knn_plan_i8_from_env(),
             knn_namespace_centroids: kosha_segment::namespace_centroids::enabled(),
-            namespace_centroids: Mutex::new(None),
+            namespace_centroids: Mutex::new(NamespaceCentroidCache::default()),
             namespace_centroid_source: None,
             knn_segment_prune: knn_segment_prune_from_env(),
             knn_rescore_stats: knn_rescore_stats_from_env(),
@@ -4295,6 +4362,10 @@ impl Searcher {
             .lock()
             .unwrap()
             .retain(|key, _| !matches(&key.0));
+        self.namespace_centroids
+            .lock()
+            .unwrap()
+            .retain(|entry| !matches(&entry.key.0));
         self.draining
             .lock()
             .unwrap()
@@ -4394,30 +4465,20 @@ impl Searcher {
         &self,
         namespace: &NamespaceId,
         manifest: &Manifest,
-    ) -> Option<Arc<kosha_segment::namespace_centroids::Snapshot>> {
-        use kosha_segment::namespace_centroids::{Snapshot, FILE_NAME};
-        let matches = |snapshot: &Snapshot| {
+    ) -> Option<Arc<NamespaceCentroidSnapshot>> {
+        let key = corpus_key(namespace, manifest);
+        let matches = |snapshot: &NamespaceCentroidSnapshot| {
             snapshot.matches(
                 manifest.version,
                 manifest.segments.iter().map(|s| s.segment_id.0.as_str()),
             )
         };
-        {
-            let cache = self.namespace_centroids.lock().unwrap();
-            if let Some(cached) = cache
-                .as_ref()
-                .filter(|c| c.namespace == *namespace && c.version == manifest.version)
-            {
-                match &cached.snapshot {
-                    Some(snapshot) if matches(snapshot) => return Some(Arc::clone(snapshot)),
-                    None if cached.loaded_at.elapsed() < Duration::from_secs(1) => return None,
-                    _ => {}
-                }
-            }
+        if let Some(hit) = self.namespace_centroids.lock().unwrap().get(&key, matches) {
+            return hit;
         }
         let path = format!("{}/{FILE_NAME}", namespace.0);
         let decode = |bytes: Vec<u8>| {
-            serde_json::from_slice::<Snapshot>(&bytes)
+            serde_json::from_slice::<NamespaceCentroidSnapshot>(&bytes)
                 .ok()
                 .filter(matches)
         };
@@ -4426,12 +4487,15 @@ impl Searcher {
             .and_then(decode)
             .or_else(|| self.namespace_centroid_source.as_ref()?(&path).and_then(decode))
             .map(Arc::new);
-        *self.namespace_centroids.lock().unwrap() = Some(CachedNamespaceCentroids {
-            namespace: namespace.clone(),
-            version: manifest.version,
-            loaded_at: Instant::now(),
-            snapshot: snapshot.clone(),
-        });
+        let bytes = size_of::<CachedNamespaceCentroids>()
+            + key.0.capacity()
+            + snapshot.as_ref().map_or(0, |snapshot| {
+                size_of::<NamespaceCentroidSnapshot>() + snapshot.estimated_heap_bytes()
+            });
+        self.namespace_centroids
+            .lock()
+            .unwrap()
+            .insert(key, snapshot.clone(), bytes);
         snapshot
     }
 
@@ -11455,6 +11519,24 @@ mod tests {
 
     mod knn_plan_prune;
     mod knn_plan_two_stage;
+
+    #[test]
+    fn namespace_centroid_cache_evicts_by_bytes_and_expires_misses() {
+        let mut cache = NamespaceCentroidCache::default();
+        let key = |namespace: &str| (namespace.to_owned(), 1, 0, false);
+        let bytes = NAMESPACE_CENTROID_CACHE_BYTES / 2;
+        cache.insert(key("a"), None, bytes);
+        cache.insert(key("b"), None, bytes);
+        assert!(matches!(cache.get(&key("a"), |_| true), Some(None)));
+        cache.insert(key("c"), None, bytes);
+        assert!(cache.get(&key("b"), |_| true).is_none());
+        cache.insert(key("oversized"), None, NAMESPACE_CENTROID_CACHE_BYTES + 1);
+        assert!(cache.get(&key("oversized"), |_| true).is_none());
+        assert!(matches!(cache.get(&key("a"), |_| true), Some(None)));
+        cache.entries.front_mut().unwrap().loaded_at -= NAMESPACE_CENTROID_MISS_TTL;
+        assert!(cache.get(&key("a"), |_| true).is_none());
+        assert_eq!(cache.bytes, bytes);
+    }
 
     /// #195: each requested field is marked up with its own tags; a
     /// multi-valued field gives one fragment per value; absent and

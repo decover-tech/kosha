@@ -62,6 +62,40 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Approximate heap bytes for the routing directory, including spare
+    /// B-tree slots and node overhead. The snapshot itself is inline.
+    pub fn estimated_heap_bytes(&self) -> usize {
+        fn tree<K, V>(map: &BTreeMap<K, V>) -> usize {
+            map.len() * (2 * size_of::<(K, V)>() + 64)
+        }
+
+        let directory = &self.directory;
+        let mut bytes = tree(&directory.segments) + tree(&directory.fields);
+        for (id, segment) in &directory.segments {
+            bytes += id.capacity() + tree(&segment.cells) + tree(&segment.counts);
+            bytes += segment
+                .cells
+                .iter()
+                .map(|(key, cells)| key.capacity() + cells.capacity())
+                .sum::<usize>();
+            bytes += segment.counts.keys().map(String::capacity).sum::<usize>();
+        }
+        for (name, field) in &directory.fields {
+            bytes += name.capacity() + tree(&field.cells);
+            for cell in field.cells.values() {
+                bytes += tree(&cell.segments) + tree(&cell.radii);
+                for (id, entries) in &cell.segments {
+                    bytes += id.capacity() + entries.capacity() * size_of::<Entry>();
+                    bytes += entries
+                        .iter()
+                        .map(|entry| entry.centroid.vector.capacity() * size_of::<f32>())
+                        .sum::<usize>();
+                }
+            }
+        }
+        bytes
+    }
+
     pub fn matches<'a>(
         &self,
         version: u64,
