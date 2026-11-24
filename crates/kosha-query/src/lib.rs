@@ -3719,6 +3719,9 @@ pub struct SearchPhaseStats {
     /// for, summed over segments — the work pruning exists to avoid. A
     /// query that took the general (exhaustive) path reports 0.
     pub wand_docs_scored: usize,
+    /// Matches counted by segment walks before the response cap is applied.
+    #[cfg(test)]
+    segment_hits_counted: usize,
     /// Segments whose whole score ceiling was already below the
     /// namespace-wide top-k floor, so no block of theirs was scored
     /// (issue #248).
@@ -6322,6 +6325,11 @@ impl Searcher {
                     // skip table already in memory; a term without stored
                     // summaries (legacy format) disables the exit and the
                     // walk stays exact, v1-style.
+                    // On postings not ordered by relevance, a late high-scoring
+                    // block can keep the suffix max high through most of the
+                    // walk. Keep the count-budget gate: checking on a full
+                    // page alone doesn't tighten the bound and could turn an
+                    // exact count below the cap into a lower bound (#114).
                     let mut early_exit_enabled = count_budget.is_some();
                     let mut hits_capped = false;
                     'join: loop {
@@ -7928,6 +7936,10 @@ impl Searcher {
             for (agg_name, result) in output.aggs {
                 all_aggs.entry(agg_name).or_default().merge(result);
             }
+        }
+        #[cfg(test)]
+        {
+            phase_stats.segment_hits_counted = total_hits;
         }
 
         // ── Hybrid: Reciprocal Rank Fusion over namespace-wide lists ──
@@ -19710,6 +19722,71 @@ mod corpus_stats_tests {
 
     fn page_ids(r: &SearchResult) -> Vec<String> {
         r.results.iter().map(|d| d.doc_id.0.clone()).collect()
+    }
+
+    #[test]
+    fn capped_and_early_exit_preserves_top_k_in_both_posting_orders() {
+        const DOCS: usize = 2_560;
+        const CAP: usize = 100;
+        const TOP_K: usize = 10;
+        let ns = NamespaceId("ns".into());
+        let dir = scratch("capped-and-posting-order");
+        let mut docs: Vec<_> = (0..DOCS)
+            .map(|i| Doc {
+                id: format!("doc-{i:04}"),
+                content: if i < DOCS / 20 {
+                    "alpha beta ".repeat(8 + i % 16)
+                } else {
+                    format!("alpha beta {}", "pad ".repeat(20 + i % 24))
+                },
+                matter: "m0".into(),
+            })
+            .collect();
+        let (clustered, _) =
+            write_segments(&dir, &ns.0, "clustered", std::slice::from_ref(&docs), 1);
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for i in (1..docs.len()).rev() {
+            docs.swap(i, rng.below(i + 1));
+        }
+        let (shuffled, _) = write_segments(&dir, &ns.0, "shuffled", &[docs], 1);
+        let searcher = Searcher::new(dir.clone());
+        let mut exact_query = query("alpha beta", TOP_K);
+        exact_query.operator = Some(kosha_core::QueryOperator::And);
+        let mut capped_query = exact_query.clone();
+        capped_query.exact_total_hits = Some(false);
+        capped_query.total_hits_cap = Some(CAP);
+
+        for (label, manifest) in [("clustered", clustered), ("shuffled", shuffled)] {
+            let (exact, exact_stats) = searcher
+                .search_with_stats(&ns, &manifest, &exact_query, None)
+                .unwrap();
+            let (capped, capped_stats) = searcher
+                .search_with_stats(&ns, &manifest, &capped_query, None)
+                .unwrap();
+            assert_eq!(exact_stats.segment_hits_counted, DOCS, "{label}");
+            assert_eq!(exact.total_hits, DOCS, "{label}");
+            assert_eq!(exact.total_hits_relation, TotalHitsRelation::Eq, "{label}");
+            assert_eq!(capped.total_hits, CAP, "{label}");
+            assert_eq!(
+                capped.total_hits_relation,
+                TotalHitsRelation::Gte,
+                "{label}"
+            );
+            assert_eq!(exact.results.len(), TOP_K, "{label}");
+            assert_eq!(page_ids(&capped), page_ids(&exact), "{label}");
+            for (c, e) in capped.results.iter().zip(&exact.results) {
+                assert_eq!(c.score, e.score, "{label}: {}", c.doc_id.0);
+            }
+            if label == "clustered" {
+                // The response's cap alone doesn't distinguish early exit from clamping.
+                assert!(
+                    (CAP..DOCS).contains(&capped_stats.segment_hits_counted),
+                    "expected the clustered walk to stop early, counted {} of {DOCS}",
+                    capped_stats.segment_hits_counted
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `N`, `avgdl` and `df` must equal the hand-computed namespace sums.
