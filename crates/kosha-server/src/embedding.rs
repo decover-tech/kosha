@@ -489,12 +489,35 @@ impl EmbedderRegistry {
             }
         };
         let key = (provider.clone(), spec.model.clone(), spec.dims);
-        let slot = Arc::clone(self.built.lock().unwrap().entry(key).or_default());
-        let mut slot = slot.lock().unwrap();
+        let shared = Arc::clone(self.built.lock().unwrap().entry(key.clone()).or_default());
+        let mut slot = shared.lock().unwrap();
         if let Some(embedder) = slot.as_ref() {
             return Ok(Arc::clone(embedder));
         }
-        let embedder: Arc<dyn Embedder> = match provider.as_str() {
+        match self.build(spec, &provider) {
+            Ok(embedder) => {
+                *slot = Some(Arc::clone(&embedder));
+                Ok(embedder)
+            }
+            Err(err) => {
+                // Forget the empty slot so failed lookups (keys are schema
+                // controlled) do not accumulate. A slot another caller is
+                // loading is left to that caller.
+                drop(slot);
+                let mut built = self.built.lock().unwrap();
+                if built.get(&key).is_some_and(|current| {
+                    Arc::ptr_eq(current, &shared)
+                        && current.try_lock().is_ok_and(|loaded| loaded.is_none())
+                }) {
+                    built.remove(&key);
+                }
+                Err(err)
+            }
+        }
+    }
+
+    fn build(&self, spec: &EmbeddingSpec, provider: &str) -> Result<Arc<dyn Embedder>, EmbedError> {
+        Ok(match provider {
             PROVIDER_MOCK if self.mock => {
                 Arc::new(MockEmbedder::new(&spec.model, spec.dims as usize))
             }
@@ -502,7 +525,7 @@ impl EmbedderRegistry {
                 Some(ref config) => {
                     Arc::new(HttpEmbedder::new(&spec.model, spec.dims as usize, config))
                 }
-                None => return Err(not_enabled(spec, &provider)),
+                None => return Err(not_enabled(spec, provider)),
             },
             #[cfg(feature = "onnx")]
             PROVIDER_ONNX => {
@@ -514,10 +537,8 @@ impl EmbedderRegistry {
                 })?;
                 Arc::new(onnx::OnnxEmbedder::load(spec, config)?)
             }
-            _ => return Err(not_enabled(spec, &provider)),
-        };
-        *slot = Some(Arc::clone(&embedder));
-        Ok(embedder)
+            _ => return Err(not_enabled(spec, provider)),
+        })
     }
 }
 
@@ -795,6 +816,17 @@ mod tests {
         let err = e.embed(&["x"]).unwrap_err();
         assert_eq!(err.status(), 503, "{err}");
         assert!(started.elapsed() < Duration::from_millis(700));
+    }
+
+    #[test]
+    fn failed_lookups_leave_no_cache_entry() {
+        let registry = EmbedderRegistry::with_mock();
+        for dims in 1..=3 {
+            assert!(registry.get(&spec("m", dims, Some("nope"))).is_err());
+        }
+        assert!(registry.built.lock().unwrap().is_empty());
+        registry.get(&spec("m", 4, None)).unwrap();
+        assert_eq!(registry.built.lock().unwrap().len(), 1);
     }
 
     #[test]
