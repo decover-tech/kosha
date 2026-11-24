@@ -8,6 +8,7 @@ pub use compaction::{
 };
 
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -2037,6 +2038,14 @@ impl Indexer {
         let seed_vectors = vector_index
             .unwrap_or_else(kosha_segment::VectorCompactionMode::from_env)
             == kosha_segment::VectorCompactionMode::Lire;
+        let vector_profile = if seed_vectors
+            && std::env::var("KOSHA_VECTOR_COMPACTION_PROFILE").as_deref() == Ok("1")
+        {
+            writer = writer.with_vector_compaction_profile();
+            Some(writer.vector_index_builds())
+        } else {
+            None
+        };
         // (old segment_id, old doc_seq) → the doc's doc_seq in the merged
         // output, for every doc actually copied. `SegmentWriter::add_document`
         // assigns doc_seq as `self.doc_records.len()` at call time (strictly
@@ -2279,6 +2288,22 @@ impl Indexer {
             .manifest_cloned(namespace)
             .map(|m| m.segments.len())
             .unwrap_or(0);
+
+        if let Some(builds) = vector_profile {
+            let mut stderr = std::io::stderr().lock();
+            for build in builds.lock().unwrap().iter() {
+                if let Some(profile) = &build.rewrite_profile {
+                    let event = serde_json::json!({
+                        "namespace": namespace.0,
+                        "segment": output_segment_id.0,
+                        "field": build.field,
+                        "lire": build.lire,
+                        "rewrite": profile,
+                    });
+                    let _ = writeln!(stderr, "vector_compaction_profile {event}");
+                }
+            }
+        }
 
         Ok(CompactResult {
             merged: true,

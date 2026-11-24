@@ -7,7 +7,7 @@ pub mod multivec;
 pub mod reorder;
 pub mod span_cache;
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -143,6 +143,7 @@ pub struct SegmentWriter {
     /// How each column's index was built by `finalize`, for tests and
     /// diagnostics. See [`VectorIndexBuild`].
     vector_index_builds: Arc<Mutex<Vec<VectorIndexBuild>>>,
+    profile_vector_compaction: bool,
     /// Chain for `Text` fields without their own (#220).
     default_analyzer: Analyzer,
     /// Per-field chains that differ from `default_analyzer`.
@@ -264,6 +265,7 @@ impl SegmentWriter {
             doc_vector_entries: Vec::new(),
             vector_seeds: HashMap::new(),
             vector_index_builds: Arc::new(Mutex::new(Vec::new())),
+            profile_vector_compaction: false,
             default_analyzer: Analyzer::new(&AnalyzerSpec::legacy()),
             field_analyzers: HashMap::new(),
             analyzed_fields: BTreeMap::new(),
@@ -451,6 +453,13 @@ impl SegmentWriter {
     /// it after `finalize` (which consumes the writer).
     pub fn vector_index_builds(&self) -> Arc<Mutex<Vec<VectorIndexBuild>>> {
         Arc::clone(&self.vector_index_builds)
+    }
+
+    /// Measure how much of the output has the same membership as an input
+    /// posting. This is opt-in to keep comparison work off the write path.
+    pub fn with_vector_compaction_profile(mut self) -> Self {
+        self.profile_vector_compaction = true;
+        self
     }
 
     /// Override the `Text` → filter-column cap for this writer (`None`
@@ -1271,8 +1280,12 @@ impl SegmentWriter {
                 embedding_model: self.embedding_models.get(&column.name).cloned(),
             };
             let seeds = self.vector_seeds.get(&column.name);
-            let (idx_bytes, offsets_bytes, build) =
-                Self::encode_vector_column(&column.vectors, seeds, quantization)?;
+            let (idx_bytes, offsets_bytes, build) = Self::encode_vector_column(
+                &column.vectors,
+                seeds,
+                quantization,
+                self.profile_vector_compaction,
+            )?;
             self.vector_index_builds
                 .lock()
                 .unwrap()
@@ -1297,6 +1310,7 @@ impl SegmentWriter {
         column: &[(u32, Vec<f32>)],
         seeds: Option<&Vec<Vec<VectorSeedPosting>>>,
         quantization: VectorQuantization,
+        profile_compaction: bool,
     ) -> Result<(Vec<u8>, Vec<u8>, VectorIndexBuild), KoshaError> {
         let dim = column[0].1.len();
         // Unit-norm (write version 3, on-disk header version 2): normalize
@@ -1383,6 +1397,14 @@ impl SegmentWriter {
             VECTOR_INDEX_VERSION
         };
         let (idx, offsets) = encode_vector_index_v2(dim as u32, &postings, format_version);
+        if profile_compaction {
+            build.rewrite_profile = Some(VectorPostingRewriteProfile::measure(
+                seeds.map_or(&[], Vec::as_slice),
+                &postings,
+                vector_entry_size(dim as u32, format_version),
+                idx.len() + offsets.len(),
+            ));
+        }
         Ok((idx, offsets, build))
     }
 
@@ -1482,6 +1504,66 @@ pub struct VectorIndexBuild {
     pub postings_merged: usize,
     /// Postings written.
     pub postings: usize,
+    /// Membership and byte accounting, only when profiling is enabled.
+    pub rewrite_profile: Option<VectorPostingRewriteProfile>,
+}
+
+/// #463 baseline: unchanged membership is not proof of byte-for-byte reuse.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct VectorPostingRewriteProfile {
+    /// Postings actually read as seeds, including those with dropped members.
+    pub input_postings_examined: usize,
+    pub output_postings: usize,
+    /// Output postings whose entire member set matches one input posting.
+    pub membership_unchanged_postings: usize,
+    /// Output `.idx` and `.offsets` file bytes, excluding the doc vectors sidecar.
+    pub index_bytes_written: usize,
+    /// Output entry bytes in membership-matched postings, excluding metadata.
+    pub membership_unchanged_payload_bytes: usize,
+    /// Bytes written minus the matched payload bytes. This estimate omits
+    /// any future remap overhead and does not validate codecs or centroids.
+    pub membership_changed_bytes_estimate: usize,
+}
+
+impl VectorPostingRewriteProfile {
+    fn measure(
+        seeds: &[Vec<VectorSeedPosting>],
+        postings: &[kosha_vector_spfresh::PostingSnapshot],
+        entry_bytes: usize,
+        index_bytes_written: usize,
+    ) -> Self {
+        let inputs: HashSet<Vec<u32>> = seeds
+            .iter()
+            .flatten()
+            .filter(|p| !p.dropped && !p.doc_seqs.is_empty())
+            .map(|p| {
+                let mut members = p.doc_seqs.clone();
+                members.sort_unstable();
+                members
+            })
+            .collect();
+        let (mut membership_unchanged_postings, mut unchanged_entries) = (0, 0);
+        let mut members = Vec::new();
+        for posting in postings {
+            members.clear();
+            members.extend(posting.entries.iter().map(|(doc_seq, _)| *doc_seq));
+            members.sort_unstable();
+            if inputs.contains(&members) {
+                membership_unchanged_postings += 1;
+                unchanged_entries += members.len();
+            }
+        }
+        let membership_unchanged_payload_bytes = unchanged_entries * entry_bytes;
+        Self {
+            input_postings_examined: seeds.iter().map(Vec::len).sum(),
+            output_postings: postings.len(),
+            membership_unchanged_postings,
+            index_bytes_written,
+            membership_unchanged_payload_bytes,
+            membership_changed_bytes_estimate: index_bytes_written
+                - membership_unchanged_payload_bytes,
+        }
+    }
 }
 
 /// Compaction inputs with fewer indexed vectors in a column than this
@@ -2772,6 +2854,36 @@ mod vector_index_v2_tests {
                 radius: 0.0,
             },
         ]
+    }
+
+    #[test]
+    fn rewrite_profile_matches_whole_postings_in_remapped_order() {
+        let seed = |doc_seqs, dropped| VectorSeedPosting {
+            centroid: vec![1.0, 0.0],
+            doc_seqs,
+            dropped,
+        };
+        let seeds = vec![
+            vec![seed(vec![3, 0], false), seed(vec![2], true)],
+            vec![seed(vec![1, 0], false)],
+        ];
+        let postings = sample_postings();
+        for version in [RADIUS_AWARE_VECTOR_INDEX_VERSION, I8_VECTOR_INDEX_VERSION] {
+            let (idx, offsets) = encode_vector_index_v2(2, &postings, version);
+            let bytes = idx.len() + offsets.len();
+            let entry_bytes = vector_entry_size(2, version);
+            let profile =
+                VectorPostingRewriteProfile::measure(&seeds, &postings, entry_bytes, bytes);
+            assert_eq!(profile.input_postings_examined, 3);
+            assert_eq!(profile.output_postings, 2);
+            assert_eq!(profile.membership_unchanged_postings, 1);
+            assert_eq!(profile.index_bytes_written, bytes);
+            assert_eq!(profile.membership_unchanged_payload_bytes, 2 * entry_bytes);
+            assert_eq!(
+                profile.membership_changed_bytes_estimate,
+                entry_bytes + VECTOR_IDX_HEADER_LEN + offsets.len()
+            );
+        }
     }
 
     /// Distinct, non-zero, non-uniform radii so a round trip is a real
