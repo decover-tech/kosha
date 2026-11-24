@@ -76,10 +76,14 @@ aggregate gauge. Given a successful response body, the transformation is:
 ```sh
 jq -er '
   select(.scheduler.enabled == true and (.namespaces | type) == "array")
-  | [.namespaces[] | select(.needs_compaction == true)]
+  | [.namespaces[] | select(.needs_compaction == true and .stats.idle_at_version != .manifest_version)]
   | "kosha_ops_compaction_namespaces_needing_compaction \(length)"
 '
 ```
+
+This excludes namespaces whose last pass found nothing to merge at the current manifest version:
+the scheduler won't reconsider them until that version changes. Running and temporarily backed-off
+work still counts.
 
 Give the collector's scrape target the same `cluster` label. On a failed poll, report collector
 failure and stop serving the stale sample; don't write zero. Monitor collector scrape and poll
