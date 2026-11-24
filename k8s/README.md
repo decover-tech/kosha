@@ -4,6 +4,9 @@ Kustomize layout for running `kosha-server` in its own **`kosha`**
 namespace. Manifests stay product-generic: no customer account names,
 bucket names, or IAM role ARNs are committed here.
 
+For segment bucket versioning, PostgreSQL PITR and the quarterly namespace
+recovery drill, see [Backups and namespace point-in-time recovery](../docs/operations/backup-restore.md).
+
     k8s/
       base/     Namespace, ServiceAccount, ConfigMap, three Deployments
                 (kosha = ingest, kosha-query = query, kosha-indexer =
