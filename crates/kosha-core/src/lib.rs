@@ -2491,6 +2491,10 @@ pub struct VectorFieldMeta {
     /// #209 — is omitted, so such footers stay byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_model: Option<String>,
+    /// Quantized direction of this column's mean unit vector, for optional
+    /// coarse kNN segment selection. Older segments omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knn_segment_centroid: Option<Vec<i8>>,
 }
 
 /// Storage of a vector column's ANN posting entries (#210). Centroids and

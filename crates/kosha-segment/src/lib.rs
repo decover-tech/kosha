@@ -117,6 +117,7 @@ pub struct SegmentWriter {
     /// [`kosha_core::VectorFieldMeta::slot`]), so a single-column segment
     /// keeps the `vector.idx` + `vector.offsets` layout it always had.
     vector_columns: Vec<VectorColumn>,
+    knn_segment_summaries: bool,
     /// Vectors kept for `doc_vectors.bin` but not indexed: their dimension
     /// disagreed with the first vector seen for the same field in this
     /// segment. The write API rejects such documents up front; this only
@@ -256,6 +257,8 @@ impl SegmentWriter {
             filters_write_version: filter_columns::filters_write_version(),
             filter_columns_meta: None,
             vector_columns: Vec::new(),
+            knn_segment_summaries: std::env::var("KOSHA_KNN_SEGMENT_SUMMARIES").as_deref()
+                == Ok("1"),
             unindexed_vectors: Vec::new(),
             text_filter_ignore_above: text_filter_ignore_above(),
             vector_store_mode: VectorStoreMode::from_env(),
@@ -278,6 +281,12 @@ impl SegmentWriter {
             },
             doc_store_compression_meta: None,
         }
+    }
+
+    /// Write a coarse kNN centroid for each indexed vector column (#380).
+    pub fn with_knn_segment_summaries(mut self, enabled: bool) -> Self {
+        self.knn_segment_summaries = enabled;
+        self
     }
 
     /// Override doc-store compression (research #388): `Some` writes
@@ -1225,6 +1234,7 @@ impl SegmentWriter {
                 offsets: false,
                 quantization: VectorQuantization::F32,
                 embedding_model: self.embedding_models.get(&column.name).cloned(),
+                knn_segment_centroid: None,
             };
             self.backend.write(&meta.idx_file(), &buf)?;
             metas.push(meta);
@@ -1269,6 +1279,10 @@ impl SegmentWriter {
                 offsets: true,
                 quantization,
                 embedding_model: self.embedding_models.get(&column.name).cloned(),
+                knn_segment_centroid: self
+                    .knn_segment_summaries
+                    .then(|| coarse_vector_centroid(column))
+                    .flatten(),
             };
             let seeds = self.vector_seeds.get(&column.name);
             let (idx_bytes, offsets_bytes, build) =
@@ -1438,6 +1452,69 @@ struct VectorColumn {
     name: String,
     dim: usize,
     vectors: Vec<(u32, Vec<f32>)>,
+}
+
+fn coarse_vector_centroid(column: &VectorColumn) -> Option<Vec<i8>> {
+    let mut mean = vec![0.0; column.dim];
+    for (_, vector) in &column.vectors {
+        let norm = vector
+            .iter()
+            .map(|&x| f64::from(x).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        if !norm.is_finite() {
+            return None;
+        }
+        if norm > 0.0 {
+            for (m, &x) in mean.iter_mut().zip(vector) {
+                *m += f64::from(x) / norm;
+            }
+        }
+    }
+    let max = mean.iter().map(|x| x.abs()).fold(0.0, f64::max);
+    (max > 0.0).then(|| {
+        mean.iter()
+            .map(|x| (127.0 * (x / max)).round() as i8)
+            .collect()
+    })
+}
+
+/// Return the summarized segments outside the top `nprobe` coarse
+/// centroids by cosine similarity. Missing or unusable summaries are
+/// never pruned. Segment keys break ties deterministically.
+pub fn knn_pruned_by_centroid<'a, T: Ord>(
+    query: &[f32],
+    centroids: impl IntoIterator<Item = (T, &'a [i8])>,
+    nprobe: usize,
+) -> Vec<T> {
+    if nprobe == 0 || query.iter().any(|x| !x.is_finite()) || !query.iter().any(|&x| x != 0.0) {
+        return Vec::new();
+    }
+    let mut scored: Vec<_> = centroids
+        .into_iter()
+        .filter(|(_, centroid)| centroid.len() == query.len())
+        .filter_map(|(key, centroid)| {
+            let (dot, norm) = query
+                .iter()
+                .zip(centroid)
+                .fold((0.0, 0.0), |(d, n), (&q, &c)| {
+                    let c = f64::from(c);
+                    (d + f64::from(q) * c, n + c * c)
+                });
+            (norm > 0.0).then(|| (dot / norm.sqrt(), key))
+        })
+        .collect();
+    if scored.len() <= nprobe {
+        return Vec::new();
+    }
+    scored.select_nth_unstable_by(nprobe, |(a, x), (b, y)| {
+        b.total_cmp(a).then_with(|| x.cmp(y))
+    });
+    scored
+        .into_iter()
+        .skip(nprobe)
+        .map(|(_, key)| key)
+        .collect()
 }
 
 /// Where a [`SegmentWriter`] buffered one parsed vector.

@@ -677,6 +677,8 @@ struct HydrationOutcome {
     /// only a pod restart, which drops the cache, recovered it).
     #[cfg_attr(not(feature = "s3"), allow(dead_code))]
     bloom_pruned: bool,
+    /// Coarse kNN pruning decided from the same footers as hydration.
+    knn_pruned: Option<kosha_query::KnnPrunedSegments>,
     /// `true` when this request hit its hydration byte ceiling
     /// (`KOSHA_HYDRATE_REQUEST_MAX_BYTES`) or waited out the process-wide
     /// in-flight byte budget, and stopped fetching on purpose.
@@ -4770,6 +4772,11 @@ impl AppState {
                 .segment_footer(&entry.segment_id)
                 .or_else(|| fetched_footers.get(&entry.segment_id).map(Arc::as_ref))
         };
+        let knn_pruned = pins.is_some().then(|| {
+            self.searcher.knn_pruned_segments(manifest, query, |entry| {
+                segment_footer(entry).map(std::borrow::Cow::Borrowed)
+            })
+        });
         // Path -> the segment's footer, borrowed: the manifest's cached copy,
         // else the one just parsed from local footer.json. Having one means
         // footer.json need not be (re)fetched or re-parsed. It does NOT mean
@@ -4808,7 +4815,13 @@ impl AppState {
             all_seg_paths
                 .iter()
                 .cloned()
-                .zip(manifest.segments.iter().map(segment_footer)),
+                .zip(&manifest.segments)
+                .filter(|(_, entry)| {
+                    knn_pruned
+                        .as_ref()
+                        .is_none_or(|pruned| !pruned.contains(&entry.segment_id))
+                })
+                .map(|(path, entry)| (path, segment_footer(entry))),
         );
         if let Some(pins) = pins {
             pins.hold_all(to_hydrate.iter().chain(&stats_only));
@@ -4934,6 +4947,7 @@ impl AppState {
         // treat this outcome as proof the whole namespace is hydrated; see
         // `HydrationOutcome::bloom_pruned`.
         outcome.bloom_pruned = needs_bloom_check;
+        outcome.knn_pruned = knn_pruned;
         // A shed request's `missing` list is real (those files genuinely
         // aren't local), but the caller must not report it as a hydration
         // *failure* — nothing failed, the request declined to pull that
@@ -9771,6 +9785,10 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
             // and vice versa.
             if outcome.missing.is_empty()
                 && !outcome.bloom_pruned
+                && outcome
+                    .knn_pruned
+                    .as_ref()
+                    .is_none_or(|pruned| pruned.is_empty())
                 && outcome.exact_knn_headers_missing == 0
             {
                 state
@@ -9841,13 +9859,14 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     #[cfg(not(feature = "s3"))]
     let vector_fetch: Option<kosha_query::VectorSpanFetch<'_>> = None;
 
-    match state.searcher.search_with_hydrators(
+    match state.searcher.search_with_hydrators_and_pruning(
         &ns,
         searched,
         search_query,
         tombstones,
         doc_store_hydrator,
         vector_fetch,
+        hydration.knn_pruned.as_ref(),
     ) {
         Ok((mut result, phases)) => {
             // Scoring is done; a reranker round trip must not hold a
@@ -10417,6 +10436,10 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
             // and `handle_search_post` for the full rationale.
             if outcome.missing.is_empty()
                 && !outcome.bloom_pruned
+                && outcome
+                    .knn_pruned
+                    .as_ref()
+                    .is_none_or(|pruned| pruned.is_empty())
                 && outcome.exact_knn_headers_missing == 0
             {
                 state
@@ -10483,13 +10506,14 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
     #[cfg(not(feature = "s3"))]
     let vector_fetch: Option<kosha_query::VectorSpanFetch<'_>> = None;
 
-    match state.searcher.search_with_hydrators(
+    match state.searcher.search_with_hydrators_and_pruning(
         &ns,
         searched,
         &query,
         tombstones,
         doc_store_hydrator,
         vector_fetch,
+        hydration.knn_pruned.as_ref(),
     ) {
         Ok((mut result, phases)) => {
             result.exhaustive_search_count = view.exhaustive_search_count();
@@ -12746,6 +12770,12 @@ fn log_search_timing(
         knn_rescore.push_str(&format!(
             " knn_read_ms={:.1} knn_decode_ms={:.1} knn_dot_ms={:.1} knn_rank_ms={:.2} knn_postings_cached={}",
             phases.knn_read_ms, phases.knn_decode_ms, phases.knn_dot_ms, phases.knn_rank_ms, phases.knn_postings_cached,
+        ));
+    }
+    if phases.knn_segments_pruned > 0 {
+        knn_rescore.push_str(&format!(
+            " knn_segments_pruned={}",
+            phases.knn_segments_pruned
         ));
     }
     println!(
@@ -19518,6 +19548,38 @@ mod tests {
     // segments it actually needed, understating counts by up to 80% until
     // the pod was restarted (which drops the in-memory cache — the only
     // reason it ever "recovered").
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn knn_segment_pruning_skips_cold_scoring_files_without_caching_partial_hydration() {
+        const NS: &str = "coarse-prune";
+        let (s3, mut state, manifest, _) = single_flight_node(
+            NS,
+            |w| w.with_knn_segment_summaries(true),
+            |i| vec![Field::vector("emb", vec![1.0, i as f32 * 0.01])],
+        );
+        state.searcher = Searcher::new(state.data_dir.clone()).with_knn_segment_nprobe(1);
+        let body = serde_json::json!({
+            "namespace": NS,
+            "query_text": "",
+            "max_results": 3,
+            "knn": {"field": "emb", "vector": [1.0, 0.0], "k": 3, "num_candidates": 100}
+        });
+        let response = handle_search_post(body.to_string().as_bytes(), &state);
+        assert_eq!(status_of(&response), 200, "{response}");
+        let body: serde_json::Value =
+            serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["results"].as_array().unwrap().len(), 3);
+        let excluded = &manifest.segments[1].segment_id.0;
+        let gets = s3.gets.lock().unwrap();
+        assert!(gets.iter().any(|key| key.ends_with("/vector.offsets")));
+        assert!(
+            gets.iter()
+                .all(|key| !key.contains(excluded) || key.ends_with("/footer.json")),
+            "{gets:?}"
+        );
+        assert!(state.completed_hydrations.lock().unwrap().is_empty());
+    }
 
     #[cfg(feature = "s3")]
     #[test]

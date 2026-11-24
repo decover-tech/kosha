@@ -1,7 +1,7 @@
 # #380 Namespace-level clustering and cluster-aligned segments
 
-Status: research prototype (offline builder only). Not merged. Part of the
-research track in #260.
+Status: offline layout prototype merged in #411; phase-1 segment pruning
+is experimental and off by default. Part of the research track in #260.
 
 ## Experiment spec
 
@@ -28,8 +28,8 @@ research track in #260.
   `--cluster-seed`, `--spill-dir`. Bench: `BUILD_ARGS` in
   `build_and_import.sh` and the `build_segments_args` input in
   `benchmark.yml` (both empty by default), and `warm_gate=cold` (a
-  no-preload cold phase; the default stays `queries`). No server flag: the
-  query path only gains log counters.
+  no-preload cold phase; the default stays `queries`). In phase 0 the
+  query path gained only log counters; see the phase-1 flags below.
 - **Metric.** At matched recall@10 on the 10M MSMarco vector corpus, per
   query from the `search timing:` lines: `knn_postings`, `knn_segments`,
   and, for the cost the layout does not remove, `opens_cold` /
@@ -52,7 +52,7 @@ research track in #260.
   `vector.idx`, but it still hydrates the small per-segment files of every
   segment; "serves without touching most segments" needs phase 1.
 
-## What Kosha does today
+## Baseline without segment pruning
 
 - **Build.** `kosha-build-segments` and the server's flush cut documents into
   segments in arrival order. `SegmentWriter` then clusters each segment's
@@ -91,7 +91,7 @@ research track in #260.
   is scanned flat rather than through a graph. This is why the existing
   format and query path can serve cluster-aligned segments unchanged.
 
-### Build (this PR)
+### Build (phase 0)
 
 1. **Sample.** Read `--cluster-sample` embeddings (default 131,072), evenly
    strided over the corpus, by seeking into the `emb-*.f32` shards. Each one
@@ -127,7 +127,7 @@ Costs and requirements:
   TFLOP single-threaded inside the streaming pass. That is not measured
   here, but expect minutes.
 
-### Write path, compaction and LIRE (#253): not in this PR
+### Cluster-aligned writes, compaction and LIRE (#253): future work
 
 - **Flush.** A server flush still produces an input-order segment. To keep
   alignment, the writer would route each document through the stored head.
@@ -283,6 +283,80 @@ $B/kosha-cluster-eval --embeddings-dir /tmp/c --dim 384 --queries 500 \
   --budgets "$(seq 5 5 80 | paste -sd, -)"
 # 1,000 blobs: gen --clusters 1000, then --budgets "$(seq 200 20 1000 | paste -sd, -)".
 # The server's default form: --fractions 0.05
+```
+
+## Phase 1: coarse segment pruning
+
+- **Write-time opt-in:** run the offline builder or write/compaction process
+  with `KOSHA_KNN_SEGMENT_SUMMARIES=1`. For each lazy vector column,
+  `SegmentWriter` averages the input vectors after unit normalization and
+  quantizes the mean direction to one signed byte per dimension. The
+  summary is an optional field in `footer.json`, available via the
+  manifest's existing in-memory footer cache. Disabled writes omit the
+  field, and neither the binary indexes nor the persisted manifest change.
+  Compaction summarizes its actual output; it does not re-align segments.
+- **Read-time opt-in:** set `KOSHA_KNN_SEGMENT_NPROBE` to a positive
+  integer (default zero). For an unfiltered, single-vector kNN query, rank
+  the usable summaries across the namespace by cosine similarity and
+  keep the closest `nprobe` summarized segments **plus every segment with
+  no usable summary**. Strong-consistency tail segments are also kept.
+  Hybrid, filtered, late-interaction, exact-count and advanced ranking
+  requests keep the original search path.
+- **Cold path:** the server uses that same selection for hydration,
+  planning, rescoring and scoring. Skipped segments do not fetch scoring
+  sidecars or postings, but a cold node still needs their footers to make
+  the first decision. Partial hydration never marks the namespace fully
+  hydrated. The search timing line reports `knn_segments_pruned` when
+  nonzero.
+- **Tradeoff:** distance to a segment mean is a routing heuristic, not a
+  lower bound. A wide or multimodal segment can contain relevant vectors
+  even when its mean is far away. Sweep the coarse and posting budgets
+  together; do not infer recall from the phase-0 results. This does
+  not replace the within-segment posting selection or #253's namespace
+  posting directory.
+
+### Phase-1 synthetic sweep
+
+Linux x86-64, release build; 60,000 vectors at 128 dimensions, 40
+segments, 200 perturbed queries, brute-force truth. Each row is the
+lowest swept posting budget that reached at least 0.95 recall@10 for
+that layout and segment nprobe. Open counts are modeled from the
+segment shortlist; the offline evaluator pre-opens the readers.
+
+| Blobs | Layout | Segment nprobe | Recall@10 | Postings/query | Segments opened/query | Segments probing postings/query |
+|---:|---|---:|---:|---:|---:|---:|
+| 60 | Input order | off | 0.968 | 62.0 | 40.0 | 39.5 |
+| 60 | Namespace | off | 1.000 | 20.0 | 40.0 | 6.5 |
+| 60 | Namespace | 2 | 0.983 | 20.0 | 2.0 | 2.0 |
+| 600 | Input order | off | 0.964 | 320.0 | 40.0 | 40.0 |
+| 600 | Namespace | off | 0.950 | 80.0 | 40.0 | 30.8 |
+| 600 | Namespace | 24 | 0.953 | 160.0 | 24.0 | 24.0 |
+| 600 | Namespace | 32 | 0.955 | 100.0 | 32.0 | 29.8 |
+
+On the tighter corpus, pruning reduced opens 20× relative to the same
+layout without pruning, at the same posting cost. On the diffuse
+corpus, nprobe ≤16 did not reach the recall target, and saving 16 opens
+at nprobe 24 doubled posting cost relative to pruning off. No swept
+pruning configuration reached the target on the input-order layout.
+This does not meet the 5× postings reduction bar, and it is not a
+measurement of MSMarco recall, S3 bytes/GETs or cold latency.
+
+```sh
+B=target/release
+for blobs in 60 600; do
+  c="./corpus-$blobs"
+  s="./segments-$blobs"
+  "$B/kosha-vector-quant-eval" gen --out "$c" --docs 60000 --dim 128 --clusters "$blobs"
+  for layout in input namespace; do
+    KOSHA_KNN_SEGMENT_SUMMARIES=1 "$B/kosha-build-segments" --shards-dir "$c" \
+      --embeddings-dir "$c" --emb-dim 128 --namespace "$layout" --out-dir "$s" \
+      --docs-per-segment 1500 --threads 4 --cluster-layout "$layout"
+  done
+  "$B/kosha-cluster-eval" --embeddings-dir "$c" --dim 128 --queries 200 \
+    --layout "input=$s/input" --layout "namespace=$s/namespace" \
+    --budgets 10,20,30,40,60,80,100,120,160,200,240,320,480,640,960 \
+    --segment-nprobes 2,4,8,12,16,24,32
+done
 ```
 
 ## Bench plan (WF-2)

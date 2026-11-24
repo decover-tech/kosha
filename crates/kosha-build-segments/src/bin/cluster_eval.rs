@@ -18,7 +18,10 @@
 //! within it (`knn_search_within_filtered`, capped at `budget`). Budgets
 //! are absolute posting counts here (the server floors `num_candidates` to
 //! `KOSHA_KNN_BUDGET_FRACTION` of the namespace's centroids, 5% by
-//! default; `--fractions` sweeps that form instead).
+//! default; `--fractions` converts fractions of the unpruned layout's
+//! centroid count to fixed budgets, so pruning never changes the sweep grid).
+//! `--segment-nprobes` also sweeps coarse pruning on the same segments;
+//! segment opens are modeled, since the evaluator pre-opens all readers.
 //!
 //! Brute force needs every corpus vector in memory: meant for synthetic or
 //! sampled corpora on a workstation, not the 10M bench corpus (use the
@@ -56,10 +59,13 @@ struct Cli {
         default_value = "25,50,100,200,400,800,1600"
     )]
     budgets: Vec<usize>,
-    /// Budgets as fractions of each layout's total centroid count (the
-    /// server's `KOSHA_KNN_BUDGET_FRACTION` form); added to `--budgets`
+    /// Fixed budgets as fractions of each unpruned layout's centroid count;
+    /// added to `--budgets` and held constant across segment probe counts
     #[arg(long, value_delimiter = ',')]
     fractions: Vec<f64>,
+    /// Also run with these coarse segment probe counts (0 = pruning off)
+    #[arg(long, value_delimiter = ',')]
+    segment_nprobes: Vec<usize>,
     /// Recall@k the matched-recall summary compares layouts at
     #[arg(long, default_value_t = 0.95)]
     target_recall: f64,
@@ -233,7 +239,11 @@ fn main() {
         .collect();
     drop(vectors);
 
-    let mut summary: Vec<(String, usize, usize, Option<Point>)> = Vec::new();
+    let mut nprobes = cli.segment_nprobes;
+    nprobes.push(0);
+    nprobes.sort_unstable();
+    nprobes.dedup();
+    let mut summary = Vec::new();
     for spec in &cli.layouts {
         let (name, dir) = spec
             .split_once('=')
@@ -243,85 +253,116 @@ fn main() {
             .iter()
             .map(|s| SegmentReader::open(s.clone()).expect("open segment"))
             .collect();
-        let dists: Vec<Vec<Vec<f32>>> = queries
+        let centroids: usize = readers
             .iter()
-            .map(|q| {
-                readers
-                    .iter()
-                    .map(|r| {
-                        r.knn_centroid_distances(&cli.field, q)
-                            .expect("segment has a lazy v2 index for the field")
-                    })
-                    .collect()
+            .map(|r| {
+                r.knn_centroid_count(&cli.field, cli.dim)
+                    .expect("segment has a lazy v2 index for the field")
+            })
+            .sum();
+        let summaries: Vec<_> = readers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| {
+                let fields = r.footer().vector_fields.as_ref()?;
+                let field = fields.iter().find(|f| f.name == cli.field)?;
+                Some((i, field.knn_segment_centroid.as_deref()?))
             })
             .collect();
-        let centroids: usize = dists[0].iter().map(Vec::len).sum();
-        let mut budgets = cli.budgets.clone();
-        budgets.extend(
-            cli.fractions
+        for &nprobe in &nprobes {
+            let dists: Vec<Vec<Vec<f32>>> = queries
                 .iter()
-                .map(|f| ((centroids as f64 * f).ceil() as usize).max(1)),
-        );
-        budgets.sort_unstable();
-        budgets.dedup();
-        // Postings whose radius-aware lower bound is 0 tie at the front of
-        // every budget: a budget below this count cannot prune them.
-        let zero_lb = dists
-            .iter()
-            .map(|d| d.iter().flatten().filter(|&&x| x <= 0.0).count())
-            .sum::<usize>() as f64
-            / dists.len() as f64;
-        let zero_lb_segments = dists
-            .iter()
-            .map(|d| d.iter().filter(|s| s.iter().any(|&x| x <= 0.0)).count())
-            .sum::<usize>() as f64
-            / dists.len() as f64;
-        println!(
-            "\n## {name}: {} segments, {centroids} posting centroids ({:.0} vectors/posting); \
-             per query {zero_lb:.1} postings in {zero_lb_segments:.1} segments have lower bound 0\n",
-            readers.len(),
-            ids.len() as f64 / centroids.max(1) as f64
-        );
-        println!(
-            "| budget | recall@{k} | postings/query | segments/query | segments p99 | ms/query |",
-            k = cli.k
-        );
-        println!("|---|---|---|---|---|---|");
-        let mut best: Option<Point> = None;
-        for &budget in &budgets {
-            let t = Instant::now();
-            let costs: Vec<QueryCost> = queries
-                .iter()
-                .zip(&dists)
-                .map(|(q, d)| search(&readers, d, &cli.field, q, cli.k, budget))
+                .map(|q| {
+                    let pruned: std::collections::HashSet<_> =
+                        kosha_segment::knn_pruned_by_centroid(q, summaries.iter().copied(), nprobe)
+                            .into_iter()
+                            .collect();
+                    readers
+                        .iter()
+                        .enumerate()
+                        .map(|(i, r)| {
+                            if pruned.contains(&i) {
+                                return Vec::new();
+                            }
+                            r.knn_centroid_distances(&cli.field, q)
+                                .expect("segment has a lazy v2 index for the field")
+                        })
+                        .collect()
+                })
                 .collect();
-            let ms = t.elapsed().as_secs_f64() * 1e3 / queries.len() as f64;
-            let n = costs.len() as f64;
-            let recall = costs
+            let opened = dists
                 .iter()
-                .zip(&truth)
-                .map(|(c, t)| c.ids.iter().filter(|id| t.contains(id)).count() as f64)
-                .sum::<f64>()
-                / (n * cli.k as f64);
-            let mut segs: Vec<usize> = costs.iter().map(|c| c.segments).collect();
-            segs.sort_unstable();
-            let p = Point {
-                budget,
-                recall,
-                postings: costs.iter().map(|c| c.postings).sum::<usize>() as f64 / n,
-                segments: segs.iter().sum::<usize>() as f64 / n,
-                segments_p99: segs[((segs.len() * 99).div_ceil(100)).saturating_sub(1)],
-                ms,
-            };
-            println!(
-                "| {} | {:.3} | {:.1} | {:.1} | {} | {:.2} |",
-                p.budget, p.recall, p.postings, p.segments, p.segments_p99, p.ms
+                .map(|d| d.iter().filter(|distances| !distances.is_empty()).count())
+                .sum::<usize>() as f64
+                / queries.len() as f64;
+            let mut budgets = cli.budgets.clone();
+            budgets.extend(
+                cli.fractions
+                    .iter()
+                    .map(|f| ((centroids as f64 * f).ceil() as usize).max(1)),
             );
-            if best.is_none() && p.recall >= cli.target_recall {
-                best = Some(p);
+            budgets.sort_unstable();
+            budgets.dedup();
+            // Postings whose radius-aware lower bound is 0 tie at the front of
+            // every budget: a budget below this count cannot prune them.
+            let zero_lb = dists
+                .iter()
+                .map(|d| d.iter().flatten().filter(|&&x| x <= 0.0).count())
+                .sum::<usize>() as f64
+                / dists.len() as f64;
+            let zero_lb_segments = dists
+                .iter()
+                .map(|d| d.iter().filter(|s| s.iter().any(|&x| x <= 0.0)).count())
+                .sum::<usize>() as f64
+                / dists.len() as f64;
+            println!(
+                "\n## {name}, segment nprobe {nprobe}: {} segments, {centroids} posting centroids ({:.0} vectors/posting); \
+                 {opened:.1} segments opened per query; \
+                 per query {zero_lb:.1} postings in {zero_lb_segments:.1} segments have lower bound 0\n",
+                readers.len(),
+                ids.len() as f64 / centroids.max(1) as f64
+            );
+            println!(
+                "| budget | recall@{k} | postings/query | segments/query | segments p99 | ms/query |",
+                k = cli.k
+            );
+            println!("|---|---|---|---|---|---|");
+            let mut best: Option<Point> = None;
+            for &budget in &budgets {
+                let t = Instant::now();
+                let costs: Vec<QueryCost> = queries
+                    .iter()
+                    .zip(&dists)
+                    .map(|(q, d)| search(&readers, d, &cli.field, q, cli.k, budget))
+                    .collect();
+                let ms = t.elapsed().as_secs_f64() * 1e3 / queries.len() as f64;
+                let n = costs.len() as f64;
+                let recall = costs
+                    .iter()
+                    .zip(&truth)
+                    .map(|(c, t)| c.ids.iter().filter(|id| t.contains(id)).count() as f64)
+                    .sum::<f64>()
+                    / (n * cli.k as f64);
+                let mut segs: Vec<usize> = costs.iter().map(|c| c.segments).collect();
+                segs.sort_unstable();
+                let p = Point {
+                    budget,
+                    recall,
+                    postings: costs.iter().map(|c| c.postings).sum::<usize>() as f64 / n,
+                    segments: segs.iter().sum::<usize>() as f64 / n,
+                    segments_p99: segs[((segs.len() * 99).div_ceil(100)).saturating_sub(1)],
+                    ms,
+                };
+                println!(
+                    "| {} | {:.3} | {:.1} | {:.1} | {} | {:.2} |",
+                    p.budget, p.recall, p.postings, p.segments, p.segments_p99, p.ms
+                );
+                if best.is_none() && p.recall >= cli.target_recall {
+                    best = Some(p);
+                }
             }
+            summary.push((name.to_string(), nprobe, readers.len(), opened, best));
         }
-        summary.push((name.to_string(), readers.len(), centroids, best));
     }
 
     println!(
@@ -329,16 +370,18 @@ fn main() {
         cli.k, cli.target_recall
     );
     println!(
-        "| layout | segments | centroids | budget | recall | postings/query | segments/query |"
+        "| layout | segment nprobe (0 = off) | segments | budget | recall | postings/query | segments opened/query | segments probed/query |"
     );
-    println!("|---|---|---|---|---|---|---|");
-    for (name, segs, cents, best) in &summary {
+    println!("|---|---|---|---|---|---|---|---|");
+    for (name, nprobe, segs, opened, best) in &summary {
         match best {
             Some(p) => println!(
-                "| {name} | {segs} | {cents} | {} | {:.3} | {:.1} | {:.1} |",
+                "| {name} | {nprobe} | {segs} | {} | {:.3} | {:.1} | {opened:.1} | {:.1} |",
                 p.budget, p.recall, p.postings, p.segments
             ),
-            None => println!("| {name} | {segs} | {cents} | not reached | - | - | - |"),
+            None => {
+                println!("| {name} | {nprobe} | {segs} | not reached | - | - | {opened:.1} | - |")
+            }
         }
     }
 }

@@ -2826,6 +2826,8 @@ pub fn segment_embedding_model_mismatch(footer: &Footer, knn: &kosha_core::KnnQu
         .any(|recorded| recorded != model)
 }
 
+pub type KnnPrunedSegments = HashSet<kosha_core::SegmentId>;
+
 fn late_interaction_params(knn: &kosha_core::KnnQuery) -> kosha_segment::LateInteractionParams {
     kosha_segment::LateInteractionParams {
         nprobe: late_interaction_nprobe(),
@@ -3625,6 +3627,8 @@ pub struct SearchPhaseStats {
     /// with the segment count whatever this says. Read it with
     /// `knn_centroids_scanned`, `knn_plan_ms` and the open counters.
     pub knn_segments_probed: usize,
+    /// Segments omitted before opening by the opt-in coarse kNN plan.
+    pub knn_segments_pruned: usize,
     /// Centroid lower bounds `knn_plan` computed for this query, summed
     /// over every segment it opened (#380): the centroid-scan work of the
     /// global budget, which a cluster-aligned layout does not reduce on its
@@ -3854,6 +3858,7 @@ pub struct Searcher {
     /// Two-stage kNN planning over i8 centroid codes; see
     /// [`Searcher::with_knn_plan_i8`]. Default from `KOSHA_KNN_PLAN_I8`.
     knn_plan_i8: bool,
+    knn_segment_nprobe: usize,
     /// Per-segment rescoring counters (#381): see
     /// [`Searcher::with_knn_rescore_stats`]. Default from
     /// `KOSHA_KNN_RESCORE_STATS`, off.
@@ -3979,6 +3984,10 @@ impl Searcher {
             knn_global_rescore: knn_global_rescore_from_env(),
             knn_global_rescore_max: knn_global_rescore_max_from_env(),
             knn_plan_i8: kosha_segment::knn_plan_i8_from_env(),
+            knn_segment_nprobe: std::env::var("KOSHA_KNN_SEGMENT_NPROBE")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
             knn_rescore_stats: knn_rescore_stats_from_env(),
         }
     }
@@ -4102,6 +4111,61 @@ impl Searcher {
     pub fn with_knn_plan_i8(mut self, on: bool) -> Self {
         self.knn_plan_i8 = on;
         self
+    }
+
+    /// Probe the nearest `nprobe` summarized segments, plus every segment
+    /// without a usable summary. Zero (the default) disables coarse pruning.
+    pub fn with_knn_segment_nprobe(mut self, nprobe: usize) -> Self {
+        self.knn_segment_nprobe = nprobe;
+        self
+    }
+
+    /// Plan coarse segment pruning before scoring files are opened or
+    /// fetched. Unknown segments are retained rather than charged to nprobe.
+    pub fn knn_pruned_segments<'a>(
+        &self,
+        manifest: &Manifest,
+        query: &SearchQuery,
+        mut footer: impl FnMut(&ManifestEntry) -> Option<std::borrow::Cow<'a, Footer>>,
+    ) -> KnnPrunedSegments {
+        let nprobe = self.knn_segment_nprobe;
+        if nprobe == 0
+            || nprobe >= manifest.segments.len()
+            || !query.is_pure_knn()
+            || !query.aggs.is_empty()
+            || query.limit_per.is_some()
+            || query.collapse.is_some()
+            || query.rank_by.is_some()
+            || !query.sort.is_empty()
+            || query.search_after.is_some()
+            || query.exact_total_hits == Some(true)
+        {
+            return HashSet::new();
+        }
+        let Some(knn) = &query.knn else {
+            return HashSet::new();
+        };
+        if knn.is_late_interaction() || knn.filter.is_some() {
+            return HashSet::new();
+        }
+        let footers: Vec<_> = manifest.segments.iter().map(&mut footer).collect();
+        let centroids = footers.iter().enumerate().filter_map(|(i, footer)| {
+            if kosha_core::is_tail_segment_id(&manifest.segments[i].segment_id.0) {
+                return None;
+            }
+            let footer = footer.as_deref()?;
+            if segment_embedding_model_mismatch(footer, knn) {
+                return None;
+            }
+            let field = footer.vector_fields.as_ref()?.iter().find(|field| {
+                field.name == knn.field && field.offsets && field.dim as usize == knn.vector.len()
+            })?;
+            Some((i, field.knn_segment_centroid.as_deref()?))
+        });
+        kosha_segment::knn_pruned_by_centroid(&knn.vector, centroids, nprobe)
+            .into_iter()
+            .map(|i| manifest.segments[i].segment_id.clone())
+            .collect()
     }
 
     /// Whether global bound-driven kNN rescoring (#381) is on. The server
@@ -4434,6 +4498,7 @@ impl Searcher {
         manifest: &Manifest,
         query: &SearchQuery,
         knn: &kosha_core::KnnQuery,
+        pruned: &KnnPrunedSegments,
         cutoff: Option<(f32, usize)>,
         rankings: &HashMap<kosha_core::SegmentId, kosha_segment::KnnSegmentRanking>,
         tombstones: Option<
@@ -4471,6 +4536,7 @@ impl Searcher {
         )> = manifest
             .segments
             .par_iter()
+            .filter(|entry| pruned.is_empty() || !pruned.contains(&entry.segment_id))
             .filter_map(|entry| {
                 let seg_dir = manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id);
                 if !seg_dir.exists() {
@@ -4632,6 +4698,7 @@ impl Searcher {
         manifest: &Manifest,
         query: &SearchQuery,
         knn: &kosha_core::KnnQuery,
+        pruned: &KnnPrunedSegments,
         filter_keys: &FilterKeys,
         tombstones: Option<
             &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
@@ -4674,6 +4741,7 @@ impl Searcher {
         let per_segment: Vec<SegmentInfo<'_>> = manifest
             .segments
             .par_iter()
+            .filter(|entry| pruned.is_empty() || !pruned.contains(&entry.segment_id))
             .filter_map(|entry| {
                 let seg_dir = manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id);
                 if !seg_dir.exists() {
@@ -7403,7 +7471,7 @@ impl Searcher {
             &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
         >,
     ) -> Result<SearchResult, KoshaError> {
-        self.search_inner(namespace, manifest, query, tombstones, None, None)
+        self.search_inner(namespace, manifest, query, tombstones, None, None, None)
             .map(|(result, _stats)| result)
     }
 
@@ -7419,7 +7487,7 @@ impl Searcher {
             &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
         >,
     ) -> Result<(SearchResult, SearchPhaseStats), KoshaError> {
-        self.search_inner(namespace, manifest, query, tombstones, None, None)
+        self.search_inner(namespace, manifest, query, tombstones, None, None, None)
     }
 
     /// Like [`Searcher::search_with_stats`], but with an optional callback
@@ -7445,7 +7513,7 @@ impl Searcher {
         >,
         hydrator: DocStoreHydrator<'_>,
     ) -> Result<(SearchResult, SearchPhaseStats), KoshaError> {
-        self.search_inner(namespace, manifest, query, tombstones, hydrator, None)
+        self.search_inner(namespace, manifest, query, tombstones, hydrator, None, None)
     }
 
     /// [`Searcher::search_with_doc_store_hydrator`] plus `vector_fetch`,
@@ -7467,6 +7535,32 @@ impl Searcher {
         hydrator: DocStoreHydrator<'_>,
         vector_fetch: Option<VectorSpanFetch<'_>>,
     ) -> Result<(SearchResult, SearchPhaseStats), KoshaError> {
+        self.search_with_hydrators_and_pruning(
+            namespace,
+            manifest,
+            query,
+            tombstones,
+            hydrator,
+            vector_fetch,
+            None,
+        )
+    }
+
+    /// Reuse the exact segment-pruning decision made by footer-first
+    /// hydration. `None` lets the searcher plan from cached/local footers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_with_hydrators_and_pruning(
+        &self,
+        namespace: &NamespaceId,
+        manifest: &Manifest,
+        query: &SearchQuery,
+        tombstones: Option<
+            &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
+        >,
+        hydrator: DocStoreHydrator<'_>,
+        vector_fetch: Option<VectorSpanFetch<'_>>,
+        pruned: Option<&KnnPrunedSegments>,
+    ) -> Result<(SearchResult, SearchPhaseStats), KoshaError> {
         self.search_inner(
             namespace,
             manifest,
@@ -7474,6 +7568,7 @@ impl Searcher {
             tombstones,
             hydrator,
             vector_fetch,
+            pruned,
         )
     }
 
@@ -7494,10 +7589,12 @@ impl Searcher {
         let first = query.first_stage_query().ok_or_else(|| {
             KoshaError::InvalidQuery("search_reranked needs a request with rerank".into())
         })?;
-        let (result, _) = self.search_inner(namespace, manifest, &first, tombstones, None, None)?;
+        let (result, _) =
+            self.search_inner(namespace, manifest, &first, tombstones, None, None, None)?;
         Ok(rerank::apply(query, result, provider))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn search_inner(
         &self,
         namespace: &NamespaceId,
@@ -7508,6 +7605,7 @@ impl Searcher {
         >,
         doc_store_hydrator: DocStoreHydrator<'_>,
         vector_fetch: Option<VectorSpanFetch<'_>>,
+        pruned: Option<&KnnPrunedSegments>,
     ) -> Result<(SearchResult, SearchPhaseStats), KoshaError> {
         // Out-of-range BM25 parameters are a client error, not something
         // to clamp: every entry point funnels through here.
@@ -7676,6 +7774,22 @@ impl Searcher {
         // Late interaction (#205) probes its own per-field token index;
         // none of this applies to it.
         let t_knn_plan = Instant::now();
+        let local_pruned;
+        let pruned = match pruned {
+            Some(pruned) => pruned,
+            None => {
+                local_pruned = self.knn_pruned_segments(manifest, query, |entry| {
+                    let dir = manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id);
+                    if !dir.exists() {
+                        return None;
+                    }
+                    manifest
+                        .footer_or_read(&entry.segment_id, || SegmentReader::read_footer(&dir).ok())
+                });
+                &local_pruned
+            }
+        };
+        phase_stats.knn_segments_pruned = pruned.len();
         let knn_plan = match query.knn {
             Some(ref knn) if !knn.is_late_interaction() => {
                 let plan = self.knn_plan(
@@ -7683,6 +7797,7 @@ impl Searcher {
                     manifest,
                     query,
                     knn,
+                    pruned,
                     &filter_keys,
                     tombstones,
                     &permit,
@@ -7720,6 +7835,7 @@ impl Searcher {
                     manifest,
                     query,
                     knn,
+                    pruned,
                     knn_plan.cutoff,
                     &knn_plan.rankings,
                     tombstones,
@@ -7774,6 +7890,9 @@ impl Searcher {
 
         let t_score = Instant::now();
         let score_one = |entry: &ManifestEntry, shared_wand: Option<SharedWand<'_>>| {
+            if !pruned.is_empty() && pruned.contains(&entry.segment_id) {
+                return Ok(None);
+            }
             self.score_segment(
                 namespace,
                 entry,
@@ -11910,6 +12029,88 @@ mod tests {
         );
         assert!(stats.knn_plan_ms >= 0.0);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn knn_segment_pruning_keeps_unsummarized_segments() {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-knn-segment-pruning-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let mut manifest = Manifest::empty(1);
+        for (name, x, y, summary) in [
+            ("near", 1.0, 0.0, true),
+            ("far", -1.0, 0.0, true),
+            ("legacy", 0.0, 1.0, false),
+            ("_tail-test", -1.0, 0.0, true),
+        ] {
+            let segment_id = SegmentId(name.into());
+            let mut writer = SegmentWriter::new(segment_id.clone(), dir.join("test").join(name))
+                .with_knn_segment_summaries(summary);
+            for i in 0..24 {
+                writer.add_document(
+                    DocumentId(format!("{name}-{i}")),
+                    vec![Field::vector("emb", vec![x, y + i as f32 * 0.01])],
+                );
+            }
+            let footer = writer.finalize(Bm25Params::default()).unwrap();
+            assert_eq!(
+                footer.vector_fields.unwrap()[0]
+                    .knn_segment_centroid
+                    .is_some(),
+                summary
+            );
+            manifest.segments.push(ManifestEntry {
+                segment_id,
+                doc_count: 24,
+            });
+        }
+        let mut query = mk_query("", 10);
+        query.knn = Some(
+            serde_json::from_value(serde_json::json!({
+                "field": "emb", "vector": [1.0, 0.0], "k": 10, "num_candidates": 100
+            }))
+            .unwrap(),
+        );
+        for rescore in [false, true] {
+            let search = |nprobe, query: &SearchQuery| {
+                Searcher::new(dir.clone())
+                    .with_knn_segment_nprobe(nprobe)
+                    .with_knn_global_rescore(rescore)
+                    .search_with_stats(&ns, &manifest, query, None)
+                    .unwrap()
+            };
+            let (base, all) = search(0, &query);
+            let (result, pruned) = search(1, &query);
+            assert_eq!(all.open_cold, 4);
+            assert_eq!(pruned.open_cold, 3);
+            assert_eq!(pruned.knn_segments_pruned, 1);
+            assert_eq!(base.results.len(), 10);
+            assert!(base
+                .results
+                .iter()
+                .all(|hit| hit.doc_id.0.starts_with("near-")));
+            assert_eq!(
+                base.results
+                    .iter()
+                    .map(|hit| &hit.doc_id)
+                    .collect::<Vec<_>>(),
+                result
+                    .results
+                    .iter()
+                    .map(|hit| &hit.doc_id)
+                    .collect::<Vec<_>>()
+            );
+            let mut restricted = query.clone();
+            restricted.knn.as_mut().unwrap().filter =
+                Some(FilterClause::MatchAll { match_all: None });
+            let (_, filtered) = search(1, &restricted);
+            assert_eq!(filtered.knn_segments_pruned, 0);
+            assert_eq!(filtered.open_cold, 4);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
