@@ -145,6 +145,9 @@ on). The histograms are fixed-bucket atomic counters rather than `prometheus-cli
 mutex-guarded histogram. Rendering, done only per scrape, takes the queue's mutex once to
 read its depth.
 
+For example alert rules, an internal tenant dashboard recipe, and incident runbooks, see
+[Managed-service operations](operations/managed-service.md).
+
 ## Checking the output
 
     curl -s localhost:8080/metrics | promtool check metrics
