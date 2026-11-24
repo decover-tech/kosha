@@ -187,11 +187,19 @@ fn load_fixture(dir: &Path) -> Fixture {
     let mut docs = Vec::with_capacity(rows.len());
     let mut vectors = Vec::new();
     let mut vector_rank = Vec::new();
+    let mut seen = HashSet::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
         let id = row["id"]
             .as_str()
             .unwrap_or_else(|| panic!("corpus line {}: `id` must be a string", i + 1))
             .to_string();
+        // Indexing keeps only the last version of a repeated id, so brute force
+        // over every row would rank vectors the index never searched.
+        assert!(
+            seen.insert(id.clone()),
+            "corpus line {}: duplicate id {id}",
+            i + 1
+        );
         let mut fields = Vec::new();
         if let Some(obj) = row["fields"].as_object() {
             for (name, v) in obj {
