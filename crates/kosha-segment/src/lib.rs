@@ -7100,10 +7100,14 @@ impl LazyVectorIndex {
     }
 
     fn probe_radii(&self) -> &[f32] {
+        self.selected_radius_quantiles().unwrap_or(&self.radii)
+    }
+
+    fn selected_radius_quantiles(&self) -> Option<&[f32]> {
         match (self.probe_radius, &self.radius_quantiles) {
-            (KnnProbeRadius::P50, Some([p50, _])) => p50,
-            (KnnProbeRadius::P90, Some([_, p90])) => p90,
-            _ => &self.radii,
+            (KnnProbeRadius::P50, Some([p50, _])) => Some(p50),
+            (KnnProbeRadius::P90, Some([_, p90])) => Some(p90),
+            _ => None,
         }
     }
 
@@ -8957,7 +8961,7 @@ impl SegmentReader {
     }
 
     /// kNN search over the lazy v2 posting index of the segment's first
-    /// vector column: probe `nprobe` nearest centroids (all resident, no
+    /// vector column: probe `nprobe` top-ranked centroids (all resident, no
     /// I/O), hydrate just those candidate postings from disk, score by
     /// cosine similarity, return the top `k`. `None` if that column has no
     /// lazy vector index — the caller (see `kosha-query`'s KNN block) falls
@@ -10133,13 +10137,6 @@ impl SegmentReader {
         })
     }
 
-    // Deliberately NOT radius-aware: this is the per-segment `nprobe`
-    // fallback used only when `KOSHA_KNN_GLOBAL_BUDGET=0` disables global
-    // budgeting entirely (an escape hatch, not the default query path).
-    // `kosha_vector_spfresh::nearest_centroids`/`nearest_centroids_dot`
-    // rank by raw distance and don't take a radius parameter — extending
-    // them is separate, lower-priority scope than the global-budget path
-    // this fix targets.
     fn knn_search_lazy(
         &self,
         vi: &LazyVectorIndex,
@@ -10185,7 +10182,22 @@ impl SegmentReader {
         } else {
             nprobe
         };
-        let candidates = if vi.dim == 0 {
+        let candidates = if let Some(radii) = vi.selected_radius_quantiles() {
+            let alpha = knn_probe_radius_alpha();
+            let unit = vi.unit_norm.then_some(query);
+            let scores = radii
+                .iter()
+                .enumerate()
+                .map(|(i, &radius)| {
+                    Self::centroid_score(vi.centroid(i), unit, query, radius, alpha)
+                })
+                .collect();
+            KnnSegmentRanking::new(scores, f32::INFINITY, rank)
+                .budgeted
+                .into_iter()
+                .map(|i| i as usize)
+                .collect()
+        } else if vi.dim == 0 {
             // A zero-dimension column (no writer produces one, but the
             // parsers accept it) has a centroid per posting and nothing in
             // the matrix to tell them apart by: rank the empty rows.
