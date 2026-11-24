@@ -2324,8 +2324,8 @@ fn score_fuzzy_query(
                 .iter()
                 .map(|e| (e.key.as_str(), e.edits))
                 .collect();
-            let postings = reader.postings_for_terms(&keys);
-            if reader.take_blob_read_failure() {
+            let postings = reader.read_postings_for_terms(&keys)?;
+            if !reader.is_tiered() && reader.take_blob_read_failure() {
                 return Err(KoshaError::CorruptSegment(format!(
                     "segment {segment}: posting blob unreadable for a fuzzy expansion \
                      (evicted or corrupt) — retry after rehydration"
@@ -2468,7 +2468,7 @@ fn score_field_query(
     for keys in slots.values() {
         let mut slot_scores: HashMap<u32, f64> = HashMap::new();
         for (i, key) in keys {
-            let Some(postings) = reader.postings(key) else {
+            let Some(postings) = reader.read_postings(key)? else {
                 continue;
             };
             let field = &scoring[*i];
@@ -2490,7 +2490,7 @@ fn score_field_query(
                     field.boost * scorer.score_term(posting.term_frequency, df, length);
             }
         }
-        if reader.take_blob_read_failure() {
+        if !reader.is_tiered() && reader.take_blob_read_failure() {
             return Err(KoshaError::CorruptSegment(format!(
                 "segment {segment}: posting blob unreadable for a present field term \
                  (evicted or corrupt) — retry after rehydration"
@@ -5888,7 +5888,8 @@ impl Searcher {
                     // Alongside each source, the `df` its scores and block
                     // ceilings use (namespace-level unless segment stats).
                     let (score_dfs, sources): (Vec<u32>, Vec<ScoringBlocks<'_>>) = reader
-                        .scoring_postings_for_terms(terms_for_bm25)
+                        .read_scoring_postings_for_terms(terms_for_bm25)
+                        .ok()?
                         .into_iter()
                         .map(|(term, scoring)| {
                             let source = ScoringBlocks::new(scoring);
@@ -5896,7 +5897,7 @@ impl Searcher {
                             (scorer.doc_frequency(term, segment_df), source)
                         })
                         .unzip();
-                    if reader.take_blob_read_failure() {
+                    if !reader.is_tiered() && reader.take_blob_read_failure() {
                         // A TOC-present term's blob shard was unreadable —
                         // fall through to the general path, whose refetch
                         // either succeeds or surfaces a hard error. Serving
@@ -6543,8 +6544,8 @@ impl Searcher {
                 // — see `SegmentReader::postings`. Fetched once per term here
                 // and held for the whole scoring pass either way.
                 let term_postings: Vec<(&str, kosha_segment::PostingsRef<'_>)> =
-                    reader.postings_for_terms(terms_for_bm25);
-                if reader.take_blob_read_failure() {
+                    reader.read_postings_for_terms(terms_for_bm25)?;
+                if !reader.is_tiered() && reader.take_blob_read_failure() {
                     // A term the TOC contains could not be served (blob shard
                     // evicted/corrupt). Erroring here — instead of scoring
                     // without the term — is what keeps eviction races from
@@ -6679,9 +6680,11 @@ impl Searcher {
                     // the once-per-term discipline matters for real: the decoded
                     // handles are bound first (they must outlive the maps, which
                     // borrow position slices out of them).
-                    let phrase_postings_data: Vec<Option<kosha_segment::PostingsRef<'_>>> =
-                        phrase_terms.iter().map(|pt| reader.postings(pt)).collect();
-                    if reader.take_blob_read_failure() {
+                    let phrase_postings_data = phrase_terms
+                        .iter()
+                        .map(|pt| reader.read_postings(pt))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if !reader.is_tiered() && reader.take_blob_read_failure() {
                         // Same contract as the scoring fetch above: an
                         // unreadable blob for a TOC-present phrase term must
                         // error, not silently fail the phrase.

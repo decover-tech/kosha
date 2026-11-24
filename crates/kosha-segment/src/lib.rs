@@ -6377,11 +6377,19 @@ impl SplitInvertedIndex {
 
     fn postings(&self, term: &str) -> Option<Arc<Vec<Posting>>> {
         let i = self.find(term)?;
+        let postings = self.postings_at(i);
+        if postings.is_none() {
+            self.note_blob_read_failure();
+        }
+        postings
+    }
+
+    fn postings_at(&self, i: usize) -> Option<Arc<Vec<Posting>>> {
         if let Some(hit) = self.cache.get(i) {
             return Some(hit);
         }
         let admit = self.cache.admit_on_miss(i);
-        let (postings, approx_bytes) = self.decode_postings(i)?;
+        let (postings, approx_bytes) = self.decode_postings_inner(i)?;
         let arc = Arc::new(postings);
         if admit {
             self.cache.insert(i, Arc::clone(&arc), approx_bytes);
@@ -6449,18 +6457,6 @@ impl SplitInvertedIndex {
         }
 
         slots.into_iter().flatten().collect()
-    }
-
-    fn decode_postings(&self, i: usize) -> Option<(Vec<Posting>, usize)> {
-        let decoded = self.decode_postings_inner(i);
-        if decoded.is_none() {
-            // The TOC contains this term (callers only reach here after
-            // `find` succeeded) but its blob shard couldn't serve it —
-            // evicted, truncated, or corrupt. Flag it so the query layer
-            // can error instead of silently treating the term as absent.
-            self.note_blob_read_failure();
-        }
-        decoded
     }
 
     fn decode_postings_inner(&self, i: usize) -> Option<(Vec<Posting>, usize)> {
@@ -10548,6 +10544,44 @@ impl SegmentReader {
         self.inverted.postings(term)
     }
 
+    /// Read a term without reporting a v8 read failure on the shared reader.
+    pub fn read_postings(&self, term: &str) -> Result<Option<PostingsRef<'_>>, KoshaError> {
+        if let InvertedAccess::Split(index) = &self.inverted {
+            if index.tier_terms.is_some() {
+                return index
+                    .find(term)
+                    .map(|i| {
+                        index.postings_at(i).map(PostingsRef::Shared).ok_or_else(|| {
+                            KoshaError::CorruptSegment(format!(
+                                "segment {:?}: posting blob unreadable for {term:?} (evicted or corrupt) — retry after rehydration",
+                                self.segment_dir
+                            ))
+                        })
+                    })
+                    .transpose();
+            }
+        }
+        Ok(self.postings(term))
+    }
+
+    /// Batch read with the same per-call v8 failure semantics as `read_postings`.
+    pub fn read_postings_for_terms<'a>(
+        &'a self,
+        terms: &'a [String],
+    ) -> Result<Vec<(&'a str, PostingsRef<'a>)>, KoshaError> {
+        if !self.is_tiered() {
+            return Ok(self.postings_for_terms(terms));
+        }
+        terms
+            .iter()
+            .filter_map(|term| {
+                self.read_postings(term)
+                    .transpose()
+                    .map(|p| p.map(|p| (term.as_str(), p)))
+            })
+            .collect()
+    }
+
     /// Fetch postings for a batch of terms. Split-postings segments group
     /// the batch by posting shard so wildcard expansions read/decompress
     /// each shard once instead of once per matching term.
@@ -10607,6 +10641,20 @@ impl SegmentReader {
             .into_iter()
             .map(|(t, p)| (t, ScoringPostingsRef::Decoded(p)))
             .collect()
+    }
+
+    pub fn read_scoring_postings_for_terms<'a>(
+        &'a self,
+        terms: &'a [String],
+    ) -> Result<Vec<(&'a str, ScoringPostingsRef<'a>)>, KoshaError> {
+        if !self.is_tiered() {
+            return Ok(self.scoring_postings_for_terms(terms));
+        }
+        Ok(self
+            .read_postings_for_terms(terms)?
+            .into_iter()
+            .map(|(term, postings)| (term, ScoringPostingsRef::Decoded(postings)))
+            .collect())
     }
 
     pub fn is_tiered(&self) -> bool {
@@ -11093,14 +11141,14 @@ impl SegmentReader {
             return Ok(Some(Arc::clone(found)));
         }
         let mut lengths = vec![0u32; self.doc_count() as usize];
-        if let Some(postings) = self.postings(&kosha_core::fields::field_norms_key(field)) {
+        if let Some(postings) = self.read_postings(&kosha_core::fields::field_norms_key(field))? {
             for posting in postings.iter() {
                 if let Some(slot) = lengths.get_mut(posting.doc_id as usize) {
                     *slot = posting.term_frequency;
                 }
             }
         }
-        if self.take_blob_read_failure() {
+        if !self.is_tiered() && self.take_blob_read_failure() {
             return Err(KoshaError::CorruptSegment(format!(
                 "segment {:?}: norms of field {field:?} unreadable (evicted or corrupt) — \
                  retry after rehydration",

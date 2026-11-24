@@ -139,6 +139,22 @@ fn tiered_search_certifies_or_fetches_and_matches_full_postings() {
     let remote = std::fs::read(seg.join(TIER_TAIL_FILE)).unwrap();
     std::fs::remove_file(seg.join(TIER_TAIL_FILE)).unwrap();
     assert!(!kosha_segment::tier_files_present(&seg));
+    let reader = kosha_segment::SegmentReader::open_with_options(seg.clone(), false).unwrap();
+    let failed = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            let result = reader.read_postings("flat");
+            failed.wait();
+            result
+        });
+        failed.wait();
+        assert!(reader.read_postings("absentword").unwrap().is_none());
+        assert!(!reader.take_blob_read_failure());
+        assert!(matches!(
+            first.join().unwrap(),
+            Err(kosha_core::KoshaError::CorruptSegment(_))
+        ));
+    });
     let fetched = AtomicUsize::new(0);
     let fetch = |dir: &Path, file: &str, ranges: &[(u64, u64)]| -> SpanHolds {
         assert_eq!(dir, seg);
