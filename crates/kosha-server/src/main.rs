@@ -3630,6 +3630,18 @@ impl AppState {
         }
     }
 
+    fn bootstrap_namespace_centroids(&self) {
+        for ns in self.indexer.namespaces() {
+            let lock = self.publication_lock(&ns);
+            let _guard = lock.lock().unwrap();
+            if let Some((published, manifest)) = self.indexer.publication_snapshot(&ns) {
+                if published == manifest.version && !manifest.segments.is_empty() {
+                    self.maintain_namespace_centroids(&ns, &manifest);
+                }
+            }
+        }
+    }
+
     fn maintain_namespace_centroids(&self, ns: &NamespaceId, manifest: &kosha_core::Manifest) {
         if self.namespace_centroids_enabled {
             if let Err(error) = self.update_namespace_centroids(ns, manifest) {
@@ -6779,6 +6791,15 @@ fn main() {
     state.spawn_posting_promoter();
     state.spawn_idle_flush_timer();
     state.spawn_compaction_scheduler();
+    if state.namespace_centroids_enabled
+        && matches!(state.role, role::Role::Indexer | role::Role::Standalone)
+    {
+        let state = Arc::clone(&state);
+        std::thread::Builder::new()
+            .name("kosha-namespace-centroid-bootstrap".into())
+            .spawn(move || state.bootstrap_namespace_centroids())
+            .expect("failed to spawn namespace centroid bootstrap thread");
+    }
     state.spawn_writer_lease_renewer();
     state.spawn_manifest_refresher();
     state.spawn_local_gc();
@@ -14898,6 +14919,37 @@ mod tests {
             assert_eq!(snapshot.directory.posting_count(&segment.0, "emb", 2), 1);
         }
         assert!(!ingest.data_dir.join(&ns.0).join(FILE_NAME).exists());
+    }
+
+    #[test]
+    fn indexer_bootstraps_namespace_centroids_for_an_already_restored_manifest() {
+        use kosha_segment::namespace_centroids::{Snapshot, FILE_NAME};
+
+        let mut state = test_state();
+        state.role = role::Role::Indexer;
+        state.namespace_centroids_enabled = false;
+        let ns = NamespaceId("bootstrap-routing".into());
+        write_and_flush(&state, &ns, "before-startup");
+        state.publish_namespace(&ns).unwrap();
+        let manifest = state
+            .controller
+            .lock()
+            .unwrap()
+            .manifest_cloned(&ns)
+            .unwrap();
+        state.indexer.restore_manifest(ns.clone(), manifest.clone());
+        let path = state.data_dir.join(&ns.0).join(FILE_NAME);
+        assert!(!path.exists());
+
+        state.namespace_centroids_enabled = true;
+        state.indexer_follow_all();
+        assert!(!path.exists()); // the already-current manifest is skipped
+        state.bootstrap_namespace_centroids();
+        let snapshot: Snapshot = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(snapshot.matches(
+            manifest.version,
+            manifest.segments.iter().map(|s| s.segment_id.0.as_str()),
+        ));
     }
 
     fn wal_is_empty(state: &AppState) -> bool {
