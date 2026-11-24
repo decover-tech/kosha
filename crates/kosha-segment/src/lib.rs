@@ -1181,9 +1181,12 @@ impl SegmentWriter {
             let encoded_len = if let Some(fraction) = fraction {
                 let mut full_span = Vec::new();
                 encoder.finish(&mut full_span)?;
-                let (mut postings, _) = BlockedTermPostings::parse(Arc::new(full_span))
-                    .and_then(|span| span.decode_full())
-                    .ok_or_else(|| KoshaError::CorruptSegment("newly encoded tier input".into()))?;
+                let (mut postings, _) =
+                    BlockedTermPostings::parse(Arc::new(full_span), SKIP_SPLIT_INVERTED_VERSION)
+                        .and_then(|span| span.decode_full(&term))
+                        .ok_or_else(|| {
+                            KoshaError::CorruptSegment("newly encoded tier input".into())
+                        })?;
                 let df = u32::try_from(postings.len())
                     .map_err(|_| std::io::Error::other("tier document frequency exceeds u32"))?;
                 let mut tail = Vec::new();
@@ -3760,26 +3763,24 @@ mod vector_index_v2_tests {
                 RABITQ_QUANTILE_VECTOR_INDEX_VERSION,
             ),
         ] {
-            let (_, old_offsets, _) =
-                SegmentWriter::encode_vector_column(
-                    &column,
-                    None,
-                    quantization,
-                    4,
-                    VectorRebuildTrigger::default(),
-                    false,
-                )
-                .unwrap();
-            let (idx, new_offsets, _) =
-                SegmentWriter::encode_vector_column(
-                    &column,
-                    None,
-                    quantization,
-                    5,
-                    VectorRebuildTrigger::default(),
-                    false,
-                )
-                .unwrap();
+            let (_, old_offsets, _) = SegmentWriter::encode_vector_column(
+                &column,
+                None,
+                quantization,
+                4,
+                VectorRebuildTrigger::default(),
+                false,
+            )
+            .unwrap();
+            let (idx, new_offsets, _) = SegmentWriter::encode_vector_column(
+                &column,
+                None,
+                quantization,
+                5,
+                VectorRebuildTrigger::default(),
+                false,
+            )
+            .unwrap();
             assert_eq!(parse_vector_idx_header(&idx), Some((2, 2, newer)));
             let old = parse_vector_offsets(&old_offsets, 2, older).unwrap();
             let new = parse_vector_offsets(&new_offsets, 2, newer).unwrap();
@@ -7568,7 +7569,7 @@ impl SplitInvertedIndex {
                     tier.tail_start,
                     tier.tail_end - tier.tail_start,
                 )?;
-                let (tail, tail_bytes) = self.decode_term(&tail)?;
+                let (tail, tail_bytes) = self.decode_term(self.term_at(i), &tail)?;
                 head.extend(tail);
                 bytes += tail_bytes;
                 head.sort_unstable_by_key(|p| p.doc_id);
@@ -11334,7 +11335,8 @@ impl SegmentReader {
         for &range_idx in &ranking.budgeted {
             if let (Some(alpha), Some(theta)) = (stop_alpha, sink.kth_lower()) {
                 let i = range_idx as usize;
-                let distance = Self::centroid_score(vi.centroid(i), unit.as_deref(), query, 0.0, 0.0);
+                let distance =
+                    Self::centroid_score(vi.centroid(i), unit.as_deref(), query, 0.0, 0.0);
                 if bound_stop(theta, distance, vi.radii[i], alpha) {
                     scan.stats.bound_skips += 1;
                     continue;
