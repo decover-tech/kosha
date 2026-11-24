@@ -66,7 +66,7 @@ def test_install_configures_existing_base_and_waits_for_all_roles(kubectl):
     assert rendered["images"] == [{
         "name": "kosha", "newName": "registry.example:5000/kosha", "newTag": "1.2.3",
     }]
-    config, account, namespace = [
+    config, account, namespace, _ = [
         json.loads(patch["patch"]) for patch in rendered["patches"]
     ]
     assert config["data"] == {
@@ -78,6 +78,22 @@ def test_install_configures_existing_base_and_waits_for_all_roles(kubectl):
         "eks.amazonaws.com/role-arn": "arn:aws:iam::123456789012:role/kosha",
     }
     assert namespace["$patch"] == "delete"
+
+
+def test_query_forwarding_uses_cluster_dns_search_path(kubectl):
+    invoke, _, _, rendered = kubectl
+    assert invoke(*INSTALL) == 0
+    patches = [json.loads(patch["patch"]) for patch in rendered["patches"]]
+    query = next(patch for patch in patches if patch["kind"] == "Deployment")
+    assert query["metadata"] == {"name": "kosha-query", "namespace": "kosha"}
+    containers = query["spec"]["template"]["spec"]["containers"]
+    assert containers == [{
+        "name": "kosha",
+        "env": [{
+            "name": "KOSHA_INGEST_HOST",
+            "value": "http://kosha-ingest-service.kosha.svc:8080",
+        }],
+    }]
 
 
 @pytest.mark.parametrize("deployment", DEPLOYMENTS)

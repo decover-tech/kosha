@@ -57,6 +57,18 @@ def render_overlay(root: Path, args: argparse.Namespace) -> Path:
         "metadata": {"name": "kosha"},
         "$patch": "delete",
     }
+    query = {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": "kosha-query", "namespace": "kosha"},
+        "spec": {"template": {"spec": {"containers": [{
+            "name": "kosha",
+            "env": [{
+                "name": "KOSHA_INGEST_HOST",
+                "value": "http://kosha-ingest-service.kosha.svc:8080",
+            }],
+        }]}}},
+    }
     kustomization = {
         "apiVersion": "kustomize.config.k8s.io/v1beta1",
         "kind": "Kustomization",
@@ -64,7 +76,8 @@ def render_overlay(root: Path, args: argparse.Namespace) -> Path:
         "resources": ["../base"],
         "images": [args.image],
         "patches": [
-            {"patch": json.dumps(patch)} for patch in (config, account, namespace)
+            {"patch": json.dumps(patch)}
+            for patch in (config, account, namespace, query)
         ],
     }
     (overlay / "kustomization.yaml").write_text(
