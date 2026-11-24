@@ -244,10 +244,11 @@ async fn rotate(
             kind.condition()
         ))
     );
+    // Match the server's whole-second clock so zero overlap expires immediately.
     let retire = format!(
         "UPDATE kosha.api_keys \
-         SET expires_at = LEAST(COALESCE(expires_at, 'infinity'), \
-                                NOW() + make_interval(secs => $2::DOUBLE PRECISION)) \
+         SET expires_at = date_trunc('second', LEAST(COALESCE(expires_at, 'infinity'), \
+                                NOW() + make_interval(secs => $2::DOUBLE PRECISION))) \
          WHERE {KEY_HASH} = $1 \
          RETURNING EXTRACT(EPOCH FROM expires_at)::BIGINT"
     );

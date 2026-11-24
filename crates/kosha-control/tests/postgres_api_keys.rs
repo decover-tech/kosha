@@ -184,6 +184,31 @@ fn plaintext_rows_from_before_the_migration_keep_working_and_can_be_scrubbed() {
 
 #[test]
 #[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn rotation_does_not_round_a_fractional_deadline_up() {
+    let store = PgStore::new(&url()).unwrap();
+    let old = store
+        .create_api_key(&full_access(&tenant("rotate")))
+        .unwrap();
+    let expires = now() + 3600;
+    // Older rotations could leave a fractional expiry. It caps this rotation's overlap.
+    sql::<(i32,)>(
+        "UPDATE kosha.api_keys \
+         SET expires_at = to_timestamp($2::TEXT::DOUBLE PRECISION) + INTERVAL '750 milliseconds' \
+         WHERE key_hash = $1 RETURNING 1",
+        &[&old.record.key_hash, &expires.to_string()],
+    );
+
+    let rotated = store
+        .rotate_api_key(&old.record.key_hash, 7200, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(rotated.old_expires_at, expires);
+    let listed = store.get_api_key(&old.record.key_hash).unwrap().unwrap();
+    assert_eq!(listed.expires_at, Some(expires));
+}
+
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
 fn rotation_overlaps_then_the_old_key_expires() {
     let store = PgStore::new(&url()).unwrap();
     let t = tenant("rotate");
