@@ -42,6 +42,25 @@ impl Reclaimed {
     }
 }
 
+fn branch_commit_error(error: &KoshaError, existing_placeholder: Option<u64>) -> String {
+    match (error, existing_placeholder) {
+        (KoshaError::ManifestCommitNotAttempted(_), None) => {
+            control_store_unavailable(&format!("branch commit failed: {error}"))
+        }
+        (KoshaError::ManifestCommitNotAttempted(_), Some(version)) => ApiError::new(
+            ErrorCode::Unavailable,
+            format!("branch commit failed: {error}"),
+        )
+        .redact("branch was not created; an empty namespace already occupies its name")
+        .detail("reason", "control_store")
+        .detail("outcome", "branch_not_created")
+        .detail("placeholder_version", version)
+        .not_retryable()
+        .into_raw(),
+        _ => publication_error("branch commit failed", error),
+    }
+}
+
 impl AppState {
     /// Resolve every deletion bitmap `manifest` (of `ns`) references into
     /// its in-memory tombstones, reading each where it lives.
@@ -142,9 +161,9 @@ impl AppState {
                     .lock()
                     .unwrap()
                     .compare_and_swap_manifest(child, at, stored.clone())
-                    .map_err(|e| publication_error("branch commit failed", &e))?;
+                    .map_err(|e| branch_commit_error(&e, Some(at)))?;
             }
-            Err(e) => return Err(publication_error("branch commit failed", &e)),
+            Err(e) => return Err(branch_commit_error(&e, None)),
         }
 
         // The writer needs the deletes in memory. This process normally
@@ -194,7 +213,23 @@ impl AppState {
 
     /// Delete the branch `ns` and reclaim its unreferenced objects. `Err`
     /// is a ready-to-send JSON error response.
+    #[cfg(test)]
     pub(crate) fn delete_branch(&self, ns: &NamespaceId) -> Result<(Manifest, Reclaimed), String> {
+        self.delete_branch_recorded(ns, None)
+            .map(|(manifest, reclaimed, _)| (manifest, reclaimed))
+    }
+
+    /// [`Self::delete_branch`] with its deletion record (#347): written,
+    /// pending, in the control-store step that drops the branch, and
+    /// completed once every object of its prefix that no remaining manifest
+    /// references is gone (objects a branch of this branch still lists stay
+    /// by design, and go with that branch). `parent` is the tenant deletion
+    /// this is part of.
+    pub(crate) fn delete_branch_recorded(
+        &self,
+        ns: &NamespaceId,
+        parent: Option<&str>,
+    ) -> Result<(Manifest, Reclaimed, kosha_core::deletion::DeletionRecord), String> {
         let _lineage = self.branch_lock.lock().unwrap();
         let stored = self
             .controller
@@ -219,6 +254,9 @@ impl AppState {
         flush_and_publish_namespace(self, ns)?;
         let lock = self.publication_lock(ns);
         let _publication = lock.lock().unwrap();
+        let request =
+            kosha_core::deletion::NewDeletion::branch(&ns.0, namespace_tenant(&ns.0), parent)
+                .with_acks(self.deletion_requires_acks());
         let mut outcome = None;
         self.indexer
             .drop_branch_namespace(ns, || {
@@ -242,11 +280,16 @@ impl AppState {
                 // created under the same name starts above it and query
                 // replicas' version-keyed caches never serve the deleted
                 // branch (#305).
-                let removed = match controller.delete_namespace(ns, stored.version) {
-                    Ok((removed, _)) => removed,
-                    Err(KoshaError::NamespaceNotFound(_)) => stored.clone(),
-                    Err(e) => return Err(e),
-                };
+                // With its deletion record, in one step (#347).
+                let (removed, record) =
+                    match controller.delete_namespace_recorded(ns, stored.version, &request) {
+                        Ok((removed, _, record)) => (removed, record),
+                        Err(KoshaError::NamespaceNotFound(_)) => (
+                            stored.clone(),
+                            controller.begin_deletion(&request, stored.version)?,
+                        ),
+                        Err(e) => return Err(e),
+                    };
                 drop(controller);
                 // Prefixes to reclaim: this namespace's own, and that of
                 // every already-deleted branch whose objects it was keeping
@@ -271,7 +314,7 @@ impl AppState {
                 for prefix in &prefixes {
                     reclaimed.absorb(self.reclaim_namespace_objects(prefix, &refs));
                 }
-                outcome = Some((removed, reclaimed));
+                outcome = Some((removed, reclaimed, record));
                 Ok(())
             })
             .map_err(|e| match e {
@@ -284,17 +327,88 @@ impl AppState {
                     &format!("branch deletion failed: {other}"),
                 ),
             })?;
-        let (removed, reclaimed) = outcome.expect("drop_namespace ran the removal");
+        let (removed, mut reclaimed, record) = outcome.expect("drop_namespace ran the removal");
+        // Parsed segments, corpus statistics and ceilings go now on this
+        // pod (#347); other pods purge theirs from the record.
+        self.forget_namespace_caches(ns);
+        self.purge_deleted_from_memory(&ns.0);
+        if let Some(e) = self.erase_exports_for(&record, || self.delete_namespace_exports(ns)) {
+            reclaimed.errors.push(format!("exports: {e}"));
+        }
+        let error = (!reclaimed.errors.is_empty()).then(|| reclaimed.errors.join("; "));
+        let record =
+            self.note_deletion_attempt(&record, reclaimed.remote_objects as u64, error.as_deref());
         println!(
-            "namespace branch deleted: ns={} version={} local_files={} remote_objects={} kept={} errors={}",
+            "namespace branch deleted: ns={} version={} local_files={} remote_objects={} kept={} errors={} deletion={} state={}",
             ns.0,
             removed.version,
             reclaimed.local_files,
             reclaimed.remote_objects,
             reclaimed.kept,
-            reclaimed.errors.len()
+            reclaimed.errors.len(),
+            record.id,
+            record.state.as_str()
         );
-        Ok((removed, reclaimed))
+        Ok((removed, reclaimed, record))
+    }
+
+    /// Retry the reclaim of a pending branch deletion (#347): everything
+    /// under the branch's own prefix that no manifest references. Refused,
+    /// with the reason on the record, while a namespace of that name exists
+    /// again.
+    pub(crate) fn resume_branch_deletion(
+        &self,
+        record: &kosha_core::deletion::DeletionRecord,
+    ) -> kosha_core::deletion::DeletionRecord {
+        let ns = NamespaceId(record.subject.clone());
+        let _lineage = self.branch_lock.lock().unwrap();
+        let lock = self.publication_lock(&ns);
+        let _publication = lock.lock().unwrap();
+        let refs = {
+            let controller = self.controller.lock().unwrap();
+            let collect = || -> Result<Option<References>, KoshaError> {
+                let mut refs = References::default();
+                for (other, _) in controller.manifest_versions()? {
+                    if other == ns {
+                        return Ok(None);
+                    }
+                    if let Some(manifest) = controller.try_manifest_cloned(&other)? {
+                        refs.add(&other, &manifest)?;
+                    }
+                }
+                Ok(Some(refs))
+            };
+            collect()
+        };
+        let refs = match refs {
+            Ok(Some(refs)) => refs,
+            Ok(None) => {
+                return self.note_deletion_attempt(
+                    record,
+                    0,
+                    Some(
+                        "a namespace of this name exists again; its objects share the prefix, \
+                         so the deleted branch's leftovers stay until it is deleted too",
+                    ),
+                )
+            }
+            Err(e) => {
+                return self.note_deletion_attempt(record, 0, Some(&format!("control store: {e}")))
+            }
+        };
+        if self.indexer.manifest_version(&ns).is_some() {
+            return self.note_deletion_attempt(
+                record,
+                0,
+                Some("this writer holds a namespace of this name again"),
+            );
+        }
+        let mut reclaimed = self.reclaim_namespace_objects(&ns, &refs);
+        if let Some(e) = self.erase_exports_for(record, || self.delete_namespace_exports(&ns)) {
+            reclaimed.errors.push(format!("exports: {e}"));
+        }
+        let error = (!reclaimed.errors.is_empty()).then(|| reclaimed.errors.join("; "));
+        self.note_deletion_attempt(record, reclaimed.remote_objects as u64, error.as_deref())
     }
 
     /// Delete everything under `ns`'s own prefix (local data dir and S3)
@@ -520,12 +634,13 @@ pub(crate) fn handle_branch_list(namespace: &str, tenant: &str, state: &AppState
 /// `DELETE /v1/namespaces/{ns}/branch`
 pub(crate) fn handle_branch_delete(namespace: &str, tenant: &str, state: &AppState) -> String {
     let ns = NamespaceId(tenant_namespace(tenant, namespace));
-    match state.delete_branch(&ns) {
-        Ok((manifest, reclaimed)) => json_ok(&serde_json::json!({
+    match state.delete_branch_recorded(&ns, None) {
+        Ok((manifest, reclaimed, record)) => json_ok(&serde_json::json!({
             "deleted": namespace,
             "parent": manifest.branch.as_ref().map(|b| short_name(&b.parent).to_string()),
             "version": manifest.version,
             "reclaimed": reclaimed,
+            "deletion": record,
         })),
         Err(response) => response,
     }

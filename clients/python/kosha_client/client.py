@@ -217,37 +217,12 @@ class KoshaClient:
         action = self._V1_ACTIONS.get(path)
         if action is None:
             return self._transport.request(method, path, body, headers)
-        legacy_body = body
         body = dict(body or {})
         namespace = body.pop("namespace", None)
         if not namespace:
             raise ValueError("%s needs a namespace" % path)
-        if path == "replace" and getattr(self, "_legacy_replace", False):
-            return self._transport.request(method, "replace", legacy_body, headers)
         target = "v1/namespaces/%s/%s" % (urllib.parse.quote(str(namespace), safe=""), action)
-        try:
-            return self._transport.request(method, target, body, headers)
-        except KoshaRequestError as e:
-            # `POST /v1/namespaces/{ns}/replace` is new in contract 0.9.0.
-            # An older server does not know the route: it answers a bare
-            # 404, or, for an API key restricted by scopes or namespaces, a
-            # bare 403 ("cannot use this route") from its authorization
-            # check, which runs before routing. Neither carries a `code`
-            # (only servers with the error model send one), so partial
-            # updates go to its legacy `/replace`, which it still serves to
-            # the same key. A current server's 404/403 carries a `code`
-            # (`namespace_not_found`, `permission_denied`) and is raised.
-            if path != "replace" or e.status_code not in (403, 404) or e.code is not None:
-                raise
-            logger.warning(
-                "kosha server has no /v1/namespaces/{ns}/replace (older than API 0.9.0); "
-                "falling back to the deprecated POST /replace. Upgrade the server."
-            )
-            result = self._transport.request(method, "replace", legacy_body, headers)
-            # Only once the legacy route has served the request: a bare 403
-            # that was a real refusal is raised by it, and not remembered.
-            self._legacy_replace = True
-            return result
+        return self._transport.request(method, target, body, headers)
 
     def _v1_request(
         self, method: str, namespace: str, action: str, body: Any = None
@@ -875,7 +850,7 @@ class KoshaClient:
 
     @classmethod
     def _knn(cls, spec: dict) -> dict:
-        """``{"knn": {field: {vector | query_text, k, filter}}}`` → Kosha's kNN.
+        """``{"knn": {field: {vector | vectors | query_text, k, filter}}}`` → Kosha's kNN.
 
         The filter is carried into the vector search itself. It used to be
         dropped here, so a project-scoped semantic search returned the
@@ -884,25 +859,38 @@ class KoshaClient:
         ``query_text`` instead of ``vector`` asks the server to embed the
         text with the model the namespace schema declares for the field
         (native embedding, #209).
+
+        ``vectors`` (a list of query token vectors) asks for late-interaction
+        (ColBERT-style MaxSim) scoring against a field indexed with token
+        bags (#205); ``scoring`` (``"cosine"`` or ``"late_interaction"``) is
+        passed through as given. The server validates both.
         """
         for field, options in (spec or {}).items():
             if not isinstance(options, dict):
                 continue
             unknown = set(options) - {
-                "vector", "query_text", "k", "filter", "num_candidates", "boost",
+                "vector", "vectors", "scoring", "query_text", "k", "filter",
+                "num_candidates", "boost",
             }
             if unknown:
                 raise cls._unsupported(f"knn option(s) {sorted(unknown)}")
             k = int(options.get("k", 10))
             knn = {"field": field}
+            vectors = options.get("vectors")
             if options.get("query_text") is not None:
-                if options.get("vector"):
+                if options.get("vector") or vectors is not None:
                     raise cls._unsupported(
-                        "knn with both vector and query_text"
+                        "knn with both vector(s) and query_text"
                     )
                 knn["query_text"] = str(options["query_text"])
+            elif vectors is not None:
+                if options.get("vector"):
+                    raise cls._unsupported("knn with both vector and vectors")
+                knn["vectors"] = [list(token) for token in vectors]
             else:
                 knn["vector"] = options.get("vector", [])
+            if options.get("scoring") is not None:
+                knn["scoring"] = str(options["scoring"])
             knn["k"] = k
             knn["num_candidates"] = int(options.get("num_candidates", max(100, k)))
             if options.get("filter"):
@@ -1259,6 +1247,32 @@ class KoshaClient:
     # queries to rebuild an HNSW graph they never needed.
     _MIN_VECTOR_DIM = 8
 
+    @classmethod
+    def _is_numeric_vector(cls, v: Any) -> bool:
+        """A list of at least ``_MIN_VECTOR_DIM`` numbers (no booleans)."""
+        return (
+            isinstance(v, (list, tuple))
+            and len(v) >= cls._MIN_VECTOR_DIM
+            and all(
+                isinstance(x, (int, float)) and not isinstance(x, bool) for x in v
+            )
+        )
+
+    @classmethod
+    def _is_token_bag(cls, v: Any) -> bool:
+        """A late-interaction bag (#205): a non-empty list of numeric
+        vectors, all the same length and each at least ``_MIN_VECTOR_DIM``
+        long — per-token embeddings, as ColBERT-style models output.
+
+        Ragged lists, lists of short tuples (polygons, bounding boxes) and
+        anything non-numeric are not bags; they stay ``Keyword``.
+        """
+        if not isinstance(v, (list, tuple)) or not v:
+            return False
+        if not all(cls._is_numeric_vector(t) for t in v):
+            return False
+        return len({len(t) for t in v}) == 1
+
     @staticmethod
     def _decode_field_value(value: str, field_type: str | None) -> Any:
         """Reverse of ``_field_to_kosha``.
@@ -1312,18 +1326,26 @@ class KoshaClient:
                 fields.append(cls._field_to_kosha(k, str(v).lower(), "Boolean"))
             elif isinstance(v, (int, float)):
                 fields.append(cls._field_to_kosha(k, str(v), "Float"))
-            elif (
-                isinstance(v, (list, tuple))
-                and len(v) >= cls._MIN_VECTOR_DIM
-                and all(
-                    isinstance(x, (int, float)) and not isinstance(x, bool) for x in v
-                )
-            ):
+            elif cls._is_numeric_vector(v):
                 fields.append(cls._field_to_kosha(k, json.dumps(list(v)), "Vector"))
+            elif cls._is_token_bag(v):
+                # A bag of token vectors (late interaction, #205): one
+                # Vector field holding the JSON bag, which the server
+                # indexes for MaxSim. Decoded back to a list of lists by
+                # _decode_field_value.
+                # A field read back as Keyword (stored before #205, e.g.
+                # rewritten by update_by_query) keeps its type so exact-match
+                # filters on it still work.
+                bag_type = "Keyword" if declared_type == "Keyword" else "Vector"
+                fields.append(
+                    cls._field_to_kosha(
+                        k, json.dumps([list(t) for t in v]), bag_type
+                    )
+                )
             elif isinstance(v, (list, tuple)):
                 # Everything else list-shaped: short numeric tuples (below
-                # _MIN_VECTOR_DIM), empty lists, string lists (labels),
-                # mixed content. JSON-encode as Keyword — stored verbatim
+                # _MIN_VECTOR_DIM), ragged or short nested numeric lists,
+                # empty lists, string lists (labels), mixed content. JSON-encode as Keyword — stored verbatim
                 # and filterable by exact match, but never tokenized and
                 # never inserted into the shared Vector store. Decoded back
                 # to a Python list by _decode_field_value.
@@ -1448,7 +1470,6 @@ class KoshaClient:
 
             # helpers.bulk update actions send {"doc": {...}} — unwrap + keep
             # Vector fields (contentEmbedding) that index() already supported.
-            # Partial updates are merged server-side by POST /replace.
             fields = self._source_to_fields(source if isinstance(source, dict) else {})
             doc = {
                 "id": doc_id or "",
@@ -1457,7 +1478,7 @@ class KoshaClient:
             actions.append((doc_index or default_ns, op_type or "index", doc))
 
         # Route each document to the namespace named by its action's _index.
-        # `index` upserts full docs via /index; partial `update` uses /replace.
+        # `index` upserts full docs; `update` merges partial docs.
         docs_by_ns: dict[str, list[dict]] = {}
         updates_by_ns: dict[str, list[dict]] = {}
         for doc_ns, op_type, doc in actions:

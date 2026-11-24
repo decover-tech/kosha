@@ -20,6 +20,8 @@ crc32fast = "1"
 unicode-segmentation = "1"
 rust-stemmers = "1"
 rayon = { workspace = true }
+# Safe casts between the posting read buffer's bytes and its f32s (#435).
+bytemuck = "1"
 
 [dev-dependencies]
 # `stats` feature for `total_allocated()` (bytes ever requested, including

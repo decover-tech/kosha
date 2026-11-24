@@ -20,6 +20,7 @@ kind: Component
 patches:
   - path: configmap-patch.yaml
   - path: ingest-host-patch.yaml
+  - path: segment-gc-patch.yaml
   # One JSON patch for the three Deployments (kosha, kosha-query,
   # kosha-indexer): every probe has the same shape.
   - path: probes-https-patch.yaml
