@@ -9965,6 +9965,42 @@ impl SegmentReader {
         }))
     }
 
+    /// Rescore a bounded quantized shortlist before returning a ranked list.
+    /// A missing exact score fails the probe rather than mixing estimates
+    /// into an order that can change when the sidecar becomes warm.
+    pub fn knn_rescore_shortlist_fetching(
+        &self,
+        field: &str,
+        query: &[f32],
+        k: usize,
+        budget: KnnProbeBudget<'_>,
+        accept: Option<KnnAccept<'_>>,
+        fetch: Option<VectorSpanFetch<'_>>,
+    ) -> BudgetedKnnResult {
+        self.knn_candidates_fetching(field, query, k, budget, accept, fetch)
+            .map(|found| {
+                let mut found = found?;
+                found
+                    .candidates
+                    .truncate(k.saturating_mul(self.vector_rescore_factor.max(1)));
+                let mut seqs: Vec<_> = found.candidates.iter().map(|c| c.doc_seq).collect();
+                if seqs.is_empty() {
+                    return Ok((Vec::new(), found.postings));
+                }
+                seqs.sort_unstable();
+                let exact = self
+                    .knn_exact_from_sidecar(field, query, k, &seqs, fetch)
+                    .filter(|result| result.vectors_scored == seqs.len())
+                    .ok_or_else(|| {
+                        KoshaError::NotFound(format!(
+                            "{}: exact kNN shortlist unavailable",
+                            self.segment_dir.display()
+                        ))
+                    })?;
+                Ok((exact.hits, found.postings))
+            })
+    }
+
     /// Exact cosine similarity of `query` with `field`'s full-precision
     /// vector of each of `doc_seqs` (#381), read from `doc_vectors.bin`:
     /// the local file when it is whole, otherwise by ranged reads through
@@ -10268,7 +10304,7 @@ impl SegmentReader {
         } else {
             let ranges = dv.field_vector_ranges(field, candidates);
             let mut spans = span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE);
-            if let Some(fetch) = fetch {
+            let _held = if let Some(fetch) = fetch {
                 let missing: Vec<(u64, u64)> = ranges
                     .iter()
                     .copied()
@@ -10279,8 +10315,13 @@ impl SegmentReader {
                     // index sees what the fetch left only in memory.
                     let _held = fetch(&self.segment_dir, DOC_VECTORS_FILE, &missing);
                     spans = span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE);
+                    Some(_held)
+                } else {
+                    None
                 }
-            }
+            } else {
+                None
+            };
             dv.visit_field_vectors_cached(&spans, field, candidates, score)
         };
         match visited {
