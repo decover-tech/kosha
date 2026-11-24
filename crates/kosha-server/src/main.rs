@@ -59,6 +59,7 @@ mod embedding_server_tests;
 mod exports;
 mod fair_admission;
 mod http;
+mod http_routes;
 #[cfg(feature = "s3")]
 mod hydration_budget;
 mod internal_tls;
@@ -120,6 +121,9 @@ mod writer_lease;
 mod writer_lease_tests;
 
 use api_error::{api_error, api_error_status, ApiError, ErrorCode};
+use http_routes::{
+    internal_segment_response, legacy_route_disabled, route, with_legacy_deprecation,
+};
 #[cfg(feature = "s3")]
 use hydration_budget::{HydrationBudget, RequestHydration};
 use kosha_cache::Cache;
@@ -477,6 +481,10 @@ struct AppState {
     /// posting blobs of in-flight warm segments — the cache is sized for
     /// that today, but the invariant is not enforced.
     posting_blob_presence: Mutex<PostingBlobPresenceCache>,
+    /// Per-tenant hits and misses of `posting_blob_presence`, counted per
+    /// segment looked up, for `kosha_cache_{hits,misses}_total{cache=
+    /// "posting_blob_presence"}` (#197).
+    posting_presence_stats: Mutex<kosha_core::tenancy::TenantLedger>,
     /// Readiness-gated warmup (Tier 1 O2): when `KOSHA_WARMUP_NAMESPACES`
     /// is set, a background thread prefetches the scoring-set files
     /// (`footer.json` + `inverted.idx` + `doc_store.offsets` [+ `filters.bin`/
@@ -521,8 +529,8 @@ struct AppState {
     /// `warm` and `warm_run`.
     warming: warm_run::Warming,
     /// `KOSHA_INGEST_HOST` — set only on query-role pods (deployment-query.yaml).
-    /// When present, write-path requests this pod receives are forwarded here
-    /// instead of executed locally — see `is_write_path`/`forward_to_ingest`.
+    /// When present, writes and writer-backed reads are forwarded here
+    /// instead of executed locally — see `is_ingest_path`/`forward_to_ingest`.
     /// `None` on the ingest pod itself, which never forwards.
     ingest_host: Option<String>,
     /// Built once, lazily, only when `ingest_host` is set — no cost on the
@@ -2377,6 +2385,7 @@ impl AppState {
             rerankers: rerank::RerankRegistry::from_env(),
             embedders: embedding::EmbedderRegistry::from_env(),
             posting_blob_presence: Mutex::new(HashMap::new()),
+            posting_presence_stats: Mutex::new(Default::default()),
             // Warmup starts ready; `spawn_warmup` flips `false` only when
             // there's configured work to do (and back to `true` on
             // completion / fail-open). See the field's doc comment.
@@ -3074,6 +3083,18 @@ impl AppState {
             .last_run_ms
             .store(unix_millis(), std::sync::atomic::Ordering::Relaxed);
         reports
+    }
+
+    /// Count posting-blob presence lookups for `ns`'s tenant (#197).
+    #[cfg(feature = "s3")]
+    fn record_presence_lookups(&self, ns: &NamespaceId, hits: u64, misses: u64) {
+        let tenant = kosha_core::tenancy::tenant_of_namespace(&ns.0);
+        let mut stats = self
+            .posting_presence_stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        stats.hits(tenant, hits);
+        stats.misses(tenant, misses);
     }
 
     /// The generation `posting_blob_presence` entries are stamped with and
@@ -5932,6 +5953,7 @@ impl AppState {
         let mut ranged: Vec<PathBuf> = Vec::new();
         let mut whole: Vec<PathBuf> = Vec::new();
         let mut shards_local: Vec<(String, String)> = Vec::new();
+        let (mut presence_hits, mut presence_misses) = (0u64, 0u64);
         for seg in seg_paths {
             let Ok(rel) = seg.strip_prefix(&self.data_dir) else {
                 continue;
@@ -5944,8 +5966,10 @@ impl AppState {
                 keys.iter().all(|k| set.contains(k))
                     || posting_files.iter().all(|f| set.contains(f))
             }) {
+                presence_hits += 1;
                 continue;
             }
+            presence_misses += 1;
             // Every shard the terms hash to is already a whole local file
             // (warmed, promoted, or fetched whole): the postings are local,
             // confirmed by name with one stat per shard. Without this, a
@@ -5976,6 +6000,8 @@ impl AppState {
                 whole.push(seg.clone());
             }
         }
+
+        self.record_presence_lookups(ns, presence_hits, presence_misses);
 
         if !shards_local.is_empty() {
             // The same generation every other presence stamp uses: a stamp
@@ -6288,6 +6314,15 @@ impl AppState {
             kosha_segment::inverted_uses_posting_blobs,
             file_present_nonempty,
         );
+        let (hits, misses) = presence_lookup_counts(
+            seg_paths,
+            posting_files,
+            &self.data_dir,
+            &cached,
+            &logical_paths,
+            &newly_confirmed,
+        );
+        self.record_presence_lookups(ns, hits, misses);
 
         let mut outcome = HydrationOutcome::default();
         match prune_unwritten_posting_blobs(&self.data_dir, &mut logical_paths) {
@@ -6705,6 +6740,36 @@ fn plan_posting_blob_fetch(
     }
 
     (logical_paths, newly_confirmed)
+}
+
+/// Presence-cache `(hits, misses)` of one [`plan_posting_blob_fetch`],
+/// counted per segment: a hit is a segment whose every shard the cache had
+/// already confirmed; a miss is a split segment the plan had to stat. A
+/// segment without posting shards is neither, as it never enters the cache.
+#[cfg(feature = "s3")]
+fn presence_lookup_counts(
+    seg_paths: &[PathBuf],
+    posting_files: &[String],
+    data_dir: &Path,
+    cached: &HashMap<String, std::collections::HashSet<String>>,
+    logical_paths: &[(String, u64)],
+    newly_confirmed: &[(String, String)],
+) -> (u64, u64) {
+    let hits = seg_paths
+        .iter()
+        .filter_map(|seg| seg.strip_prefix(data_dir).ok())
+        .filter(|rel| {
+            cached
+                .get(rel.to_string_lossy().as_ref())
+                .is_some_and(|set| posting_files.iter().all(|f| set.contains(f.as_str())))
+        })
+        .count() as u64;
+    let planned: std::collections::HashSet<&str> = logical_paths
+        .iter()
+        .filter_map(|(path, _)| path.rsplit_once('/').map(|(seg, _)| seg))
+        .chain(newly_confirmed.iter().map(|(seg, _)| seg.as_str()))
+        .collect();
+    (hits, planned.len() as u64)
 }
 
 /// Cache a TOC-proven absence as resolved, just like a present shard:
@@ -7166,11 +7231,8 @@ fn dispatch_authenticated(
     started: Instant,
 ) -> http::Response {
     // ── Query/ingest role routing ────────────────────────────────────────
-    // A query-role pod (KOSHA_INGEST_HOST set) forwards write-path requests
-    // to the single ingest pod instead of executing them locally — see
-    // is_write_path/forward_to_ingest. Every other request (all reads, and
-    // everything on the ingest pod itself, which never forwards) is handled
-    // locally exactly as before this existed.
+    // A query-role pod forwards writes and reads of writer-local state
+    // to the ingest pod; all other requests are handled locally.
     // ── Billing gate (#349) ──────────────────────────────────────────────
     // Ahead of the role routing, so a query pod refuses a blocked write
     // itself instead of forwarding it.
@@ -7197,7 +7259,7 @@ fn dispatch_authenticated(
                  /v1/admin/compact* and /v1/admin/compaction-*",
             ))
         }
-        (Ok(tenant), Some(ingest_host), Some(client)) if is_write_path(request_line) => {
+        (Ok(tenant), Some(ingest_host), Some(client)) if is_ingest_path(request_line) => {
             if let Some((_, path)) =
                 legacy_route(request_line).filter(|_| !auth::legacy_routes_enabled_for(tenant))
             {
@@ -7263,6 +7325,14 @@ fn cache_tenant_samples(state: &AppState) -> Vec<metrics::CacheTenantSample> {
             state.searcher.corpus_stats_cache_tenant_stats(),
         ),
         ("ceiling", state.searcher.ceiling_cache_tenant_stats()),
+        (
+            "posting_blob_presence",
+            state
+                .posting_presence_stats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .stats(),
+        ),
     ]
     .into_iter()
     .flat_map(|(cache, stats)| {
@@ -7298,6 +7368,10 @@ fn handle_metrics(state: &AppState, headers: &HashMap<String, String>) -> String
         nvme_evictions: state.cache.eviction_generation(),
         segment_checksum_failures,
         cache_tenants: cache_tenant_samples(state),
+        decoded_caches: [
+            kosha_segment::text_postings_cache_stats(),
+            kosha_segment::vector_postings_cache_stats(),
+        ],
         span_writes: state.span_writes.stats(),
     });
     format!(
@@ -7350,13 +7424,7 @@ fn tenant_is_limited(state: &AppState, tenant: &str) -> bool {
 /// (its [`routes::ROUTES`] row), and the legacy `POST /search` and
 /// `GET /search?...`.
 fn is_search_route(request_line: &str) -> bool {
-    if let Some(route) = routes::lookup_line(request_line) {
-        return route.class == routes::Class::Search;
-    }
-    matches!(
-        legacy_route(request_line),
-        Some(("POST" | "GET", "/search"))
-    )
+    request_route_class(request_line) == routes::Class::Search
 }
 
 /// The response for a request refused by a tenant limit (#341, #350): its
@@ -7917,24 +7985,27 @@ fn unauthenticated(message: &str) -> String {
         .into_raw()
 }
 
-/// True for every write-mutating route — the set a query pod forwards to
-/// `KOSHA_INGEST_HOST` instead of handling locally. False for read-only
-/// routes (search/exists/stats/healthz), which every pod always handles
-/// itself.
-///
-/// `/v1` routes are classified by their row in [`routes::ROUTES`] (#350),
-/// the same table `route()` admits them by, so the two cannot drift. Only
-/// the legacy unversioned routes are matched here by hand, exactly.
-fn is_write_path(request_line: &str) -> bool {
+fn request_route_class(request_line: &str) -> routes::Class {
+    use routes::Class::{Read, Search, Write, WriterRead};
     if let Some(route) = routes::lookup_line(request_line) {
-        return matches!(
-            route.class,
-            routes::Class::Write | routes::Class::WriterRead
-        );
+        return route.class;
     }
+    match legacy_route(request_line) {
+        Some(("POST", "/index" | "/replace" | "/flush" | "/delete")) => Write,
+        Some(("POST", "/exists")) => WriterRead,
+        Some(("POST" | "GET", "/search")) => Search,
+        _ => Read,
+    }
+}
+
+fn is_write_path(request_line: &str) -> bool {
+    request_route_class(request_line) == routes::Class::Write
+}
+
+fn is_ingest_path(request_line: &str) -> bool {
     matches!(
-        legacy_route(request_line),
-        Some(("POST", "/index" | "/replace" | "/flush" | "/delete"))
+        request_route_class(request_line),
+        routes::Class::Write | routes::Class::WriterRead
     )
 }
 
@@ -7956,7 +8027,7 @@ fn legacy_route(request_line: &str) -> Option<(&str, &'static str)> {
     Some((method, path))
 }
 
-/// Forward a write-path request to the single ingest pod, verbatim, and
+/// Forward a writer-routed request to the single ingest pod, verbatim, and
 /// relay its response back as received: status (with its correct reason
 /// phrase), body, and the headers that are part of the API contract
 /// ([`RELAYED_HEADERS`]: `Retry-After`, `X-Request-Id`, `Allow`, the
@@ -8165,489 +8236,6 @@ fn valid_new_tenant_id(tenant: &str) -> bool {
 /// names fit the filesystem (see [`MAX_NAMESPACE_NAME_BYTES`]).
 fn valid_new_key_tenant_id(tenant: &str) -> bool {
     valid_new_tenant_id(tenant) && tenant.len() <= MAX_TENANT_ID_BYTES
-}
-
-/// Authorize before dispatch, including compatibility and internal routes.
-/// A response on a legacy unversioned route carries the deprecation
-/// headers (ADR-350 §c): `Deprecation`, `Sunset`, and a `Link` to the
-/// migration notes.
-fn route(
-    request_line: &str,
-    headers: &HashMap<String, String>,
-    body: &[u8],
-    tenant: &str,
-    state: &AppState,
-) -> String {
-    let response = route_checked(request_line, headers, body, tenant, state);
-    if legacy_route(request_line).is_none() {
-        return response;
-    }
-    with_legacy_deprecation(response)
-}
-
-fn with_legacy_deprecation(response: String) -> String {
-    let response = with_header(
-        response,
-        "link",
-        &format!("<{}>; rel=\"deprecation\"", auth::LEGACY_DEPRECATION_LINK),
-    );
-    let response = with_header(response, "sunset", auth::LEGACY_SUNSET);
-    with_header(
-        response,
-        "deprecation",
-        &format!("@{}", auth::LEGACY_DEPRECATED_AT),
-    )
-}
-
-fn route_checked(
-    request_line: &str,
-    headers: &HashMap<String, String>,
-    body: &[u8],
-    tenant: &str,
-    state: &AppState,
-) -> String {
-    let Some((method, path)) = parse_method_and_path(request_line) else {
-        return api_error(ErrorCode::InvalidArgument, "invalid request line");
-    };
-    if path.starts_with("/v1/admin/") {
-        let Some(operator) = admin_actor(headers, state) else {
-            return api_error(ErrorCode::PermissionDenied, "admin credential required");
-        };
-        if let Some(response) = unrouted_v1(method, path) {
-            return response;
-        }
-        if let Some(response) = state.control_store_write_refusal(request_line) {
-            return response;
-        }
-        // Organizations, users, projects, audit log (#345).
-        let key_table = match state.auth() {
-            auth::Auth::Keys(keys) => Some(keys),
-            auth::Auth::Disabled => None,
-        };
-        if let Some(response) = org_admin::handle(
-            method,
-            path,
-            headers,
-            body,
-            &state.orgs,
-            key_table,
-            &operator,
-        ) {
-            return response;
-        }
-        // Every other admin route is the operator's and knows nothing of
-        // roles. A request that names a user must not reach one: it would
-        // run with the operator's powers (a key for any tenant, gc, ...).
-        if org_admin::names_actor(headers) {
-            return api_error(
-                ErrorCode::PermissionDenied,
-                "this route is operator-only: it cannot be called with an 'x-kosha-actor' header",
-            );
-        }
-        // Per-operator admin credentials (#346).
-        if let Some(response) = operator_admin::handle(method, path, body, &operator) {
-            return response;
-        }
-        // Tenant API keys (#346), audited as the credential's holder.
-        if let Some(response) = api_key_admin::handle(method, path, body, &operator) {
-            return response;
-        }
-        // Every other admin change is audited here, naming the operator.
-        if method != "GET" {
-            return admin_audit::audited(&state.orgs, &operator, method, path, || {
-                route_inner(request_line, headers, body, tenant, state)
-            });
-        }
-    } else if path.starts_with("/internal/") {
-        if !service_authorized(headers, state.internal_service_key.as_deref()) {
-            return api_error(
-                ErrorCode::PermissionDenied,
-                "internal service credential required",
-            );
-        }
-    } else {
-        if !valid_name_component(tenant) {
-            return api_error(ErrorCode::PermissionDenied, "invalid tenant");
-        }
-        if let Some(rest) = path.strip_prefix("/v1/namespaces/") {
-            // `/v1/namespaces/{ns}/{action}`, or the bare
-            // `/v1/namespaces/{ns}` that `DELETE` addresses.
-            // The query string goes first: a '/' in it must not move the
-            // split (`DELETE /v1/namespaces/_shard-0001?x=/` would
-            // otherwise validate `_shard-0001?x=` and delete the shard).
-            let rest = rest.split('?').next().unwrap_or(rest);
-            let ns = match rest.rsplit_once('/') {
-                // `/v1/namespaces/{ns}/exports/{id}[/download]` (#347).
-                _ if rest.split('/').nth(1) == Some("exports") => {
-                    rest.split('/').next().unwrap_or(rest)
-                }
-                Some((ns, _action)) => ns,
-                None => rest,
-            };
-            if !addressable_namespace(state, tenant, &path_decode(ns)) {
-                return api_error(ErrorCode::InvalidArgument, "invalid namespace");
-            }
-        }
-        let bare_path = path.split('?').next().unwrap_or(path);
-        let is_legacy = legacy_route(request_line).is_some();
-        if is_legacy {
-            if !auth::legacy_routes_enabled_for(tenant) {
-                return legacy_route_disabled(bare_path);
-            }
-            auth::record_legacy_use(tenant, bare_path);
-            state.metrics.record_legacy_request(bare_path, tenant);
-        }
-        if let Some(response) = state.control_store_write_refusal(request_line) {
-            return response;
-        }
-        if method == "GET" && (bare_path == "/stats" || bare_path == "/v1/stats") {
-            return if admin_actor(headers, state).is_some() {
-                handle_stats(state)
-            } else {
-                api_error(ErrorCode::PermissionDenied, "use namespace-scoped stats")
-            };
-        }
-        if method == "POST"
-            && [
-                "/index", "/exists", "/replace", "/search", "/flush", "/delete",
-            ]
-            .contains(&bare_path)
-        {
-            let mut value: serde_json::Value = match serde_json::from_slice(body) {
-                Ok(v) => v,
-                Err(_) => return api_error(ErrorCode::InvalidArgument, "invalid JSON"),
-            };
-            let Some(ns) = value.get("namespace").and_then(|v| v.as_str()) else {
-                return api_error(ErrorCode::InvalidArgument, "missing namespace");
-            };
-            if !addressable_namespace(state, tenant, ns) {
-                return api_error(
-                    ErrorCode::InvalidArgument,
-                    "invalid namespace; use an unqualified namespace name",
-                );
-            }
-            value["namespace"] = serde_json::json!(tenant_namespace(tenant, ns));
-            return route_inner(
-                request_line,
-                headers,
-                &serde_json::to_vec(&value).unwrap(),
-                tenant,
-                state,
-            );
-        }
-        if method == "GET" && bare_path == "/search" {
-            let Some((_, query)) = path.split_once('?') else {
-                return api_error(ErrorCode::InvalidArgument, "missing query parameters");
-            };
-            let mut pairs = Vec::new();
-            let mut found = false;
-            for pair in query.split('&') {
-                if let Some(raw) = pair.strip_prefix("ns=") {
-                    if found {
-                        return api_error(ErrorCode::InvalidArgument, "duplicate namespace");
-                    }
-                    let ns = url_decode(raw);
-                    if !addressable_namespace(state, tenant, &ns) {
-                        return api_error(ErrorCode::InvalidArgument, "invalid namespace");
-                    }
-                    // The original escaped component is preserved; tenant names
-                    // are escaped too so they cannot inject query parameters.
-                    let encoded_tenant: String =
-                        tenant.bytes().map(|b| format!("%{b:02X}")).collect();
-                    pairs.push(format!("ns={encoded_tenant}%2F{raw}"));
-                    found = true;
-                } else {
-                    pairs.push(pair.to_string());
-                }
-            }
-            if !found {
-                return api_error(ErrorCode::InvalidArgument, "missing ns");
-            }
-            let scoped = format!("GET /search?{} HTTP/1.1", pairs.join("&"));
-            return route_inner(&scoped, headers, body, tenant, state);
-        }
-        if bare_path.starts_with("/v1/") {
-            if let Some(response) = unrouted_v1(method, path) {
-                return response;
-            }
-        } else if bare_path != "/healthz" {
-            return api_error(ErrorCode::NotFound, "not found");
-        }
-    }
-    route_inner(request_line, headers, body, tenant, state)
-}
-
-/// The 404 (unknown path) or 405 with `Allow` (known path, wrong method)
-/// for a `/v1` request [`routes::ROUTES`] does not serve; `None` when it
-/// does. Everything `route_inner` answers under `/v1` must have a row.
-fn unrouted_v1(method: &str, path: &str) -> Option<String> {
-    if routes::lookup(method, path).is_some() {
-        return None;
-    }
-    let allowed = routes::allowed_methods(path);
-    if allowed.is_empty() {
-        return Some(api_error(ErrorCode::NotFound, "not found"));
-    }
-    let allow = allowed.join(", ");
-    Some(
-        ApiError::new(
-            ErrorCode::MethodNotAllowed,
-            format!("method {method} is not allowed on this path (allowed: {allow})"),
-        )
-        .detail("allowed", allowed)
-        .header("allow", &allow)
-        .into_raw(),
-    )
-}
-
-/// The `/v1` route that replaces a legacy unversioned one.
-fn legacy_replacement(path: &str) -> &'static str {
-    match path {
-        "/index" => "POST /v1/namespaces/{namespace}/documents",
-        "/replace" => "POST /v1/namespaces/{namespace}/replace",
-        "/exists" => "POST /v1/namespaces/{namespace}/exists",
-        "/search" => "POST /v1/namespaces/{namespace}/search",
-        "/flush" => "POST /v1/namespaces/{namespace}/flush",
-        "/delete" => "POST /v1/namespaces/{namespace}/delete",
-        "/stats" => "GET /v1/stats",
-        _ => "/v1/namespaces/{namespace}/...",
-    }
-}
-
-/// The 410 for a legacy route that is off for the caller.
-fn legacy_route_disabled(path: &str) -> String {
-    let replacement = legacy_replacement(path);
-    ApiError::new(
-        ErrorCode::LegacyRouteDisabled,
-        format!("unversioned route {path} is disabled; use {replacement}"),
-    )
-    .detail("route", path)
-    .detail("replacement", replacement)
-    .into_raw()
-}
-
-fn route_inner(
-    request_line: &str,
-    headers: &HashMap<String, String>,
-    body: &[u8],
-    tenant: &str,
-    state: &AppState,
-) -> String {
-    // ── v1 routes ──────────────────────────────────────────────────────────
-    // `route` admitted only paths in `routes::ROUTES` (#350), the table the
-    // checked-in OpenAPI documents are tested against.
-    if request_line.starts_with("GET /v1/healthz") {
-        return json_ok(&serde_json::json!({"status": "ok"}));
-    }
-
-    if is_create_namespace_route(request_line) {
-        return handle_create_namespace(body, tenant, state);
-    }
-
-    if let Some(ns) = bare_namespace(request_line, "DELETE") {
-        if let Err(response) =
-            namespace_deletion::check_delete_confirmation(request_line, &ns, state)
-        {
-            return response;
-        }
-        return handle_delete_namespace(&ns, tenant, state);
-    }
-
-    if is_list_namespaces_route(request_line) {
-        return handle_list_namespaces(tenant, state);
-    }
-
-    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/documents") {
-        return handle_index_with_ns(&ns, tenant, body, state);
-    }
-
-    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/replace") {
-        return handle_replace_with_ns(&ns, tenant, body, state);
-    }
-
-    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/search") {
-        return handle_search_post_with_ns(&ns, tenant, body, state);
-    }
-
-    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/flush") {
-        return handle_flush_with_ns(&ns, tenant, body, state);
-    }
-
-    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/delete") {
-        return handle_delete_with_ns(&ns, tenant, body, state);
-    }
-
-    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/exists") {
-        return handle_exists_with_ns(&ns, tenant, body, state);
-    }
-
-    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/schema") {
-        return handle_put_schema_with_ns(&ns, tenant, body, state);
-    }
-
-    if let Some(ns) = extract_namespace(request_line, "GET /v1/namespaces/", "/schema") {
-        return handle_get_schema_with_ns(&ns, tenant, state);
-    }
-
-    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/shards") {
-        return handle_put_shards_with_ns(&ns, tenant, body, state);
-    }
-
-    // ── Namespace branching (#208) ─────────────────────────────────────────
-    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/branch") {
-        return branching::handle_branch_create(&ns, tenant, body, state);
-    }
-
-    if let Some(ns) = extract_namespace(request_line, "GET /v1/namespaces/", "/branches") {
-        return branching::handle_branch_list(&ns, tenant, state);
-    }
-
-    if let Some(ns) = extract_namespace(request_line, "DELETE /v1/namespaces/", "/branch") {
-        return branching::handle_branch_delete(&ns, tenant, state);
-    }
-
-    if request_line.starts_with("GET /v1/stats") {
-        return handle_stats(state);
-    }
-
-    if let Some(ns) = extract_namespace(request_line, "GET /v1/namespaces/", "/stats") {
-        return handle_namespace_stats(&ns, tenant, state);
-    }
-
-    // ── Usage metering (#348) ──────────────────────────────────────────────
-    if request_line.starts_with("GET /v1/usage ") || request_line.starts_with("GET /v1/usage?") {
-        return usage::handle_usage(request_line, Some(tenant), false, state);
-    }
-
-    if request_line.starts_with("GET /v1/admin/usage ")
-        || request_line.starts_with("GET /v1/admin/usage?")
-    {
-        return usage::handle_admin_usage(request_line, state);
-    }
-
-    if request_line.starts_with("GET /v1/admin/usage/reconcile ")
-        || request_line.starts_with("GET /v1/admin/usage/reconcile?")
-    {
-        return usage_reconcile::handle_admin_reconcile(request_line, state);
-    }
-
-    // ── Billing (#349) ─────────────────────────────────────────────────────
-    // `dispatch` answers Stripe webhooks before authentication; one that
-    // reaches the router (an in-process caller) gets the same answer.
-    if let Some(response) = billing::webhook_response(state, request_line, headers, body) {
-        return response;
-    }
-    if let Some(response) = billing::route(request_line, body, tenant, state) {
-        return response;
-    }
-
-    // ── A tenant's own API keys (#346 self-service, Postgres only) ─────────
-    if let Some(response) = tenant_key_admin::handle(request_line, body) {
-        return response;
-    }
-
-    if request_line.starts_with("POST /v1/admin/rebuild-filter-blooms") {
-        return handle_rebuild_filter_blooms(body, tenant, state);
-    }
-
-    if request_line.starts_with("POST /v1/admin/backfill-offset-tables") {
-        return handle_backfill_offset_tables(body, tenant, state);
-    }
-
-    if request_line.starts_with("POST /v1/admin/compact-namespace") {
-        return handle_compact_namespace(body, tenant, state);
-    }
-
-    if request_line.starts_with("GET /v1/admin/warmup-status") {
-        return json_ok(&state.warmup_status_json());
-    }
-
-    if request_line.starts_with("GET /v1/admin/compaction-status") {
-        return handle_compaction_status(state);
-    }
-
-    if let Some(rest) = request_line.strip_prefix("GET /v1/admin/compaction-jobs/") {
-        let job_id = rest.split([' ', '?']).next().unwrap_or_default();
-        return handle_compaction_job(job_id, state);
-    }
-
-    if request_line.starts_with("POST /v1/admin/import-namespace") {
-        return handle_import_namespace(body, tenant, state);
-    }
-
-    if request_line.starts_with("POST /v1/admin/gc ")
-        || request_line.starts_with("POST /v1/admin/gc?")
-    {
-        return handle_segment_gc(body, state);
-    }
-
-    // Tenant deletion and deletion records (#347).
-    if let Some(response) = namespace_deletion::route_admin(request_line, body, state) {
-        return response;
-    }
-
-    // Namespace exports (#347); the download streams from `dispatch`.
-    if let Some(response) = exports::route(request_line, body, tenant, state) {
-        return response;
-    }
-
-    // `GET /internal/segment/...` (pod-to-pod) never reaches here: it
-    // streams a file, so `dispatch` answers it (`internal_segment_response`)
-    // once the internal credential checks out. `route` still answers 403
-    // to any other credential.
-
-    // A query pod's strong-consistency search reads the ingest pod's
-    // unindexed tail (#255). Authorized like the segment route above.
-    if let Some(rest) = request_line.strip_prefix("GET /internal/namespaces/") {
-        let target = rest.split(' ').next().unwrap_or("");
-        let (path, query) = target.split_once('?').unwrap_or((target, ""));
-        return match path.strip_suffix("/unindexed") {
-            Some(ns) if !ns.is_empty() => {
-                unindexed::handle_internal_unindexed(&path_decode(ns), query, state)
-            }
-            _ => api_error(ErrorCode::NotFound, "not found"),
-        };
-    }
-
-    // ── Legacy Phase 1 routes (backward compat) ────────────────────────────
-    // These will be removed after DecoverAI cuts over to the v1 paths.
-    if request_line.starts_with("GET /healthz") {
-        return json_ok(&serde_json::json!({"status": "ok"}));
-    }
-
-    if request_line.starts_with("POST /index") {
-        return handle_index(body, state);
-    }
-
-    if request_line.starts_with("POST /exists") {
-        return handle_exists(body, state);
-    }
-
-    if request_line.starts_with("POST /replace") {
-        return handle_replace(body, state);
-    }
-
-    if request_line.starts_with("GET /search") {
-        return handle_search_get(request_line, state);
-    }
-
-    if request_line.starts_with("POST /search") {
-        return handle_search_post(body, state);
-    }
-
-    if request_line.starts_with("POST /flush") {
-        return handle_flush(body, state);
-    }
-
-    if request_line.starts_with("POST /delete") {
-        return handle_delete(body, state);
-    }
-
-    if request_line.starts_with("GET /stats") {
-        return handle_stats(state);
-    }
-
-    api_error(ErrorCode::NotFound, "not found")
 }
 
 /// Extract a namespace from a v1 path: `METHOD /v1/namespaces/{ns}/suffix ...`
@@ -9950,9 +9538,11 @@ fn add_manifest_follow_stats(state: &AppState, ns: &NamespaceId, entry: &mut ser
     let status = state.manifest_follow.status(ns);
     let lag = state.manifest_follow.lag(ns, Instant::now());
     entry["stored_manifest_version"] = serde_json::json!(status.as_ref().map(|s| s.stored_version));
-    entry["last_refresh_at"] = serde_json::json!(status
-        .as_ref()
-        .map(|s| manifest_follow::unix_seconds(s.last_refresh_at)));
+    entry["last_refresh_at"] = serde_json::json!(status.as_ref().map(|s| s
+        .last_refresh_at
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()));
     entry["manifest_lag_seconds"] = serde_json::json!(lag.map(|d| d.as_secs_f64()));
 }
 
@@ -13099,54 +12689,6 @@ fn capped_segment_list<'a>(segments: impl ExactSizeIterator<Item = &'a str>) -> 
     }
 }
 
-// ─── Internal (pod-to-pod) routes ───────────────────────────────────────────
-
-/// `GET /internal/segment/<relative-path>` — stream an already-cached
-/// segment file's raw bytes to a peer replica, for `fetch_from_peer`, as
-/// `application/octet-stream` in O(chunk) memory (#259). Only called once
-/// the internal service credential checked out (see `dispatch`); ordinary
-/// tenant credentials cannot retrieve another tenant's cached files.
-///
-/// `relative_path` is validated the same way any other cache key is
-/// (`Cache::path_for` rejects `..`/absolute-path traversal). 404 (not an
-/// error — the caller retries against the lease owner) when the path isn't
-/// cached on this pod, whether because it's not the owner or hydration is
-/// still in flight.
-fn internal_segment_response(request_line: &str, state: &AppState) -> http::Response {
-    #[cfg(all(feature = "s3", feature = "postgres"))]
-    {
-        let raw = request_line
-            .strip_prefix("GET /internal/segment/")
-            .and_then(|rest| rest.split(' ').next())
-            .unwrap_or("");
-        let relative_path = path_decode(raw.split('?').next().unwrap_or(raw));
-        let local_path = match state.cache.path_for(&relative_path) {
-            Ok(p) => p,
-            Err(_) => {
-                return http::Response::from_raw(api_error(
-                    ErrorCode::InvalidArgument,
-                    "invalid path",
-                ))
-            }
-        };
-        // Files land in the cache by rename, complete, so an open file is
-        // a whole one; its length is fixed from here on.
-        let opened = std::fs::File::open(&local_path)
-            .and_then(|file| file.metadata().map(|meta| (file, meta)));
-        match opened {
-            Ok((file, meta)) if meta.is_file() => {
-                http::Response::file(file, meta.len(), "application/octet-stream")
-            }
-            _ => http::Response::from_raw(api_error(ErrorCode::NotFound, "not cached here")),
-        }
-    }
-    #[cfg(not(all(feature = "s3", feature = "postgres")))]
-    {
-        let _ = (request_line, state);
-        http::Response::from_raw(api_error(ErrorCode::NotFound, "not found"))
-    }
-}
-
 // ─── JSON response helpers ──────────────────────────────────────────────────
 
 fn json_ok<T: serde::Serialize>(value: &T) -> String {
@@ -13628,6 +13170,7 @@ impl Drop for AppState {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use crate::http_routes::route_inner;
     use kosha_core::{Document, DocumentId, Field};
     use std::fs;
     use std::io::{BufRead, BufReader, Read, Write};
@@ -15202,7 +14745,7 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(entry["manifest_version"], published);
-        assert!(entry["last_refresh_at"].as_f64().unwrap() > 0.0);
+        assert!(entry["last_refresh_at"].as_i64().unwrap() > 0);
         assert!(entry["manifest_lag_seconds"].as_f64().unwrap() < 5.0);
         assert_eq!(stats["manifest_refresh"]["enabled"], true);
         assert_eq!(stats["manifest_refresh"]["interval_ms"], 20);
@@ -18570,6 +18113,44 @@ mod tests {
     /// A non-split-format segment must be skipped entirely — no stat calls,
     /// no fetch, no cache entries — matching the pre-cache
     /// `inverted_uses_posting_blobs` gate this wraps.
+    /// #197: a segment the cache fully covered is a hit, a split segment
+    /// the plan had to stat or fetch is one miss however many shards it
+    /// planned, and a segment without shards is neither.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn presence_lookup_counts_hits_and_misses_per_segment() {
+        let segs: Vec<PathBuf> = ["seg-1", "seg-2", "seg-3", "seg-legacy"]
+            .iter()
+            .map(|s| PathBuf::from(format!("/data/ns/{s}")))
+            .collect();
+        let files = vec!["postings-00.bin".to_string(), "postings-01.bin".to_string()];
+        let mut cached = HashMap::new();
+        cached.insert(
+            "ns/seg-1".to_string(),
+            std::collections::HashSet::from(["postings-00.bin".into(), "postings-01.bin".into()]),
+        );
+        cached.insert(
+            "ns/seg-2".to_string(),
+            std::collections::HashSet::from(["postings-00.bin".into()]),
+        );
+        let fetch = vec![
+            ("ns/seg-2/postings-01.bin".to_string(), 0),
+            ("ns/seg-3/postings-00.bin".to_string(), 0),
+        ];
+        let confirmed = vec![("ns/seg-3".to_string(), "postings-01.bin".to_string())];
+        assert_eq!(
+            presence_lookup_counts(
+                &segs,
+                &files,
+                Path::new("/data"),
+                &cached,
+                &fetch,
+                &confirmed
+            ),
+            (1, 2)
+        );
+    }
+
     #[cfg(feature = "s3")]
     #[test]
     fn plan_posting_blob_fetch_skips_non_split_segments() {
@@ -19674,8 +19255,7 @@ mod tests {
     }
 
     /// Every write route `route()` actually dispatches to a mutating
-    /// handler must also be classified `true` here — this is the drift risk
-    /// called out in `is_write_path`'s own doc comment. If this test starts
+    /// handler must also be classified `true` here. If this test starts
     /// failing after adding a new write route to `route()`, that's the
     /// signal to update `is_write_path` too, not to weaken this test.
     #[test]
@@ -19692,8 +19272,6 @@ mod tests {
             "POST /v1/admin/rebuild-filter-blooms HTTP/1.1\r\n",
             "POST /v1/admin/backfill-offset-tables HTTP/1.1\r\n",
             "POST /v1/admin/compact-namespace HTTP/1.1\r\n",
-            "GET /v1/admin/compaction-status HTTP/1.1\r\n",
-            "GET /v1/admin/compaction-jobs/cj-1-1 HTTP/1.1\r\n",
             "POST /index HTTP/1.1\r\n",
             "POST /replace HTTP/1.1\r\n",
             "POST /flush HTTP/1.1\r\n",
@@ -19956,6 +19534,8 @@ mod tests {
             "GET /healthz HTTP/1.1\r\n",
             "POST /v1/namespaces/foo/search HTTP/1.1\r\n",
             "POST /v1/namespaces/foo/exists HTTP/1.1\r\n",
+            "GET /v1/admin/compaction-status HTTP/1.1\r\n",
+            "GET /v1/admin/compaction-jobs/cj-1-1 HTTP/1.1\r\n",
             "GET /v1/stats HTTP/1.1\r\n",
             "GET /v1/namespaces/foo/stats HTTP/1.1\r\n",
             "GET /v1/namespaces/foo/schema HTTP/1.1\r\n",
@@ -21432,8 +21012,8 @@ mod tests {
 
     /// A requester with a peer HTTP client and the shared internal key.
     #[cfg(all(feature = "s3", feature = "postgres"))]
-    fn peer_requester() -> AppState {
-        let mut requester = test_state();
+    fn peer_requester(data_dir: PathBuf) -> AppState {
+        let mut requester = AppState::new(data_dir);
         requester.internal_auth_key = Some("peer-test-secret".into());
         requester.peer_http_client = Some(
             reqwest::blocking::Client::builder()
@@ -21444,37 +21024,91 @@ mod tests {
         requester
     }
 
-    /// #259 acceptance: a large segment file moves peer to peer as raw
-    /// bytes, streamed on both ends, and arrives intact.
+    /// #259 acceptance: a 500 MB file arrives intact without either peer
+    /// buffering it in memory.
     #[cfg(all(feature = "s3", feature = "postgres"))]
     #[test]
-    fn fetch_from_peer_streams_a_64_mib_file_intact() {
-        const SIZE: usize = 64 * 1024 * 1024;
-        let mut peer = test_state();
+    fn fetch_from_peer_streams_a_500_mb_file_intact() {
+        const TEST_ROOT: &str = "TEST_KOSHA_PEER_TRANSFER_ROOT";
+        let Some(root) = std::env::var_os(TEST_ROOT) else {
+            // Peak RSS includes both peers but no parallel tests. The parent
+            // owns cleanup even if the child fails or its server is still up.
+            let root = test_dir();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    std::thread::current().name().unwrap(),
+                    "--nocapture",
+                ])
+                .env(TEST_ROOT, &root)
+                .output();
+            fs::remove_dir_all(root).unwrap();
+            let output = output.unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            print!("{stdout}");
+            return;
+        };
+
+        const SIZE: usize = 500_000_000;
+        const KEY: &str = "ns/big/doc_store.bin";
+        let root = PathBuf::from(root);
+        let mut peer = AppState::new(root.join("peer"));
         peer.internal_service_key = Some("peer-test-secret".into());
-        // Deterministic, incompressible-looking bytes (xorshift).
-        let mut data = vec![0u8; SIZE];
+        let source = peer.cache.path_for(KEY).unwrap();
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        let mut file = fs::File::create(&source).unwrap();
+        let mut buffer = vec![0u8; http::FILE_CHUNK_BYTES];
+        // Generate the fixture without raising the baseline with a full-file
+        // allocation. Stamp each block so that the hash detects reordering.
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
-        for chunk in data.chunks_mut(8) {
+        for chunk in buffer.as_chunks_mut::<8>().0 {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
-            chunk.copy_from_slice(&x.to_le_bytes()[..chunk.len()]);
+            *chunk = x.to_le_bytes();
         }
-        let expected_crc = crc32fast::hash(&data);
-        peer.cache.put_bytes("ns/big/doc_store.bin", &data).unwrap();
-        drop(data);
+        let mut expected = crc32fast::Hasher::new();
+        for offset in (0..SIZE).step_by(buffer.len()) {
+            buffer[..8].copy_from_slice(&(offset as u64).to_le_bytes());
+            let block = &buffer[..(SIZE - offset).min(buffer.len())];
+            file.write_all(block).unwrap();
+            expected.update(block);
+        }
+        drop(file);
+        peer.cache.note_external_write(KEY);
         let addr = serve_state(peer);
+        let requester = peer_requester(root.join("requester"));
 
-        let requester = peer_requester();
+        #[cfg(target_os = "linux")]
+        let before = peer_transfer_peak_rss_kib();
         let written = requester
-            .fetch_from_peer(&addr.to_string(), "ns/big/doc_store.bin")
+            .fetch_from_peer(&addr.to_string(), KEY)
             .expect("peer fetch should succeed");
+        #[cfg(target_os = "linux")]
+        {
+            // Allow runtime/allocator overhead but reject a whole-file buffer.
+            let growth_kib = peer_transfer_peak_rss_kib().saturating_sub(before);
+            println!("500 MB peer transfer grew peak RSS by {growth_kib} KiB");
+            assert!(growth_kib < 32 * 1024, "peak RSS grew by {growth_kib} KiB");
+        }
         assert_eq!(written, SIZE as u64);
-        let local = requester.cache.path_for("ns/big/doc_store.bin").unwrap();
-        let received = fs::read(&local).unwrap();
-        assert_eq!(received.len(), SIZE);
-        assert_eq!(crc32fast::hash(&received), expected_crc);
+        let local = requester.cache.path_for(KEY).unwrap();
+        let mut received = fs::File::open(&local).unwrap();
+        assert_eq!(received.metadata().unwrap().len(), SIZE as u64);
+        let mut actual = crc32fast::Hasher::new();
+        loop {
+            let n = received.read(&mut buffer).unwrap();
+            if n == 0 {
+                break;
+            }
+            actual.update(&buffer[..n]);
+        }
+        assert_eq!(actual.finalize(), expected.finalize());
         // Accounted in the cache like any other hydrated file, and no temp
         // file left behind.
         assert!(requester.cache.total_size() >= SIZE as u64);
@@ -21484,6 +21118,17 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[cfg(all(feature = "s3", feature = "postgres", target_os = "linux"))]
+    fn peer_transfer_peak_rss_kib() -> u64 {
+        fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("VmHWM:"))
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|kib| kib.parse().ok())
+            .expect("VmHWM in /proc/self/status")
     }
 
     /// Rolling upgrade: a peer still on a pre-#259 build answers with the
@@ -21522,7 +21167,7 @@ mod tests {
             .unwrap();
         });
 
-        let requester = peer_requester();
+        let requester = peer_requester(test_dir());
         let written = requester
             .fetch_from_peer(&addr.to_string(), "ns/old/postings.bin")
             .expect("legacy peer fetch should succeed");
@@ -21557,7 +21202,7 @@ mod tests {
                 .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\nonly a few bytes")
                 .unwrap();
         });
-        let requester = peer_requester();
+        let requester = peer_requester(test_dir());
         assert!(requester
             .fetch_from_peer(&addr.to_string(), "ns/cut/doc_store.bin")
             .is_err());

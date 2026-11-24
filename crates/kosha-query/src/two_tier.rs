@@ -320,7 +320,7 @@ pub(crate) fn certify_segment(
         aggs: HashMap::new(),
         total_hits,
         hits_capped: single_list.is_none(),
-        knn_segment_degraded: false,
+        knn_segment_degraded: None,
         knn_failed_segment: None,
     }))
 }
