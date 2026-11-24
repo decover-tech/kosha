@@ -10078,7 +10078,7 @@ impl SegmentReader {
         query: &[f32],
         k: usize,
         budget: KnnProbeBudget<'_>,
-        accept: Option<&dyn Fn(u32) -> bool>,
+        accept: Option<KnnAccept<'_>>,
         fetch: Option<VectorSpanFetch<'_>>,
     ) -> BudgetedKnnResult {
         self.knn_candidates_fetching(field, query, k, budget, accept, fetch)
