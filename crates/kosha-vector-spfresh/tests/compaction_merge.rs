@@ -570,7 +570,10 @@ fn build_quality_sweep() {
         .collect();
 
     eprintln!("build-quality sweep: {n} vectors, dim={dim}, {query_count} held-out queries, median of 3 builds");
-    eprintln!("radius eta elkan build_ms radius_p50 radius_p90 imbalance recall@1/2/3/5% mean_scanned@0.95");
+    eprintln!(
+        "radius eta elkan build_ms radius_p50 radius_p90 imbalance \
+         [d-r] recall@1/2/3/5% scanned@0.95 | [d] recall@1/2/3/5% scanned@0.95"
+    );
     let settings = std::iter::once((8, None, false)).chain(
         [8, 16, 32, 64]
             .into_iter()
@@ -593,15 +596,24 @@ fn build_quality_sweep() {
             .unwrap();
         build_times.sort_unstable();
         let snap = idx.snapshot();
-        let (recalls, scanned) = build_quality_probe_curve(&snap, &queries);
-        let [r1, r2, r3, r5] = recalls;
+        // Two probe orders (#458/#384): the radius-aware lower bound
+        // `d - r` (alpha 1, the engine default) and raw centroid distance
+        // (alpha 0). A build that only helps one of them is a ranking
+        // artifact, not a better partition.
+        let curve = |alpha| {
+            let (recalls, scanned) = build_quality_probe_curve(&snap, &queries, alpha);
+            let [r1, r2, r3, r5] = recalls;
+            format!("{r1:.3}/{r2:.3}/{r3:.3}/{r5:.3} {scanned:.1}")
+        };
         let eta = if eta.is_some() { "4" } else { "off" };
         eprintln!(
-            "{radius:>2} {eta:>3} {elkan:>5} {:>8.1} {:.4} {:.4} {:.4} {r1:.3}/{r2:.3}/{r3:.3}/{r5:.3} {scanned:.1}",
+            "{radius:>2} {eta:>3} {elkan:>5} {:>8.1} {:.4} {:.4} {:.4} {} | {}",
             build_times[1].as_secs_f64() * 1e3,
             median_radius(&snap),
             radius_quantile(&snap, 0.9),
-            idx.stats().imbalance_factor
+            idx.stats().imbalance_factor,
+            curve(1.0),
+            curve(0.0),
         );
     }
 }
@@ -609,6 +621,7 @@ fn build_quality_sweep() {
 fn build_quality_probe_curve(
     snap: &[PostingSnapshot],
     queries: &[(Vec<f32>, Vec<u32>)],
+    alpha: f32,
 ) -> ([f64; 4], f64) {
     let max_id = snap
         .iter()
@@ -628,7 +641,12 @@ fn build_quality_probe_curve(
         let mut order: Vec<_> = snap
             .iter()
             .enumerate()
-            .map(|(pid, p)| (pid, (cosine_distance(q, &p.centroid) - p.radius).max(0.0)))
+            .map(|(pid, p)| {
+                (
+                    pid,
+                    (cosine_distance(q, &p.centroid) - alpha * p.radius).max(0.0),
+                )
+            })
             .collect();
         order.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
         // Every global top-10 hit in a probed posting survives exact
