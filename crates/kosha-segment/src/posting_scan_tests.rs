@@ -1462,11 +1462,23 @@ fn per_segment_probe_respects_opt_in_radius_quantiles() {
         let records = parse_vector_offsets(&offsets, 2, version).unwrap();
         let mut vi = LazyVectorIndex::from_parsed(&path, 0, 2, version, records, None);
         vi.probe_radius = mode;
+        // The selected quantile only reorders postings at a nonzero radius
+        // weight: at alpha 1 a p50/p90 radius ranks the diffuse posting first.
+        if expected == 1 {
+            let scores = SegmentReader::centroid_scores(&vi, &query, 1.0);
+            let best = (0..scores.len())
+                .min_by(|&a, &b| scores[a].total_cmp(&scores[b]))
+                .unwrap();
+            assert_eq!(best, 1, "{version} {mode:?} at alpha 1");
+        }
+        // The default (alpha 0 since DEC-3203) ranks by raw centroid
+        // distance whatever radius is selected, so the one-posting probe
+        // scans the nearest centroid's posting (doc 0) in every mode.
         let hits = fixture
             .reader
             .knn_search_lazy(&vi, &query, 1, 1, None, None)
             .unwrap();
-        assert_eq!(hits[0].0, expected, "{version} {mode:?}");
+        assert_eq!(hits[0].0, 0, "{version} {mode:?} at the default alpha");
     }
 }
 
