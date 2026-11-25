@@ -17031,45 +17031,29 @@ mod tests {
             retired: Default::default(),
             shards: None,
         };
-        // Ranked at an explicit radius weight, so this pins the mechanism
-        // whatever `KOSHA_KNN_PROBE_RADIUS_ALPHA` defaults to. The default
-        // is 0 since DEC-3203: on a real 988k-vector legal corpus, full
-        // radius weight (alpha 1) cut tie-tolerant recall@10 to 0.82 at 4x
-        // the postings of alpha 0 (0.99), because outlier members inflate
-        // max radii and clamp most rank scores to 0. This contrived corpus
-        // (a two-member posting whose members are 162 degrees apart) is the
-        // case alpha 1 exists for; `KOSHA_KNN_PROBE_RADIUS_ALPHA=1` restores it.
-        let query = [1.0f32, 0.0];
-        let rank_of_target = |alpha: f32| {
-            let mut scores: Vec<(f32, String)> = manifest
-                .segments
-                .iter()
-                .map(|entry| {
-                    let reader = kosha_segment::SegmentReader::open(
-                        dir.join(&ns.0).join(&entry.segment_id.0),
-                    )
-                    .unwrap();
-                    let s = reader
-                        .knn_centroid_distances_with_alpha("emb", &query, alpha)
-                        .unwrap();
-                    (s[0], entry.segment_id.0.clone())
-                })
-                .collect();
-            scores.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-            scores.iter().position(|(_, seg)| seg == "target").unwrap()
-        };
-        assert!(
-            rank_of_target(1.0) < 15,
-            "full radius weight must rank the diluted posting inside a thin \
-             budget (15 of 51), got rank {}",
-            rank_of_target(1.0)
+        let searcher = Searcher::new(dir.clone());
+        let mut q = mk_query("", 1);
+        q.knn = Some(kosha_core::KnnQuery {
+            query_text: None,
+            embedding_model: None,
+            field: "emb".into(),
+            vector: vec![1.0, 0.0],
+            k: 1,
+            num_candidates: 15, // thin: well under the 51-segment corpus
+            filter: None,
+            vectors: None,
+            scoring: None,
+        });
+        let r = searcher.search(&ns, &manifest, &q, None).unwrap();
+        assert_eq!(
+            r.results.first().map(|h| h.doc_id.0.clone()),
+            Some("true-nn".to_string()),
+            "radius-aware ranking must find the diluted true neighbour at a \
+             thin budget (15), not just at a budget wide enough to admit \
+             every segment — got {:?}",
+            r.results
         );
-        assert!(
-            rank_of_target(0.0) >= 15,
-            "raw centroid distance ranks the diluted posting behind the decoys \
-             (the trade-off alpha 0 accepts), got rank {}",
-            rank_of_target(0.0)
-        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
