@@ -146,7 +146,7 @@ routes: they are never gated (see
 
 | When | Step |
 |---|---|
-| The release that ships this (target 2026-12-15) | Headers and counter live; Kosha's own clients, bench and tools use only `/v1`. Legacy routes are off by default; stage and prod explicitly keep them on until the rollout gates below are met. |
+| The release that ships this (target 2026-12-15) | Headers and counter live; Kosha's own clients, bench and tools use only `/v1`. Legacy routes are off by default; stage and prod explicitly kept them on until the rollout gates below were met. |
 | Once stage shows 7 days of zero `kosha_legacy_requests_total` and kosha-client 0.3.0 is on PyPI | Stage: `KOSHA_LEGACY_ROUTES=off` in `k8s/stage/configmap-patch.yaml` (the stage backfill Job runs `kosha-server migrate` directly and `scripts/copy_es_to_kosha.py` uses `/v1`, so neither needs the legacy routes). |
 | After stage is clean and prod shows 7 days of zero legacy traffic (or the stragglers are allowlisted) | Prod: `KOSHA_LEGACY_ROUTES=off` in `k8s/prod/configmap-patch.yaml`. |
 | 2027-06-01 (Sunset) | Handlers removed, provided `kosha_legacy_requests_total` read zero on managed deployments for 14 days; otherwise the Sunset is extended and announced. After removal the paths keep answering `410 legacy_route_disabled` for the rest of v1. |
@@ -169,11 +169,12 @@ above as already in effect:
 - Shipped: `info.version` 1.0.0 (v1 GA), the `oasdiff breaking` gate on
   the public document, Redoc API docs (`api-docs.yml`) and both specs as
   release assets.
-- **Not yet done: existing managed deployments switch off (stage, then
-  prod).** The built-in default is `off`, but the existing `k8s/stage`
-  and `k8s/prod` overlays explicitly opt in until the traffic and client
-  readiness conditions above are met (ADR-350 §c). Physical removal of
-  the legacy handlers remains scheduled for Sunset.
+- Shipped: stage runs with `KOSHA_LEGACY_ROUTES=off`
+  (`k8s/stage/configmap-patch.yaml`).
+- **Not yet done: prod switches off.** The built-in default is `off`, but
+  the `k8s/prod` overlay explicitly opts in until the traffic conditions
+  above are met (ADR-350 §c). Physical removal of the legacy handlers
+  remains scheduled for Sunset.
 
 ## Changing the contract
 
