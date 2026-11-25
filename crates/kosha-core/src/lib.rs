@@ -4746,6 +4746,12 @@ impl From<serde_json::Error> for KoshaError {
 
 // ─── Filter value store ─────────────────────────────────────────────────────
 
+/// One segment's filterable values, row by row. Each field's entries are in
+/// non-decreasing doc_seq order (a document with several values keeps them
+/// adjacent, in its field order): the writer appends them as documents
+/// arrive, columns are validated to be in that order, and the `filters.bin`
+/// parser restores it. Readers rely on it to look up a few documents by
+/// galloping instead of scanning every entry.
 #[derive(Debug, Clone, Default)]
 pub struct FilterStore {
     pub string_fields: std::collections::HashMap<String, Vec<(u32, String)>>,

@@ -13570,6 +13570,28 @@ impl SegmentReader {
                 _ => {}
             }
         }
+        // The writer appends entries as documents arrive, so they are in
+        // doc_seq order already; a file that is not (none is known) is put
+        // back in that order rather than trusted, because sorts look values
+        // up by doc_seq (see `FilterStore`). Stable, so one document's
+        // values keep their order. One pass per field, once per segment.
+        fn in_doc_order<V>(field: &str, entries: &mut [(u32, V)]) {
+            if !entries.is_sorted_by_key(|e| e.0) {
+                eprintln!(
+                    "WARN: filters.bin field {field:?}: entries out of doc_seq order; sorting"
+                );
+                entries.sort_by_key(|e| e.0);
+            }
+        }
+        for (field, entries) in &mut store.string_fields {
+            in_doc_order(field, entries);
+        }
+        for (field, entries) in &mut store.integer_fields {
+            in_doc_order(field, entries);
+        }
+        for (field, entries) in &mut store.float_fields {
+            in_doc_order(field, entries);
+        }
         Ok(store)
     }
 }
@@ -18278,6 +18300,39 @@ mod filter_column_format_tests {
             );
             let _ = fs::remove_dir_all(&dir);
         }
+    }
+
+    /// Sorts gallop through a field's entries by doc_seq, so a `filters.bin`
+    /// whose entries are out of that order (the writer never produces one)
+    /// is parsed back into it, one document's values kept in their order.
+    #[test]
+    fn parsed_filters_are_in_doc_order() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(b"tag");
+        buf.push(0);
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        for (doc, value) in [(2u32, "c"), (0, "a"), (2, "b"), (1, "x")] {
+            buf.extend_from_slice(&doc.to_le_bytes());
+            buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            buf.extend_from_slice(value.as_bytes());
+        }
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(b"n");
+        buf.push(1);
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        for (doc, value) in [(5u32, 50i64), (4, 40)] {
+            buf.extend_from_slice(&doc.to_le_bytes());
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+        let store = SegmentReader::parse_filters(&buf).unwrap();
+        let tag: Vec<(u32, &str)> = store.string_fields["tag"]
+            .iter()
+            .map(|(d, v)| (*d, v.as_str()))
+            .collect();
+        assert_eq!(tag, vec![(0, "a"), (1, "x"), (2, "c"), (2, "b")]);
+        assert_eq!(store.integer_fields["n"], vec![(4, 40), (5, 50)]);
     }
 
     #[test]
