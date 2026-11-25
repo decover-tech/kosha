@@ -194,7 +194,9 @@ on:
           = off. "fractions" = KOSHA_KNN_BUDGET_FRACTION 0.05/0.03/0.02/0.01;
           "relative" = the step 2 flag grid (alpha 0/0.5, alpha=0 relative
           cutoff at eps 0.5/1/2, min probes 500/1000, plus f0.05); "bound" =
-          KOSHA_KNN_BOUND_STOP_ALPHA 1/0.95/0.9/0.85 plus f0.05;
+          KOSHA_KNN_BOUND_STOP_ALPHA 1/0.95/0.9/0.85 plus f0.05; "radius" =
+          KOSHA_KNN_PROBE_RADIUS max/p90/p50 (#458; needs a vector_snapshot
+          built with KOSHA_VECTOR_WRITE_VERSION=5);
           or points "label:ENV=V,ENV=V;label2:..." over the kNN probe knobs
           (see scripts/bench/bm25_scale/vm/knn_budget_sweep.sh). Each point
           restarts the server with those env vars, runs a warm kNN phase of

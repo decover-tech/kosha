@@ -477,6 +477,12 @@ table is appended to the job summary). Points:
   `KOSHA_KNN_PROBE_RADIUS_ALPHA`, `KOSHA_KNN_BOUND_STOP_ALPHA`. Include an
   `f0.05` point (or pass the
   report `--baseline`) for the comparison column.
+- `radius`: the #458 probe-order radius (`KOSHA_KNN_PROBE_RADIUS`), 5
+  points: `f0.05` (baseline, max radius), `rp90`, `rp50`, `rp90a0.5`
+  (p90 at alpha 0.5) and `rp90rel1m500` (p90, alpha 0, eps 1, min probes
+  500). Only meaningful on a `vector_snapshot` built with
+  `KOSHA_VECTOR_WRITE_VERSION=5` (p50/p90 stored); older segments fall
+  back to the max radius.
 
 `recall_check.py` reports, per query and summarized (mean, p1/p5/p10/p50):
 exact-id recall@k, ANN-Benchmarks distance-threshold recall (a returned

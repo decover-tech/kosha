@@ -31,6 +31,14 @@
 #                    skip a posting once the segment's k-th score reaches
 #                    alpha x the posting's similarity ceiling (Block-Max
 #                    Pruning reports alpha=0.85 near-lossless on its index)
+# The shorthand "radius" is the #458 probe-order radius
+# (KOSHA_KNN_PROBE_RADIUS, default max). It only changes anything on a
+# snapshot written with KOSHA_VECTOR_WRITE_VERSION=5 (p50/p90 stored);
+# older segments fall back to the max radius:
+#   f0.05            baseline (max radius, fixed budget)
+#   rp90, rp50       rank by the p90 / p50 member distance, fixed budget
+#   rp90a0.5         p90 at half radius weight
+#   rp90rel1m500     p90 + alpha=0 relative cutoff (eps 1, min 500)
 # Each recall query reports which rule set its cutoff
 # (timings.knn_cutoff_rule: budget / eps / floor / zero_best), and the
 # report tabulates the shares, so a point that misses the bar can be read.
@@ -66,7 +74,7 @@ BENCH_DIR="$(cd "$HERE/.." && pwd)"
 PY=~/venv311/bin/python3
 # The knobs a point may set. All are read once at server start, hence the
 # container recreate per point.
-KNOBS="KOSHA_KNN_BUDGET_FRACTION KOSHA_KNN_BUDGET_MAX_CAP KOSHA_KNN_RELATIVE_CUTOFF_EPS KOSHA_KNN_RELATIVE_MIN_PROBES KOSHA_KNN_PROBE_RADIUS_ALPHA KOSHA_KNN_BOUND_STOP_ALPHA"
+KNOBS="KOSHA_KNN_BUDGET_FRACTION KOSHA_KNN_BUDGET_MAX_CAP KOSHA_KNN_RELATIVE_CUTOFF_EPS KOSHA_KNN_RELATIVE_MIN_PROBES KOSHA_KNN_PROBE_RADIUS_ALPHA KOSHA_KNN_PROBE_RADIUS KOSHA_KNN_BOUND_STOP_ALPHA"
 
 if [ "$POINTS" = fractions ]; then
   POINTS="f0.05:KOSHA_KNN_BUDGET_FRACTION=0.05;f0.03:KOSHA_KNN_BUDGET_FRACTION=0.03;f0.02:KOSHA_KNN_BUDGET_FRACTION=0.02;f0.01:KOSHA_KNN_BUDGET_FRACTION=0.01"
@@ -82,6 +90,11 @@ fi
 if [ "$POINTS" = bound ]; then
   B=KOSHA_KNN_BOUND_STOP_ALPHA
   POINTS="f0.05:KOSHA_KNN_BUDGET_FRACTION=0.05;b1:$B=1;b0.95:$B=0.95;b0.9:$B=0.9;b0.85:$B=0.85"
+fi
+if [ "$POINTS" = radius ]; then
+  R=KOSHA_KNN_PROBE_RADIUS
+  POINTS="f0.05:KOSHA_KNN_BUDGET_FRACTION=0.05;rp90:$R=p90;rp50:$R=p50;rp90a0.5:$R=p90,KOSHA_KNN_PROBE_RADIUS_ALPHA=0.5"
+  POINTS="$POINTS;rp90rel1m500:$R=p90,KOSHA_KNN_PROBE_RADIUS_ALPHA=0,KOSHA_KNN_RELATIVE_CUTOFF_EPS=1.0,KOSHA_KNN_RELATIVE_MIN_PROBES=500"
 fi
 case "$POINTS" in *[!A-Za-z0-9_.=:\;,-]*) echo "points may only contain [A-Za-z0-9_.=:;,-]: $POINTS"; exit 1 ;; esac
 
