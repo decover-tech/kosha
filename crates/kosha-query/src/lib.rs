@@ -8188,14 +8188,30 @@ impl Searcher {
             }
         }
 
+        // A custom sort that leads with `_score` (the backend's keyword
+        // search sends `[_score, documentId, pageNumber]`): the later keys
+        // only order hits whose scores tie, so a hit scoring below this
+        // segment's `effective_k`-th best score can never make its first
+        // `effective_k`, whatever its other keys. Drop those before reading
+        // any sort values, which then cost the cut plus its boundary ties,
+        // not every match. The exact cut under the full order is still the
+        // one below.
+        if !pure_knn && !score_ranked && rrf.is_none() && !has_cursor && group_cap.is_none() {
+            if let Some(descending) = leading_score_order(&query.sort) {
+                cut_below_score_boundary(&mut ranked, effective_k, descending);
+            }
+        }
+
         let sort_value_maps = if sort_value_fields.is_empty() {
             HashMap::new()
         } else {
-            let wanted: HashSet<u32> = ranked
+            let mut wanted: Vec<u32> = ranked
                 .iter()
                 .map(|(_, doc_seq)| *doc_seq)
                 .chain(knn_hits.iter().map(|(doc_seq, _, _)| *doc_seq))
                 .collect();
+            wanted.sort_unstable();
+            wanted.dedup();
             if columnar_filters {
                 build_sort_value_maps_columnar(&reader, sort_value_fields, &wanted, &query.sort)?
             } else {
@@ -10506,16 +10522,18 @@ fn sort_fields_needing_values(sort: &[SortSpec]) -> Vec<String> {
 /// disk read per candidate instead of just per returned page. Built once
 /// per segment per query, not once per hit.
 ///
-/// `wanted` restricts the clone to this segment's actual candidate set:
-/// `store`'s per-field entries cover *every document in the segment* that
-/// has the field set, matched or not, so without this filter a query
-/// matching a handful of docs in a large segment would still clone every
-/// other document's value for that field. `extract_sort_values` only ever
-/// looks up `wanted` doc_seqs, so anything outside it is wasted work.
+/// `wanted` (sorted, distinct) restricts the work to this segment's
+/// candidate set: `store`'s per-field entries cover *every document in the
+/// segment* that has the field set, matched or not. The entries are in
+/// doc_seq order (see `FilterStore`), so the walk gallops to each wanted
+/// doc_seq the way the columnar twin does: a query with a handful of
+/// candidates in a large segment costs a few binary searches, not a pass
+/// over every document's value. `extract_sort_values` only ever looks up
+/// `wanted` doc_seqs.
 fn build_sort_value_maps(
     store: &FilterStore,
     fields: &[String],
-    wanted: &HashSet<u32>,
+    wanted: &[u32],
     sort: &[SortSpec],
 ) -> HashMap<String, HashMap<u32, SortValue>> {
     fields
@@ -10547,27 +10565,43 @@ fn build_sort_value_maps(
                 }
             };
             if let Some(entries) = kosha_core::lookup_field(&store.string_fields, field) {
-                for (seq, v) in entries.iter().filter(|(seq, _)| wanted.contains(seq)) {
-                    match (is_sort_key && v.starts_with('['))
-                        .then(|| kosha_core::list_elements(v))
-                        .flatten()
-                    {
-                        // An empty list is no value: the document sorts as
-                        // missing.
-                        Some(elements) => elements
-                            .into_iter()
-                            .for_each(|e| offer(*seq, SortValue::Text(e))),
-                        None => offer(*seq, SortValue::Text(v.clone())),
-                    }
-                }
+                for_each_wanted_entry_by(
+                    entries,
+                    |e| e.0,
+                    wanted,
+                    |_, i| {
+                        let (seq, v) = &entries[i];
+                        match (is_sort_key && v.starts_with('['))
+                            .then(|| kosha_core::list_elements(v))
+                            .flatten()
+                        {
+                            // An empty list is no value: the document sorts as
+                            // missing.
+                            Some(elements) => elements
+                                .into_iter()
+                                .for_each(|e| offer(*seq, SortValue::Text(e))),
+                            None => offer(*seq, SortValue::Text(v.clone())),
+                        }
+                    },
+                );
             } else if let Some(entries) = kosha_core::lookup_field(&store.integer_fields, field) {
-                for (seq, v) in entries.iter().filter(|(seq, _)| wanted.contains(seq)) {
-                    offer(*seq, SortValue::Number(*v as f64));
-                }
+                for_each_wanted_entry_by(
+                    entries,
+                    |e| e.0,
+                    wanted,
+                    |_, i| {
+                        offer(entries[i].0, SortValue::Number(entries[i].1 as f64));
+                    },
+                );
             } else if let Some(entries) = kosha_core::lookup_field(&store.float_fields, field) {
-                for (seq, v) in entries.iter().filter(|(seq, _)| wanted.contains(seq)) {
-                    offer(*seq, SortValue::Number(*v));
-                }
+                for_each_wanted_entry_by(
+                    entries,
+                    |e| e.0,
+                    wanted,
+                    |_, i| {
+                        offer(entries[i].0, SortValue::Number(entries[i].1));
+                    },
+                );
             }
             (field.clone(), map)
         })
@@ -10727,6 +10761,47 @@ fn wand_eligible_query(query: &SearchQuery, has_text: bool) -> bool {
 /// cut produce.
 fn sort_is_default_ranking(sort: &[SortSpec]) -> bool {
     kosha_core::sort_is_by_score(sort)
+}
+
+/// `Some(descending)` when the request's sort starts with `_score` as a
+/// key of its own. A first spec naming several keys does not count: its
+/// keys sit in a map, so which of them compares first is not `_score` by
+/// construction.
+fn leading_score_order(sort: &[SortSpec]) -> Option<bool> {
+    let first = sort.first()?;
+    if first.fields.len() != 1 {
+        return None;
+    }
+    let (field, order) = first.fields.iter().next()?;
+    (field == "_score").then(|| order.order == "desc")
+}
+
+/// Keep the hits that can still be in the first `k` of an order whose first
+/// key is the score: those scoring at least as well as the `k`-th best,
+/// boundary ties included (their later sort keys decide between them).
+/// Every hit dropped has `k` hits scoring strictly better, so no later key
+/// can lift it into the first `k`. Leaves `ranked` whole when it holds a
+/// NaN score: `compare_candidates` treats NaN as equal to every score, so
+/// the order is not by score first and nothing can be ruled out.
+fn cut_below_score_boundary(ranked: &mut Vec<(f64, u32)>, k: usize, descending: bool) {
+    if k == 0 || ranked.len() <= k || ranked.iter().any(|(score, _)| score.is_nan()) {
+        return;
+    }
+    let first = |a: &(f64, u32), b: &(f64, u32)| {
+        let ord = a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal);
+        if descending {
+            ord.reverse()
+        } else {
+            ord
+        }
+    };
+    ranked.select_nth_unstable_by(k - 1, first);
+    let boundary = ranked[k - 1].0;
+    if descending {
+        ranked.retain(|(score, _)| *score >= boundary);
+    } else {
+        ranked.retain(|(score, _)| *score <= boundary);
+    }
 }
 
 /// Score descending, `_id` ascending: default ranking, and the order each
@@ -11666,25 +11741,38 @@ fn aggregate_matches(
 /// column's non-decreasing doc_seqs) whose doc_seq is in `wanted` (sorted,
 /// distinct). Gallops through `docs`, so the cost follows the candidate
 /// count, not the column length, when candidates are few.
-fn for_each_wanted_entry(docs: &[u32], wanted: &[u32], mut f: impl FnMut(usize, usize)) {
+fn for_each_wanted_entry(docs: &[u32], wanted: &[u32], f: impl FnMut(usize, usize)) {
+    for_each_wanted_entry_by(docs, |d| *d, wanted, f)
+}
+
+/// [`for_each_wanted_entry`] over any entries in non-decreasing doc_seq
+/// order, `doc_of` reading an entry's doc_seq: a `filters.bin` segment's
+/// `(doc_seq, value)` rows as well as a column's `docs`.
+fn for_each_wanted_entry_by<T>(
+    entries: &[T],
+    doc_of: impl Fn(&T) -> u32,
+    wanted: &[u32],
+    mut f: impl FnMut(usize, usize),
+) {
+    let docs = entries;
     let mut p = 0usize;
     for (wi, &doc) in wanted.iter().enumerate() {
         if p >= docs.len() {
             return;
         }
-        if docs[p] < doc {
+        if doc_of(&docs[p]) < doc {
             // Exponential probe, then binary search inside the bracket.
             let mut step = 1usize;
             let mut hi = p + 1;
-            while hi < docs.len() && docs[hi] < doc {
+            while hi < docs.len() && doc_of(&docs[hi]) < doc {
                 p = hi;
                 step *= 2;
                 hi = p + step;
             }
             let hi = hi.min(docs.len());
-            p += docs[p..hi].partition_point(|d| *d < doc);
+            p += docs[p..hi].partition_point(|d| doc_of(d) < doc);
         }
-        while p < docs.len() && docs[p] == doc {
+        while p < docs.len() && doc_of(&docs[p]) == doc {
             f(wi, p);
             p += 1;
         }
@@ -12103,14 +12191,12 @@ fn visit_metric_values_columnar(
 fn build_sort_value_maps_columnar(
     reader: &SegmentReader,
     fields: &[String],
-    wanted: &HashSet<u32>,
+    sorted: &[u32],
     sort: &[SortSpec],
 ) -> Result<HashMap<String, HashMap<u32, SortValue>>, KoshaError> {
     use kosha_core::FilterColumnKind;
     use kosha_segment::filter_columns::FilterColumn;
     use kosha_segment::filter_eval::resolve_column;
-    let mut sorted: Vec<u32> = wanted.iter().copied().collect();
-    sorted.sort_unstable();
     let mut out = HashMap::with_capacity(fields.len());
     for field in fields {
         let descending = sort_field_is_descending(sort, field);
@@ -12146,7 +12232,7 @@ fn build_sort_value_maps_columnar(
         match column.as_deref() {
             Some(FilterColumn::String(c)) => {
                 let ords = c.ords();
-                for_each_wanted_entry(c.docs(), &sorted, |wi, i| {
+                for_each_wanted_entry(c.docs(), sorted, |wi, i| {
                     let v = c.term(ords[i]);
                     match (is_sort_key && v.starts_with('['))
                         .then(|| kosha_core::list_elements(v))
@@ -12163,13 +12249,13 @@ fn build_sort_value_maps_columnar(
             }
             Some(FilterColumn::Integer(c)) => {
                 let values = c.values();
-                for_each_wanted_entry(c.docs(), &sorted, |wi, i| {
+                for_each_wanted_entry(c.docs(), sorted, |wi, i| {
                     offer(sorted[wi], SortValue::Number(values[i] as f64));
                 });
             }
             Some(FilterColumn::Float(c)) => {
                 let values = c.values();
-                for_each_wanted_entry(c.docs(), &sorted, |wi, i| {
+                for_each_wanted_entry(c.docs(), sorted, |wi, i| {
                     offer(sorted[wi], SortValue::Number(values[i]));
                 });
             }
@@ -29930,5 +30016,340 @@ mod filtered_knn_tests {
         assert_eq!(filtered_knn_budget(100, Some(0.25)), 400);
         assert_eq!(filtered_knn_budget(100, Some(0.001)), 800, "capped at 8x");
         assert_eq!(filtered_knn_budget(100, Some(0.0)), 100);
+    }
+}
+
+/// A custom sort reads its keys only for the hits that can still make the
+/// page: under a leading `_score`, this segment's best `from + size` by
+/// score plus the boundary ties; and on a `filters.bin` segment by
+/// galloping to each candidate, not by scanning every document's value.
+/// The page must be exactly what ranking every match would give.
+#[cfg(test)]
+mod sort_keys_tests {
+    use super::*;
+    use kosha_core::{DocumentId, Field, ManifestEntry, SegmentId};
+    use kosha_segment::SegmentWriter;
+    use std::path::PathBuf;
+
+    const TEMPLATES: [&str; 5] = [
+        "alpha",
+        "alpha beta",
+        "alpha alpha",
+        "beta gamma",
+        "alpha gamma delta",
+    ];
+
+    /// Doc `g`: its id, documentId, pageNumber (absent on every 6th), and
+    /// matter. Five content templates give large groups of equal scores,
+    /// documentIds repeat across segments, and pageNumbers repeat within a
+    /// documentId, so every sort key has ties for the next one to break.
+    fn doc(g: usize) -> (String, String, Option<i64>, &'static str, &'static str) {
+        (
+            format!("c{:03}", (g * 37) % 101),
+            format!("doc-{:02}", (g * 7) % 17),
+            (!g.is_multiple_of(6)).then_some((g % 4) as i64),
+            if g.is_multiple_of(3) { "m2" } else { "m1" },
+            TEMPLATES[g % TEMPLATES.len()],
+        )
+    }
+
+    /// Three segments (30, 50 and 20 docs) in `filters_version`'s format.
+    fn namespace(filters_version: u32) -> (PathBuf, NamespaceId, Manifest) {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-sort-keys-{filters_version}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ns = NamespaceId("ns".into());
+        let mut segments = Vec::new();
+        let mut g = 0;
+        for (s, n) in [30usize, 50, 20].into_iter().enumerate() {
+            let id = format!("s{s}");
+            let mut w = SegmentWriter::new(SegmentId(id.clone()), dir.join(&ns.0).join(&id))
+                .with_filters_write_version(filters_version);
+            for _ in 0..n {
+                let (doc_id, document, page, matter, content) = doc(g);
+                let mut fields = vec![
+                    Field::text("content", content),
+                    Field::text("documentId", document),
+                    Field::keyword("matterId", matter),
+                ];
+                if let Some(page) = page {
+                    fields.push(Field::integer("pageNumber", page));
+                }
+                w.add_document(DocumentId(doc_id), fields);
+                g += 1;
+            }
+            w.finalize(kosha_core::Bm25Params::default()).unwrap();
+            segments.push(ManifestEntry {
+                segment_id: SegmentId(id),
+                doc_count: n as u32,
+            });
+        }
+        let manifest = Manifest {
+            version: 1,
+            segments,
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            schema: None,
+            retired: Default::default(),
+            shards: None,
+            branch: None,
+        };
+        (dir, ns, manifest)
+    }
+
+    fn query(sort: &serde_json::Value, filtered: bool, from: usize, size: usize) -> SearchQuery {
+        let mut q = serde_json::json!({
+            "query_text": "alpha", "sort": sort, "from": from, "max_results": size,
+            "no_cache": true,
+        });
+        if filtered {
+            q["filter"] = serde_json::json!({"term": {"matterId": "m1"}});
+        }
+        serde_json::from_value(q).unwrap()
+    }
+
+    /// (documentId, pageNumber) of a hit, from the data the namespace was
+    /// written with: an oracle independent of the sort-value lookups.
+    fn keys_of(id: &str) -> (String, Option<i64>) {
+        let (_, document, page, _, _) = (0..100).map(doc).find(|d| d.0 == id).unwrap();
+        (document, page)
+    }
+
+    /// `a` before `b` under `sort`, with the hits' scores and the oracle's
+    /// keys; `_id` ascending last. A missing pageNumber sorts first.
+    fn oracle_order(sort: &[(&str, bool)], a: &ScoredDocument, b: &ScoredDocument) -> bool {
+        use std::cmp::Ordering;
+        let (ka, kb) = (keys_of(&a.doc_id.0), keys_of(&b.doc_id.0));
+        for &(field, desc) in sort {
+            let ord = match field {
+                "_score" => a.score.partial_cmp(&b.score).unwrap(),
+                "documentId" => ka.0.cmp(&kb.0),
+                "pageNumber" => ka.1.cmp(&kb.1),
+                other => unreachable!("{other}"),
+            };
+            let ord = if desc { ord.reverse() } else { ord };
+            if ord != Ordering::Equal {
+                return ord == Ordering::Less;
+            }
+        }
+        a.doc_id.0 < b.doc_id.0
+    }
+
+    #[test]
+    fn pages_under_custom_sorts_match_ranking_every_match() {
+        let sorts: [&[(&str, bool)]; 4] = [
+            // The backend's keyword search.
+            &[
+                ("_score", true),
+                ("documentId", false),
+                ("pageNumber", false),
+            ],
+            &[("documentId", false)],
+            &[
+                ("_score", false),
+                ("documentId", true),
+                ("pageNumber", true),
+            ],
+            &[("_score", true), ("pageNumber", true)],
+        ];
+        for filters_version in [1, 2] {
+            let (dir, ns, manifest) = namespace(filters_version);
+            let searcher = Searcher::new(dir.clone());
+            for sort in sorts {
+                let spec = serde_json::Value::Array(
+                    sort.iter()
+                        .map(|(f, desc)| {
+                            serde_json::json!({ *f: {"order": if *desc { "desc" } else { "asc" }}})
+                        })
+                        .collect(),
+                );
+                for filtered in [false, true] {
+                    let ctx = format!("v{filters_version} sort {spec} filtered {filtered}");
+                    let all = searcher
+                        .search(&ns, &manifest, &query(&spec, filtered, 0, 1000), None)
+                        .unwrap();
+                    let expected = (0..100)
+                        .map(doc)
+                        .filter(|d| d.4.contains("alpha") && (!filtered || d.3 == "m1"))
+                        .count();
+                    assert_eq!(all.results.len(), expected, "{ctx}");
+                    // Ties at every key, so the oracle checks the lookups.
+                    let scores: HashSet<u64> =
+                        all.results.iter().map(|h| h.score.to_bits()).collect();
+                    assert!(scores.len() < expected / 4, "{ctx}: scores must tie");
+                    for pair in all.results.windows(2) {
+                        assert!(oracle_order(sort, &pair[0], &pair[1]), "{ctx}: {pair:?}");
+                    }
+                    for (from, size) in [(0, 1), (0, 2), (0, 5), (3, 4), (7, 9), (0, 30), (40, 30)]
+                    {
+                        let page = searcher
+                            .search(&ns, &manifest, &query(&spec, filtered, from, size), None)
+                            .unwrap();
+                        let want: Vec<(&str, u64)> = all
+                            .results
+                            .iter()
+                            .skip(from)
+                            .take(size)
+                            .map(|h| (h.doc_id.0.as_str(), h.score.to_bits()))
+                            .collect();
+                        let got: Vec<(&str, u64)> = page
+                            .results
+                            .iter()
+                            .map(|h| (h.doc_id.0.as_str(), h.score.to_bits()))
+                            .collect();
+                        assert_eq!(got, want, "{ctx} from {from} size {size}");
+                        assert_eq!(page.total_hits, expected, "{ctx}");
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn leading_score_cut_keeps_boundary_ties_and_drops_the_rest() {
+        let mut ranked = vec![(1.0, 0), (3.0, 1), (2.0, 2), (2.0, 3), (2.0, 4), (0.5, 5)];
+        cut_below_score_boundary(&mut ranked, 2, true);
+        ranked.sort_by_key(|r| r.1);
+        // The 2nd best score is 2.0, so all three hits on it stay.
+        assert_eq!(ranked, vec![(3.0, 1), (2.0, 2), (2.0, 3), (2.0, 4)]);
+
+        let mut ranked = vec![(1.0, 0), (3.0, 1), (2.0, 2), (1.0, 3), (0.5, 5)];
+        cut_below_score_boundary(&mut ranked, 2, false);
+        ranked.sort_by_key(|r| r.1);
+        assert_eq!(ranked, vec![(1.0, 0), (1.0, 3), (0.5, 5)]);
+
+        // NaN scores have no order to cut by; k at least the hit count and
+        // k = 0 are left to the exact cut.
+        for (mut ranked, k) in [
+            (vec![(f64::NAN, 0), (3.0, 1), (2.0, 2)], 1),
+            (vec![(1.0, 0), (2.0, 1)], 2),
+            (vec![(1.0, 0), (2.0, 1)], 0),
+        ] {
+            let before = format!("{ranked:?}");
+            cut_below_score_boundary(&mut ranked, k, true);
+            assert_eq!(format!("{ranked:?}"), before);
+        }
+    }
+
+    #[test]
+    fn leading_score_order_needs_score_as_its_own_first_key() {
+        let sort = |v: serde_json::Value| -> Vec<SortSpec> { serde_json::from_value(v).unwrap() };
+        assert_eq!(
+            leading_score_order(&sort(serde_json::json!([
+                {"_score": {"order": "desc"}}, {"documentId": {"order": "asc"}}]))),
+            Some(true)
+        );
+        assert_eq!(
+            leading_score_order(&sort(serde_json::json!([{"_score": {"order": "asc"}}]))),
+            Some(false)
+        );
+        assert_eq!(
+            leading_score_order(&sort(serde_json::json!([
+                {"documentId": {"order": "asc"}}, {"_score": {"order": "desc"}}]))),
+            None
+        );
+        // Two keys in one spec: their order is a map's, not the request's.
+        assert_eq!(
+            leading_score_order(&sort(serde_json::json!([
+                {"_score": {"order": "desc"}, "documentId": {"order": "asc"}}]))),
+            None
+        );
+        assert_eq!(leading_score_order(&[]), None);
+    }
+
+    /// The galloping lookup reads exactly what a scan of every entry
+    /// filtered to the candidates reads, multi-valued fields included.
+    #[test]
+    fn legacy_sort_values_match_a_full_scan() {
+        let mut store = FilterStore::default();
+        store.string_fields.insert(
+            "tag".into(),
+            (0..200u32)
+                .flat_map(|d| {
+                    let n = (d % 3) as usize; // 0, 1 or 2 values
+                    (0..n).map(move |i| (d, format!("t{}", (d * 13 + i as u32 * 7) % 31)))
+                })
+                .chain([(250, "[\"z\", \"b\"]".to_string())])
+                .collect(),
+        );
+        store.integer_fields.insert(
+            "n".into(),
+            (0..200u32)
+                .step_by(2)
+                .map(|d| (d, (d % 9) as i64))
+                .collect(),
+        );
+        store.float_fields.insert(
+            "f".into(),
+            (5..150u32).map(|d| (d, d as f64 / 3.0)).collect(),
+        );
+        let fields: Vec<String> = ["tag", "n", "f", "absent"].map(String::from).to_vec();
+        for desc in [false, true] {
+            let order = if desc { "desc" } else { "asc" };
+            let sort: Vec<SortSpec> = serde_json::from_value(serde_json::json!(fields
+                .iter()
+                .map(|f| serde_json::json!({f: {"order": order}}))
+                .collect::<Vec<_>>()))
+            .unwrap();
+            for wanted in [
+                vec![],
+                vec![0, 1, 2],
+                vec![3, 50, 51, 199, 250, 300],
+                (0..300).step_by(7).collect::<Vec<u32>>(),
+                (0..300).collect(),
+            ] {
+                let got = build_sort_value_maps(&store, &fields, &wanted, &sort);
+                for field in &fields {
+                    let mut scan: HashMap<u32, SortValue> = HashMap::new();
+                    let mut offer = |seq: u32, v: SortValue| {
+                        let keep = scan.get(&seq).is_some_and(|old| {
+                            let ord = v.compare(old);
+                            if desc {
+                                ord.is_le()
+                            } else {
+                                ord.is_ge()
+                            }
+                        });
+                        if !keep {
+                            scan.insert(seq, v);
+                        }
+                    };
+                    let w: HashSet<u32> = wanted.iter().copied().collect();
+                    if let Some(e) = store.string_fields.get(field) {
+                        for (d, v) in e.iter().filter(|(d, _)| w.contains(d)) {
+                            match v
+                                .starts_with('[')
+                                .then(|| kosha_core::list_elements(v))
+                                .flatten()
+                            {
+                                Some(els) => {
+                                    els.into_iter().for_each(|x| offer(*d, SortValue::Text(x)))
+                                }
+                                None => offer(*d, SortValue::Text(v.clone())),
+                            }
+                        }
+                    } else if let Some(e) = store.integer_fields.get(field) {
+                        for (d, v) in e.iter().filter(|(d, _)| w.contains(d)) {
+                            offer(*d, SortValue::Number(*v as f64));
+                        }
+                    } else if let Some(e) = store.float_fields.get(field) {
+                        for (d, v) in e.iter().filter(|(d, _)| w.contains(d)) {
+                            offer(*d, SortValue::Number(*v));
+                        }
+                    }
+                    assert_eq!(got[field], scan, "{field} desc {desc} wanted {wanted:?}");
+                }
+            }
+        }
     }
 }
