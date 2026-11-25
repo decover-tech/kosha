@@ -22,6 +22,9 @@
 //! # distinct warm queries, so the decoded-posting cache is mostly missed:
 //! KOSHA_BENCH_SEGS=16 KOSHA_BENCH_DOCS=20000 KOSHA_BENCH_DIM=1024 KOSHA_BENCH_K=50 \
 //!   KOSHA_BENCH_QUERIES=16 cargo bench -p kosha-query --bench knn_open_search
+//! # clustered vectors (queries land near a cluster, so the probe ranking
+//! # and the per-query budget matter; uniform vectors tie every bound):
+//! KOSHA_BENCH_CLUSTERS=64 cargo bench -p kosha-query --bench knn_open_search
 //! # CI-grade percentiles:
 //! KOSHA_BENCH_COLD_ITERS=25 KOSHA_BENCH_WARM_ITERS=200 \
 //!   KOSHA_BENCH_JSON=/tmp/knn_bench.json cargo bench -p kosha-query --bench knn_open_search
@@ -94,11 +97,39 @@ fn vocab_word(rank: usize) -> String {
     }
 }
 
+/// `KOSHA_BENCH_CLUSTERS` centres (0 = uniform vectors, the default),
+/// from their own seed so every segment and every query shares them.
+fn centres(clusters: usize, dim: usize) -> Vec<Vec<f32>> {
+    let mut rng = Lcg(0xCE47E5);
+    (0..clusters)
+        .map(|_| (0..dim).map(|_| rng.coord()).collect())
+        .collect()
+}
+
+/// Spread of a clustered vector around its centre, relative to the
+/// [-1, 1) coordinate range.
+const CLUSTER_NOISE: f32 = 0.25;
+
+fn draw_vector(rng: &mut Lcg, centres: &[Vec<f32>], dim: usize, pick: Option<usize>) -> Vec<f32> {
+    if centres.is_empty() {
+        return (0..dim).map(|_| rng.coord()).collect();
+    }
+    let c = &centres[pick.unwrap_or_else(|| rng.next() as usize % centres.len())];
+    c.iter().map(|x| x + CLUSTER_NOISE * rng.coord()).collect()
+}
+
 /// Short prose (kNN benches shouldn't be dominated by postings volume) plus
 /// one embedding per doc.
 const WORDS_PER_DOC: usize = 24;
 
-fn build_corpus(root: &Path, ns: &NamespaceId, segs: usize, docs: usize, dim: usize) -> Manifest {
+fn build_corpus(
+    root: &Path,
+    ns: &NamespaceId,
+    segs: usize,
+    docs: usize,
+    dim: usize,
+    centres: &[Vec<f32>],
+) -> Manifest {
     let _ = std::fs::remove_dir_all(root);
     let mut entries = Vec::with_capacity(segs);
     for s in 0..segs {
@@ -111,7 +142,7 @@ fn build_corpus(root: &Path, ns: &NamespaceId, segs: usize, docs: usize, dim: us
             for _ in 0..WORDS_PER_DOC {
                 words.push(vocab_word(rng.zipfish(2000)));
             }
-            let vector: Vec<f32> = (0..dim).map(|_| rng.coord()).collect();
+            let vector = draw_vector(&mut rng, centres, dim, None);
             w.add_document(
                 DocumentId(format!("s{s}-d{d}")),
                 vec![
@@ -175,13 +206,13 @@ fn mk_query(text: &str, knn: Option<KnnQuery>) -> SearchQuery {
     }
 }
 
-fn mk_knn(dim: usize, k: usize) -> KnnQuery {
-    mk_knn_seeded(dim, k, 0)
+fn mk_knn(dim: usize, k: usize, centres: &[Vec<f32>]) -> KnnQuery {
+    mk_knn_seeded(dim, k, 0, centres)
 }
 
 /// Query vector number `n` (`KOSHA_BENCH_QUERIES` rotates through several;
 /// `0` is the one every other shape uses).
-fn mk_knn_seeded(dim: usize, k: usize, n: u64) -> KnnQuery {
+fn mk_knn_seeded(dim: usize, k: usize, n: u64, centres: &[Vec<f32>]) -> KnnQuery {
     // Deterministic query vector from its own seed — not a corpus vector,
     // so the search can't degenerate into an exact-match shortcut.
     let mut rng = Lcg(0xC0FFEE + n);
@@ -189,7 +220,13 @@ fn mk_knn_seeded(dim: usize, k: usize, n: u64) -> KnnQuery {
         query_text: None,
         embedding_model: None,
         field: "embedding".into(),
-        vector: (0..dim).map(|_| rng.coord()).collect(),
+        // Clustered: near centre n (a fresh draw, not a corpus vector).
+        vector: draw_vector(
+            &mut rng,
+            centres,
+            dim,
+            (!centres.is_empty()).then(|| n as usize % centres.len()),
+        ),
         k,
         num_candidates: 10 * k,
         filter: None,
@@ -250,13 +287,15 @@ fn main() {
     let docs = env_usize("KOSHA_BENCH_DOCS", 2000);
     let dim = env_usize("KOSHA_BENCH_DIM", 128);
     let k = env_usize("KOSHA_BENCH_K", 10);
+    let clusters = env_usize("KOSHA_BENCH_CLUSTERS", 0);
+    let centres = centres(clusters, dim);
 
     let root = std::env::temp_dir().join("kosha-bench-knn-open-search");
     let ns = NamespaceId("bench".into());
 
     eprintln!("building corpus: {segs} segs × {docs} docs, dim {dim} …");
     let t_build = Instant::now();
-    let manifest = build_corpus(&root, &ns, segs, docs, dim);
+    let manifest = build_corpus(&root, &ns, segs, docs, dim, &centres);
     let build_ms = t_build.elapsed().as_secs_f64() * 1e3;
 
     // Cold open (vectors + HNSW build-or-load) + exact resident bytes while
@@ -295,7 +334,7 @@ fn main() {
     let mut cold_samples = Vec::new();
     for _ in 0..cold_iters {
         let searcher = Searcher::new(root.to_path_buf());
-        let q = mk_query("", Some(mk_knn(dim, k)));
+        let q = mk_query("", Some(mk_knn(dim, k, &centres)));
         let t = Instant::now();
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         cold_samples.push(t.elapsed().as_secs_f64() * 1e3);
@@ -310,11 +349,15 @@ fn main() {
     let searcher = Searcher::new(root.to_path_buf());
     let warm_iters = env_usize("KOSHA_BENCH_WARM_ITERS", 20);
     let shapes: Vec<(&'static str, &'static str, SearchQuery)> = vec![
-        ("warm kNN", "knn", mk_query("", Some(mk_knn(dim, k)))),
+        (
+            "warm kNN",
+            "knn",
+            mk_query("", Some(mk_knn(dim, k, &centres))),
+        ),
         (
             "warm hybrid (\"the\" + kNN)",
             "hybrid_broad",
-            mk_query("the", Some(mk_knn(dim, k))),
+            mk_query("the", Some(mk_knn(dim, k, &centres))),
         ),
     ];
     // `KOSHA_BENCH_QUERIES` > 1 rotates each warm shape through that many
@@ -341,7 +384,7 @@ fn main() {
         let variants: Vec<SearchQuery> = (0..distinct as u64)
             .map(|n| {
                 let mut q = query.clone();
-                q.knn = Some(mk_knn_seeded(dim, k, n));
+                q.knn = Some(mk_knn_seeded(dim, k, n, &centres));
                 q
             })
             .collect();
@@ -386,7 +429,7 @@ fn main() {
 
     println!();
     println!(
-        "corpus: {segs} segments × {docs} docs ({} total), dim {dim}, k {k}",
+        "corpus: {segs} segments × {docs} docs ({} total), dim {dim}, k {k}, clusters {clusters}",
         segs * docs
     );
     println!(
@@ -442,7 +485,7 @@ fn main() {
             .collect();
         let report = serde_json::json!({
             "schema": 1,
-            "corpus": { "segs": segs, "docs": docs, "dim": dim, "k": k },
+            "corpus": { "segs": segs, "docs": docs, "dim": dim, "k": k, "clusters": clusters },
             "write_ms": build_ms,
             "vector_idx_bytes": idx_bytes,
             "open_ms": open.json(),

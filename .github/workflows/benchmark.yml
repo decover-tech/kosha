@@ -149,16 +149,16 @@ on:
       run_recall_check:
         description: >-
           also compute real recall@k against exact brute-force ground truth
-          over the full vector corpus (recall_check.py) — off by default:
-          adds a persistent-volume attach/mount plus the brute-force scan
-          itself (a few minutes once the embeddings cache is warm; ~4 min
-          longer on the very first run ever, which populates it). Only
-          meaningful when the vector suite is running.
+          over the full vector corpus (recall_check.py). On by default: a
+          kNN latency number without a paired recall number is not
+          publishable (the #160 regression). Adds a persistent-volume
+          attach/mount plus the brute-force scan (a few minutes once the
+          embeddings cache is warm). Only meaningful with the vector suite.
         type: boolean
-        default: false
+        default: true
       recall_sample:
         description: number of queries to check recall for (statistical sample, not the full query set)
-        default: "100"
+        default: "500"
       cache_experiment:
         description: >-
           research #389 disk-cache knobs, space-separated key=value (empty =
@@ -190,8 +190,8 @@ on:
         default: "100"
       knn_sweep:
         description: >-
-          kNN probe-budget sweep (#384) after the vector suite; empty (default)
-          = off. "fractions" = KOSHA_KNN_BUDGET_FRACTION 0.05/0.03/0.02/0.01;
+          kNN probe-budget sweep (#384) after the vector suite; empty = off.
+          "fractions" (default) = KOSHA_KNN_BUDGET_FRACTION 0.05/0.03/0.02/0.01;
           "relative" = the step 2 flag grid (alpha 0/0.5, alpha=0 relative
           cutoff at eps 0.5/1/2, min probes 500/1000, plus f0.05); "bound" =
           KOSHA_KNN_BOUND_STOP_ALPHA 1/0.95/0.9/0.85 plus f0.05; "radius" =
@@ -203,7 +203,16 @@ on:
           (see scripts/bench/bm25_scale/vm/knn_budget_sweep.sh). Each point
           restarts the server with those env vars, runs a warm kNN phase of
           `duration` seconds at `qps` and recall over 1000 random queries.
-          Needs run_recall_check=true. Adds ~(duration + 8 min) per point.
+          Skipped (with a warning) when run_recall_check is off. Adds
+          ~(duration + 8 min) per point, ~55 min for "fractions".
+        default: "fractions"
+      bench_gate:
+        description: >-
+          pass/fail bar over the results (scripts/bench/bm25_scale/bench_gate.py),
+          checked last, after teardown: every phase has 0 errors and 0
+          zero-hit requests, and tie-tolerant recall@10 >= recall_min. Empty
+          = defaults (recall_min=0.93 max_error_rate=0); override with
+          space-separated key=value, or "off" to report only.
         default: ""
       bm25_snapshot:
         description: >-
@@ -639,8 +648,8 @@ jobs:
             *[!A-Za-z0-9_.=:\;,-]*) echo "::error::knn_sweep may only contain [A-Za-z0-9_.=:;,-], got: $KNN_SWEEP"; exit 1 ;;
           esac
           if [ '${{ inputs.run_recall_check }}' != 'true' ]; then
-            echo "::error::knn_sweep needs run_recall_check=true (the embeddings volume holds the recall ground truth)"
-            exit 1
+            echo "::warning::knn_sweep skipped: it needs run_recall_check=true (the embeddings volume holds the recall ground truth)"
+            exit 0
           fi
           $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && \
             EMB_DIR=\$(./mount_embeddings_cache.sh '${{ steps.tf.outputs.embeddings_volume_id }}') && \
@@ -771,3 +780,20 @@ jobs:
       - name: Kept-VM notice
         if: success() && inputs.keep_vm == true
         run: echo "::warning::bench VM stack KEPT (keep_vm=true). Re-dispatch with keep_vm off (suite=none to only tear down) when done iterating."
+
+      # Last, so a failed bar never keeps the VM: teardown already ran.
+      - name: Bench gate (pass/fail bar)
+        if: success() && inputs.suite != 'none'
+        env:
+          BENCH_GATE: ${{ inputs.bench_gate }}
+        run: |
+          set -euo pipefail
+          expect=()
+          if [ '${{ inputs.run_recall_check }}' = 'true' ] && \
+             { [ '${{ inputs.suite }}' = vector ] || [ '${{ inputs.suite }}' = both ]; }; then
+            expect=(--expect-recall)
+          fi
+          python3 scripts/bench/bm25_scale/bench_gate.py results \
+            --spec "$BENCH_GATE" "${expect[@]}" --out "$RUNNER_TEMP/gate.md" || status=$?
+          cat "$RUNNER_TEMP/gate.md" >> "$GITHUB_STEP_SUMMARY"
+          exit "${status:-0}"

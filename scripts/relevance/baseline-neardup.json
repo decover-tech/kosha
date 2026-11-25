@@ -1,0 +1,201 @@
+{
+  "config": {
+    "env": {},
+    "hybrid_fusion": "rrf",
+    "knn_k": 10,
+    "lexical_operator": "or",
+    "ndcg_k": 10,
+    "num_candidates": 1,
+    "recall_k": 100,
+    "selectivities": [
+      "100%",
+      "50%",
+      "10%",
+      "1%",
+      "0.1%"
+    ]
+  },
+  "fixture": {
+    "docs": 1900,
+    "judged_queries": 120,
+    "name": "neardup",
+    "ood_vector_queries": 0,
+    "queries": 120,
+    "segments": 2,
+    "vectors": 1900
+  },
+  "kind": "kosha-relevance",
+  "kmr": {
+    "id": {
+      "points": [
+        {
+          "max_postings_per_segment": 1,
+          "mean_vectors_scanned": 160.20833333333334,
+          "queries": 120,
+          "recall_at_10": 0.49666666666666665
+        },
+        {
+          "max_postings_per_segment": 2,
+          "mean_vectors_scanned": 323.1333333333333,
+          "queries": 120,
+          "recall_at_10": 0.8083333333333332
+        },
+        {
+          "max_postings_per_segment": 4,
+          "mean_vectors_scanned": 639.5666666666667,
+          "queries": 120,
+          "recall_at_10": 0.9625
+        },
+        {
+          "max_postings_per_segment": 8,
+          "mean_vectors_scanned": 1261.7166666666667,
+          "queries": 120,
+          "recall_at_10": 0.9983333333333334
+        },
+        {
+          "max_postings_per_segment": 16,
+          "mean_vectors_scanned": 1900.0,
+          "queries": 120,
+          "recall_at_10": 1.0
+        },
+        {
+          "max_postings_per_segment": 32,
+          "mean_vectors_scanned": 1900.0,
+          "queries": 120,
+          "recall_at_10": 1.0
+        },
+        {
+          "max_postings_per_segment": null,
+          "mean_vectors_scanned": 1900.0,
+          "queries": 120,
+          "recall_at_10": 1.0
+        }
+      ]
+    }
+  },
+  "metrics": {
+    "filtered_knn.planned@0.1%.recall@10": {
+      "knn_exact_vectors_per_query": 2.0,
+      "knn_postings_per_query": 0.0,
+      "queries": 120,
+      "value": 1.0
+    },
+    "filtered_knn.planned@1%.recall@10": {
+      "knn_exact_vectors_per_query": 19.0,
+      "knn_postings_per_query": 0.0,
+      "queries": 120,
+      "value": 1.0
+    },
+    "filtered_knn.planned@10%.recall@10": {
+      "knn_exact_vectors_per_query": 190.0,
+      "knn_postings_per_query": 0.0,
+      "queries": 120,
+      "value": 1.0
+    },
+    "filtered_knn.planned@100%.recall@10": {
+      "knn_exact_vectors_per_query": 0.0,
+      "knn_postings_per_query": 3.3833333333333333,
+      "queries": 120,
+      "value": 0.7899999999999999
+    },
+    "filtered_knn.planned@50%.recall@10": {
+      "knn_exact_vectors_per_query": 950.0,
+      "knn_postings_per_query": 0.0,
+      "queries": 120,
+      "value": 1.0
+    },
+    "filtered_knn.probe@0.1%.recall@10": {
+      "knn_exact_vectors_per_query": 0.0,
+      "knn_postings_per_query": 24.0,
+      "queries": 120,
+      "value": 1.0
+    },
+    "filtered_knn.probe@1%.recall@10": {
+      "knn_exact_vectors_per_query": 0.0,
+      "knn_postings_per_query": 21.941666666666666,
+      "queries": 120,
+      "value": 0.9875000000000005
+    },
+    "filtered_knn.probe@10%.recall@10": {
+      "knn_exact_vectors_per_query": 0.0,
+      "knn_postings_per_query": 16.0,
+      "queries": 120,
+      "value": 0.9916666666666667
+    },
+    "filtered_knn.probe@100%.recall@10": {
+      "knn_exact_vectors_per_query": 0.0,
+      "knn_postings_per_query": 3.3833333333333333,
+      "queries": 120,
+      "value": 0.7899999999999999
+    },
+    "filtered_knn.probe@50%.recall@10": {
+      "knn_exact_vectors_per_query": 0.0,
+      "knn_postings_per_query": 4.583333333333333,
+      "queries": 120,
+      "value": 0.8858333333333337
+    },
+    "hybrid.ndcg@10": {
+      "knn_exact_vectors_per_query": 237.33333333333334,
+      "knn_postings_per_query": 2.808333333333333,
+      "queries": 120,
+      "value": 0.9690276740470591
+    },
+    "hybrid.recall@100": {
+      "knn_exact_vectors_per_query": 237.33333333333334,
+      "knn_postings_per_query": 2.808333333333333,
+      "queries": 120,
+      "value": 0.8595917757081999
+    },
+    "lexical.ndcg@10": {
+      "knn_exact_vectors_per_query": 0.0,
+      "knn_postings_per_query": 0.0,
+      "queries": 120,
+      "value": 0.990291455248979
+    },
+    "lexical.recall@100": {
+      "knn_exact_vectors_per_query": 0.0,
+      "knn_postings_per_query": 0.0,
+      "queries": 120,
+      "value": 0.8575659664953484
+    },
+    "vector.ndcg@10": {
+      "knn_exact_vectors_per_query": 237.33333333333334,
+      "knn_postings_per_query": 2.808333333333333,
+      "queries": 120,
+      "value": 0.794272653644042
+    },
+    "vector.recall@100": {
+      "knn_exact_vectors_per_query": 237.33333333333334,
+      "knn_postings_per_query": 2.808333333333333,
+      "queries": 120,
+      "value": 0.748018685170199
+    },
+    "vector_ann.mrr@10": {
+      "knn_exact_vectors_per_query": 0.0,
+      "knn_postings_per_query": 3.525,
+      "queries": 120,
+      "value": 0.7950330687830688
+    },
+    "vector_ann.ndcg@10": {
+      "knn_exact_vectors_per_query": 0.0,
+      "knn_postings_per_query": 3.525,
+      "queries": 120,
+      "value": 0.7957166913150479
+    }
+  },
+  "schema": 1,
+  "vector_vs_exact": {
+    "mrr@10": {
+      "ann": 0.7950330687830688,
+      "delta": -0.0038194444444444864,
+      "exact": 0.7988525132275133,
+      "queries": 120
+    },
+    "ndcg@10": {
+      "ann": 0.7957166913150479,
+      "delta": -0.01310639114914447,
+      "exact": 0.8088230824641923,
+      "queries": 120
+    }
+  }
+}

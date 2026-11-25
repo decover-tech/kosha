@@ -25,7 +25,8 @@ committed baseline has gone stale (it should equal the base report, since
 the harness is deterministic).
 
 The rendered markdown starts with MARKER so CI can find and update one
-sticky PR comment.
+sticky PR comment. CI runs this once per fixture and joins the sections,
+keeping only the first MARKER.
 """
 
 from __future__ import annotations
@@ -169,9 +170,14 @@ def render_comment(
     against_baseline: bool = False,
     stale_baseline: Optional[List[str]] = None,
     head_report: Optional[dict] = None,
+    baseline_path: str = "scripts/relevance/baseline.json",
 ) -> str:
     bad = failures(rows)
-    lines = [MARKER, "### Relevance & recall (`kosha-query` bench `relevance`)", ""]
+    fixture = (head_report or {}).get("fixture", {}).get("name")
+    title = "### Relevance & recall (`kosha-query` bench `relevance`)"
+    if fixture:
+        title += f" — fixture `{fixture}`"
+    lines = [MARKER, title, ""]
     if bad:
         names = ", ".join(f"`{r['name']}`" for r in bad)
         lines.append(f"**❌ {len(bad)} metric(s) regressed past the threshold:** {names}")
@@ -181,7 +187,7 @@ def render_comment(
     if against_baseline:
         lines.append(
             f"> No base-tree report; head is compared with the committed "
-            f"`scripts/relevance/baseline.json` ({base_label})."
+            f"`{baseline_path}` ({base_label})."
         )
         lines.append("")
     lines += [
@@ -225,7 +231,7 @@ def render_comment(
         more = "" if len(stale_baseline) <= 6 else f" and {len(stale_baseline) - 6} more"
         lines += [
             "",
-            f"ℹ️ The committed `scripts/relevance/baseline.json` differs from the base run "
+            f"ℹ️ The committed `{baseline_path}` differs from the base run "
             f"({shown}{more}). Regenerate it when this PR intends to move these numbers "
             "(see scripts/relevance/README.md).",
         ]
@@ -311,6 +317,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         against_baseline=against_baseline,
         stale_baseline=stale,
         head_report=head_report,
+        baseline_path=str(args.baseline or "scripts/relevance/baseline.json"),
     )
     if args.out:
         args.out.write_text(comment)
