@@ -3,8 +3,8 @@ pub mod object_wal;
 pub mod wal;
 
 pub use compaction::{
-    needs_compaction, plan_merge_group, CompactMode, CompactOptions, CompactResult,
-    CompactionPolicy, MergePlan,
+    needs_compaction, plan_merge_group, tombstone_heavy_segments, tombstone_ratio, CompactMode,
+    CompactOptions, CompactResult, CompactionPolicy, MergePlan,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -2000,7 +2000,10 @@ impl Indexer {
                     .filter(|e| seg_dir(&e.segment_id).exists())
                     .cloned()
                     .collect();
-                (inputs.len() >= 2).then_some(MergePlan { inputs })
+                // Two or more, or one tombstone-heavy segment (#464).
+                (inputs.len() >= 2
+                    || compaction::is_tombstone_rewrite(manifest, &self.compaction_policy, &inputs))
+                .then_some(MergePlan { inputs })
             },
             None,
             || {},
@@ -6967,6 +6970,72 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #464: one large segment with half its documents deleted. With the
+    /// tombstone-ratio trigger off, tiered compaction leaves it alone, as
+    /// before; with it on, the scheduler is told to compact and the pass
+    /// rewrites the segment on its own, expunging the deleted documents.
+    #[test]
+    fn tombstone_ratio_trigger_rewrites_a_large_deleted_segment() {
+        for trigger in [None, Some(3_000u32)] {
+            let dir = std::env::temp_dir().join(format!(
+                "kosha-test-compact-tombstone-ratio-{}",
+                trigger.is_some()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let ns = NamespaceId("test".into());
+            let policy = CompactionPolicy {
+                max_mergeable_docs: 3,
+                trigger_mergeable_segments: 2,
+                tombstone_ratio_bp: trigger,
+                ..CompactionPolicy::default()
+            };
+            let idx = Indexer::new(dir.clone()).with_compaction_policy(policy.clone());
+            idx.index_documents(
+                ns.clone(),
+                (0..6)
+                    .map(|i| Document {
+                        id: DocumentId(format!("d{i}")),
+                        fields: vec![
+                            Field::text("title", format!("doc {i}")),
+                            Field::keyword("id", format!("d{i}")),
+                        ],
+                    })
+                    .collect(),
+            )
+            .unwrap();
+            idx.flush_namespace(&ns).unwrap();
+            for i in 0..3 {
+                let m = idx.manifest(&ns).unwrap();
+                let filter: FilterClause =
+                    serde_json::from_str(&format!(r#"{{"term": {{"id": "d{i}"}}}}"#)).unwrap();
+                assert_eq!(idx.delete_by_query(&ns, &m, &filter).unwrap(), 1);
+            }
+            let before = idx.manifest(&ns).unwrap();
+            assert_eq!(before.segments.len(), 1);
+            assert_eq!(before.segments[0].doc_count, 6);
+            assert_eq!(tombstone_ratio(&before, &before.segments[0]), 0.5);
+
+            assert_eq!(idx.needs_compaction(&ns), trigger.is_some());
+            let result = idx
+                .compact_namespace_with_options(&ns, CompactOptions::tiered(policy))
+                .unwrap();
+            assert_eq!(result.merged, trigger.is_some());
+            let after = idx.manifest(&ns).unwrap();
+            assert_eq!(after.segments.len(), 1);
+            if trigger.is_some() {
+                assert_eq!(after.segments[0].doc_count, 3, "deleted docs expunged");
+                assert!(after
+                    .tombstones
+                    .get(&after.segments[0].segment_id)
+                    .is_none_or(|t| t.is_empty()));
+                assert!(!idx.needs_compaction(&ns), "nothing left over the ratio");
+            } else {
+                assert_eq!(after.segments[0].segment_id, before.segments[0].segment_id);
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// Proves genuine multi-writer parallelism, not just coalescing: a
