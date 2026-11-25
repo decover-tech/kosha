@@ -283,6 +283,12 @@ def main() -> None:
     )
     ap.add_argument("--knn-field", default="text_emb")
     ap.add_argument(
+        "--knn-dim",
+        type=int,
+        default=1024,
+        help="dimension of the --knn-embeddings records (msmarco embeddings are 1024)",
+    )
+    ap.add_argument(
         "--knn-num-candidates",
         type=int,
         default=100,
@@ -358,7 +364,7 @@ def main() -> None:
     queries = load_queries(args.queries_file)
 
     if args.knn_embeddings:
-        vecs = load_knn_vectors(args.knn_embeddings, len(queries))
+        vecs = load_knn_vectors(args.knn_embeddings, len(queries), args.knn_dim)
         KNN_VECS = vecs
         KNN_FIELD = args.knn_field
         KNN_NUM_CANDIDATES = args.knn_num_candidates
