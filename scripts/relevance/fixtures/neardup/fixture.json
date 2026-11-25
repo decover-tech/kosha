@@ -1,0 +1,8 @@
+{
+  "description": "Near-duplicate, legal-matter-shaped fixture; see generate.py",
+  "keyword_fields": [
+    "family",
+    "lang"
+  ],
+  "seed": 1125
+}
