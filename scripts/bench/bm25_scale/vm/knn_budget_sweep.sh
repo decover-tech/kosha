@@ -43,7 +43,7 @@
 # (KOSHA_KNN_NAMESPACE_CENTROIDS, default off), which probes the global top
 # num_candidates postings instead of the 5% floor. NUM_CANDIDATES=N in a
 # point sets that point's request num_candidates (not a server knob):
-#   f0.05            baseline (per-segment planner, num_candidates 100)
+#   f0.05            baseline (namespace routing off, num_candidates 100)
 #   ns100            routed, num_candidates 100 (the request default)
 #   ns1000, ns2000   routed, num_candidates 1000 / 2000
 #   ns5700           routed at the baseline's probe count (5% of ~114k)
@@ -82,7 +82,10 @@ BENCH_DIR="$(cd "$HERE/.." && pwd)"
 PY=~/venv311/bin/python3
 # The knobs a point may set. All are read once at server start, hence the
 # container recreate per point.
-KNOBS="KOSHA_KNN_BUDGET_FRACTION KOSHA_KNN_BUDGET_MAX_CAP KOSHA_KNN_RELATIVE_CUTOFF_EPS KOSHA_KNN_RELATIVE_MIN_PROBES KOSHA_KNN_PROBE_RADIUS_ALPHA KOSHA_KNN_PROBE_RADIUS KOSHA_KNN_BOUND_STOP_ALPHA KOSHA_KNN_NAMESPACE_CENTROIDS"
+KNOBS="KOSHA_KNN_BUDGET_FRACTION KOSHA_KNN_BUDGET_MAX_CAP KOSHA_KNN_RELATIVE_CUTOFF_EPS KOSHA_KNN_RELATIVE_MIN_PROBES KOSHA_KNN_PROBE_RADIUS_ALPHA KOSHA_KNN_PROBE_RADIUS KOSHA_KNN_BOUND_STOP_ALPHA"
+# Planner modes a point may also set, but which, unlike KNOBS, keep the
+# container's value (e.g. from server_env) on points that do not set them.
+MODES="KOSHA_KNN_NAMESPACE_CENTROIDS"
 
 if [ "$POINTS" = fractions ]; then
   POINTS="f0.05:KOSHA_KNN_BUDGET_FRACTION=0.05;f0.03:KOSHA_KNN_BUDGET_FRACTION=0.03;f0.02:KOSHA_KNN_BUDGET_FRACTION=0.02;f0.01:KOSHA_KNN_BUDGET_FRACTION=0.01"
@@ -106,7 +109,7 @@ if [ "$POINTS" = radius ]; then
 fi
 if [ "$POINTS" = routing ]; then
   NSC=KOSHA_KNN_NAMESPACE_CENTROIDS=1
-  POINTS="f0.05:KOSHA_KNN_BUDGET_FRACTION=0.05;ns100:$NSC;ns1000:$NSC,NUM_CANDIDATES=1000"
+  POINTS="f0.05:KOSHA_KNN_BUDGET_FRACTION=0.05,KOSHA_KNN_NAMESPACE_CENTROIDS=0;ns100:$NSC;ns1000:$NSC,NUM_CANDIDATES=1000"
   POINTS="$POINTS;ns2000:$NSC,NUM_CANDIDATES=2000;ns5700:$NSC,NUM_CANDIDATES=5700"
 fi
 case "$POINTS" in *[!A-Za-z0-9_.=:\;,-]*) echo "points may only contain [A-Za-z0-9_.=:;,-]: $POINTS"; exit 1 ;; esac
@@ -123,8 +126,9 @@ IMAGE=$(sudo docker inspect kosha --format '{{.Config.Image}}')
 sudo docker inspect kosha --format '{{range .Config.Env}}{{println .}}{{end}}' | sed '/^$/d' > "$OUT/base.env"
 KNOB_RE="^($(echo $KNOBS | tr ' ' '|'))="
 grep -Ev "$KNOB_RE" "$OUT/base.env" > "$OUT/base-sans-knobs.env" || true
+SET_RE="^($(echo $KNOBS $MODES | tr ' ' '|'))="
 echo "sweep: image=$IMAGE points=$POINTS sample=$SAMPLE seed=$SEED qps=$QPS duration=${DURATION}s"
-echo "base kNN knobs on the container: $(grep -E "$KNOB_RE" "$OUT/base.env" | tr '\n' ' ' || true)"
+echo "base kNN knobs on the container: $(grep -E "$SET_RE" "$OUT/base.env" | tr '\n' ' ' || true)"
 
 iso_now() { date -u +%Y-%m-%dT%H:%M:%S.%NZ; }
 recreate() { # recreate <env-file>
@@ -152,10 +156,11 @@ for pt in "${PTS[@]}"; do
   for a in "${AS[@]}"; do
     key="${a%%=*}"
     if [ "$key" = NUM_CANDIDATES ]; then nc="${a#*=}"; continue; fi
-    case " $KNOBS " in *" $key "*) ;; *) echo "point $label: $key is not a sweep knob ($KNOBS)"; exit 1 ;; esac
+    case " $KNOBS $MODES " in *" $key "*) ;; *) echo "point $label: $key is not a sweep knob ($KNOBS $MODES)"; exit 1 ;; esac
+    sed -i "/^$key=/d" "$dir/server.env"
     echo "$a" >> "$dir/server.env"
   done
-  grep -E "$KNOB_RE" "$dir/server.env" > "$dir/knobs.env" || true
+  grep -E "$SET_RE" "$dir/server.env" > "$dir/knobs.env" || true
   echo "num_candidates=$nc" > "$dir/num_candidates.txt"
   echo "=== SWEEP-POINT $label: $(tr '\n' ' ' < "$dir/knobs.env")num_candidates=$nc"
   recreate "$dir/server.env"
@@ -163,7 +168,7 @@ for pt in "${PTS[@]}"; do
   # Re-warm in-process caches with the workload (local NVMe is kept).
   $PY "$BENCH_DIR/warm_gate.py" --host http://127.0.0.1:8080 --namespace "$NS" \
     --queries-file /data/queries.txt --api-key "$API_KEY" --topk 10 \
-    --knn-embeddings /data/queries_emb.f32 --return "$RETURN_FIELDS" \
+    --knn-embeddings /data/queries_emb.f32 --knn-num-candidates "$nc" --return "$RETURN_FIELDS" \
     --timeout "${WARM_GATE_TIMEOUT_S:-10800}" > "$dir/warm_gate.log" 2>&1 \
     || { echo "warm gate failed for $label"; tail -20 "$dir/warm_gate.log"; exit 1; }
   grep -E 'WARM-GATE-READY' "$dir/warm_gate.log" | tail -1 || true
