@@ -45,7 +45,10 @@ fn build(root: &Path, ns: &NamespaceId, sizes: &[usize]) -> Manifest {
     let mut entries = Vec::new();
     for (s, &docs) in sizes.iter().enumerate() {
         let id = SegmentId(format!("seg{s}"));
-        let mut w = SegmentWriter::new(id.clone(), root.join(&ns.0).join(&id.0));
+        // v5: the analysis's byte accounting models the v5 span layout
+        // (`scoring_section_bytes_match_v5_spans`), not the v6 default.
+        let mut w = SegmentWriter::new(id.clone(), root.join(&ns.0).join(&id.0))
+            .with_postings_write_version(kosha_segment::SKIP_SPLIT_INVERTED_VERSION);
         let mut rng = Lcg(0xC0FFEE + s as u64 * 7919);
         for d in 0..docs {
             let len = 5 + (rng.unit() * (40.0 + 60.0 * s as f64)) as usize;

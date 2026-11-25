@@ -14,7 +14,8 @@
 # p50 18 -> 7 ms (612 instead of ~2,540 postings probed); legal corpora are
 # near-duplicate heavy, so outlier members inflate posting radii and the
 # radius-weighted default (1.0) ranks most postings as ties. See
-# docs/configuration.md. Rollback: delete the key (engine default 1.0).
+# docs/configuration.md. The engine default is also 0 since #578; set "1"
+# to roll back.
 apiVersion: v1
 kind: ConfigMap
 metadata:
