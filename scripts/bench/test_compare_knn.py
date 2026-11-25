@@ -52,9 +52,14 @@ class CompareKnnTest(unittest.TestCase):
         self.assertIn("`warm kNN p50`", text)
 
     def test_absolute_floor_prevents_tiny_failures(self):
-        # +50% but only 0.05 ms.
-        code, _ = self.run_main([report(warm=0.1)], [report(warm=0.15)])
+        # +50% but only 0.02 ms.
+        code, _ = self.run_main([report(warm=0.04)], [report(warm=0.06)])
         self.assertEqual(code, 0)
+
+    def test_ci_scale_regression_fails(self):
+        # CI's warm kNN is ~0.25 ms: +40% must not hide under the floor.
+        code, _ = self.run_main([report(warm=0.25)], [report(warm=0.35)])
+        self.assertEqual(code, 1)
 
     def test_best_of_interleaved_runs(self):
         # One noisy head run is ignored: the lower p50 is used.

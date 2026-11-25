@@ -39,11 +39,13 @@ from typing import List, Optional
 MARKER = "<!-- kosha-knn-bench-compare -->"
 
 # (label, key path to a {n,p50,p90,p99} dist, max p50 growth, abs floor ms)
+# Floors sized for the CI runner, where warm kNN p50 is ~0.25 ms: 0.05 ms
+# there is 20%, so the % limit is what bites, not the floor.
 LATENCIES = [
-    ("warm kNN", ("warm_ms", "knn"), 0.25, 0.2),
-    ("warm hybrid", ("warm_ms", "hybrid_broad"), 0.25, 0.2),
-    ("cold kNN", ("cold_knn_ms",), 0.40, 1.0),
-    ("open all segments", ("open_ms",), 0.40, 1.0),
+    ("warm kNN", ("warm_ms", "knn"), 0.25, 0.05),
+    ("warm hybrid", ("warm_ms", "hybrid_broad"), 0.25, 0.05),
+    ("cold kNN", ("cold_knn_ms",), 0.40, 0.3),
+    ("open all segments", ("open_ms",), 0.40, 0.3),
 ]
 POSTINGS_LIMIT = 0.10
 POSTINGS_PATH = ("warm_knn_scan", "postings_per_query")
