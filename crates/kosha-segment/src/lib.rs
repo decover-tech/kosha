@@ -4109,14 +4109,16 @@ pub fn is_split_inverted_version(version: u32) -> bool {
 
 /// The inverted-postings version the writer emits —
 /// `KOSHA_POSTINGS_WRITE_VERSION`, accepted values `4` (varint-delta
-/// split), `5` (skip-split), `6` (experimental bit-packed scoring) and
-/// `7` (experimental bit-packed scoring and positions, #386); default
-/// `5`. This is the mixed-fleet
+/// split), `5` (skip-split), `6` (bit-packed scoring blocks) and `7`
+/// (experimental: bit-packed scoring and positions, #386); default `6`.
+/// On 10M MS MARCO, v6 postings are 10.3% smaller than v5 and warm OR
+/// p50/p99 is 7-10% lower (#386). This is the mixed-fleet
 /// rollout/rollback gate: a reader only understands versions up to its own
 /// build, so during a rolling deploy (writer upgraded before all query
-/// replicas) or ahead of a possible rollback, set `4` until the whole
-/// fleet reads v5 — segments written as v5 are permanently unreadable by
-/// pre-v5 binaries. Read once (segments are finalized frequently).
+/// replicas) or ahead of a possible rollback, set `5` until the whole
+/// fleet reads v6 — segments written as v6 are permanently unreadable by
+/// pre-v6 binaries (before d7a6ec7). Read once (segments are finalized
+/// frequently).
 fn postings_write_version() -> u32 {
     static VERSION: OnceLock<u32> = OnceLock::new();
     *VERSION.get_or_init(|| {
@@ -4125,15 +4127,15 @@ fn postings_write_version() -> u32 {
             .as_deref()
         {
             Some("4") => SPLIT_INVERTED_VERSION,
-            Some("5") | None => SKIP_SPLIT_INVERTED_VERSION,
-            Some("6") => BITPACKED_SKIP_SPLIT_INVERTED_VERSION,
+            Some("5") => SKIP_SPLIT_INVERTED_VERSION,
+            Some("6") | None => BITPACKED_SKIP_SPLIT_INVERTED_VERSION,
             Some("7") => PACKED_POSITIONS_INVERTED_VERSION,
             Some(other) => {
                 eprintln!(
                     "WARN: KOSHA_POSTINGS_WRITE_VERSION={other} not supported \
-                     (accepted: 4, 5, 6, 7) — writing v{SKIP_SPLIT_INVERTED_VERSION}"
+                     (accepted: 4, 5, 6, 7) — writing v{BITPACKED_SKIP_SPLIT_INVERTED_VERSION}"
                 );
-                SKIP_SPLIT_INVERTED_VERSION
+                BITPACKED_SKIP_SPLIT_INVERTED_VERSION
             }
         }
     })
@@ -14443,7 +14445,8 @@ mod tests {
         let dir = std::env::temp_dir().join("kosha-test-inverted-v2-roundtrip");
         let expected = write_inverted_fixture(&dir);
 
-        // Sanity: the file on disk really is the split layout (v5 today).
+        // Sanity: the file on disk really is the split layout, at the
+        // writer's version (v6 by default since #386).
         let raw = fs::read(dir.join("inverted.idx")).unwrap();
         assert!(
             SplitInvertedIndex::detect(&raw),
@@ -14451,8 +14454,8 @@ mod tests {
         );
         assert_eq!(
             u32::from_le_bytes(raw[4..8].try_into().unwrap()),
-            SKIP_SPLIT_INVERTED_VERSION,
-            "writer should emit the v5 skip-split version"
+            postings_write_version(),
+            "writer should emit the configured skip-split version"
         );
 
         let r = SegmentReader::open(dir.clone()).unwrap();
@@ -17600,12 +17603,15 @@ mod bounded_build_tests {
         }
     }
 
-    /// Default writer stays v5: v6 is opt-in only.
+    /// Default writer emits v6 (#386); v5 and v7 are opt-in.
     #[test]
-    fn default_writer_does_not_emit_v6() {
+    fn default_writer_emits_v6() {
         // The env gate is process-global; only assert when unset.
         if std::env::var_os("KOSHA_POSTINGS_WRITE_VERSION").is_none() {
-            assert_eq!(postings_write_version(), SKIP_SPLIT_INVERTED_VERSION);
+            assert_eq!(
+                postings_write_version(),
+                BITPACKED_SKIP_SPLIT_INVERTED_VERSION
+            );
         }
         let dir = scratch("v6default");
         let docs = corpus(50);

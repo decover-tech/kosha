@@ -11,7 +11,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use kosha_core::{Bm25Params, DocumentId, Field, FieldType, SegmentId, VectorFieldMeta};
-use kosha_segment::{SegmentReader, SegmentWriter, VectorFieldStatus, VectorStoreMode};
+use kosha_segment::{
+    SegmentReader, SegmentWriter, VectorFieldStatus, VectorStoreMode, SKIP_SPLIT_INVERTED_VERSION,
+};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -63,7 +65,9 @@ fn write(dir: &Path, mode: VectorStoreMode, docs: Vec<(String, Vec<Field>)>) -> 
         // The fixtures predate per-field indexes (#249), which change the
         // lexical files; the vector files are what this suite compares.
         .with_field_index(false)
-        .with_filters_write_version(1);
+        .with_filters_write_version(1)
+        // The fixtures are v5 postings; v6 is the default since #386.
+        .with_postings_write_version(SKIP_SPLIT_INVERTED_VERSION);
     for (id, fields) in docs {
         w.add_document(DocumentId(id), fields);
     }

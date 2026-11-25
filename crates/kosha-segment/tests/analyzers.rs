@@ -13,7 +13,7 @@ use kosha_core::{
     AnalysisConfig, AnalyzerSpec, Bm25Params, DocumentId, Field, FieldSchema, NamespaceSchema,
     SegmentId,
 };
-use kosha_segment::{SegmentReader, SegmentWriter};
+use kosha_segment::{SegmentReader, SegmentWriter, SKIP_SPLIT_INVERTED_VERSION};
 
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy-seg")
@@ -64,7 +64,9 @@ fn write(dir: &Path, config: Option<&AnalysisConfig>) -> kosha_core::Footer {
     // off a segment is exactly what the pre-analyzer writer produced.
     let mut writer = SegmentWriter::new(SegmentId("legacy-seg".into()), dir.to_path_buf())
         .with_text_filter_ignore_above(Some(256))
-        .with_field_index(false);
+        .with_field_index(false)
+        // The fixtures are v5 postings; v6 is the default since #386.
+        .with_postings_write_version(SKIP_SPLIT_INVERTED_VERSION);
     if let Some(config) = config {
         writer = writer.with_analysis(config);
     }
