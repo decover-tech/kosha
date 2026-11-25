@@ -958,6 +958,25 @@ cargo run --release -p kosha-build-segments --bin kosha-late-interaction-eval --
 cargo run --release -p kosha-build-segments --bin kosha-late-interaction-eval -- gen --out /tmp/li
 ```
 
+`scripts/eval/colbert_encode_beir.py --out /data/scifact-colbertv2` writes that directory for a
+BEIR dataset (default SciFact test) with the ColBERTv2 checkpoint, no colbert-ai package needed
+(`torch`, `transformers`, `huggingface_hub`, `pandas`; about 15 minutes on an 8-vCPU CPU VM).
+SciFact with those defaults (5,183 passages, 815,632 tokens, 157 per passage; 300 queries; one
+segment; Linux VM, one query thread):
+
+| method | recall@10 | nDCG@10 | overlap with exact top 10 | p50 |
+|---|--:|--:|--:|--:|
+| late interaction (Kosha) | 0.757 | 0.646 | 0.994 | 28.0 ms |
+| exact MaxSim | 0.757 | 0.646 | 1.000 | 4,010 ms |
+| single vector (mean-pooled) | 0.381 | 0.267 | 0.271 | 0.25 ms |
+
+The probed approximation matches exact MaxSim on both metrics at 1/140 of its latency, and
+roughly doubles the relevance of one pooled vector per passage. Published ColBERTv2 SciFact
+nDCG@10 is 0.693; the gap is the encoder (180-token passages, no colbert-ai preprocessing), not
+the index, since exact MaxSim over the same vectors scores the same. Storage on this corpus:
+`.bags` 417.6 MB (1.00x the raw f32 tokens), `.ivf` 115.2 MB (0.28x), and the source JSON in
+`doc_store.bin` 878 MB (2.10x).
+
 ## Native embedding
 
 Opt-in server-side embedding (issue #209). Declare a model on a vector field in the namespace
