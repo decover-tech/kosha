@@ -4139,8 +4139,11 @@ fn postings_write_version() -> u32 {
     })
 }
 
-/// Default weight of a posting's radius in its probe-ranking score.
-pub const DEFAULT_KNN_PROBE_RADIUS_ALPHA: f32 = 1.0;
+/// Default weight of a posting's radius in its probe-ranking score: raw
+/// centroid distance (#458). On 10M MS MARCO at the 5% budget, `1.0` gave
+/// tie-tolerant recall@10 0.833 and `0.0` gave 0.971 for the same
+/// postings probed (bench run 45694987243).
+pub const DEFAULT_KNN_PROBE_RADIUS_ALPHA: f32 = 0.0;
 
 /// The score a kNN probe ranks and admits postings by (#384):
 /// `(distance - alpha * radius).max(0.0)`, where `distance` is the query's
@@ -4148,9 +4151,11 @@ pub const DEFAULT_KNN_PROBE_RADIUS_ALPHA: f32 = 1.0;
 /// member-distance percentile. This is a ranking heuristic, not a bound
 /// on member distance: cosine distance is not a metric.
 ///
-/// - `alpha = 1.0` (default): full radius weight, bit-identical to the
-///   ranking before #384 when using the max radius.
-/// - `alpha = 0.0`: raw centroid distance, as SPANN and plain IVF rank.
+/// - `alpha = 0.0` (default since #458): raw centroid distance, as SPANN
+///   and plain IVF rank.
+/// - `alpha = 1.0`: full radius weight, bit-identical to the ranking
+///   before #384 when using the max radius. Outlier members inflate max
+///   radii, so most scores clamp to 0 and tie at the cutoff.
 /// - in between: partial credit for spread. At 1024 dimensions a
 ///   posting's radius is close to typical centroid distances, so the full
 ///   radius weight ranks many diffuse postings near zero; a smaller
@@ -4196,8 +4201,9 @@ pub fn knn_probe_radius_uses_quantiles() -> bool {
     KnnProbeRadius::from_env() != KnnProbeRadius::Max
 }
 
-/// `KOSHA_KNN_PROBE_RADIUS_ALPHA` (#384, experimental; default 1.0, the
-/// pre-#384 ranking): the radius weight in [`centroid_probe_score`].
+/// `KOSHA_KNN_PROBE_RADIUS_ALPHA` (#384; default 0.0 since #458, raw
+/// centroid distance; 1.0 restores the pre-#458 ranking): the radius
+/// weight in [`centroid_probe_score`].
 /// Accepts a finite value `>= 0`; anything else keeps the default with a
 /// warning. Read once per process.
 pub fn knn_probe_radius_alpha() -> f32 {
@@ -4208,7 +4214,7 @@ pub fn knn_probe_radius_alpha() -> f32 {
         if let Some(raw) = raw.as_deref() {
             eprintln!(
                 "INFO: KOSHA_KNN_PROBE_RADIUS_ALPHA={raw}: kNN postings ranked by \
-                 max(0, d(q,c) - {alpha} * radius) (#384, experimental)"
+                 max(0, d(q,c) - {alpha} * radius) (#384)"
             );
         }
         alpha
@@ -8365,6 +8371,10 @@ struct LazyVectorIndex {
     radii: Vec<f32>,
     radius_quantiles: Option<[Vec<f32>; 2]>,
     probe_radius: KnnProbeRadius,
+    /// Radius weight of the per-segment quantile probe: the process's
+    /// [`knn_probe_radius_alpha`], held here like `probe_radius` so a test
+    /// can pin it.
+    probe_alpha: f32,
     /// Stored vectors and centroids are unit-L2 (on-disk header version is
     /// [`UNIT_NORM_VECTOR_INDEX_VERSION`]) — scoring uses the dot-only fast
     /// path: normalize the query once, then `1 - dot` *is* cosine distance.
@@ -8438,6 +8448,7 @@ impl LazyVectorIndex {
             radii,
             radius_quantiles,
             probe_radius: KnnProbeRadius::from_env(),
+            probe_alpha: knn_probe_radius_alpha(),
             unit_norm,
             version,
             quantized: is_quantized_vector_index_version(version),
@@ -12297,7 +12308,7 @@ impl SegmentReader {
             nprobe
         };
         let candidates = if let Some(radii) = vi.selected_radius_quantiles() {
-            let alpha = knn_probe_radius_alpha();
+            let alpha = vi.probe_alpha;
             let unit = vi.unit_norm.then_some(query);
             let scores = radii
                 .iter()
@@ -14086,17 +14097,21 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn probe_score_default_alpha_is_the_pre_384_lower_bound() {
-        // Bit-identical to `(d - r).max(0.0)` at the default alpha, so the
-        // ranking (and every result) is unchanged unless the flag is set.
+    fn probe_score_default_alpha_is_raw_distance_and_one_is_the_pre_384_bound() {
+        // Default (#458): raw centroid distance. alpha=1 stays
+        // bit-identical to the pre-#384 `(d - r).max(0.0)` lower bound.
         for &(d, r) in &[(0.7f32, 0.3f32), (0.2, 0.5), (1.3, 0.0), (0.41, 0.41)] {
             assert_eq!(
                 centroid_probe_score(d, r, DEFAULT_KNN_PROBE_RADIUS_ALPHA).to_bits(),
+                d.to_bits()
+            );
+            assert_eq!(
+                centroid_probe_score(d, r, 1.0).to_bits(),
                 (d - r).max(0.0).to_bits()
             );
         }
-        assert_eq!(parse_probe_radius_alpha(None), 1.0);
-        assert_eq!(parse_probe_radius_alpha(Some("")), 1.0);
+        assert_eq!(parse_probe_radius_alpha(None), 0.0);
+        assert_eq!(parse_probe_radius_alpha(Some("")), 0.0);
     }
 
     #[test]
@@ -14114,10 +14129,14 @@ mod tests {
 
     #[test]
     fn probe_radius_alpha_parse_rejects_bad_values() {
-        assert_eq!(parse_probe_radius_alpha(Some("0")), 0.0);
+        assert_eq!(parse_probe_radius_alpha(Some("1")), 1.0);
         assert_eq!(parse_probe_radius_alpha(Some(" 0.5 ")), 0.5);
         for bad in ["-0.1", "NaN", "inf", "abc"] {
-            assert_eq!(parse_probe_radius_alpha(Some(bad)), 1.0, "{bad}");
+            assert_eq!(
+                parse_probe_radius_alpha(Some(bad)),
+                DEFAULT_KNN_PROBE_RADIUS_ALPHA,
+                "{bad}"
+            );
         }
     }
 

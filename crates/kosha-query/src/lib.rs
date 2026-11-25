@@ -17197,11 +17197,15 @@ mod tests {
 
     #[test]
     fn radius_aware_ranking_finds_the_diluted_neighbour_without_widening_the_budget() {
-        // The structural fix for the exact scenario proved above: instead
-        // of needing a budget wide enough to include every segment (the
-        // "generous" case), a radius-aware lower bound lets the diluted
-        // target segment qualify at a budget that's still genuinely thin
-        // (15, vs. 51 total segments — nowhere close to "admit everything").
+        // What `alpha = 1` (full radius weight) buys in the scenario proved
+        // above, and what the `alpha = 0` default (#458) gives up: instead
+        // of needing a budget wide enough to include every segment, the
+        // radius-aware lower bound lets the diluted target segment qualify
+        // at a budget that's still genuinely thin (15 of 51 segments).
+        // Raw distance (the default) ranks it last. At 10M real vectors
+        // the trade goes the other way (recall@10 0.97 vs 0.83 at the 5%
+        // budget), so this pins the ranking with an explicit alpha rather
+        // than through the process default.
         //
         // Same corpus as `thin_global_budget_can_bury_the_true_neighbour_in_a_diluted_centroid`
         // (true neighbour at 8°, opposite-facing diluter at 170°, 50
@@ -17272,27 +17276,41 @@ mod tests {
             retired: Default::default(),
             shards: None,
         };
-        let searcher = Searcher::new(dir.clone());
-        let mut q = mk_query("", 1);
-        q.knn = Some(kosha_core::KnnQuery {
-            query_text: None,
-            embedding_model: None,
-            field: "emb".into(),
-            vector: vec![1.0, 0.0],
-            k: 1,
-            num_candidates: 15, // thin: well under the 51-segment corpus
-            filter: None,
-            vectors: None,
-            scoring: None,
-        });
-        let r = searcher.search(&ns, &manifest, &q, None).unwrap();
-        assert_eq!(
-            r.results.first().map(|h| h.doc_id.0.clone()),
-            Some("true-nn".to_string()),
-            "radius-aware ranking must find the diluted true neighbour at a \
-             thin budget (15), not just at a budget wide enough to admit \
-             every segment — got {:?}",
-            r.results
+        // Rank of the target segment among all 51 by probe score, at an
+        // explicit alpha (the process default would make this test depend
+        // on KOSHA_KNN_PROBE_RADIUS_ALPHA).
+        let target_rank = |alpha: f32| {
+            let mut scores: Vec<(f32, String)> = manifest
+                .segments
+                .iter()
+                .map(|e| {
+                    let reader = kosha_segment::SegmentReader::open_with_options(
+                        dir.join(&ns.0).join(&e.segment_id.0),
+                        true,
+                    )
+                    .unwrap();
+                    let d = reader
+                        .knn_centroid_distances_with_alpha("emb", &[1.0, 0.0], alpha)
+                        .unwrap();
+                    let best = d.into_iter().fold(f32::INFINITY, f32::min);
+                    (best, e.segment_id.0.clone())
+                })
+                .collect();
+            scores.sort_by(|a, b| a.0.total_cmp(&b.0));
+            scores.iter().position(|(_, id)| id == "target").unwrap()
+        };
+        const THIN_BUDGET: usize = 15; // well under the 51-segment corpus
+        let full_radius = target_rank(1.0);
+        assert!(
+            full_radius < THIN_BUDGET,
+            "alpha=1 must rank the diluted target inside a thin budget \
+             ({THIN_BUDGET}); got rank {full_radius}"
+        );
+        let raw = target_rank(0.0);
+        assert!(
+            raw >= THIN_BUDGET,
+            "alpha=0 (raw distance) ranks the diluted target outside the thin \
+             budget, the documented trade-off; got rank {raw}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
