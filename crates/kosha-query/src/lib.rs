@@ -3146,9 +3146,9 @@ fn knn_cost_posting_overhead_bytes() -> f64 {
 /// Cost model for filtered kNN (#465): whether scoring a segment's
 /// `passing` documents exactly reads no more than probing it would.
 ///
-/// A probe reads its share of the global budget (`budget_share` postings)
-/// widened by the filter's selectivity as [`filtered_knn_budget`] widens
-/// it, but never fewer postings than it takes, on average, to see `k`
+/// A probe reads `budget_share` postings, widened by the filter's
+/// selectivity as [`filtered_knn_budget`] widens it when `widen` (the
+/// global budget does; a per-segment fallback probe does not), but never fewer postings than it takes, on average, to see `k`
 /// passing entries, nor more than the column holds; each posting costs its
 /// entries plus `posting_overhead` bytes. A quantized column also rescores
 /// `k × rescore_factor` exact vectors. An exact scan reads one exact vector
@@ -3158,6 +3158,7 @@ pub fn knn_exact_is_cheaper(
     cost: &kosha_segment::KnnColumnCost,
     passing: usize,
     budget_share: usize,
+    widen: bool,
     k: usize,
     rescore_factor: usize,
     posting_overhead: f64,
@@ -3170,7 +3171,11 @@ pub fn knn_exact_is_cheaper(
     let avg_len = entries / postings;
     let selectivity = (passing as f64 / entries).min(1.0);
     let per_posting = avg_len * cost.entry_bytes as f64 + posting_overhead;
-    let widened = filtered_knn_budget(budget_share.max(1), Some(selectivity)) as f64;
+    let widened = if widen {
+        filtered_knn_budget(budget_share.max(1), Some(selectivity))
+    } else {
+        budget_share.max(1)
+    } as f64;
     let to_find_k = (k.max(1) as f64 / (selectivity * avg_len)).ceil();
     let probed = widened.max(to_find_k).min(postings);
     let mut probe = probed * per_posting;
@@ -5482,12 +5487,13 @@ impl Searcher {
                             cost,
                             passing,
                             // Without global budgeting each segment probes
-                            // up to `num_candidates` on its own.
+                            // `num_candidates`, unwidened, on its own.
                             if budgeted {
                                 (cost_budget * cost.postings).div_ceil(cost_postings.max(1))
                             } else {
                                 requested
                             },
+                            budgeted,
                             knn.k,
                             kosha_segment::vector_rescore_factor(),
                             knn_cost_posting_overhead_bytes(),
@@ -29102,7 +29108,7 @@ mod filtered_knn_tests {
             quantized: false,
             exact_vector_bytes: Some(512),
         };
-        let cheaper = |cost, passing| knn_exact_is_cheaper(cost, passing, 10, 10, 4, 4096.0);
+        let cheaper = |cost, passing| knn_exact_is_cheaper(cost, passing, 10, true, 10, 4, 4096.0);
         assert!(cheaper(&f32_col, 0), "nothing passes: exact (empty)");
         assert!(cheaper(&f32_col, 50), "0.5%: a probe needs every posting");
         assert!(!cheaper(&f32_col, 5_000), "50%: ten postings suffice");
