@@ -950,6 +950,7 @@ Read in `GroupCommitConfig::from_env` (`crates/kosha-write/src/wal.rs`).
 | `KOSHA_COMPACTION_INTERVAL_MS` | Background compaction scheduler period on pods that run it (`indexer`, `standalone`, and `ingest` unless `KOSHA_COMPACTION_ON_INGEST=false`); `0` disables it (`compaction_sched.rs`). Benchmarks and the conformance suite set `0` | `30000` | milliseconds |
 | `KOSHA_COMPACTION_ON_INGEST` | Whether a writer pod (`ingest`, `standalone`) runs the compaction scheduler. Set `false` once an `indexer` pod compacts (k8s base does). The admin compaction API still works either way | `true` | flag |
 | `KOSHA_COMPACTION_MAX_CONCURRENT` | Compaction passes at once, including API jobs. Must be > 0 | `1` | passes |
+| `KOSHA_COMPACT_TOMBSTONE_RATIO` | Experimental (#464). A segment whose tombstoned share of documents is at or above this fraction is a tiered compaction input whatever its size, goes first, and is rewritten on its own when nothing else fits with it, which expunges its deleted documents and their vectors. It also makes `needs_compaction` true. Unset, it is never considered: large segments keep their deletes until a `full` pass. A fraction in (0, 1], e.g. `0.2`; unset or `off` disables it | off | ratio |
 | `KOSHA_COMPACT_MAX_SEGMENT_BYTES` | Largest merged segment; `0` removes the cap. A request's own value overrides it (`compact_options`) | `5368709120` (5 GiB) | bytes |
 
 ## Segment garbage collection
