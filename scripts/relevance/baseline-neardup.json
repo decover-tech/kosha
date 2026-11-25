@@ -30,27 +30,27 @@
       "points": [
         {
           "max_postings_per_segment": 1,
-          "mean_vectors_scanned": 160.20833333333334,
+          "mean_vectors_scanned": 172.13333333333333,
           "queries": 120,
-          "recall_at_10": 0.49666666666666665
+          "recall_at_10": 0.76
         },
         {
           "max_postings_per_segment": 2,
-          "mean_vectors_scanned": 323.1333333333333,
+          "mean_vectors_scanned": 330.90833333333336,
           "queries": 120,
-          "recall_at_10": 0.8083333333333332
+          "recall_at_10": 0.925
         },
         {
           "max_postings_per_segment": 4,
-          "mean_vectors_scanned": 639.5666666666667,
+          "mean_vectors_scanned": 650.4083333333333,
           "queries": 120,
-          "recall_at_10": 0.9625
+          "recall_at_10": 0.9941666666666668
         },
         {
           "max_postings_per_segment": 8,
-          "mean_vectors_scanned": 1261.7166666666667,
+          "mean_vectors_scanned": 1271.9916666666666,
           "queries": 120,
-          "recall_at_10": 0.9983333333333334
+          "recall_at_10": 0.9991666666666668
         },
         {
           "max_postings_per_segment": 16,
@@ -94,9 +94,9 @@
     },
     "filtered_knn.planned@100%.recall@10": {
       "knn_exact_vectors_per_query": 0.0,
-      "knn_postings_per_query": 3.3833333333333333,
+      "knn_postings_per_query": 2.0,
       "queries": 120,
-      "value": 0.7899999999999999
+      "value": 0.7466666666666666
     },
     "filtered_knn.planned@50%.recall@10": {
       "knn_exact_vectors_per_query": 950.0,
@@ -112,39 +112,39 @@
     },
     "filtered_knn.probe@1%.recall@10": {
       "knn_exact_vectors_per_query": 0.0,
-      "knn_postings_per_query": 21.941666666666666,
+      "knn_postings_per_query": 22.35,
       "queries": 120,
-      "value": 0.9875000000000005
+      "value": 0.9908333333333333
     },
     "filtered_knn.probe@10%.recall@10": {
       "knn_exact_vectors_per_query": 0.0,
       "knn_postings_per_query": 16.0,
       "queries": 120,
-      "value": 0.9916666666666667
+      "value": 1.0
     },
     "filtered_knn.probe@100%.recall@10": {
       "knn_exact_vectors_per_query": 0.0,
-      "knn_postings_per_query": 3.3833333333333333,
+      "knn_postings_per_query": 2.0,
       "queries": 120,
-      "value": 0.7899999999999999
+      "value": 0.7466666666666666
     },
     "filtered_knn.probe@50%.recall@10": {
       "knn_exact_vectors_per_query": 0.0,
-      "knn_postings_per_query": 4.583333333333333,
+      "knn_postings_per_query": 4.0,
       "queries": 120,
-      "value": 0.8858333333333337
+      "value": 0.919166666666667
     },
     "hybrid.ndcg@10": {
       "knn_exact_vectors_per_query": 237.33333333333334,
-      "knn_postings_per_query": 2.808333333333333,
+      "knn_postings_per_query": 1.6666666666666667,
       "queries": 120,
-      "value": 0.9690276740470591
+      "value": 0.9691522533692893
     },
     "hybrid.recall@100": {
       "knn_exact_vectors_per_query": 237.33333333333334,
-      "knn_postings_per_query": 2.808333333333333,
+      "knn_postings_per_query": 1.6666666666666667,
       "queries": 120,
-      "value": 0.8595917757081999
+      "value": 0.8658908153789224
     },
     "lexical.ndcg@10": {
       "knn_exact_vectors_per_query": 0.0,
@@ -160,40 +160,40 @@
     },
     "vector.ndcg@10": {
       "knn_exact_vectors_per_query": 237.33333333333334,
-      "knn_postings_per_query": 2.808333333333333,
+      "knn_postings_per_query": 1.6666666666666667,
       "queries": 120,
-      "value": 0.794272653644042
+      "value": 0.8261259152581594
     },
     "vector.recall@100": {
       "knn_exact_vectors_per_query": 237.33333333333334,
-      "knn_postings_per_query": 2.808333333333333,
+      "knn_postings_per_query": 1.6666666666666667,
       "queries": 120,
-      "value": 0.748018685170199
+      "value": 0.7177994632093572
     },
     "vector_ann.mrr@10": {
       "knn_exact_vectors_per_query": 0.0,
-      "knn_postings_per_query": 3.525,
+      "knn_postings_per_query": 2.175,
       "queries": 120,
-      "value": 0.7950330687830688
+      "value": 0.834672619047619
     },
     "vector_ann.ndcg@10": {
       "knn_exact_vectors_per_query": 0.0,
-      "knn_postings_per_query": 3.525,
+      "knn_postings_per_query": 2.175,
       "queries": 120,
-      "value": 0.7957166913150479
+      "value": 0.8305282088379752
     }
   },
   "schema": 1,
   "vector_vs_exact": {
     "mrr@10": {
-      "ann": 0.7950330687830688,
-      "delta": -0.0038194444444444864,
+      "ann": 0.834672619047619,
+      "delta": 0.03582010582010575,
       "exact": 0.7988525132275133,
       "queries": 120
     },
     "ndcg@10": {
-      "ann": 0.7957166913150479,
-      "delta": -0.01310639114914447,
+      "ann": 0.8305282088379752,
+      "delta": 0.021705126373782857,
       "exact": 0.8088230824641923,
       "queries": 120
     }

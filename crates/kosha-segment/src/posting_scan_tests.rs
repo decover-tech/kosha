@@ -1451,22 +1451,33 @@ fn per_segment_probe_respects_opt_in_radius_quantiles() {
     ];
     let path = fixture.dir.join(VECTOR_IDX_FILE);
     let query = [1.0, 0.0];
-    for (version, mode, expected) in [
-        (QUANTILE_VECTOR_INDEX_VERSION, KnnProbeRadius::Max, 0),
-        (RADIUS_AWARE_VECTOR_INDEX_VERSION, KnnProbeRadius::P50, 0),
-        (QUANTILE_VECTOR_INDEX_VERSION, KnnProbeRadius::P50, 1),
-        (QUANTILE_VECTOR_INDEX_VERSION, KnnProbeRadius::P90, 1),
+    // Quantile radii change the ranking only under a radius weight (alpha
+    // 1); at alpha 0, the default since #458, raw distance picks posting 0
+    // in every mode.
+    for (version, mode, alpha, expected) in [
+        (QUANTILE_VECTOR_INDEX_VERSION, KnnProbeRadius::Max, 1.0, 0),
+        (
+            RADIUS_AWARE_VECTOR_INDEX_VERSION,
+            KnnProbeRadius::P50,
+            1.0,
+            0,
+        ),
+        (QUANTILE_VECTOR_INDEX_VERSION, KnnProbeRadius::P50, 1.0, 1),
+        (QUANTILE_VECTOR_INDEX_VERSION, KnnProbeRadius::P90, 1.0, 1),
+        (QUANTILE_VECTOR_INDEX_VERSION, KnnProbeRadius::P50, 0.0, 0),
+        (QUANTILE_VECTOR_INDEX_VERSION, KnnProbeRadius::P90, 0.0, 0),
     ] {
         let (idx, offsets) = encode_vector_index_v2(2, &postings, version);
         fs::write(&path, idx).unwrap();
         let records = parse_vector_offsets(&offsets, 2, version).unwrap();
         let mut vi = LazyVectorIndex::from_parsed(&path, 0, 2, version, records, None);
         vi.probe_radius = mode;
+        vi.probe_alpha = alpha;
         let hits = fixture
             .reader
             .knn_search_lazy(&vi, &query, 1, 1, None, None)
             .unwrap();
-        assert_eq!(hits[0].0, expected, "{version} {mode:?}");
+        assert_eq!(hits[0].0, expected, "{version} {mode:?} alpha {alpha}");
     }
 }
 
