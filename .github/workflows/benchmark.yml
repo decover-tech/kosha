@@ -721,6 +721,12 @@ jobs:
           print(f"| {n} | {fmt(d['p50_ms'])} | {fmt(d['p90_ms'])} | {fmt(d['p99_ms'])} | {d['requests']} | {d['errors']} |")
           EOF
             done
+            # Engine internals next to the latency it explains: stage
+            # breakdown, tail vs median, work counters and server CPU/RSS
+            # per phase (query_bench.py's `internals` block). Reporting
+            # only, so a failure here never fails the run.
+            echo ""
+            python3 scripts/bench/bm25_scale/internals_report.py results || true
             # recall.json has a different schema entirely (mean_recall_at_k,
             # not p50_ms) — its own section rather than forcing it into the
             # latency table above.
