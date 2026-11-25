@@ -39,6 +39,14 @@
 #   rp90, rp50       rank by the p90 / p50 member distance, fixed budget
 #   rp90a0.5         p90 at half radius weight
 #   rp90rel1m500     p90 + alpha=0 relative cutoff (eps 1, min 500)
+# The shorthand "routing" is the #253 namespace centroid directory
+# (KOSHA_KNN_NAMESPACE_CENTROIDS, default off), which probes the global top
+# num_candidates postings instead of the 5% floor. NUM_CANDIDATES=N in a
+# point sets that point's request num_candidates (not a server knob):
+#   f0.05            baseline (per-segment planner, num_candidates 100)
+#   ns100            routed, num_candidates 100 (the request default)
+#   ns1000, ns2000   routed, num_candidates 1000 / 2000
+#   ns5700           routed at the baseline's probe count (5% of ~114k)
 # Each recall query reports which rule set its cutoff
 # (timings.knn_cutoff_rule: budget / eps / floor / zero_best), and the
 # report tabulates the shares, so a point that misses the bar can be read.
@@ -74,7 +82,7 @@ BENCH_DIR="$(cd "$HERE/.." && pwd)"
 PY=~/venv311/bin/python3
 # The knobs a point may set. All are read once at server start, hence the
 # container recreate per point.
-KNOBS="KOSHA_KNN_BUDGET_FRACTION KOSHA_KNN_BUDGET_MAX_CAP KOSHA_KNN_RELATIVE_CUTOFF_EPS KOSHA_KNN_RELATIVE_MIN_PROBES KOSHA_KNN_PROBE_RADIUS_ALPHA KOSHA_KNN_PROBE_RADIUS KOSHA_KNN_BOUND_STOP_ALPHA"
+KNOBS="KOSHA_KNN_BUDGET_FRACTION KOSHA_KNN_BUDGET_MAX_CAP KOSHA_KNN_RELATIVE_CUTOFF_EPS KOSHA_KNN_RELATIVE_MIN_PROBES KOSHA_KNN_PROBE_RADIUS_ALPHA KOSHA_KNN_PROBE_RADIUS KOSHA_KNN_BOUND_STOP_ALPHA KOSHA_KNN_NAMESPACE_CENTROIDS"
 
 if [ "$POINTS" = fractions ]; then
   POINTS="f0.05:KOSHA_KNN_BUDGET_FRACTION=0.05;f0.03:KOSHA_KNN_BUDGET_FRACTION=0.03;f0.02:KOSHA_KNN_BUDGET_FRACTION=0.02;f0.01:KOSHA_KNN_BUDGET_FRACTION=0.01"
@@ -95,6 +103,11 @@ if [ "$POINTS" = radius ]; then
   R=KOSHA_KNN_PROBE_RADIUS
   POINTS="f0.05:KOSHA_KNN_BUDGET_FRACTION=0.05;rp90:$R=p90;rp50:$R=p50;rp90a0.5:$R=p90,KOSHA_KNN_PROBE_RADIUS_ALPHA=0.5"
   POINTS="$POINTS;rp90rel1m500:$R=p90,KOSHA_KNN_PROBE_RADIUS_ALPHA=0,KOSHA_KNN_RELATIVE_CUTOFF_EPS=1.0,KOSHA_KNN_RELATIVE_MIN_PROBES=500"
+fi
+if [ "$POINTS" = routing ]; then
+  NSC=KOSHA_KNN_NAMESPACE_CENTROIDS=1
+  POINTS="f0.05:KOSHA_KNN_BUDGET_FRACTION=0.05;ns100:$NSC;ns1000:$NSC,NUM_CANDIDATES=1000"
+  POINTS="$POINTS;ns2000:$NSC,NUM_CANDIDATES=2000;ns5700:$NSC,NUM_CANDIDATES=5700"
 fi
 case "$POINTS" in *[!A-Za-z0-9_.=:\;,-]*) echo "points may only contain [A-Za-z0-9_.=:;,-]: $POINTS"; exit 1 ;; esac
 
@@ -135,13 +148,16 @@ for pt in "${PTS[@]}"; do
   dir="$OUT/$label"; mkdir -p "$dir/server"
   cp "$OUT/base-sans-knobs.env" "$dir/server.env"
   IFS=',' read -ra AS <<< "$assigns"
+  nc="$NUM_CANDIDATES"
   for a in "${AS[@]}"; do
     key="${a%%=*}"
+    if [ "$key" = NUM_CANDIDATES ]; then nc="${a#*=}"; continue; fi
     case " $KNOBS " in *" $key "*) ;; *) echo "point $label: $key is not a sweep knob ($KNOBS)"; exit 1 ;; esac
     echo "$a" >> "$dir/server.env"
   done
   grep -E "$KNOB_RE" "$dir/server.env" > "$dir/knobs.env" || true
-  echo "=== SWEEP-POINT $label: $(tr '\n' ' ' < "$dir/knobs.env")"
+  echo "num_candidates=$nc" > "$dir/num_candidates.txt"
+  echo "=== SWEEP-POINT $label: $(tr '\n' ' ' < "$dir/knobs.env")num_candidates=$nc"
   recreate "$dir/server.env"
   since=$(iso_now)
   # Re-warm in-process caches with the workload (local NVMe is kept).
@@ -156,14 +172,14 @@ for pt in "${PTS[@]}"; do
   $PY "$BENCH_DIR/query_bench.py" --host http://127.0.0.1:8080 --namespace "$NS" \
     --queries-file /data/queries.txt --api-key "$API_KEY" \
     --qps "$QPS" --topk 10 --duration "$DURATION" --timeout 600 --phase warm \
-    --knn-embeddings /data/queries_emb.f32 --knn-num-candidates "$NUM_CANDIDATES" --no-cache \
+    --knn-embeddings /data/queries_emb.f32 --knn-num-candidates "$nc" --no-cache \
     --server-timings --raw-out "$dir/knn_warm_nocache.requests.jsonl.gz" --return "$RETURN_FIELDS" \
     --out "$dir/knn_warm_nocache.json"
   sudo docker logs --timestamps --since "$since" kosha 2>&1 | gzip > "$dir/server/knn_warm_nocache.log.gz" || true
   since=$(iso_now)
   $PY "$BENCH_DIR/recall_check.py" --host http://127.0.0.1:8080 --namespace "$NS" --api-key "$API_KEY" \
     --embeddings-dir "$EMB_DIR" --queries-file /data/queries.txt --queries-emb /data/queries_emb.f32 \
-    --sample "$SAMPLE" --sampling random --seed "$SEED" --k 10 --num-candidates "$NUM_CANDIDATES" \
+    --sample "$SAMPLE" --sampling random --seed "$SEED" --k 10 --num-candidates "$nc" \
     --server-timings --no-cache --truth-cache "$TRUTH" --label "$label" --out "$dir/recall.json"
   sudo docker logs --timestamps --since "$since" kosha 2>&1 | gzip > "$dir/server/recall.log.gz" || true
   echo "SWEEP-POINT-COMPLETE $label"

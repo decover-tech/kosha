@@ -152,6 +152,31 @@ ANN structure when a segment is opened.
   dimension mismatch. `KOSHA_VECTOR_COMPACTION=rebuild` switches the whole path
   off (default `lire`).
 
+  Measured (`cargo test --release -p kosha-vector-spfresh --test
+  compaction_merge -- --ignored --nocapture`, 8-vCPU Linux VM, 128 dims,
+  unit-norm 200-centre mixture, one big input plus `pct`% of its vectors
+  updated in flush-sized inputs, refinement on):
+
+  | input vectors | changed | rebuild | lire | speedup |
+  |--:|--:|--:|--:|--:|
+  | 10,000 | 1% | 105 ms | 2 ms | 64x |
+  | 10,000 | 5% | 117 ms | 5 ms | 22x |
+  | 50,000 | 1% | 917 ms | 11 ms | 86x |
+  | 50,000 | 5% | 742 ms | 25 ms | 30x |
+  | 100,000 | 1% | 1,683 ms | 25 ms | 68x |
+  | 100,000 | 5% | 1,741 ms | 65 ms | 27x |
+  | 200,000 | 1% | 5,932 ms | 70 ms | 85x |
+  | 200,000 | 5% | 4,252 ms | 221 ms | 19x |
+
+  At a fixed changed share, `lire` time grows with the changed vectors
+  (1% of 200k = 2,000 changed: 70 ms; 5% = 10,000: 221 ms), while
+  `rebuild` grows with the column. A tiered merge of four equal inputs is
+  the worst case (most postings change): 50k in 192 ms against 821 ms,
+  200k in 1,417 ms against 3,995 ms. Recall@10 at a 5% probe budget stays
+  within 0.5 pt of a from-scratch build (asserted by the same test file):
+  one compaction 1.0000 / 1.0000, four equal inputs 0.9994 / 1.0000, six
+  churn cycles 1.0000 / 0.9999 (lire / rebuild).
+
 ### Querying (`kosha-query`)
 
 - **Global probe budget.** A kNN does not probe a fixed `nprobe` per segment.
@@ -171,6 +196,13 @@ ANN structure when a segment is opened.
   bounded by the request. Missing or stale directories and searches that
   may need to refill (for example, filtered kNN) use the default planner.
   This does not change the segment layout or eliminate segment opens.
+  In `tests/namespace_centroid_routing.rs` (kosha-query) going from 10 to
+  1,000 segments keeps probes at 10 with recall@10 1.0000 on both paths.
+  On the 10M bench it is measured with `knn_sweep=routing` (benchmark.yml),
+  which compares the default planner against routed queries at
+  `num_candidates` 100, 1,000, 2,000 and 5,700 (the default planner's
+  probe count there); `phase_centroids_mean` in the sweep table shows the
+  centroids each query scored.
 - **Radius-aware ranking.** Postings are ranked by the triangle-inequality
   lower bound `max(0, distance(query, centroid) - radius)` instead of raw
   centroid distance, so a posting with an unremarkable centroid but a close
@@ -184,6 +216,18 @@ ANN structure when a segment is opened.
 - **i8 rescoring.** An i8 column scores with an i8 dot product, then rescores
   its best `k * KOSHA_VECTOR_RESCORE_FACTOR` candidates with the f32 vectors in
   `doc_vectors.bin`.
+- **Posting scan** (#435, `kosha-segment`). One open idx file and one
+  4-byte-aligned buffer per segment visit, f32 postings scored in place
+  from the read bytes (`bytemuck`, no `unsafe`, no mmap), and a running
+  top-k. The `search timing:` line splits scoring into `knn_read_ms`,
+  `knn_decode_ms` and `knn_dot_ms` (summed across scoring threads). On the
+  x86 bench host, warm kNN on `msmarco-10m-vec` (8 QPS, 5,700 postings over
+  ~196 segments per query) went from `score_ms` p50/p90/p99 80.2 / 103.0 /
+  219.7 ms (run 45068373889) to 24.7 / 25.3 / 25.9 ms (run 45506667653,
+  3.2x at p50), with identical top-10 ids for all 1,677 queries. What is
+  left is mostly the read (411 ms summed across threads against 282 ms of
+  dot per query); an mmap'd idx file would remove it but needs an
+  `unsafe_code` exception in `kosha-segment`.
 
 ### Not wired yet
 
