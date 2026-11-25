@@ -436,6 +436,22 @@ with `KOSHA_DOC_STORE_READ_MODE=whole` and report with
 `knn_seg_unrescored` / `knn_seg_quantized` counters; enabling whole page reads
 does not guarantee the sidecar is present on every probed segment.
 
+### Defaults and the pass/fail bar (`bench_gate`)
+
+Every dispatch now runs the recall check (`run_recall_check=true`,
+`recall_sample=500`) and the `fractions` kNN sweep by default, so no kNN
+latency number is published without a paired recall number. The sweep adds
+about 55 minutes; clear `knn_sweep` to skip it.
+
+The last step, after teardown, runs `bench_gate.py` over the collected results
+and fails the run when a phase has errors or zero-hit requests, or when
+tie-tolerant recall@10 is below `recall_min` (0.93 by default), or when the
+recall check was expected and produced nothing. The sweep is never gated.
+Override the bar with `bench_gate="recall_min=0.9 max_error_rate=0.001"`, or
+report only with `bench_gate=off` (for example for a server_env experiment
+that trades recall on purpose). Running the gate after teardown means a
+failed bar never keeps the VM.
+
 ### kNN probe-budget sweep (`knn_sweep`, #384)
 
 Recall@10 against p50/p99 and postings probed, one point per server

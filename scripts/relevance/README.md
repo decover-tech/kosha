@@ -158,6 +158,20 @@ seed. A unit test checks that the committed files match the generator byte for b
 The fixture is a regression signal, not a quality claim. Its absolute numbers mean little,
 but their movement does.
 
+## Fixtures
+
+CI runs every fixture in `RELEVANCE_FIXTURES` (`relevance-compare.yml`) and gates each one
+separately:
+
+| Fixture | Shape | Why it is gated |
+| --- | --- | --- |
+| `synthetic` | 30 topics with overlapping vocabularies and vector clusters, key terms, OOD queries | General ranking and filtered-recall regressions |
+| `neardup` | 1,900 documents (16-d vectors) in 150 Zipf-sized families: near-identical text and vectors, 25% byte-identical vectors, families packed into 12 regions | Probe selection on duplicate-heavy data, the legal-matter shape where kNN recall fell to 0.81 (2026-11-25). At the default 5% floor its recall@10 is about 0.79 and reaches 1.0 when every posting is probed, so a worse probe ranking shows up immediately |
+
+Each fixture has a `generate.py` that reproduces its files byte for byte
+(`test_converters.py` checks this). The committed baselines are `baseline.json`
+(synthetic) and `baseline-<fixture>.json` for the others.
+
 ## CI gate and baseline
 
 `bench-compare.yml` calls `relevance-compare.yml` on PRs that touch `kosha-query`,
@@ -182,6 +196,8 @@ the drop reviewed:
 
 ```sh
 KOSHA_RELEVANCE_JSON=scripts/relevance/baseline.json cargo bench -p kosha-query --bench relevance
+KOSHA_RELEVANCE_JSON=scripts/relevance/baseline-neardup.json \
+  cargo bench -p kosha-query --bench relevance -- scripts/relevance/fixtures/neardup
 ```
 
 Do this without any `KOSHA_*` engine overrides set; the report records the ones that are
