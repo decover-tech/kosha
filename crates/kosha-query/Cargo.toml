@@ -13,6 +13,9 @@ kosha-core = { path = "../kosha-core" }
 kosha-segment = { path = "../kosha-segment" }
 instant-distance = "0.6"
 rayon = { workspace = true }
+# Fast non-keyed hasher for per-segment doc_seq → score maps (keys are
+# segment-local u32 ids, not attacker-chosen strings). Already in the lock.
+rustc-hash = "2.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 

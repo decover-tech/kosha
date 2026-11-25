@@ -2482,6 +2482,7 @@ dependencies = [
  "kosha-vector-spfresh",
  "kosha-write",
  "rayon",
+ "rustc-hash",
  "serde",
  "serde_json",
  "tempfile",
