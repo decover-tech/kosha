@@ -5770,7 +5770,40 @@ fn vector_cluster_config(dim: usize) -> kosha_vector_spfresh::ClusterIndexConfig
     if !vector_build_refine() {
         config.build_refine_rounds = 0;
     }
+    if let Some(radius) = vector_reassign_radius() {
+        config.reassign_radius = radius;
+    }
     config
+}
+
+/// `KOSHA_VECTOR_REASSIGN_RADIUS` (#459, experimental), read once: how
+/// many nearest postings a split's LIRE reassignment considers, in every
+/// build and compaction. Unset keeps `ClusterIndexConfig`'s default (8);
+/// SPFresh uses 64. On the #459 sweep (50k × 128-d) 64 scanned 4-17×
+/// fewer vectors at recall@10 = 0.95 for ~27% more build time. Same
+/// on-disk format either way.
+fn vector_reassign_radius() -> Option<usize> {
+    static RADIUS: OnceLock<Option<usize>> = OnceLock::new();
+    *RADIUS.get_or_init(|| {
+        parse_vector_reassign_radius(
+            std::env::var("KOSHA_VECTOR_REASSIGN_RADIUS")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+fn parse_vector_reassign_radius(raw: Option<&str>) -> Option<usize> {
+    let raw = raw.map(str::trim).filter(|v| !v.is_empty())?;
+    match raw.parse::<usize>() {
+        Ok(radius) if (1..=1024).contains(&radius) => Some(radius),
+        _ => {
+            eprintln!(
+                "WARN: KOSHA_VECTOR_REASSIGN_RADIUS={raw} is not an integer in 1..=1024 — using the default"
+            );
+            None
+        }
+    }
 }
 
 /// `KOSHA_VECTOR_BUILD_REFINE`, read once: whether a from-scratch vector
@@ -14108,6 +14141,16 @@ mod tests {
     // bug this test exists to catch.
     #[global_allocator]
     static ALLOC: cap::Cap<std::alloc::System> = cap::Cap::new(std::alloc::System, usize::MAX);
+
+    #[test]
+    fn vector_reassign_radius_parses_a_bounded_integer() {
+        assert_eq!(parse_vector_reassign_radius(None), None);
+        assert_eq!(parse_vector_reassign_radius(Some("")), None);
+        assert_eq!(parse_vector_reassign_radius(Some(" 64 ")), Some(64));
+        assert_eq!(parse_vector_reassign_radius(Some("0")), None);
+        assert_eq!(parse_vector_reassign_radius(Some("5000")), None);
+        assert_eq!(parse_vector_reassign_radius(Some("lots")), None);
+    }
 
     #[test]
     fn vector_build_refine_parses_on_off_and_defaults_on() {
