@@ -52,6 +52,9 @@ import statistics
 from pathlib import Path
 
 LOG_POSTINGS = re.compile(r"search timing: .*?\bknn_postings=(\d+)")
+# Centroids scored per query: every centroid of every searched segment on
+# the per-segment planner, far fewer when the #253 namespace directory routes.
+LOG_CENTROIDS = re.compile(r"search timing: .*?\bknn_centroids=(\d+)")
 
 
 def pct(xs, p):
@@ -71,14 +74,14 @@ def read_jsonl_gz(path: Path) -> list[dict]:
         return [json.loads(line) for line in f if line.strip()]
 
 
-def log_postings(path: Path) -> list[int]:
+def log_postings(path: Path, pattern: re.Pattern = LOG_POSTINGS) -> list[int]:
     if not path.exists():
         return []
     opener = gzip.open if path.suffix == ".gz" else open
     out = []
     with opener(path, "rt", errors="replace") as f:
         for line in f:
-            m = LOG_POSTINGS.search(line)
+            m = pattern.search(line)
             if m:
                 out.append(int(m.group(1)))
     return out
@@ -92,6 +95,9 @@ def point_row(d: Path) -> dict | None:
     row: dict = {"label": d.name}
     knobs = d / "knobs.env"
     row["knobs"] = " ".join(knobs.read_text().split()) if knobs.exists() else ""
+    nc = d / "num_candidates.txt"
+    if nc.exists():
+        row["knobs"] = " ".join(filter(None, [row["knobs"], nc.read_text().strip()]))
     if phase.exists():
         p = json.loads(phase.read_text())
         row.update(
@@ -112,6 +118,8 @@ def point_row(d: Path) -> dict | None:
     row["phase_postings_mean"] = statistics.fmean(postings) if postings else float("nan")
     row["phase_postings_p50"] = pct(postings, 50)
     row["phase_postings_p99"] = pct(postings, 99)
+    centroids = log_postings(d / "server" / "knn_warm_nocache.log.gz", LOG_CENTROIDS)
+    row["phase_centroids_mean"] = statistics.fmean(centroids) if centroids else float("nan")
     rpost: list[float] = []
     rsource = "none"
     if recall.exists():
@@ -199,6 +207,7 @@ def main() -> None:
         ("recall_p10", 2), ("recall_dist_mean", 4), ("recall_eps_mean", 4),
         ("recall_postings_mean", 0), ("recall_postings_p99", 0), ("postings_vs_baseline", 2),
         ("meets_bar", 0), ("phase_postings_mean", 0), ("phase_vs_baseline", 2), ("pair_check", 0),
+        ("phase_centroids_mean", 0),
         ("cutoff_rules", 0), ("recall_postings_source", 0), ("phase_postings_source", 0), ("knobs", 0),
     ]
     lines = [

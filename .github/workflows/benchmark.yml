@@ -196,7 +196,9 @@ on:
           cutoff at eps 0.5/1/2, min probes 500/1000, plus f0.05); "bound" =
           KOSHA_KNN_BOUND_STOP_ALPHA 1/0.95/0.9/0.85 plus f0.05; "radius" =
           KOSHA_KNN_PROBE_RADIUS max/p90/p50 (#458; needs a vector_snapshot
-          built with KOSHA_VECTOR_WRITE_VERSION=5);
+          built with KOSHA_VECTOR_WRITE_VERSION=5); "routing" =
+          KOSHA_KNN_NAMESPACE_CENTROIDS=1 at num_candidates 100/1000/2000/5700
+          plus f0.05 (#253);
           or points "label:ENV=V,ENV=V;label2:..." over the kNN probe knobs
           (see scripts/bench/bm25_scale/vm/knn_budget_sweep.sh). Each point
           restarts the server with those env vars, runs a warm kNN phase of
