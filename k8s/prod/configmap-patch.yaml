@@ -10,6 +10,13 @@
 #   KOSHA_LEGACY_ROUTES: "off"
 #   KOSHA_LEGACY_ROUTES_TENANTS: "<tenants still migrating>"
 # here (docs/api/versioning.md, "Legacy routes").
+#
+# kNN probe ranking (DEC-3203): rank postings by raw centroid distance. On a
+# real 988k-vector matter, tie-tolerant recall@10 went 0.82 -> 0.99 and server
+# p50 18 -> 7 ms (612 instead of ~2,540 postings probed); legal corpora are
+# near-duplicate heavy, so outlier members inflate posting radii and the
+# radius-weighted default (1.0) ranks most postings as ties. See
+# docs/configuration.md. Rollback: delete the key (engine default 1.0).
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -17,3 +24,4 @@ metadata:
   namespace: kosha
 data:
   KOSHA_LEGACY_ROUTES: "on"
+  KOSHA_KNN_PROBE_RADIUS_ALPHA: "0"

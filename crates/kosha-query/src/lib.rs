@@ -6918,6 +6918,9 @@ impl Searcher {
                             cursors.iter_mut().map(|c| c.advance_to(0)).collect();
 
                         let mut total_hits = 0usize;
+                        // Of `total_hits`, how many are already added to the
+                        // namespace-wide count (`GlobalWandFloor::counted`).
+                        let mut published_hits = 0usize;
                         let mut hits_capped = false;
                         let mut topk = BoundedTopK::new(effective_k);
                         // Set once pivoting proves no remaining combination
@@ -6926,9 +6929,12 @@ impl Searcher {
                         // enter the page.
                         let mut ranking_settled = false;
 
+                        // Live cursors in doc order, rebuilt per step into
+                        // one reused buffer (was a fresh Vec per member).
+                        let mut order: Vec<usize> = Vec::with_capacity(cursors.len());
                         'or_join: loop {
-                            let mut order: Vec<usize> =
-                                (0..cursors.len()).filter(|&i| cur[i].is_some()).collect();
+                            order.clear();
+                            order.extend((0..cursors.len()).filter(|&i| cur[i].is_some()));
                             if order.is_empty() {
                                 break 'or_join;
                             }
@@ -6950,8 +6956,16 @@ impl Searcher {
                             // The threshold may come from other segments
                             // (issue #248) before this one's top-k fills.
                             let threshold = topk.threshold(global);
-                            let can_skip = count_budget.is_some_and(|cap| total_hits >= cap)
-                                && threshold > f64::NEG_INFINITY;
+                            // The budget is spent once this segment, or all
+                            // segments together, have counted `cap` members.
+                            let can_skip = count_budget.is_some_and(|cap| {
+                                total_hits >= cap
+                                    || global.is_some_and(|g| {
+                                        g.counted.load(Ordering::Relaxed)
+                                            + (total_hits - published_hits)
+                                            >= cap
+                                    })
+                            }) && threshold > f64::NEG_INFINITY;
                             let pivot_pos = if can_skip && !ranking_settled {
                                 let floor = threshold;
                                 let mut acc = 0.0;
@@ -7013,6 +7027,13 @@ impl Searcher {
                                 continue 'or_join;
                             }
                             total_hits += 1;
+                            if total_hits - published_hits >= SHARED_COUNT_BATCH {
+                                if let Some(g) = global {
+                                    g.counted
+                                        .fetch_add(total_hits - published_hits, Ordering::Relaxed);
+                                }
+                                published_hits = total_hits;
+                            }
                             if let Some(meta) = reader.doc_meta(pivot_doc) {
                                 // Query-term order (0..cursors.len()), not
                                 // doc-sorted `order` — matches the general
@@ -9274,6 +9295,29 @@ impl Searcher {
         doc_store_hydrator: DocStoreHydrator<'_>,
         phase_stats: &mut SearchPhaseStats,
     ) -> Result<Vec<ScoredDocument>, KoshaError> {
+        // An ids-only page (`source_includes: []`, no highlight) returns no
+        // stored field, so the doc store is never read: every hit's id and
+        // score are already known from scoring. Without this a cold ids-only
+        // search still fetched each page document's record — a ranged S3 GET
+        // per segment on first touch — only to drop every field (DEC-3203).
+        // A reranked request's first stage puts the rerank field into
+        // `source_includes`, so it never takes this path.
+        if query.highlight.is_none() && query.source_includes.as_ref().is_some_and(|f| f.is_empty())
+        {
+            return Ok(candidates
+                .iter()
+                .map(|cand| ScoredDocument {
+                    doc_id: cand.doc_id.clone(),
+                    score: cand.score,
+                    fields: Vec::new(),
+                    highlights: None,
+                    highlight: None,
+                    rank_details: cand.rank_details.clone(),
+                    fused_score: None,
+                    rerank_score: None,
+                })
+                .collect());
+        }
         let query_terms = query
             .highlight
             .as_ref()
@@ -9861,13 +9905,26 @@ struct GlobalWandFloor {
     /// no longer a proven lower bound; `search_inner` reruns the scoring
     /// pass without the shared floor.
     poisoned: std::sync::atomic::AtomicBool,
+    /// Union members the OR joins of every segment have counted so far,
+    /// published in batches (DEC-3203). The total-hits cap is a
+    /// namespace-wide budget: once the segments together have counted
+    /// `cap` hits, the reported total is `(cap, gte)` whatever else they
+    /// count, so every segment may start WAND pivoting. A segment's own
+    /// count alone used to gate that, so each of N segments walked up to
+    /// `cap` members first. Always a lower bound on the true union count.
+    counted: std::sync::atomic::AtomicUsize,
 }
+
+/// How many union members an OR join counts locally before adding them to
+/// `GlobalWandFloor::counted`.
+const SHARED_COUNT_BATCH: usize = 256;
 
 impl GlobalWandFloor {
     fn new() -> Self {
         Self {
             bits: AtomicU64::new(f64::NEG_INFINITY.to_bits()),
             poisoned: std::sync::atomic::AtomicBool::new(false),
+            counted: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -17381,6 +17438,80 @@ mod tests {
     }
 
     #[test]
+    fn ids_only_page_never_reads_the_doc_store() {
+        // DEC-3203: `source_includes: []` returns ids and scores only, so a
+        // page must materialize without the doc store — a cold ids-only
+        // search used to make a ranged S3 GET per page segment just to drop
+        // every field. A highlight still reads the field it marks up.
+        let dir = std::env::temp_dir().join("kosha-test-ids-only-page");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir.clone());
+        w.add_document(
+            DocumentId("d1".into()),
+            vec![Field::text("t", "hello world")],
+        );
+        w.add_document(
+            DocumentId("d2".into()),
+            vec![Field::text("t", "hello there")],
+        );
+        w.finalize(Bm25Params::default()).unwrap();
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 2,
+            }],
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            branch: None,
+            schema: None,
+            retired: Default::default(),
+            shards: None,
+        };
+        let searcher = Searcher::new(dir.clone());
+        let mut full = mk_query("hello", 10);
+        let expected = searcher.search(&ns, &manifest, &full, None).unwrap();
+
+        std::fs::remove_file(seg_dir.join("doc_store.bin")).unwrap();
+        let searcher = Searcher::new(dir.clone());
+        full.source_includes = Some(Vec::new());
+        let ids_only = searcher
+            .search(&ns, &manifest, &full, None)
+            .expect("an ids-only page must not need doc_store.bin");
+        let got: Vec<_> = ids_only
+            .results
+            .iter()
+            .map(|d| (d.doc_id.0.clone(), d.score.to_bits()))
+            .collect();
+        let want: Vec<_> = expected
+            .results
+            .iter()
+            .map(|d| (d.doc_id.0.clone(), d.score.to_bits()))
+            .collect();
+        assert_eq!(got, want, "same ids, same order, same score bits");
+        assert!(ids_only.results.iter().all(|d| d.fields.is_empty()));
+        assert_eq!(ids_only.total_hits, expected.total_hits);
+
+        full.highlight = Some(kosha_core::HighlightConfig {
+            fields: Vec::new(),
+            pre_tags: None,
+            post_tags: None,
+            legacy_single_field: true,
+        });
+        assert!(
+            searcher.search(&ns, &manifest, &full, None).is_err(),
+            "a highlighted page still reads the field it marks up"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn search_with_doc_store_hydrator_fetches_only_page_segments_on_demand() {
         // Scoring-set-only hydration contract (Option A): a cold search has
         // only the offsets sidecar locally, so the hydrator is asked to
@@ -21816,6 +21947,20 @@ mod corpus_stats_tests {
                                     .split_off(from.min(exhaustive.results.len()));
                                 let mut on_page = on.clone();
                                 if capped {
+                                    // The namespace-wide count (DEC-3203)
+                                    // only ends counting once the segments
+                                    // together reached the cap, so the
+                                    // reported total is still a lower bound
+                                    // and is exactly the cap past it.
+                                    assert!(on.total_hits <= exhaustive.total_hits, "{label}");
+                                    if exhaustive.total_hits > 40 {
+                                        assert_eq!(on.total_hits, 40, "{label}");
+                                        assert_eq!(
+                                            on.total_hits_relation,
+                                            TotalHitsRelation::Gte,
+                                            "{label}"
+                                        );
+                                    }
                                     on_page.total_hits = exhaustive.total_hits;
                                 }
                                 assert_same_scores(
