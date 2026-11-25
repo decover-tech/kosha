@@ -702,6 +702,35 @@ Compaction reorders only when `KOSHA_DOC_REORDER_COMPACTION_MAX_DOCS` is
 also set (default 0: never), because it buffers the merged output in
 memory; the bench runs with compaction off.
 
+## Engine internals in every result
+
+p50/p90/p99 say how fast a phase was, not why. Each phase summary
+(`<phase>.json`) also carries an `internals` block, built by
+`bench_internals.py` from data the run already collects, and the
+benchmark workflow prints it under the latency table
+(`internals_report.py <results-dir>`):
+
+- **Where the time goes:** the server's per-request stage timings
+  (`--server-timings`, needs `KOSHA_DASHBOARD=on`): queue, admit, hydrate,
+  bm25_stats, score and materialize, each with p50/p90/p99/mean and its
+  share of mean server time, plus time no stage covers (`other_ms`) and
+  time outside the engine (client latency minus server total).
+- **Tail vs median:** mean stage times for the slowest 1% of requests next
+  to the p45-p55 band, so a p99 reads as "more hydrate" or "more score".
+- **Work counters:** `/v1/stats` deltas across the phase
+  (`--stats-api-key`): scoring blocks decoded and posting / doc-store reads,
+  per request and per returned hit. Process-wide, so only per-query when
+  nothing else queries the server during the phase.
+- **I/O and cache:** S3 rounds and MB per request, fully-cached and
+  result-cache rates.
+- **Resources:** CPU cores and RSS of the `kosha-server` process, and host
+  CPU, sampled once a second from `/proc` (`--server-process`,
+  `--server-pid`; a no-op off Linux).
+
+All of it is reporting only: anything missing is left out, never failing a
+run. `--no-internals` drops the block. For per-request detail use
+`--raw-out` and `analyze_tail.py` (below).
+
 ## Logs and tail analysis
 
 Every CI benchmark run (`.github/workflows/benchmark.yml`) archives its
