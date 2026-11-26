@@ -12912,6 +12912,14 @@ fn log_search_timing(
     if phases.knn_mode.is_some() && kosha_segment::knn_bound_stop_alpha().is_some() {
         knn_rescore.push_str(&format!(" knn_bound_skips={}", phases.knn_bound_skips));
     }
+    // Codes-scan depth (perf branch only): RaBitQ postings budgeted and
+    // their code bytes.
+    if let Some(budget) = phases.knn_rabitq_budget {
+        knn_rescore.push_str(&format!(
+            " knn_rabitq_budget={budget} knn_codes_mb={:.1}",
+            phases.knn_codes_bytes as f64 / (1024.0 * 1024.0)
+        ));
+    }
     if phases.knn_segments_pruned > 0 {
         knn_rescore.push_str(&format!(
             " knn_segments_pruned={}",

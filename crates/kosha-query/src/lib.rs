@@ -3085,10 +3085,7 @@ fn knn_rabitq_preflight(
     rankings: &[Option<kosha_segment::KnnSegmentRanking>],
     max_bytes: u64,
     namespace: &NamespaceId,
-) -> Result<(), KoshaError> {
-    if max_bytes == u64::MAX {
-        return Ok(());
-    }
+) -> Result<u64, KoshaError> {
     let codes: u64 = sources
         .iter()
         .zip(rankings)
@@ -3104,7 +3101,7 @@ fn knn_rabitq_preflight(
         .sum();
     let needed = codes.saturating_add(depth.index_bytes);
     if needed <= max_bytes {
-        return Ok(());
+        return Ok(codes);
     }
     let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
     let message = format!(
@@ -3501,6 +3498,9 @@ struct KnnPlan {
     /// when they have no ranking: unscorable RaBitQ segments under the
     /// codes-scan depth, which take the RaBitQ cut.
     fallback_cutoffs: HashMap<kosha_core::SegmentId, (f32, usize)>,
+    /// `(RaBitQ postings budgeted, their code bytes)` under the codes-scan
+    /// depth; perf branch only (see `SearchPhaseStats::knn_rabitq_budget`).
+    rabitq: Option<(usize, u64)>,
 }
 
 /// One probed segment as kNN planning sees it: the scores of its
@@ -4215,6 +4215,11 @@ pub struct SearchPhaseStats {
     /// is every centroid of the segments the budget is shared between.
     /// Zero for non-kNN queries and on the per-segment fallback.
     pub knn_plan_exact_centroids: usize,
+    /// Perf branch only: RaBitQ postings the codes-scan depth budgeted
+    /// (`KOSHA_KNN_RABITQ_BUDGET_FRACTION`); `None` when it did not apply.
+    pub knn_rabitq_budget: Option<usize>,
+    /// Perf branch only: `vector.idx` bytes of those postings.
+    pub knn_codes_bytes: u64,
     /// Segment directories holding at least one document of the returned
     /// page, deduplicated, in page order: the segments whose doc store this
     /// search read. The server's access tracker (#213) counts these as
@@ -5752,6 +5757,7 @@ impl Searcher {
             cutoff_rule: None,
             exact_centroids: 0,
             fallback_cutoffs: HashMap::new(),
+            rabitq: None,
         };
 
         if !budgeted {
@@ -5936,7 +5942,9 @@ impl Searcher {
             return Ok(plan);
         }
         if let Some(depth) = &rabitq {
-            knn_rabitq_preflight(depth, &sources, &ranked.rankings, max_bytes, namespace)?;
+            let codes =
+                knn_rabitq_preflight(depth, &sources, &ranked.rankings, max_bytes, namespace)?;
+            plan.rabitq = Some((depth.budget(selectivity, max_bytes).0, codes));
         }
         plan.cutoff = cutoffs[0].or(cutoffs[1]);
         // An unranked RaBitQ segment plans by the RaBitQ cut, not f32's.
@@ -9201,6 +9209,10 @@ impl Searcher {
         phase_stats.knn_filtered_candidates = knn_plan.filtered_candidates;
         phase_stats.knn_cutoff_rule = knn_plan.cutoff_rule;
         phase_stats.knn_plan_exact_centroids = knn_plan.exact_centroids;
+        if let Some((budget, codes)) = knn_plan.rabitq {
+            phase_stats.knn_rabitq_budget = Some(budget);
+            phase_stats.knn_codes_bytes = codes;
+        }
 
         // ── global bound-driven rescoring (#381) ───────────────────────
         // Off by default. Unfiltered single-vector kNN only: a filtered
@@ -30920,6 +30932,8 @@ mod knn_rabitq_depth_tests {
             )
             .unwrap();
         assert_eq!(stats.knn_postings_probed, total);
+        assert_eq!(stats.knn_rabitq_budget, Some(total));
+        assert!(stats.knn_codes_bytes > 0);
         // Half the postings: half, rounded up.
         let half = searcher(&dir, Some(0.5));
         let (_, stats) = half
