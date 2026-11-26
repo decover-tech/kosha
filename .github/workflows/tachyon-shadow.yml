@@ -1,8 +1,9 @@
 name: tachyon shadow
 
-# Benchmark only: cargo test on the same commit on Tachyon (prebuilt
-# target/), Tachyon cold (base image only), Blacksmith and GitHub-hosted.
-# Not a required check; runs only on this branch.
+# Benchmark only: cargo test compile and run on the same commit, cold (no
+# cache) and warm, on Tachyon (warm = prebuilt target/), Blacksmith and
+# GitHub-hosted (warm = rust-cache). Not a required check; runs only on
+# this branch.
 on:
   push:
     branches: [devin/tachyon-shadow]
@@ -12,7 +13,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
+  tachyon-warm:
     runs-on: tachyon-ubuntu-24.04-4x
     env:
       AGENT_TOOLSDIRECTORY: /opt/hostedtoolcache
@@ -44,22 +45,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: stable
-      - name: cargo test
+      - name: compile
+        run: cargo test --all-features --locked --no-run
+      - name: test
         run: cargo test --all-features --locked
 
-  test-cold:
-    # Same VM, base image only: no prebuild snapshot.
+  tachyon-cold:
     runs-on: [tachyon-ubuntu-24.04-4x, tachyon-clean]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: stable
-      - name: cargo test
+      - name: compile
+        run: cargo test --all-features --locked --no-run
+      - name: test
         run: cargo test --all-features --locked
 
-  test-blacksmith:
-    # As in ci.yml (rust-cache included).
+  blacksmith-warm:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
@@ -67,10 +70,26 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test
+        with:
+          shared-key: shadow-blacksmith
+      - name: compile
+        run: cargo test --all-features --locked --no-run
+      - name: test
         run: cargo test --all-features --locked
 
-  test-github:
+  blacksmith-cold:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - name: compile
+        run: cargo test --all-features --locked --no-run
+      - name: test
+        run: cargo test --all-features --locked
+
+  github-warm:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -78,5 +97,21 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test
+        with:
+          shared-key: shadow-github
+      - name: compile
+        run: cargo test --all-features --locked --no-run
+      - name: test
+        run: cargo test --all-features --locked
+
+  github-cold:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - name: compile
+        run: cargo test --all-features --locked --no-run
+      - name: test
         run: cargo test --all-features --locked
