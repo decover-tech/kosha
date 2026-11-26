@@ -2316,8 +2316,10 @@ fn score_fuzzy_query(
     let and = operator == kosha_core::QueryOperator::And;
 
     let mut best = DocScores::default();
+    let mut block: Vec<ScoringPosting> = Vec::with_capacity(SCORING_BLOCK_LEN);
     for reading in &readings {
-        let mut matched: Option<DocScores> = None;
+        // A token is a slot; its expansions combine by their best tier.
+        let mut union = SlotUnion::new(reader.doc_count() as usize, and, SlotCombine::Max);
         for token in &reading.fuzzy {
             let expansions = kosha_core::fuzzy::expand(
                 &dict,
@@ -2332,7 +2334,8 @@ fn score_fuzzy_query(
                 .iter()
                 .map(|e| (e.key.as_str(), e.edits))
                 .collect();
-            let postings = reader.read_postings_for_terms(&keys)?;
+            // `(doc_seq, tf)` only: positions are never read here.
+            let postings = reader.read_scoring_postings_for_terms(&keys)?;
             if !reader.is_tiered() && reader.take_blob_read_failure() {
                 return Err(KoshaError::CorruptSegment(format!(
                     "segment {segment}: posting blob unreadable for a fuzzy expansion \
@@ -2340,51 +2343,35 @@ fn score_fuzzy_query(
                 )));
             }
             // Best tier per document over the token's expansions.
-            let mut group = DocScores::default();
+            union.begin_slot(postings.len());
             for (key, list) in &postings {
                 let edits = edits_of.get(key).copied().unwrap_or(MAX_FUZZY_EDITS);
                 let tier = f64::from(MAX_FUZZY_EDITS.saturating_sub(edits));
-                for posting in list.iter() {
-                    if rejected(posting.doc_id) {
-                        continue;
+                for_each_scoring_posting(list, &mut block, segment, |doc_seq, tf| {
+                    if !union.wanted(doc_seq) || rejected(doc_seq) {
+                        return;
                     }
-                    let Some(meta) = reader.doc_meta(posting.doc_id) else {
-                        continue;
+                    let Some(meta) = reader.doc_meta(doc_seq) else {
+                        return;
                     };
                     let length = match lengths {
-                        Some(ref lengths) => {
-                            lengths.get(posting.doc_id as usize).copied().unwrap_or(0)
-                        }
+                        Some(ref lengths) => lengths.get(doc_seq as usize).copied().unwrap_or(0),
                         None => meta.field_length,
                     };
-                    let score = tier + scorer.tf_norm(posting.term_frequency, length);
-                    let slot = group.entry(posting.doc_id).or_insert(score);
-                    if score > *slot {
-                        *slot = score;
-                    }
-                }
+                    union.add(doc_seq, tier + scorer.tf_norm(tf, length));
+                })?;
             }
-            matched = Some(match matched.take() {
-                None => group,
-                Some(mut acc) if and => {
-                    acc.retain(|doc, _| group.contains_key(doc));
-                    for (doc, score) in acc.iter_mut() {
-                        *score += group[doc];
-                    }
-                    acc
-                }
-                Some(mut acc) => {
-                    for (doc, score) in group {
-                        *acc.entry(doc).or_insert(0.0) += score;
-                    }
-                    acc
-                }
-            });
-            if and && matched.as_ref().is_some_and(DocScores::is_empty) {
+            if !union.end_slot() {
                 break;
             }
         }
-        for (doc, score) in matched.unwrap_or_default() {
+        let matched = union.into_scores();
+        if best.is_empty() {
+            // The first reading with a match: `best` is exactly its map.
+            best = matched;
+            continue;
+        }
+        for (doc, score) in matched {
             let slot = best.entry(doc).or_insert(score);
             if score > *slot {
                 *slot = score;
@@ -2477,30 +2464,24 @@ fn score_field_query(
         slots.values().flatten().map(|(_, key)| key.as_str()),
         span_fetch,
     );
-    let mut matched: Option<DocScores> = None;
+    // `(doc_seq, tf)` only: this scorer never reads positions (a phrase
+    // restricted to fields is matched on the general path).
+    let mut union = SlotUnion::new(
+        reader.doc_count() as usize,
+        operator != kosha_core::QueryOperator::Or,
+        SlotCombine::Sum,
+    );
+    let mut block: Vec<ScoringPosting> = Vec::with_capacity(SCORING_BLOCK_LEN);
     for keys in slots.values() {
-        let mut slot_scores = DocScores::default();
+        // One read per key, as before: each list is scored with its key's
+        // field.
+        let mut lists = Vec::with_capacity(keys.len());
         for (i, key) in keys {
-            let Some(postings) = reader.read_postings(key)? else {
-                continue;
-            };
-            let field = &scoring[*i];
-            let scorer = field.scorer.as_ref().unwrap_or(combined);
-            let segment_df = u32::try_from(postings.len()).unwrap_or(u32::MAX);
-            let df = scorer.doc_frequency(key, segment_df);
-            for posting in postings.iter() {
-                if rejected(posting.doc_id) {
-                    continue;
-                }
-                let length = match field.lengths {
-                    Some(ref lengths) => lengths.get(posting.doc_id as usize).copied().unwrap_or(0),
-                    None => match reader.doc_meta(posting.doc_id) {
-                        Some(meta) => meta.field_length,
-                        None => continue,
-                    },
-                };
-                *slot_scores.entry(posting.doc_id).or_insert(0.0) +=
-                    field.boost * scorer.score_term(posting.term_frequency, df, length);
+            if let Some((_, postings)) = reader
+                .read_scoring_postings_for_terms(std::slice::from_ref(key))?
+                .pop()
+            {
+                lists.push((&scoring[*i], key.as_str(), postings));
             }
         }
         if !reader.is_tiered() && reader.take_blob_read_failure() {
@@ -2509,32 +2490,30 @@ fn score_field_query(
                  (evicted or corrupt) — retry after rehydration"
             )));
         }
-        matched = Some(match matched {
-            None => slot_scores,
-            Some(mut so_far) => {
-                if operator == kosha_core::QueryOperator::Or {
-                    for (doc_seq, score) in slot_scores {
-                        *so_far.entry(doc_seq).or_insert(0.0) += score;
-                    }
-                } else {
-                    so_far.retain(|doc_seq, score| match slot_scores.get(doc_seq) {
-                        Some(add) => {
-                            *score += add;
-                            true
-                        }
-                        None => false,
-                    });
+        union.begin_slot(lists.len());
+        for (field, key, postings) in &lists {
+            let scorer = field.scorer.as_ref().unwrap_or(combined);
+            let segment_df = u32::try_from(postings.doc_count()).unwrap_or(u32::MAX);
+            let df = scorer.doc_frequency(key, segment_df);
+            for_each_scoring_posting(postings, &mut block, segment, |doc_seq, tf| {
+                if !union.wanted(doc_seq) || rejected(doc_seq) {
+                    return;
                 }
-                so_far
-            }
-        });
-        if operator != kosha_core::QueryOperator::Or
-            && matched.as_ref().is_some_and(|m| m.is_empty())
-        {
+                let length = match field.lengths {
+                    Some(ref lengths) => lengths.get(doc_seq as usize).copied().unwrap_or(0),
+                    None => match reader.doc_meta(doc_seq) {
+                        Some(meta) => meta.field_length,
+                        None => return,
+                    },
+                };
+                union.add(doc_seq, field.boost * scorer.score_term(tf, df, length));
+            })?;
+        }
+        if !union.end_slot() {
             break;
         }
     }
-    Ok(matched.unwrap_or_default())
+    Ok(union.into_scores())
 }
 
 // ─── Filter applier ─────────────────────────────────────────────────────────
@@ -6481,11 +6460,9 @@ impl Searcher {
                 &rejected,
                 vector_fetch,
             )?;
-            for (doc_seq, score) in scored {
-                if reader.doc_meta(doc_seq).is_some() {
-                    seg_hits.insert(doc_seq, score);
-                }
-            }
+            // Taken whole, not re-hashed into another map (same below).
+            seg_hits = scored;
+            seg_hits.retain(|&doc_seq, _| reader.doc_meta(doc_seq).is_some());
         } else if let Some(fields) = field_query {
             let scored = score_field_query(
                 &reader,
@@ -6499,11 +6476,8 @@ impl Searcher {
                 &rejected,
                 vector_fetch,
             )?;
-            for (doc_seq, score) in scored {
-                if reader.doc_meta(doc_seq).is_some() {
-                    seg_hits.insert(doc_seq, score);
-                }
-            }
+            seg_hits = scored;
+            seg_hits.retain(|&doc_seq, _| reader.doc_meta(doc_seq).is_some());
         } else if multi_reading
             || ((!effective_terms.is_empty() || phrase_tokenized.is_some())
                 && !missing_required_term)
@@ -7533,19 +7507,23 @@ impl Searcher {
                             entry.segment_id.0
                         )));
                     }
-                    let phrase_postings: Vec<HashMap<u32, &[u32]>> = phrase_postings_data
-                        .iter()
-                        .map(|data| {
-                            data.as_ref()
-                                .map(|postings| {
-                                    postings
-                                        .iter()
-                                        .map(|p| (p.doc_id, p.positions.as_slice()))
-                                        .collect()
-                                })
-                                .unwrap_or_default()
-                        })
-                        .collect();
+                    // Keyed by segment-local doc_seq and only looked up:
+                    // FxHash, as `DocScores` (one insert per phrase-term
+                    // posting).
+                    let phrase_postings: Vec<HashMap<u32, &[u32], rustc_hash::FxBuildHasher>> =
+                        phrase_postings_data
+                            .iter()
+                            .map(|data| {
+                                data.as_ref()
+                                    .map(|postings| {
+                                        postings
+                                            .iter()
+                                            .map(|p| (p.doc_id, p.positions.as_slice()))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default()
+                            })
+                            .collect();
 
                     let doc_ids: Vec<u32> = scored.keys().copied().collect();
                     for doc_id in doc_ids {
@@ -7654,9 +7632,9 @@ impl Searcher {
                 score_reading(terms_for_bm25, phrase_match.as_ref(), &scorer, None)?
             };
 
-            // `accept` already ran on every candidate above, and only the
-            // fuzzy and field arms fill `seg_hits` before this one: take the
-            // map whole instead of re-hashing every hit into another.
+            // `accept` already ran on every candidate above, and no other
+            // arm has filled `seg_hits`: take the map whole instead of
+            // re-hashing every hit into another.
             debug_assert!(seg_hits.is_empty());
             seg_hits = scored;
             seg_hits.retain(|&doc_seq, _| reader.doc_meta(doc_seq).is_some());
@@ -9592,8 +9570,315 @@ impl<'a> ScoringBlocks<'a> {
 type DocScores = HashMap<u32, f64, rustc_hash::FxBuildHasher>;
 
 /// The dense accumulator is used when the terms' postings add up to at least
-/// `doc_count / OR_DENSE_MIN_FILL` (see [`or_union_scores`]).
+/// `doc_count / OR_DENSE_MIN_FILL` (see [`or_union_scores`]), or, when that
+/// is not known up front, once that many documents have been accumulated
+/// (see [`ScoreAcc`]).
 const OR_DENSE_MIN_FILL: usize = 8;
+
+/// A segment's `doc_seq → f64` accumulator for the scoring paths: a dense
+/// `Vec<f64>` indexed by `doc_seq` plus a 1-bit "present" set when the
+/// members cover at least 1/[`OR_DENSE_MIN_FILL`] of the segment, otherwise
+/// a [`DocScores`] map. 8.125 bytes per segment document against ≥19 bytes
+/// per map entry, so the dense form costs at most ~65 bytes per member.
+///
+/// [`ScoreAcc::add`] is exactly `*map.entry(doc).or_insert(0.0) += s` and
+/// [`ScoreAcc::max`] exactly `or_insert(s)` then keep the larger, the two
+/// map loops this replaces; the arithmetic per document is unchanged, so
+/// sums are bit-identical for the same order of calls.
+struct ScoreAcc {
+    doc_count: usize,
+    /// Map mode switches to dense when the map reaches this many members.
+    dense_at: usize,
+    dense: bool,
+    sums: Vec<f64>,
+    present: Vec<u64>,
+    /// Dense members (set bits in `present`).
+    members: usize,
+    /// Map mode: every member. Dense mode: members past `doc_count`, which
+    /// the writer never produces; kept so an inconsistent segment scores
+    /// exactly as it did with a map.
+    map: DocScores,
+}
+
+impl ScoreAcc {
+    /// `expected` postings will be accumulated, when known (0 otherwise:
+    /// the accumulator starts as a map and turns dense as it fills).
+    fn new(expected: usize, doc_count: usize) -> Self {
+        let mut acc = Self {
+            doc_count,
+            dense_at: doc_count.div_ceil(OR_DENSE_MIN_FILL),
+            dense: false,
+            sums: Vec::new(),
+            present: Vec::new(),
+            members: 0,
+            map: DocScores::default(),
+        };
+        if expected.saturating_mul(OR_DENSE_MIN_FILL) >= doc_count {
+            acc.make_dense();
+        }
+        acc
+    }
+
+    fn make_dense(&mut self) {
+        self.dense = true;
+        self.sums = vec![0.0; self.doc_count];
+        self.present = vec![0; self.doc_count.div_ceil(64)];
+        for (doc, value) in std::mem::take(&mut self.map) {
+            *self.entry(doc, value) = value;
+        }
+    }
+
+    /// The document's value, inserted as `init` when it is not a member.
+    fn entry(&mut self, doc: u32, init: f64) -> &mut f64 {
+        if self.dense {
+            if let Some(sum) = self.sums.get_mut(doc as usize) {
+                let (word, bit) = (doc as usize / 64, 1u64 << (doc % 64));
+                if self.present[word] & bit == 0 {
+                    self.present[word] |= bit;
+                    self.members += 1;
+                    *sum = init;
+                }
+                return sum;
+            }
+        } else if self.map.len() >= self.dense_at {
+            self.make_dense();
+            return self.entry(doc, init);
+        }
+        self.map.entry(doc).or_insert(init)
+    }
+
+    /// `*entry(doc).or_insert(0.0) += s`.
+    fn add(&mut self, doc: u32, s: f64) {
+        *self.entry(doc, 0.0) += s;
+    }
+
+    /// `or_insert(s)`, then keep the larger.
+    fn max(&mut self, doc: u32, s: f64) {
+        let slot = self.entry(doc, s);
+        if s > *slot {
+            *slot = s;
+        }
+    }
+
+    fn get(&self, doc: u32) -> Option<f64> {
+        match self.sums.get(doc as usize) {
+            Some(&sum) if self.dense => {
+                (self.present[doc as usize / 64] & (1u64 << (doc % 64)) != 0).then_some(sum)
+            }
+            _ => self.map.get(&doc).copied(),
+        }
+    }
+
+    fn contains(&self, doc: u32) -> bool {
+        self.get(doc).is_some()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.members == 0 && self.map.is_empty()
+    }
+
+    /// Every member, dense ones in ascending `doc_seq` first.
+    fn for_each(&self, mut f: impl FnMut(u32, f64)) {
+        for (word, &bits) in self.present.iter().enumerate() {
+            let mut bits = bits;
+            while bits != 0 {
+                let doc = word * 64 + bits.trailing_zeros() as usize;
+                f(doc as u32, self.sums[doc]);
+                bits &= bits - 1;
+            }
+        }
+        for (&doc, &value) in &self.map {
+            f(doc, value);
+        }
+    }
+
+    /// Keep the members `other` also has, adding its value to each:
+    /// `retain(|d, s| other.get(d).map(|v| *s += v).is_some())`.
+    fn retain_add(&mut self, other: &ScoreAcc) {
+        for (word, bits) in self.present.iter_mut().enumerate() {
+            let mut rest = *bits;
+            while rest != 0 {
+                let bit = rest.isolate_lowest_one();
+                let doc = word * 64 + bit.trailing_zeros() as usize;
+                match other.get(doc as u32) {
+                    Some(value) => self.sums[doc] += value,
+                    None => {
+                        *bits &= !bit;
+                        self.members -= 1;
+                    }
+                }
+                rest &= rest - 1;
+            }
+        }
+        self.map.retain(|&doc, sum| match other.get(doc) {
+            Some(value) => {
+                *sum += value;
+                true
+            }
+            None => false,
+        });
+    }
+
+    /// Empty, keeping the mode and the allocations (a dense value is
+    /// overwritten on its next first touch, so only the bits are cleared).
+    fn clear(&mut self) {
+        self.present.fill(0);
+        self.members = 0;
+        self.map.clear();
+    }
+
+    fn into_scores(self) -> DocScores {
+        if !self.dense {
+            return self.map;
+        }
+        let mut out = self.map;
+        out.reserve(self.members);
+        for (word, &bits) in self.present.iter().enumerate() {
+            let mut bits = bits;
+            while bits != 0 {
+                let doc = word * 64 + bits.trailing_zeros() as usize;
+                out.insert(doc as u32, self.sums[doc]);
+                bits &= bits - 1;
+            }
+        }
+        out
+    }
+}
+
+/// How one query position's ("slot's") keys combine for a document.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SlotCombine {
+    /// Fielded BM25: the fields' scores add up (`or_insert(0.0) += s`).
+    Sum,
+    /// Fuzzy: the best expansion (`or_insert(s)`, keep the larger).
+    Max,
+}
+
+/// The fielded and fuzzy scorers' slot loop: each slot's keys combine per
+/// document ([`SlotCombine`]); slots then add up in slot order, over the
+/// union of the slots (OR) or their intersection (AND). Bit for bit the
+/// map loop it replaces:
+///
+/// ```text
+/// matched = None
+/// for slot: s = {}; for key, posting: combine(s[doc], score)
+///           matched = s                                 (first slot)
+///                   | for (d, v) in s: or_insert(0.0) += v  (OR)
+///                   | retain d in s, += s[d]            (AND)
+/// ```
+///
+/// The first slot accumulates straight into the result. Under OR a slot
+/// with a single key adds each document's one value (`0.0 + s` for a sum,
+/// `s` for a max — what its slot map would hold) straight into the result
+/// too; a document occurs once per posting list. Otherwise a slot fills a
+/// scratch accumulator that is merged and cleared when it ends. Under AND
+/// a document that missed an earlier slot is skipped ([`Self::wanted`]):
+/// the intersection would drop it anyway.
+struct SlotUnion {
+    total: ScoreAcc,
+    scratch: ScoreAcc,
+    and: bool,
+    combine: SlotCombine,
+    slots_done: usize,
+    direct: bool,
+}
+
+impl SlotUnion {
+    fn new(doc_count: usize, and: bool, combine: SlotCombine) -> Self {
+        Self {
+            total: ScoreAcc::new(0, doc_count),
+            scratch: ScoreAcc::new(0, doc_count),
+            and,
+            combine,
+            slots_done: 0,
+            direct: false,
+        }
+    }
+
+    /// Start a slot whose keys have `lists` posting lists in this segment.
+    fn begin_slot(&mut self, lists: usize) {
+        self.direct = !self.and && self.slots_done > 0 && lists == 1;
+    }
+
+    /// Whether `doc` can still match: under AND, only a document every
+    /// earlier slot matched.
+    fn wanted(&self, doc: u32) -> bool {
+        !self.and || self.slots_done == 0 || self.total.contains(doc)
+    }
+
+    fn add(&mut self, doc: u32, s: f64) {
+        let acc = if self.slots_done == 0 {
+            &mut self.total
+        } else if self.direct {
+            // The slot map's value for a document seen once: `0.0 + s`
+            // summed, `s` maxed; merged as `or_insert(0.0) += v`.
+            let v = match self.combine {
+                SlotCombine::Sum => 0.0 + s,
+                SlotCombine::Max => s,
+            };
+            self.total.add(doc, v);
+            return;
+        } else {
+            &mut self.scratch
+        };
+        match self.combine {
+            SlotCombine::Sum => acc.add(doc, s),
+            SlotCombine::Max => acc.max(doc, s),
+        }
+    }
+
+    /// End the slot. `false` when an AND can no longer match anything.
+    fn end_slot(&mut self) -> bool {
+        if self.slots_done > 0 && !self.direct {
+            if self.and {
+                self.total.retain_add(&self.scratch);
+            } else {
+                let total = &mut self.total;
+                self.scratch.for_each(|doc, v| total.add(doc, v));
+            }
+            self.scratch.clear();
+        }
+        self.slots_done += 1;
+        !(self.and && self.total.is_empty())
+    }
+
+    fn into_scores(self) -> DocScores {
+        self.total.into_scores()
+    }
+}
+
+/// Every `(doc_seq, tf)` of one term's scoring postings, in posting order.
+/// A v5+ term is walked block by block from its scoring bytes (positions
+/// are never decoded); a corrupt block fails the read, like the full decode
+/// it replaces (which also ran every block).
+fn for_each_scoring_posting(
+    postings: &kosha_segment::ScoringPostingsRef<'_>,
+    block: &mut Vec<ScoringPosting>,
+    segment_id: &str,
+    mut f: impl FnMut(u32, u32),
+) -> Result<(), KoshaError> {
+    match postings {
+        kosha_segment::ScoringPostingsRef::Blocked(b) => {
+            for i in 0..b.block_count() {
+                if !b.read_block(i, block) {
+                    return Err(KoshaError::CorruptSegment(format!(
+                        "segment {segment_id}: posting block unreadable for a present \
+                         term (evicted or corrupt) — retry after rehydration"
+                    )));
+                }
+                for sp in block.iter() {
+                    f(sp.doc_id, sp.term_frequency);
+                }
+            }
+        }
+        kosha_segment::ScoringPostingsRef::Decoded(p) => {
+            for posting in p.iter() {
+                f(posting.doc_id, posting.term_frequency);
+            }
+        }
+    }
+    Ok(())
+}
 
 /// The general path's OR union: every document in any term's postings that
 /// `score` accepts, with its BM25 summed over the terms in `sources` order —
@@ -9602,15 +9887,9 @@ const OR_DENSE_MIN_FILL: usize = 8;
 /// sum is bit-identical. Posting order within a term does not matter: a
 /// document appears once per term.
 ///
-/// Reads `(doc_seq, tf)` only. A v5+ term is walked block by block from its
-/// scoring bytes and its positions are never decoded; a corrupt block fails
-/// the read, like the full decode it replaces (which also ran every block).
-///
-/// Accumulates into a dense `Vec<f64>` indexed by `doc_seq` (plus a 1-bit
-/// "touched" set) when the postings cover at least 1/[`OR_DENSE_MIN_FILL`]
-/// of the segment, otherwise into a [`DocScores`] map: 8.125 bytes per
-/// segment document against ≥19 bytes per map entry, so the dense form
-/// is used only where it costs at most ~65 bytes per posting scored.
+/// Reads `(doc_seq, tf)` only ([`for_each_scoring_posting`]), and sums
+/// into a [`ScoreAcc`], dense when the postings cover at least
+/// 1/[`OR_DENSE_MIN_FILL`] of the segment.
 fn or_union_scores(
     sources: &[(&str, kosha_segment::ScoringPostingsRef<'_>)],
     dfs: &[u32],
@@ -9618,95 +9897,17 @@ fn or_union_scores(
     segment_id: &str,
     mut score: impl FnMut(u32, u32, u32) -> Option<f64>,
 ) -> Result<DocScores, KoshaError> {
-    enum Acc {
-        Dense {
-            sums: Vec<f64>,
-            touched: Vec<u64>,
-            members: usize,
-            // A posting past `doc_count` (impossible from the writer; kept
-            // so an inconsistent segment scores exactly as it did before).
-            beyond: DocScores,
-        },
-        Sparse(DocScores),
-    }
     let postings: usize = sources.iter().map(|(_, p)| p.doc_count()).sum();
-    let mut acc = if postings.saturating_mul(OR_DENSE_MIN_FILL) >= doc_count {
-        Acc::Dense {
-            sums: vec![0.0; doc_count],
-            touched: vec![0; doc_count.div_ceil(64)],
-            members: 0,
-            beyond: DocScores::default(),
-        }
-    } else {
-        Acc::Sparse(DocScores::default())
-    };
-    let mut add = |doc: u32, tf: u32, df: u32| {
-        let Some(s) = score(doc, tf, df) else {
-            return;
-        };
-        match &mut acc {
-            Acc::Dense {
-                sums,
-                touched,
-                members,
-                beyond,
-            } => match sums.get_mut(doc as usize) {
-                Some(sum) => {
-                    let (word, bit) = (doc as usize / 64, 1u64 << (doc % 64));
-                    if touched[word] & bit == 0 {
-                        touched[word] |= bit;
-                        *members += 1;
-                    }
-                    *sum += s;
-                }
-                None => *beyond.entry(doc).or_insert(0.0) += s,
-            },
-            Acc::Sparse(map) => *map.entry(doc).or_insert(0.0) += s,
-        }
-    };
+    let mut acc = ScoreAcc::new(postings, doc_count);
     let mut block: Vec<ScoringPosting> = Vec::with_capacity(SCORING_BLOCK_LEN);
     for ((_, postings), &df) in sources.iter().zip(dfs) {
-        match postings {
-            kosha_segment::ScoringPostingsRef::Blocked(b) => {
-                for i in 0..b.block_count() {
-                    if !b.read_block(i, &mut block) {
-                        return Err(KoshaError::CorruptSegment(format!(
-                            "segment {segment_id}: posting block unreadable for a present \
-                             term (evicted or corrupt) — retry after rehydration"
-                        )));
-                    }
-                    for sp in &block {
-                        add(sp.doc_id, sp.term_frequency, df);
-                    }
-                }
+        for_each_scoring_posting(postings, &mut block, segment_id, |doc, tf| {
+            if let Some(s) = score(doc, tf, df) {
+                acc.add(doc, s);
             }
-            kosha_segment::ScoringPostingsRef::Decoded(p) => {
-                for posting in p.iter() {
-                    add(posting.doc_id, posting.term_frequency, df);
-                }
-            }
-        }
+        })?;
     }
-    Ok(match acc {
-        Acc::Sparse(map) => map,
-        Acc::Dense {
-            sums,
-            touched,
-            members,
-            mut beyond,
-        } => {
-            beyond.reserve(members);
-            for (word, &bits) in touched.iter().enumerate() {
-                let mut bits = bits;
-                while bits != 0 {
-                    let doc = word * 64 + bits.trailing_zeros() as usize;
-                    beyond.insert(doc as u32, sums[doc]);
-                    bits &= bits - 1;
-                }
-            }
-            beyond
-        }
-    })
+    Ok(acc.into_scores())
 }
 
 /// One pass over a decoded (≤[`SCORING_BLOCK_LEN`]) block of scoring
@@ -21935,6 +22136,271 @@ mod corpus_stats_tests {
         assert!(
             general > 100,
             "too few queries scored on the general path: {general}"
+        );
+    }
+
+    /// `SlotUnion` against the map loops it replaced in `score_field_query`
+    /// (sum per slot) and `score_fuzzy_query` (best per slot), over random
+    /// slots of random posting lists: same documents, every value equal to
+    /// the bit, OR and AND, map and dense accumulators, single-list slots
+    /// (added straight into the result) and multi-list slots (scratch).
+    /// Scores span many magnitudes, so a different summation order or
+    /// grouping changes bits (checked below): the bit check is not vacuous.
+    #[test]
+    fn slot_union_matches_the_map_loops_to_the_bit() {
+        let (mut order_matters, mut grouping_matters) = (false, false);
+        let mut seen = HashSet::new();
+        for seed in 1..=400u64 {
+            let mut rng = Rng(0x2545_F491_4F6C_DD1D ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let doc_count = 1 + rng.below(3000);
+            let and = rng.below(2) == 0;
+            let combine = [SlotCombine::Sum, SlotCombine::Max][rng.below(2)];
+            let density = [1, 2, 20, 200, 2000][rng.below(5)];
+            let rejected_every = 2 + rng.below(9) as u32;
+            let rejected = |doc: u32| doc.is_multiple_of(rejected_every);
+            // slot → posting lists → (doc, score), each list's docs unique.
+            let slots: Vec<Vec<Vec<(u32, f64)>>> = (0..1 + rng.below(8))
+                .map(|slot| {
+                    (0..rng.below(4))
+                        .map(|list| {
+                            let mut docs: Vec<u32> = (0..doc_count as u32)
+                                .filter(|_| rng.below(density) < 10)
+                                .collect();
+                            if rng.below(10) == 0 {
+                                docs.push(doc_count as u32 + rng.below(5) as u32);
+                            }
+                            docs.into_iter()
+                                .map(|doc| {
+                                    let x = f64::from(
+                                        doc.wrapping_mul(2_654_435_761)
+                                            ^ (slot as u32) << 3
+                                            ^ list as u32,
+                                    );
+                                    let s = (x / 3.7).sqrt()
+                                        * 10f64.powi(((doc + slot as u32) % 7) as i32 - 3);
+                                    (doc, s)
+                                })
+                                .collect()
+                        })
+                        .collect()
+                })
+                .collect();
+
+            // The loops `SlotUnion` replaced, verbatim in effect.
+            let reference = |slots: &[Vec<Vec<(u32, f64)>>]| -> HashMap<u32, f64> {
+                let mut matched: Option<HashMap<u32, f64>> = None;
+                for slot in slots {
+                    let mut group: HashMap<u32, f64> = HashMap::new();
+                    for list in slot {
+                        for &(doc, s) in list {
+                            if rejected(doc) {
+                                continue;
+                            }
+                            match combine {
+                                SlotCombine::Sum => *group.entry(doc).or_insert(0.0) += s,
+                                SlotCombine::Max => {
+                                    let slot = group.entry(doc).or_insert(s);
+                                    if s > *slot {
+                                        *slot = s;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    matched = Some(match matched {
+                        None => group,
+                        Some(mut so_far) if and => {
+                            so_far.retain(|doc, score| match group.get(doc) {
+                                Some(add) => {
+                                    *score += add;
+                                    true
+                                }
+                                None => false,
+                            });
+                            so_far
+                        }
+                        Some(mut so_far) => {
+                            for (doc, score) in group {
+                                *so_far.entry(doc).or_insert(0.0) += score;
+                            }
+                            so_far
+                        }
+                    });
+                    if and && matched.as_ref().is_some_and(HashMap::is_empty) {
+                        break;
+                    }
+                }
+                matched.unwrap_or_default()
+            };
+            let want = reference(&slots);
+
+            let mut union = SlotUnion::new(doc_count, and, combine);
+            for (i, slot) in slots.iter().enumerate() {
+                union.begin_slot(slot.len());
+                seen.insert(match (i, union.direct) {
+                    (0, _) => "first",
+                    (_, true) => "direct",
+                    (_, false) => "scratch",
+                });
+                for list in slot {
+                    for &(doc, s) in list {
+                        if union.wanted(doc) && !rejected(doc) {
+                            union.add(doc, s);
+                        }
+                    }
+                }
+                seen.insert(if union.scratch.dense {
+                    "dense scratch"
+                } else {
+                    "map scratch"
+                });
+                if !union.end_slot() {
+                    break;
+                }
+            }
+            seen.insert(if union.total.dense { "dense" } else { "map" });
+            let got = union.into_scores();
+
+            let label = format!("seed {seed} and={and} {combine:?}");
+            assert_eq!(got.len(), want.len(), "{label}: member count");
+            for (doc, w) in &want {
+                let g = got
+                    .get(doc)
+                    .unwrap_or_else(|| panic!("{label}: doc {doc} missing"));
+                assert_eq!(g.to_bits(), w.to_bits(), "{label}: doc {doc}: {g} vs {w}");
+            }
+
+            // Slot order and slot grouping both decide bits.
+            if !and && combine == SlotCombine::Sum {
+                let reversed: Vec<_> = slots.iter().rev().cloned().collect();
+                let flat = vec![slots.concat()];
+                let (rev, flat) = (reference(&reversed), reference(&flat));
+                for (doc, w) in &want {
+                    order_matters |= rev[doc].to_bits() != w.to_bits();
+                    grouping_matters |= flat[doc].to_bits() != w.to_bits();
+                }
+            }
+        }
+        for mode in [
+            "first",
+            "direct",
+            "scratch",
+            "dense",
+            "map",
+            "dense scratch",
+            "map scratch",
+        ] {
+            assert!(seen.contains(mode), "never exercised: {mode}");
+        }
+        assert!(order_matters, "no sum depended on the order of its slots");
+        assert!(grouping_matters, "no sum depended on its slots' grouping");
+    }
+
+    /// End to end on real (v5+) segments with per-field indexes: a fielded
+    /// query (`score_field_query`) with `fields: ["_all^2"]` reads the same
+    /// postings, lengths and `df` as the unfielded query and multiplies
+    /// each term's BM25 by 2, which is exact in binary floating point. Its
+    /// per-document sum in slot order must therefore be exactly twice the
+    /// unfielded sum in query-term order: same ids, same order, scores
+    /// equal to the bit after the ×2, same total. OR and AND, 1–12 terms,
+    /// deletes, with and without a filter, a 10-hit page and the whole set.
+    #[test]
+    fn fielded_query_is_bit_identical_to_the_unfielded_one() {
+        let ns = NamespaceId("ns".into());
+        let word = |rng: &mut Rng| {
+            let u = rng.below(1_000_000) as f64 / 1e6;
+            format!("w{:03}", (60f64.powf(u) as usize).saturating_sub(1))
+        };
+        let (mut compared, mut nonempty_and) = (0, 0);
+        for seed in 1..=5u64 {
+            let mut rng = Rng(0x94D0_49BB_1331_11EB ^ seed.wrapping_mul(0xBF58_476D_1CE4_E5B9));
+            let n = 300 + rng.below(1000);
+            let docs: Vec<Doc> = (0..n)
+                .map(|i| Doc {
+                    id: format!("doc-{i:05}"),
+                    content: (0..1 + rng.below(30))
+                        .map(|_| word(&mut rng))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    matter: format!("m{}", rng.below(4)),
+                })
+                .collect();
+            let deleted: HashSet<String> = docs
+                .iter()
+                .filter(|_| rng.below(15) == 0)
+                .map(|d| d.id.clone())
+                .collect();
+            let dir = scratch(&format!("fielded-{seed}"));
+            let groups = random_split(&mut rng, &docs, seed % 2 == 0);
+            let (manifest, locations) = write_segments(&dir, &ns.0, "s", &groups, 1);
+            for entry in &manifest.segments {
+                let footer =
+                    SegmentReader::read_footer(&dir.join(&ns.0).join(&entry.segment_id.0)).unwrap();
+                assert!(footer.field_index.is_some(), "the fielded path needs one");
+            }
+            let tombstones = tombstones_for(&deleted, &locations);
+            let searcher = Searcher::new(dir.clone());
+
+            for case in 0..30 {
+                let mut words: Vec<String> = Vec::new();
+                for _ in 0..1 + rng.below(12) {
+                    let w = word(&mut rng);
+                    if !words.contains(&w) {
+                        words.push(w);
+                    }
+                }
+                let text = words.join(" ");
+                for op in [
+                    kosha_core::QueryOperator::Or,
+                    kosha_core::QueryOperator::And,
+                ] {
+                    for filtered in [false, true] {
+                        for max in [10, n] {
+                            let label = format!(
+                                "seed {seed} case {case} '{text}' {op:?} filtered={filtered} k={max}"
+                            );
+                            let mut plain = query(&text, max);
+                            plain.operator = Some(op);
+                            if filtered {
+                                plain.filter = matter_filter("m1");
+                            }
+                            let mut fielded = plain.clone();
+                            fielded.fields = vec!["_all^2".into()];
+                            let a = searcher
+                                .search(&ns, &manifest, &fielded, Some(&tombstones))
+                                .unwrap();
+                            let b = searcher
+                                .search(&ns, &manifest, &plain, Some(&tombstones))
+                                .unwrap();
+                            assert_eq!(a.total_hits, b.total_hits, "{label}: total_hits");
+                            assert_eq!(a.results.len(), b.results.len(), "{label}: page");
+                            for (rank, (x, y)) in a.results.iter().zip(&b.results).enumerate() {
+                                assert_eq!(x.doc_id, y.doc_id, "{label}: id at rank {rank}");
+                                assert_eq!(
+                                    x.score.to_bits(),
+                                    (2.0 * y.score).to_bits(),
+                                    "{label}: {} scored {} vs 2 × {}",
+                                    x.doc_id.0,
+                                    x.score,
+                                    y.score
+                                );
+                            }
+                            compared += 1;
+                            nonempty_and += usize::from(
+                                op == kosha_core::QueryOperator::And
+                                    && words.len() > 1
+                                    && a.total_hits > 0,
+                            );
+                        }
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        assert_eq!(compared, 5 * 30 * 8);
+        assert!(
+            nonempty_and > 50,
+            "too few multi-term AND matches: {nonempty_and}"
         );
     }
 
