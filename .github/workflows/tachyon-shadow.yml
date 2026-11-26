@@ -1,0 +1,82 @@
+name: tachyon shadow
+
+# Benchmark only: cargo test on the same commit on Tachyon (prebuilt
+# target/), Tachyon cold (base image only), Blacksmith and GitHub-hosted.
+# Not a required check; runs only on this branch.
+on:
+  push:
+    branches: [devin/tachyon-shadow]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: tachyon-ubuntu-24.04-4x
+    env:
+      AGENT_TOOLSDIRECTORY: /opt/hostedtoolcache
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tachyon warm
+        # Same as decover-tech/tachyon/actions/warm (private, so inlined):
+        # moves prebuild workspace paths back after checkout.
+        shell: bash
+        run: |
+          set -euo pipefail
+          stash="${TACHYON_WARM_STASH:-/opt/tachyon/warm}"
+          result=miss
+          if [[ -n "${TACHYON_JOB_ID:-}" && "${TACHYON_PREBUILD_MATCH:-none}" == full && -n "${TACHYON_WARM_PATHS:-}" ]]; then
+            result=hit
+            IFS=: read -ra paths <<< "$TACHYON_WARM_PATHS"
+            for p in "${paths[@]}"; do
+              case "$p" in /*|*..*) result=miss; continue;; esac
+              if [[ -e "$stash/$p" ]]; then
+                mkdir -p "$(dirname "$GITHUB_WORKSPACE/$p")"
+                rm -rf "${GITHUB_WORKSPACE:?}/$p"
+                mv "$stash/$p" "$GITHUB_WORKSPACE/$p"
+              else
+                result=miss
+              fi
+            done
+          fi
+          echo "Tachyon warm: $result (prebuild match: ${TACHYON_PREBUILD_MATCH:-none})"
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - name: cargo test
+        run: cargo test --all-features --locked
+
+  test-cold:
+    # Same VM, base image only: no prebuild snapshot.
+    runs-on: [tachyon-ubuntu-24.04-4x, tachyon-clean]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - name: cargo test
+        run: cargo test --all-features --locked
+
+  test-blacksmith:
+    # As in ci.yml (rust-cache included).
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --all-features --locked
+
+  test-github:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --all-features --locked

@@ -1,0 +1,14 @@
+# Tachyon prebuild: Rust toolchain, cargo registry and a warm target/ from
+# `cargo test --no-run`, so shadow jobs compile only what changed.
+version: 1
+key_files: [Cargo.lock, rust-toolchain.toml]
+paths: [~/.rustup, ~/.cargo, target]
+warm:
+  - run: |
+      if ! command -v rustup >/dev/null; then
+        curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+      fi
+      export PATH="$HOME/.cargo/bin:$PATH"
+      rustup toolchain install stable --profile minimal
+      cargo test --all-features --locked --no-run
+memory_snapshot: false
