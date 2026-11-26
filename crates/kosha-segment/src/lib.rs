@@ -2662,70 +2662,107 @@ fn encode_vector_index_v2(
     version: u32,
 ) -> (Vec<u8>, Vec<u8>) {
     let total_count: u32 = postings.iter().map(|p| p.entries.len() as u32).sum();
-
-    let mut idx_buf = Vec::new();
-    idx_buf.extend_from_slice(&VECTOR_MAGIC.to_le_bytes());
-    idx_buf.extend_from_slice(&version.to_le_bytes());
-    idx_buf.extend_from_slice(&dim.to_le_bytes());
-    idx_buf.extend_from_slice(&total_count.to_le_bytes());
-
-    let mut offsets_buf = Vec::new();
-    offsets_buf.extend_from_slice(&VECTOR_OFFSETS_MAGIC.to_le_bytes());
-    offsets_buf.extend_from_slice(&version.to_le_bytes());
-    offsets_buf.extend_from_slice(&dim.to_le_bytes());
-    offsets_buf.extend_from_slice(&(postings.len() as u32).to_le_bytes());
-
-    let radius_aware = version >= RADIUS_AWARE_VECTOR_INDEX_VERSION;
-    let quantile_aware = has_radius_quantiles(version);
-    let quantized = is_i8_vector_index_version(version);
-    let rabitq = is_rabitq_vector_index_version(version)
-        .then(|| kosha_vector_spfresh::RaBitQRotation::new(dim as usize));
-    let mut codes: Vec<i8> = Vec::with_capacity(dim as usize);
-    let mut bits: Vec<u8> = Vec::new();
-    let mut distances = Vec::new();
+    let mut idx_buf = vector_file_header(VECTOR_MAGIC, version, dim, total_count);
+    let mut offsets_buf =
+        vector_file_header(VECTOR_OFFSETS_MAGIC, version, dim, postings.len() as u32);
+    let mut encoder = VectorPostingEncoder::new(dim, version);
     for p in postings {
-        let offset = idx_buf.len() as u64;
+        encoder.encode(p, 0, &mut idx_buf, &mut offsets_buf);
+    }
+    (idx_buf, offsets_buf)
+}
+
+/// `[magic][version][dim][count]`: the 16-byte header both `vector.idx`
+/// (count = entries) and `vector.offsets` (count = postings) start with.
+fn vector_file_header(magic: u32, version: u32, dim: u32, count: u32) -> Vec<u8> {
+    let mut header = Vec::with_capacity(VECTOR_IDX_HEADER_LEN);
+    for word in [magic, version, dim, count] {
+        header.extend_from_slice(&word.to_le_bytes());
+    }
+    header
+}
+
+/// Encodes one posting at a time into the v2 layout of `version`: the body
+/// of [`encode_vector_index_v2`], shared with
+/// [`SegmentReader::rewrite_vector_column_rabitq`], which streams a column
+/// posting by posting instead of holding all of it.
+struct VectorPostingEncoder {
+    radius_aware: bool,
+    quantile_aware: bool,
+    quantized: bool,
+    rabitq: Option<kosha_vector_spfresh::RaBitQRotation>,
+    codes: Vec<i8>,
+    bits: Vec<u8>,
+    distances: Vec<f32>,
+}
+
+impl VectorPostingEncoder {
+    fn new(dim: u32, version: u32) -> Self {
+        Self {
+            radius_aware: version >= RADIUS_AWARE_VECTOR_INDEX_VERSION,
+            quantile_aware: has_radius_quantiles(version),
+            quantized: is_i8_vector_index_version(version),
+            rabitq: is_rabitq_vector_index_version(version)
+                .then(|| kosha_vector_spfresh::RaBitQRotation::new(dim as usize)),
+            codes: Vec::with_capacity(dim as usize),
+            bits: Vec::new(),
+            distances: Vec::new(),
+        }
+    }
+
+    /// Appends `p`'s entries to `idx_buf` and its record to `offsets_buf`.
+    /// `idx_base` is how many bytes of `vector.idx` precede `idx_buf`, so
+    /// the record's offset is `idx_base + idx_buf.len()` (0 when `idx_buf`
+    /// is the whole file).
+    fn encode(
+        &mut self,
+        p: &kosha_vector_spfresh::PostingSnapshot,
+        idx_base: u64,
+        idx_buf: &mut Vec<u8>,
+        offsets_buf: &mut Vec<u8>,
+    ) {
+        let start = idx_buf.len();
         for (id, v) in &p.entries {
             idx_buf.extend_from_slice(&id.to_le_bytes());
-            if let Some(rotation) = &rabitq {
-                let code = kosha_vector_spfresh::encode_rabitq(rotation, v, &p.centroid, &mut bits);
+            if let Some(rotation) = &self.rabitq {
+                let code =
+                    kosha_vector_spfresh::encode_rabitq(rotation, v, &p.centroid, &mut self.bits);
                 idx_buf.extend_from_slice(&code.residual_norm.to_le_bytes());
                 idx_buf.extend_from_slice(&code.ip.to_le_bytes());
-                idx_buf.extend_from_slice(&bits);
-            } else if quantized {
-                let scale = kosha_vector_spfresh::quantize_i8(v, &mut codes);
+                idx_buf.extend_from_slice(&self.bits);
+            } else if self.quantized {
+                let scale = kosha_vector_spfresh::quantize_i8(v, &mut self.codes);
                 idx_buf.extend_from_slice(&scale.to_le_bytes());
-                idx_buf.extend(codes.iter().map(|&c| c as u8));
+                idx_buf.extend(self.codes.iter().map(|&c| c as u8));
             } else {
                 for &x in v {
                     idx_buf.extend_from_slice(&x.to_le_bytes());
                 }
             }
         }
-        let length = (idx_buf.len() as u64 - offset) as u32;
+        let offset = idx_base + start as u64;
+        let length = (idx_buf.len() - start) as u32;
 
         for &x in &p.centroid {
             offsets_buf.extend_from_slice(&x.to_le_bytes());
         }
         offsets_buf.extend_from_slice(&offset.to_le_bytes());
         offsets_buf.extend_from_slice(&length.to_le_bytes());
-        if quantile_aware {
-            distances.clear();
-            distances.extend(
+        if self.quantile_aware {
+            self.distances.clear();
+            self.distances.extend(
                 p.entries
                     .iter()
                     .map(|(_, v)| kosha_vector_spfresh::cosine_distance(&p.centroid, v)),
             );
-            let radii = PostingRadii::from_distances(&mut distances);
+            let radii = PostingRadii::from_distances(&mut self.distances);
             offsets_buf.extend_from_slice(&radii.max.to_le_bytes());
             offsets_buf.extend_from_slice(&radii.p50.to_le_bytes());
             offsets_buf.extend_from_slice(&radii.p90.to_le_bytes());
-        } else if radius_aware {
+        } else if self.radius_aware {
             offsets_buf.extend_from_slice(&p.radius.to_le_bytes());
         }
     }
-
-    (idx_buf, offsets_buf)
 }
 
 /// The first `VECTOR_IDX_HEADER_LEN` bytes of a `vector.idx` (fewer if the
@@ -9110,6 +9147,8 @@ pub struct KnnColumnCost {
     /// Entries are quantized, so a probe also rescores a shortlist from
     /// `doc_vectors.bin`.
     pub quantized: bool,
+    /// Entries are 1-bit RaBitQ codes (a subset of `quantized`).
+    pub rabitq: bool,
     /// Bytes an exact scan reads per passing document from
     /// `doc_vectors.bin`; `None` without that file, when an exact scan reads
     /// every posting instead.
@@ -11321,8 +11360,25 @@ impl SegmentReader {
                 entries: bytes / entry_bytes as u64,
                 entry_bytes,
                 quantized: vi.quantized,
+                rabitq: vi.rabitq,
                 exact_vector_bytes: doc_vectors.then_some(4 * vi.dim),
             })
+        })
+    }
+
+    /// Bytes of `field`'s `vector.idx` a probe of `postings` (indexes into
+    /// the column, as [`KnnSegmentRanking::budgeted`] lists them) reads;
+    /// `None` exactly when [`Self::knn_centroid_count`] is `None`. An index
+    /// past the column counts nothing.
+    pub fn knn_postings_bytes(&self, field: &str, dim: usize, postings: &[u32]) -> Option<u64> {
+        self.with_knn_plan_index(field, dim, |vi| {
+            Some(
+                postings
+                    .iter()
+                    .filter_map(|&i| vi.ranges.get(i as usize))
+                    .map(|&(_, length)| length as u64)
+                    .sum(),
+            )
         })
     }
 
@@ -13318,6 +13374,104 @@ impl SegmentReader {
         let mut footer = Self::read_footer(segment_dir)?;
         let store = Self::read_filters_any(segment_dir, &footer)?;
         footer.filter_blooms = Some(build_filter_blooms(&store.string_fields));
+        let json = serde_json::to_string_pretty(&footer)?;
+        atomic_write(&segment_dir.join("footer.json"), json.as_bytes())?;
+        Ok(footer)
+    }
+
+    /// Re-encode `field`'s f32 posting column as 1-bit RaBitQ codes, in
+    /// place: the idx header version goes 3 → 5 or 6 → 8, and every
+    /// posting keeps its members, centroid and radius, so the column is the
+    /// one [`SegmentWriter`] writes from the same postings with
+    /// `VectorQuantization::RaBitQ`. Rewrites the column's idx and offsets
+    /// files and `footer.json` only. For building an offline copy of a
+    /// namespace to compare the two encodings on the same layout
+    /// (`kosha-reencode-rabitq`); never run it on a segment a server has
+    /// open. Streams one posting at a time: the resident cost is one
+    /// posting plus the new offsets sidecar.
+    ///
+    /// Refused (nothing written) when the segment has no `doc_vectors.bin`
+    /// (a RaBitQ probe rescores its shortlist from it), or the column is
+    /// missing, already quantized, or of a version without radii.
+    pub fn rewrite_vector_column_rabitq(
+        segment_dir: &Path,
+        field: &str,
+    ) -> Result<Footer, KoshaError> {
+        let refuse = |why: &str| {
+            Err(KoshaError::InvalidQuery(format!(
+                "{}: cannot re-encode '{field}' as RaBitQ: {why}",
+                segment_dir.display()
+            )))
+        };
+        let mut footer = Self::read_footer(segment_dir)?;
+        if !footer.doc_vectors {
+            return refuse("no doc_vectors.bin to rescore from");
+        }
+        let Some(meta) = footer
+            .vector_fields
+            .iter_mut()
+            .flatten()
+            .find(|meta| meta.name == field)
+        else {
+            return refuse("no such vector column");
+        };
+        if meta.quantization != VectorQuantization::F32 || !meta.offsets {
+            return refuse("not a clustered f32 column");
+        }
+        let idx_path = segment_dir.join(meta.idx_file());
+        let offsets_path = segment_dir.join(meta.offsets_file());
+        let mut idx = fs::File::open(&idx_path)?;
+        let mut header = [0u8; VECTOR_IDX_HEADER_LEN];
+        idx.read_exact(&mut header)?;
+        let corrupt = || {
+            KoshaError::CorruptSegment(format!("{}: unreadable vector column", idx_path.display()))
+        };
+        let (dim, total_count, version) = parse_vector_idx_header(&header).ok_or_else(corrupt)?;
+        let target = match version {
+            RADIUS_AWARE_VECTOR_INDEX_VERSION => RABITQ_VECTOR_INDEX_VERSION,
+            QUANTILE_VECTOR_INDEX_VERSION => RABITQ_QUANTILE_VECTOR_INDEX_VERSION,
+            _ => return refuse(&format!("idx version {version} is not 3 or 6")),
+        };
+        let postings =
+            parse_vector_offsets(&fs::read(&offsets_path)?, dim, version).ok_or_else(corrupt)?;
+
+        let mut offsets =
+            vector_file_header(VECTOR_OFFSETS_MAGIC, target, dim, postings.len() as u32);
+        // The new idx is filled into a temp file renamed over the old one,
+        // so a hard-linked copy of the source keeps its f32 column.
+        kosha_core::atomic_write_with(&idx_path, |tmp| {
+            let mut out = std::io::BufWriter::new(fs::File::create(tmp)?);
+            let idx_header = vector_file_header(VECTOR_MAGIC, target, dim, total_count);
+            out.write_all(&idx_header)?;
+            let mut encoder = VectorPostingEncoder::new(dim, target);
+            let mut written = idx_header.len() as u64;
+            let (mut raw, mut body) = (Vec::new(), Vec::new());
+            for p in &postings {
+                raw.resize(p.length as usize, 0);
+                idx.seek(SeekFrom::Start(p.offset))?;
+                idx.read_exact(&mut raw)?;
+                let VectorPosting::F32 { ids, vectors, .. } =
+                    decode_posting_entries(&raw, dim, version)
+                else {
+                    return Err(std::io::Error::other("f32 column decoded as quantized"));
+                };
+                let snapshot = kosha_vector_spfresh::PostingSnapshot {
+                    centroid: p.centroid.clone(),
+                    entries: ids
+                        .into_iter()
+                        .zip(vectors.chunks_exact(dim as usize).map(<[f32]>::to_vec))
+                        .collect(),
+                    radius: p.radius,
+                };
+                body.clear();
+                encoder.encode(&snapshot, written, &mut body, &mut offsets);
+                out.write_all(&body)?;
+                written += body.len() as u64;
+            }
+            out.into_inner().map_err(|e| e.into_error())?.sync_all()
+        })?;
+        atomic_write(&offsets_path, &offsets)?;
+        meta.quantization = VectorQuantization::RaBitQ;
         let json = serde_json::to_string_pretty(&footer)?;
         atomic_write(&segment_dir.join("footer.json"), json.as_bytes())?;
         Ok(footer)

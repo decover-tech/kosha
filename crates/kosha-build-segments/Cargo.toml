@@ -42,6 +42,12 @@ path = "src/bin/boundary_replication_eval.rs"
 name = "kosha-late-interaction-eval"
 path = "src/bin/late_interaction_eval.rs"
 
+# Re-encodes a namespace's f32 vector column as RaBitQ codes into a new
+# directory, same postings: the scratch namespace of the codes-scan A/B.
+[[bin]]
+name = "kosha-reencode-rabitq"
+path = "src/bin/reencode_rabitq.rs"
+
 [lints]
 workspace = true
 
