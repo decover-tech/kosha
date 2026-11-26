@@ -3503,6 +3503,17 @@ struct KnnPlan {
     fallback_cutoffs: HashMap<kosha_core::SegmentId, (f32, usize)>,
 }
 
+impl KnnPlan {
+    /// The `(cutoff, budget)` a segment without a ranking plans by: its
+    /// own encoding's under the codes-scan depth, else the plan's.
+    fn cutoff_for(&self, segment_id: &kosha_core::SegmentId) -> Option<(f32, usize)> {
+        self.fallback_cutoffs
+            .get(segment_id)
+            .copied()
+            .or(self.cutoff)
+    }
+}
+
 /// One probed segment as kNN planning sees it: the scores of its
 /// postings, and, when the column has i8 centroid codes, guaranteed
 /// bounds on them that are much cheaper to compute.
@@ -5310,8 +5321,7 @@ impl Searcher {
         query: &SearchQuery,
         knn: &kosha_core::KnnQuery,
         pruned: &KnnPrunedSegments,
-        cutoff: Option<(f32, usize)>,
-        rankings: &HashMap<kosha_core::SegmentId, kosha_segment::KnnSegmentRanking>,
+        plan: &KnnPlan,
         tombstones: Option<
             &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
         >,
@@ -5326,10 +5336,10 @@ impl Searcher {
         // This pass runs unfiltered requests only, so the one restriction
         // a segment can have is its deleted documents.
         let refill = kosha_segment::KnnRefill::BudgetedSegments;
-        let budget_for = |segment_id: &kosha_core::SegmentId| match cutoff {
+        let budget_for = |segment_id: &kosha_core::SegmentId| match plan.cutoff_for(segment_id) {
             // The plan's ranking of this segment's postings (#436), when
             // it has one; the segment ranks its own otherwise.
-            Some((max_distance, max_probes)) => match rankings.get(segment_id) {
+            Some((max_distance, max_probes)) => match plan.rankings.get(segment_id) {
                 Some(ranking) => kosha_segment::KnnProbeBudget::Planned { ranking, refill },
                 None => kosha_segment::KnnProbeBudget::Within {
                     max_distance,
@@ -9226,8 +9236,7 @@ impl Searcher {
                     query,
                     knn,
                     pruned,
-                    knn_plan.cutoff,
-                    &knn_plan.rankings,
+                    &knn_plan,
                     tombstones,
                     permit,
                     &open_stats,
@@ -9295,11 +9304,7 @@ impl Searcher {
                 manifest,
                 permit,
                 &open_stats,
-                knn_plan
-                    .fallback_cutoffs
-                    .get(&entry.segment_id)
-                    .copied()
-                    .or(knn_plan.cutoff),
+                knn_plan.cutoff_for(&entry.segment_id),
                 knn_plan.rankings.get(&entry.segment_id),
                 knn_plan.exact_segments.contains(&entry.segment_id),
                 knn_global

@@ -20143,4 +20143,104 @@ mod rabitq_duplicate_cluster_tests {
         assert_eq!(short[..K], (1000..1000 + K as u32).collect::<Vec<_>>()[..]);
         assert_eq!(short[K..], (0..slots as u32 - 1).collect::<Vec<_>>()[..]);
     }
+
+    /// A block far past the shortlist's x8 cap (1,000 copies over 320
+    /// slots), so the pool widens past its first pass.
+    #[test]
+    fn a_thousand_copy_block_is_one_slot_and_the_pool_widens() {
+        let mut dups: Vec<(u32, f64)> = (0..1000).map(|i| (10_000 + i, 0.95)).collect();
+        dups.extend((0..500).map(|i| (i, 0.9 - i as f64 * 1e-3)));
+        let errors = vec![1e-4f32; dups.len()];
+        let slots = floored_shortlist_len(&dups, &errors, K, 40, true, 0);
+        assert_eq!(slots, 320, "the cap binds");
+        // First pass: 2 x 320 = 640 candidates, all copies of the block.
+        let short: Vec<u32> = rescore_shortlist(dups, &errors, K, 40, true, 0)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(short.len(), K + 319);
+        assert!(short[..K].iter().all(|&id| id >= 10_000));
+        assert_eq!(short[K..], (0..319).collect::<Vec<_>>()[..]);
+    }
+
+    /// Engine level, on a written RaBitQ segment: 1,000 copies of a vector
+    /// 4e-5 below the true 10th neighbour (20 copies), searched with every
+    /// posting probed. The seed is the first whose on-disk codes put more
+    /// than the x8 cap (320) of candidates above every copy of the true
+    /// block by estimate, so a shortlist where each copy takes a slot
+    /// cannot reach it; the probe must still return it.
+    #[test]
+    fn written_segment_finds_the_true_tenth_under_a_block_past_the_cap() {
+        let (high, low) = (20usize, 1000usize);
+        let unit_q = unit(vector(42));
+        for l_seed in 5000..5040u64 {
+            let (q, docs) = posting(1021, l_seed, high, low);
+            let dir = std::env::temp_dir()
+                .join(format!("kosha-rabitq-dup-{}-{l_seed}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            let mut w = SegmentWriter::new(SegmentId("dup".into()), dir.clone())
+                .with_vector_store_mode(VectorStoreMode::Sidecar)
+                .with_vector_quantization(
+                    VectorQuantizationConfig::default()
+                        .with_field("emb", VectorQuantization::RaBitQ),
+                );
+            for (i, d) in docs.iter().enumerate() {
+                w.add_document(
+                    DocumentId(format!("d{i:05}")),
+                    vec![Field::vector("emb", d.clone())],
+                );
+            }
+            w.finalize(Bm25Params::default()).unwrap();
+            // Estimates exactly as the probe makes them, from the files.
+            let idx = fs::read(dir.join("vector.idx")).unwrap();
+            let (dim, _, version) = parse_vector_idx_header(&idx).unwrap();
+            let postings =
+                parse_vector_offsets(&fs::read(dir.join("vector.offsets")).unwrap(), dim, version)
+                    .unwrap();
+            let query = rabitq_query_for(&unit_q);
+            let mut estimates = Vec::new();
+            for p in &postings {
+                let bytes = &idx[p.offset as usize..p.offset as usize + p.length as usize];
+                let VectorPosting::RaBitQ {
+                    code_bytes,
+                    ids,
+                    codes,
+                    bits,
+                } = decode_posting_entries(bytes, dim, version)
+                else {
+                    panic!("RaBitQ column");
+                };
+                let centroid_dot = kosha_vector_spfresh::dot(&unit_q, &p.centroid);
+                for (i, (&id, code)) in ids.iter().zip(&codes).enumerate() {
+                    let entry = &bits[i * code_bytes..(i + 1) * code_bytes];
+                    estimates.push((id as usize, query.estimate(code, entry, centroid_dot).0));
+                }
+            }
+            let is_high = |id: usize| (9..9 + high).contains(&id);
+            let best_high = estimates
+                .iter()
+                .filter(|(id, _)| is_high(*id))
+                .map(|(_, e)| *e)
+                .fold(f32::MIN, f32::max);
+            let above = estimates.iter().filter(|(_, e)| *e > best_high).count();
+            if above <= 320 {
+                fs::remove_dir_all(&dir).ok();
+                continue;
+            }
+            let reader = SegmentReader::open(dir.clone()).unwrap();
+            let (hits, _) = reader
+                .knn_search_within_filtered("emb", &q, K, f32::MAX, usize::MAX, None)
+                .expect("lazy index")
+                .unwrap();
+            let ids: Vec<usize> = hits.iter().map(|(id, _)| *id as usize).collect();
+            assert_eq!(ids[..9], (0..9).collect::<Vec<_>>()[..], "{ids:?}");
+            assert!(
+                is_high(ids[9]),
+                "{above} candidates above the true block: {ids:?}"
+            );
+            fs::remove_dir_all(&dir).ok();
+            return;
+        }
+        panic!("no seed put the block above the true one past the cap");
+    }
 }
