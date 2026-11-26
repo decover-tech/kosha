@@ -3021,6 +3021,55 @@ fn effective_knn_budget(requested: usize, total_centroids: usize) -> usize {
     requested.max(floor)
 }
 
+/// [`knn_rank_postings`] cut separately per encoding: the f32 sources
+/// (`columns[i]` is `None`) under `budgets.0`, the RaBitQ ones under
+/// `budgets.1`, rankings back in `sources` order. Returns the merged
+/// result and the budget the plan records: the looser of the two cutoffs
+/// and the larger budget, which only a segment left without a ranking
+/// (it could not be scored) plans by.
+fn knn_rank_by_encoding<'a>(
+    sources: &[ColumnPlanSource<'a>],
+    columns: &[Option<kosha_segment::KnnColumnCost>],
+    budgets: (usize, usize),
+    rank: impl Fn(&[ColumnPlanSource<'a>], usize) -> KnnRankedPostings,
+) -> (KnnRankedPostings, usize) {
+    let part = |rabitq: bool| -> Vec<ColumnPlanSource<'a>> {
+        sources
+            .iter()
+            .zip(columns)
+            .filter(|(_, column)| column.is_some() == rabitq)
+            .map(|(source, _)| *source)
+            .collect()
+    };
+    let rank_part = |rabitq: bool, budget: usize| {
+        let sources = part(rabitq);
+        (!sources.is_empty()).then(|| (rank(&sources, budget), budget))
+    };
+    let (f32_part, rabitq_part) = (rank_part(false, budgets.0), rank_part(true, budgets.1));
+    let mut f32_rankings = f32_part.as_ref().map(|(r, _)| r.rankings.iter());
+    let mut rabitq_rankings = rabitq_part.as_ref().map(|(r, _)| r.rankings.iter());
+    let rankings = columns
+        .iter()
+        .map(|column| {
+            let next = match column {
+                Some(_) => rabitq_rankings.as_mut(),
+                None => f32_rankings.as_mut(),
+            };
+            next.and_then(Iterator::next).cloned().flatten()
+        })
+        .collect();
+    let parts = || f32_part.iter().chain(rabitq_part.iter());
+    let merged = KnnRankedPostings {
+        cutoff: parts()
+            .map(|(r, _)| r.cutoff)
+            .fold(f32::NEG_INFINITY, f32::max),
+        rule: parts().find_map(|(r, _)| r.rule),
+        rankings,
+        exact_centroids: parts().map(|(r, _)| r.exact_centroids).sum(),
+    };
+    (merged, parts().map(|(_, b)| *b).max().unwrap_or(0))
+}
+
 /// Preflight of a codes-scan plan (K10 iii): the RaBitQ postings the plan
 /// probes plus the columns' index must fit under `max_bytes`, the request's
 /// hydration ceiling, or the query fails now with `Overloaded` (429)
@@ -3474,6 +3523,7 @@ trait KnnPlanSource: Sync {
 }
 
 /// [`KnnPlanSource`] over an open segment's column.
+#[derive(Clone, Copy)]
 struct ColumnPlanSource<'a> {
     reader: &'a SegmentReader,
     field: &'a str,
@@ -5807,10 +5857,17 @@ impl Searcher {
             return Ok(plan); // no v2 vector segments to probe — keep legacy behavior
         }
         let max_bytes = self.rrf_shortlist_hydration_limit.max_bytes;
-        let budget = match &rabitq {
-            None => filtered_knn_budget(
-                effective_knn_budget(requested, total_centroids),
-                selectivity,
+        // With the codes-scan depth, f32 and RaBitQ postings are cut
+        // separately, each under its own budget and cap: one joint cut
+        // would let either encoding take the other's share (f32 past its
+        // 20K cap at 24x the bytes per vector, or RaBitQ squeezed out).
+        let budgets = match &rabitq {
+            None => (
+                filtered_knn_budget(
+                    effective_knn_budget(requested, total_centroids),
+                    selectivity,
+                ),
+                0,
             ),
             Some(depth) => {
                 let f32_postings = total_centroids - depth.postings;
@@ -5830,7 +5887,7 @@ impl Searcher {
                         max_bytes as f64 / (1024.0 * 1024.0),
                     );
                 }
-                (f32_budget + rabitq_budget).max(requested)
+                (f32_budget, rabitq_budget.max(requested.min(depth.postings)))
             }
         };
         // #384 (experimental, off by default): SPANN-style relative cutoff
@@ -5846,13 +5903,19 @@ impl Searcher {
         };
         // Score the centroids, pick the cutoff and rank every probed
         // segment's postings inside it: see `knn_rank_postings`.
-        let ranked = knn_rank_postings_with(
-            &sources,
-            budget,
-            relative,
-            self.knn_plan_i8,
-            self.knn_segment_prune,
-        );
+        let rank = |sources: &[ColumnPlanSource<'_>], budget: usize| {
+            knn_rank_postings_with(
+                sources,
+                budget,
+                relative,
+                self.knn_plan_i8,
+                self.knn_segment_prune,
+            )
+        };
+        let (ranked, budget) = match &rabitq {
+            None => (rank(&sources, budgets.0), budgets.0),
+            Some(depth) => knn_rank_by_encoding(&sources, &depth.columns, budgets, rank),
+        };
         // A segment that could not be scored gets no ranking and ranks its
         // own postings under the cutoff; when none could, there is no
         // cutoff either (as when nothing is probeable).
@@ -30621,17 +30684,18 @@ mod knn_rabitq_depth_tests {
         docs: Vec<(String, Vec<f32>, &'static str)>,
     }
 
+    /// `rabitq(s)` picks segment `s`'s column encoding.
     fn write(
         dir: &Path,
         segments: Vec<Vec<(String, Vec<f32>, &'static str)>>,
-        rabitq: bool,
+        rabitq: impl Fn(usize) -> bool,
     ) -> Corpus {
         let ns = NamespaceId("ns".into());
         let mut entries = Vec::new();
         let mut docs = Vec::new();
         for (s, segment) in segments.into_iter().enumerate() {
             let id = format!("seg{s}");
-            let quantization = if rabitq {
+            let quantization = if rabitq(s) {
                 VectorQuantizationConfig::default().with_field("emb", VectorQuantization::RaBitQ)
             } else {
                 VectorQuantizationConfig::default()
@@ -30689,7 +30753,7 @@ mod knn_rabitq_depth_tests {
                     .collect()
             })
             .collect();
-        write(dir, segments, rabitq)
+        write(dir, segments, |_| rabitq)
     }
 
     fn query(vector: Vec<f32>, k: usize, matter: Option<&str>) -> SearchQuery {
@@ -30868,6 +30932,107 @@ mod knn_rabitq_depth_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A namespace mid-migration: f32 and RaBitQ segments. Each encoding
+    /// is cut under its own budget, so the RaBitQ depth never lends f32
+    /// postings its share (nor the reverse): the f32 segment probes exactly
+    /// what it probes alone, and every RaBitQ posting is probed.
+    #[test]
+    fn rabitq_depth_cuts_f32_and_rabitq_postings_separately_in_a_mixed_namespace() {
+        let segment = |s: usize| -> Vec<(String, Vec<f32>, &'static str)> {
+            (0..800)
+                .map(|i| {
+                    let n = s * 800 + i;
+                    (format!("d{n}"), vector(n as u64), "a")
+                })
+                .collect()
+        };
+        let (mixed_dir, f32_dir) = (temp_dir("mixed"), temp_dir("mixed-f32"));
+        let mixed = write(&mixed_dir, (0..3).map(segment).collect(), |s| s < 2);
+        let alone = write(&f32_dir, vec![segment(2)], |_| false);
+        let postings = |dir: &Path, s: usize| {
+            SegmentReader::open(dir.join("ns").join(format!("seg{s}")))
+                .unwrap()
+                .knn_centroid_count("emb", DIM)
+                .unwrap()
+        };
+        let rabitq_postings = postings(&mixed_dir, 0) + postings(&mixed_dir, 1);
+        let f32_postings = postings(&mixed_dir, 2);
+        assert_eq!(f32_postings, postings(&f32_dir, 0), "same f32 segment");
+        let on = searcher(&mixed_dir, Some(1.0));
+        let alone_on = searcher(&f32_dir, Some(1.0));
+        for s in 0..5u64 {
+            let q = query(vector(3_000_000 + s), 10, None);
+            let (_, mixed_stats) = on
+                .search_with_stats(&mixed.ns, &mixed.manifest, &q, None)
+                .unwrap();
+            let (_, alone_stats) = alone_on
+                .search_with_stats(&alone.ns, &alone.manifest, &q, None)
+                .unwrap();
+            assert!(
+                alone_stats.knn_postings_probed < f32_postings,
+                "f32 is budgeted"
+            );
+            assert_eq!(
+                mixed_stats.knn_postings_probed,
+                rabitq_postings + alone_stats.knn_postings_probed,
+                "every RaBitQ posting, and the f32 segment's own budget"
+            );
+        }
+
+        // The cut itself, for a query next to the f32 segment's data: one
+        // joint cut at the pooled budget hands the f32 postings the RaBitQ
+        // share (past their own budget); the split cut keeps
+        // each encoding to its own.
+        let readers: Vec<SegmentReader> = (0..3)
+            .map(|s| SegmentReader::open(mixed_dir.join("ns").join(format!("seg{s}"))).unwrap())
+            .collect();
+        let q = vector(2 * 800 + 5);
+        let sources: Vec<ColumnPlanSource<'_>> = readers
+            .iter()
+            .map(|reader| ColumnPlanSource {
+                reader,
+                field: "emb",
+                query: &q,
+                alpha: kosha_segment::knn_probe_radius_alpha(),
+                postings: reader.knn_centroid_count("emb", DIM).unwrap(),
+            })
+            .collect();
+        let columns: Vec<_> = readers
+            .iter()
+            .map(|r| r.knn_column_cost("emb", DIM).filter(|c| c.rabitq))
+            .collect();
+        let f32_budget = effective_knn_budget(4, f32_postings);
+        assert!(f32_budget < f32_postings);
+        let rank = |sources: &[ColumnPlanSource<'_>], budget: usize| {
+            knn_rank_postings_with(sources, budget, None, false, false)
+        };
+        let probed = |ranked: &KnnRankedPostings| -> Vec<usize> {
+            ranked
+                .rankings
+                .iter()
+                .map(|r| r.as_ref().map_or(0, |r| r.budgeted().len()))
+                .collect()
+        };
+        let joint = rank(&sources, f32_budget + rabitq_postings);
+        let joint = probed(&joint);
+        assert!(
+            joint[2] > f32_budget,
+            "joint: f32 takes RaBitQ slots: {joint:?}"
+        );
+        assert!(
+            joint[0] + joint[1] < rabitq_postings,
+            "and RaBitQ is squeezed: {joint:?}"
+        );
+        let (split, budget) =
+            knn_rank_by_encoding(&sources, &columns, (f32_budget, rabitq_postings), rank);
+        let split = probed(&split);
+        assert_eq!(split[2], f32_budget);
+        assert_eq!(split[0] + split[1], rabitq_postings);
+        assert_eq!(budget, rabitq_postings.max(f32_budget));
+        std::fs::remove_dir_all(&mixed_dir).ok();
+        std::fs::remove_dir_all(&f32_dir).ok();
+    }
+
     #[test]
     fn rabitq_depth_preflight_sheds_a_plan_over_the_request_ceiling_before_fetching() {
         let dir = temp_dir("preflight");
@@ -30943,14 +31108,14 @@ mod knn_rabitq_depth_tests {
         assert_eq!(all.budget(Some(0.01), u64::MAX), (10_000, false));
     }
 
-    /// The knn-085 shape (exp-codes-rerank §4): the true 10th neighbour is
-    /// one of a block of identical vectors, and a different vector a hair
-    /// below it is duplicated 8 times, so all 8 share one code and one
-    /// estimate error. The probe's rescore floor (k x
-    /// `KOSHA_VECTOR_RESCORE_FACTOR` = 40) covers both blocks, so exact
-    /// scores pick the higher block.
+    /// End to end through a filtered codes-scan search: a block of
+    /// identical copies of the true 10th neighbour and 8 copies of a vector
+    /// 4e-5 below it, both within the rescore floor (k x 4 = 40), resolve
+    /// by exact score. The block that overflows the floor, and why the
+    /// estimator does not guard it, is kosha-segment's
+    /// `duplicate_block_past_the_rescore_floor_needs_depth_not_an_estimator`.
     #[test]
-    fn rabitq_depth_breaks_a_duplicate_cluster_tie_by_exact_score() {
+    fn rabitq_depth_breaks_a_duplicate_cluster_tie_within_the_rescore_floor() {
         let dir = temp_dir("dups");
         let mut q = vector(42);
         normalize(&mut q);
@@ -30983,7 +31148,7 @@ mod knn_rabitq_depth_tests {
                 if i % 2 == 0 { "a" } else { "b" },
             ));
         }
-        let corpus = write(&dir, vec![docs], true);
+        let corpus = write(&dir, vec![docs], |_| true);
         let on = searcher(&dir, Some(1.0));
         let (r, _) = on
             .search_with_stats(
