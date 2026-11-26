@@ -11,4 +11,6 @@ warm:
       export PATH="$HOME/.cargo/bin:$PATH"
       rustup toolchain install stable --profile minimal
       cargo test --all-features --locked --no-run
+      # Jobs diff against this commit to keep unchanged files' mtimes old.
+      git rev-parse HEAD > target/.tachyon-prebuild-sha
 memory_snapshot: false

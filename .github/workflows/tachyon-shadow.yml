@@ -42,6 +42,16 @@ jobs:
             done
           fi
           echo "Tachyon warm: $result (prebuild match: ${TACHYON_PREBUILD_MATCH:-none})"
+          # Checkout gives every file a new mtime, which makes cargo rebuild
+          # all workspace crates. Age every file, then re-touch only the
+          # files changed since the prebuild's commit.
+          base=$(cat target/.tachyon-prebuild-sha 2>/dev/null || true)
+          if [[ $result == hit && -n "$base" ]] && { git cat-file -e "$base^{commit}" 2>/dev/null || git fetch -q --depth=1 origin "$base"; }; then
+            git ls-files -z | xargs -0 touch -h -d @1
+            changed=$(git diff --name-only "$base" HEAD | wc -l)
+            git diff --name-only -z "$base" HEAD | xargs -0 -r touch -h
+            echo "mtimes reset against prebuild ${base:0:7}; $changed file(s) changed"
+          fi
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: stable
