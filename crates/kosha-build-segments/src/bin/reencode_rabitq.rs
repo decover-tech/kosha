@@ -38,7 +38,8 @@ struct Args {
     #[arg(long)]
     field: String,
     /// Segments re-encoded at once (0: rayon's default). Each holds one
-    /// posting and its column's `vector.offsets` in memory.
+    /// posting plus its column's old and new `vector.offsets` (~2 x 23 MB
+    /// for a 3.7K-posting 1536-d segment).
     #[arg(long, default_value_t = 0)]
     threads: usize,
 }

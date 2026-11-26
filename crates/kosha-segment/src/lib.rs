@@ -9767,6 +9767,24 @@ fn rabitq_bound_shortlist_len(scored: &[(u32, f64)], errors: &[f32], k: usize) -
         .count()
 }
 
+/// [`exact_shortlist_len`], at least `rabitq_min` on a RaBitQ column (past
+/// its x8 cap: the floor is the point). See [`rabitq_rescore_min`].
+fn floored_shortlist_len(
+    scored: &[(u32, f64)],
+    errors: &[f32],
+    k: usize,
+    factor_len: usize,
+    rabitq: bool,
+    rabitq_min: usize,
+) -> usize {
+    let rule = exact_shortlist_len(scored, errors, k, factor_len, rabitq);
+    if rabitq {
+        rule.max(rabitq_min)
+    } else {
+        rule
+    }
+}
+
 fn exact_shortlist_len(
     scored: &[(u32, f64)],
     errors: &[f32],
@@ -9873,6 +9891,9 @@ pub struct SegmentReader {
     /// candidates at full precision (#210); `0` disables. See
     /// [`vector_rescore_factor`].
     vector_rescore_factor: usize,
+    /// Least candidates a RaBitQ column's probe rescores; see
+    /// [`SegmentReader::with_rabitq_rescore_min`].
+    rabitq_rescore_min: usize,
     /// Late-interaction fields (#205) opened so far, by footer index. Only
     /// success is cached, as for `doc_vectors`.
     multi_vectors: Mutex<HashMap<usize, Arc<multivec::MultiVectorIndex>>>,
@@ -9881,6 +9902,43 @@ pub struct SegmentReader {
     /// `vector_cache`, budgeted by
     /// `KOSHA_LATE_INTERACTION_POSTINGS_CACHE_MAX_BYTES`.
     multi_vector_cache: multivec::IvfPostingCache,
+}
+
+/// Default of [`SegmentReader::with_rabitq_rescore_min`]:
+/// `KOSHA_KNN_RABITQ_RESCORE_MIN` (experimental), the least candidates a
+/// RaBitQ column's probe rescores exactly, on top of its bound rule. Unset
+/// or `0` (the default): the rule alone. A block of identical vectors
+/// shares one 1-bit code and so one estimate error, which the epsilon0
+/// bound covers per estimate, not per block; a floor deeper than the block
+/// (`400` passed every set in exp-codes-rerank) rescores past it. Costs up
+/// to that many `doc_vectors.bin` reads per probed segment.
+pub fn rabitq_rescore_min() -> usize {
+    static MIN: OnceLock<usize> = OnceLock::new();
+    *MIN.get_or_init(|| {
+        match std::env::var("KOSHA_KNN_RABITQ_RESCORE_MIN")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+        {
+            None | Some("") => 0,
+            Some(raw) => match raw.parse() {
+                Ok(min) => {
+                    eprintln!(
+                        "INFO: KOSHA_KNN_RABITQ_RESCORE_MIN={min}: RaBitQ probes rescore at \
+                         least {min} candidates per segment (experimental)"
+                    );
+                    min
+                }
+                Err(_) => {
+                    eprintln!(
+                        "WARN: KOSHA_KNN_RABITQ_RESCORE_MIN={raw} not a non-negative integer — \
+                         using 0 (the bound rule alone)"
+                    );
+                    0
+                }
+            },
+        }
+    })
 }
 
 /// Default of [`SegmentReader::with_vector_rescore_factor`]:
@@ -10024,6 +10082,7 @@ impl SegmentReader {
             doc_vectors: Mutex::new(None),
             field_lengths: Mutex::new(HashMap::new()),
             vector_rescore_factor: vector_rescore_factor(),
+            rabitq_rescore_min: rabitq_rescore_min(),
             multi_vectors: Mutex::new(HashMap::new()),
             multi_vector_cache: PostingsCache::new(
                 late_interaction_postings_cache_max_bytes(),
@@ -10124,6 +10183,33 @@ impl SegmentReader {
     pub fn with_vector_rescore_factor(mut self, factor: usize) -> Self {
         self.vector_rescore_factor = factor;
         self
+    }
+
+    /// Override the least candidates a RaBitQ column's probe rescores
+    /// (`0`: the bound rule alone). Readers default to
+    /// `KOSHA_KNN_RABITQ_RESCORE_MIN` (see [`rabitq_rescore_min`]).
+    pub fn with_rabitq_rescore_min(mut self, min: usize) -> Self {
+        self.rabitq_rescore_min = min;
+        self
+    }
+
+    /// [`floored_shortlist_len`] at this reader's floor.
+    fn rescore_shortlist_len(
+        &self,
+        scored: &[(u32, f64)],
+        errors: &[f32],
+        k: usize,
+        factor_len: usize,
+        rabitq: bool,
+    ) -> usize {
+        floored_shortlist_len(
+            scored,
+            errors,
+            k,
+            factor_len,
+            rabitq,
+            self.rabitq_rescore_min,
+        )
     }
 
     /// Bytes the decoded vector-posting cache holds right now (#210
@@ -11781,7 +11867,8 @@ impl SegmentReader {
         hydration_limit: ShortlistHydrationLimit,
     ) -> Result<(Vec<(u32, f64)>, usize), KoshaError> {
         let factor_len = k.saturating_mul(self.vector_rescore_factor.max(1));
-        let limit = exact_shortlist_len(&probed.scored, &probed.errors, k, factor_len, rabitq);
+        let limit =
+            self.rescore_shortlist_len(&probed.scored, &probed.errors, k, factor_len, rabitq);
         let mut seqs: Vec<_> = top_k_by_score(probed.scored, limit)
             .into_iter()
             .map(|(seq, _)| seq)
@@ -12532,7 +12619,7 @@ impl SegmentReader {
             return scored;
         }
         let factor_len = k.saturating_mul(self.vector_rescore_factor);
-        let shortlist_len = exact_shortlist_len(&scored, errors, k, factor_len, vi.rabitq);
+        let shortlist_len = self.rescore_shortlist_len(&scored, errors, k, factor_len, vi.rabitq);
         let mut shortlist = top_k_by_score(scored, shortlist_len);
         if let Some(field) = vi.field.as_deref() {
             let rescored = self.rescore_exact(field, query, &mut shortlist);
@@ -13388,7 +13475,8 @@ impl SegmentReader {
     /// namespace to compare the two encodings on the same layout
     /// (`kosha-reencode-rabitq`); never run it on a segment a server has
     /// open. Streams one posting at a time: the resident cost is one
-    /// posting plus the new offsets sidecar.
+    /// posting plus the column's old and new `vector.offsets` (each ~6 KB
+    /// per posting at 1536-d: ~2 x 23 MB for a 3.7K-posting segment).
     ///
     /// Refused (nothing written) when the segment has no `doc_vectors.bin`
     /// (a RaBitQ probe rescores its shortlist from it), or the column is
@@ -19760,5 +19848,184 @@ mod doc_store_zstd_tests {
             }
             let _ = fs::remove_dir_all(&dir);
         }
+    }
+}
+
+/// The `knn-085` failure (exp-codes-rerank §4) through the engine's own
+/// rescoring rule: a block of identical vectors shares one RaBitQ code,
+/// so its estimate error is perfectly correlated across the block.
+#[cfg(test)]
+mod rabitq_duplicate_cluster_tests {
+    use super::*;
+    use kosha_vector_spfresh::{RaBitQEstimator, RaBitQQuery, RaBitQRotation};
+
+    const DIM: usize = 1536;
+    const K: usize = 10;
+
+    fn vector(seed: u64) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
+        (0..DIM)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+            })
+            .collect()
+    }
+
+    fn unit(mut v: Vec<f32>) -> Vec<f32> {
+        kosha_vector_spfresh::normalize_in_place(&mut v);
+        v
+    }
+
+    /// A unit vector at cosine `c` from the unit `q`, its other component
+    /// along `seed`'s direction.
+    fn at(q: &[f32], c: f32, seed: u64) -> Vec<f32> {
+        let mut r = vector(seed);
+        let along: f32 = r.iter().zip(q).map(|(a, b)| a * b).sum();
+        r.iter_mut().zip(q).for_each(|(x, qi)| *x -= along * qi);
+        let r = unit(r);
+        unit(
+            q.iter()
+                .zip(&r)
+                .map(|(qi, ri)| c * qi + (1.0 - c * c).sqrt() * ri)
+                .collect(),
+        )
+    }
+
+    /// One posting: 9 near documents, `high` copies of the true 10th
+    /// neighbour (cos 0.83198) and `low` copies of a vector 4e-5 below it.
+    /// Returns ids `0..9` near, then the high block, then the low block,
+    /// with their vectors, and the query.
+    fn posting(h_seed: u64, l_seed: u64, high: usize, low: usize) -> (Vec<f32>, Vec<Vec<f32>>) {
+        let q = unit(vector(42));
+        let mut docs: Vec<Vec<f32>> = (0..9)
+            .map(|i| at(&q, 0.95 - 0.01 * i as f32, 100 + i))
+            .collect();
+        let (h, l) = (at(&q, 0.83198, h_seed), at(&q, 0.83194, l_seed));
+        docs.extend(std::iter::repeat_n(h, high));
+        docs.extend(std::iter::repeat_n(l, low));
+        (q, docs)
+    }
+
+    /// The per-segment probe of one RaBitQ posting under `estimator`:
+    /// estimates as `VectorPosting::for_each_similarity` emits them, the
+    /// shortlist of `rescore_probed_shortlist` (floor `k * 4`, bound
+    /// shortlist at the code's epsilon0, cap x8), exact rescore, top `k`.
+    /// `floor`: `KOSHA_KNN_RABITQ_RESCORE_MIN` (0: the rule alone).
+    fn probe(q: &[f32], docs: &[Vec<f32>], estimator: RaBitQEstimator, floor: usize) -> Vec<u32> {
+        let rotation = RaBitQRotation::new(DIM);
+        let mut centroid = vec![0f32; DIM];
+        docs.iter()
+            .for_each(|d| centroid.iter_mut().zip(d).for_each(|(c, x)| *c += x));
+        let centroid = unit(centroid);
+        let query = RaBitQQuery::with_estimator(&rotation, q, estimator);
+        let centroid_dot = kosha_vector_spfresh::dot(q, &centroid);
+        let mut bits = Vec::new();
+        let (mut scored, mut errors) = (Vec::new(), Vec::new());
+        for (id, d) in docs.iter().enumerate() {
+            let code = kosha_vector_spfresh::encode_rabitq(&rotation, d, &centroid, &mut bits);
+            let (sim, err) = query.estimate(&code, &bits, centroid_dot);
+            scored.push((id as u32, sim.clamp(-1.0, 1.0) as f64));
+            errors.push(err);
+        }
+        let limit = floored_shortlist_len(&scored, &errors, K, K * 4, true, floor);
+        let exact: Vec<(u32, f64)> = top_k_by_score(scored, limit)
+            .into_iter()
+            .map(|(id, _)| {
+                (
+                    id,
+                    kosha_vector_spfresh::cosine_similarity(q, &docs[id as usize]) as f64,
+                )
+            })
+            .collect();
+        top_k_by_score(exact, K)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// Reproduces the counts in the next test's doc (`--ignored`).
+    #[test]
+    #[ignore]
+    fn duplicate_block_miss_rate_by_estimator() {
+        let (mut l_only, mut p_only, mut both, mut n) = (0, 0, 0, 0);
+        for h in 1000..1100u64 {
+            for l in 5000..5060u64 {
+                let (q, docs) = posting(h, l, 20, 48);
+                let lm = !tenth_is_high(&probe(&q, &docs, RaBitQEstimator::Lut, 0), 20);
+                let pm = !tenth_is_high(&probe(&q, &docs, RaBitQEstimator::Popcount4, 0), 20);
+                n += 1;
+                match (lm, pm) {
+                    (true, true) => {
+                        both += 1;
+                        if both < 4 {
+                            println!("BOTH {h} {l}");
+                        }
+                    }
+                    (true, false) => l_only += 1,
+                    (false, true) => p_only += 1,
+                    _ => {}
+                }
+            }
+        }
+        println!("n={n} both={both} lut_only={l_only} pop_only={p_only}");
+    }
+
+    /// Whether the 10th hit is a copy of the true 10th neighbour.
+    fn tenth_is_high(ids: &[u32], high: usize) -> bool {
+        ids.len() == K && (9..9 + high).contains(&(ids[9] as usize))
+    }
+
+    /// What guards the tie is rescore depth, not the estimator.
+    ///
+    /// The miss needs the low block's estimate to sit more than both
+    /// bounds above the high block's. The error comes from the 1-bit data
+    /// code, which both estimators share (Popcount4 only adds the query's
+    /// 4-bit rounding in quadrature, ~2% wider here), so they miss on
+    /// nearly the same inputs. Measured over 6,000 direction pairs of this
+    /// fixture (`h` 1000..1100 x `l` 5000..5060, 20 high / 48 low copies,
+    /// `duplicate_block_miss_rate_by_estimator`): LUT misses 24, Popcount4
+    /// 23; 15 both, 9 only LUT, 8 only Popcount4. The pair below is one
+    /// both miss. That Popcount4 passed `knn-085` in the
+    /// replay is one draw of this, not a property to rely on.
+    #[test]
+    fn duplicate_block_past_the_rescore_floor_needs_depth_not_an_estimator() {
+        let estimators = [RaBitQEstimator::Lut, RaBitQEstimator::Popcount4];
+        // Within the floor (9 + 20 + 20 <= k * 4 = 40): rescued either way.
+        let (q, docs) = posting(1021, 5041, 20, 20);
+        for e in estimators {
+            assert!(tenth_is_high(&probe(&q, &docs, e, 0), 20), "{e:?}");
+        }
+        // 48 copies of the over-estimated vector fill the shortlist past
+        // the floor, and the high block is outside both bounds: missed
+        // under the engine rule at epsilon0 1.9 by both estimators ...
+        let (q, docs) = posting(1021, 5041, 20, 48);
+        for e in estimators {
+            let ids = probe(&q, &docs, e, 0);
+            assert!(!tenth_is_high(&ids, 20), "{e:?}: {ids:?}");
+            assert!(
+                (9 + 20..9 + 20 + 48).contains(&(ids[9] as usize)),
+                "{e:?}: {ids:?}"
+            );
+        }
+        // ... and found under a rescore floor deeper than the block
+        // (`KOSHA_KNN_RABITQ_RESCORE_MIN=400`, past the rule's x8 cap).
+        for e in estimators {
+            assert!(tenth_is_high(&probe(&q, &docs, e, 400), 20), "{e:?}");
+        }
+        // The floor never shortens the rule's list, and leaves f32 alone.
+        let scored: Vec<(u32, f64)> = (0..1000).map(|i| (i, 1.0 - i as f64 * 1e-6)).collect();
+        let loose = vec![0.5f32; 1000];
+        assert_eq!(
+            floored_shortlist_len(&scored, &loose, K, 40, true, 100),
+            320
+        );
+        assert_eq!(
+            floored_shortlist_len(&scored, &loose, K, 40, true, 400),
+            400
+        );
+        assert_eq!(floored_shortlist_len(&scored, &[], K, 40, false, 400), 40);
     }
 }
