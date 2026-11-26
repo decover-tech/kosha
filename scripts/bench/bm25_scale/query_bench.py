@@ -38,6 +38,8 @@ from pathlib import Path
 
 import requests
 
+import bench_internals
+
 
 def auth_headers(api_key: str | None) -> dict:
     return {"Authorization": f"Bearer {api_key}"} if api_key else {}
@@ -102,19 +104,24 @@ def payload_for(namespace: str, query_text: str, topk: int, qidx: int = 0) -> di
     return payload
 
 
-def read_blocks_decoded(session, host: str, admin_key: str | None) -> int | None:
-    """The server's scoring_blocks_decoded counter from GET /stats (#385);
-    None when not asked for, unreachable, or an older server without it."""
+def read_stats(session, host: str, admin_key: str | None) -> dict | None:
+    """GET /v1/stats (admin), for the counters diffed around a phase
+    (scoring_blocks_decoded #385, posting and doc-store reads); None when
+    not asked for or unreachable."""
     if not admin_key:
         return None
     try:
-        resp = session.get(f"{host}/stats", headers=auth_headers(admin_key), timeout=60)
+        resp = session.get(f"{host}/v1/stats", headers=auth_headers(admin_key), timeout=60)
         resp.raise_for_status()
-        value = resp.json().get("scoring_blocks_decoded")
-        return int(value) if value is not None else None
+        return resp.json()
     except Exception as e:  # noqa: BLE001 - reporting only, never fails a run
-        print(f"WARN: could not read scoring_blocks_decoded from /stats: {e}")
+        print(f"WARN: could not read /v1/stats: {e}")
         return None
+
+
+def blocks_decoded(stats: dict | None) -> int | None:
+    value = (stats or {}).get("scoring_blocks_decoded")
+    return int(value) if value is not None else None
 
 
 def load_queries(path: Path) -> list[str]:
@@ -188,7 +195,7 @@ def load_knn_vectors(path: Path, n_queries: int, dim: int = 1024) -> list[list[f
 def run_query(
     session, host, namespace, headers, query_text, topk, timeout,
     results, lock, errors, hit_counts, degraded_counts, qidx=0,
-    raw=None, seq=0, scheduled=0.0, start=0.0,
+    raw=None, seq=0, scheduled=0.0, start=0.0, rows=None,
 ):
     t0 = time.time()
     rec = None
@@ -204,7 +211,7 @@ def run_query(
         }
     try:
         resp = session.post(
-            f"{host}/search",
+            f"{host}/v1/namespaces/{namespace}/search",
             json=payload_for(namespace, query_text, topk, qidx),
             headers=headers,
             timeout=timeout,
@@ -226,6 +233,13 @@ def run_query(
             results.append(latency)
             hit_counts.append(hits)
             degraded_counts.append(degraded if degraded is not None else 0)
+            if rows is not None:
+                rows.append({
+                    "latency_ms": latency * 1000,
+                    "send_lag_ms": (t0 - scheduled) * 1000 if scheduled else None,
+                    "hits": hits,
+                    "server": body.get("timings"),
+                })
             if rec is not None:
                 rec.update(latency_ms=round(latency * 1000, 3), hits=hits)
                 if RAW_IDS:
@@ -282,6 +296,12 @@ def main() -> None:
         "run vector search (knn clause) instead of BM25",
     )
     ap.add_argument("--knn-field", default="text_emb")
+    ap.add_argument(
+        "--knn-dim",
+        type=int,
+        default=1024,
+        help="dimension of the --knn-embeddings records (msmarco embeddings are 1024)",
+    )
     ap.add_argument(
         "--knn-num-candidates",
         type=int,
@@ -341,12 +361,26 @@ def main() -> None:
     ap.add_argument(
         "--stats-api-key",
         default=None,
-        help="admin key for GET /stats: if set, read the server's "
+        help="admin key for GET /v1/stats: if set, read the server's "
         "scoring_blocks_decoded counter before and after the phase and report "
         "the delta and blocks decoded per successful request (#385). The "
         "counter is process wide, so it is only per-query when nothing else "
         "queries the server during the phase",
     )
+    ap.add_argument(
+        "--no-internals",
+        action="store_true",
+        help="leave the engine-internals block out of the summary (stage "
+        "breakdown from --server-timings, /v1/stats counter deltas from "
+        "--stats-api-key, server CPU/RSS sampled from /proc)",
+    )
+    ap.add_argument(
+        "--server-process",
+        default="kosha-server",
+        help="process name whose CPU and RSS are sampled during the phase "
+        "(Linux /proc; containers share the host's). Ignored when not found",
+    )
+    ap.add_argument("--server-pid", type=int, default=None, help="sample this pid instead")
     args = ap.parse_args()
     global OPERATOR, NO_CACHE, KNN_VECS, KNN_FIELD, KNN_NUM_CANDIDATES, SERVER_TIMINGS, RETURN_FIELDS, RAW_IDS
     OPERATOR = args.operator
@@ -358,7 +392,7 @@ def main() -> None:
     queries = load_queries(args.queries_file)
 
     if args.knn_embeddings:
-        vecs = load_knn_vectors(args.knn_embeddings, len(queries))
+        vecs = load_knn_vectors(args.knn_embeddings, len(queries), args.knn_dim)
         KNN_VECS = vecs
         KNN_FIELD = args.knn_field
         KNN_NUM_CANDIDATES = args.knn_num_candidates
@@ -371,6 +405,7 @@ def main() -> None:
     hit_counts: list[int] = []
     degraded_counts: list[int] = []
     raw: list[dict] | None = [] if args.raw_out else None
+    rows: list[dict] | None = None if args.no_internals else []
     lock = threading.Lock()
     threads: list[threading.Thread] = []
 
@@ -383,7 +418,11 @@ def main() -> None:
         f"duration={args.duration}s (~{int(args.qps * args.duration)} requests) order={args.order}"
     )
 
-    blocks_before = read_blocks_decoded(session, args.host, args.stats_api_key)
+    stats_before = read_stats(session, args.host, args.stats_api_key)
+    blocks_before = blocks_decoded(stats_before)
+    sampler = None
+    if not args.no_internals:
+        sampler = bench_internals.ResourceSampler(args.server_process, args.server_pid).start()
     start = time.time()
     next_send = start
     i = 0
@@ -414,6 +453,7 @@ def main() -> None:
                 i - 1,
                 next_send,
                 start,
+                rows,
             ),
             daemon=True,
         )
@@ -426,7 +466,9 @@ def main() -> None:
         th.join(timeout=args.timeout + 5)
 
     elapsed = time.time() - start
-    blocks_after = read_blocks_decoded(session, args.host, args.stats_api_key)
+    resources = sampler.stop(len(results)) if sampler is not None else None
+    stats_after = read_stats(session, args.host, args.stats_api_key)
+    blocks_after = blocks_decoded(stats_after)
     achieved_qps = len(results) / elapsed if elapsed > 0 else 0
 
     # Correctness signal, not just latency: a 200 with an empty/short page,
@@ -475,6 +517,19 @@ def main() -> None:
         delta = blocks_after - blocks_before
         summary["scoring_blocks_decoded"] = delta
         summary["scoring_blocks_decoded_per_request"] = (delta / len(results)) if results else float("nan")
+    if rows is not None:
+        # The engine taken apart: where each request's time went, the work
+        # it did, and what the server used (bench_internals.py).
+        internals = bench_internals.stage_breakdown(rows) or {}
+        counters = bench_internals.counter_deltas(
+            stats_before, stats_after, len(results), sum(hit_counts)
+        )
+        if counters:
+            internals["counters"] = counters
+        if resources:
+            internals["resources"] = resources
+        if internals:
+            summary["internals"] = internals
 
     print(json.dumps(summary, indent=2))
     if errors:

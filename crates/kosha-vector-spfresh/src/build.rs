@@ -9,7 +9,7 @@
 //! members far from its centroid: loose postings, large radii, and a
 //! radius-aware probe (kosha-query ranks postings by `max(0, d - r)`) that
 //! cannot rule them out. Unless `build_refine_rounds` is 0, the leaves are
-//! then refined: each round moves every vector to the nearest centroid among
+//! then refined: each round assigns every vector to the best centroid among
 //! its posting's `build_refine_candidates` nearest postings (found with a
 //! `CentroidIndex`, not a scan of all of them) and recomputes centroids;
 //! in the first round a stray the candidates may not cover looks up its
@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use crate::centroid_index::CentroidIndex;
 use crate::error::VectorIndexError;
 use crate::kmeans::balanced_bisect;
-use crate::point::{dot, mean_vector, normalize_in_place};
+use crate::point::{dot, elkan_cutoff, mean_vector, normalize_in_place};
 use crate::posting::{Posting, PostingEntry, PostingId};
 use crate::rng::DeterministicRng;
 use crate::{validate_config, ClusterIndex, ClusterIndexConfig};
@@ -95,6 +95,8 @@ pub(crate) fn build(
         owner_map,
         rng,
         defer_cascade_splits: false,
+        #[cfg(test)]
+        deferred_reassign: None,
     };
 
     if refine {
@@ -136,7 +138,8 @@ const STRAY_FACTOR: f32 = 1.25;
 
 /// Bounded nearest-centroid refinement of freshly bisected leaves: up to
 /// `build_refine_rounds` rounds, each moving every vector to the nearest
-/// centroid among its posting's `build_refine_candidates` nearest postings
+/// centroid (or the lowest anisotropic loss when opted in) among its
+/// posting's `build_refine_candidates` nearest postings
 /// (its own included; ties stay put), then recomputing every centroid. In
 /// the first round, a stray — far from every candidate, which the
 /// candidates cannot be shown to cover (see the triangle-inequality test
@@ -166,7 +169,15 @@ fn refine_postings(postings: &mut Vec<Posting>, config: &ClusterIndexConfig) {
         );
         let mut next: Vec<Vec<PostingEntry>> = (0..postings.len()).map(|_| Vec::new()).collect();
         let mut moved = 0usize;
-        for (pid, posting) in postings.iter_mut().enumerate() {
+        let eta = config.build_refine_anisotropic_eta.map(f64::from);
+        let prune = config.enable_elkan_pruning && eta.is_none();
+        let centroid_norms = (prune || eta.is_some()).then(|| {
+            postings
+                .iter()
+                .map(|p| dot(&p.centroid, &p.centroid))
+                .collect::<Vec<_>>()
+        });
+        for pid in 0..postings.len() {
             let near = centroids.nearest(&units[pid], candidates);
             // Every posting outside `near` is at least `reach` (an angle)
             // from this posting's centroid.
@@ -174,8 +185,26 @@ fn refine_postings(postings: &mut Vec<Posting>, config: &ClusterIndexConfig) {
                 Some(&far) if near.len() < units.len() => angle(dot(&units[pid], &units[far])),
                 _ => f32::INFINITY,
             };
+            let cutoff = if let Some(norms) = centroid_norms.as_ref().filter(|_| prune) {
+                // Only the actual candidate set must be bounded; the
+                // first-round stray lookup still runs as before.
+                let nearest = near
+                    .iter()
+                    .filter(|&&q| q != pid)
+                    .map(|&q| {
+                        if norms[pid].is_normal() && norms[q].is_normal() {
+                            1.0 - dot(&units[pid], &units[q]).clamp(-1.0, 1.0)
+                        } else {
+                            0.0
+                        }
+                    })
+                    .fold(2.0, f32::min);
+                elkan_cutoff(nearest, config.dim)
+            } else {
+                0.0
+            };
             // Pass 1: the best of the candidates, and its angle to `v`.
-            let picks: Vec<(PostingId, f32, f32)> = posting
+            let picks: Vec<(PostingId, f32, f32)> = postings[pid]
                 .entries
                 .iter()
                 .map(|entry| {
@@ -183,19 +212,52 @@ fn refine_postings(postings: &mut Vec<Posting>, config: &ClusterIndexConfig) {
                     // For a fixed vector, `dot(v, unit centroid)` orders
                     // centroids exactly as cosine distance does.
                     let own_score = dot(v, &units[pid]);
+                    let norm_squared = dot(v, v);
+                    let norm = norm_squared.sqrt().max(f32::MIN_POSITIVE);
+                    let own_cosine = own_score / norm;
                     let mut best = pid;
                     let mut best_score = own_score;
-                    for &q in &near {
-                        if q != pid {
-                            let s = dot(v, &units[q]);
-                            if s > best_score {
-                                best_score = s;
-                                best = q;
+                    if let (Some(eta), Some(centroid_norms)) = (eta, &centroid_norms) {
+                        // Score the same cosine-generated shortlist against
+                        // the unnormalized means, not the routing directions.
+                        let mut best_loss = anisotropic_loss(
+                            v,
+                            &postings[pid].centroid,
+                            centroid_norms[pid],
+                            norm,
+                            eta,
+                        );
+                        for &q in &near {
+                            if q != pid {
+                                let loss = anisotropic_loss(
+                                    v,
+                                    &postings[q].centroid,
+                                    centroid_norms[q],
+                                    norm,
+                                    eta,
+                                );
+                                if loss < best_loss {
+                                    best_loss = loss;
+                                    best = q;
+                                }
+                            }
+                        }
+                        best_score = dot(v, &units[best]);
+                    } else if !(cutoff > 0.0
+                        && 1.0 - own_cosine < cutoff
+                        && norm_squared.is_normal())
+                    {
+                        for &q in &near {
+                            if q != pid {
+                                let s = dot(v, &units[q]);
+                                if s > best_score {
+                                    best_score = s;
+                                    best = q;
+                                }
                             }
                         }
                     }
-                    let norm = dot(v, v).sqrt().max(f32::MIN_POSITIVE);
-                    (best, angle(best_score / norm), angle(own_score / norm))
+                    (best, angle(best_score / norm), angle(own_cosine))
                 })
                 .collect();
             // A stray (bisection's balance pass can push a member far from
@@ -218,10 +280,25 @@ fn refine_postings(postings: &mut Vec<Posting>, config: &ClusterIndexConfig) {
             } else {
                 f32::INFINITY
             };
-            for (entry, (mut best, best_angle, own_angle)) in posting.entries.drain(..).zip(picks) {
+            let entries = std::mem::take(&mut postings[pid].entries);
+            for (entry, (mut best, best_angle, own_angle)) in entries.into_iter().zip(picks) {
                 if best_angle > stray_floor && best_angle > reach - own_angle {
                     if let Some(&q) = centroids.nearest(&entry.vector, 1).first() {
-                        if dot(&entry.vector, &units[q]) > dot(&entry.vector, &units[best]) {
+                        let v = &entry.vector;
+                        let improves = if let (Some(eta), Some(norms)) = (eta, &centroid_norms) {
+                            let norm = dot(v, v).sqrt();
+                            anisotropic_loss(v, &postings[q].centroid, norms[q], norm, eta)
+                                < anisotropic_loss(
+                                    v,
+                                    &postings[best].centroid,
+                                    norms[best],
+                                    norm,
+                                    eta,
+                                )
+                        } else {
+                            dot(v, &units[q]) > dot(v, &units[best])
+                        };
+                        if improves {
                             best = q;
                         }
                     }
@@ -244,6 +321,25 @@ fn refine_postings(postings: &mut Vec<Posting>, config: &ClusterIndexConfig) {
     }
 }
 
+/// ScaNN §4: squared residual plus (η - 1) times the squared residual
+/// parallel to the input vector. The vector's fixed squared norm is omitted.
+fn anisotropic_loss(
+    v: &[f32],
+    centroid: &[f32],
+    centroid_norm_squared: f32,
+    norm: f32,
+    eta: f64,
+) -> f64 {
+    let product = f64::from(dot(v, centroid));
+    let norm = f64::from(norm);
+    let parallel = if norm > 0.0 {
+        norm - product / norm
+    } else {
+        0.0
+    };
+    f64::from(centroid_norm_squared) - 2.0 * product + (eta - 1.0) * parallel * parallel
+}
+
 /// The angle (radians) whose cosine is `cos`, clamped into range.
 fn angle(cos: f32) -> f32 {
     cos.clamp(-1.0, 1.0).acos()
@@ -261,4 +357,41 @@ fn leaf_posting(group: &[u32], by_id: &HashMap<u32, &Vec<f32>>, dim: usize) -> P
         })
         .collect();
     Posting { centroid, entries }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refine_anisotropic_penalizes_parallel_residual() {
+        let entry = |id, vector| PostingEntry {
+            id,
+            vector,
+            deleted: false,
+            version: 0,
+        };
+        let fixture = || {
+            vec![
+                Posting {
+                    centroid: vec![0.6, 0.0],
+                    entries: vec![entry(1, vec![1.0, 0.0])],
+                },
+                Posting {
+                    centroid: vec![0.9, 0.5],
+                    entries: vec![entry(2, vec![0.9, 0.5])],
+                },
+            ]
+        };
+        let mut cfg = ClusterIndexConfig::new(2);
+        cfg.build_refine_rounds = 1;
+        for eta in [None, Some(1.0), Some(4.0)] {
+            let mut postings = fixture();
+            cfg.build_refine_anisotropic_eta = eta;
+            cfg.enable_elkan_pruning = true;
+            refine_postings(&mut postings, &cfg);
+            assert_eq!(postings.len(), if eta == Some(4.0) { 1 } else { 2 });
+            assert_eq!(postings[0].entries[0].id, 1);
+        }
+    }
 }

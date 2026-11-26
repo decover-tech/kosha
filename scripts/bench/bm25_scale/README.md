@@ -200,8 +200,9 @@ the bound covers only the suite namespace), runs the workload unmeasured
 for `fill` seconds, and measures only the no-result-cache phase,
 `repeats` times (`warm_or_nocache_rN` / `knn_warm_nocache_rN`).
 S3 misses are part of the measured latency by design. It writes
-`footprint.tsv` (local bytes every 60 s) and `evictions.tsv` (files and
-MB the server evicted per stage, from its `disk cache evicted` lines).
+`footprint.tsv` (local bytes every 60 s), `phase_footprint.tsv` (start
+and end samples for each measured repeat), and `evictions.tsv` (files and MB
+the server evicted per stage).
 
 ### Disk-cache experiment input (research #389): `cache_experiment`
 
@@ -225,7 +226,22 @@ every file once on every path, which is what `KOSHA_CACHE_ACCOUNTING=exact`
 used to provide. A legacy control and a policy arm get the same effective
 capacity without it.
 
-Compare arms with `cache_sim.py p99ci --a <control raw-out files> --b <arm
+For each timed run, download the `bench-results` artifact and report the arm:
+
+```sh
+python3 scripts/bench/cache_sim/cache_sim.py arm --run-dir results > arm.json
+```
+
+The JSON includes per-repeat results and pooled latency percentiles, S3 work
+per submitted query, and estimated local GiB-hours and cost. Local occupancy
+is integrated between samples during measured repeats only; warm fill and
+the gaps between repeats are excluded. This prices occupied bytes, not the
+entire provisioned volume. Use the same deployment prices for all arms;
+`arm --help` lists the overrides. Check HTTP errors and degraded kNN
+requests before treating an arm as comparable. GETs are estimates from logged
+searches; failed requests may do work that the timing lines do not capture.
+
+Compare tails with `cache_sim.py p99ci --a <control raw-out files> --b <arm
 raw-out files>` (bootstrap CIs for p50/p99 and their difference).
 
 ### What each hit returns (`return_fields`: `ids` (default) or `all`)
@@ -361,6 +377,81 @@ Approximate times per stage:
 For comparison, `warm_gate=preload` on the original vector snapshot
 spends about 115 minutes in warmup alone, before its phases.
 
+### Codes-only vector tier comparison (#381)
+
+Use one commit, the same 10M MSMarco corpus and query workload, and equivalent
+starting caches (a fresh VM, or a wiped cache, for each arm). Build one
+sidecar snapshot per format using a fresh `vector_snapshot` name and
+`build_vector_snapshot=true`; pass `KOSHA_VECTOR_QUANTIZATION=f32`, `i8`,
+or `rabitq` in `server_env`. Reuse each snapshot for its flag-on/off pair.
+For every arm, use `suite=vector`, `warm_gate=queries`, `qps=8`,
+`duration=300`, `run_recall_check=true`, and `recall_sample=1000`.
+Include `KOSHA_KNN_RESCORE_STATS=1` in every arm. The bench enables search
+timing logs for all requests.
+
+| Arm | Format | Additional `server_env` |
+|---|---|---|
+| Control | f32 | none (repeat with global on to measure control overhead) |
+| i8 off | i8 | none |
+| i8 on | i8 | `KOSHA_KNN_GLOBAL_RESCORE=1` (strict bound by default; optional separate probabilistic-bound arm) |
+| RaBitQ off | rabitq | none |
+| RaBitQ on | rabitq | `KOSHA_KNN_GLOBAL_RESCORE=1` |
+
+The regular workflow recall step samples the *first* queries. For the #381
+success bar, use `keep_vm=true` and, before switching to the next arm, rerun
+`recall_check.py` against that arm with the same arguments as the workflow
+recall step plus `--sampling random --seed 384`. Save that JSON as
+`vector/recall.json` in the local copy of the archive. Use the same random
+sample and recall probe settings for every arm at a given comparison point.
+The standard warm latency phase uses the default query probe count (100);
+vary the probe settings consistently across arms for a curve, checking logged
+`knn_postings` for actual probe counts.
+
+From the repository root, point the report at downloaded run directories
+(each containing `meta.json` and `vector/`):
+
+```sh
+python3 scripts/bench/bm25_scale/rescore_report.py runs/f32-off runs/i8-off \
+    runs/i8-on runs/rabitq-off runs/rabitq-on
+```
+
+Add `--json` for per-counter distributions and sample counts. Format comes
+from vector column footers recorded in `vector/snapshot-build-info.json`;
+older archives without this metadata show an unknown format. Compare recall
+against warm p50/p99 at matched probe settings; compare each arm to the f32
+sidecar control for the 0.01 recall tolerance, 2× warm p50 reduction, and 10×
+local vector byte reduction. Warm-gate time means time for the workload to
+become cached, not time to preload a namespace. The local byte total includes
+vector indexes, offsets, and exact-vector files or cached spans. S3 bytes are
+the server's `s3_bytes`; ranged GETs sum the reported vector, postings, and page
+range counts, not whole-file requests. Missing counters are not zero, and
+incomplete log coverage is marked separately.
+
+The default report checks for whole `doc_vectors.bin` files in a codes-only
+run. Flag-off quantized arms can return unrescored estimates in this cohort;
+that is not a comparison to local per-segment rescoring. To compare the two
+rescoring algorithms with whole vectors local, run a separate matched cohort
+with `KOSHA_DOC_STORE_READ_MODE=whole` and report with
+`--allow-whole-sidecar`. Verify actual locality and the
+`knn_seg_unrescored` / `knn_seg_quantized` counters; enabling whole page reads
+does not guarantee the sidecar is present on every probed segment.
+
+### Defaults and the pass/fail bar (`bench_gate`)
+
+Every dispatch now runs the recall check (`run_recall_check=true`,
+`recall_sample=500`) and the `fractions` kNN sweep by default, so no kNN
+latency number is published without a paired recall number. The sweep adds
+about 55 minutes; clear `knn_sweep` to skip it.
+
+The last step, after teardown, runs `bench_gate.py` over the collected results
+and fails the run when a phase has errors or zero-hit requests, or when
+tie-tolerant recall@10 is below `recall_min` (0.93 by default), or when the
+recall check was expected and produced nothing. The sweep is never gated.
+Override the bar with `bench_gate="recall_min=0.9 max_error_rate=0.001"`, or
+report only with `bench_gate=off` (for example for a server_env experiment
+that trades recall on purpose). Running the gate after teardown means a
+failed bar never keeps the VM.
+
 ### kNN probe-budget sweep (`knn_sweep`, #384)
 
 Recall@10 against p50/p99 and postings probed, one point per server
@@ -391,11 +482,23 @@ table is appended to the job summary). Points:
   `a0rel1m500`, `a0rel0.5m1000` (`KOSHA_KNN_RELATIVE_MIN_PROBES` 500 /
   1000). The relative points all use alpha 0: at alpha 1 the best score
   is usually 0 and eps has no effect.
+- `bound`: the alpha-scaled bound stop (`KOSHA_KNN_BOUND_STOP_ALPHA`), 5
+  points: `f0.05` (baseline), `b1`, `b0.95`,
+  `b0.9`, `b0.85`. `b1` only skips postings whose similarity bound cannot
+  beat the segment's k-th score; the report's `knn_postings` column against
+  `f0.05` is the #384 success bar.
 - `label:ENV=V,ENV=V;label2:...`, over these knobs only:
   `KOSHA_KNN_BUDGET_FRACTION`, `KOSHA_KNN_BUDGET_MAX_CAP`,
   `KOSHA_KNN_RELATIVE_CUTOFF_EPS`, `KOSHA_KNN_RELATIVE_MIN_PROBES`,
-  `KOSHA_KNN_PROBE_RADIUS_ALPHA`. Include an `f0.05` point (or pass the
+  `KOSHA_KNN_PROBE_RADIUS_ALPHA`, `KOSHA_KNN_BOUND_STOP_ALPHA`. Include an
+  `f0.05` point (or pass the
   report `--baseline`) for the comparison column.
+- `radius`: the #458 probe-order radius (`KOSHA_KNN_PROBE_RADIUS`), 5
+  points: `f0.05` (baseline, max radius), `rp90`, `rp50`, `rp90a0.5`
+  (p90 at alpha 0.5) and `rp90rel1m500` (p90, alpha 0, eps 1, min probes
+  500). Only meaningful on a `vector_snapshot` built with
+  `KOSHA_VECTOR_WRITE_VERSION=5` (p50/p90 stored); older segments fall
+  back to the max radius.
 
 `recall_check.py` reports, per query and summarized (mean, p1/p5/p10/p50):
 exact-id recall@k, ANN-Benchmarks distance-threshold recall (a returned
@@ -428,6 +531,7 @@ The #384 engine flags are off by default:
 | `KOSHA_KNN_RELATIVE_CUTOFF_EPS` | unset (off) | unfiltered kNN probes a posting only if its rank score <= (1 + eps) x the best posting's score (SPANN's relative cutoff); never fewer than `KOSHA_KNN_RELATIVE_MIN_PROBES` postings, never more than the fixed budget |
 | `KOSHA_KNN_RELATIVE_MIN_PROBES` | the query's `num_candidates` | floor for the relative cutoff |
 | `KOSHA_KNN_PROBE_RADIUS_ALPHA` | 1.0 (`d - radius`, unchanged) | posting rank score `max(0, d(q,c) - alpha x radius)`; 0 = raw centroid distance |
+| `KOSHA_KNN_BOUND_STOP_ALPHA` | unset (off) | a segment's probe skips a budgeted posting once its k-th guaranteed similarity >= alpha x the posting's similarity ceiling (angle triangle inequality on centroid distance and radius); never more than the fixed budget |
 
 With the default alpha the best posting's score is often clamped to 0, so
 the relative cutoff then falls back to `min_probes`; SPANN's own rule is
@@ -504,6 +608,57 @@ Details and caveats:
   four and dispatches fine).
   Further experiment knobs go in `server_env` rather than new inputs.
 
+### Distance kernels and x86-64-v3 (#382, experimental)
+
+For a kernel-only check on a v3-capable x86 host, run the same benchmark
+with the default target and with v3 codegen:
+
+```bash
+cargo bench --locked -p kosha-vector-spfresh --bench distance_kernels
+RUSTFLAGS="-C target-cpu=x86-64-v3" cargo bench --locked -p kosha-vector-spfresh --bench distance_kernels
+```
+
+Compare the scalar reference, the current 8-lane dot, and the wider
+dots on the same synthetic f32 posting. Compare LUT and popcount on the
+same RaBitQ posting; query preparation is timed separately. These
+numbers do not include the cost of the real posting scan.
+
+Use one revision that contains the experiment and the zero-copy posting
+scan (#435). The old `research/382-bench-integration` ref predates the
+scan. Keep the host type, 10M snapshots, cache policy, query order, QPS,
+and duration fixed within each comparison. Use `mode=restore`,
+`warm_gate=queries`, `return_fields=ids`, and `run_recall_check=true`;
+compare the warm result-cache-off phases after the warm gate reports ready.
+
+| Comparison | `suite` | Vector snapshot | `rustflags` | `server_env` |
+|---|---|---|---|---|
+| A: baseline | both | `msmarco-10m-vec` (f32) | empty | `KOSHA_VECTOR_DOT_LANES=8` |
+| B: codegen only | both | same f32 | `-C target-cpu=x86-64-v3` | `KOSHA_VECTOR_DOT_LANES=8` |
+| C: wider dot | both | same f32 | same v3 | `KOSHA_VECTOR_DOT_LANES=16` (or `32`/`64`) |
+| D: RaBitQ LUT | vector | dedicated RaBitQ | same v3 | `KOSHA_VECTOR_RABITQ_ESTIMATOR=lut` |
+| E: RaBitQ popcount | vector | same RaBitQ | same v3 | `KOSHA_VECTOR_RABITQ_ESTIMATOR=popcount` |
+
+Compare B to A for BM25 and kNN codegen, C to B for widening, and E to D
+for the estimator. Only run C if the kernel bench on the target host
+shows a wider dot beating 8 lanes. For D and E, use the same snapshot
+built with `KOSHA_VECTOR_QUANTIZATION=rabitq`; changing the estimator on
+an f32 snapshot does not exercise either RaBitQ kernel.
+
+Before comparing, check `meta.json` for the inputs and
+`zgrep 'vector kernels (#382' server/full.log.gz` for the effective
+lanes and estimator and for `x86_features=baseline` (A) or
+`x86_features=popcnt,avx2,fma,bmi2` (B–E). A sets the default lane count
+explicitly so it also emits this line.
+
+Use `knn_log_stats.py` on each `vector/server/knn_warm_nocache.log.gz`
+for `score_ms` and the read/decode/dot split. Judge the 2× `score_ms`
+target using the best f32 candidate vs A, not the isolated dot benchmark.
+Use `topk_parity.py` on the matching f32 request logs to check ranked IDs
+and scores within float tolerance. For E vs D use recall@10 against the same ground truth:
+4-bit query rounding changes approximate scores, not the on-disk format.
+Record recall@10 against warm p50/p99 latency, local bytes, S3 bytes,
+and GETs/query; report the warm BM25 p50/p90/p99 side effect separately.
+
 ### Docid reordering and blocks decoded (#385, experimental)
 
 `KOSHA_DOC_REORDER=bp` makes `kosha-build-segments` (and compaction)
@@ -546,6 +701,35 @@ reorders; check the build log for both before trusting a `bp` snapshot.
 Compaction reorders only when `KOSHA_DOC_REORDER_COMPACTION_MAX_DOCS` is
 also set (default 0: never), because it buffers the merged output in
 memory; the bench runs with compaction off.
+
+## Engine internals in every result
+
+p50/p90/p99 say how fast a phase was, not why. Each phase summary
+(`<phase>.json`) also carries an `internals` block, built by
+`bench_internals.py` from data the run already collects, and the
+benchmark workflow prints it under the latency table
+(`internals_report.py <results-dir>`):
+
+- **Where the time goes:** the server's per-request stage timings
+  (`--server-timings`, needs `KOSHA_DASHBOARD=on`): queue, admit, hydrate,
+  bm25_stats, score and materialize, each with p50/p90/p99/mean and its
+  share of mean server time, plus time no stage covers (`other_ms`) and
+  time outside the engine (client latency minus server total).
+- **Tail vs median:** mean stage times for the slowest 1% of requests next
+  to the p45-p55 band, so a p99 reads as "more hydrate" or "more score".
+- **Work counters:** `/v1/stats` deltas across the phase
+  (`--stats-api-key`): scoring blocks decoded and posting / doc-store reads,
+  per request and per returned hit. Process-wide, so only per-query when
+  nothing else queries the server during the phase.
+- **I/O and cache:** S3 rounds and MB per request, fully-cached and
+  result-cache rates.
+- **Resources:** CPU cores and RSS of the `kosha-server` process, and host
+  CPU, sampled once a second from `/proc` (`--server-process`,
+  `--server-pid`; a no-op off Linux).
+
+All of it is reporting only: anything missing is left out, never failing a
+run. `--no-internals` drops the block. For per-request detail use
+`--raw-out` and `analyze_tail.py` (below).
 
 ## Logs and tail analysis
 

@@ -29,11 +29,11 @@ kosha_client/
 ```bash
 # From repo root — generate OpenAPI spec from proto
 make openapi
-# The spec lands at gen/openapi/kosha.yaml
+# The spec lands at api/openapi/v1/kosha.openapi.json (checked in)
 
 # Generate Python stubs
 npx @openapitools/openapi-generator-cli generate \
-  -i gen/openapi/kosha.yaml \
+  -i api/openapi/v1/kosha.openapi.json \
   -g python \
   -o clients/python/kosha_client/stubs
 ```
@@ -43,6 +43,43 @@ npx @openapitools/openapi-generator-cli generate \
 Phase 1 ships with a lightweight hand-written client (`client.py`) that directly calls the
 Kosha HTTP API. As the API stabilises, the hand-written code will shrink to just `transport.py`
 + `compat.py` + the delegation layer in `client.py`.
+
+Since 0.3.0 the client calls only the `/v1` API (`/v1/namespaces/{ns}/documents`,
+`.../replace`, `.../search`, ...), so it works against servers with
+`KOSHA_LEGACY_ROUTES=off`; 0.2.x needs the legacy routes on.
+
+**Server compatibility.** Upgrade the server before upgrading the SDK.
+Partial updates (`update()`, bulk `update` actions, `update_by_query`) use
+`POST /v1/namespaces/{ns}/replace` and require a server that supports it
+(API contract 0.10.0 or later). The SDK surfaces any error from that
+operation rather than retrying it on the deprecated route. `KoshaRequestError`
+carries the server's error model: `code`, `retryable`, `retry_after_ms` and
+`request_id` (see [docs/api/errors.md](../../docs/api/errors.md)), plus
+`attempts`.
+
+**Retries.** Every request follows the retry policy the TypeScript and Go
+SDKs share ([clients/conformance/RETRY.md](../conformance/RETRY.md)): an
+error the server marks `"retryable": true` (or a bare 429/503 from an older
+server or a proxy) is retried after the server's `retry_after_ms` /
+`Retry-After`, else with jittered backoff; `"retryable": false` (a quota) is
+never retried. `max_retries` (default 3) counts attempts, so `max_retries=1`
+fails fast. A connection that could not be opened is retried for every
+operation; a timeout after the request was sent only for idempotent ones
+(search, upsert, merge, delete-by-query, flush, every GET), unless you pass
+`retry_non_idempotent=True`. `retry_on_timeout=False` turns off every
+transport-error retry (timeouts, resets, refused connections, DNS
+failures), as in 0.2.x; HTTP error responses still follow the policy.
+
+**Native helpers.** `search_all(namespace, body, page_size=None)` yields
+every hit of a native `/v1` search body, paging with `search_after` (the
+sort gets an `_id` tie-break); `bulk_index(namespace, documents, ...)`
+upserts native documents in batches by count and bytes, with bounded
+concurrency and per-batch failures (`BulkError.result`). A batch closes
+before its request body (the bytes actually sent, envelope included) would
+pass `max_bytes_per_batch`, so the cap can be set to a tenant's
+`max_body_bytes`. They take Kosha's
+own bodies, not OpenSearch DSL, and behave like `searchAll` / `bulkIndex`
+in the TypeScript and Go SDKs.
 
 ## Supported APIs
 
@@ -158,6 +195,45 @@ alongside. If the provider times out or fails, hits come back in search order an
 
 ## Changelog
 
+### 0.3.1
+
+- **Behavior change (type inference):** a `_source` value that is a list of equal-length numeric
+  lists, each at least 8 long (per-token embeddings from a ColBERT-style model), is now sent as
+  one `Vector` field holding the JSON bag, which the server indexes for late-interaction
+  (MaxSim) search (issue #205). It used to be sent as a `Keyword` holding the same JSON. Ragged
+  lists, lists of shorter tuples (polygons, bounding-box pairs) and non-numeric nested lists keep
+  the `Keyword` mapping. Documents read back unchanged either way. If you index such values
+  today and filter on them by exact match (a `Keyword` behavior), keep that field out of the
+  upgrade or reindex: new writes send it as `Vector`, which is not filterable.
+- `knn` passes `vectors` (a bag of query token vectors) and `scoring` (`"cosine"` or
+  `"late_interaction"`) through to the server. `vector` with `vectors`, or either with
+  `query_text`, is refused.
+
+### 0.3.0
+
+- Calls only the `/v1` API (see "Current state").
+- **Behavior change:** HTTP errors are retried under the shared policy
+  ([clients/conformance/RETRY.md](../conformance/RETRY.md)): 429 and 503,
+  and any error with `"retryable": true`, are retried (up to `max_retries`
+  attempts in total, 3 by default) after the server's delay. `max_retries=1`
+  restores fail-fast.
+- **Behavior change:** a timeout after the request was sent is no longer
+  retried for non-idempotent operations (namespace create, schema put,
+  branches, shards) unless `retry_non_idempotent=True`. Merges sent to the
+  deprecated `POST /replace` (pre-0.9 servers) still count as idempotent.
+- `retry_on_timeout=False` still stops every transport-error retry,
+  refused connections and DNS failures included, as in 0.2.x.
+- **Behavior change:** request bodies are compact UTF-8 JSON (no spaces,
+  non-ASCII text unescaped), the same bytes the TypeScript and Go SDKs send.
+  The server reads them the same; bodies with non-ASCII text are smaller.
+- `KoshaRequestError` gains `code` (falling back to a tenant-limit
+  `reason`), `retryable`, `retry_after_ms`, `request_id` and `attempts`.
+- New `search_all()` and `bulk_index()` native helpers.
+- The 0.2.17 retry rules are replaced by the shared policy above (503 is
+  retried for writes too; 502/504 only for idempotent operations). The
+  0.2.17 `retry_budget` (seconds) is still accepted and sets
+  `total_budget_ms`. Connections stay kept alive and pooled as in 0.2.17.
+
 ### 0.2.17
 
 - **Behavior change:** the transport retries what the server asks it to retry. A `429`
@@ -214,3 +290,34 @@ alongside. If the provider times out or fails, hits come back in search order an
   `number_of_shards`, `number_of_replicas` or `knn`; it returns only `provided_name`.
 - `get_mapping` / `get_settings` / `get` accept a list or comma-separated string of indices.
 - Removed application-specific field names from examples, tests and docstrings.
+
+### 0.2.11.2
+
+Keep-alive on top of 0.2.11.1 (which it includes); nothing else from 0.2.12+ is included.
+
+- Connections are kept alive and reused, instead of one connection (one DNS lookup, one TCP
+  handshake) per request. A process keeps at most 10 idle connections per host, for 15 s
+  idle (the server closes at 30 s) and 60 s in total, so new server pods get traffic; all
+  clients for the same host share them, and the pool is thread-safe and reset in a forked
+  child. A read whose reused connection turns out closed is resent once on a new
+  connection; a write takes the connection-error retry. Timeouts and errors are those of
+  `urlopen` as before. A host that the `*_proxy` environment sends through a proxy still
+  uses `urlopen` per request.
+
+### 0.2.11.1
+
+Retry-only release on top of 0.2.11; nothing else from 0.2.12+ is included.
+
+- **Behavior change:** the transport retries what the server asks it to retry. A `429`
+  (any request) and a `502`/`503`/`504` on a read (`GET`, or a `POST` to the `search`
+  route) are retried after the server's `Retry-After` plus jitter, or a full-jitter
+  exponential backoff without one. Attempts in total are `max_retries` (default 3), and no
+  retry starts later than `retry_budget` seconds (default 20) after the first attempt; a
+  `Retry-After` that does not fit the budget (a quota refusal says 60 s) raises at once.
+  `5xx` on writes, `500` and every other `4xx` (including `402`) are raised immediately, as
+  before. `retry_budget=0` restores the old behavior.
+- The attempts and the budget apply **per HTTP call**: `bulk` (one call per namespace and
+  operation, plus a flush per namespace, per `helpers.bulk` chunk) can wait up to
+  `retry_budget` once per call.
+- An error body that is not a JSON object now raises `KoshaRequestError` with the raw body as
+  `error`, instead of an `AttributeError`.

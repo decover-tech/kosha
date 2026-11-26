@@ -79,9 +79,17 @@ rm -f /tmp/pg-kosha.sql.gz
 # Re-key a bare-named namespace to its scoped id (no-op when the dump is
 # already scoped). manifests.namespace_id references namespaces.id, so:
 # insert the new id, repoint the manifest, drop the old id — one txn.
+#
+# A dump can hold both forms: pg_dump takes every namespace, so a stack
+# that once restored a pre-#262 snapshot carries a stale bare row into
+# every snapshot taken on it later. The scoped row is the one this
+# snapshot's segments belong to; drop the bare one instead of repointing
+# it onto the scoped key (manifests_pkey violation).
 sudo docker exec -i pg psql -U postgres -q -v ON_ERROR_STOP=1 \
   -v bare="$NS" -v scoped="$SCOPED" kosha <<'SQL'
 BEGIN;
+DELETE FROM kosha.manifests WHERE namespace_id = :'bare'
+  AND EXISTS (SELECT 1 FROM kosha.manifests WHERE namespace_id = :'scoped');
 INSERT INTO kosha.namespaces (id, created_at)
   SELECT :'scoped', created_at FROM kosha.namespaces WHERE id = :'bare'
   ON CONFLICT (id) DO NOTHING;
@@ -105,7 +113,7 @@ else
   echo "LOCAL-CACHE-WIPED $SCOPED"
 fi
 sudo docker start kosha >/dev/null
-until curl -sf http://127.0.0.1:8080/healthz >/dev/null; do sleep 3; done
+until curl -sf http://127.0.0.1:8080/v1/healthz >/dev/null; do sleep 3; done
 
 # Segment count matters for anything that reasons about a per-query probe
 # budget spread across segments (e.g. knn.num_candidates is a whole-query

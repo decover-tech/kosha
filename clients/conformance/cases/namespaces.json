@@ -1,0 +1,40 @@
+[
+  {
+    "id": "namespaces.lifecycle",
+    "description": "Create, list, delete; a deleted namespace is gone.",
+    "covers": ["KoshaService_CreateNamespace", "KoshaService_ListNamespaces", "KoshaService_DeleteNamespace", "KoshaService_GetNamespaceSchema"],
+    "steps": [
+      { "op": "create_namespace", "expect": { "ok": true } },
+      { "op": "list_namespaces", "expect": { "ids_include": ["$NS"] } },
+      { "op": "delete_namespace", "expect": { "ok": true } },
+      {
+        "op": "get_schema",
+        "expect": { "error": { "kind": "http", "status": 404, "code": "namespace_not_found", "retryable": false } }
+      }
+    ]
+  },
+  {
+    "id": "namespaces.create_conflict",
+    "description": "Creating a namespace twice is a 409 that is not retried.",
+    "covers": ["KoshaService_CreateNamespace"],
+    "setup": [{ "op": "create_namespace" }],
+    "steps": [
+      {
+        "op": "create_namespace",
+        "expect": { "error": { "kind": "http", "status": 409, "code": "already_exists", "retryable": false, "has_request_id": true } }
+      }
+    ]
+  },
+  {
+    "id": "namespaces.schema_round_trip",
+    "description": "A schema put on an existing namespace reads back.",
+    "covers": ["KoshaService_PutNamespaceSchema", "KoshaService_GetNamespaceSchema"],
+    "setup": [
+      { "op": "create_namespace", "args": { "schema": { "fields": { "title": { "type": "text", "stored": true, "indexed": true } } } } }
+    ],
+    "steps": [
+      { "op": "put_schema", "args": { "schema": { "fields": { "extra": { "type": "keyword", "stored": true, "indexed": true } } } }, "expect": { "ok": true } },
+      { "op": "get_schema", "expect": { "ids_include": ["extra"] } }
+    ]
+  }
+]

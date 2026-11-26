@@ -126,8 +126,9 @@ impl S3Config {
         }
     }
 
-    /// [`S3Config::from_env`] that returns an invalid encryption setting as
-    /// an error instead of exiting.
+    /// [`S3Config::from_env`] that returns an invalid encryption setting
+    /// (or a plain-HTTP endpoint under `KOSHA_INTERNAL_TLS=required`) as an
+    /// error instead of exiting.
     pub fn try_from_env() -> Result<Option<Self>, String> {
         let Ok(bucket) = std::env::var("KOSHA_S3_BUCKET") else {
             return Ok(None);
@@ -162,6 +163,9 @@ impl S3Config {
             });
 
         let sse = SseConfig::from_env()?;
+        // Encryption in transit to S3 (#343): `KOSHA_INTERNAL_TLS=required`
+        // refuses a plain-HTTP custom endpoint.
+        crate::internal_tls::check_s3_endpoint_env()?;
 
         Ok(Some(Self {
             bucket,
@@ -429,7 +433,7 @@ pub mod sse {
         (!legacy_shard).then_some(tenant)
     }
 
-    fn validate_key_id(what: &str, key: &str) -> Result<String, String> {
+    pub(super) fn validate_key_id(what: &str, key: &str) -> Result<String, String> {
         if key.is_empty() {
             return Err(format!("{what}: empty KMS key id"));
         }
@@ -741,6 +745,8 @@ pub mod sse {
     }
 }
 
+type TenantKmsKeyLookup = dyn Fn(&str) -> Result<Option<String>, KoshaError> + Send + Sync;
+
 /// S3-backed storage that wraps a local cache and uploads/downloads
 /// segment files to/from an S3 bucket.
 ///
@@ -757,7 +763,9 @@ pub struct S3Storage {
     prefix: String,
     rt: tokio::runtime::Runtime,
     client: aws_sdk_s3::Client,
+    custom_endpoint: bool,
     sse: SseConfig,
+    tenant_kms_key_lookup: Option<Box<TenantKmsKeyLookup>>,
 }
 
 impl Debug for S3Storage {
@@ -805,7 +813,9 @@ impl S3Storage {
             prefix: config.prefix,
             rt,
             client,
+            custom_endpoint: config.endpoint.is_some(),
             sse: config.sse,
+            tenant_kms_key_lookup: None,
         })
     }
 
@@ -817,8 +827,27 @@ impl S3Storage {
     /// The SSE headers for a write of `logical_path` (unprefixed; the
     /// destination path for a copy). Apply them with
     /// [`ApplySse::apply_sse`].
-    pub fn sse_for_path(&self, logical_path: &str) -> Option<ObjectSse> {
-        self.sse.for_path(logical_path)
+    pub fn sse_for_path(&self, logical_path: &str) -> Result<Option<ObjectSse>, KoshaError> {
+        let mut headers = self.sse.for_path(logical_path);
+        if let (sse::SseMode::AwsKms, Some(resolve), Some(tenant), Some(headers)) = (
+            self.sse.mode,
+            &self.tenant_kms_key_lookup,
+            sse::tenant_of_path(logical_path),
+            &mut headers,
+        ) {
+            if let Some(key) = resolve(tenant)? {
+                headers.kms_key_id = Some(
+                    sse::validate_key_id("control-plane tenant KMS key", &key)
+                        .map_err(KoshaError::ControlPlane)?,
+                );
+            }
+        }
+        Ok(headers)
+    }
+
+    #[cfg(feature = "postgres")]
+    pub fn set_tenant_kms_key_store(&mut self, store: kosha_control::PgStore) {
+        self.tenant_kms_key_lookup = Some(Box::new(move |tenant| store.tenant_kms_key_id(tenant)));
     }
 
     pub fn bucket(&self) -> &str {
@@ -835,6 +864,37 @@ impl S3Storage {
 
     pub fn s3_key(&self, path: &str) -> String {
         join_s3_key(&self.prefix, path)
+    }
+
+    pub(crate) fn read_uncached(&self, path: &str) -> Result<Vec<u8>, KoshaError> {
+        self.rt.block_on(Self::read_remote_bytes(
+            &self.client,
+            &self.bucket,
+            &self.s3_key(path),
+        ))
+    }
+
+    pub(crate) fn namespace_centroid_source(
+        &self,
+    ) -> impl Fn(&str) -> Option<Vec<u8>> + Send + Sync + 'static {
+        let runtime = self.rt.handle().clone();
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let prefix = self.prefix.clone();
+        move |path| {
+            let key = join_s3_key(&prefix, path);
+            runtime
+                .block_on(Self::read_remote_bytes(&client, &bucket, &key))
+                .ok()
+        }
+    }
+
+    pub(crate) fn upload_namespace_centroids(
+        &self,
+        path: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(), KoshaError> {
+        self.upload_bytes(bytes, path)
     }
 
     /// Upload a locally-built segment directory and commit it (#231): every
@@ -888,6 +948,11 @@ impl S3Storage {
         // Each task reads its own file, so at most `upload_concurrency`
         // files are in memory at once, not the whole segment.
         let limit = Arc::new(tokio::sync::Semaphore::new(upload_concurrency()));
+        let commit_path = logical_dir
+            .join(segment_commit::COMMIT_FILE)
+            .to_string_lossy()
+            .into_owned();
+        let sse = self.sse_for_path(&commit_path)?;
         let uploads: Vec<(String, PathBuf, String, Option<ObjectSse>)> = names
             .iter()
             .map(|name| {
@@ -896,7 +961,7 @@ impl S3Storage {
                     name.clone(),
                     local_dir.join(name),
                     self.s3_key(&logical_path),
-                    self.sse_for_path(&logical_path),
+                    sse.clone(),
                 )
             })
             .collect();
@@ -938,13 +1003,9 @@ impl S3Storage {
                 None => Ok(files),
             }
         })?;
-        let commit_path = logical_dir
-            .join(segment_commit::COMMIT_FILE)
-            .to_string_lossy()
-            .into_owned();
         segment_commit::commit_uploaded_files(files, |commit| {
             self.local.write(&commit_path, &commit)?;
-            self.upload_bytes(commit, &commit_path)
+            self.upload_bytes_with_sse(commit, &commit_path, sse)
         })
     }
 
@@ -957,10 +1018,19 @@ impl S3Storage {
     /// Upload bytes to S3 at `logical_path` (unprefixed), with its SSE
     /// headers. Uses multi-part upload for payloads > 5MB.
     fn upload_bytes(&self, data: Vec<u8>, logical_path: &str) -> Result<(), KoshaError> {
+        let sse = self.sse_for_path(logical_path)?;
+        self.upload_bytes_with_sse(data, logical_path, sse)
+    }
+
+    fn upload_bytes_with_sse(
+        &self,
+        data: Vec<u8>,
+        logical_path: &str,
+        sse: Option<ObjectSse>,
+    ) -> Result<(), KoshaError> {
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         let key = self.s3_key(logical_path);
-        let sse = self.sse_for_path(logical_path);
         self.rt
             .block_on(async move { put_bytes(client, bucket, key, data, sse).await })
     }
@@ -1133,38 +1203,9 @@ impl S3Storage {
 
     /// Download a file from S3 to local cache.
     fn download_from_s3(&self, s3_key: &str, local_path: &Path) -> Result<Vec<u8>, KoshaError> {
-        let client = self.client.clone();
-        let bucket = self.bucket.clone();
-        let key = s3_key.to_string();
-
-        let data = self.rt.block_on(async move {
-            let resp = client
-                .get_object()
-                .bucket(&bucket)
-                .key(&key)
-                .send()
-                .await
-                .map_err(|e| {
-                    KoshaError::NotFound(format!(
-                        "S3 get_object: {}",
-                        log_get_object_error(&key, &e)
-                    ))
-                })?;
-
-            let bytes = resp
-                .body
-                .collect()
-                .await
-                .map_err(|e| {
-                    KoshaError::NotFound(format!(
-                        "S3 read body: {}",
-                        log_s3_error("read body", &key, &e)
-                    ))
-                })?
-                .into_bytes();
-            Ok::<Vec<u8>, KoshaError>(bytes.to_vec())
-        })?;
-
+        let data = self
+            .rt
+            .block_on(Self::read_remote_bytes(&self.client, &self.bucket, s3_key))?;
         if let Some(parent) = local_path.parent() {
             kosha_core::create_dir_named(parent)?;
         }
@@ -1177,8 +1218,36 @@ impl S3Storage {
                 local_path.display()
             )
         })?;
-
         Ok(data)
+    }
+
+    async fn read_remote_bytes(
+        client: &aws_sdk_s3::Client,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Vec<u8>, KoshaError> {
+        let resp = client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| {
+                KoshaError::NotFound(format!("S3 get_object: {}", log_get_object_error(key, &e)))
+            })?;
+
+        let bytes = resp
+            .body
+            .collect()
+            .await
+            .map_err(|e| {
+                KoshaError::NotFound(format!(
+                    "S3 read body: {}",
+                    log_s3_error("read body", key, &e)
+                ))
+            })?
+            .into_bytes();
+        Ok(bytes.to_vec())
     }
 
     /// List object key basenames (and sizes) under a logical (unprefixed)
@@ -1437,6 +1506,92 @@ impl S3Storage {
         )
     }
 
+    /// Upload a local file to `logical_path` as an object of `tenant`
+    /// (#347 exports, which live under `_exports/` where
+    /// [`SseConfig::for_path`] would see no tenant): the tenant's SSE key
+    /// applies. The file is read whole; export parts are bounded by
+    /// `KOSHA_EXPORT_PART_BYTES`.
+    pub fn put_file_for_tenant(
+        &self,
+        local: &Path,
+        logical_path: &str,
+        tenant: &str,
+    ) -> Result<(), KoshaError> {
+        let data = std::fs::read(local).map_err(KoshaError::Io)?;
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key = self.s3_key(logical_path);
+        let sse = self.sse.for_tenant(Some(tenant));
+        self.rt
+            .block_on(async move { put_bytes(client, bucket, key, data, sse).await })
+    }
+
+    /// Stream one object into a local file (created or truncated), without
+    /// going through the segment cache. Returns its length.
+    pub fn get_object_to_file(&self, logical_path: &str, dest: &Path) -> Result<u64, KoshaError> {
+        use tokio::io::AsyncWriteExt;
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key = self.s3_key(logical_path);
+        let dest = dest.to_path_buf();
+        self.rt.block_on(async move {
+            let resp = client
+                .get_object()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 get_object: {}",
+                        log_get_object_error(&key, &e)
+                    ))
+                })?;
+            let mut body = resp.body;
+            let mut file = tokio::fs::File::create(&dest).await?;
+            let mut written = 0u64;
+            while let Some(chunk) = body.try_next().await.map_err(|e| {
+                KoshaError::NotFound(format!(
+                    "S3 read body: {}",
+                    log_s3_error("read body", &key, &e)
+                ))
+            })? {
+                file.write_all(&chunk).await?;
+                written += chunk.len() as u64;
+            }
+            file.flush().await?;
+            Ok(written)
+        })
+    }
+
+    /// A presigned `GET` URL for `logical_path`, valid for `expires_in`.
+    pub fn presign_get(
+        &self,
+        logical_path: &str,
+        expires_in: std::time::Duration,
+    ) -> Result<String, KoshaError> {
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key = self.s3_key(logical_path);
+        let config = aws_sdk_s3::presigning::PresigningConfig::expires_in(expires_in)
+            .map_err(|e| KoshaError::NotFound(format!("presigning config: {e}")))?;
+        self.rt.block_on(async move {
+            client
+                .get_object()
+                .bucket(&bucket)
+                .key(&key)
+                .presigned(config)
+                .await
+                .map(|request| request.uri().to_string())
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 presign get_object: {}",
+                        log_s3_error("presign get_object", &key, &e)
+                    ))
+                })
+        })
+    }
+
     /// Delete one object from S3, surfacing failures (unlike the trait's
     /// `delete`, which predates GC and is best-effort remotely).
     pub fn delete_remote(&self, path: &str) -> Result<(), KoshaError> {
@@ -1460,11 +1615,8 @@ impl S3Storage {
         })
     }
 
-    /// Delete every object under a logical directory, recursively: a
-    /// deleted namespace's segments, footers and deletion sidecars
-    /// (`DELETE /v1/namespaces/{ns}`). Paginated listing, `DeleteObjects`
-    /// in batches of up to 1000 keys. Returns how many objects were
-    /// deleted. Refuses an empty path (the whole bucket prefix).
+    /// Delete current objects under a logical directory, recursively.
+    /// Refuses an empty path (the whole bucket prefix).
     pub fn delete_prefix(&self, path: &str) -> Result<usize, KoshaError> {
         if path.trim_matches('/').is_empty() {
             return Err(KoshaError::NotFound(
@@ -1533,6 +1685,260 @@ impl S3Storage {
                 }
             }
             Ok(deleted)
+        })
+    }
+
+    fn erasure_prefix(&self, path: &str) -> Result<String, KoshaError> {
+        let path = path.trim_matches('/');
+        if path.is_empty() {
+            return Err(KoshaError::NotFound(
+                "refusing to delete the whole S3 prefix".into(),
+            ));
+        }
+        Ok(format!("{}/", self.s3_key(path)))
+    }
+
+    async fn erasure_page(
+        &self,
+        prefix: &str,
+        selected: &impl Fn(&str) -> bool,
+    ) -> Result<Vec<aws_sdk_s3::types::ObjectIdentifier>, KoshaError> {
+        let mut markers = (None, None);
+        loop {
+            let page = self
+                .client
+                .list_object_versions()
+                .bucket(&self.bucket)
+                .prefix(prefix)
+                .set_key_marker(markers.0.clone())
+                .set_version_id_marker(markers.1.clone())
+                .send()
+                .await
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 list_object_versions: {}",
+                        log_s3_error("list_object_versions", prefix, &e)
+                    ))
+                })?;
+            let entries = page
+                .versions()
+                .iter()
+                .map(|v| (v.key(), v.version_id()))
+                .chain(
+                    page.delete_markers()
+                        .iter()
+                        .map(|v| (v.key(), v.version_id())),
+                );
+            let mut matches = Vec::new();
+            for (key, version) in entries {
+                let (Some(key), Some(version)) = (key, version) else {
+                    return Err(KoshaError::NotFound(
+                        "S3 version listing returned an entry without a key or version ID".into(),
+                    ));
+                };
+                if !key.starts_with(prefix) {
+                    return Err(KoshaError::NotFound(
+                        "S3 version listing returned a key outside the deletion prefix".into(),
+                    ));
+                }
+                if selected(key) {
+                    matches.push(
+                        aws_sdk_s3::types::ObjectIdentifier::builder()
+                            .key(key)
+                            .version_id(version)
+                            .build()
+                            .map_err(|e| KoshaError::NotFound(format!("S3 delete batch: {e}")))?,
+                    );
+                }
+            }
+            if !matches.is_empty() || !page.is_truncated().unwrap_or_default() {
+                return Ok(matches);
+            }
+            let next = (
+                page.next_key_marker().map(str::to_owned),
+                page.next_version_id_marker().map(str::to_owned),
+            );
+            if next.0.is_none() || next == markers {
+                return Err(KoshaError::NotFound(
+                    "S3 version listing did not advance".into(),
+                ));
+            }
+            markers = next;
+        }
+    }
+
+    async fn multipart_erasure_page(
+        &self,
+        prefix: &str,
+        selected: &impl Fn(&str) -> bool,
+    ) -> Result<Vec<(String, String)>, KoshaError> {
+        // MinIO's prefixed listing treats the prefix as an exact object key.
+        let list_prefix = (!self.custom_endpoint).then(|| prefix.to_owned());
+        let mut markers = (None, None);
+        loop {
+            let page = self
+                .client
+                .list_multipart_uploads()
+                .bucket(&self.bucket)
+                .set_prefix(list_prefix.clone())
+                .set_key_marker(markers.0.clone())
+                .set_upload_id_marker(markers.1.clone())
+                .send()
+                .await
+                .map_err(|e| {
+                    KoshaError::NotFound(format!(
+                        "S3 list_multipart_uploads: {}",
+                        log_s3_error("list_multipart_uploads", prefix, &e)
+                    ))
+                })?;
+            let mut matches = Vec::new();
+            for upload in page.uploads() {
+                let Some(key) = upload.key() else {
+                    return Err(KoshaError::NotFound(
+                        "S3 multipart listing returned an upload without a key".into(),
+                    ));
+                };
+                if !key.starts_with(prefix) || !selected(key) {
+                    continue;
+                }
+                let Some(id) = upload.upload_id() else {
+                    return Err(KoshaError::NotFound(
+                        "S3 multipart listing returned an upload without an ID".into(),
+                    ));
+                };
+                matches.push((key.into(), id.into()));
+            }
+            if !matches.is_empty() || !page.is_truncated().unwrap_or_default() {
+                return Ok(matches);
+            }
+            let next = (
+                page.next_key_marker().map(str::to_owned),
+                page.next_upload_id_marker().map(str::to_owned),
+            );
+            if next.0.is_none() || next == markers {
+                return Err(KoshaError::NotFound(
+                    "S3 multipart listing did not advance".into(),
+                ));
+            }
+            markers = next;
+        }
+    }
+
+    /// A lower bound on entries still under this prefix; zero means neither
+    /// listing found an entry.
+    pub(crate) fn count_erasure_page(&self, path: &str) -> Result<usize, KoshaError> {
+        self.count_matching_erasure_page(path, &|_| true)
+    }
+
+    fn count_matching_erasure_page(
+        &self,
+        path: &str,
+        selected: &impl Fn(&str) -> bool,
+    ) -> Result<usize, KoshaError> {
+        let prefix = self.erasure_prefix(path)?;
+        self.rt.block_on(async {
+            Ok(self.erasure_page(&prefix, selected).await?.len()
+                + self.multipart_erasure_page(&prefix, selected).await?.len())
+        })
+    }
+
+    async fn abort_incomplete_uploads(
+        &self,
+        prefix: &str,
+        selected: &impl Fn(&str) -> bool,
+    ) -> Result<(), KoshaError> {
+        loop {
+            let uploads = self.multipart_erasure_page(prefix, selected).await?;
+            if uploads.is_empty() {
+                return Ok(());
+            }
+            for (key, id) in uploads {
+                if let Err(e) = self
+                    .client
+                    .abort_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(&key)
+                    .upload_id(id)
+                    .send()
+                    .await
+                {
+                    if !e.as_service_error().is_some_and(|e| e.is_no_such_upload()) {
+                        return Err(KoshaError::NotFound(format!(
+                            "S3 abort_multipart_upload: {}",
+                            log_s3_error("abort_multipart_upload", &key, &e)
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Permanently delete every version and delete marker under a logical
+    /// directory (unversioned objects use the S3 "null" version), and
+    /// abort incomplete multipart uploads under the same prefix.
+    pub(crate) fn erase_prefix(&self, path: &str) -> Result<usize, KoshaError> {
+        self.erase_matching_prefix(path, &|_| true)
+    }
+
+    pub(crate) fn erase_unreferenced_prefix(
+        &self,
+        path: &str,
+        refs: &kosha_core::branch::References,
+    ) -> Result<usize, KoshaError> {
+        let selected = |key: &str| {
+            logical_path_of_key(&self.prefix, key).is_some_and(|path| !refs.holds_file(&path))
+        };
+        let deleted = self.erase_matching_prefix(path, &selected)?;
+        let left = self.count_matching_erasure_page(path, &selected)?;
+        if left != 0 {
+            return Err(KoshaError::NotFound(format!(
+                "at least {left} unreferenced storage entries remain under {path}/"
+            )));
+        }
+        Ok(deleted)
+    }
+
+    fn erase_matching_prefix(
+        &self,
+        path: &str,
+        selected: &impl Fn(&str) -> bool,
+    ) -> Result<usize, KoshaError> {
+        let prefix = self.erasure_prefix(path)?;
+        self.rt.block_on(async {
+            let multipart = self.abort_incomplete_uploads(&prefix, selected).await;
+            let mut deleted = 0usize;
+            loop {
+                let objects = self.erasure_page(&prefix, selected).await?;
+                let count = objects.len();
+                if count == 0 {
+                    return multipart.map(|()| deleted);
+                }
+                let delete = aws_sdk_s3::types::Delete::builder()
+                    .set_objects(Some(objects))
+                    .quiet(true)
+                    .build()
+                    .map_err(|e| KoshaError::NotFound(format!("S3 delete batch: {e}")))?;
+                let out = self
+                    .client
+                    .delete_objects()
+                    .bucket(&self.bucket)
+                    .delete(delete)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        KoshaError::NotFound(format!(
+                            "S3 delete_objects: {}",
+                            log_s3_error("delete_objects", &prefix, &e)
+                        ))
+                    })?;
+                if !out.errors().is_empty() {
+                    return Err(KoshaError::NotFound(format!(
+                        "S3 delete_objects: {} of {count} versions failed",
+                        out.errors().len()
+                    )));
+                }
+                deleted += count;
+            }
         })
     }
 
@@ -3569,7 +3975,9 @@ pub(crate) mod capture {
             prefix: prefix.into(),
             rt: tokio::runtime::Runtime::new().unwrap(),
             client,
+            custom_endpoint: false,
             sse,
+            tenant_kms_key_lookup: None,
         };
         (storage, capture)
     }
@@ -3722,6 +4130,40 @@ mod sse_request_tests {
     }
 
     #[test]
+    fn control_plane_key_wins_and_missing_keys_fall_back_on_put() {
+        const CONTROL_KEY: &str = "alias/control-plane-acme";
+        let root = temp_root("control-plane");
+        let (mut storage, capture) = capture::storage(root.clone(), "", kms_config());
+        storage.tenant_kms_key_lookup = Some(Box::new(|tenant| match tenant {
+            "acme" => Ok(Some(CONTROL_KEY.into())),
+            "unavailable" => Err(KoshaError::ControlPlane("database unavailable".into())),
+            _ => Ok(None),
+        }));
+        storage
+            .sse
+            .tenant_kms_keys
+            .insert("beta".into(), "alias/config-beta".into());
+        for (tenant, key) in [
+            ("acme", CONTROL_KEY),
+            ("beta", "alias/config-beta"),
+            ("gamma", DEFAULT_KEY),
+        ] {
+            assert!(storage
+                .write(&format!("{tenant}/docs/seg/a.bin"), b"a")
+                .is_err());
+            let requests = capture.take();
+            assert_eq!(requests.len(), 1, "{requests:?}");
+            assert_kms(&requests[0], key);
+        }
+        assert!(matches!(
+            storage.write("unavailable/docs/seg/a.bin", b"a"),
+            Err(KoshaError::ControlPlane(_))
+        ));
+        assert!(capture.take().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn copy_object_adopts_the_destination_tenant_key() {
         // The helper a server-side copy path (#344) applies.
         let (client, capture) = capture::client();
@@ -3780,7 +4222,7 @@ mod sse_request_tests {
                 "bucket".into(),
                 storage.s3_key(&format!("{seg}/big.bin")),
                 vec![0u8; 5 * 1024 * 1024 + 1],
-                storage.sse_for_path(&format!("{seg}/big.bin")),
+                storage.sse_for_path(&format!("{seg}/big.bin")).unwrap(),
             ));
             assert!(multipart.is_err());
             let copy = rt.block_on(
@@ -3804,7 +4246,7 @@ mod sse_request_tests {
         let (storage, capture) = start_pod(None);
         write_all(
             &storage,
-            storage.sse_for_path("acme/docs/docs-000002/a.bin"),
+            storage.sse_for_path("acme/docs/docs-000002/a.bin").unwrap(),
         );
         let requests = capture.take();
         assert_eq!(requests.len(), 3, "{requests:?}");
@@ -3817,7 +4259,7 @@ mod sse_request_tests {
         let (storage, capture) = start_pod(None);
         write_all(
             &storage,
-            storage.sse_for_path("acme/docs/docs-000002/a.bin"),
+            storage.sse_for_path("acme/docs/docs-000002/a.bin").unwrap(),
         );
         let requests = capture.take();
         assert_eq!(requests.len(), 3, "{requests:?}");
@@ -3860,6 +4302,12 @@ mod error_path_tests {
     /// Serve every request with `status` and `body`, one response per
     /// connection, until the test process exits.
     fn serve(status: &'static str, body: &'static str) -> String {
+        serve_requests(move |_, _| (status, body))
+    }
+
+    fn serve_requests<B: AsRef<str>>(
+        mut respond: impl FnMut(&str, &[u8]) -> (&'static str, B) + Send + 'static,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -3873,14 +4321,17 @@ mod error_path_tests {
                         _ => break,
                     }
                 }
-                let text = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                let text = String::from_utf8_lossy(&head);
                 let len = text
+                    .to_ascii_lowercase()
                     .lines()
                     .find_map(|l| l.strip_prefix("content-length:"))
                     .and_then(|v| v.trim().parse::<usize>().ok())
                     .unwrap_or(0);
                 let mut sink = vec![0u8; len];
                 let _ = stream.read_exact(&mut sink);
+                let (status, body) = respond(&text, &sink);
+                let body = body.as_ref();
                 let _ = write!(
                     stream,
                     "HTTP/1.1 {status}\r\ncontent-type: application/xml\r\n\
@@ -3890,6 +4341,452 @@ mod error_path_tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    #[test]
+    fn export_cleanup_preserves_current_object_permissions() {
+        use kosha_core::export::{export_dir, ExportState, ExportUpdate, NewExport};
+
+        for expire in [false, true] {
+            let mut state = crate::AppState::new(crate::tests::test_dir());
+            let record = state
+                .controller
+                .lock()
+                .unwrap()
+                .create_export(&NewExport {
+                    tenant_id: "acme".into(),
+                    namespace: "acme/docs".into(),
+                    include_vectors: false,
+                    pins: vec![],
+                    upload_url: None,
+                    ttl_ms: 1,
+                })
+                .unwrap();
+            state
+                .controller
+                .lock()
+                .unwrap()
+                .update_export(
+                    &record.id,
+                    &ExportUpdate {
+                        state: Some(ExportState::Completed),
+                        expires_at_ms: Some(1),
+                        ..ExportUpdate::default()
+                    },
+                )
+                .unwrap();
+            let key = format!(
+                "secret-prefix/{}/part.jsonl",
+                export_dir("acme", &record.id)
+            );
+            let mut deleted = false;
+            let endpoint = serve_requests(move |head, body| {
+                let request = head.lines().next().unwrap();
+                if request.starts_with("GET /bucket/?") && request.contains("list-type=2") {
+                    let contents = if deleted {
+                        String::new()
+                    } else {
+                        format!("<Contents><Key>{key}</Key></Contents>")
+                    };
+                    return (
+                        "200 OK",
+                        format!("<ListBucketResult>{contents}</ListBucketResult>"),
+                    );
+                }
+                if request.starts_with("POST /bucket/?delete") {
+                    let body = std::str::from_utf8(body).unwrap();
+                    assert!(body.contains(&format!("<Key>{key}</Key>")));
+                    assert!(!body.contains("VersionId"));
+                    deleted = true;
+                    return ("200 OK", "<DeleteResult/>".into());
+                }
+                (
+                    "403 Forbidden",
+                    "<Error><Code>AccessDenied</Code></Error>".into(),
+                )
+            });
+            let (storage, root) = storage(&endpoint, "export-cleanup");
+            state.s3_storage = Some(storage);
+
+            if expire {
+                assert_eq!(state.run_export_sweep(1), 1);
+            } else {
+                let response = crate::exports::route(
+                    &format!("DELETE /v1/namespaces/docs/exports/{} HTTP/1.1", record.id),
+                    b"",
+                    "acme",
+                    &state,
+                )
+                .unwrap();
+                assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+            }
+            let cleaned = state
+                .controller
+                .lock()
+                .unwrap()
+                .export(&record.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(cleaned.state, ExportState::Expired);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn namespace_erasure_removes_and_rechecks_historical_export_objects() {
+        use kosha_core::export::{export_dir, NewExport};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut state = crate::AppState::new(crate::tests::test_dir());
+        let ns = kosha_core::NamespaceId("acme/docs".into());
+        let record = state
+            .controller
+            .lock()
+            .unwrap()
+            .create_export(&NewExport {
+                tenant_id: "acme".into(),
+                namespace: ns.0.clone(),
+                include_vectors: false,
+                pins: vec![],
+                upload_url: None,
+                ttl_ms: 1,
+            })
+            .unwrap();
+        let key = format!(
+            "secret-prefix/{}/part.jsonl",
+            export_dir("acme", &record.id)
+        );
+        let versions = std::sync::Arc::new(AtomicUsize::new(0));
+        let lists = versions.clone();
+        let mut deleted = false;
+        let endpoint = serve_requests(move |head, body| {
+            let request = head.lines().next().unwrap();
+            if request.starts_with("GET /bucket/?uploads") {
+                return ("200 OK", "<ListMultipartUploadsResult/>".to_string());
+            }
+            if request.starts_with("POST /bucket/?delete") {
+                let body = std::str::from_utf8(body).unwrap();
+                assert!(body.contains(&format!("<Key>{key}</Key>")));
+                assert!(body.contains("<VersionId>old</VersionId>"));
+                assert!(body.contains("<VersionId>marker</VersionId>"));
+                deleted = true;
+                return ("200 OK", "<DeleteResult/>".into());
+            }
+            assert!(request.starts_with("GET /bucket/?versions"), "{request}");
+            lists.fetch_add(1, Ordering::Relaxed);
+            let entries = if deleted {
+                String::new()
+            } else {
+                format!(
+                    "<Version><Key>{key}</Key><VersionId>old</VersionId></Version>\
+                     <DeleteMarker><Key>{key}</Key><VersionId>marker</VersionId></DeleteMarker>"
+                )
+            };
+            (
+                "200 OK",
+                format!("<ListVersionsResult>{entries}</ListVersionsResult>"),
+            )
+        });
+        let (storage, root) = storage(&endpoint, "erase-export");
+        state.s3_storage = Some(storage);
+
+        assert_eq!(state.delete_namespace_exports(&ns), (1, None));
+        assert_eq!(versions.load(Ordering::Relaxed), 3);
+        assert!(state
+            .controller
+            .lock()
+            .unwrap()
+            .export(&record.id)
+            .unwrap()
+            .is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tenant_erasure_sweeps_versions_without_live_namespaces() {
+        use kosha_core::deletion::{DeletionState, NewDeletion};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut state = crate::AppState::new(crate::tests::test_dir());
+        let record = state
+            .controller
+            .lock()
+            .unwrap()
+            .begin_deletion(&NewDeletion::tenant("acme"), 0)
+            .unwrap();
+        let version_lists = std::sync::Arc::new(AtomicUsize::new(0));
+        let lists = version_lists.clone();
+        let mut deleted = false;
+        let endpoint = serve_requests(move |head, body| {
+            let request = head.lines().next().unwrap();
+            if request.starts_with("GET /bucket/?uploads") {
+                return ("200 OK", "<ListMultipartUploadsResult/>");
+            }
+            if request.starts_with("POST /bucket/?delete") {
+                let body = std::str::from_utf8(body).unwrap();
+                assert!(body.contains("<Key>secret-prefix/acme/orphan/part</Key>"));
+                assert!(body.contains("<VersionId>old</VersionId>"));
+                deleted = true;
+                return ("200 OK", "<DeleteResult/>");
+            }
+            assert!(request.starts_with("GET /bucket/?versions"), "{request}");
+            if request.contains("prefix=secret-prefix%2Facme%2F") {
+                lists.fetch_add(1, Ordering::Relaxed);
+                if !deleted {
+                    return (
+                        "200 OK",
+                        "<ListVersionsResult><Version><Key>secret-prefix/acme/orphan/part</Key>+                         <VersionId>old</VersionId></Version></ListVersionsResult>",
+                    );
+                }
+            }
+            ("200 OK", "<ListVersionsResult/>")
+        });
+        let (storage, root) = storage(&endpoint, "erase-tenant");
+        state.s3_storage = Some(storage);
+
+        let deleted = state.delete_tenant(&crate::auth::Auth::Disabled, &record);
+        assert!(deleted.errors.is_empty(), "{:?}", deleted.errors);
+        assert_eq!(deleted.record.state, DeletionState::Completed);
+        assert_eq!(version_lists.load(Ordering::Relaxed), 3);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn branch_erasure_pages_past_referenced_versions_and_keeps_them() {
+        use kosha_core::{branch::References, Manifest, ManifestEntry, NamespaceId, SegmentId};
+
+        let ns = NamespaceId("acme/branch".into());
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("keep".into()),
+                doc_count: 1,
+            }],
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            schema: None,
+            branch: None,
+            retired: Default::default(),
+            shards: Default::default(),
+        };
+        let refs = References::collect([(&ns, &manifest)]).unwrap();
+        let mut deleted = false;
+        let endpoint = serve_requests(move |head, body| {
+            let request = head.lines().next().unwrap();
+            if request.starts_with("GET /bucket/?uploads") {
+                return ("200 OK", "<ListMultipartUploadsResult/>");
+            }
+            if request.contains("list-type=2") {
+                return (
+                    "200 OK",
+                    "<ListBucketResult><Contents><Key>secret-prefix/acme/branch/keep/doc_store.bin</Key>+                     </Contents></ListBucketResult>",
+                );
+            }
+            if request.starts_with("POST /bucket/?delete") {
+                let body = std::str::from_utf8(body).unwrap();
+                assert!(!body.contains("/keep/"), "{body}");
+                assert!(body.contains("<VersionId>old</VersionId>"), "{body}");
+                assert!(body.contains("<VersionId>marker</VersionId>"), "{body}");
+                deleted = true;
+                return ("200 OK", "<DeleteResult/>");
+            }
+            assert!(request.starts_with("GET /bucket/?versions"), "{request}");
+            assert!(
+                request.contains("prefix=secret-prefix%2Facme%2Fbranch%2F"),
+                "{request}"
+            );
+            if request.contains("version-id-marker=keep-version") {
+                if deleted {
+                    return ("200 OK", "<ListVersionsResult/>");
+                }
+                return (
+                    "200 OK",
+                    "<ListVersionsResult>+                     <Version><Key>secret-prefix/acme/branch/old/doc_store.bin</Key><VersionId>old</VersionId></Version>+                     <DeleteMarker><Key>secret-prefix/acme/branch/old/doc_store.bin</Key><VersionId>marker</VersionId></DeleteMarker>+                     </ListVersionsResult>",
+                );
+            }
+            (
+                "200 OK",
+                "<ListVersionsResult><IsTruncated>true</IsTruncated>+                 <NextKeyMarker>secret-prefix/acme/branch/keep/doc_store.bin</NextKeyMarker>+                 <NextVersionIdMarker>keep-version</NextVersionIdMarker>+                 <Version><Key>secret-prefix/acme/branch/keep/doc_store.bin</Key><VersionId>keep-version</VersionId></Version>+                 </ListVersionsResult>",
+            )
+        });
+        let (storage, root) = storage(&endpoint, "erase-branch");
+        let mut state = crate::AppState::new(crate::tests::test_dir());
+        state.s3_storage = Some(storage);
+
+        let deleted = state.reclaim_namespace_objects(&ns, &refs);
+        assert!(deleted.errors.is_empty(), "{:?}", deleted.errors);
+        assert_eq!(deleted.kept, 1);
+        assert_eq!(deleted.remote_objects, 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn erasure_removes_hidden_versions_and_delete_markers_before_verifying_empty() {
+        let mut deleted = false;
+        let endpoint = serve_requests(move |head, body| {
+            if head.starts_with("GET /bucket/?uploads") {
+                return ("200 OK", "<ListMultipartUploadsResult/>");
+            }
+            if head.starts_with("POST /bucket/?delete") {
+                let body = std::str::from_utf8(body).unwrap();
+                assert!(body.contains("<Key>secret-prefix/acme/docs/seg/doc_store.bin</Key>"));
+                assert!(body.contains("<VersionId>old</VersionId>"));
+                assert!(body.contains("<VersionId>marker</VersionId>"));
+                deleted = true;
+                return ("200 OK", "<DeleteResult/>");
+            }
+            assert!(head.starts_with("GET /bucket/?versions"), "{head}");
+            assert!(
+                head.contains("prefix=secret-prefix%2Facme%2Fdocs%2F"),
+                "{head}"
+            );
+            if !deleted {
+                return (
+                    "200 OK",
+                    "<ListVersionsResult>\
+                     <Version><Key>secret-prefix/acme/docs/seg/doc_store.bin</Key><VersionId>old</VersionId></Version>\
+                     <DeleteMarker><Key>secret-prefix/acme/docs/seg/doc_store.bin</Key><VersionId>marker</VersionId></DeleteMarker>\
+                     </ListVersionsResult>",
+                );
+            }
+            ("200 OK", "<ListVersionsResult/>")
+        });
+        let (storage, root) = storage(&endpoint, "versions");
+        use crate::namespace_deletion::RemotePrefixStore;
+        assert_eq!(storage.count_erasure_entries("acme/docs").unwrap(), 2);
+        assert_eq!(storage.erase_prefix("acme/docs").unwrap(), 2);
+        assert_eq!(storage.count_erasure_entries("acme/docs").unwrap(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn erasure_aborts_unfinished_uploads_even_without_any_object_versions() {
+        let mut aborted = false;
+        let endpoint = serve_requests(move |head, _| {
+            let request = head.lines().next().unwrap();
+            if request.starts_with("GET /bucket/?uploads") {
+                assert!(request.contains("prefix=secret-prefix%2Facme%2Fdocs%2F"));
+                if aborted {
+                    return ("200 OK", "<ListMultipartUploadsResult/>");
+                }
+                return (
+                    "200 OK",
+                    "<ListMultipartUploadsResult>\
+                     <Upload><Key>secret-prefix/acme/docs/_exports/partial.jsonl</Key>\
+                     <UploadId>unfinished</UploadId></Upload>\
+                     </ListMultipartUploadsResult>",
+                );
+            }
+            if request.starts_with("DELETE ") {
+                assert!(request
+                    .starts_with("DELETE /bucket/secret-prefix/acme/docs/_exports/partial.jsonl?"));
+                let query = request
+                    .split_once('?')
+                    .unwrap()
+                    .1
+                    .split(' ')
+                    .next()
+                    .unwrap();
+                assert!(query.split('&').any(|part| part == "uploadId=unfinished"));
+                aborted = true;
+                return ("204 No Content", "");
+            }
+            assert!(request.starts_with("GET /bucket/?versions"), "{request}");
+            ("200 OK", "<ListVersionsResult/>")
+        });
+        let (storage, root) = storage(&endpoint, "unfinished");
+        assert_eq!(storage.count_erasure_page("acme/docs").unwrap(), 1);
+        assert_eq!(storage.erase_prefix("acme/docs").unwrap(), 0);
+        assert_eq!(storage.count_erasure_page("acme/docs").unwrap(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn custom_endpoint_erasure_finds_uploads_beyond_unrelated_keys() {
+        let mut aborted = false;
+        let endpoint = serve_requests(move |head, _| {
+            let request = head.lines().next().unwrap();
+            if request.starts_with("GET /bucket/?uploads") {
+                assert!(!request.contains("prefix="), "{request}");
+                if !request.contains("key-marker=") {
+                    return (
+                        "200 OK",
+                        "<ListMultipartUploadsResult><IsTruncated>true</IsTruncated>\
+                         <NextKeyMarker>before</NextKeyMarker><NextUploadIdMarker>skip</NextUploadIdMarker>\
+                         <Upload><Key>before</Key><UploadId>skip</UploadId></Upload>\
+                         </ListMultipartUploadsResult>",
+                    );
+                }
+                assert!(request.contains("key-marker=before"), "{request}");
+                assert!(request.contains("upload-id-marker=skip"), "{request}");
+                if aborted {
+                    return ("200 OK", "<ListMultipartUploadsResult/>");
+                }
+                return (
+                    "200 OK",
+                    "<ListMultipartUploadsResult>\
+                     <Upload><Key>secret-prefix/acme/docs/_exports/partial.jsonl</Key><UploadId>unfinished</UploadId></Upload>\
+                     <Upload><Key>secret-prefix/acme/docs2/report.jsonl</Key><UploadId>sibling</UploadId></Upload>\
+                     </ListMultipartUploadsResult>",
+                );
+            }
+            if request.starts_with("DELETE ") {
+                assert!(request
+                    .starts_with("DELETE /bucket/secret-prefix/acme/docs/_exports/partial.jsonl?"));
+                assert!(request.contains("uploadId=unfinished"));
+                aborted = true;
+                return ("204 No Content", "");
+            }
+            assert!(request.starts_with("GET /bucket/?versions"), "{request}");
+            ("200 OK", "<ListVersionsResult/>")
+        });
+        let (mut storage, root) = storage(&endpoint, "compatible-multipart");
+        storage.custom_endpoint = true;
+        assert_eq!(storage.count_erasure_page("acme/docs").unwrap(), 1);
+        assert_eq!(storage.erase_prefix("acme/docs").unwrap(), 0);
+        assert_eq!(storage.count_erasure_page("acme/docs").unwrap(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn erasure_removes_versions_but_fails_if_multipart_listing_is_denied() {
+        let mut deleted = false;
+        let endpoint = serve_requests(move |head, body| {
+            let request = head.lines().next().unwrap();
+            if request.starts_with("GET /bucket/?uploads") {
+                return ("403 Forbidden", "<Error><Code>AccessDenied</Code></Error>");
+            }
+            if request.starts_with("POST /bucket/?delete") {
+                assert!(std::str::from_utf8(body)
+                    .unwrap()
+                    .contains("<VersionId>old</VersionId>"));
+                deleted = true;
+                return ("200 OK", "<DeleteResult/>");
+            }
+            assert!(request.starts_with("GET /bucket/?versions"), "{request}");
+            if deleted {
+                return ("200 OK", "<ListVersionsResult/>");
+            }
+            (
+                "200 OK",
+                "<ListVersionsResult>\
+                 <Version><Key>secret-prefix/acme/docs/doc_store.bin</Key><VersionId>old</VersionId></Version>\
+                 </ListVersionsResult>",
+            )
+        });
+        let (storage, root) = storage(&endpoint, "multipart-denied");
+        let error = storage.erase_prefix("acme/docs").unwrap_err();
+        assert!(error.to_string().contains("S3 list_multipart_uploads"));
+        assert!(storage
+            .rt
+            .block_on(storage.erasure_page("secret-prefix/acme/docs/", &|_| true))
+            .unwrap()
+            .is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn storage(endpoint: &str, tag: &str) -> (S3Storage, PathBuf) {
@@ -3910,7 +4807,9 @@ mod error_path_tests {
             prefix: "secret-prefix".into(),
             rt: tokio::runtime::Runtime::new().unwrap(),
             client: aws_sdk_s3::Client::from_conf(config),
+            custom_endpoint: false,
             sse: SseConfig::default(),
+            tenant_kms_key_lookup: None,
         };
         (storage, root)
     }

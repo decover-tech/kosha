@@ -42,7 +42,8 @@
 #          (default 1): warm_or_nocache_rN / knn_warm_nocache_rN. The
 #          result-cache phase is skipped: it hides the disk cache.
 #     It also samples the local footprint (du of the data dir, every 60 s,
-#     footprint.tsv) and sums the server's "disk cache evicted" lines per
+#     footprint.tsv), records the measured phase boundaries with byte counts
+#     (phase_footprint.tsv), and sums the server's "disk cache evicted" lines per
 #     stage (evictions.tsv), so arms can be compared at equal real
 #     footprint and their miss work is on record. Misses are part of the
 #     measured latency by design.
@@ -150,7 +151,7 @@ else
 fi
 
 # Research #389 bookkeeping for timed mode (see the header).
-local_bytes() { sudo du -sb "${KOSHA_LOCAL_DATA:?}" 2>/dev/null | cut -f1; }
+disk_cache_bytes() { sudo du -sb "${KOSHA_LOCAL_DATA:?}" 2>/dev/null | cut -f1; }
 count_evictions() { # count_evictions <stage>: files + MB the server evicted in that stage log
   zcat "$OUT/server/$1.log.gz" 2>/dev/null \
     | awk '/disk cache evicted:/ { for (i = 1; i <= NF; i++) { split($i, kv, "="); if (kv[1] == "files") f += kv[2]; if (kv[1] == "freed_mb") m += kv[2] } } END { printf "%d\t%.1f\n", f, m }'
@@ -165,11 +166,15 @@ sudo docker stop kosha >/dev/null
 # Empty local store (also drops every local.* reuse marker): see step 1.
 wipe_local_cache
 sudo docker start kosha >/dev/null
-for i in $(seq 120); do curl -sf http://127.0.0.1:8080/readyz >/dev/null 2>&1 && break; sleep 5
-  [ "$i" -eq 120 ] && { echo "::error::/readyz not green after 600s"; exit 1; }; done
-echo "LOCAL-BYTES-START $(local_bytes)"
-( while true; do printf '%s\t%s\n' "$(date +%s)" "$(local_bytes)"; sleep 60; done ) > "$OUT/footprint.tsv" &
+for i in $(seq 120); do curl -sf http://127.0.0.1:8080/v1/readyz >/dev/null 2>&1 && break; sleep 5
+  [ "$i" -eq 120 ] && { echo "::error::/v1/readyz not green after 600s"; exit 1; }; done
+echo "LOCAL-BYTES-START $(disk_cache_bytes)"
+( while true; do
+    if bytes=$(disk_cache_bytes); then printf '%s\t%s\n' "$(date +%s)" "$bytes"; fi
+    sleep 60
+  done ) > "$OUT/footprint.tsv" &
 FOOTPRINT_PID=$!
+printf 'phase\tstart_s\tstart_bytes\tend_s\tend_bytes\n' > "$OUT/phase_footprint.tsv"
 printf 'stage\tevicted_files\tevicted_mb\n' > "$OUT/evictions.tsv"
 FILL_SINCE=$(iso_now)
 T0=$(date +%s)
@@ -181,7 +186,7 @@ $PY $BENCH --host http://127.0.0.1:8080 --namespace "$NS" \
   --phase warm "${WORKLOAD[@]}" "${NOCACHE[@]}" ${ORDER_ARGS[@]+"${ORDER_ARGS[@]}"} 2>&1 | tee "$OUT/warm_fill.log"
 save_server_log warm_fill "$FILL_SINCE"
 printf 'warm_fill\t%s\n' "$(count_evictions warm_fill)" >> "$OUT/evictions.tsv"
-echo "WARM-FILL-DONE in $(( $(date +%s) - T0 ))s local=$(local_bytes) bytes (not measured)"
+echo "WARM-FILL-DONE in $(( $(date +%s) - T0 ))s local=$(disk_cache_bytes) bytes (not measured)"
 elif [ "$WARM_GATE" = queries ]; then
 # ── tpuf protocol: warm with the workload queries, measure warm only ─────
 # No wipe and no restart: restore_namespace.sh restarted the server and
@@ -190,8 +195,8 @@ sudo docker start kosha >/dev/null 2>&1 || true
 T0=$(date +%s)
 # No boot warmup is configured in this mode, so /readyz is green within
 # seconds of the server answering at all.
-for i in $(seq 120); do curl -sf http://127.0.0.1:8080/readyz >/dev/null 2>&1 && break; sleep 5
-  [ "$i" -eq 120 ] && { echo "::error::/readyz not green after 600s (KOSHA_WARMUP_NAMESPACES set on the container?)"; curl -s http://127.0.0.1:8080/readyz || true; echo; exit 1; }; done
+for i in $(seq 120); do curl -sf http://127.0.0.1:8080/v1/readyz >/dev/null 2>&1 && break; sleep 5
+  [ "$i" -eq 120 ] && { echo "::error::/v1/readyz not green after 600s (KOSHA_WARMUP_NAMESPACES set on the container?)"; curl -s http://127.0.0.1:8080/v1/readyz || true; echo; exit 1; }; done
 GATE_SINCE=$(iso_now)
 set +e
 $PY $GATE --host http://127.0.0.1:8080 --namespace "$NS" \
@@ -221,8 +226,8 @@ wipe_local_cache
 T0=$(date +%s)
 BOOT_SINCE=$(iso_now)
 sudo docker start kosha >/dev/null
-for i in $(seq 120); do curl -sf http://127.0.0.1:8080/readyz >/dev/null 2>&1 && break; sleep 5
-  [ "$i" -eq 120 ] && { echo "::error::/readyz not green after 600s with no warmup configured"; curl -s http://127.0.0.1:8080/readyz || true; echo; exit 1; }; done
+for i in $(seq 120); do curl -sf http://127.0.0.1:8080/v1/readyz >/dev/null 2>&1 && break; sleep 5
+  [ "$i" -eq 120 ] && { echo "::error::/v1/readyz not green after 600s with no warmup configured"; curl -s http://127.0.0.1:8080/v1/readyz || true; echo; exit 1; }; done
 save_server_log boot "$BOOT_SINCE"
 echo "COLD-READY in $(( $(date +%s) - T0 ))s local=$(sudo du -sb /data/kosha 2>/dev/null | cut -f1) bytes (no preload)"
 else
@@ -240,7 +245,7 @@ sudo docker start kosha >/dev/null
 # from a stuck one, and the server log on timeout.
 WARMUP_TIMEOUT_S="${WARMUP_TIMEOUT_S:-3600}"
 LAST_REPORT=$T0
-until curl -sf http://127.0.0.1:8080/readyz >/dev/null 2>&1; do
+until curl -sf http://127.0.0.1:8080/v1/readyz >/dev/null 2>&1; do
   sleep 5
   NOW=$(date +%s)
   if [ $(( NOW - LAST_REPORT )) -ge 300 ]; then
@@ -249,7 +254,7 @@ until curl -sf http://127.0.0.1:8080/readyz >/dev/null 2>&1; do
   fi
   if [ $(( NOW - T0 )) -gt "$WARMUP_TIMEOUT_S" ]; then
     echo "WARMUP-TIMEOUT after ${WARMUP_TIMEOUT_S}s"
-    curl -s http://127.0.0.1:8080/readyz || true; echo
+    curl -s http://127.0.0.1:8080/v1/readyz || true; echo
     sudo docker logs --tail 200 kosha 2>&1 || true
     save_server_log warmup "$WARMUP_SINCE"
     exit 1
@@ -276,8 +281,14 @@ local_bytes warm
 # topk_parity.py <a>.requests.jsonl.gz <b>.requests.jsonl.gz (#385).
 phase() { # phase <label> <extra-args...>
   local label="$1"; shift
-  local since; since=$(iso_now)
+  local since until start_s end_s start_bytes end_bytes
   next_order_args
+  if [ "$WARM_GATE" = timed ]; then
+    start_bytes=$(disk_cache_bytes) || start_bytes=''
+    read -r since start_s < <(date -u '+%Y-%m-%dT%H:%M:%S.%NZ %s.%N')
+  else
+    since=$(iso_now)
+  fi
   $PY $BENCH \
     --host http://127.0.0.1:8080 --namespace "$NS" \
     --queries-file /data/queries.txt --api-key "$API_KEY" \
@@ -285,9 +296,14 @@ phase() { # phase <label> <extra-args...>
     --server-timings --raw-out "$OUT/$label.requests.jsonl.gz" --raw-ids --return "$RETURN_FIELDS" \
     --stats-api-key "${KOSHA_ADMIN_API_KEY:-sk-bench-admin}" \
     "$@" ${ORDER_ARGS[@]+"${ORDER_ARGS[@]}"} --out "$OUT/$label.json"
-  save_server_log "$label" "$since"
   if [ "$WARM_GATE" = timed ]; then
+    read -r until end_s < <(date -u '+%Y-%m-%dT%H:%M:%S.%NZ %s.%N')
+    end_bytes=$(disk_cache_bytes) || end_bytes=''
+    printf '%s\t%s\t%s\t%s\t%s\n' "$label" "$start_s" "$start_bytes" "$end_s" "$end_bytes" >> "$OUT/phase_footprint.tsv"
+    save_server_log "$label" "$since" "$until"
     printf '%s\t%s\n' "$label" "$(count_evictions "$label")" >> "$OUT/evictions.tsv"
+  else
+    save_server_log "$label" "$since"
   fi
   echo "PHASE-COMPLETE $label"
 }
@@ -302,7 +318,7 @@ if [ "$WARM_GATE" = timed ]; then
     fi
   done
   stop_footprint
-  echo "LOCAL-BYTES-END $(local_bytes)"
+  echo "LOCAL-BYTES-END $(disk_cache_bytes)"
 elif [ "$WARM_GATE" = queries ]; then
   # Warm only (see the header). Same queries and payloads as the gate.
   if [ "$SUITE" = "bm25" ]; then

@@ -296,7 +296,12 @@ fn second_writer_is_refused_while_the_first_holds_the_lease() {
     let refused = write(&b, &["b1"]);
     assert_eq!(status(&refused), 503, "{refused}");
     assert!(refused.contains("retry-after: 60"), "{refused}");
-    assert!(refused.contains("writer fenced"), "{refused}");
+    // The fencing detail (tokens, tenant-qualified id) stays in the log.
+    assert!(
+        refused.contains("another writer owns this namespace"),
+        "{refused}"
+    );
+    assert!(!refused.contains("fencing token"), "{refused}");
     assert_eq!(status(&flush(&a)), 200);
     assert_eq!(status(&write(&b, &["b2"])), 503);
     // Nothing of B's reached the namespace, and B buffered nothing.

@@ -35,7 +35,7 @@ use kosha_control::orgs::{self, Actor, MemoryOrgStore, OrgError, OrgStore, Role}
 use serde_json::{json, Value};
 
 use crate::auth::KeyStore;
-use crate::{json_error, json_ok, url_decode};
+use crate::{api_error, api_error_status, json_ok, url_decode, ErrorCode};
 
 /// The header naming the user a request acts for.
 const ACTOR_HEADER: &str = "x-kosha-actor";
@@ -64,6 +64,12 @@ impl OrgBackend {
         }
     }
 
+    /// Every audit row of the in-memory store, oldest first (tests).
+    #[cfg(test)]
+    pub(crate) fn audit_rows(&self) -> Vec<kosha_control::orgs::AuditEvent> {
+        self.memory.audit_log()
+    }
+
     pub(crate) fn from_env() -> Self {
         #[allow(unused_mut)]
         let mut backend = Self::in_memory();
@@ -74,7 +80,9 @@ impl OrgBackend {
         backend
     }
 
-    fn store(&self) -> Result<Arc<dyn OrgStore>, String> {
+    /// The organization store: Postgres when configured, else this
+    /// process's memory. Also where `admin_audit` writes its rows.
+    pub(crate) fn store(&self) -> Result<Arc<dyn OrgStore>, String> {
         #[cfg(feature = "postgres")]
         if let Some(url) = &self.database_url {
             // One pool per process: the key store's, when there is one.
@@ -97,6 +105,36 @@ impl OrgBackend {
     }
 }
 
+impl OrgBackend {
+    /// The same store as [`Self::store`], as the console's identity store
+    /// (#345 part 2). `auth` is the server's key table, whose Postgres pool
+    /// is shared when there is one.
+    pub(crate) fn identity_store(
+        &self,
+        auth: &crate::auth::Auth,
+    ) -> Result<Arc<dyn kosha_control::identity::IdentityStore>, String> {
+        #[cfg(feature = "postgres")]
+        if let Some(url) = &self.database_url {
+            if let crate::auth::Auth::Keys(keys) = auth {
+                if let Some(pg) = keys.pg() {
+                    return Ok(pg);
+                }
+            }
+            let mut own = self.pg.lock().unwrap_or_else(|e| e.into_inner());
+            if own.is_none() {
+                let store = kosha_control::PgStore::new(url)
+                    .map_err(|e| format!("failed to connect to postgres: {e}"))?;
+                *own = Some(Arc::new(store));
+            }
+            if let Some(pg) = own.clone() {
+                return Ok(pg);
+            }
+        }
+        let _ = auth;
+        Ok(self.memory.clone())
+    }
+}
+
 fn error_response(e: &OrgError) -> String {
     let status = match e {
         OrgError::Invalid(_) => 400,
@@ -105,7 +143,7 @@ fn error_response(e: &OrgError) -> String {
         OrgError::Conflict(_) => 409,
         OrgError::Store(_) => 500,
     };
-    json_error(status, &e.to_string())
+    api_error_status(status, &e.to_string())
 }
 
 fn respond<T>(result: Result<T, OrgError>, body: impl FnOnce(T) -> Value) -> String {
@@ -351,7 +389,7 @@ fn dispatch(
                 },
             )
         }
-        _ => json_error(404, "not found"),
+        _ => api_error(ErrorCode::NotFound, "not found"),
     })
 }
 
@@ -677,7 +715,8 @@ mod tests {
             api.status(None, "GET", &format!("{base}/nope"), Value::Null),
             404
         );
-        assert_eq!(api.status(None, "PUT", &base, json!({})), 404);
+        // A known path with the wrong method is a 405 (#350).
+        assert_eq!(api.status(None, "PUT", &base, json!({})), 405);
         // 409: duplicates and the last owner.
         assert_eq!(
             api.status(None, "POST", users, json!({ "email": "ADA@example.com" })),
@@ -758,7 +797,6 @@ mod tests {
             ("POST", "/v1/admin/gc"),
             ("POST", "/v1/admin/compact-namespace"),
             ("GET", "/v1/admin/compaction-status"),
-            ("POST", "/v1/admin/no-such-route"),
         ] {
             let body = json!({ "tenant_id": "someone-elses-tenant" });
             for actor in [ada.as_str(), ""] {

@@ -131,3 +131,12 @@ The oracle models mark-deleted + append upserts and flush-before-delete semantic
 For a spawned S3-backed server, `--cold-restart --database-url ...` clears only
 its temporary local cache before checking both deleted and compacted snapshots.
 This verifies that referenced deletion bitmaps and segment data survive remotely.
+
+## OpenSearch / Elasticsearch DSL matrix: `dsl/`
+
+`dsl/run.py` reuses this suite's corpus, reference model and server helpers to
+check the OpenSearch / Elasticsearch DSL cases in `dsl/cases.yaml` through
+kosha-client (Python), and writes the compatibility matrix in
+[`docs/compat/opensearch.md`](../../docs/compat/opensearch.md). CI runs it on the
+same stack after this suite and fails when the matrix is stale. See
+[`dsl/README.md`](dsl/README.md).

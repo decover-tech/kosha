@@ -6,6 +6,7 @@
 
 mod client;
 mod config;
+mod keys;
 mod search;
 
 use std::fs;
@@ -188,6 +189,12 @@ enum Commands {
         #[command(subcommand)]
         command: AdminCommands,
     },
+    /// Manage this tenant's own API keys (needs a tenant API key with the
+    /// admin scope as --api-key; grants at most what that key holds)
+    Keys {
+        #[command(subcommand)]
+        command: keys::KeyCommands,
+    },
     /// Raw HTTP escape hatch (any path)
     Curl {
         /// HTTP method (GET, POST, …)
@@ -318,9 +325,12 @@ enum AdminCommands {
         expires_in_secs: Option<u64>,
     },
     /// Remove the plaintext that keys created before scoped keys still
-    /// hold in the database. Run once every server is upgraded: the keys
-    /// keep working, but an older server build can no longer read them
+    /// hold in the database now, instead of waiting for the server's
+    /// automatic scrub. The keys keep working, but a server build from
+    /// before hashed keys can no longer read them
     ScrubPlaintextApiKeys,
+    #[command(flatten)]
+    Operator(keys::OperatorCommands),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -717,6 +727,10 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
             }
         }
         Commands::Admin {
+            command: AdminCommands::Operator(command),
+        } => keys::run_operator(&client, command, cli.json)?,
+        Commands::Keys { command } => keys::run_keys(&client, command, cli.json)?,
+        Commands::Admin {
             command: AdminCommands::ScrubPlaintextApiKeys,
         } => {
             let value = client.scrub_plaintext_api_keys().map_err(admin_error)?;
@@ -854,8 +868,10 @@ fn search_usage_error(message: String) -> clap::Error {
 
 /// Explain an admin route's failure in plain words. The server answers 403
 /// when the request's key is neither an operator credential nor its
-/// `KOSHA_ADMIN_API_KEY` (or it has none configured), and 400 when the route needs a backend this server was
-/// not built or configured with (Postgres for API keys, S3 for import).
+/// `KOSHA_ADMIN_API_KEY` (or it has none configured), and 501
+/// `not_implemented` when the route needs a backend this server was not
+/// built or configured with (Postgres for API keys, S3 for import). Servers
+/// before API contract 1.0.0 answered that with a 400.
 fn admin_error(error: RequestError) -> ClientError {
     match error {
         RequestError::Http(http) if http.status == 403 => ClientError(format!(
@@ -865,7 +881,9 @@ fn admin_error(error: RequestError) -> ClientError {
              server with no usable admin credential refuses every admin route.",
             http.method, http.path, http.message
         )),
-        RequestError::Http(http) if http.status == 400 && backend_unsupported(&http.message) => {
+        RequestError::Http(http)
+            if http.status == 501 || (http.status == 400 && backend_unsupported(&http.message)) =>
+        {
             ClientError(format!(
                 "this server does not support {}: {}",
                 http.path, http.message
@@ -876,8 +894,9 @@ fn admin_error(error: RequestError) -> ClientError {
     }
 }
 
-/// The 400 messages an admin route gives when the server lacks the
-/// backend it needs, as opposed to a malformed request.
+/// The 400 messages a pre-#350 server's admin route gives when it lacks
+/// the backend it needs, as opposed to a malformed request. Current servers
+/// send 501 `not_implemented` instead.
 fn backend_unsupported(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     [
@@ -1904,6 +1923,67 @@ mod tests {
     }
 
     #[test]
+    fn operator_and_self_service_key_commands_parse() {
+        use keys::{KeyCommands, OperatorCommands};
+        let admin = |args: &[&str]| match parse(args).unwrap().command {
+            Commands::Admin {
+                command: AdminCommands::Operator(command),
+            } => command,
+            other => panic!("expected an operator command: {other:?}"),
+        };
+        assert!(matches!(
+            admin(&["admin", "create-operator", "--name", "alice", "--expires-in-secs", "60"]),
+            OperatorCommands::CreateOperator { name, expires_in_secs: Some(60), .. }
+                if name == "alice"
+        ));
+        assert!(parse(&["admin", "create-operator"]).is_err());
+        assert!(matches!(
+            admin(&["admin", "list-operators"]),
+            OperatorCommands::ListOperators
+        ));
+        assert!(matches!(
+            admin(&["admin", "rotate-operator", "abc", "--force"]),
+            OperatorCommands::RotateOperator { key_id, force: true, .. } if key_id == "abc"
+        ));
+        assert!(matches!(
+            admin(&["admin", "revoke-operator", "--name", "alice"]),
+            OperatorCommands::RevokeOperator { key_id: None, name: Some(n), force: false }
+                if n == "alice"
+        ));
+        assert!(matches!(
+            admin(&["admin", "revoke-operator", "abc", "--force"]),
+            OperatorCommands::RevokeOperator { key_id: Some(k), name: None, force: true }
+                if k == "abc"
+        ));
+        assert!(parse(&["admin", "revoke-operator"]).is_err());
+        assert!(parse(&["admin", "revoke-operator", "abc", "--name", "alice"]).is_err());
+        assert!(matches!(
+            admin(&["admin", "api-key-plaintext-count"]),
+            OperatorCommands::ApiKeyPlaintextCount
+        ));
+
+        let own = |args: &[&str]| match parse(args).unwrap().command {
+            Commands::Keys { command } => command,
+            other => panic!("expected a keys command: {other:?}"),
+        };
+        assert!(matches!(own(&["keys", "list"]), KeyCommands::List));
+        assert!(matches!(
+            own(&["keys", "create", "--scope", "read", "--namespace", "docs"]),
+            KeyCommands::Create { scopes, namespaces, expires_in_secs: None, .. }
+                if scopes == [KeyScope::Read] && namespaces == ["docs"]
+        ));
+        assert!(matches!(
+            own(&["keys", "rotate", "abc", "--overlap-secs", "0"]),
+            KeyCommands::Rotate { key_id, overlap_secs: Some(0), .. } if key_id == "abc"
+        ));
+        assert!(matches!(
+            own(&["keys", "revoke", "abc"]),
+            KeyCommands::Revoke { key_id } if key_id == "abc"
+        ));
+        assert!(parse(&["keys", "revoke"]).is_err());
+    }
+
+    #[test]
     fn api_key_listing_reads_one_line_per_key() {
         let lines = api_key_lines(&serde_json::json!({"api_keys": [
             {"key_id": "aa11", "tenant_id": "acme", "description": "ci",
@@ -1949,6 +2029,12 @@ mod tests {
         let s3 =
             admin_error(http_error(400, "import-namespace requires the s3 feature")).to_string();
         assert!(s3.starts_with("this server does not support"), "{s3}");
+        let not_implemented =
+            admin_error(http_error(501, "import-namespace requires the s3 feature")).to_string();
+        assert!(
+            not_implemented.starts_with("this server does not support"),
+            "{not_implemented}"
+        );
 
         // An ordinary 400 keeps the server's message as is.
         let other = admin_error(http_error(400, "missing 'tenant_id'")).to_string();

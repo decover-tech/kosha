@@ -84,7 +84,7 @@ class Probe:
 def search(host, namespace, headers, queries, topk, qidx, timeout) -> Probe:
     try:
         resp = _session().post(
-            f"{host}/search",
+            f"{host}/v1/namespaces/{namespace}/search",
             json=qb.payload_for(namespace, queries[qidx], topk, qidx),
             headers=headers,
             timeout=timeout,

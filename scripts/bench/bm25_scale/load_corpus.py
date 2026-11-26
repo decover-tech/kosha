@@ -2,15 +2,15 @@
 """Bulk-load a generate_corpus.py NDJSON corpus into a Kosha namespace.
 
 Deliberately does NOT use kosha_client.KoshaClient.bulk() — before client
-0.2.12 that helper called POST /flush after every batch, which forced one
+0.2.12 that helper called a flush after every batch, which forced one
 immutable segment per batch regardless of server-side flush threshold (issue
 #241). It no longer does unless asked (refresh=True/"wait_for"), but posting
-large batches straight to /index is still the cheapest bulk path.
+large batches straight to POST /v1/namespaces/{ns}/documents is still the cheapest bulk path.
 
-Instead this script POSTs directly to /index in large batches and never calls
-/flush mid-load: auto-flush is left entirely to the server's
+Instead this script POSTs directly to /v1/namespaces/{ns}/documents in large batches and never calls
+flush mid-load: auto-flush is left entirely to the server's
 KOSHA_FLUSH_THRESHOLD (set that env var on the kosha-server deployment before
-running this — see README.md in this directory). One explicit /flush happens
+running this — see README.md in this directory). One explicit flush happens
 once at the very end to drain any partial buffer, followed by an optional
 /v1/admin/compact-namespace call to merge whatever segment count resulted.
 
@@ -129,8 +129,8 @@ def iter_emb_records(emb_dir: str):
 def post_batch(session, host, namespace, headers, docs, timeout) -> float:
     t0 = time.time()
     resp = session.post(
-        f"{host}/index",
-        json={"namespace": namespace, "documents": docs},
+        f"{host}/v1/namespaces/{namespace}/documents",
+        json={"documents": docs},
         headers=headers,
         timeout=timeout,
     )
@@ -147,7 +147,7 @@ def s3_fetch_with_retries(url: str, dest: Path) -> None:
     """Download one S3 object to a local file, retrying transient failures.
 
     Streaming objects through a live `aws s3 cp <key> -` pipe proved
-    fragile: while the loader blocks on a flush-triggering /index request
+    fragile: while the loader blocks on a flush-triggering documents request
     (minutes at large flush thresholds), the pipe backs up and the idle S3
     connection gets killed — surfacing as a truncated shard mid-load
     (round 9). A to-file download gets the CLI's own retry/resume
@@ -313,7 +313,7 @@ def main() -> None:
     # Drain any partial buffer below flush_threshold.
     print("final flush...")
     session.post(
-        f"{args.host}/flush", json={"namespace": args.namespace}, headers=headers
+        f"{args.host}/v1/namespaces/{args.namespace}/flush", json={}, headers=headers
     ).raise_for_status()
 
     if args.compact_after:
@@ -374,13 +374,14 @@ def main() -> None:
 
 
 def namespace_stats(session, host: str, headers: dict, namespace: str) -> dict:
-    """Fetch this namespace's entry from GET /stats (documents, segments)."""
-    resp = session.get(f"{host}/stats", headers=headers, timeout=60)
+    """This namespace's stats (documents, segments) from
+    GET /v1/namespaces/{ns}/stats, which a tenant key may read (the old
+    global GET /stats needs the admin key)."""
+    resp = session.get(f"{host}/v1/namespaces/{namespace}/stats", headers=headers, timeout=60)
+    if resp.status_code == 404:
+        raise SystemExit(f"namespace {namespace!r} not found")
     resp.raise_for_status()
-    for entry in resp.json().get("namespaces", []):
-        if entry.get("namespace") == namespace:
-            return entry
-    raise SystemExit(f"namespace {namespace!r} missing from /stats response")
+    return resp.json()
 
 
 def _progress(docs_sent: int, t0: float) -> None:

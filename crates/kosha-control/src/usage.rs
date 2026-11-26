@@ -38,11 +38,29 @@ pub mod meter {
     pub const BYTES_WRITTEN: &str = "bytes_written";
     /// Documents in an accepted write.
     pub const DOCUMENTS_WRITTEN: &str = "documents_written";
+    /// Vector dimensions in an accepted write: each flat vector's
+    /// dimension, plus dimension x tokens of each late-interaction bag,
+    /// counted after server-side embedding.
+    pub const VECTOR_DIMENSIONS_WRITTEN: &str = "vector_dimensions_written";
     /// Bytes of the objects of every segment the namespace's manifest
     /// references (segments a branch inherits are counted on the namespace
     /// that owns them). A gauge: one event per namespace per hour, with a
     /// deterministic id, so the hour's sum is the snapshot.
     pub const STORED_BYTES: &str = "stored_bytes";
+    /// Documents a delete by query removed (`POST .../delete`, legacy
+    /// `/delete`), counted when the delete is applied.
+    pub const DOCUMENTS_DELETED: &str = "documents_deleted";
+    /// Bytes of those documents' records in the doc store, as stored
+    /// (compressed when the segment's doc store is). The space comes back
+    /// in `stored_bytes` once compaction has rewritten the segments.
+    pub const BYTES_DELETED: &str = "bytes_deleted";
+    /// Vector dimensions times vectors stored: for every vector column of
+    /// every segment the namespace's manifest references and owns,
+    /// `dim x count`, plus `dim x tokens` for every late-interaction
+    /// field. A gauge like [`STORED_BYTES`], one event per namespace per
+    /// hour (id `vectors/<namespace>/<hour>`). Read from each segment's
+    /// footer once per segment, never per snapshot.
+    pub const VECTOR_DIMENSIONS: &str = "vector_dimensions";
 }
 
 /// One hour in milliseconds: the bucket width of [`UsageStore::hourly`].
@@ -138,6 +156,14 @@ pub struct NamespaceUsage {
     pub stored_snapshots: u64,
     /// The latest snapshot in the window, if any.
     pub stored_bytes_latest: Option<u64>,
+    pub vector_dimensions_written: u64,
+    pub documents_deleted: u64,
+    pub bytes_deleted: u64,
+    /// Sum of the hourly `vector_dimensions` snapshots in the window:
+    /// dimension-hours, like `stored_byte_hours`.
+    pub vector_dimension_hours: u64,
+    /// The latest `vector_dimensions` snapshot in the window, if any.
+    pub vector_dimensions_latest: Option<u64>,
     /// Meters this build does not know, summed.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub other: BTreeMap<String, u64>,
@@ -163,6 +189,23 @@ impl NamespaceUsage {
             self.stored_bytes_latest =
                 Some(self.stored_bytes_latest.unwrap_or(0).saturating_add(latest));
         }
+        self.vector_dimensions_written = self
+            .vector_dimensions_written
+            .saturating_add(other.vector_dimensions_written);
+        self.documents_deleted = self
+            .documents_deleted
+            .saturating_add(other.documents_deleted);
+        self.bytes_deleted = self.bytes_deleted.saturating_add(other.bytes_deleted);
+        self.vector_dimension_hours = self
+            .vector_dimension_hours
+            .saturating_add(other.vector_dimension_hours);
+        if let Some(latest) = other.vector_dimensions_latest {
+            self.vector_dimensions_latest = Some(
+                self.vector_dimensions_latest
+                    .unwrap_or(0)
+                    .saturating_add(latest),
+            );
+        }
         for (meter, quantity) in &other.other {
             let total = self.other.entry(meter.clone()).or_default();
             *total = total.saturating_add(*quantity);
@@ -180,6 +223,7 @@ pub fn summarize(buckets: &[UsageBucket], carry_in: &[UsageGauge]) -> Vec<Namesp
     struct Hour {
         queries: u64,
         stored: Option<u64>,
+        vectors: Option<u64>,
     }
     #[derive(Default)]
     struct Acc {
@@ -210,6 +254,17 @@ pub fn summarize(buckets: &[UsageBucket], carry_in: &[UsageGauge]) -> Vec<Namesp
                 usage.stored_snapshots += 1;
                 acc.hours.entry(bucket.hour_start_ms).or_default().stored = Some(q);
             }
+            meter::VECTOR_DIMENSIONS_WRITTEN => {
+                usage.vector_dimensions_written = usage.vector_dimensions_written.saturating_add(q)
+            }
+            meter::DOCUMENTS_DELETED => {
+                usage.documents_deleted = usage.documents_deleted.saturating_add(q)
+            }
+            meter::BYTES_DELETED => usage.bytes_deleted = usage.bytes_deleted.saturating_add(q),
+            meter::VECTOR_DIMENSIONS => {
+                usage.vector_dimension_hours = usage.vector_dimension_hours.saturating_add(q);
+                acc.hours.entry(bucket.hour_start_ms).or_default().vectors = Some(q);
+            }
             other => {
                 let total = usage.other.entry(other.to_string()).or_default();
                 *total = total.saturating_add(q);
@@ -230,6 +285,9 @@ pub fn summarize(buckets: &[UsageBucket], carry_in: &[UsageGauge]) -> Vec<Namesp
                 .or(first_in_window)
                 .unwrap_or(0);
             for hour in acc.hours.values() {
+                if let Some(vectors) = hour.vectors {
+                    acc.usage.vector_dimensions_latest = Some(vectors);
+                }
                 if let Some(stored) = hour.stored {
                     size = stored;
                     acc.usage.stored_bytes_latest = Some(stored);
@@ -437,7 +495,7 @@ mod pg {
                 .map_err(|e| format!("failed to create tokio runtime: {e}"))?;
             let pool = {
                 let _guard = rt.enter();
-                sqlx::postgres::PgPoolOptions::new()
+                crate::postgres::writer_pool_options()
                     .max_connections(2)
                     .acquire_timeout(Duration::from_secs(5))
                     .connect_lazy(database_url)
@@ -742,6 +800,80 @@ mod tests {
         assert_eq!(total.other.get("gpu_ms"), Some(&7));
         assert_eq!(total.stored_bytes_latest, Some(11));
         assert_eq!(total.stored_byte_hours, 11);
+    }
+
+    #[test]
+    fn vector_dimensions_written_are_summed() {
+        let store = MemoryUsageStore::new();
+        store
+            .record(&[
+                event("w1", "docs", 10, &[(meter::VECTOR_DIMENSIONS_WRITTEN, 768)]),
+                event(
+                    "w2",
+                    "docs",
+                    H + 10,
+                    &[(meter::VECTOR_DIMENSIONS_WRITTEN, 384)],
+                ),
+                event("w3", "logs", 10, &[(meter::VECTOR_DIMENSIONS_WRITTEN, 4)]),
+                // Before the meter: no vector field at all.
+                event("w4", "old", 10, &[(meter::DOCUMENTS_WRITTEN, 1)]),
+            ])
+            .unwrap();
+        let usage = usage_summary(&store, None, 0, 2 * H).unwrap();
+        assert_eq!(usage[0].vector_dimensions_written, 1_152);
+        assert_eq!(usage[2].vector_dimensions_written, 0);
+        let mut total = NamespaceUsage::default();
+        for namespace in &usage {
+            total.add(namespace);
+        }
+        assert_eq!(total.vector_dimensions_written, 1_156);
+        assert!(total.other.is_empty(), "{:?}", total.other);
+    }
+
+    #[test]
+    fn deletes_and_vector_dimensions_are_summarized() {
+        let store = MemoryUsageStore::new();
+        let vectors = |ns: &str, hour: u64, dims: u64| {
+            event(
+                &format!("vectors/{ns}/{hour}"),
+                ns,
+                hour * H,
+                &[(meter::VECTOR_DIMENSIONS, dims)],
+            )
+        };
+        store
+            .record(&[
+                event(
+                    "d1",
+                    "docs",
+                    10,
+                    &[(meter::DOCUMENTS_DELETED, 3), (meter::BYTES_DELETED, 300)],
+                ),
+                event(
+                    "d2",
+                    "docs",
+                    H + 10,
+                    &[(meter::DOCUMENTS_DELETED, 1), (meter::BYTES_DELETED, 90)],
+                ),
+                vectors("docs", 0, 768 * 100),
+                vectors("docs", 1, 768 * 150),
+                // The same hour again (another writer): ignored.
+                vectors("docs", 1, 1),
+                vectors("logs", 1, 4 * 10),
+            ])
+            .unwrap();
+        let usage = usage_summary(&store, None, 0, 2 * H).unwrap();
+        let docs = &usage[0];
+        assert_eq!((docs.documents_deleted, docs.bytes_deleted), (4, 390));
+        assert_eq!(docs.vector_dimension_hours, 768 * 250);
+        assert_eq!(docs.vector_dimensions_latest, Some(768 * 150));
+        assert!(docs.other.is_empty());
+        let mut total = NamespaceUsage::default();
+        for namespace in &usage {
+            total.add(namespace);
+        }
+        assert_eq!(total.vector_dimensions_latest, Some(768 * 150 + 40));
+        assert_eq!(total.documents_deleted, 4);
     }
 
     #[test]

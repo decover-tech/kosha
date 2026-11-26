@@ -21,6 +21,18 @@ import evalset_to_fixture  # noqa: E402
 import generate  # noqa: E402
 import opensearch_to_qrels  # noqa: E402
 
+
+def load_generator(name: str):
+    """The generate.py of fixtures/<name> (every fixture's module is `generate`)."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        f"generate_{name}", HERE / "fixtures" / name / "generate.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
 # A trimmed real-shaped OpenSearch `_search` response.
 CANNED_RESPONSE = {
     "took": 7,
@@ -155,6 +167,42 @@ class SyntheticFixtureTest(unittest.TestCase):
         self.assertLess(size, 2 * 1024 * 1024)
         grades = {line.split()[3] for line in (fixture / "qrels.txt").read_text().splitlines()}
         self.assertEqual(grades, {"1", "2"})
+
+    def test_ood_vectors_are_a_separate_unjudged_cohort(self):
+        _, queries, qrels = generate.generate()
+        judged = {qid for qid, _, _ in qrels}
+        ood = [q for q in queries if q.get("distribution") == "ood"]
+        self.assertEqual(len(ood), generate.OOD_QUERIES)
+        self.assertTrue(all(len(q["vector"]) == generate.DIM for q in ood))
+        self.assertTrue(judged.isdisjoint(q["qid"] for q in ood))
+
+
+class NearDupFixtureTest(unittest.TestCase):
+    fixture = HERE / "fixtures" / "neardup"
+
+    def test_committed_fixture_matches_the_generator(self):
+        gen = load_generator("neardup")
+        with tempfile.TemporaryDirectory() as tmp:
+            gen.write(Path(tmp))
+            for name in ("corpus.jsonl", "queries.jsonl", "qrels.txt", "fixture.json"):
+                self.assertEqual(
+                    (Path(tmp) / name).read_bytes(),
+                    (self.fixture / name).read_bytes(),
+                    f"{name} is stale: rerun fixtures/neardup/generate.py",
+                )
+
+    def test_fixture_is_small(self):
+        size = sum(p.stat().st_size for p in self.fixture.iterdir() if p.is_file())
+        self.assertLess(size, 2 * 1024 * 1024)
+
+    def test_corpus_is_duplicate_heavy(self):
+        # The point of the fixture: many byte-identical vectors, so the
+        # 10th neighbour is usually a tie (tie-tolerant recall is the metric).
+        rows = [json.loads(line) for line in (self.fixture / "corpus.jsonl").open()]
+        distinct = {tuple(r["vector"]) for r in rows}
+        self.assertGreater(len(rows) - len(distinct), len(rows) // 10)
+        ids = [r["id"] for r in rows]
+        self.assertEqual(len(ids), len(set(ids)))
 
 
 if __name__ == "__main__":

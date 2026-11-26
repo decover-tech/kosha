@@ -1,52 +1,59 @@
 #!/usr/bin/env python3
-"""Copy all chunks and embeddings from ElasticSearch/OpenSearch into Kosha.
+"""Copy Elasticsearch / OpenSearch indices into Kosha through the /v1 API.
 
-One-time backfill task for the ES → Kosha migration (DESIGN.md §14): scrolls
-one or more ES indices (the paragraph/chunk indices that carry ``content`` +
-``contentEmbedding``) and replays every document through Kosha's index API.
+Scrolls one or more ES indices and writes every document to a Kosha
+namespace with ``POST /v1/namespaces/{ns}/documents``, then flushes the
+namespace and checks that Kosha holds as many documents as ES counted. The
+step-by-step guide is docs/migration/from-elasticsearch.md.
 
-Index names map 1:1 to Kosha namespaces — Sage already resolves per-org/matter
-index names through ``IndexRegistry`` and uses the same string as the Kosha
-namespace, so copying under the original name keeps the read path unchanged.
+Each index is copied into a namespace of the same name (``--namespace``
+renames a single index). With ``--create-schema-from-mapping`` the ES mapping
+of each index becomes the namespace schema, and its field types decide how
+values are sent: ``keyword`` stays Keyword, ``long`` stays Integer, ``date``
+stays Date. Without it, values are typed from their JSON shape exactly as
+kosha-client's ``index()`` does (string -> Text, number -> Float, ...), so a
+copied document is indistinguishable from one written through the client.
 
-Stdlib-only, so it can run from a bare ``python:3.x-slim`` container (e.g. the
-k8s migration Job under ``k8s/stage/``). Auth mirrors the backend's
-``connection_factory``: HTTP basic (default) or AWS SigV4
-(``ELASTICSEARCH_AUTH_MODE=sigv4``, service name "es") — SigV4 needs
-``boto3``/``botocore`` installed and credentials resolvable from the
-environment (IRSA, node instance profile, ...).
+Stdlib-only, so it runs from a bare ``python:3.x-slim`` container. ES auth is
+HTTP basic (the default; credentials in the URL or the environment) or AWS
+SigV4 (``ELASTICSEARCH_AUTH_MODE=sigv4``, service name "es"), which needs
+``boto3``/``botocore`` and credentials resolvable from the environment.
 
 Usage:
-    # Everything matching the staging paragraph index + custom per-matter ones
-    python scripts/copy_es_to_kosha.py --pattern 'paragraph_index*'
+    # Everything matching a pattern
+    python scripts/copy_es_to_kosha.py --pattern 'logs-*'
 
-    # One index, capped, into a different namespace (smoke test)
-    python scripts/copy_es_to_kosha.py \
-        --index paragraph_index_hnsw --namespace smoke-test --limit 100
+    # One index, keeping keyword / integer / date semantics from its mapping
+    python scripts/copy_es_to_kosha.py --index products --create-schema-from-mapping
+
+    # One index, capped, into a scratch namespace (smoke test)
+    python scripts/copy_es_to_kosha.py --index products --namespace products-smoke --limit 100
 
     # Parallel sliced scroll (4 ES partitions writing concurrently)
-    python scripts/copy_es_to_kosha.py --index paragraph_index_hnsw --workers 4
+    python scripts/copy_es_to_kosha.py --index products --workers 4
 
     # Count what would move, write nothing
-    python scripts/copy_es_to_kosha.py --pattern 'paragraph_index*' --dry-run
+    python scripts/copy_es_to_kosha.py --pattern 'logs-*' --dry-run
 
-Env:
-    ELASTICSEARCH_HOST       http(s)://host[:port] — may embed user:pass@
-                             (default http://localhost:9200)
+Env (each also has a flag):
+    ELASTICSEARCH_HOST       http(s)://host[:port], may embed user:pass@
+                             (default http://localhost:9200; --es-host)
     ELASTICSEARCH_USERNAME   basic-auth user (overrides URL userinfo)
     ELASTICSEARCH_PASSWORD   basic-auth password
     ELASTICSEARCH_AUTH_MODE  "basic" (default) or "sigv4"
     AWS_REGION / AWS_DEFAULT_REGION  SigV4 region (default us-east-1)
-    KOSHA_HOST               default http://localhost:8080
+    KOSHA_HOST               default http://localhost:8080 (--kosha-host)
     KOSHA_API_KEY            sent as ``Authorization: Bearer ...`` when set
-    PARAGRAPH_INDEX          default index when neither --index nor --pattern
-                             is given (default "paragraph_index")
+
+Exit status: 0 when every index was copied and its count verified, 1 when a
+count does not match, 2 on a usage error.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import datetime
 import json
 import logging
 import os
@@ -62,23 +69,66 @@ logger = logging.getLogger("copy_es_to_kosha")
 
 DEFAULT_ES_HOST = "http://localhost:9200"
 DEFAULT_KOSHA_HOST = "http://localhost:8080"
-DEFAULT_EMBEDDING_FIELD = "contentEmbedding"
 
-# Mirror of KoshaClient._MIN_VECTOR_DIM — below this, a numeric list is an
+# Mirror of KoshaClient._MIN_VECTOR_DIM: below this, a numeric list is an
 # incidental tuple (coordinates, bounding boxes, ...), not an embedding, and
 # must not go into the shared Vector store. Keep in sync with
 # clients/python/kosha_client/client.py.
 _MIN_VECTOR_DIM = 8
 
+# Elasticsearch mapping type -> proto FieldType name (the namespace schema).
+# Mirror of kosha_client IndexOps._FIELD_TYPES_FROM_ES; the smoke test
+# (scripts/tests/test_copy_es_to_kosha.py) fails if they drift. Types not
+# listed (object, nested, geo_point, ...) are left out of the schema.
+FIELD_TYPES_FROM_ES = {
+    "text": "FIELD_TYPE_TEXT",
+    "match_only_text": "FIELD_TYPE_TEXT",
+    "keyword": "FIELD_TYPE_KEYWORD",
+    "constant_keyword": "FIELD_TYPE_KEYWORD",
+    "long": "FIELD_TYPE_INTEGER",
+    "integer": "FIELD_TYPE_INTEGER",
+    "short": "FIELD_TYPE_INTEGER",
+    "byte": "FIELD_TYPE_INTEGER",
+    "double": "FIELD_TYPE_FLOAT",
+    "float": "FIELD_TYPE_FLOAT",
+    "half_float": "FIELD_TYPE_FLOAT",
+    "scaled_float": "FIELD_TYPE_FLOAT",
+    "date": "FIELD_TYPE_DATE",
+    "date_nanos": "FIELD_TYPE_DATE",
+    "boolean": "FIELD_TYPE_BOOLEAN",
+    "knn_vector": "FIELD_TYPE_VECTOR",
+    "dense_vector": "FIELD_TYPE_VECTOR",
+}
 
-# ─── ElasticSearch: just enough of the API to bulk-read indices ─────────────
+# Analyzers Elasticsearch and Kosha both have under the same name; any other
+# analyzer in a mapping is dropped (the server refuses unknown names), and
+# the field gets Kosha's default analysis.
+KOSHA_ANALYZERS = frozenset({"standard", "whitespace", "keyword"})
+
+# Proto FieldType name -> the document field_type the server takes.
+_DOC_FIELD_TYPES = {
+    "FIELD_TYPE_TEXT": "Text",
+    "FIELD_TYPE_KEYWORD": "Keyword",
+    "FIELD_TYPE_INTEGER": "Integer",
+    "FIELD_TYPE_FLOAT": "Float",
+    "FIELD_TYPE_DATE": "Date",
+    "FIELD_TYPE_BOOLEAN": "Boolean",
+    "FIELD_TYPE_VECTOR": "Vector",
+}
+
+# Kosha statuses worth retrying: load shedding, and an unavailable or
+# restarting pod.
+_RETRY_STATUSES = (429, 502, 503, 504)
+
+
+# ─── Elasticsearch: just enough of the API to bulk-read indices ─────────────
 
 
 class EsScrollClient:
-    """Just enough of the ES API to bulk-read indices: _cat, _count, scroll.
+    """_cat/indices, _count, _mapping and sliced scroll.
 
-    Auth mirrors the backend's connection_factory: HTTP basic (default) or
-    AWS SigV4 (``ELASTICSEARCH_AUTH_MODE=sigv4``, service name "es").
+    Auth: HTTP basic (default) or AWS SigV4 (``auth_mode="sigv4"``,
+    service name "es").
     """
 
     def __init__(
@@ -104,7 +154,6 @@ class EsScrollClient:
 
         self._auth_mode = (auth_mode or "basic").lower()
         self._timeout = timeout
-        self._signer = None
 
         if self._auth_mode == "sigv4":
             try:
@@ -160,6 +209,23 @@ class EsScrollClient:
         result = self._request("POST", f"/{urllib.parse.quote(index)}/_count", body)
         return int(result.get("count", 0))
 
+    def mapping_properties(self, index: str) -> dict:
+        """The top-level ``properties`` of an index's mapping.
+
+        ``GET /{index}/_mapping`` is keyed by the concrete index name (an
+        alias answers with its backing index); the properties of every index
+        it returns are merged.
+        """
+        result = self._request("GET", f"/{urllib.parse.quote(index)}/_mapping")
+        merged: dict = {}
+        for entry in result.values():
+            mappings = (entry or {}).get("mappings") or {}
+            # ES 6 nests the properties under a mapping type name.
+            if "properties" not in mappings and len(mappings) == 1:
+                mappings = next(iter(mappings.values())) or {}
+            merged.update(mappings.get("properties") or {})
+        return merged
+
     def open_scroll(
         self,
         index: str,
@@ -174,8 +240,8 @@ class EsScrollClient:
             "track_total_hits": True,
             "query": {"match_all": {}},
         }
-        # Point-in-time sliced scroll: each worker gets a disjoint partition of
-        # the index (ES/OpenSearch). Omit the key for the single-worker path.
+        # Sliced scroll: each worker gets a disjoint partition of the index.
+        # Omit the key for the single-worker path.
         if slice_id is not None and slice_max is not None and slice_max > 1:
             body["slice"] = {"id": slice_id, "max": slice_max}
         result = self._request(
@@ -199,74 +265,223 @@ class EsScrollClient:
             logger.warning("failed to clear scroll: %s", exc)
 
 
-# ─── Kosha: batched writes to the legacy Phase 1 routes ─────────────────────
+# ─── Kosha: the /v1 API ─────────────────────────────────────────────────────
+
+
+class KoshaError(RuntimeError):
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class KoshaWriter:
-    def __init__(self, host: str, api_key: str | None, timeout: int = 300) -> None:
+    def __init__(self, host: str, api_key: str | None, timeout: int = 300, max_retries: int = 5) -> None:
         self._base = host.rstrip("/")
         self._api_key = api_key
         self._timeout = timeout
+        self._max_retries = max_retries
 
     def _request(self, method: str, path: str, body: dict | None = None) -> dict:
         data = json.dumps(body).encode() if body is not None else None
         headers = {"Content-Type": "application/json"}
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
-        req = urllib.request.Request(self._base + path, data=data, headers=headers, method=method)
+        for attempt in range(self._max_retries + 1):
+            req = urllib.request.Request(self._base + path, data=data, headers=headers, method=method)
+            try:
+                with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                    return json.loads(resp.read().decode() or "{}")
+            except urllib.error.HTTPError as e:
+                detail = e.read().decode()[:500]
+                if e.code in _RETRY_STATUSES and attempt < self._max_retries:
+                    delay = _retry_after(e.headers.get("Retry-After"), attempt)
+                    logger.warning("Kosha %s %s → %s; retrying in %.1fs", method, path, e.code, delay)
+                    time.sleep(delay)
+                    continue
+                raise KoshaError(e.code, f"Kosha {method} {path} → {e.code}: {detail}") from e
+        raise AssertionError("unreachable")
+
+    @staticmethod
+    def _ns(namespace: str, action: str) -> str:
+        """``/v1/namespaces/{namespace}/{action}``."""
+        return "/v1/namespaces/%s/%s" % (urllib.parse.quote(namespace, safe=""), action)
+
+    def create_namespace(self, namespace: str, schema: dict | None) -> bool:
+        """Create the namespace; False if it already exists (left unchanged)."""
+        body: dict = {"namespace": namespace}
+        if schema:
+            body["schema"] = schema
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                return json.loads(resp.read().decode() or "{}")
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode()[:500]
-            raise RuntimeError(f"Kosha {method} {path} → {e.code}: {detail}") from e
+            self._request("POST", "/v1/namespaces", body)
+            return True
+        except KoshaError as e:
+            if e.status == 409:
+                return False
+            raise
 
     def index_batch(self, namespace: str, documents: list[dict]) -> int:
-        result = self._request(
-            "POST", "/index", {"namespace": namespace, "documents": documents}
-        )
+        result = self._request("POST", self._ns(namespace, "documents"), {"documents": documents})
         return int(result.get("indexed_count", len(documents)))
 
     def flush(self, namespace: str) -> None:
-        self._request("POST", "/flush", {"namespace": namespace})
+        self._request("POST", self._ns(namespace, "flush"), {})
+
+    def count(self, namespace: str) -> int:
+        """Exact number of live documents (a filter matching everything)."""
+        result = self._request(
+            "POST",
+            self._ns(namespace, "search"),
+            {
+                "query_text": "",
+                "filter": {"match_all": {}},
+                "max_results": 0,
+                "exact_total_hits": True,
+                "no_cache": True,
+                "consistency": "strong",
+            },
+        )
+        return int(result.get("total_hits", 0))
 
 
-# ─── Field conversion — keep in sync with KoshaClient._source_to_fields ─────
+def _retry_after(header: str | None, attempt: int) -> float:
+    try:
+        return min(30.0, max(0.0, float(header)))
+    except (TypeError, ValueError):
+        return min(30.0, 0.5 * (2**attempt))
+
+
+# ─── Mapping -> schema and field types ──────────────────────────────────────
+
+
+def schema_from_mapping(properties: dict) -> tuple[dict | None, dict[str, str]]:
+    """``(NamespaceSchema or None, {field: document field_type})``.
+
+    Each top-level property with a type Kosha has becomes a schema field
+    (``index: false`` -> ``indexed: false``; a text field keeps its
+    analyzer when Kosha has one of that name). Object, nested and unknown
+    types are skipped and logged.
+    """
+    fields: dict[str, dict] = {}
+    types: dict[str, str] = {}
+    for name, spec in (properties or {}).items():
+        if not isinstance(spec, dict):
+            continue
+        proto = FIELD_TYPES_FROM_ES.get(str(spec.get("type", "")))
+        if proto is None:
+            logger.info("mapping for %r (type %r) has no Kosha equivalent; left out of the schema", name, spec.get("type", "object"))
+            continue
+        field = {"type": proto, "indexed": spec.get("index", True) is not False, "stored": True}
+        analyzer = spec.get("analyzer")
+        if proto == "FIELD_TYPE_TEXT" and isinstance(analyzer, str):
+            if analyzer in KOSHA_ANALYZERS:
+                field["analyzer"] = [analyzer]
+            else:
+                logger.info("field %r: analyzer %r has no Kosha equivalent; the default is used", name, analyzer)
+        fields[name] = field
+        types[name] = _DOC_FIELD_TYPES[proto]
+    return ({"fields": fields} if fields else None), types
+
+
+# ─── Field conversion ───────────────────────────────────────────────────────
 
 
 def _field(name: str, value: str, field_type: str) -> dict:
     return {"name": name, "field_type": field_type, "value": value}
 
 
-def source_to_fields(source: dict) -> list[dict]:
+def _is_number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _shape_field(k: str, v) -> dict | None:
+    """One field typed from its JSON shape, as KoshaClient._source_to_fields
+    does: str -> Text, bool -> Boolean, number -> Float, numeric list (len >=
+    _MIN_VECTOR_DIM) -> Vector, other list or object -> Keyword (JSON)."""
+    if isinstance(v, str):
+        return _field(k, v, "Text")
+    if isinstance(v, bool):
+        return _field(k, str(v).lower(), "Boolean")
+    if _is_number(v):
+        return _field(k, str(v), "Float")
+    if isinstance(v, (list, tuple)) and len(v) >= _MIN_VECTOR_DIM and all(_is_number(x) for x in v):
+        return _field(k, json.dumps(list(v)), "Vector")
+    if isinstance(v, (list, tuple, dict)):
+        # A nested object (#206) or a list: whole, as JSON text in a Keyword
+        # field; the server indexes an object's leaves under dotted paths.
+        return _field(k, json.dumps(v if isinstance(v, dict) else list(v), default=str), "Keyword")
+    return None  # None and anything else: skipped, as the client does
+
+
+def _typed_value(v, field_type: str) -> str | None:
+    """``v`` as the string Kosha stores for ``field_type``, or None if it
+    does not fit (the caller then falls back to the JSON shape)."""
+    if field_type in ("Text", "Keyword"):
+        if isinstance(v, bool):
+            return str(v).lower()
+        if isinstance(v, (str, int, float)):
+            return str(v)
+        return None
+    if field_type == "Integer":
+        if _is_number(v) and float(v).is_integer():
+            return str(int(v))
+        if isinstance(v, str) and v.strip().lstrip("-").isdigit():
+            return v.strip()
+        return None
+    if field_type == "Float":
+        if _is_number(v):
+            return str(v)
+        if isinstance(v, str):
+            try:
+                float(v)
+                return v.strip()
+            except ValueError:
+                return None
+        return None
+    if field_type == "Date":
+        if isinstance(v, str):
+            return v
+        if _is_number(v):
+            # epoch_millis, ES's other default date format: as ISO-8601 UTC,
+            # so it orders with string dates.
+            ts = datetime.datetime.fromtimestamp(v / 1000.0, tz=datetime.timezone.utc)
+            return ts.isoformat().replace("+00:00", "Z")
+        return None
+    if field_type == "Boolean":
+        if isinstance(v, bool):
+            return str(v).lower()
+        if isinstance(v, str) and v.lower() in ("true", "false"):
+            return v.lower()
+        return None
+    if field_type == "Vector":
+        if isinstance(v, (list, tuple)) and v and all(_is_number(x) for x in v):
+            return json.dumps(list(v))
+        return None
+    return None
+
+
+def source_to_fields(source: dict, types: dict[str, str] | None = None) -> list[dict]:
     """Convert an ES ``_source`` doc into Kosha fields.
 
-    Identical mapping to the Python client so backfilled docs are
-    indistinguishable from docs written through ``KoshaClient.index``:
-    str → Text, bool → Boolean, int/float → Float, numeric list (len ≥
-    _MIN_VECTOR_DIM) → Vector, any other list → Keyword (JSON), dicts and
-    other types are skipped.
+    A field named in ``types`` (from the mapping) is sent with that type; a
+    list of values for a non-vector field becomes one field per value, which
+    Kosha treats as multi-valued (a term filter matches any of them). Every
+    other field is typed from its JSON shape, identically to kosha-client.
     """
+    types = types or {}
     fields: list[dict] = []
     for k, v in source.items():
         if k.startswith("__type__"):
             continue
-        if isinstance(v, str):
-            fields.append(_field(k, v, "Text"))
-        elif isinstance(v, bool):
-            fields.append(_field(k, str(v).lower(), "Boolean"))
-        elif isinstance(v, (int, float)):
-            fields.append(_field(k, str(v), "Float"))
-        elif (
-            isinstance(v, (list, tuple))
-            and len(v) >= _MIN_VECTOR_DIM
-            and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in v)
-        ):
-            fields.append(_field(k, json.dumps(list(v)), "Vector"))
-        elif isinstance(v, (list, tuple)):
-            fields.append(_field(k, json.dumps(list(v), default=str), "Keyword"))
-        # else: unsupported type (dict, None, ...) — skip silently, same as
-        # the client.
+        field_type = types.get(k)
+        if field_type is not None and v is not None:
+            values = v if isinstance(v, list) and field_type != "Vector" else [v]
+            typed = [_typed_value(x, field_type) for x in values]
+            if all(t is not None for t in typed):
+                fields.extend(_field(k, t, field_type) for t in typed)
+                continue
+        shaped = _shape_field(k, v)
+        if shaped is not None:
+            fields.append(shaped)
     return fields
 
 
@@ -274,16 +489,14 @@ def source_to_fields(source: dict) -> list[dict]:
 
 
 def resolve_indices(es: EsScrollClient, args: argparse.Namespace) -> list[str]:
-    """List of ES indices/aliases to copy, in stable order, de-duplicated.
+    """ES indices/aliases to copy, in stable order, de-duplicated.
 
-    ``--index`` values are kept verbatim (do not resolve through
-    ``_cat/indices``): staging shared indices are often aliases whose
-    concrete backing name differs (e.g. ``findings_index`` →
-    ``findings_index_v2``), and Sage uses the alias string as the Kosha
-    namespace. ``--pattern`` still expands via ``_cat/indices``.
+    ``--index`` values are kept verbatim, not resolved through
+    ``_cat/indices``: an alias's concrete backing index usually has a
+    different name (``products`` -> ``products_v2``), and the namespace takes
+    the name given. ``--pattern`` expands through ``_cat/indices``.
     """
     indices: list[str] = []
-    # Exact names first so the big shared aliases copy before any patterns.
     for name in args.index or []:
         try:
             es.count(name)
@@ -296,18 +509,9 @@ def resolve_indices(es: EsScrollClient, args: argparse.Namespace) -> list[str]:
         if not matched:
             logger.warning("pattern %r matched no indices — skipping", pattern)
         indices.extend(matched)
-    if not indices and not args.index and not args.pattern:
-        indices.append(os.environ.get("PARAGRAPH_INDEX") or "paragraph_index")
     if not indices:
         raise RuntimeError("no indices matched — nothing to copy")
-    # De-dupe, keep stable order.
-    seen: set[str] = set()
-    out: list[str] = []
-    for name in indices:
-        if name not in seen:
-            seen.add(name)
-            out.append(name)
-    return out
+    return list(dict.fromkeys(indices))
 
 
 def copy_index(
@@ -316,10 +520,11 @@ def copy_index(
     index: str,
     namespace: str,
     args: argparse.Namespace,
+    types: dict[str, str] | None = None,
 ) -> tuple[int, int]:
-    """Scroll one ES index and index every doc into a Kosha namespace.
+    """Scroll one ES index and write every doc into a Kosha namespace.
 
-    Returns (docs_copied, docs_with_embedding).
+    Returns (docs_copied, docs_with_embedding_field).
     """
     total = es.count(index)
     planned = min(total, args.limit) if args.limit else total
@@ -332,10 +537,10 @@ def copy_index(
 
     progress = {"copied": 0, "with_embedding": 0}
     progress_lock = threading.Lock()
+    claimed_total = [0]  # documents reserved under --limit
     log_every = max(args.batch_size, 200)
 
-    def _run_slice(slice_id: int) -> tuple[int, int]:
-        local_copied = 0
+    def _run_slice(slice_id: int) -> None:
         local_emb = 0
         batch: list[dict] = []
 
@@ -352,54 +557,47 @@ def copy_index(
                 progress["copied"] += n
                 total_copied = progress["copied"]
             if total_copied % log_every < n or total_copied >= planned:
-                logger.info(
-                    "index %s: %s / %s docs copied",
-                    index, min(total_copied, planned), planned,
-                )
+                logger.info("index %s: %s / %s docs copied", index, min(total_copied, planned), planned)
 
-        def limit_reached() -> bool:
+        def claim() -> bool:
+            """Reserve one document under --limit (shared by the workers)."""
             if not args.limit:
-                return False
+                return True
             with progress_lock:
-                return progress["copied"] >= args.limit
+                if claimed_total[0] >= args.limit:
+                    return False
+                claimed_total[0] += 1
+                return True
 
         scroll_id, hits, _ = es.open_scroll(
-            index,
-            args.scroll_size,
-            args.scroll_keepalive,
-            slice_id=slice_id,
-            slice_max=workers,
+            index, args.scroll_size, args.scroll_keepalive, slice_id=slice_id, slice_max=workers,
         )
         try:
-            while True:
-                if limit_reached():
-                    break
+            done = False
+            while hits and not done:
                 for hit in hits:
-                    if limit_reached():
-                        break
                     doc_id = hit.get("_id")
                     if not doc_id:
                         logger.warning("hit without _id in %s — skipping", index)
                         continue
+                    if not claim():
+                        done = True
+                        break
                     source = hit.get("_source") or {}
-                    if args.embedding_field in source:
+                    if args.embedding_field and args.embedding_field in source:
                         local_emb += 1
-                    batch.append({"id": doc_id, "fields": source_to_fields(source)})
-                    local_copied += 1
+                    batch.append({"id": doc_id, "fields": source_to_fields(source, types)})
                     if len(batch) >= args.batch_size:
                         send_batch()
-                if limit_reached() or not hits:
+                if done:
                     break
                 scroll_id, hits = es.next_scroll(scroll_id, args.scroll_keepalive)
-                if not hits:
-                    break
         finally:
             es.clear_scroll(scroll_id)
 
         send_batch()
         with progress_lock:
             progress["with_embedding"] += local_emb
-        return local_copied, local_emb
 
     if workers == 1:
         _run_slice(0)
@@ -409,16 +607,13 @@ def copy_index(
             for fut in as_completed(futures):
                 fut.result()  # surface worker errors
 
-    with progress_lock:
-        copied = progress["copied"]
-        with_emb = progress["with_embedding"]
-
+    copied, with_emb = progress["copied"], progress["with_embedding"]
     if copied > 0:
         kosha.flush(namespace)
     logger.info(
-        "index %s: %s namespace %s — %s docs copied, %s with %s",
-        index, "flushed" if copied else "skipped (empty)", namespace,
-        copied, with_emb, args.embedding_field,
+        "index %s: %s namespace %s — %s docs copied%s",
+        index, "flushed" if copied else "skipped (empty)", namespace, copied,
+        f", {with_emb} with {args.embedding_field}" if args.embedding_field else "",
     )
     return copied, with_emb
 
@@ -428,27 +623,34 @@ def dry_run(es: EsScrollClient, indices: list[str], args: argparse.Namespace) ->
     grand_total = 0
     for index in indices:
         total = es.count(index)
-        with_emb = es.count(index, {"exists": {"field": args.embedding_field}})
         planned = min(total, args.limit) if args.limit else total
         grand_total += planned
-        print(f"  {index:<48}{planned:>12,} docs   ({with_emb:>12,} with {args.embedding_field})")
+        line = f"  {index:<48}{planned:>12,} docs"
+        if args.embedding_field:
+            with_emb = es.count(index, {"exists": {"field": args.embedding_field}})
+            line += f"   ({with_emb:>12,} with {args.embedding_field})"
+        print(line)
     print(f"  {'TOTAL':<48}{grand_total:>12,} docs\n")
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Copy chunks + embeddings from ElasticSearch/OpenSearch into Kosha."
+        description="Copy Elasticsearch / OpenSearch indices into Kosha through the /v1 API."
     )
     parser.add_argument("--index", action="append",
-                        help="Concrete ES index/alias to copy (repeatable).")
+                        help="Exact ES index or alias to copy (repeatable).")
     parser.add_argument("--pattern", action="append",
                         help="ES index pattern resolved via _cat/indices (repeatable).")
     parser.add_argument("--namespace",
-                        help="Kosha namespace override (only valid with a single --index).")
+                        help="Kosha namespace for the copy (only with a single index; default: the index name).")
+    parser.add_argument("--create-schema-from-mapping", action="store_true",
+                        help="Create each namespace with a schema from the ES mapping and send values "
+                             "with the mapped types (keyword, integer, date, ...). An existing "
+                             "namespace keeps its schema.")
     parser.add_argument("--limit", type=int,
                         help="Max docs per index (smoke tests).")
     parser.add_argument("--batch-size", type=int, default=200,
-                        help="Docs per Kosha /index call (default 200).")
+                        help="Docs per Kosha write (default 200).")
     parser.add_argument("--scroll-size", type=int, default=1000,
                         help="ES scroll page size (default 1000).")
     parser.add_argument("--scroll-keepalive", default="5m",
@@ -457,17 +659,34 @@ def main(argv: list[str] | None = None) -> int:
                         help="Parallel ES sliced-scroll workers per index (default 1).")
     parser.add_argument("--sleep", type=float, default=0.0,
                         help="Seconds to sleep between batches (throttle, default 0).")
-    parser.add_argument("--embedding-field", default=DEFAULT_EMBEDDING_FIELD,
-                        help=f"Embedding field name for stats (default {DEFAULT_EMBEDDING_FIELD}).")
+    parser.add_argument("--embedding-field",
+                        help="Also report how many docs carry this field (an embedding, say).")
+    parser.add_argument("--no-verify", action="store_true",
+                        help="Skip the count check after each index.")
+    parser.add_argument("--allow-extra", action="store_true",
+                        help="On a re-run, accept a namespace that holds more documents than "
+                             "Elasticsearch (documents deleted there since an earlier copy are "
+                             "not removed); the excess is logged as a warning, not a failure.")
     parser.add_argument("--timeout", type=int, default=120,
                         help="Per-request timeout in seconds (default 120).")
+    parser.add_argument("--es-host", default=os.environ.get("ELASTICSEARCH_HOST", DEFAULT_ES_HOST),
+                        help="ES / OpenSearch URL (default $ELASTICSEARCH_HOST or %s)." % DEFAULT_ES_HOST)
+    parser.add_argument("--kosha-host", default=os.environ.get("KOSHA_HOST", DEFAULT_KOSHA_HOST),
+                        help="Kosha URL (default $KOSHA_HOST or %s)." % DEFAULT_KOSHA_HOST)
     parser.add_argument("--dry-run", action="store_true",
                         help="Count docs per index, write nothing.")
     parser.add_argument("--verbose", action="store_true")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
 
     if args.workers < 1:
         parser.error("--workers must be >= 1")
+    if not args.index and not args.pattern:
+        parser.error("name what to copy with --index and/or --pattern")
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -475,7 +694,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     es = EsScrollClient(
-        host=os.environ.get("ELASTICSEARCH_HOST", DEFAULT_ES_HOST),
+        host=args.es_host,
         username=os.environ.get("ELASTICSEARCH_USERNAME"),
         password=os.environ.get("ELASTICSEARCH_PASSWORD"),
         auth_mode=os.environ.get("ELASTICSEARCH_AUTH_MODE", "basic"),
@@ -492,23 +711,51 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     kosha = KoshaWriter(
-        host=os.environ.get("KOSHA_HOST", DEFAULT_KOSHA_HOST),
+        host=args.kosha_host,
         api_key=os.environ.get("KOSHA_API_KEY"),
         timeout=max(args.timeout, 300),
     )
 
     grand_copied = 0
-    grand_embeddings = 0
+    mismatches: list[str] = []
     for index in indices:
         namespace = args.namespace or index
-        copied, with_emb = copy_index(es, kosha, index, namespace, args)
+        types = None
+        if args.create_schema_from_mapping:
+            schema, types = schema_from_mapping(es.mapping_properties(index))
+            if kosha.create_namespace(namespace, schema):
+                logger.info("namespace %s created with %d schema fields", namespace, len((schema or {}).get("fields", {})))
+            else:
+                logger.warning("namespace %s already exists; its schema is left as it is", namespace)
+        copied, _ = copy_index(es, kosha, index, namespace, args, types)
         grand_copied += copied
-        grand_embeddings += with_emb
+        if not args.no_verify:
+            want = es.count(index)
+            if args.limit:
+                want = min(want, args.limit)
+            got = kosha.count(namespace)
+            if got == want:
+                logger.info("verified %s: %s documents in ES and in Kosha", namespace, got)
+            elif args.limit and got > want:
+                # A capped copy into a namespace that already held documents.
+                logger.warning("namespace %s holds %s documents; %s were copied (--limit)", namespace, got, want)
+            elif args.allow_extra and got > want:
+                # A re-run: the copy upserts but never deletes, so documents
+                # deleted in Elasticsearch since an earlier copy remain.
+                logger.warning(
+                    "namespace %s holds %s documents, %s more than Elasticsearch's %s "
+                    "(documents deleted in Elasticsearch since an earlier copy are not removed; "
+                    "--allow-extra)",
+                    namespace, got, got - want, want,
+                )
+            else:
+                mismatches.append(f"{index} → {namespace}: ES {want}, Kosha {got}")
 
-    logger.info(
-        "done: %s docs copied (%s with %s) across %s indices",
-        grand_copied, grand_embeddings, args.embedding_field, len(indices),
-    )
+    logger.info("done: %s docs copied across %s indices", grand_copied, len(indices))
+    if mismatches:
+        for line in mismatches:
+            logger.error("count mismatch: %s", line)
+        return 1
     return 0
 
 

@@ -547,6 +547,103 @@
     }
   }
 
+  // ── Usage ─────────────────────────────────────────────────────────────
+  // `GET /v1/usage` (#348): the key's tenant's metered usage per namespace.
+  const USAGE_WINDOWS = [
+    ["1", "Last 24 hours"],
+    ["7", "Last 7 days"],
+    ["30", "Last 30 days"],
+  ];
+  const USAGE_COLUMNS = [
+    ["queries", "Queries", fmtNum],
+    ["bytes_queried", "Bytes queried", fmtBytes],
+    ["bytes_returned", "Bytes returned", fmtBytes],
+    ["bytes_written", "Bytes written", fmtBytes],
+    ["documents_written", "Documents written", fmtNum],
+    ["vector_dimensions_written", "Vector dims written", fmtNum],
+    ["stored_bytes_latest", "Stored bytes", fmtBytes],
+    ["vector_dimensions_latest", "Stored vector dims", fmtNum],
+  ];
+  function fmtBytes(n) {
+    if (n === undefined || n === null) return "-";
+    const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let v = Number(n);
+    let i = 0;
+    while (v >= 1024 && i < units.length - 1) {
+      v /= 1024;
+      i += 1;
+    }
+    return (i === 0 ? String(v) : v.toFixed(v < 10 ? 2 : 1)) + " " + units[i];
+  }
+
+  async function showUsage(days) {
+    const windowDays = USAGE_WINDOWS.some(([d]) => d === days) ? days : "30";
+    const picker = el(
+      "select",
+      { id: "usage-window", "aria-label": "Usage window" },
+      USAGE_WINDOWS.map(([d, label]) => el("option", { value: d, selected: d === windowDays, text: label }))
+    );
+    picker.addEventListener("change", () => {
+      location.hash = "#/usage/" + picker.value;
+    });
+    const title = el("h1", { text: "Usage" });
+    const controls = el("p", {}, picker);
+    render(title, controls, el("p", { class: "muted", text: "Loading…" }));
+    const to = Math.floor(Date.now() / 1000) + 1;
+    const from = to - Number(windowDays) * 86400;
+    let data;
+    try {
+      data = await api("GET", "/v1/usage?from=" + from + "&to=" + to);
+    } catch (e) {
+      const off = /^404:/.test(e.message);
+      render(title, controls, off ? el("div", { class: "panel muted", text: "Usage metering is off on this server (KOSHA_USAGE_METERING=on enables it)." }) : errorBox(e.message));
+      return;
+    }
+    const total = data.total || {};
+    const namespaces = data.namespaces || [];
+    render(
+      title,
+      controls,
+      el(
+        "div",
+        { class: "panel" },
+        kv(USAGE_COLUMNS.map(([key, label, fmt]) => [label, fmt(total[key])]))
+      ),
+      el(
+        "div",
+        { class: "panel" },
+        el("h2", { text: "Per namespace" }),
+        namespaces.length
+          ? el(
+              "table",
+              {},
+              el(
+                "thead",
+                {},
+                el("tr", {}, el("th", { text: "Namespace" }), USAGE_COLUMNS.map(([, label]) => el("th", { class: "num", text: label })))
+              ),
+              el(
+                "tbody",
+                {},
+                namespaces.map((u) =>
+                  el(
+                    "tr",
+                    {},
+                    el("td", { class: "mono", text: u.namespace }),
+                    USAGE_COLUMNS.map(([key, , fmt]) => el("td", { class: "num", text: fmt(u[key]) }))
+                  )
+                )
+              )
+            )
+          : el("p", { class: "muted", text: "No usage recorded in this window." })
+      ),
+      el(
+        "p",
+        { class: "muted", text: "Stored figures are the latest hourly snapshot in the window. Usage still spooled on other pods appears after their next flush." }
+      )
+    );
+  }
+
   // ── Router ────────────────────────────────────────────────────────────
   function route() {
     const hash = location.hash.replace(/^#/, "") || "/";
@@ -554,11 +651,13 @@
     const section = parts[0] || "";
     const arg = parts[1] ? decodeURIComponent(parts[1]) : "";
     document.querySelectorAll("nav a").forEach((a) => {
-      const active = a.dataset.nav === (section === "console" ? "console" : "namespaces");
+      const current = section === "console" || section === "usage" ? section : "namespaces";
+      const active = a.dataset.nav === current;
       a.classList.toggle("active", active);
     });
     if (section === "ns" && arg) return showNamespace(arg);
     if (section === "console") return showConsole(arg);
+    if (section === "usage") return showUsage(arg);
     return showNamespaces();
   }
 

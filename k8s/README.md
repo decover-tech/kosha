@@ -4,6 +4,9 @@ Kustomize layout for running `kosha-server` in its own **`kosha`**
 namespace. Manifests stay product-generic: no customer account names,
 bucket names, or IAM role ARNs are committed here.
 
+For segment bucket versioning, PostgreSQL PITR and the quarterly namespace
+recovery drill, see [Backups and namespace point-in-time recovery](../docs/operations/backup-restore.md).
+
     k8s/
       base/     Namespace, ServiceAccount, ConfigMap, three Deployments
                 (kosha = ingest, kosha-query = query, kosha-indexer =
@@ -16,6 +19,10 @@ bucket names, or IAM role ARNs are committed here.
                 transit"); not included by stage or prod
       stage/    floating `:main` image tag + larger memory for warm hydration
       prod/     versioned release image tag
+      saas/     multi-tenant SaaS cell: base + internal-tls + tenant quotas,
+                fair admission, /v1 only, SSE-KMS, S3 WAL, metering,
+                billing, console, usage reconcile (see "Multi-tenant SaaS
+                cells" and ../docs/deployment-model.md)
 
 ## Query/ingest split and request routing
 
@@ -52,13 +59,19 @@ ConfigMap). The role is validated at startup (#254): `query` requires
   kosha` returning real numbers, not `FailedGetResourceMetric`) or the HPA
   is a no-op.
 
+  The deployment and HPA start at three replicas. Zone spread requires
+  eligible worker capacity across three AZs to place one replica in each;
+  hostname anti-affinity prefers distinct nodes. The PDB keeps two query
+  replicas available during voluntary evictions. See the
+  [HA deployment and failover runbook](../docs/high-availability.md)
+  before rolling this out or changing the ingest replica count.
+
 **Clients only ever need `kosha-service`** — for both reads and writes,
 exactly like a single OpenSearch cluster endpoint. `kosha-service` selects
-`role: query`; a query pod handles reads itself and *transparently forwards*
-write-path requests (`/index`, `/flush`, `/replace`, `/delete`,
-`/v1/admin/*`) to `kosha-ingest-service` (which selects `role: ingest`),
-relaying the response back verbatim. See `crates/kosha-server/src/main.rs`'s
-`is_write_path`/`forward_to_ingest` for the implementation.
+`role: query`; a query pod handles most reads itself and *transparently forwards*
+writes and reads of writer-local state to `kosha-ingest-service` (which selects
+`role: ingest`), relaying the response back verbatim. This includes existence
+checks so they see acknowledged writes that have not been flushed.
 `kosha-ingest-service` is not meant for direct
 client use; it exists as the forwarding target and an optional bypass for
 admin/migration scripts.
@@ -144,7 +157,9 @@ vars, which key an object uses, key rotation) is in
 **S3.** Set `KOSHA_S3_SSE=aws:kms` (and optionally
 `KOSHA_S3_SSE_KMS_KEY_ID`, `KOSHA_S3_SSE_BUCKET_KEY=true` and per-tenant
 `KOSHA_S3_TENANT_KMS_KEYS` / `KOSHA_S3_TENANT_KMS_KEYS_FILE`) in the
-ConfigMap; see the commented example in `base/configmap.yaml`. Every pod
+ConfigMap; see the commented example in `base/configmap.yaml`. A key on the
+control-plane tenant record (`kosha.tenants.kms_key_id`) takes precedence over
+the configured tenant map. Every pod
 that reads or writes S3 (ingest, query, indexer, the GC CronJob and
 `migrate`) runs as the `kosha` service account, so its IRSA role needs KMS
 access to every key in use, the old key included until a rotation's hard
@@ -203,7 +218,7 @@ reclaimPolicy: Delete
 ## Encryption in transit
 
 The reference for every setting is `docs/configuration.md`, "TLS between
-pods" and "TLS to Postgres". Neither is turned on by the stage or prod
+pods", "TLS to Postgres" and "TLS to S3". Neither is turned on by the stage or prod
 overlays; turning them on is a per-cluster step.
 
 **Between pods.** `components/internal-tls` is an opt-in kustomize
@@ -232,10 +247,11 @@ Before applying it:
    `/etc/kosha/tls`.
 2. Move every other client of port 8080 to `https://` in the same change:
    HTTPS is per port, so a pod with a certificate no longer answers plain
-   HTTP. In this repo that is the `curl` URL in `base/cronjob-segment-gc.yaml`
-   and `stage/cronjob-compaction.yaml` (they also need the CA, for example
-   `--cacert` with the Secret mounted); the component does not patch them.
-   Outside it, that is every service calling `kosha-service`.
+   HTTP. The component switches `base/cronjob-segment-gc.yaml` to HTTPS and
+   mounts the CA for it. It does not patch `stage/cronjob-compaction.yaml`
+   (switch its `curl` URL to `https://` and add `--cacert` with the Secret
+   mounted). Outside this repo, that is every service calling `kosha-service`;
+   add their hostnames to the certificate SANs.
 3. Check the Prometheus scrape job. `/metrics` is on the same port, so it
    is HTTPS-only too (it needs no client certificate). The component adds
    `prometheus.io/scheme: https` next to the existing `prometheus.io/*`
@@ -293,6 +309,195 @@ With `KOSHA_INTERNAL_TLS=required`, a URL whose `sslmode` is anything else
 than `require`, `verify-ca` or `verify-full` stops the pod at startup.
 
 ## Deploying
+
+### Fresh install on an existing cluster
+
+Use `scripts/kosha_cluster.py` from this checkout with Python 3.10+ and
+`kubectl`. Before installing:
+
+- Set up a kubeconfig context and permissions to deploy the base manifests.
+  The cluster needs the [Kosha NVMe node pool](#the-kosha-node-pool-karpenter-nvme-instance-store)
+  for ingest. The base manifests include the query PodDisruptionBudget, so
+  the deploying identity also needs `policy/poddisruptionbudgets` (see
+  `base/rbac-query-pdb.yaml`), and the three query replicas need schedulable
+  capacity in three availability zones, or the install waits on the query
+  rollout ([HA deployment](../docs/high-availability.md)).
+- Provision an empty Postgres database and an unused S3 bucket/prefix.
+  Give the Kosha service account access to S3 (and KMS if required). On
+  EKS with IRSA, pass the role ARN below; the role must trust
+  `system:serviceaccount:kosha:kosha` in this cluster. Leave creation of
+  that service account to the installer.
+- In namespace `kosha`, provision the Secret `kosha-secret` with keys
+  `database-url` and `bootstrap-api-key` using your usual secret tooling.
+  Add `admin-bootstrap-key` too: the installer wires it into every Deployment as
+  `KOSHA_ADMIN_API_KEY`, the admin bootstrap credential for `/v1/admin/*`
+  (without it those routes stay disabled). It is separate from
+  `admin-api-key`, the segment-GC credential, which may be a revocable
+  per-operator credential. The installer neither creates
+  nor overwrites that Secret.
+
+```sh
+python3 scripts/kosha_cluster.py --context customer-eks install \
+  --image "ravidecoverai/kosha:${KOSHA_RELEASE_TAG}" \
+  --s3-bucket customer-kosha --s3-prefix segments/ --aws-region us-east-1 \
+  --irsa-role-arn arn:aws:iam::123456789012:role/kosha \
+  --confirm-empty-storage
+python3 scripts/kosha_cluster.py --context customer-eks status
+```
+
+Set `KOSHA_RELEASE_TAG` to a published tag or specify the image by digest.
+The installer creates the `k8s/base` workloads and supporting resources
+with cluster-specific S3, image, and optional IRSA settings, then waits
+for ingest, query, and indexer to roll out. `status` is a read-only snapshot
+of the three Deployments' images and readiness counts.
+
+**Install only.** The command refuses to run if any Kosha Deployment
+already exists, including after a partial install. Do not use it with
+storage from a previous installation, even on a new Kubernetes cluster:
+`--confirm-empty-storage` is your confirmation, not a storage check. To move
+a running stack to a new release use `upgrade` (below); it follows the
+[manifest and WAL compatibility rules](../README.md#s3-wal-kosha_wal_modes3)
+in the main README. Old binaries cannot read the new formats, so it refuses
+rollbacks.
+
+### Multi-tenant SaaS cells
+
+Kosha's deployment model is multi-tenant SaaS
+([decision record](../docs/deployment-model.md)). A **cell** is one stack
+built from `k8s/saas`, shared by many organizations and tenants. Add capacity
+by scaling a cell or adding another cell, never by installing a stack per
+customer.
+
+**What the overlay sets.** `k8s/saas` is `base` plus
+`components/internal-tls` and:
+
+| Concern | Setting |
+| --- | --- |
+| Tenant quotas | `KOSHA_TENANT_LIMITS_FILE` = `tenant-limits.json` (ConfigMap `kosha-saas-plans`), default plan `saas-default` |
+| Fair admission | `KOSHA_SEARCH_QUEUE_DEPTH_PER_TENANT=8`, `KOSHA_ADMISSION_TENANT_SHARES=on` |
+| Public API | `KOSHA_LEGACY_ROUTES=off` (list holdouts in `KOSHA_LEGACY_ROUTES_TENANTS`) |
+| TLS between pods | `KOSHA_INTERNAL_TLS=required`, HTTPS probes and ingest forwarding |
+| Encryption at rest | `KOSHA_S3_SSE=aws:kms`, bucket keys on; per-tenant keys from `kosha.tenants.kms_key_id` (or `KOSHA_S3_TENANT_KMS_KEYS_FILE`) |
+| Durability | `KOSHA_WAL_MODE=s3` |
+| Metering and billing | `KOSHA_USAGE_METERING`, `KOSHA_BILLING` (Stripe), `KOSHA_BILLING_SCHEDULER`; catalog `billing-plans.json`; `kosha-usage-reconcile` CronJob unsuspended |
+| Console | `KOSHA_CONSOLE=on`, `KOSHA_SIGNUP=off` until a mailer (`KOSHA_MAILER=smtp`) and paid plans exist |
+| Roles and HA | ingest (1, `Recreate`), query (3 to 12 via HPA, zone spread, PDB `minAvailable: 2`), indexer (1) |
+
+`billing-plans.json` ships empty and the `saas-default` limits are
+conservative guardrails: both wait on the pricing hypothesis (TODO in the
+decision record). Edit them in place; pods reload both files without a
+restart.
+
+**Before installing**, in addition to the [fresh-install
+prerequisites](#fresh-install-on-an-existing-cluster):
+
+- `kosha-secret` must hold `database-url` (with `sslmode=verify-full`,
+  see "Encryption in transit" above; put its CA in ConfigMap `kosha-pg-ca`,
+  key `ca.crt`, which the overlay mounts at `/etc/kosha/pg` in the
+  Deployments and the reconcile CronJob), `bootstrap-api-key`,
+  `admin-bootstrap-key`, `internal-api-key` and `stripe-api-key`. Optional:
+  `stripe-webhook-secret`, `console-secret-key` (organization OIDC secrets).
+- `admin-bootstrap-key` is the **admin bootstrap credential**: the overlay
+  sets it as `KOSHA_ADMIN_API_KEY` on every Deployment, and it is the only
+  way into `/v1/admin/*` on a fresh cell. The segment-GC CronJob reads
+  `admin-api-key` instead; give it its own operator credential (or the same
+  value as `admin-bootstrap-key` until operator credentials exist), so
+  revoking a GC credential never leaves it accepted as the bootstrap key. Use it to create per-operator credentials
+  (`POST /v1/admin/operators`) for people and automation, then set
+  `KOSHA_ADMIN_BOOTSTRAP_KEY=disabled` in `kosha-config` and keep the shared
+  key only for break-glass (see `docs/configuration.md`).
+- `kosha-internal-tls` must hold `tls.crt`, `tls.key` and `ca.crt`
+  (`base/certificate-internal-tls.example.yaml`).
+- The IRSA role needs `kms:GenerateDataKey` and `kms:Decrypt` on the default
+  key and every per-tenant key.
+
+The installer checks the Secret key names (never their values) before
+creating anything.
+
+```sh
+python3 scripts/kosha_cluster.py --context saas-cell-1 install --overlay saas \
+  --image "ravidecoverai/kosha:${KOSHA_RELEASE_TAG}" \
+  --s3-bucket example-kosha-cell-1 --s3-prefix segments/ --aws-region us-east-1 \
+  --irsa-role-arn arn:aws:iam::123456789012:role/kosha \
+  --console-public-url https://console.example.com \
+  --kms-key-id alias/kosha-cell-1 \
+  --confirm-empty-storage
+```
+
+**Onboarding a tenant** goes through the cell's control plane, never a new
+cluster: self-service through the console once sign-up is open, or an
+operator calls `POST /v1/admin/orgs`, then `.../projects`, `.../tenants` and
+`.../tenants/{tenant}/api-keys` ([organizations](../docs/organizations.md)).
+Plans and per-tenant KMS keys are set on the tenant through the same APIs.
+
+**Upgrading a cell.** `upgrade` moves every role to one release:
+
+```sh
+python3 scripts/kosha_cluster.py --context saas-cell-1 upgrade \
+  --image "ravidecoverai/kosha:${KOSHA_RELEASE_TAG}" --dry-run   # print the plan
+python3 scripts/kosha_cluster.py --context saas-cell-1 upgrade \
+  --image "ravidecoverai/kosha:${KOSHA_RELEASE_TAG}"
+```
+
+It enforces the [manifest/WAL rules](../README.md#s3-wal-kosha_wal_modes3):
+
+- It refuses a lower release tag than the running one (old readers cannot
+  read the manifest object or v2/v3 WAL frames). Digests and non-semver tags
+  need `--confirm-forward-only`.
+- It refuses mixed images unless they are a resumable state with readers at
+  least as new as the writer (an interrupted run, or a failed ingest release
+  being fixed forward), refuses a query tier that is not fully rolled out,
+  and requires ingest to run one replica with `Recreate` (one WAL writer).
+- It refuses a local WAL (`KOSHA_WAL_MODE` not `s3`) unless
+  `--allow-local-wal` confirms the ingest pod keeps its node and WAL directory.
+  The check reads `configmap/kosha-config`, not the running ingest pod, so
+  never change the WAL mode in the same step as an upgrade (see below).
+- Order: stop the indexer (it also writes manifests), roll query, then
+  ingest, then restart the indexer on the new image and move CronJobs on the
+  old image. Readers are always at least as new as the writer.
+- A failed query rollout is undone (nothing has written new formats yet). A
+  failed ingest rollout is not rolled back: fix forward by rerunning
+  `upgrade` with the same or a newer fixed release. A rerun also restores a
+  stopped indexer and CronJobs left on another tag.
+
+#### Switching the WAL mode
+
+Change `KOSHA_WAL_MODE` as its own drained step, never together with an image
+upgrade. `upgrade` only sees the ConfigMap: if it says `s3` while the ingest
+pod still runs a local WAL, the upgrade restart could come back elsewhere and
+lose acknowledged writes that were never flushed.
+
+1. Stop writes to the cell and flush every namespace (`POST /flush`) so the
+   WAL checkpoint covers every record.
+2. Change `KOSHA_WAL_MODE` in `kosha-config` and restart ingest on the
+   **current** release (`kubectl -n kosha rollout restart deployment/kosha`).
+   For local → s3 the pod must come back on the same node: on first start it
+   copies the local `_wal` into the S3 stream. For s3 → local, check the
+   stream is empty first (see the root README, "S3 WAL").
+3. Wait for `kosha_cluster.py status` to report the cell healthy and resume
+   writes.
+4. Only then run `upgrade`.
+
+Changing a segment format setting (`KOSHA_POSTINGS_WRITE_VERSION`,
+`KOSHA_VECTOR_QUANTIZATION`, ...) is a separate step after the upgrade: see
+the rollout and rollback gates in [configuration](../docs/configuration.md).
+
+**Fleet health.** `status` is read-only and takes one `--context` per cell:
+
+```sh
+python3 scripts/kosha_cluster.py --context saas-cell-1 --context saas-cell-2 status
+python3 scripts/kosha_cluster.py --context saas-cell-1 status --json
+```
+
+Per cell it reports each role's image and ready/desired replicas, CronJob
+suspension and last success, HPA and PDB state, and problems (a role not
+ready, roles on different images, an unreachable cluster). It exits 1 if any
+cell is unhealthy, so it can gate a fleet-wide rollout.
+
+BYOC and dedicated clusters are deferred: there is no Terraform for customer
+cloud accounts. See the decision record for how they stay possible.
+
+### Stage and production workflows
 
 `.github/workflows/release.yml` / `deploy.yml` call
 `.github/actions/deploy-eks`, which:
@@ -367,8 +572,12 @@ Notes:
   adding `--limit 500 --namespace migration-smoke` and retaining exactly one
   `--index`.
 - Regenerate the manifest after CLI/Job changes with
-  `make migration-job-manifest`. OpenSearch host/IAM for that Job are
-  environment-specific — edit or regenerate before use.
+  `make migration-job-manifest MIGRATION_INDICES="<index> ..."` (the exact
+  index names or aliases to copy; nothing is defaulted). OpenSearch host/IAM
+  for that Job are environment-specific — edit or regenerate before use.
+- To copy through the public `/v1` API instead (no S3 or Postgres access),
+  use `scripts/copy_es_to_kosha.py`; see
+  [docs/migration/from-elasticsearch.md](../docs/migration/from-elasticsearch.md).
 
 ## Migrating pre-#262 namespaces
 
@@ -542,6 +751,7 @@ one-off pod with the server's configuration:
 ## Local verification
 
     kustomize build k8s/stage
+    kustomize build k8s/saas
     kubectl apply --dry-run=client -k k8s/stage
     # with real cluster credentials:
     kubectl apply --dry-run=server -k k8s/stage

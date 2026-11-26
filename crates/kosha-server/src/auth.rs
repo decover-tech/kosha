@@ -9,11 +9,20 @@
 //!     without a restart. These keys are stored and matched by hash, and
 //!     carry scopes, an optional namespace allow-list and an optional
 //!     expiry (#346); `authz.rs` enforces them per request.
-//!   - `KOSHA_API_KEYS` (`key1=tenant1,key2=tenant2`).
+//!   - `KOSHA_API_KEYS` (`key1=tenant1,key2=tenant2`). An entry may add
+//!     `;`-separated attributes (#346): `key=acme;scopes=read;namespaces=
+//!     docs+wiki;expires_at=1798761600` ([`parse_env_key_specs`]).
 //!   - `KOSHA_API_KEY` (single key, tenant `default`).
 //!
-//! Env keys are operator configuration: they have every scope, no namespace
-//! restriction and no expiry.
+//! Env keys are operator configuration. An entry without attributes (every
+//! value written before #346) has every scope, no namespace restriction
+//! and no expiry; attributes narrow it exactly as they do a Postgres key.
+//!
+//! Plaintext scrub (#346): with Postgres, the refresh thread also runs
+//! rounds of `PgStore::auto_scrub_plaintext`, which removes the plaintext
+//! that rows from before hashed keys still hold once no pre-#346 server
+//! can be running (`KOSHA_API_KEY_AUTO_SCRUB`,
+//! `KOSHA_API_KEY_SCRUB_GRACE_SECS`).
 //!
 //! Admin and peer access is not a property of tenant keys: it is the
 //! dedicated `KOSHA_ADMIN_API_KEY` / `KOSHA_INTERNAL_API_KEY` credentials,
@@ -32,7 +41,7 @@
 //! Then every request is tenant `dev` (local development only). Before this,
 //! an empty key table or a failed Postgres connect silently turned auth off.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
@@ -40,14 +49,17 @@ use std::time::{Duration, Instant};
 use kosha_control::api_keys::{is_operator_tenant_id, operator_name};
 use kosha_control::{hash_api_key, ApiKeyRecord, Scopes};
 
-/// Parse the env-var tenant key sources into one map. Empty keys and
-/// tenants are ignored: an empty `KOSHA_API_KEY=""` must never make the
+/// Parse the env-var tenant key sources into one map of key -> tenant,
+/// ignoring any attributes ([`parse_env_key_specs`] reads those). Empty keys
+/// and tenants are ignored: an empty `KOSHA_API_KEY=""` must never make the
 /// empty string a valid key.
+#[cfg(test)]
 pub fn parse_env_keys(api_keys: Option<&str>, api_key: Option<&str>) -> HashMap<String, String> {
     let mut map = HashMap::new();
     if let Some(list) = api_keys {
         for pair in list.split(',') {
-            if let Some((k, t)) = pair.split_once('=') {
+            if let Some((k, rest)) = pair.split_once('=') {
+                let t = rest.split(';').next().unwrap_or("");
                 let (k, t) = (k.trim(), t.trim());
                 if !k.is_empty() && !t.is_empty() {
                     map.insert(k.to_string(), t.to_string());
@@ -61,6 +73,96 @@ pub fn parse_env_keys(api_keys: Option<&str>, api_key: Option<&str>) -> HashMap<
     map
 }
 
+/// Parse the env-var tenant keys with their attributes (#346).
+///
+/// `KOSHA_API_KEYS` is a comma-separated list of `key=tenant` entries. An
+/// entry may go on with `;`-separated attributes:
+///
+/// - `scopes=read+write`: `+`-separated subset of `read`, `write`, `admin`.
+/// - `namespaces=docs+wiki`: the only namespaces the key may touch.
+/// - `expires_at=1798761600`: unix seconds; the key is refused from then on.
+///
+/// An entry without attributes has full access, as before. Entries without
+/// a key or a tenant are ignored, as they always were; a malformed
+/// attribute is an error, so a typo cannot widen (or silently narrow) what
+/// a key may do. Errors name the entry by position and tenant, never by
+/// its key. `KOSHA_API_KEY` is always a full-access key of tenant `default`.
+pub fn parse_env_key_specs(
+    api_keys: Option<&str>,
+    api_key: Option<&str>,
+) -> Result<HashMap<String, Principal>, String> {
+    let mut map = HashMap::new();
+    for (index, pair) in api_keys.unwrap_or("").split(',').enumerate() {
+        let Some((key, rest)) = pair.split_once('=') else {
+            continue;
+        };
+        let mut parts = rest.split(';');
+        let (key, tenant) = (key.trim(), parts.next().unwrap_or("").trim());
+        if key.is_empty() || tenant.is_empty() {
+            continue;
+        }
+        let at = || format!("KOSHA_API_KEYS entry {} (tenant '{tenant}')", index + 1);
+        let mut principal = Principal::full(tenant);
+        let mut seen = Vec::new();
+        for attribute in parts {
+            let attribute = attribute.trim();
+            if attribute.is_empty() {
+                continue;
+            }
+            let Some((name, value)) = attribute.split_once('=') else {
+                return Err(format!("{}: attribute '{attribute}' has no value", at()));
+            };
+            let (name, value) = (name.trim(), value.trim());
+            if seen.contains(&name) {
+                return Err(format!("{}: '{name}' is given twice", at()));
+            }
+            seen.push(name);
+            let items = || value.split('+').map(str::trim);
+            match name {
+                "scopes" => {
+                    principal.scopes =
+                        Scopes::parse(items()).map_err(|e| format!("{}: {e}", at()))?;
+                }
+                "namespaces" => {
+                    let mut names: Vec<String> = items().map(str::to_string).collect();
+                    if let Some(bad) = names.iter().find(|n| !crate::valid_namespace_component(n)) {
+                        return Err(format!(
+                            "{}: invalid namespace '{bad}' (use unqualified namespace names \
+                             joined by '+')",
+                            at()
+                        ));
+                    }
+                    names.sort_unstable();
+                    names.dedup();
+                    principal.namespaces = Some(Arc::from(names));
+                }
+                "expires_at" => {
+                    let secs = value
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|t| *t > 0)
+                        .ok_or_else(|| {
+                            format!("{}: 'expires_at' must be a time in unix seconds", at())
+                        })?;
+                    principal.expires_at = Some(secs);
+                }
+                _ => {
+                    return Err(format!(
+                        "{}: unknown attribute '{name}' (expected scopes, namespaces or \
+                         expires_at)",
+                        at()
+                    ))
+                }
+            }
+        }
+        map.insert(key.to_string(), principal);
+    }
+    if let Some(k) = api_key.map(str::trim).filter(|k| !k.is_empty()) {
+        map.insert(k.to_string(), Principal::full("default"));
+    }
+    Ok(map)
+}
+
 /// Who a request authenticated as, and what its key may do (#346).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
@@ -69,22 +171,49 @@ pub struct Principal {
     /// `None`: every namespace of the tenant. Otherwise the unqualified
     /// namespace names the key may touch.
     pub namespaces: Option<Arc<[String]>>,
+    /// Unix seconds; `None` never expires. A key it grants may not outlive
+    /// it (`tenant_key_admin`).
+    pub expires_at: Option<i64>,
+    /// The key's registry id (its hash), for the audit log; `None` for env
+    /// keys and `KOSHA_AUTH=disabled`.
+    pub key_id: Option<String>,
 }
 
 impl Principal {
     /// Everything within `tenant`: what every key could do before #346,
-    /// and what env keys and `KOSHA_AUTH=disabled` still get.
+    /// and what env keys without attributes and `KOSHA_AUTH=disabled` get.
     pub fn full(tenant: impl Into<String>) -> Self {
         Self {
             tenant: tenant.into(),
             scopes: Scopes::ALL,
             namespaces: None,
+            expires_at: None,
+            key_id: None,
         }
     }
 
     /// True when no scope or namespace check can ever reject this key.
     pub fn unrestricted(&self) -> bool {
         self.scopes == Scopes::ALL && self.namespaces.is_none()
+    }
+
+    /// What this key may grant through the self-service key routes.
+    pub fn authority(&self) -> kosha_control::KeyAuthority {
+        kosha_control::KeyAuthority {
+            tenant: self.tenant.clone(),
+            scopes: self.scopes,
+            namespaces: self.namespaces.as_deref().map(<[String]>::to_vec),
+            expires_at: self.expires_at,
+        }
+    }
+
+    /// How the audit log names this key: `api_key:<first 12 characters of
+    /// its id>` for a registry key, `api_key:env` for an env key.
+    pub fn audit_label(&self) -> String {
+        match &self.key_id {
+            Some(id) => format!("api_key:{}", id.get(..12).unwrap_or(id)),
+            None => "api_key:env".to_string(),
+        }
     }
 }
 
@@ -110,12 +239,14 @@ struct DbKey {
 impl DbKey {
     fn new(record: ApiKeyRecord) -> (String, Self) {
         (
-            record.key_hash,
+            record.key_hash.clone(),
             Self {
                 principal: Principal {
                     tenant: record.tenant_id,
                     scopes: record.scopes,
                     namespaces: record.namespaces.map(Arc::from),
+                    expires_at: record.expires_at,
+                    key_id: Some(record.key_hash),
                 },
                 expires_at: record.expires_at,
                 last_used: AtomicI64::new(0),
@@ -131,16 +262,46 @@ pub(crate) fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// This pod's view of the automatic plaintext scrub, so its log says
+/// something when the state changes and stays quiet otherwise.
+#[derive(Debug, Default)]
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+struct ScrubState {
+    /// Rounds attempted.
+    rounds: u64,
+    /// The last round found no plaintext: later rounds only look again
+    /// every [`SCRUB_CLEAN_EVERY`] refreshes.
+    clean: bool,
+    /// The deadline the last "waiting" line reported.
+    reported_due_at: Option<i64>,
+}
+
+/// Once no plaintext is left, how many refreshes pass between checks (a
+/// pre-#346 pod could still insert a plaintext row).
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+const SCRUB_CLEAN_EVERY: u64 = 10;
+
 /// Tenant API keys: fixed env keys plus a periodically refreshed snapshot
 /// of the Postgres `kosha.api_keys` table.
 ///
 /// Postgres keys are held and matched by SHA-256 hash (#346): neither the
 /// table (for keys created since) nor this snapshot holds a usable key.
-/// Env keys are operator configuration and always have full access.
+/// Env keys are operator configuration ([`parse_env_key_specs`]).
 pub struct KeyStore {
-    env: HashMap<String, String>,
+    env: HashMap<String, Principal>,
     /// key hash → key, from Postgres. Replaced wholesale on each refresh.
     db: RwLock<HashMap<String, DbKey>>,
+    /// Unix seconds of the last wholesale snapshot load.
+    snapshot_at: AtomicI64,
+    /// How old the snapshot may get before operator credentials in it are
+    /// refused (#346); `None` without Postgres. See
+    /// [`Self::lookup_operator_at`].
+    max_snapshot_age: Option<i64>,
+    /// Unix seconds of the last "snapshot too old" warning.
+    stale_warned_at: AtomicI64,
+    /// The automatic plaintext scrub's progress on this pod.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    scrub: Mutex<ScrubState>,
     /// Orders registry changes against refreshes; see [`Self::registry_guard`].
     registry: Mutex<()>,
     #[cfg(feature = "postgres")]
@@ -152,11 +313,26 @@ pub struct KeyStore {
 }
 
 impl KeyStore {
-    /// A store with only the given keys and no database (tests, env-only).
+    /// A store with only the given full-access keys (key -> tenant) and no
+    /// database (tests, env-only).
     pub fn with_keys(env: HashMap<String, String>) -> Self {
+        Self::with_env_keys(
+            env.into_iter()
+                .map(|(key, tenant)| (key, Principal::full(tenant)))
+                .collect(),
+        )
+    }
+
+    /// A store with only the given env keys ([`parse_env_key_specs`]) and
+    /// no database.
+    pub fn with_env_keys(env: HashMap<String, Principal>) -> Self {
         Self {
             env,
             db: RwLock::new(HashMap::new()),
+            snapshot_at: AtomicI64::new(0),
+            max_snapshot_age: None,
+            stale_warned_at: AtomicI64::new(0),
+            scrub: Mutex::new(ScrubState::default()),
             registry: Mutex::new(()),
             #[cfg(feature = "postgres")]
             database_url: None,
@@ -176,8 +352,11 @@ impl KeyStore {
         if key.is_empty() {
             return Err(Rejected::Unknown);
         }
-        if let Some(t) = self.env.get(key) {
-            return Ok(Principal::full(t.clone()));
+        if let Some(principal) = self.env.get(key) {
+            if principal.expires_at.is_some_and(|at| now >= at) {
+                return Err(Rejected::Expired);
+            }
+            return Ok(principal.clone());
         }
         let db = self.db.read().unwrap();
         let found = db.get(&hash_api_key(key)).ok_or(Rejected::Unknown)?;
@@ -201,9 +380,35 @@ impl KeyStore {
     /// tenant key, the credential is rejected from the second it expires,
     /// and from this pod's next refresh after it is revoked. A tenant key
     /// is never an operator credential, whatever its scopes.
+    ///
+    /// Revocation reaches other pods only through a refresh, so a pod whose
+    /// refreshes keep failing could go on accepting a revoked admin
+    /// credential indefinitely. Instead, once the snapshot is older than
+    /// `max_snapshot_age` (ten refresh intervals), every operator
+    /// credential is refused here until a refresh succeeds; tenant keys keep
+    /// working from the last snapshot, as before.
     pub fn lookup_operator_at(&self, key: &str, now: i64) -> Result<String, Rejected> {
         if key.is_empty() {
             return Err(Rejected::Unknown);
+        }
+        if let Some(max_age) = self.max_snapshot_age {
+            let age = now - self.snapshot_at.load(Ordering::Relaxed);
+            if age > max_age {
+                let warned = self.stale_warned_at.load(Ordering::Relaxed);
+                if now - warned >= 60
+                    && self
+                        .stale_warned_at
+                        .compare_exchange(warned, now, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    eprintln!(
+                        "WARN: admin credentials: the key snapshot is {age}s old (no successful \
+                         refresh); operator credentials are refused on this pod until one \
+                         succeeds"
+                    );
+                }
+                return Err(Rejected::Unknown);
+            }
         }
         let db = self.db.read().unwrap();
         let found = db.get(&hash_api_key(key)).ok_or(Rejected::Unknown)?;
@@ -217,6 +422,7 @@ impl KeyStore {
 
     /// How many operator admin credentials in the snapshot are usable at
     /// `now` (unix seconds).
+    #[cfg(test)]
     pub fn active_operator_credentials(&self, now: i64) -> usize {
         self.db
             .read()
@@ -254,6 +460,7 @@ impl KeyStore {
             .map(DbKey::new)
             .collect();
         *self.db.write().unwrap() = map;
+        self.snapshot_at.store(unix_now(), Ordering::Relaxed);
     }
 
     /// Apply a just-made change to one key (created, or given an earlier
@@ -289,7 +496,28 @@ impl KeyStore {
     /// How many env-configured keys map to `tenant`. They cannot be
     /// removed at runtime.
     pub fn env_key_count(&self, tenant: &str) -> usize {
-        self.env.values().filter(|t| t.as_str() == tenant).count()
+        self.env.values().filter(|p| p.tenant == tenant).count()
+    }
+
+    /// Refuse operator credentials once the snapshot is older than
+    /// `max_age` seconds ([`Self::lookup_operator_at`]).
+    pub fn set_max_snapshot_age(&mut self, max_age: i64) {
+        self.max_snapshot_age = Some(max_age);
+    }
+
+    /// The latest expiry among the operator credentials usable at `now`:
+    /// `Some(None)` when one never expires, `None` when none is usable.
+    pub fn operator_horizon(&self, now: i64) -> Option<Option<i64>> {
+        let db = self.db.read().unwrap();
+        db.values()
+            .filter(|key| operator_name(&key.principal.tenant).is_some())
+            .filter(|key| key.expires_at.is_none_or(|at| now < at))
+            .map(|key| key.expires_at)
+            .fold(None, |latest, at| match (latest, at) {
+                (Some(None), _) | (_, None) => Some(None),
+                (Some(Some(a)), Some(b)) => Some(Some(a.max(b))),
+                (None, Some(b)) => Some(Some(b)),
+            })
     }
 
     /// Drop every database key of `tenant` from this pod's snapshot.
@@ -343,6 +571,122 @@ impl KeyStore {
     pub fn refresh(&self) -> Result<usize, String> {
         Ok(0)
     }
+
+    /// One round of the automatic plaintext scrub (#346,
+    /// `PgStore::auto_scrub_plaintext`), logging what changed. `startup`
+    /// reports the state even when it did not change. Returns whether the
+    /// round reached a decision (false: no database, another pod held the
+    /// round, or it failed).
+    #[cfg(feature = "postgres")]
+    pub fn scrub_round(&self, grace_secs: u64, startup: bool) -> bool {
+        use kosha_control::ScrubStatus;
+        let mut state = self.scrub.lock().unwrap_or_else(|e| e.into_inner());
+        state.rounds += 1;
+        if state.clean && !startup && !state.rounds.is_multiple_of(SCRUB_CLEAN_EVERY) {
+            return true;
+        }
+        let Some(pg) = self.database_url.as_ref().and_then(|_| self.pg()) else {
+            return false;
+        };
+        match pg.auto_scrub_plaintext(grace_secs) {
+            Ok(ScrubStatus::Clean) => {
+                if startup || !state.clean {
+                    println!("api keys: no row holds a plaintext key");
+                }
+                state.clean = true;
+                state.reported_due_at = None;
+                true
+            }
+            Ok(ScrubStatus::Waiting { plaintext, due_at }) => {
+                if startup || state.reported_due_at != Some(due_at) {
+                    println!(
+                        "api keys: {plaintext} row(s) still hold a plaintext key; the automatic \
+                         scrub removes it at unix time {due_at} \
+                         (KOSHA_API_KEY_SCRUB_GRACE_SECS={grace_secs} after the last sign of a \
+                         server build from before hashed keys)"
+                    );
+                }
+                state.clean = false;
+                state.reported_due_at = Some(due_at);
+                true
+            }
+            Ok(ScrubStatus::Scrubbed(rows)) => {
+                println!(
+                    "api keys: automatic scrub removed the plaintext of {rows} row(s); the \
+                     database now holds no usable key"
+                );
+                state.clean = true;
+                state.reported_due_at = None;
+                true
+            }
+            Ok(ScrubStatus::Busy) => false,
+            Err(e) => {
+                eprintln!("api keys: automatic plaintext scrub failed (will retry): {e}");
+                false
+            }
+        }
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    pub fn scrub_round(&self, _grace_secs: u64, _startup: bool) -> bool {
+        false
+    }
+}
+
+/// How long the automatic plaintext scrub waits by default after the last
+/// sign of a server build from before hashed keys: one day, longer than any
+/// rolling deploy should take.
+pub const DEFAULT_SCRUB_GRACE_SECS: u64 = 24 * 60 * 60;
+
+/// The automatic plaintext scrub's grace period from
+/// `KOSHA_API_KEY_AUTO_SCRUB` and `KOSHA_API_KEY_SCRUB_GRACE_SECS`; `None`
+/// when it is switched off. It is on by default: removing plaintext keys
+/// is part of storing only hashes, and nothing should be left for an
+/// operator to remember.
+pub fn auto_scrub_config(switch: Option<&str>, grace: Option<&str>) -> Result<Option<u64>, String> {
+    let enabled = match switch
+        .map(str::trim)
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "on" | "enabled" | "true" | "1" => true,
+        "off" | "disabled" | "false" | "0" => false,
+        other => {
+            return Err(format!(
+                "invalid KOSHA_API_KEY_AUTO_SCRUB '{other}' (expected 'on' or 'off')"
+            ))
+        }
+    };
+    let grace = match grace.map(str::trim).filter(|g| !g.is_empty()) {
+        None => DEFAULT_SCRUB_GRACE_SECS,
+        Some(text) => text.parse::<u64>().map_err(|_| {
+            format!("invalid KOSHA_API_KEY_SCRUB_GRACE_SECS '{text}' (expected seconds)")
+        })?,
+    };
+    Ok(enabled.then_some(grace))
+}
+
+/// The warning to log when the shared admin key is off and the last usable
+/// operator credential lapses within a week (or none is usable): lapsing
+/// is not an API call the lock-out guard can refuse, so it is announced.
+pub fn operator_lapse_warning(horizon: Option<Option<i64>>, now: i64) -> Option<String> {
+    const WEEK: i64 = 7 * 24 * 60 * 60;
+    match horizon {
+        None => Some(
+            "WARN: admin credentials: KOSHA_ADMIN_BOOTSTRAP_KEY=disabled and no usable \
+             operator credential was loaded; /v1/admin/* is unreachable until one is, or \
+             until the bootstrap key is enabled again"
+                .to_string(),
+        ),
+        Some(Some(at)) if at - now < WEEK => Some(format!(
+            "WARN: admin credentials: KOSHA_ADMIN_BOOTSTRAP_KEY=disabled and the last usable \
+             operator credential expires at unix time {at} (in {}h); rotate it or issue \
+             another before then",
+            (at - now).max(0) / 3600
+        )),
+        Some(_) => None,
+    }
 }
 
 /// What [`purge_tenant_keys`] did.
@@ -387,6 +731,8 @@ pub fn purge_tenant_keys(auth: &Auth, tenant: &str) -> Result<KeyPurge, String> 
     })
 }
 
+// One process-wide instance (`AUTH`): its size does not matter.
+#[allow(clippy::large_enum_variant)]
 pub enum Auth {
     /// `KOSHA_AUTH=disabled`: every request is tenant `dev`.
     Disabled,
@@ -434,9 +780,14 @@ pub fn parse_bootstrap_admin_key_flag(value: Option<&str>) -> Result<bool, Strin
     match value.to_ascii_lowercase().as_str() {
         "" | "enabled" | "on" | "true" | "1" => Ok(true),
         "disabled" | "off" | "false" | "0" => Ok(false),
-        _ => Err(format!(
-            "invalid KOSHA_ADMIN_BOOTSTRAP_KEY '{value}' (expected 'enabled' or 'disabled')"
-        )),
+        // Never echo the value: the variable's name invites pasting the
+        // shared admin key into it, and a crash-looping pod would write
+        // that key to its log on every restart.
+        _ => Err(
+            "invalid KOSHA_ADMIN_BOOTSTRAP_KEY (expected 'enabled' or 'disabled'; the value \
+             is not shown, in case it is a key)"
+                .into(),
+        ),
     }
 }
 
@@ -491,17 +842,52 @@ pub fn init_global() {
         return;
     }
 
-    let env = parse_env_keys(
+    let env = match parse_env_key_specs(
         std::env::var("KOSHA_API_KEYS").ok().as_deref(),
         std::env::var("KOSHA_API_KEY").ok().as_deref(),
+    ) {
+        Ok(env) => env,
+        Err(e) => {
+            eprintln!("FATAL: {e}. Refusing to start.");
+            std::process::exit(1);
+        }
+    };
+    let auto_scrub = match auto_scrub_config(
+        std::env::var("KOSHA_API_KEY_AUTO_SCRUB").ok().as_deref(),
+        std::env::var("KOSHA_API_KEY_SCRUB_GRACE_SECS")
+            .ok()
+            .as_deref(),
+    ) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("FATAL: {e}. Refusing to start.");
+            std::process::exit(1);
+        }
+    };
+    let restricted = env.values().filter(|p| !p.unrestricted()).count();
+    let expiring = env.values().filter(|p| p.expires_at.is_some()).count();
+    println!(
+        "api keys: {} tenant key(s) from env ({restricted} with restricted scopes or \
+         namespaces, {expiring} with an expiry)",
+        env.len()
     );
-    println!("api keys: {} tenant key(s) from env", env.len());
+    if let Some(expired) = env
+        .values()
+        .filter(|p| p.expires_at.is_some_and(|at| at <= unix_now()))
+        .map(|p| p.tenant.as_str())
+        .next()
+    {
+        eprintln!(
+            "WARN: api keys: an env key of tenant '{expired}' has already expired \
+             (KOSHA_API_KEYS expires_at); it is refused"
+        );
+    }
     // #342: namespaces under a tenant id starting with `_` or `.` are
     // accounted to the shared `_legacy` tenant. Such keys keep working, but
     // the operator is told.
     let mut reserved: Vec<&str> = env
         .values()
-        .map(String::as_str)
+        .map(|p| p.tenant.as_str())
         .filter(|t| t.starts_with('_') || t.starts_with('.'))
         .collect();
     reserved.sort_unstable();
@@ -513,12 +899,16 @@ pub fn init_global() {
         );
     }
     #[allow(unused_mut)]
-    let mut store = KeyStore::with_keys(env);
+    let mut store = KeyStore::with_env_keys(env);
 
     let database_url = std::env::var("DATABASE_URL").ok().filter(|u| !u.is_empty());
     #[cfg(feature = "postgres")]
     {
         store.database_url = database_url.clone();
+    }
+    if database_url.is_some() {
+        // Ten missed refreshes, and operator credentials stop working here.
+        store.set_max_snapshot_age(10 * refresh_interval().as_secs() as i64);
     }
     #[cfg(not(feature = "postgres"))]
     if database_url.is_some() {
@@ -530,27 +920,37 @@ pub fn init_global() {
             Ok(n) => println!("api keys: loaded {n} key(s) from postgres"),
             Err(e) => eprintln!("api keys: initial postgres load failed: {e}"),
         }
-        // The plaintext scrub (#346) stays a manual step, so say when it
-        // is due.
+        // The plaintext scrub (#346): one round now, which reports the
+        // state; when it is off, or another pod is running the round, the
+        // count alone.
+        let reported = auto_scrub.is_some_and(|grace| store.scrub_round(grace, true));
         #[cfg(feature = "postgres")]
-        if let Some(count) = store.pg().map(|pg| pg.count_plaintext_api_keys()) {
-            match count {
-                Ok(0) => println!("api keys: no row holds a plaintext key"),
-                Ok(n) => println!(
-                    "api keys: {n} row(s) still hold a plaintext key; once every pod runs a \
-                     build with hashed keys, remove them with \
-                     POST /v1/admin/api-keys/scrub-plaintext"
-                ),
-                Err(e) => eprintln!("api keys: could not count plaintext rows: {e}"),
+        if !reported {
+            if let Some(count) = store.pg().map(|pg| pg.count_plaintext_api_keys()) {
+                match (count, auto_scrub) {
+                    (Ok(0), _) => println!("api keys: no row holds a plaintext key"),
+                    (Ok(n), Some(_)) => println!(
+                        "api keys: {n} row(s) still hold a plaintext key; the automatic scrub \
+                         removes it once it is safe"
+                    ),
+                    (Ok(n), None) => println!(
+                        "api keys: {n} row(s) still hold a plaintext key and \
+                         KOSHA_API_KEY_AUTO_SCRUB=off; once every pod runs a build with hashed \
+                         keys, remove it with POST /v1/admin/api-keys/scrub-plaintext"
+                    ),
+                    (Err(e), _) => eprintln!("api keys: could not count plaintext rows: {e}"),
+                }
             }
         }
+        #[cfg(not(feature = "postgres"))]
+        let _ = reported;
     }
-    if !bootstrap_enabled && store.active_operator_credentials(unix_now()) == 0 {
-        eprintln!(
-            "WARN: admin credentials: KOSHA_ADMIN_BOOTSTRAP_KEY=disabled and no usable \
-             operator credential was loaded; /v1/admin/* is unreachable until one is, or \
-             until the bootstrap key is enabled again"
-        );
+    if !bootstrap_enabled {
+        if let Some(warning) =
+            operator_lapse_warning(store.operator_horizon(unix_now()), unix_now())
+        {
+            eprintln!("{warning}");
+        }
     }
 
     // A switched-off bootstrap key is not a configured credential.
@@ -570,13 +970,33 @@ pub fn init_global() {
 
     if database_url.is_some() {
         let ttl = refresh_interval();
+        // About once an hour, a reminder when the last operator credential
+        // is about to lapse with the shared key off.
+        let lapse_check_every = (3600 / ttl.as_secs().max(1)).max(1);
         std::thread::Builder::new()
             .name("api-key-refresh".into())
-            .spawn(move || loop {
-                std::thread::sleep(ttl);
-                if let Auth::Keys(store) = global() {
+            .spawn(move || {
+                let mut round = 0u64;
+                loop {
+                    round += 1;
+                    std::thread::sleep(ttl);
+                    let Auth::Keys(store) = global() else {
+                        continue;
+                    };
                     if let Err(e) = store.refresh() {
                         eprintln!("api keys: refresh failed, keeping previous snapshot: {e}");
+                        continue;
+                    }
+                    if let Some(grace) = auto_scrub {
+                        store.scrub_round(grace, false);
+                    }
+                    if !bootstrap_enabled && round.is_multiple_of(lapse_check_every) {
+                        let now = unix_now();
+                        if let Some(warning) =
+                            operator_lapse_warning(store.operator_horizon(now), now)
+                        {
+                            eprintln!("{warning}");
+                        }
                     }
                 }
             })
@@ -605,11 +1025,102 @@ pub fn max_body_bytes() -> usize {
     })
 }
 
-/// `KOSHA_LEGACY_ROUTES=off` disables the unversioned Phase 1 routes.
+/// The unversioned Phase 1 routes are off unless explicitly enabled.
 pub fn legacy_routes_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| !env_flag_disabled("KOSHA_LEGACY_ROUTES"))
+    *ON.get_or_init(|| {
+        std::env::var("KOSHA_LEGACY_ROUTES").is_ok_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "enabled" | "on" | "true" | "1"
+            )
+        })
+    })
 }
+
+/// `KOSHA_LEGACY_ROUTES_TENANTS`: tenants that keep the legacy routes while
+/// the pod default is off. Read once at startup.
+fn legacy_routes_tenants() -> &'static HashSet<String> {
+    static TENANTS: OnceLock<HashSet<String>> = OnceLock::new();
+    TENANTS.get_or_init(|| {
+        parse_tenant_list(std::env::var("KOSHA_LEGACY_ROUTES_TENANTS").ok().as_deref())
+    })
+}
+
+/// A comma-separated tenant list; blanks are ignored.
+pub fn parse_tenant_list(raw: Option<&str>) -> HashSet<String> {
+    raw.unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether `tenant` may use the legacy routes: the pod default, or the
+/// tenant is on the allowlist. A managed deployment sets the default off
+/// and lists only the tenants still migrating.
+pub fn legacy_routes_enabled_for(tenant: &str) -> bool {
+    #[cfg(test)]
+    if let Some(allowed) = LEGACY_POLICY_OVERRIDE.with(|policy| {
+        policy
+            .borrow()
+            .as_ref()
+            .map(|(default_on, allowlist)| legacy_routes_allowed(*default_on, allowlist, tenant))
+    }) {
+        return allowed;
+    }
+    legacy_routes_allowed(legacy_routes_enabled(), legacy_routes_tenants(), tenant)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A per-thread stand-in for `KOSHA_LEGACY_ROUTES` and
+    /// `KOSHA_LEGACY_ROUTES_TENANTS` (both read once per process), so a
+    /// test can drive `route()` with the flag off without touching other
+    /// tests.
+    static LEGACY_POLICY_OVERRIDE: std::cell::RefCell<Option<(bool, HashSet<String>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` as if the pod default were `default_on` and the allowlist
+/// `allowlist`, on this thread only.
+#[cfg(test)]
+pub fn with_legacy_policy<T>(default_on: bool, allowlist: &str, f: impl FnOnce() -> T) -> T {
+    let _policy = override_legacy_policy(default_on, allowlist);
+    f()
+}
+
+#[cfg(test)]
+pub fn override_legacy_policy(default_on: bool, allowlist: &str) -> impl Drop {
+    let policy = (default_on, parse_tenant_list(Some(allowlist)));
+    let previous = LEGACY_POLICY_OVERRIDE.with(|p| p.replace(Some(policy)));
+    struct Reset(Option<(bool, HashSet<String>)>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            LEGACY_POLICY_OVERRIDE.with(|p| p.replace(self.0.take()));
+        }
+    }
+    Reset(previous)
+}
+
+/// The decision behind [`legacy_routes_enabled_for`], for tests.
+pub fn legacy_routes_allowed(default_on: bool, allowlist: &HashSet<String>, tenant: &str) -> bool {
+    default_on || allowlist.contains(tenant)
+}
+
+/// When the legacy routes were deprecated (RFC 9745 `Deprecation`): the
+/// release that ships #350's 350c, 2026-12-15T00:00:00Z.
+pub const LEGACY_DEPRECATED_AT: u64 = 1_797_292_800;
+
+/// When the legacy routes are removed (RFC 8594 `Sunset`). Pushed later,
+/// never earlier; gated on `kosha_legacy_requests_total` reading zero on
+/// managed deployments (docs/api/versioning.md).
+pub const LEGACY_SUNSET: &str = "Tue, 01 Jun 2027 00:00:00 GMT";
+
+/// Where the deprecation is documented (`Link: <...>; rel="deprecation"`).
+pub const LEGACY_DEPRECATION_LINK: &str =
+    "https://github.com/decover-tech/kosha/blob/main/docs/api/versioning.md#legacy-routes";
 
 /// The unversioned Phase 1 routes, as `record_legacy_use` counts them.
 const LEGACY_ROUTES: [&str; 7] = [
@@ -717,6 +1228,166 @@ mod tests {
             None,
             "not a legacy route"
         );
+    }
+
+    #[test]
+    fn env_keys_without_attributes_keep_full_access() {
+        let keys = parse_env_key_specs(Some("ka=acme, kb=beta,bad,=x,kc="), Some("boot")).unwrap();
+        assert_eq!(keys.get("ka"), Some(&Principal::full("acme")));
+        assert_eq!(keys.get("kb"), Some(&Principal::full("beta")));
+        assert_eq!(keys.get("boot"), Some(&Principal::full("default")));
+        assert_eq!(keys.len(), 3);
+        // The legacy parser reads the same tenants.
+        let legacy = parse_env_keys(Some("ka=acme;scopes=read"), None);
+        assert_eq!(legacy.get("ka").map(String::as_str), Some("acme"));
+    }
+
+    #[test]
+    fn env_keys_take_scopes_namespaces_and_expiry() {
+        use kosha_control::Scope;
+        let keys = parse_env_key_specs(
+            Some(
+                "sk-ro=acme;scopes=read, sk-docs=acme; scopes = read+write ;namespaces=wiki+docs+docs;\
+                 expires_at=2000000000,sk-tmp=beta;expires_at=1000",
+            ),
+            None,
+        )
+        .unwrap();
+        let ro = &keys["sk-ro"];
+        assert_eq!(ro.scopes, Scopes::of(&[Scope::Read]));
+        assert_eq!((ro.namespaces.as_deref(), ro.expires_at), (None, None));
+        let docs = &keys["sk-docs"];
+        assert_eq!(docs.scopes, Scopes::of(&[Scope::Read, Scope::Write]));
+        assert_eq!(
+            docs.namespaces.as_deref(),
+            Some(&["docs".to_string(), "wiki".to_string()][..])
+        );
+        assert_eq!(docs.expires_at, Some(2_000_000_000));
+        assert!(keys["sk-tmp"].unrestricted());
+
+        // Enforced like a Postgres key's.
+        let store = KeyStore::with_env_keys(keys);
+        assert_eq!(
+            store.lookup_at("sk-docs", 1_999_999_999).unwrap().tenant,
+            "acme"
+        );
+        assert_eq!(
+            store.lookup_at("sk-docs", 2_000_000_000),
+            Err(Rejected::Expired)
+        );
+        assert_eq!(store.lookup_at("sk-tmp", 999).unwrap().key_id, None);
+        assert_eq!(store.lookup_at("sk-tmp", 1_000), Err(Rejected::Expired));
+        assert_eq!(store.env_key_count("acme"), 2);
+    }
+
+    #[test]
+    fn env_key_attribute_errors_name_the_entry_never_the_key() {
+        for (value, needle) in [
+            ("sk-secret=acme;scope=read", "unknown attribute 'scope'"),
+            ("sk-secret=acme;scopes=root", "root"),
+            ("sk-secret=acme;scopes=", "unknown scope"),
+            ("sk-secret=acme;namespaces=a/b", "a/b"),
+            ("sk-secret=acme;namespaces=", "invalid namespace"),
+            ("sk-secret=acme;expires_at=tomorrow", "unix seconds"),
+            ("sk-secret=acme;expires_at=-5", "unix seconds"),
+            ("sk-secret=acme;scopes", "no value"),
+            ("sk-secret=acme;scopes=read;scopes=write", "twice"),
+        ] {
+            let e = parse_env_key_specs(Some(&format!("k1=x,{value}")), None).unwrap_err();
+            assert!(e.contains(needle), "{value}: {e}");
+            assert!(e.contains("entry 2 (tenant 'acme')"), "{value}: {e}");
+            assert!(!e.contains("sk-secret"), "{value}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_stale_snapshot_stops_operator_credentials_but_not_tenant_keys() {
+        let mut store = KeyStore::with_keys(HashMap::new());
+        store.set_max_snapshot_age(300);
+        let now = unix_now();
+        store.replace_db_keys(vec![
+            operator_record("sk-alice", "alice"),
+            record("sk-tenant", "acme"),
+        ]);
+        assert_eq!(
+            store.lookup_operator_at("sk-alice", now).as_deref(),
+            Ok("alice")
+        );
+        assert!(store.lookup_operator_at("sk-alice", now + 250).is_ok());
+        assert_eq!(
+            store.lookup_operator_at("sk-alice", now + 400),
+            Err(Rejected::Unknown)
+        );
+        assert!(store.lookup_at("sk-tenant", now + 10_000).is_ok());
+        // The next successful refresh restores them.
+        store.replace_db_keys(vec![operator_record("sk-alice", "alice")]);
+        assert!(store.lookup_operator_at("sk-alice", unix_now() + 1).is_ok());
+        // Without Postgres there is no bound (tests, env-only).
+        let unbounded = KeyStore::with_keys(HashMap::new());
+        unbounded.upsert_db_key(operator_record("sk-bob", "bob"));
+        assert!(unbounded.lookup_operator_at("sk-bob", i64::MAX / 2).is_ok());
+    }
+
+    #[test]
+    fn the_operator_horizon_and_its_warning() {
+        let store = KeyStore::with_keys(HashMap::new());
+        assert_eq!(store.operator_horizon(0), None);
+        let day = 24 * 3600;
+        store.replace_db_keys(vec![
+            ApiKeyRecord {
+                expires_at: Some(10 * day),
+                ..operator_record("sk-a", "alice")
+            },
+            ApiKeyRecord {
+                expires_at: Some(3 * day),
+                ..operator_record("sk-b", "bob")
+            },
+            record("sk-tenant", "acme"),
+        ]);
+        assert_eq!(store.operator_horizon(0), Some(Some(10 * day)));
+        assert_eq!(store.operator_horizon(10 * day), None);
+        assert!(operator_lapse_warning(store.operator_horizon(0), 0).is_none());
+        let soon = operator_lapse_warning(store.operator_horizon(5 * day), 5 * day).unwrap();
+        assert!(soon.contains("expires at unix time"), "{soon}");
+        assert!(operator_lapse_warning(None, 0)
+            .unwrap()
+            .contains("no usable"));
+        store.upsert_db_key(operator_record("sk-c", "carol"));
+        assert_eq!(store.operator_horizon(0), Some(None));
+        assert!(operator_lapse_warning(Some(None), 0).is_none());
+    }
+
+    #[test]
+    fn the_automatic_scrub_is_on_by_default_with_a_day_of_grace() {
+        assert_eq!(
+            auto_scrub_config(None, None),
+            Ok(Some(DEFAULT_SCRUB_GRACE_SECS))
+        );
+        assert_eq!(auto_scrub_config(Some("on"), Some("600")), Ok(Some(600)));
+        assert_eq!(auto_scrub_config(Some(""), Some("0")), Ok(Some(0)));
+        assert_eq!(auto_scrub_config(Some("off"), Some("600")), Ok(None));
+        assert!(auto_scrub_config(Some("maybe"), None).is_err());
+        assert!(auto_scrub_config(None, Some("1d")).is_err());
+    }
+
+    #[test]
+    fn db_principals_carry_their_id_and_expiry() {
+        let store = KeyStore::with_keys(HashMap::new());
+        store.replace_db_keys(vec![ApiKeyRecord {
+            expires_at: Some(5_000),
+            ..record("sk-a", "acme")
+        }]);
+        let principal = store.lookup_at("sk-a", 1).unwrap();
+        assert_eq!(
+            principal.key_id.as_deref(),
+            Some(hash_api_key("sk-a").as_str())
+        );
+        assert_eq!(principal.expires_at, Some(5_000));
+        assert_eq!(
+            principal.audit_label(),
+            format!("api_key:{}", &hash_api_key("sk-a")[..12])
+        );
+        assert_eq!(principal.authority().expires_at, Some(5_000));
     }
 
     #[test]

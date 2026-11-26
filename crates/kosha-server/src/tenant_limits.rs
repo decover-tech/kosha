@@ -2,11 +2,10 @@
 //!
 //! A [`TenantLimits`] says what one tenant may consume on this pod: query
 //! rate and concurrency, write rate in documents and bytes, how many
-//! namespaces it may hold, documents per namespace, vector dimensions and
-//! request body size. A [`LimitsProvider`] answers "what are tenant X's
-//! limits"; today the only provider is [`ConfigLimitsProvider`], which reads
-//! `KOSHA_TENANT_LIMITS_FILE` and reloads it periodically. Limits stored in
-//! the control plane (Phase H) slot in behind the same trait.
+//! namespaces it may hold, documents and bytes per namespace, vector
+//! dimensions and request body size. A [`LimitsProvider`] answers "what
+//! are tenant X's limits"; [`ConfigLimitsProvider`] reloads operator
+//! overrides, which are layered over the tenant's billing plan defaults.
 //!
 //! [`TenantLimiter`] enforces them with lock-free token buckets (GCRA over
 //! one `AtomicU64`) and an atomic concurrency counter per tenant. With no
@@ -40,7 +39,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -63,9 +62,11 @@ pub(crate) struct TenantLimits {
     pub namespaces: Option<u64>,
     /// Documents per namespace, committed plus not yet flushed.
     pub docs_per_namespace: Option<u64>,
+    /// Estimated stored bytes per namespace, including unflushed writes.
+    pub bytes_per_namespace: Option<u64>,
     /// Largest vector dimension a document may carry.
     pub vector_dims: Option<u32>,
-    /// Largest write request body, below the pod-wide
+    /// Largest request body, below the pod-wide
     /// `KOSHA_MAX_BODY_BYTES`.
     pub max_body_bytes: Option<u64>,
     /// Share of the search queue when several tenants wait (deficit round
@@ -83,6 +84,7 @@ impl TenantLimits {
             write_bytes_per_sec: over.write_bytes_per_sec.or(self.write_bytes_per_sec),
             namespaces: over.namespaces.or(self.namespaces),
             docs_per_namespace: over.docs_per_namespace.or(self.docs_per_namespace),
+            bytes_per_namespace: over.bytes_per_namespace.or(self.bytes_per_namespace),
             vector_dims: over.vector_dims.or(self.vector_dims),
             max_body_bytes: over.max_body_bytes.or(self.max_body_bytes),
             weight: over.weight.or(self.weight),
@@ -124,6 +126,7 @@ pub(crate) struct TenantEntry {
     pub write_bytes_per_sec: Option<f64>,
     pub namespaces: Option<u64>,
     pub docs_per_namespace: Option<u64>,
+    pub bytes_per_namespace: Option<u64>,
     pub vector_dims: Option<u32>,
     pub max_body_bytes: Option<u64>,
     pub weight: Option<u32>,
@@ -139,6 +142,7 @@ impl TenantEntry {
             write_bytes_per_sec: self.write_bytes_per_sec,
             namespaces: self.namespaces,
             docs_per_namespace: self.docs_per_namespace,
+            bytes_per_namespace: self.bytes_per_namespace,
             vector_dims: self.vector_dims,
             max_body_bytes: self.max_body_bytes,
             weight: self.weight,
@@ -360,7 +364,7 @@ impl TokenBucket {
 
 // ─── Enforcement ────────────────────────────────────────────────────────────
 
-/// Why a request was refused, as the `reason` of the 429 body and the
+/// Why a request was refused, as the `reason` of the error body and the
 /// `reason` label of `kosha_tenant_rejections_total`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RejectReason {
@@ -369,6 +373,7 @@ pub(crate) enum RejectReason {
     TenantWriteRate,
     NamespaceQuota,
     DocQuota,
+    StorageQuota,
     VectorDims,
     BodyTooLarge,
     /// The tenant already has `KOSHA_SEARCH_QUEUE_DEPTH_PER_TENANT`
@@ -377,12 +382,13 @@ pub(crate) enum RejectReason {
 }
 
 impl RejectReason {
-    pub(crate) const ALL: [RejectReason; 8] = [
+    pub(crate) const ALL: [RejectReason; 9] = [
         Self::TenantQps,
         Self::TenantConcurrency,
         Self::TenantWriteRate,
         Self::NamespaceQuota,
         Self::DocQuota,
+        Self::StorageQuota,
         Self::VectorDims,
         Self::BodyTooLarge,
         Self::TenantQueueFull,
@@ -395,19 +401,38 @@ impl RejectReason {
             Self::TenantWriteRate => "tenant_write_rate_exceeded",
             Self::NamespaceQuota => "namespace_quota_exceeded",
             Self::DocQuota => "doc_quota_exceeded",
+            Self::StorageQuota => "storage_quota_exceeded",
             Self::VectorDims => "vector_dims_exceeded",
             Self::BodyTooLarge => "body_too_large",
             Self::TenantQueueFull => "tenant_queue_full",
         }
     }
 
-    fn message(self) -> &'static str {
+    /// The API error code (#350). Rates are retryable 429s; quotas are
+    /// 403s and the body cap a 413, which retrying cannot fix.
+    pub(crate) fn code(self) -> crate::ErrorCode {
+        use crate::ErrorCode;
+        match self {
+            Self::TenantQps => ErrorCode::TenantQpsExceeded,
+            Self::TenantConcurrency => ErrorCode::TenantConcurrencyExceeded,
+            Self::TenantWriteRate => ErrorCode::TenantWriteRateExceeded,
+            Self::TenantQueueFull => ErrorCode::TenantQueueFull,
+            Self::NamespaceQuota => ErrorCode::NamespaceQuotaExceeded,
+            Self::DocQuota => ErrorCode::DocQuotaExceeded,
+            Self::StorageQuota => ErrorCode::PermissionDenied,
+            Self::VectorDims => ErrorCode::VectorDimsExceeded,
+            Self::BodyTooLarge => ErrorCode::PayloadTooLarge,
+        }
+    }
+
+    pub(crate) fn message(self) -> &'static str {
         match self {
             Self::TenantQps => "tenant query rate limit exceeded",
             Self::TenantConcurrency => "tenant concurrent query limit exceeded",
             Self::TenantWriteRate => "tenant write rate limit exceeded",
             Self::NamespaceQuota => "tenant namespace quota exceeded",
             Self::DocQuota => "namespace document quota exceeded",
+            Self::StorageQuota => "namespace storage quota exceeded",
             Self::VectorDims => "vector dimension limit exceeded",
             Self::BodyTooLarge => "request body exceeds the tenant's limit",
             Self::TenantQueueFull => "tenant search queue is full",
@@ -452,24 +477,13 @@ impl Rejection {
         }
     }
 
-    /// `Retry-After`, in whole seconds, at least 1.
-    pub(crate) fn retry_after_secs(&self) -> u64 {
-        self.retry_after_ms.div_ceil(1000).max(1)
-    }
-
-    /// The JSON body of the 429.
-    pub(crate) fn body(&self) -> serde_json::Value {
-        let limit = if self.limit.fract() == 0.0 && self.limit.abs() < 9.0e15 {
+    /// The limit as JSON: an integer when it is whole.
+    pub(crate) fn limit_json(&self) -> serde_json::Value {
+        if self.limit.fract() == 0.0 && self.limit.abs() < 9.0e15 {
             serde_json::json!(self.limit as u64)
         } else {
             serde_json::json!(self.limit)
-        };
-        serde_json::json!({
-            "error": self.reason.message(),
-            "reason": self.reason.as_str(),
-            "limit": limit,
-            "retry_after_ms": self.retry_after_ms,
-        })
+        }
     }
 }
 
@@ -480,6 +494,7 @@ struct TenantCounters {
     write_docs: TokenBucket,
     write_bytes: TokenBucket,
     in_flight: AtomicU32,
+    storage_admission: Mutex<()>,
 }
 
 /// Holds one of a tenant's concurrent-query slots until dropped.
@@ -668,9 +683,14 @@ impl TenantLimiter {
         Ok(guard)
     }
 
-    /// Admit a write request body: the tenant's body size cap, then its
-    /// write bytes per second.
-    pub(crate) fn admit_write_body(&self, tenant: &str, bytes: usize) -> Result<(), Rejection> {
+    /// Admit a request body: the tenant's body size cap, then its bytes
+    /// per second for write requests only.
+    pub(crate) fn admit_body(
+        &self,
+        tenant: &str,
+        bytes: usize,
+        write: bool,
+    ) -> Result<(), Rejection> {
         let Some(limits) = self.limits(tenant) else {
             return Ok(());
         };
@@ -679,7 +699,7 @@ impl TenantLimiter {
                 return Err(Rejection::quota(RejectReason::BodyTooLarge, max));
             }
         }
-        if let Some(rate) = limits.write_bytes_per_sec {
+        if let Some(rate) = limits.write_bytes_per_sec.filter(|_| write) {
             self.counters(tenant)
                 .write_bytes
                 .try_take(self.now(), rate, rate, bytes as f64)
@@ -690,6 +710,17 @@ impl TenantLimiter {
                 })?;
         }
         Ok(())
+    }
+
+    /// Serialize the quota check and write against other quota-checked
+    /// writes by this tenant. Each tenant has its own lock.
+    pub(crate) fn with_storage_admission<R>(&self, tenant: &str, f: impl FnOnce() -> R) -> R {
+        let counters = self.counters(tenant);
+        let _guard = counters
+            .storage_admission
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        f()
     }
 
     /// Admit `docs` documents against the tenant's write docs per second.
@@ -717,6 +748,17 @@ mod tests {
     use super::*;
 
     const SEC: u64 = 1_000_000_000;
+
+    #[test]
+    fn saas_overlay_limits_file_parses_with_a_default_plan() {
+        let text = include_str!("../../../k8s/saas/tenant-limits.json");
+        let config = LimitsConfig::parse(text, None).expect("k8s/saas/tenant-limits.json");
+        let plan = config
+            .default_plan
+            .as_deref()
+            .expect("SaaS cells limit every tenant");
+        assert!(config.plans.contains_key(plan));
+    }
 
     #[test]
     fn bucket_allows_a_burst_then_refills_at_the_rate() {
@@ -859,10 +901,8 @@ mod tests {
         let qps = limiter.admit_query("a").err().unwrap();
         assert_eq!(qps.reason, RejectReason::TenantQps);
         assert!(qps.retry_after_ms > 0 && qps.retry_after_ms <= 500);
-        assert_eq!(qps.retry_after_secs(), 1);
-        let body = qps.body();
-        assert_eq!(body["reason"], "tenant_qps_exceeded");
-        assert_eq!(body["limit"], 2);
+        assert_eq!(qps.reason.code(), crate::ErrorCode::TenantQpsExceeded);
+        assert_eq!(qps.limit_json(), serde_json::json!(2));
     }
 
     #[test]
@@ -873,7 +913,7 @@ mod tests {
             .map(|_| limiter.admit_query("t").unwrap())
             .collect();
         assert_eq!(guards.len(), 1000);
-        assert!(limiter.admit_write_body("t", usize::MAX).is_ok());
+        assert!(limiter.admit_body("t", usize::MAX, true).is_ok());
         assert!(limiter.admit_write_docs("t", usize::MAX).is_ok());
         assert_eq!(limiter.weight("t"), 1);
     }
@@ -887,11 +927,11 @@ mod tests {
         )
         .unwrap();
         let limiter = TenantLimiter::new(Arc::new(ConfigLimitsProvider::from_config(c)));
-        let big = limiter.admit_write_body("t", 101).unwrap_err();
+        let big = limiter.admit_body("t", 101, true).unwrap_err();
         assert_eq!(big.reason, RejectReason::BodyTooLarge);
         assert_eq!(big.retry_after_ms, QUOTA_RETRY_AFTER_MS);
-        assert!(limiter.admit_write_body("t", 100).is_ok());
-        let rate = limiter.admit_write_body("t", 100).unwrap_err();
+        assert!(limiter.admit_body("t", 100, true).is_ok());
+        let rate = limiter.admit_body("t", 100, true).unwrap_err();
         assert_eq!(rate.reason, RejectReason::TenantWriteRate);
         assert!(limiter.admit_write_docs("t", 10).is_ok());
         assert_eq!(

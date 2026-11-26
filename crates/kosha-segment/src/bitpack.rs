@@ -91,6 +91,86 @@ pub fn unpack128(bytes: &[u8], bits: u32, out: &mut [u32; BP_BLOCK]) -> Option<(
     Some(())
 }
 
+/// v7 position deltas: one width byte followed by BP128 (full group) or
+/// a contiguous little-endian bitstream (short group). Width 33 escapes
+/// to varints when an outlier would make packing larger. Group lengths
+/// come from the scoring block's total tf, never from this stream.
+pub(crate) fn encode_position_group(deltas: &[u32; BP_BLOCK], n: usize, out: &mut Vec<u8>) {
+    let values = &deltas[..n];
+    let bits = bit_width(values);
+    let packed_len = (n * bits as usize).div_ceil(8);
+    if packed_len > n
+        && packed_len
+            > values
+                .iter()
+                .map(|v| ((32 - v.leading_zeros()) as usize).max(1).div_ceil(7))
+                .sum()
+    {
+        out.push(33);
+        for &v in values {
+            put_var_u32(out, v);
+        }
+        return;
+    }
+    out.push(bits as u8);
+    if n == BP_BLOCK {
+        pack128(deltas, bits, out);
+        return;
+    }
+    let mut acc = 0u64;
+    let mut pending = 0;
+    for &v in values {
+        acc |= u64::from(v) << pending;
+        pending += bits;
+        while pending >= 8 {
+            out.push(acc as u8);
+            acc >>= 8;
+            pending -= 8;
+        }
+    }
+    if pending != 0 {
+        out.push(acc as u8);
+    }
+}
+
+pub(crate) fn decode_position_group(
+    buf: &mut &[u8],
+    n: usize,
+    out: &mut [u32; BP_BLOCK],
+) -> Option<()> {
+    let (&bits, rest) = buf.split_first()?;
+    *buf = rest;
+    if bits == 33 {
+        for slot in &mut out[..n] {
+            *slot = take_var_u32(buf)?;
+        }
+        return Some(());
+    }
+    if bits > 32 {
+        return None;
+    }
+    let bits = u32::from(bits);
+    let (bytes, rest) = buf.split_at_checked((n * bits as usize).div_ceil(8))?;
+    *buf = rest;
+    if n == BP_BLOCK {
+        return unpack128(bytes, bits, out);
+    }
+    let mut bytes = bytes.iter();
+    let mut acc = 0u64;
+    let mut pending = 0;
+    let mask = (1u64 << bits) - 1;
+    for slot in &mut out[..n] {
+        while pending < bits {
+            acc |= u64::from(*bytes.next()?) << pending;
+            pending += 8;
+        }
+        *slot = (acc & mask) as u32;
+        acc >>= bits;
+        pending -= bits;
+    }
+    Some(())
+}
+
 /// One monomorphized unpack per bit width: with `B` a constant the shift
 /// amounts and word indices are compile-time, the lane loop is four
 /// identical operations and LLVM vectorizes it. Words are read straight

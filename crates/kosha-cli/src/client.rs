@@ -170,8 +170,28 @@ impl Client {
                 &format!("/v1/namespaces/{}/flush", encode_ns(ns)),
                 Some(serde_json::json!({})),
             ),
-            // Legacy route supports flush-all when namespace is omitted.
-            None => self.request(Method::POST, "/flush", Some(serde_json::json!({}))),
+            // Every namespace of the caller: `/v1` has no flush-all, so list
+            // them and flush each (#350; the unversioned `/flush` is
+            // deprecated).
+            None => {
+                let listed: Value = self.request(Method::GET, "/v1/namespaces", None)?;
+                let names: Vec<String> = listed
+                    .get("namespaces")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|ns| ns.get("name").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect();
+                for ns in &names {
+                    let _: Value = self.request(
+                        Method::POST,
+                        &format!("/v1/namespaces/{}/flush", encode_ns(ns)),
+                        Some(serde_json::json!({})),
+                    )?;
+                }
+                Ok(serde_json::json!({"status": "flushed", "namespaces": names}))
+            }
         }
     }
 

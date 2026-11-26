@@ -1,7 +1,6 @@
 //! Offline two-tier (head/tail) impact-index analysis — research #387.
 //!
-//! **Analysis only.** Nothing on the query path calls this module; it backs
-//! the `kosha-two-tier-eval` binary, which reads real segments and a query
+//! The `kosha-two-tier-eval` binary reads real segments and a query
 //! set and answers: if every term's postings were split into a small
 //! high-impact *head* (kept local) and a *tail* (left in S3), for what
 //! fraction of queries does the head alone *provably* produce the exact
@@ -194,29 +193,136 @@ pub fn scoring_section_bytes(postings: impl Iterator<Item = (u32, u32, u32)>) ->
     total + varint_len(count)
 }
 
-/// The `(tf, dl)` Pareto frontier of `tail` as a step function: `(dl,
-/// tf)` points, `dl` ascending and `tf` strictly increasing. Every tail
-/// posting `(tf, dl)` is dominated by a point with `dl_i <= dl` and
-/// `tf_i >= tf`, so a tail document of length `dl` has
-/// `tf <= F(dl) = tf_i` of the last point with `dl_i <= dl` (none: the
-/// term cannot occur in a tail document that short). Its points are the
-/// only postings that can be the tail maximum under any BM25 statistics.
-pub fn frontier_steps(tail: &mut [(u32, u32)]) -> Vec<(u32, u32)> {
-    tail.sort_unstable_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)));
-    let mut steps: Vec<(u32, u32)> = Vec::new();
-    for &(tf, dl) in tail.iter() {
-        if steps.last().is_none_or(|&(_, best)| tf > best) {
-            steps.push((dl, tf));
-        }
-    }
-    steps
-}
+pub use kosha_segment::tail_frontier as frontier_steps;
 
 /// `F(dl)` of [`frontier_steps`]: the largest `tf` a tail posting of a
 /// document with length `dl` can have, or `None`.
 pub fn frontier_tf(steps: &[(u32, u32)], dl: u32) -> Option<u32> {
     let i = steps.partition_point(|&(d, _)| d <= dl);
     (i > 0).then(|| steps[i - 1].1)
+}
+
+pub(crate) fn certify_segment(
+    reader: &Arc<crate::TrackedSegment>,
+    terms: &[String],
+    scorer: &Bm25Scorer,
+    k: usize,
+    count_budget: Option<usize>,
+    restricted: bool,
+    rejected: &impl Fn(u32) -> bool,
+) -> Result<Option<crate::SegmentOutput>, KoshaError> {
+    if k == 0
+        || !scorer.params.k1.is_finite()
+        || scorer.params.k1 < 0.0
+        || !(0.0..=1.0).contains(&scorer.params.b)
+    {
+        return Ok(None);
+    }
+    // The exact union count is known without tail postings only for one
+    // unrestricted posting list. Otherwise the head alone must exceed
+    // the reported count cap (at equality the relation might still be eq).
+    let heads = terms
+        .iter()
+        .map(|term| Ok(reader.tier_head(term)?.map(|head| (term, head))))
+        .collect::<Result<Vec<_>, KoshaError>>()?;
+    let heads: Vec<_> = heads
+        .into_iter()
+        .flatten()
+        .map(|(term, head)| (scorer.doc_frequency(term, head.df), head))
+        .collect();
+    if heads.iter().all(|(_, head)| head.frontier.is_empty()) {
+        return Ok(None);
+    }
+    let single_list = (!restricted && !heads.is_empty() && terms.iter().all(|t| t == &terms[0]))
+        .then(|| heads[0].1.df as usize);
+    if single_list.is_none() && count_budget.is_none() {
+        return Ok(None);
+    }
+
+    let mut scores = HashMap::<u32, f64>::new();
+    let mut unseen = 0.0;
+    for (df, head) in &heads {
+        for posting in &head.postings {
+            if rejected(posting.doc_id) {
+                continue;
+            }
+            let dl = reader
+                .doc_meta(posting.doc_id)
+                .ok_or_else(|| {
+                    KoshaError::CorruptSegment("tier head document metadata missing".into())
+                })?
+                .field_length;
+            *scores.entry(posting.doc_id).or_default() +=
+                scorer.score_term(posting.term_frequency, *df, dl);
+        }
+        let mut max = 0.0f64;
+        for &(dl, tf) in head.frontier {
+            let score = scorer.score_term(tf, *df, dl);
+            if !score.is_finite() || score < 0.0 {
+                return Ok(None);
+            }
+            max = max.max(score);
+        }
+        unseen += max;
+    }
+    let total_hits = match single_list {
+        Some(total) => total,
+        None if count_budget.is_some_and(|cap| scores.len() > cap) => scores.len(),
+        None => return Ok(None),
+    };
+    let mut top = crate::BoundedTopK::new(k);
+    for (&doc, &score) in &scores {
+        if !score.is_finite() || score < 0.0 {
+            return Ok(None);
+        }
+        top.insert(score, doc, reader.doc_meta(doc).unwrap().doc_id);
+    }
+    if !top.is_full() {
+        return Ok(None);
+    }
+    // Strict comparison (including a rounding margin) keeps score ties
+    // from being decided without the potentially unseen document IDs.
+    let floor = top.floor();
+    let below_floor = |upper: f64| upper + upper.abs().max(floor.abs()) * 1e-9 < floor;
+    if !below_floor(unseen) {
+        return Ok(None);
+    }
+    let winning_docs: std::collections::HashSet<_> =
+        top.entries.iter().map(|&(_, doc, _)| doc).collect();
+    for (&doc, &score) in &scores {
+        let dl = reader.doc_meta(doc).unwrap().field_length;
+        let mut missing = 0.0;
+        for (df, head) in &heads {
+            if let Some(tf) = frontier_tf(head.frontier, dl) {
+                if head
+                    .postings
+                    .binary_search_by_key(&doc, |p| p.doc_id)
+                    .is_err()
+                {
+                    missing += scorer.score_term(tf, *df, dl);
+                }
+            }
+        }
+        if !missing.is_finite()
+            || missing < 0.0
+            || if winning_docs.contains(&doc) {
+                missing != 0.0
+            } else {
+                !below_floor(score + missing)
+            }
+        {
+            return Ok(None);
+        }
+    }
+    Ok(Some(crate::SegmentOutput {
+        candidates: top.into_candidates(reader),
+        vector_candidates: Vec::new(),
+        aggs: HashMap::new(),
+        total_hits,
+        hits_capped: single_list.is_none(),
+        knn_segment_degraded: None,
+        knn_failed_segment: None,
+    }))
 }
 
 /// Bytes to store a tail's frontier step function: a count varint, then
@@ -279,6 +385,11 @@ impl Segment {
             .unwrap_or_default();
         let split = kosha_segment::inverted_uses_posting_blobs(&dir);
         let reader = SegmentReader::open_with_options(dir, false)?;
+        if reader.is_tiered() {
+            return Err(KoshaError::InvalidQuery(
+                "offline head selection needs an untiered segment".into(),
+            ));
+        }
         let lengths = (0..reader.doc_count())
             .map(|seq| reader.doc_meta(seq).map_or(0, |m| m.field_length))
             .collect();

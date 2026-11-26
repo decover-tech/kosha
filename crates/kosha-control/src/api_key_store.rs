@@ -12,9 +12,21 @@
 //!
 //! Creating, rotating and revoking a tenant key each append a row to
 //! `kosha.audit_log` (migration 006, #345) in the transaction that makes
-//! the change, with the operator as the actor: these back the operator's
-//! `/v1/admin/api-keys` routes. Keys created through the organization
-//! console are audited by `orgs::create_api_key`.
+//! the change, naming who made it: the operator credential for the
+//! `/v1/admin/api-keys` routes (`operator` or `operator:<name>`), the
+//! tenant's own key for the self-service `/v1/api-keys` routes
+//! (`api_key:<id prefix>`). Keys created through the organization console
+//! are audited by `orgs::create_api_key`.
+//!
+//! Every change to operator credentials takes one advisory lock
+//! ([`OPERATOR_LOCK`]), so a revoke-by-name cannot miss a rotation running
+//! on another pod, and the lock-out guard ([`LockoutGuard`]) sees every
+//! other change before deciding.
+//!
+//! Plaintext scrub (#346): rows from before hashed keys still hold the key
+//! in `api_key`. [`PgStore::auto_scrub_plaintext`] removes it once it is
+//! safe, without an operator: see its documentation and migration
+//! `009_api_key_scrub.sql`.
 
 use crate::api_keys::{
     hash_api_key, operator_name, operator_tenant_id, valid_operator_name, ApiKeyRecord, NewApiKey,
@@ -153,12 +165,13 @@ fn issued_detail(issued: &IssuedApiKey) -> serde_json::Value {
     })
 }
 
-/// Append an operator action on one of `tenant_id`'s keys to the audit
-/// log, under the tenant's organization when it has one (as
+/// Append `actor`'s action on one of `tenant_id`'s keys to the audit log,
+/// under the tenant's organization when it has one (as
 /// `orgs::create_api_key` does for the console's keys). Run it on the
 /// transaction that makes the change, so neither exists without the other.
 async fn audit<'e, E>(
     executor: E,
+    actor: &str,
     action: &str,
     tenant_id: &str,
     detail: &serde_json::Value,
@@ -169,11 +182,12 @@ where
     sqlx::query(
         "INSERT INTO kosha.audit_log (org_id, actor, action, target_type, target_id, detail) \
          VALUES ((SELECT org_id FROM kosha.tenants WHERE tenant_id = $1), \
-                 'operator', $2, 'tenant', $1, $3)",
+                 $4, $2, 'tenant', $1, $3)",
     )
     .bind(tenant_id)
     .bind(action)
     .bind(detail.to_string())
+    .bind(actor)
     .execute(executor)
     .await
     .map(|_| ())
@@ -217,6 +231,7 @@ async fn rotate(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     kind: Kind,
     key_hash: &str,
+    tenant_id: Option<&str>,
     overlap_secs: u64,
     new_expires_at: Option<i64>,
 ) -> Result<Option<RotatedApiKey>, sqlx::Error> {
@@ -224,19 +239,23 @@ async fn rotate(
         "{} FOR UPDATE",
         select(&format!(
             "{KEY_HASH} = $1 AND revoked_at IS NULL \
-             AND (expires_at IS NULL OR expires_at > NOW()) AND {}",
+             AND (expires_at IS NULL OR expires_at > NOW()) \
+             AND ($2::TEXT IS NULL OR tenant_id = $2) AND {}",
             kind.condition()
         ))
     );
+    // A zero-overlap deadline must not round up past the server's clock.
     let retire = format!(
         "UPDATE kosha.api_keys \
          SET expires_at = LEAST(COALESCE(expires_at, 'infinity'), \
-                                NOW() + make_interval(secs => $2::DOUBLE PRECISION)) \
+                                CASE WHEN $2::DOUBLE PRECISION = 0 THEN date_trunc('second', NOW()) \
+                                ELSE NOW() + make_interval(secs => $2::DOUBLE PRECISION) END) \
          WHERE {KEY_HASH} = $1 \
          RETURNING EXTRACT(EPOCH FROM expires_at)::BIGINT"
     );
     let old: Option<Row> = sqlx::query_as(&find)
         .bind(key_hash)
+        .bind(tenant_id)
         .fetch_optional(&mut **tx)
         .await?;
     let Some(old) = old.map(record) else {
@@ -294,6 +313,96 @@ pub enum OperatorCredentials<'a> {
     Operator(&'a str),
 }
 
+/// Whether a change to operator credentials is checked against locking
+/// every operator out (#346, [`crate::api_keys::check_lockout`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockoutGuard {
+    /// Not checked: the shared bootstrap key is enabled (it stays a way
+    /// in), or the caller overrode the guard (`"force": true`).
+    Off,
+    /// Refuse a change that leaves no usable operator credential, or makes
+    /// the last one lapse within a day.
+    On,
+}
+
+/// Why a change to operator credentials did not happen.
+#[derive(Debug)]
+pub enum CredentialError {
+    /// [`LockoutGuard::On`] refused it; the message says why (a 409).
+    WouldLockOut(String),
+    /// The database failed.
+    Store(KoshaError),
+}
+
+impl std::fmt::Display for CredentialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CredentialError::WouldLockOut(message) => f.write_str(message),
+            CredentialError::Store(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<sqlx::Error> for CredentialError {
+    fn from(e: sqlx::Error) -> Self {
+        CredentialError::Store(db_error(e))
+    }
+}
+
+/// The advisory lock every change to operator credentials takes for its
+/// transaction: creates (one usable credential per name), rotations,
+/// revocations and the lock-out guard all see each other's results.
+/// Credential changes are rare, so one lock for all of them costs nothing.
+const OPERATOR_LOCK: &str =
+    "SELECT pg_advisory_xact_lock(hashtextextended('kosha.operator_credentials', 0))";
+
+/// The advisory lock [`PgStore::auto_scrub_plaintext`] tries, so one pod
+/// at a time decides; the others skip that round.
+const SCRUB_LOCK: &str =
+    "SELECT pg_try_advisory_xact_lock(hashtextextended('kosha.api_key_scrub', 0))";
+
+/// The database clock and the expiries of the operator credentials usable
+/// now, except `excluding` (a credential being rotated out).
+async fn usable_operator_expiries(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    excluding: Option<&str>,
+) -> Result<(i64, Vec<Option<i64>>), sqlx::Error> {
+    let sql = format!(
+        "SELECT tenant_id, EXTRACT(EPOCH FROM expires_at)::BIGINT FROM kosha.api_keys \
+         WHERE revoked_at IS NULL AND (expires_at IS NULL OR expires_at > NOW()) AND {} \
+           AND ($1::TEXT IS NULL OR {KEY_HASH} <> $1)",
+        Kind::Operator.condition()
+    );
+    let rows: Vec<(String, Option<i64>)> = sqlx::query_as(&sql)
+        .bind(excluding)
+        .fetch_all(&mut **tx)
+        .await?;
+    let (now,): (i64,) = sqlx::query_as("SELECT EXTRACT(EPOCH FROM NOW())::BIGINT")
+        .fetch_one(&mut **tx)
+        .await?;
+    // Only a credential a server would accept counts.
+    let expiries = rows
+        .into_iter()
+        .filter(|(tenant_id, _)| operator_name(tenant_id).is_some())
+        .map(|(_, expires_at)| expires_at)
+        .collect();
+    Ok((now, expiries))
+}
+
+/// What one [`PgStore::auto_scrub_plaintext`] round found or did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrubStatus {
+    /// No row holds a plaintext key.
+    Clean,
+    /// `plaintext` rows still hold one; they are scrubbed from `due_at`
+    /// (unix seconds) on.
+    Waiting { plaintext: u64, due_at: i64 },
+    /// This round removed the plaintext of that many rows.
+    Scrubbed(u64),
+    /// Another pod is deciding this round.
+    Busy,
+}
+
 impl PgStore {
     /// The tenant of a tenant key that is neither revoked nor expired.
     pub fn validate_api_key(&self, api_key: &str) -> Option<String> {
@@ -316,18 +425,54 @@ impl PgStore {
 
     /// Create a key. Only its hash is stored; the returned `api_key` is the
     /// one chance to see the key. Audited as `api_key.created` by the
-    /// operator, in the same transaction.
+    /// shared-key operator, in the same transaction.
     pub fn create_api_key(&self, new: &NewApiKey) -> Result<IssuedApiKey, KoshaError> {
+        self.create_api_key_as(new, "operator")
+    }
+
+    /// [`Self::create_api_key`], audited as made by `actor` (an audit
+    /// label: `operator:alice`, `api_key:<id prefix>`, `user:<id>`). The
+    /// caller has checked that `actor` may grant `new`
+    /// ([`crate::KeyAuthority::grant`]).
+    pub fn create_api_key_as(
+        &self,
+        new: &NewApiKey,
+        actor: &str,
+    ) -> Result<IssuedApiKey, KoshaError> {
+        if crate::api_keys::is_operator_tenant_id(&new.tenant_id) {
+            return Err(KoshaError::ControlPlane(
+                "an operator credential is not a tenant key".into(),
+            ));
+        }
         let (pool, rt) = self.pool_and_runtime();
         rt.block_on(async {
             let mut tx = pool.begin().await?;
             let issued = insert(&mut *tx, new).await?;
             let detail = issued_detail(&issued);
-            audit(&mut *tx, "api_key.created", &new.tenant_id, &detail).await?;
+            audit(&mut *tx, actor, "api_key.created", &new.tenant_id, &detail).await?;
             tx.commit().await?;
             Ok::<_, sqlx::Error>(issued)
         })
         .map_err(db_error)
+    }
+
+    /// The tenant key with this hash, unless it is revoked (an expired key
+    /// is returned: it can still be revoked). `None` for an operator
+    /// credential.
+    pub fn get_api_key(&self, key_hash: &str) -> Result<Option<ApiKeyRecord>, KoshaError> {
+        let (pool, rt) = self.pool_and_runtime();
+        let sql = select(&format!(
+            "{KEY_HASH} = $1 AND revoked_at IS NULL AND {}",
+            Kind::Tenant.condition()
+        ));
+        rt.block_on(async {
+            let row: Option<Row> = sqlx::query_as(&sql)
+                .bind(key_hash)
+                .fetch_optional(pool)
+                .await
+                .map_err(db_error)?;
+            Ok(row.map(record))
+        })
     }
 
     /// Every tenant key that is not revoked (expired keys included, so an
@@ -374,13 +519,25 @@ impl PgStore {
 
     /// Revoke the tenant key with this hash. `false` when there is no such
     /// active key. Servers stop accepting it on their next key refresh.
-    /// Audited as `api_key.revoked` by the operator, in the same
+    /// Audited as `api_key.revoked` by the shared-key operator, in the same
     /// transaction.
     pub fn revoke_api_key(&self, key_hash: &str) -> Result<bool, KoshaError> {
+        self.revoke_api_key_as(key_hash, None, "operator")
+    }
+
+    /// [`Self::revoke_api_key`], audited as made by `actor`, and only when
+    /// the key belongs to `tenant_id` if one is given (`false` otherwise).
+    pub fn revoke_api_key_as(
+        &self,
+        key_hash: &str,
+        tenant_id: Option<&str>,
+        actor: &str,
+    ) -> Result<bool, KoshaError> {
         let (pool, rt) = self.pool_and_runtime();
         let sql = format!(
             "UPDATE kosha.api_keys SET revoked_at = NOW() \
-             WHERE {KEY_HASH} = $1 AND revoked_at IS NULL AND {} \
+             WHERE {KEY_HASH} = $1 AND revoked_at IS NULL \
+               AND ($2::TEXT IS NULL OR tenant_id = $2) AND {} \
              RETURNING tenant_id, description",
             Kind::Tenant.condition()
         );
@@ -388,6 +545,7 @@ impl PgStore {
             let mut tx = pool.begin().await?;
             let revoked: Option<(String, String)> = sqlx::query_as(&sql)
                 .bind(key_hash)
+                .bind(tenant_id)
                 .fetch_optional(&mut *tx)
                 .await?;
             let Some((tenant_id, description)) = revoked else {
@@ -397,7 +555,7 @@ impl PgStore {
                 "key_id_prefix": key_id_prefix(key_hash),
                 "description": description,
             });
-            audit(&mut *tx, "api_key.revoked", &tenant_id, &detail).await?;
+            audit(&mut *tx, actor, "api_key.revoked", &tenant_id, &detail).await?;
             tx.commit().await?;
             Ok::<_, sqlx::Error>(true)
         })
@@ -410,13 +568,26 @@ impl PgStore {
     /// `overlap_secs` more seconds. The overlap never extends the old key:
     /// one that already expires sooner keeps its earlier expiry. `None`
     /// when there is no such key, or it is revoked or already expired.
-    /// Audited as `api_key.rotated` by the operator, in the same
+    /// Audited as `api_key.rotated` by the shared-key operator, in the same
     /// transaction.
     pub fn rotate_api_key(
         &self,
         key_hash: &str,
         overlap_secs: u64,
         new_expires_at: Option<i64>,
+    ) -> Result<Option<RotatedApiKey>, KoshaError> {
+        self.rotate_api_key_as(key_hash, None, overlap_secs, new_expires_at, "operator")
+    }
+
+    /// [`Self::rotate_api_key`], audited as made by `actor`, and only when
+    /// the key belongs to `tenant_id` if one is given (`None` otherwise).
+    pub fn rotate_api_key_as(
+        &self,
+        key_hash: &str,
+        tenant_id: Option<&str>,
+        overlap_secs: u64,
+        new_expires_at: Option<i64>,
+        actor: &str,
     ) -> Result<Option<RotatedApiKey>, KoshaError> {
         let (pool, rt) = self.pool_and_runtime();
         rt.block_on(async {
@@ -425,6 +596,7 @@ impl PgStore {
                 &mut tx,
                 Kind::Tenant,
                 key_hash,
+                tenant_id,
                 overlap_secs,
                 new_expires_at,
             )
@@ -439,7 +611,7 @@ impl PgStore {
                 "expires_at": rotated.old_expires_at,
             });
             let tenant_id = &rotated.new.record.tenant_id;
-            audit(&mut *tx, "api_key.rotated", tenant_id, &detail)
+            audit(&mut *tx, actor, "api_key.rotated", tenant_id, &detail)
                 .await
                 .map_err(db_error)?;
             tx.commit().await.map_err(db_error)?;
@@ -469,8 +641,7 @@ impl PgStore {
         rt.block_on(async {
             let mut tx = pool.begin().await.map_err(db_error)?;
             // Two creates for one name must not both find it free.
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-                .bind(&tenant_id)
+            sqlx::query(OPERATOR_LOCK)
                 .execute(&mut *tx)
                 .await
                 .map_err(db_error)?;
@@ -522,12 +693,14 @@ impl PgStore {
     /// Revoke operator credentials, recording `actor` as who did it.
     /// Returns the `(key hash, operator name)` of each credential revoked:
     /// empty when nothing active matched. Servers stop accepting them on
-    /// their next key refresh.
+    /// their next key refresh. With [`LockoutGuard::On`] a revocation that
+    /// would lock every operator out is refused and nothing changes.
     pub fn revoke_operator_credentials(
         &self,
         which: OperatorCredentials<'_>,
         actor: &str,
-    ) -> Result<Vec<(String, String)>, KoshaError> {
+        guard: LockoutGuard,
+    ) -> Result<Vec<(String, String)>, CredentialError> {
         let (key_hash, tenant_id) = match which {
             OperatorCredentials::KeyHash(hash) => (Some(hash.to_string()), None),
             OperatorCredentials::Operator(name) => (None, Some(operator_tenant_id(name))),
@@ -541,13 +714,22 @@ impl PgStore {
             Kind::Operator.condition()
         );
         rt.block_on(async {
-            let mut tx = pool.begin().await.map_err(db_error)?;
+            let mut tx = pool.begin().await?;
+            // Taken before the UPDATE, so its snapshot holds every rotation
+            // that committed first: a replacement minted by a concurrent
+            // rotation cannot slip past a revoke-by-name.
+            sqlx::query(OPERATOR_LOCK).execute(&mut *tx).await?;
+            let (_, before) = usable_operator_expiries(&mut tx, None).await?;
             let rows: Vec<(String, String)> = sqlx::query_as(&sql)
                 .bind(key_hash)
                 .bind(tenant_id)
                 .fetch_all(&mut *tx)
-                .await
-                .map_err(db_error)?;
+                .await?;
+            if guard == LockoutGuard::On && !rows.is_empty() {
+                let (now, after) = usable_operator_expiries(&mut tx, None).await?;
+                crate::api_keys::check_lockout(&before, &after, now)
+                    .map_err(CredentialError::WouldLockOut)?;
+            }
             let mut revoked = Vec::with_capacity(rows.len());
             for (hash, tenant_id) in rows {
                 let name = audited_operator(&tenant_id).to_string();
@@ -558,40 +740,51 @@ impl PgStore {
                     &name,
                     serde_json::json!({ "key_id": hash }),
                 )
-                .await
-                .map_err(db_error)?;
+                .await?;
                 revoked.push((hash, name));
             }
-            tx.commit().await.map_err(db_error)?;
+            tx.commit().await?;
             Ok(revoked)
         })
     }
 
     /// [`Self::rotate_api_key`] for an operator credential: the replacement
     /// belongs to the same operator, and `actor` is recorded as who rotated
-    /// it. `None` when there is no such active operator credential.
+    /// it. `None` when there is no such active operator credential. With
+    /// [`LockoutGuard::On`] a rotation whose replacement would make the
+    /// last usable credential lapse within a day is refused.
     pub fn rotate_operator_credential(
         &self,
         key_hash: &str,
         overlap_secs: u64,
         new_expires_at: Option<i64>,
         actor: &str,
-    ) -> Result<Option<RotatedApiKey>, KoshaError> {
+        guard: LockoutGuard,
+    ) -> Result<Option<RotatedApiKey>, CredentialError> {
         let (pool, rt) = self.pool_and_runtime();
         rt.block_on(async {
-            let mut tx = pool.begin().await.map_err(db_error)?;
+            let mut tx = pool.begin().await?;
+            sqlx::query(OPERATOR_LOCK).execute(&mut *tx).await?;
+            let (_, before) = usable_operator_expiries(&mut tx, None).await?;
             let Some(rotated) = rotate(
                 &mut tx,
                 Kind::Operator,
                 key_hash,
+                None,
                 overlap_secs,
                 new_expires_at,
             )
-            .await
-            .map_err(db_error)?
+            .await?
             else {
                 return Ok(None);
             };
+            if guard == LockoutGuard::On {
+                // The credential rotated out is on its way out: it does
+                // not keep anyone in.
+                let (now, after) = usable_operator_expiries(&mut tx, Some(key_hash)).await?;
+                crate::api_keys::check_lockout(&before, &after, now)
+                    .map_err(CredentialError::WouldLockOut)?;
+            }
             audit_operator(
                 &mut tx,
                 actor,
@@ -603,9 +796,8 @@ impl PgStore {
                     "replaces": { "key_id": key_hash, "expires_at": rotated.old_expires_at },
                 }),
             )
-            .await
-            .map_err(db_error)?;
-            tx.commit().await.map_err(db_error)?;
+            .await?;
+            tx.commit().await?;
             Ok(Some(rotated))
         })
     }
@@ -641,18 +833,17 @@ impl PgStore {
     /// (rows from before #346) with an unusable placeholder, keeping the
     /// hash. Returns how many rows held plaintext. The keys keep working
     /// on builds with #346; a build from before it can no longer
-    /// authenticate them, so run this only once every pod is upgraded.
+    /// authenticate them. [`Self::auto_scrub_plaintext`] does this once it
+    /// is safe; calling this does it now.
     pub fn scrub_plaintext_api_keys(&self) -> Result<u64, KoshaError> {
         let (pool, rt) = self.pool_and_runtime();
-        let sql = format!(
-            "UPDATE kosha.api_keys \
-             SET key_hash = {KEY_HASH}, api_key = ' sha256:' || {KEY_HASH} \
-             WHERE api_key NOT LIKE ' sha256:%'"
-        );
         rt.block_on(async {
-            let done = sqlx::query(&sql).execute(pool).await.map_err(db_error)?;
-            Ok(done.rows_affected())
+            let mut tx = pool.begin().await?;
+            let scrubbed = scrub(&mut tx).await?;
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(scrubbed)
         })
+        .map_err(db_error)
     }
 
     /// How many rows still hold a plaintext key in the `api_key` column:
@@ -661,13 +852,107 @@ impl PgStore {
     pub fn count_plaintext_api_keys(&self) -> Result<u64, KoshaError> {
         let (pool, rt) = self.pool_and_runtime();
         rt.block_on(async {
-            let (rows,): (i64,) = sqlx::query_as(
-                "SELECT count(*) FROM kosha.api_keys WHERE api_key NOT LIKE ' sha256:%'",
-            )
-            .fetch_one(pool)
-            .await
-            .map_err(db_error)?;
+            let (rows,): (i64,) = sqlx::query_as(COUNT_PLAINTEXT)
+                .fetch_one(pool)
+                .await
+                .map_err(db_error)?;
             Ok(rows.max(0) as u64)
         })
     }
+
+    /// One round of the automatic plaintext scrub (#346). Every server
+    /// with Postgres runs one on each key refresh; it is idempotent.
+    ///
+    /// The danger it avoids: a server build from before hashed keys
+    /// matches the plaintext column, so scrubbing while such a pod still
+    /// serves would lock tenants out of it mid-rollout. The scrub waits
+    /// until `grace_secs` have passed since the database last showed any
+    /// sign of such a pod:
+    ///
+    /// - `kosha.api_key_scrub.hash_only_since` is set the first time a
+    ///   server of this build runs a round (by the server, not by the
+    ///   migration, so applying migrations ahead of a deploy starts no
+    ///   clock).
+    /// - A row without `key_hash` can only have been inserted by a build
+    ///   from before hashed keys, so finding one shows such a pod is still
+    ///   running: the row is hashed and the clock starts again.
+    ///
+    /// Builds with hashed keys but without this scrub match by hash and
+    /// are unaffected by it. One pod decides per round (an advisory lock);
+    /// the others get [`ScrubStatus::Busy`].
+    pub fn auto_scrub_plaintext(&self, grace_secs: u64) -> Result<ScrubStatus, KoshaError> {
+        let grace_secs = grace_secs.min(i64::MAX as u64 / 2) as i64;
+        let (pool, rt) = self.pool_and_runtime();
+        rt.block_on(async {
+            let mut tx = pool.begin().await?;
+            let (locked,): (bool,) = sqlx::query_as(SCRUB_LOCK).fetch_one(&mut *tx).await?;
+            if !locked {
+                return Ok(ScrubStatus::Busy);
+            }
+            sqlx::query(
+                "INSERT INTO kosha.api_key_scrub (id) VALUES (TRUE) ON CONFLICT (id) DO NOTHING",
+            )
+            .execute(&mut *tx)
+            .await?;
+            let old_build_rows = sqlx::query(&format!(
+                "UPDATE kosha.api_keys SET key_hash = {KEY_HASH} WHERE key_hash IS NULL"
+            ))
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if old_build_rows > 0 {
+                sqlx::query("UPDATE kosha.api_key_scrub SET hash_only_since = NOW()")
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            let (plaintext,): (i64,) = sqlx::query_as(COUNT_PLAINTEXT).fetch_one(&mut *tx).await?;
+            let status = if plaintext <= 0 {
+                ScrubStatus::Clean
+            } else {
+                let (due_at, due): (i64, bool) = sqlx::query_as(
+                    "SELECT EXTRACT(EPOCH FROM hash_only_since)::BIGINT + $1, \
+                            hash_only_since + make_interval(secs => $1::DOUBLE PRECISION) \
+                                <= NOW() \
+                     FROM kosha.api_key_scrub",
+                )
+                .bind(grace_secs)
+                .fetch_one(&mut *tx)
+                .await?;
+                if due {
+                    let scrubbed = scrub(&mut tx).await?;
+                    sqlx::query(
+                        "UPDATE kosha.api_key_scrub \
+                         SET last_scrub_at = NOW(), last_scrubbed = $1",
+                    )
+                    .bind(scrubbed as i64)
+                    .execute(&mut *tx)
+                    .await?;
+                    ScrubStatus::Scrubbed(scrubbed)
+                } else {
+                    ScrubStatus::Waiting {
+                        plaintext: plaintext as u64,
+                        due_at,
+                    }
+                }
+            };
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(status)
+        })
+        .map_err(db_error)
+    }
+}
+
+/// Rows whose `api_key` column still holds a usable key.
+const COUNT_PLAINTEXT: &str =
+    "SELECT count(*) FROM kosha.api_keys WHERE api_key NOT LIKE ' sha256:%'";
+
+/// Replace the plaintext of every row that holds one with the placeholder,
+/// keeping (or computing) its hash. Returns how many rows changed.
+async fn scrub(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<u64, sqlx::Error> {
+    let sql = format!(
+        "UPDATE kosha.api_keys \
+         SET key_hash = {KEY_HASH}, api_key = ' sha256:' || {KEY_HASH} \
+         WHERE api_key NOT LIKE ' sha256:%'"
+    );
+    Ok(sqlx::query(&sql).execute(&mut **tx).await?.rows_affected())
 }

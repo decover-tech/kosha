@@ -39,6 +39,31 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  relevance-changes:
+    name: Detect relevance changes
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    outputs:
+      changed: ${{ steps.paths.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - id: paths
+        run: |
+          set -euo pipefail
+          changed="$(git diff --name-only --no-renames HEAD^1 HEAD -- \
+            crates/kosha-query crates/kosha-segment crates/kosha-vector-spfresh \
+            crates/kosha-core crates/kosha-write scripts/relevance Cargo.lock \
+            .github/workflows/bench-compare.yml .github/workflows/relevance-compare.yml)"
+          if [[ -n "$changed" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  relevance:
+    needs: relevance-changes
+    if: needs.relevance-changes.outputs.changed == 'true'
+    uses: ./.github/workflows/relevance-compare.yml
+
   compare-script-tests:
     name: compare_pr.py unit tests
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -48,6 +73,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: python3 scripts/bench/test_compare_pr.py
+      - run: python3 scripts/bench/test_compare_knn.py
 
   bench-compare:
     name: bench merge-base vs head, comment on PR
@@ -139,4 +165,130 @@ jobs:
             echo "creating bench comment"
             gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
               -F "body=@$RUNNER_TEMP/comment.md" > /dev/null
+          fi
+
+  # kNN gate: `knn_open_search` on a clustered corpus, main vs this PR on one
+  # runner, runs interleaved (base, head, base, head). Unlike the comment-only
+  # job above, this one FAILS on a large regression (scripts/bench/compare_knn.py):
+  # a warm/cold p50 past its % limit and absolute floor, or more postings
+  # probed per query (deterministic: the #160 budget floor would have tripped
+  # it). Label the PR `perf-regression-accepted` and re-run to accept an
+  # intended cost.
+  knn-bench-compare:
+    name: kNN bench merge-base vs head (gate)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 45
+    env:
+      KOSHA_BENCH_SEGS: "8"
+      KOSHA_BENCH_DOCS: "4000"
+      KOSHA_BENCH_DIM: "256"
+      KOSHA_BENCH_CLUSTERS: "64"
+      KOSHA_BENCH_QUERIES: "64"
+      KOSHA_BENCH_COLD_ITERS: "15"
+      KOSHA_BENCH_WARM_ITERS: "200"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need HEAD^1 for the baseline worktree
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Both binaries are built first and copied out of the shared target
+      # dir, so the runs can alternate instead of base-then-head.
+      - name: Build baseline bench (main side of the test merge)
+        run: |
+          set -euo pipefail
+          base_sha="$(git rev-parse HEAD^1)"
+          echo "base_sha=$base_sha" >> "$GITHUB_ENV"
+          bench=crates/kosha-query/benches/knn_open_search.rs
+          git worktree add --detach "$RUNNER_TEMP/knn-base-tree" "$base_sha"
+          cp "$bench" "$RUNNER_TEMP/knn-base-tree/$bench"
+          export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target"
+          cd "$RUNNER_TEMP/knn-base-tree"
+          if ! bin="$(python3 "$GITHUB_WORKSPACE/scripts/bench/bench_exe.py" kosha-query knn_open_search)"; then
+            echo "::warning::head's knn bench failed against the base tree — using the base's own (not gated)"
+            git checkout -- "$bench"
+            bin="$(python3 "$GITHUB_WORKSPACE/scripts/bench/bench_exe.py" kosha-query knn_open_search)" || bin=""
+          fi
+          [ -n "$bin" ] && cp "$bin" "$RUNNER_TEMP/knn-base" || echo "::warning::no baseline bench binary"
+
+      - name: Build PR bench (test-merge commit)
+        run: |
+          set -euo pipefail
+          # The base build is newer than head's sources in the shared target dir.
+          find crates -name '*.rs' -exec touch {} +
+          cp "$(python3 scripts/bench/bench_exe.py kosha-query knn_open_search)" "$RUNNER_TEMP/knn-head"
+
+      - name: Run interleaved
+        run: |
+          set -euo pipefail
+          for round in 1 2; do
+            if [ -x "$RUNNER_TEMP/knn-base" ]; then
+              KOSHA_BENCH_JSON="$RUNNER_TEMP/knn-base-$round.json" "$RUNNER_TEMP/knn-base" \
+                || echo "::warning::baseline run $round failed"
+            fi
+            KOSHA_BENCH_JSON="$RUNNER_TEMP/knn-head-$round.json" "$RUNNER_TEMP/knn-head"
+          done
+
+      - name: Compare
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          set -euo pipefail
+          accept=()
+          case ",$LABELS," in *,perf-regression-accepted,*) accept=(--accept) ;; esac
+          base_args=()
+          for f in "$RUNNER_TEMP"/knn-base-*.json; do
+            [ -f "$f" ] && base_args+=(--base "$f")
+          done
+          status=0
+          python3 scripts/bench/compare_knn.py "${base_args[@]}" \
+            --head "$RUNNER_TEMP/knn-head-1.json" --head "$RUNNER_TEMP/knn-head-2.json" \
+            --base-sha "$base_sha" --head-sha "$HEAD_SHA" \
+            --out "$RUNNER_TEMP/knn-comment.md" "${accept[@]}" || status=$?
+          echo "knn_status=$status" >> "$GITHUB_ENV"
+
+      - name: Post sticky comment
+        if: always() && github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          [ -f "$RUNNER_TEMP/knn-comment.md" ] || { echo "no comment rendered"; exit 0; }
+          marker='<!-- kosha-knn-bench-compare -->'
+          cid="$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+                   --paginate \
+                   --jq "[.[] | select(.body | startswith(\"$marker\")) | .id][0] // empty")"
+          if [ -n "$cid" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$cid" \
+              -F "body=@$RUNNER_TEMP/knn-comment.md" > /dev/null
+          else
+            gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+              -F "body=@$RUNNER_TEMP/knn-comment.md" > /dev/null
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: knn-bench-report
+          path: |
+            ${{ runner.temp }}/knn-*.json
+            ${{ runner.temp }}/knn-comment.md
+          if-no-files-found: warn
+
+      - name: Gate on regressions
+        run: |
+          if [ "${knn_status:-1}" != "0" ]; then
+            echo "::error::kNN bench regressed past its limit (see the comment / knn-bench-report artifact); label perf-regression-accepted if intended"
+            exit 1
           fi

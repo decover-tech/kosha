@@ -82,7 +82,7 @@ spec:
               value: "1800"
           readinessProbe:
             httpGet:
-              path: /readyz
+              path: /v1/readyz
               port: 8080
             initialDelaySeconds: 5
             periodSeconds: 10
@@ -90,14 +90,14 @@ spec:
           # corpus (see deployment.yaml).
           startupProbe:
             httpGet:
-              path: /healthz
+              path: /v1/healthz
               port: 8080
             periodSeconds: 10
             failureThreshold: 60
             timeoutSeconds: 3
           livenessProbe:
             httpGet:
-              path: /healthz
+              path: /v1/healthz
               port: 8080
             initialDelaySeconds: 15
             periodSeconds: 20

@@ -19,13 +19,20 @@ mod centroid_index;
 mod centroid_probe;
 mod error;
 mod kmeans;
+pub mod namespace_centroids;
 mod ops;
 mod point;
 mod posting;
 mod quant;
 mod rabitq;
+pub mod replication;
 mod rng;
 mod search;
+
+#[cfg(test)]
+extern crate self as kosha_vector_spfresh;
+#[cfg(test)]
+mod lazy_npa;
 
 use std::collections::{HashMap, HashSet};
 
@@ -83,7 +90,7 @@ pub struct ClusterIndexConfig {
     pub enable_merge: bool,
     pub enable_reassign: bool,
     /// Rounds of post-build refinement in [`ClusterIndex::build`]: after
-    /// balanced bisection, every vector moves to the nearest centroid
+    /// balanced bisection, every vector moves to the best centroid
     /// among its posting's `build_refine_candidates` nearest postings,
     /// centroids are recomputed, and [`ClusterIndex::rebalance`] restores
     /// the size bounds. Bisection's balance pass pushes far members into
@@ -94,6 +101,12 @@ pub struct ClusterIndexConfig {
     /// How many nearby postings (including its own) a vector may move to
     /// during build refinement.
     pub build_refine_candidates: usize,
+    /// ScaNN's parallel residual weight (η >= 1) for build refinement.
+    /// `None` keeps cosine assignment. Split/Merge/Reassign still use cosine.
+    pub build_refine_anisotropic_eta: Option<f32>,
+    /// Skip cosine comparisons when Elkan's angular half-distance test
+    /// proves the current posting wins. Off by default for cost ablations.
+    pub enable_elkan_pruning: bool,
 }
 
 impl ClusterIndexConfig {
@@ -118,6 +131,8 @@ impl ClusterIndexConfig {
             enable_reassign: true,
             build_refine_rounds: 2,
             build_refine_candidates: 16,
+            build_refine_anisotropic_eta: None,
+            enable_elkan_pruning: false,
         }
     }
 }
@@ -151,6 +166,14 @@ fn validate_config(cfg: &ClusterIndexConfig) -> Result<(), VectorIndexError> {
     if cfg.nprobe == 0 {
         return Err(VectorIndexError::InvalidConfig("nprobe must be > 0"));
     }
+    if cfg
+        .build_refine_anisotropic_eta
+        .is_some_and(|eta| !eta.is_finite() || eta < 1.0)
+    {
+        return Err(VectorIndexError::InvalidConfig(
+            "build_refine_anisotropic_eta must be finite and >= 1",
+        ));
+    }
     Ok(())
 }
 
@@ -164,6 +187,23 @@ pub struct IndexStats {
     pub min_posting_size: usize,
     pub max_posting_size: usize,
     pub avg_posting_size: f64,
+    pub imbalance_factor: f64,
+}
+
+/// Faiss posting-size imbalance: `n * sum(size²) / sum(size)²`. Returns
+/// 1 for equally sized non-empty postings and 0 when there are no vectors.
+pub fn posting_imbalance_factor(sizes: impl IntoIterator<Item = usize>) -> f64 {
+    let (n, sum, squares) = sizes
+        .into_iter()
+        .fold((0.0, 0.0, 0.0), |(n, sum, squares), size| {
+            let size = size as f64;
+            (n + 1.0, sum + size, squares + size * size)
+        });
+    if sum == 0.0 {
+        0.0
+    } else {
+        n * squares / (sum * sum)
+    }
 }
 
 /// Result of an explicit [`ClusterIndex::rebalance`] pass.
@@ -226,12 +266,14 @@ pub struct ClusterIndex {
     /// at once (just after `absorb_postings`), cascades would otherwise
     /// chain from one oversized neighbour to the next.
     pub(crate) defer_cascade_splits: bool,
+    #[cfg(test)]
+    deferred_reassign: Option<lazy_npa::DeferredReassign>,
 }
 
 impl ClusterIndex {
     /// Builds an index from a full vector set via recursive balanced
     /// bisection, then (unless `config.build_refine_rounds` is 0) a
-    /// bounded nearest-centroid refinement and a [`Self::rebalance`] (see
+    /// bounded assignment refinement and a [`Self::rebalance`] (see
     /// `build.rs`). `vectors` must have unique ids and uniform
     /// dimensionality matching `config.dim`.
     pub fn build(
@@ -538,6 +580,7 @@ impl ClusterIndex {
             tombstoned_entries: tombstoned,
             min_posting_size: sizes.iter().copied().min().unwrap_or(0),
             max_posting_size: sizes.iter().copied().max().unwrap_or(0),
+            imbalance_factor: posting_imbalance_factor(sizes.iter().copied()),
             avg_posting_size: if active == 0 {
                 0.0
             } else {
@@ -589,6 +632,8 @@ impl ClusterIndex {
             owner_map: HashMap::new(),
             rng,
             defer_cascade_splits: false,
+            #[cfg(test)]
+            deferred_reassign: None,
         }
     }
 
@@ -618,6 +663,14 @@ impl ClusterIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn posting_imbalance_counts_size_squared() {
+        assert_eq!(posting_imbalance_factor([]), 0.0);
+        assert_eq!(posting_imbalance_factor([0, 0]), 0.0);
+        assert_eq!(posting_imbalance_factor([4, 4, 4]), 1.0);
+        assert_eq!(posting_imbalance_factor([1, 3]), 1.25);
+    }
 
     fn vec_at(dim: usize, angle_bucket: f32, jitter: f32) -> Vec<f32> {
         // A crude but deterministic way to place points on a circle in the

@@ -1,0 +1,11 @@
+# Shared query tier: scale out on CPU above the three-zone floor. Needs a
+# healthy metrics-server. The PDB (base/pdb-query.yaml) keeps two replicas
+# through voluntary disruptions.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: kosha-query
+  namespace: kosha
+spec:
+  minReplicas: 3
+  maxReplicas: 12

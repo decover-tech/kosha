@@ -8,7 +8,7 @@ name: relevance-compare
 #
 # — posts/updates one sticky PR comment with nDCG@10, recall@100 (lexical,
 # vector, hybrid) and filtered-kNN recall@10 per selectivity, uploads both
-# reports, and FAILS when a metric drops by more than its threshold
+# reports for each fixture in RELEVANCE_FIXTURES, and FAILS when a metric drops by more than its threshold
 # (scripts/relevance/compare.py). The harness is deterministic, so every
 # non-zero delta is a real change, not noise.
 #
@@ -17,22 +17,7 @@ name: relevance-compare
 # measure the same thing. If that does not build, the head is compared with
 # the committed scripts/relevance/baseline.json instead.
 on:
-  pull_request:
-    branches: [main]
-    types: [opened, reopened, synchronize]
-    paths:
-      - "crates/kosha-query/**"
-      - "crates/kosha-segment/**"
-      - "crates/kosha-vector-spfresh/**"
-      - "crates/kosha-core/**"
-      - "crates/kosha-write/**"
-      - "scripts/relevance/**"
-      - "Cargo.lock"
-      - ".github/workflows/relevance-compare.yml"
-
-concurrency:
-  group: relevance-compare-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  workflow_call:
 
 permissions:
   contents: read
@@ -44,6 +29,9 @@ env:
   RELEVANCE_THRESHOLD: "1.0"
   # Filtered recall at 0.1% selectivity: a few passing documents per query.
   RELEVANCE_THRESHOLD_LOWEST_SELECTIVITY: "2.0"
+  # scripts/relevance/fixtures/<name>, each gated separately. `neardup` is
+  # duplicate-heavy, legal-matter shaped: where probe selection breaks.
+  RELEVANCE_FIXTURES: "synthetic neardup"
 
 jobs:
   relevance-script-tests:
@@ -61,8 +49,6 @@ jobs:
     name: relevance merge-base vs head, comment on PR
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 45
-    # The results comment needs a writable token, which fork PRs don't get.
-    if: github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@v4
         with:
@@ -79,7 +65,6 @@ jobs:
           set -euo pipefail
           base_sha="$(git rev-parse HEAD^1)"
           echo "base_sha=$base_sha" >> "$GITHUB_ENV"
-          fixture="$GITHUB_WORKSPACE/scripts/relevance/fixtures/synthetic"
 
           git worktree add --detach "$RUNNER_TEMP/base-tree" "$base_sha"
           bench_dir=crates/kosha-query/benches/relevance
@@ -93,9 +78,14 @@ jobs:
           # One target dir for both builds: dependencies compile once.
           export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target"
           cd "$RUNNER_TEMP/base-tree"
-          KOSHA_RELEVANCE_JSON="$RUNNER_TEMP/base.json" \
-            cargo bench -p kosha-query --bench relevance -- "$fixture" || \
-            echo "::warning::relevance harness failed on the base tree — comparing with the committed baseline"
+          # Fixtures are read from the head checkout, so a fixture the PR
+          # adds is measured on both sides.
+          for fx in $RELEVANCE_FIXTURES; do
+            KOSHA_RELEVANCE_JSON="$RUNNER_TEMP/base-$fx.json" \
+              cargo bench -p kosha-query --bench relevance -- \
+              "$GITHUB_WORKSPACE/scripts/relevance/fixtures/$fx" || \
+              echo "::warning::relevance harness failed on the base tree for $fx — comparing with the committed baseline"
+          done
 
       - name: Relevance on PR head (test-merge commit)
         run: |
@@ -103,9 +93,11 @@ jobs:
           # The base build is newer than head's sources in the shared target
           # dir; touch them so cargo rebuilds every changed crate.
           find crates -name '*.rs' -exec touch {} +
-          KOSHA_RELEVANCE_JSON="$RUNNER_TEMP/head.json" \
-            cargo bench -p kosha-query --bench relevance -- \
-            "$GITHUB_WORKSPACE/scripts/relevance/fixtures/synthetic"
+          for fx in $RELEVANCE_FIXTURES; do
+            KOSHA_RELEVANCE_JSON="$RUNNER_TEMP/head-$fx.json" \
+              cargo bench -p kosha-query --bench relevance -- \
+              "$GITHUB_WORKSPACE/scripts/relevance/fixtures/$fx"
+          done
 
       - uses: actions/setup-python@v5
         with:
@@ -115,20 +107,37 @@ jobs:
         env:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          set -uo pipefail
-          python3 scripts/relevance/compare.py \
-            --base "$RUNNER_TEMP/base.json" \
-            --head "$RUNNER_TEMP/head.json" \
-            --baseline scripts/relevance/baseline.json \
-            --base-sha "$base_sha" \
-            --head-sha "$HEAD_SHA" \
-            --threshold "$RELEVANCE_THRESHOLD" \
-            --threshold-for "filtered_knn.*@0.1%.*=$RELEVANCE_THRESHOLD_LOWEST_SELECTIVITY" \
-            --out "$RUNNER_TEMP/comment.md"
-          echo "compare_status=$?" >> "$GITHUB_ENV"
+          set -euo pipefail
+          compare_status=0
+          : > "$RUNNER_TEMP/comment.md"
+          first=1
+          for fx in $RELEVANCE_FIXTURES; do
+            # synthetic keeps its historical baseline.json name.
+            baseline=scripts/relevance/baseline.json
+            [ "$fx" = synthetic ] || baseline="scripts/relevance/baseline-$fx.json"
+            python3 scripts/relevance/compare.py \
+              --base "$RUNNER_TEMP/base-$fx.json" \
+              --head "$RUNNER_TEMP/head-$fx.json" \
+              --baseline "$baseline" \
+              --base-sha "$base_sha" \
+              --head-sha "$HEAD_SHA" \
+              --threshold "$RELEVANCE_THRESHOLD" \
+              --threshold-for "*filtered_knn.*@0.1%.*=$RELEVANCE_THRESHOLD_LOWEST_SELECTIVITY" \
+              --out "$RUNNER_TEMP/comment-$fx.md" > /dev/null || compare_status=1
+            # One sticky comment: keep the marker line of the first section only.
+            if [ "$first" = 1 ]; then
+              cat "$RUNNER_TEMP/comment-$fx.md" >> "$RUNNER_TEMP/comment.md"
+              first=0
+            else
+              tail -n +2 "$RUNNER_TEMP/comment-$fx.md" >> "$RUNNER_TEMP/comment.md"
+            fi
+          done
+          cat "$RUNNER_TEMP/comment.md"
+          echo "compare_status=$compare_status" >> "$GITHUB_ENV"
 
       - name: Post sticky comment
-        if: always()
+        # Fork PRs can run the gate and publish the artifact, but not comment.
+        if: always() && github.event.pull_request.head.repo.full_name == github.repository
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -152,14 +161,14 @@ jobs:
         with:
           name: relevance-report
           path: |
-            ${{ runner.temp }}/base.json
-            ${{ runner.temp }}/head.json
-            ${{ runner.temp }}/comment.md
+            ${{ runner.temp }}/base-*.json
+            ${{ runner.temp }}/head-*.json
+            ${{ runner.temp }}/comment*.md
           if-no-files-found: warn
 
       - name: Gate on regressions
         run: |
           if [ "${compare_status:-1}" != "0" ]; then
-            echo "::error::relevance/recall regressed past the threshold (see the PR comment)"
+            echo "::error::relevance comparison failed (see the relevance-report artifact)"
             exit 1
           fi

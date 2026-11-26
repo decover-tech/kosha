@@ -772,7 +772,11 @@ impl Deletions {
         // Oldest first, so a later record of the same subject replaces it.
         for record in records {
             let map = match record.scope {
-                DeletionScope::Namespace => &mut deletions.namespaces,
+                // A branch or a migrated (pre-#262) source id is a
+                // namespace id too (#347).
+                DeletionScope::Namespace | DeletionScope::Branch | DeletionScope::Migrated => {
+                    &mut deletions.namespaces
+                }
                 DeletionScope::Tenant => &mut deletions.tenants,
             };
             map.insert(record.subject.clone(), record);
@@ -877,7 +881,11 @@ type Snapshots = HashMap<(String, String), (u64, u64)>;
 
 /// The latest `stored_bytes` snapshot of each namespace inside the window.
 fn latest_snapshots(usage: &dyn UsageStore, options: &Options) -> Result<Snapshots, KoshaError> {
-    let from_ms = options.now_ms.saturating_sub(options.max_snapshot_age_ms);
+    // Rounded down to the start of an hour: snapshots are stamped with the
+    // start of theirs, so a window of exactly one hour opened at 07:02
+    // would otherwise begin after the 06:00 snapshot while the 07:00 one
+    // is not taken yet.
+    let from_ms = options.now_ms.saturating_sub(options.max_snapshot_age_ms) / HOUR_MS * HOUR_MS;
     let to_ms = options.now_ms.saturating_add(1);
     let mut latest = Snapshots::new();
     for bucket in usage.hourly(options.tenant.as_deref(), from_ms, to_ms)? {
@@ -908,6 +916,14 @@ fn judge(
         let difference = difference.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
         (difference, options.allowed(storage.referenced_bytes, bytes))
     });
+    // The byte floor of the tolerance is for two measurements of the same
+    // segments taken minutes apart. A snapshot of something against no
+    // referenced bytes at all is not that: an `unknown` prefix (whose
+    // referenced bytes are always 0) holding untracked objects, or a live
+    // namespace whose prefix is empty. Those never read `match`, however
+    // small the snapshot.
+    let nothing_referenced =
+        snapshot.is_some_and(|(_, bytes)| bytes > 0) && storage.referenced_bytes == 0;
     let has_storage = storage.objects > 0;
     // A namespace can leave the control plane without a deletion record
     // (branch deletion, `migrate-namespace`). Its last snapshots stay in
@@ -933,7 +949,11 @@ fn judge(
         (_, Some(_)) if left_quietly && !has_storage => Status::Removed,
         (_, None) if has_storage => Status::StorageWithoutSnapshot,
         (_, None) => Status::Empty,
-        (_, Some((difference, allowed))) if difference.unsigned_abs() <= allowed => Status::Match,
+        (_, Some((difference, allowed)))
+            if !nothing_referenced && difference.unsigned_abs() <= allowed =>
+        {
+            Status::Match
+        }
         (_, Some(_)) if has_storage => Status::Mismatch,
         (_, Some(_)) => Status::SnapshotWithoutStorage,
     };
@@ -1230,20 +1250,20 @@ fn query_params(request_line: &str) -> Vec<(String, String)> {
 /// events are delivered first, as for `GET /v1/admin/usage`.
 pub(crate) fn handle_admin_reconcile(request_line: &str, state: &AppState) -> String {
     let Some(meter) = state.usage.as_ref() else {
-        return json_error(
+        return api_error_status(
             404,
             "usage metering is off on this pod (KOSHA_USAGE_METERING=on enables it)",
         );
     };
     let mut options = match Options::from_env(unix_millis()) {
         Ok(options) => options,
-        Err(e) => return json_error(500, &e),
+        Err(e) => return api_error_status(500, &e),
     };
     for (key, value) in query_params(request_line) {
         match options.set(&key, &value) {
             Ok(true) => {}
-            Ok(false) => return json_error(400, &format!("unknown parameter '{key}'")),
-            Err(e) => return json_error(400, &format!("invalid '{key}': {e}")),
+            Ok(false) => return api_error_status(400, &format!("unknown parameter '{key}'")),
+            Err(e) => return api_error_status(400, &format!("invalid '{key}': {e}")),
         }
     }
     let _ = meter.flush();
@@ -1255,7 +1275,7 @@ pub(crate) fn handle_admin_reconcile(request_line: &str, state: &AppState) -> St
         Ok(report) => json_ok(&report),
         Err(e) => {
             eprintln!("WARN: usage reconciliation failed: {e}");
-            json_error(503, &format!("usage reconciliation could not run: {e}"))
+            api_error_status(503, &format!("usage reconciliation could not run: {e}"))
         }
     }
 }

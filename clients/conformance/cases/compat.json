@@ -1,0 +1,29 @@
+[
+  {
+    "id": "compat.unknown_response_field",
+    "description": "A response field the SDK does not know never fails a call.",
+    "covers": ["KoshaService_Search"],
+    "setup": [{ "op": "create_namespace" }],
+    "faults": [{ "match": { "method": "POST", "path_suffix": "/search" }, "inject_field": { "added_in_a_later_release": { "x": 1 } } }],
+    "steps": [{ "op": "search", "args": { "body": { "query_text": "x" } }, "expect": { "ok": true, "count": 0 } }]
+  },
+  {
+    "id": "compat.unknown_error_code",
+    "description": "An error code the SDK does not know is surfaced verbatim and treated by status and retryable.",
+    "covers": ["KoshaService_Search"],
+    "setup": [{ "op": "create_namespace" }],
+    "faults": [
+      {
+        "match": { "method": "POST", "path_suffix": "/search" },
+        "respond": { "status": 409, "body": { "error": "new", "code": "added_in_a_later_release", "retryable": false, "request_id": "fault-3", "details": { "k": "v" } } }
+      }
+    ],
+    "steps": [
+      {
+        "op": "search",
+        "args": { "body": { "query_text": "x" } },
+        "expect": { "error": { "kind": "http", "status": 409, "code": "added_in_a_later_release", "retryable": false, "has_request_id": true }, "attempts": 1 }
+      }
+    ]
+  }
+]

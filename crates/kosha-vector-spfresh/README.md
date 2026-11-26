@@ -9,6 +9,70 @@ kosha uses it to build every segment's vector index. The crate itself has no
 I/O and no dependency on the rest of the workspace; `kosha-segment` turns its
 postings into files and `kosha-query` probes them.
 
+## Churn stability experiment (#466)
+
+Run the ignored synthetic gate from the repository root:
+
+```sh
+cargo test --release --locked -p kosha-vector-spfresh --test churn_stability \
+  churn_cycle_recall_stability -- --ignored --exact --nocapture
+```
+
+Defaults: 8,000 live vectors, 50 cycles per workload, and 100 fixed queries.
+Override with `KOSHA_BENCH_CHURN_SIZE`, `KOSHA_BENCH_CHURN_CYCLES`, and
+`KOSHA_BENCH_CHURN_QUERIES`.
+Each workload starts with the same seed build and uses the smallest radius-aware
+posting budget reaching 95% initial recall@10 (rounded up to a whole posting).
+That absolute budget is held fixed for both methods, capped only by the number
+of available postings. Each of the 5%, 10%, and 50% workloads deletes a random
+subset and inserts the same number from an equally sized inactive reservoir.
+Stationary inserts are uniform; drifting inserts come from a window that moves
+from low to high along a fixed embedding projection. Queries stay fixed, and
+exact top-10 neighbours are determined for the current live set each cycle.
+
+The gate prints paired CSV rows for LIRE compaction and a fresh rebuild of the
+same live vectors: recall@10, mean vectors scanned per query, median and p90
+posting radius, and posting count. It reports every cycle before failing if any
+pair differs by more than 0.5 percentage points of recall or more than 10% of
+the rebuild scan count. This exercises the in-memory compaction algorithm
+(adopt/absorb/rebalance), not segment I/O, fallback to clustering, or end-to-end
+query latency.
+
+Reduced synthetic run (2,400 live vectors, 3 cycles per workload, 100 queries):
+the calibration chose two postings and reached 99.8% recall@10, scanning
+151.39 vectors/query; one posting did not reach 95%. The gate reported 16 of
+18 cycles outside the bar.
+
+| Inserts | Churn | Max absolute recall gap (pp) | Max relative scan gap | Outside bar |
+| --- | ---: | ---: | ---: | ---: |
+| Stationary | 5% | 1.60 | 27.80% | 3/3 |
+| Stationary | 10% | 3.20 | 7.66% | 2/3 |
+| Stationary | 50% | 1.00 | 14.60% | 2/3 |
+| Drifting | 5% | 3.40 | 13.67% | 3/3 |
+| Drifting | 10% | 2.80 | 13.20% | 3/3 |
+| Drifting | 50% | 21.50 | 21.56% | 3/3 |
+
+In the last 50%-drifting cycle, LIRE versus rebuild was 66.6% vs 88.1%
+recall@10, 190.51 vs 156.72 vectors/query, 0.756 vs 0.514 median radius,
+0.827 vs 0.743 p90 radius, and 26 vs 30 postings. These are smoke-run
+observations, not 50-cycle or MSMarco results.
+
+For the offline MSMarco experiment, prepare two million passage embeddings
+(one million live, one million replacement candidates) and the corresponding
+query embedding file with the existing fetcher, then pass the local directory
+to the runner:
+
+```sh
+python3 scripts/bench/bm25_scale/fetch_msmarco_embeddings.py \
+  --docs 2000000 --out-dir /data/msmarco-emb
+python3 scripts/bench/bm25_scale/run_msmarco_churn.py \
+  /data/msmarco-emb msmarco-churn.csv
+```
+
+The runner does not download data or contact a Kosha server. The default run
+needs substantial RAM and CPU; use `--size`, `--cycles`, and `--queries` for
+smaller runs. The CSV is retained even if the gate fails.
+
 ## What is wired into kosha
 
 ### Segment files (`kosha-segment`)
@@ -53,8 +117,9 @@ ANN structure when a segment is opened.
   `build_refine_rounds = 0` (kosha: `KOSHA_VECTOR_BUILD_REFINE=off`) is the
   plain bisection build, with undersized postings merged away, exactly as
   before. The same build serves `KOSHA_VECTOR_COMPACTION=rebuild` and the
-  compaction fallback. Late-interaction `.ivf` clustering keeps the plain
-  build.
+  compaction fallback. Late-interaction `.ivf` files do not use this index:
+  they assign tokens to a frozen ColBERTv2-style codebook of about
+  `16 * sqrt(n)` centroids (`kosha-segment/src/multivec/codebook.rs`).
 - **Compaction** (#253) does not re-cluster. Per vector column:
   1. The largest input whose column has at least 1,024 vectors and a clustered
      index has its postings adopted with [`ClusterIndex::from_postings`]:
@@ -87,6 +152,31 @@ ANN structure when a segment is opened.
   dimension mismatch. `KOSHA_VECTOR_COMPACTION=rebuild` switches the whole path
   off (default `lire`).
 
+  Measured (`cargo test --release -p kosha-vector-spfresh --test
+  compaction_merge -- --ignored --nocapture`, 8-vCPU Linux VM, 128 dims,
+  unit-norm 200-centre mixture, one big input plus `pct`% of its vectors
+  updated in flush-sized inputs, refinement on):
+
+  | input vectors | changed | rebuild | lire | speedup |
+  |--:|--:|--:|--:|--:|
+  | 10,000 | 1% | 105 ms | 2 ms | 64x |
+  | 10,000 | 5% | 117 ms | 5 ms | 22x |
+  | 50,000 | 1% | 917 ms | 11 ms | 86x |
+  | 50,000 | 5% | 742 ms | 25 ms | 30x |
+  | 100,000 | 1% | 1,683 ms | 25 ms | 68x |
+  | 100,000 | 5% | 1,741 ms | 65 ms | 27x |
+  | 200,000 | 1% | 5,932 ms | 70 ms | 85x |
+  | 200,000 | 5% | 4,252 ms | 221 ms | 19x |
+
+  At a fixed changed share, `lire` time grows with the changed vectors
+  (1% of 200k = 2,000 changed: 70 ms; 5% = 10,000: 221 ms), while
+  `rebuild` grows with the column. A tiered merge of four equal inputs is
+  the worst case (most postings change): 50k in 192 ms against 821 ms,
+  200k in 1,417 ms against 3,995 ms. Recall@10 at a 5% probe budget stays
+  within 0.5 pt of a from-scratch build (asserted by the same test file):
+  one compaction 1.0000 / 1.0000, four equal inputs 0.9994 / 1.0000, six
+  churn cycles 1.0000 / 0.9999 (lire / rebuild).
+
 ### Querying (`kosha-query`)
 
 - **Global probe budget.** A kNN does not probe a fixed `nprobe` per segment.
@@ -95,21 +185,54 @@ ANN structure when a segment is opened.
   floored at `KOSHA_KNN_BUDGET_FRACTION` (5%) of the namespace's centroids and
   capped by `KOSHA_KNN_BUDGET_MAX_CAP`. Filtered kNN widens it by the filter's
   selectivity, or scores passing documents exactly when few pass (#252).
+- **Namespace centroid routing** (#253, experimental and off by default).
+  With `KOSHA_KNN_NAMESPACE_CENTROIDS=1`, the indexer maintains a separate
+  directory of the existing segment centroids and posting IDs when it
+  observes a committed flush or publishes a compaction. A standalone
+  server maintains it directly when publishing a manifest.
+  Changes remove retired segments and read offsets only for new segments.
+  Eligible queries look up the global top `num_candidates` postings in the
+  directory instead of applying the percentage floor, so posting reads are
+  bounded by the request. Missing or stale directories and searches that
+  may need to refill (for example, filtered kNN) use the default planner.
+  This does not change the segment layout or eliminate segment opens.
+  In `tests/namespace_centroid_routing.rs` (kosha-query) going from 10 to
+  1,000 segments keeps probes at 10 with recall@10 1.0000 on both paths.
+  On the 10M bench it is measured with `knn_sweep=routing` (benchmark.yml),
+  which compares the default planner against routed queries at
+  `num_candidates` 100, 1,000, 2,000 and 5,700 (the default planner's
+  probe count there); `phase_centroids_mean` in the sweep table shows the
+  centroids each query scored.
 - **Radius-aware ranking.** Postings are ranked by the triangle-inequality
   lower bound `max(0, distance(query, centroid) - radius)` instead of raw
   centroid distance, so a posting with an unremarkable centroid but a close
   member still gets probed.
+- **Segment pruning.** Each unit-norm column keeps a spherical cap around all
+  its centroids (in memory, built at load). It gives a guaranteed floor under
+  every rank score in the segment, so the plan leaves out, unscored, every
+  segment whose floor is above the budget's cutoff (`KOSHA_KNN_SEGMENT_PRUNE`,
+  default on, #253). The plan is unchanged; the saving is in centroid scoring
+  and grows the more each segment's vectors are clustered in one region.
 - **i8 rescoring.** An i8 column scores with an i8 dot product, then rescores
   its best `k * KOSHA_VECTOR_RESCORE_FACTOR` candidates with the f32 vectors in
   `doc_vectors.bin`.
+- **Posting scan** (#435, `kosha-segment`). One open idx file and one
+  4-byte-aligned buffer per segment visit, f32 postings scored in place
+  from the read bytes (`bytemuck`, no `unsafe`, no mmap), and a running
+  top-k. The `search timing:` line splits scoring into `knn_read_ms`,
+  `knn_decode_ms` and `knn_dot_ms` (summed across scoring threads). On the
+  x86 bench host, warm kNN on `msmarco-10m-vec` (8 QPS, 5,700 postings over
+  ~196 segments per query) went from `score_ms` p50/p90/p99 80.2 / 103.0 /
+  219.7 ms (run 45068373889) to 24.7 / 25.3 / 25.9 ms (run 45506667653,
+  3.2x at p50), with identical top-10 ids for all 1,677 queries. What is
+  left is mostly the read (411 ms summed across threads against 282 ms of
+  dot per query); an mmap'd idx file would remove it but needs an
+  `unsafe_code` exception in `kosha-segment`.
 
 ### Not wired yet
 
-- A namespace- or shard-level centroid index whose postings are shared across
-  segments and updated from the WAL (#253 step 2, after the indexer role in
-  #254). Today every segment carries its own postings, so the number of
-  centroids a query ranks grows with segment count; compaction only reduces it
-  by producing fewer, larger segments.
+- Shared posting objects or a cluster-aligned segment layout. Namespace
+  routing points to immutable postings already stored in each segment.
 - LIRE on flush: a flush has no seed (every vector is new), so it still
   clusters from scratch; the post-build refinement above is what gives its
   postings LIRE-like radii.
@@ -180,6 +303,16 @@ vectors, rewritten by compaction, which shapes these choices:
 billion-scale defaults (it uses `reassign_radius = 64`). `nprobe` applies only
 to this crate's own `search`; kosha-query uses the global budget above.
 
+`build_refine_anisotropic_eta` defaults to `None` (cosine assignment).
+Set it to `Some(4.0)` to try ScaNN's weighted residual loss against the
+unnormalized means in the cosine-generated refinement shortlist. The
+stray lookup still proposes a cosine neighbour; Split/Merge/Reassign and
+queries still use cosine. `enable_elkan_pruning` defaults to `false`.
+It skips comparisons in cosine refinement and LIRE reassignment using
+half the angular separation, not half the non-metric cosine distance.
+Faiss's posting-size imbalance factor is available in index stats and the
+offline segment build log, per vector field; it is not stored on disk.
+
 ## Tests and benchmarks
 
 - `tests/compaction_merge.rs`: compaction-shaped merges (one big input plus
@@ -192,6 +325,13 @@ to this crate's own `search`; kosha-query uses the global budget above.
   build time, median radius and recall with refinement off and on, and
   wall-clock rebuild vs lire times
   (`cargo test --release -p kosha-vector-spfresh --test compaction_merge -- --ignored --nocapture`).
+- Run the #459 sweep with
+  `cargo test --release -p kosha-vector-spfresh --test compaction_merge build_quality_sweep -- --ignored --nocapture`.
+  It compares the unchanged default with the radius/η grid using Elkan
+  pruning on 50k synthetic vectors and 1,000 held-out queries. Scan cost at
+  0.95 recall is mean vectors visited at the first shared posting budget
+  that reaches 0.95 mean recall. This is an in-memory probe simulation,
+  not the #384 MS MARCO baseline; it doesn't measure serving latency or I/O.
 - `tests/churn_ablation.rs`: the paper's Figure 10 ablation on one
   insert/delete/drift sequence.
 - `tests/invariants.rs`, `tests/recall.rs`: structural invariants and recall

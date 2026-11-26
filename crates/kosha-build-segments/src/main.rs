@@ -22,14 +22,15 @@
 //! documents to segments by vector region instead of input order: see
 //! [`head`] (default) and [`cluster`]. The segment format is the same either way.
 
-mod cluster;
-mod head;
+mod watchdog;
 
 use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::time::Duration;
 
 use clap::Parser;
+use kosha_build_segments::{cluster, head};
 use kosha_core::{Bm25Params, DocumentId, Field, SegmentId};
 use kosha_segment::{BpConfig, DocReorder, SegmentWriter, VectorQuantizationConfig};
 
@@ -58,6 +59,14 @@ struct Args {
     /// Worker threads (segment builds run one per thread)
     #[arg(long, default_value_t = 0)]
     threads: usize,
+    /// Fail builds taking longer than this multiple of the median peer build
+    /// time (0 disables the watchdog).
+    #[arg(long, default_value_t = 10)]
+    segment_watchdog_multiplier: u32,
+    /// Minimum segment watchdog timeout, in seconds. Until three segments
+    /// seal, the timeout is the floor times the watchdog multiplier.
+    #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..))]
+    segment_watchdog_floor_secs: u64,
     /// Stop after this many documents (0 = the whole corpus)
     #[arg(long, default_value_t = 0)]
     max_docs: usize,
@@ -74,8 +83,10 @@ struct Args {
     vector_quantization: Option<String>,
     /// Reorder each segment's documents before writing it (#385): `off`
     /// keeps ingest order, `bp` uses recursive graph bisection over the
-    /// documents' terms. Unset follows KOSHA_DOC_REORDER (default off).
-    /// The output format is unchanged either way.
+    /// documents' terms, `posting` (#456, research) numbers documents
+    /// posting by posting of `--vector-field`'s index, so each posting is
+    /// one contiguous doc_seq range. Unset follows KOSHA_DOC_REORDER
+    /// (default off). The output format is unchanged either way.
     #[arg(long)]
     doc_reorder: Option<String>,
     #[arg(long, default_value_t = 1.2)]
@@ -523,7 +534,8 @@ fn main() {
         Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
             "off" | "none" => DocReorder::Off,
             "bp" => DocReorder::Bp,
-            _ => panic!("--doc-reorder {raw:?}: expected off or bp"),
+            "posting" => DocReorder::Posting,
+            _ => panic!("--doc-reorder {raw:?}: expected off, bp or posting"),
         },
     };
     println!("doc reorder: {}", doc_reorder.as_str());
@@ -536,6 +548,31 @@ fn main() {
     let (tx, rx) = mpsc::sync_channel::<Batch>(threads);
     let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
 
+    let watchdog = (args.segment_watchdog_multiplier > 0).then(|| {
+        std::sync::Arc::new(watchdog::Watchdog::new(
+            args.segment_watchdog_multiplier,
+            Duration::from_secs(args.segment_watchdog_floor_secs),
+        ))
+    });
+    let monitor = watchdog.as_ref().map(|watchdog| {
+        let watchdog = watchdog.clone();
+        let (stop, stopped) = mpsc::channel();
+        // Supervise independently of both blocking batch sends and worker joins.
+        let monitor = std::thread::spawn(move || {
+            if let Some(timeout) = watchdog.monitor(stopped) {
+                eprintln!(
+                    "segment watchdog: {} has been building for {:.1}s (timeout {:.1}s); aborting build",
+                    timeout.segment.0,
+                    timeout.elapsed.as_secs_f64(),
+                    timeout.limit.as_secs_f64()
+                );
+                // A stuck worker cannot be joined or cancelled; fail the CLI.
+                std::process::exit(1);
+            }
+        });
+        (stop, monitor)
+    });
+
     let workers: Vec<_> = (0..threads)
         .map(|_| {
             let rx = std::sync::Arc::clone(&rx);
@@ -543,6 +580,8 @@ fn main() {
             let ns = args.namespace.clone();
             let bm25 = bm25.clone();
             let quantization = quantization.clone();
+            let vector_field = args.vector_field.clone();
+            let watchdog = watchdog.clone();
             std::thread::spawn(move || {
                 let mut built = 0usize;
                 loop {
@@ -552,40 +591,64 @@ fn main() {
                     let seg_dir = ns_out.join(&seg_id.0);
                     let n = docs.len();
                     let t = std::time::Instant::now();
+                    let watched = watchdog.as_ref().map(|w| w.start(seg_id.clone(), t));
                     let mut w = SegmentWriter::new(seg_id.clone(), seg_dir);
                     if let Some(q) = &quantization {
                         w = w.with_vector_quantization(q.clone());
                     }
-                    let mut reorder_secs = 0.0;
-                    if doc_reorder == DocReorder::Bp {
-                        // doc_seq follows add order, so adding in BP order
-                        // remaps every per-doc structure at once (#385).
-                        let tr = std::time::Instant::now();
-                        let order = w.bp_order(
-                            docs.iter().map(|(_, fields)| fields.as_slice()),
-                            &BpConfig::default(),
-                        );
-                        let mut slots: Vec<Option<(DocumentId, Vec<Field>)>> =
-                            docs.into_iter().map(Some).collect();
-                        reorder_secs = tr.elapsed().as_secs_f64();
-                        for old in order {
-                            let (id, fields) = slots[old as usize].take().expect("permutation");
-                            w.add_document(id, fields);
+                    // doc_seq follows add order, so adding in a new order
+                    // remaps every per-doc structure at once (#385, #456).
+                    let tr = std::time::Instant::now();
+                    let fields_of = || docs.iter().map(|(_, fields)| fields.as_slice());
+                    let (order, seeds) = match doc_reorder {
+                        DocReorder::Off => (None, None),
+                        DocReorder::Bp => {
+                            (Some(w.bp_order(fields_of(), &BpConfig::default())), None)
                         }
-                    } else {
-                        for (id, fields) in docs {
-                            w.add_document(id, fields);
+                        DocReorder::Posting => match w.posting_order(fields_of(), &vector_field) {
+                            Some(p) => (Some(p.order), Some(p.seeds)),
+                            None => (None, None),
+                        },
+                    };
+                    let reorder_secs = tr.elapsed().as_secs_f64();
+                    match order {
+                        Some(order) => {
+                            let mut slots: Vec<Option<(DocumentId, Vec<Field>)>> =
+                                docs.into_iter().map(Some).collect();
+                            for old in order {
+                                let (id, fields) = slots[old as usize].take().expect("permutation");
+                                w.add_document(id, fields);
+                            }
+                        }
+                        None => {
+                            for (id, fields) in docs {
+                                w.add_document(id, fields);
+                            }
                         }
                     }
+                    if let Some(seeds) = seeds {
+                        w.seed_vector_postings(&vector_field, seeds);
+                    }
+                    let vector_builds = w.vector_index_builds();
                     w.finalize(bm25.clone())
                         .unwrap_or_else(|e| panic!("finalize {} failed: {e}", seg_id.0));
+                    let elapsed = t.elapsed();
+                    if let Some(watched) = watched {
+                        watched.sealed(elapsed);
+                    }
                     built += 1;
                     println!(
                         "segment {} sealed: {n} docs in {:.1}s (reorder {:.1}s)",
                         seg_id.0,
-                        t.elapsed().as_secs_f64(),
+                        elapsed.as_secs_f64(),
                         reorder_secs
                     );
+                    for build in vector_builds.lock().unwrap().iter() {
+                        println!(
+                            "segment {} vector field {:?}: {} postings, imbalance factor {:.4}",
+                            seg_id.0, build.field, build.postings, build.imbalance_factor
+                        );
+                    }
                 }
                 built
             })
@@ -617,6 +680,10 @@ fn main() {
     };
     drop(tx);
     let built: usize = workers.into_iter().map(|w| w.join().unwrap()).sum();
+    if let Some((stop, monitor)) = monitor {
+        drop(stop);
+        monitor.join().unwrap();
+    }
     assert_eq!(built, seg_idx, "worker/segment count mismatch");
 
     println!(

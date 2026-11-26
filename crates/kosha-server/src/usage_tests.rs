@@ -208,6 +208,7 @@ fn writes_and_searches_are_metered_per_tenant_and_namespace() {
 
 #[test]
 fn legacy_routes_and_replace_are_metered_too() {
+    let _legacy = auth::override_legacy_policy(true, "");
     let (state, store) = metered_state();
     ok(call(
         &state,
@@ -306,7 +307,7 @@ fn events_spooled_by_a_dead_process_are_delivered_by_the_next() {
         assert!(dead.flush().is_err());
         // ...and these two are still in the active file at the "crash".
         dead.record_query(&ns, 20, 0);
-        dead.record_write(&ns, 300, 3);
+        dead.record_write(&ns, 300, 3, 0);
     }
     assert_eq!(store.inner.row_count(), 0);
     store.down.store(false, Ordering::SeqCst);
@@ -497,6 +498,68 @@ fn stored_bytes_are_snapshotted_hourly_and_price_every_search_alike() {
     assert_eq!(next[0].stored_bytes_latest, Some(grown));
 }
 
+#[test]
+fn vector_dimensions_are_metered_on_write_and_snapshotted_hourly() {
+    let (state, store) = metered_state();
+    let vector_doc = |id: &str, emb: &str| {
+        serde_json::json!({"id": id, "fields": [
+            {"name": "title", "field_type": "Text", "value": "fox"},
+            {"name": "emb", "field_type": "Vector", "value": emb}]})
+    };
+    let bag_doc = serde_json::json!({"id": "c1", "fields": [
+        {"name": "title", "field_type": "Text", "value": "fox"},
+        {"name": "tokens", "field_type": "Vector", "value": "[[1.0, 0.0], [0.0, 1.0]]"}]});
+    ok(call(
+        &state,
+        "acme",
+        "POST /v1/namespaces/docs/documents",
+        serde_json::json!({"documents": [
+            vector_doc("v1", "[1.0, 0.0, 0.0]"),
+            vector_doc("v2", "[0.0, 1.0, 0.0]"),
+            bag_doc,
+            doc("t1", "no vectors here"),
+        ]}),
+    ));
+    // A write without vectors records no vector row.
+    ok(call(
+        &state,
+        "acme",
+        "POST /v1/namespaces/text/documents",
+        serde_json::json!({"documents": [doc("t2", "plain")]}),
+    ));
+    for ns in ["docs", "text"] {
+        ok(call(
+            &state,
+            "acme",
+            &format!("POST /v1/namespaces/{ns}/flush"),
+            serde_json::json!({}),
+        ));
+    }
+    let now = unix_millis();
+    assert_eq!(usage::run_snapshot_tick(&state, now), 2);
+    flush(&state);
+
+    let usage = stored_usage(&store, "acme");
+    let docs = usage.iter().find(|u| u.namespace == "docs").unwrap();
+    // Two 3-dimension vectors and one bag of two 2-dimension tokens.
+    assert_eq!(docs.vector_dimensions_written, 2 * 3 + 2 * 2);
+    assert_eq!(docs.vector_dimensions_latest, Some(2 * 3 + 2 * 2));
+    assert_eq!(docs.vector_dimension_hours, 2 * 3 + 2 * 2);
+    let text = usage.iter().find(|u| u.namespace == "text").unwrap();
+    assert_eq!(text.vector_dimensions_written, 0);
+    assert_eq!(text.vector_dimensions_latest, Some(0));
+
+    // The read API reports them per namespace and in the total.
+    let read = body_of(&ok(call(
+        &state,
+        "acme",
+        "GET /v1/usage",
+        serde_json::Value::Null,
+    )));
+    assert_eq!(read["total"]["vector_dimensions_written"], 10);
+    assert_eq!(read["total"]["vector_dimensions_latest"], 10);
+}
+
 /// A restarted writer (or a second one) snapshotting an hour that is
 /// already recorded changes nothing.
 #[test]
@@ -536,10 +599,138 @@ fn a_repeated_snapshot_of_the_same_hour_is_idempotent_across_processes() {
     let rows = store.inner.row_count();
     let restarted = boot();
     // The new process does not know the hour was snapshotted; the store does.
+    // Two events: `stored_bytes` and `vector_dimensions`.
     assert_eq!(usage::run_snapshot_tick(&restarted, now), 1);
     let report = flush(&restarted);
-    assert_eq!((report.events, report.stored_rows), (1, 0));
+    assert_eq!((report.events, report.stored_rows), (2, 0));
     assert_eq!(store.inner.row_count(), rows);
+}
+
+/// A delete by query is metered with the documents it removed and their
+/// doc-store bytes; one that matches nothing emits nothing. The hourly
+/// snapshot carries `vector_dimensions` from the segments' footers, read
+/// once per segment.
+#[test]
+fn deletes_and_vector_dimensions_are_metered() {
+    let (state, store) = metered_state();
+    let vector = |id: &str, dims: usize| {
+        let v: Vec<f32> = (0..dims).map(|i| i as f32 + 0.5).collect();
+        serde_json::json!({"id": id, "fields": [
+            {"name": "title", "field_type": "Text", "value": format!("doc {id}")},
+            {"name": "emb", "field_type": "Vector", "value": serde_json::to_string(&v).unwrap()}
+        ]})
+    };
+    ok(call(
+        &state,
+        "acme",
+        "POST /v1/namespaces/docs/documents",
+        serde_json::json!({"documents": [vector("a", 8), vector("b", 8), vector("c", 8), doc("d", "no vector")]}),
+    ));
+    ok(call(
+        &state,
+        "acme",
+        "POST /v1/namespaces/docs/flush",
+        serde_json::json!({}),
+    ));
+    let now = unix_millis();
+    assert_eq!(usage::run_snapshot_tick(&state, now), 1);
+    let stats = state.usage.as_ref().unwrap().stats();
+    assert_eq!(stats.footer_reads.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.vector_snapshots.load(Ordering::Relaxed), 1);
+
+    let deleted = ok(call(
+        &state,
+        "acme",
+        "POST /v1/namespaces/docs/delete",
+        serde_json::json!({"filter": {"match_all": {}}}),
+    ));
+    assert_eq!(body_of(&deleted)["deleted"], 4);
+    // Nothing matched: nothing metered.
+    ok(call(
+        &state,
+        "acme",
+        "POST /v1/namespaces/docs/delete",
+        serde_json::json!({"filter": {"term": {"nope": "zzz"}}}),
+    ));
+    flush(&state);
+    let usage = stored_usage(&store, "acme");
+    let docs = usage.iter().find(|u| u.namespace == "docs").unwrap();
+    assert_eq!(docs.documents_deleted, 4);
+    assert!(docs.bytes_deleted > 0, "{docs:?}");
+    // Three 8-dimension vectors in one segment.
+    assert_eq!(docs.vector_dimensions_latest, Some(3 * 8));
+    assert_eq!(docs.vector_dimension_hours, 3 * 8);
+
+    // The next hour: the same segment, its footer not read again.
+    assert_eq!(usage::run_snapshot_tick(&state, now + HOUR_MS), 1);
+    assert_eq!(stats.footer_reads.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.vector_snapshots.load(Ordering::Relaxed), 2);
+    flush(&state);
+    let usage = stored_usage(&store, "acme");
+    let docs = usage.iter().find(|u| u.namespace == "docs").unwrap();
+    assert_eq!(docs.vector_dimension_hours, 2 * 3 * 8);
+}
+
+/// Deletes are metered once applied, even when the publish after them
+/// fails: the documents are gone from the writer either way (#348 review).
+#[test]
+fn applied_deletes_are_metered_even_when_the_publish_fails() {
+    let (state, store) = metered_state();
+    ok(call(
+        &state,
+        "acme",
+        "POST /v1/namespaces/docs/documents",
+        serde_json::json!({"documents": [doc("a", "x"), doc("b", "y")]}),
+    ));
+    ok(call(
+        &state,
+        "acme",
+        "POST /v1/namespaces/docs/flush",
+        serde_json::json!({}),
+    ));
+    *state.controller.lock().unwrap() = Box::new(crate::tests::FailingManifestStore(
+        kosha_control::Controller::new(),
+    ));
+    let response = call(
+        &state,
+        "acme",
+        "POST /v1/namespaces/docs/delete",
+        serde_json::json!({"filter": {"match_all": {}}}),
+    );
+    assert_eq!(status_of(&response), 500, "{response}");
+    flush(&state);
+    let usage = stored_usage(&store, "acme");
+    let docs = usage.iter().find(|u| u.namespace == "docs").unwrap();
+    assert_eq!(docs.documents_deleted, 2, "{docs:?}");
+}
+
+#[test]
+fn footer_vector_dimensions_counts_columns_and_bags() {
+    let mut footer: kosha_core::Footer = serde_json::from_value(serde_json::json!({
+        "segment_id": "s", "doc_count": 3, "total_field_length": 0, "avg_field_length": 0.0,
+        "bm25_params": {"k1": 1.2, "b": 0.75}, "created_at": "now"
+    }))
+    .unwrap();
+    // A legacy footer (no column inventory) counts nothing.
+    assert_eq!(usage::footer_vector_dimensions(&footer), 0);
+    footer.vector_fields = Some(vec![
+        serde_json::from_value(
+            serde_json::json!({"name": "a", "dim": 768, "count": 10, "slot": 0}),
+        )
+        .unwrap(),
+        serde_json::from_value(serde_json::json!({"name": "b", "dim": 4, "count": 2, "slot": 1}))
+            .unwrap(),
+    ]);
+    footer.multi_vectors = vec![kosha_core::MultiVectorField {
+        name: "m".into(),
+        dim: 128,
+        docs: 2,
+        tokens: 50,
+    }];
+    assert_eq!(
+        usage::footer_vector_dimensions(&footer),
+        768 * 10 + 4 * 2 + 128 * 50
+    );
 }
 
 /// A sharded namespace is metered as one namespace: its shards' segments
@@ -738,4 +929,19 @@ fn metering_is_off_by_default() {
     let response = call(&state, "acme", "GET /v1/usage", serde_json::Value::Null);
     assert_eq!(status_of(&response), 404, "{response}");
     state.flush_usage_on_shutdown();
+}
+
+#[test]
+fn a_doc_id_repeated_in_a_batch_meters_only_its_last_copy() {
+    let vector_doc = |id: &str, emb: &str| -> kosha_core::Document {
+        serde_json::from_value(serde_json::json!({"id": id, "fields": [
+            {"name": "emb", "field_type": "Vector", "value": emb}]}))
+        .unwrap()
+    };
+    let documents = [
+        vector_doc("a", "[1.0, 0.0, 0.0, 0.0]"),
+        vector_doc("b", "[1.0, 0.0]"),
+        vector_doc("a", "[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]"),
+    ];
+    assert_eq!(usage::documents_vector_dimensions(&documents), 2 + 6);
 }

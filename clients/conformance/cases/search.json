@@ -1,0 +1,53 @@
+[
+  {
+    "id": "search.filter_sort",
+    "description": "A filtered search sorted by _id pages with max_results.",
+    "covers": ["KoshaService_Search"],
+    "setup": [
+      {
+        "op": "create_namespace",
+        "args": { "schema": { "fields": { "title": { "type": "text", "stored": true, "indexed": true }, "tag": { "type": "keyword", "stored": true, "indexed": true } } } }
+      },
+      {
+        "op": "upsert",
+        "args": { "documents": { "generate": { "count": 20, "id": "d{i:04}", "fields": { "title": { "type": "Text", "value": "row {i}" }, "tag": { "type": "Keyword", "value": "t{i%2}" } } } } }
+      }
+    ],
+    "steps": [
+      {
+        "op": "search",
+        "args": { "body": { "query_text": "", "filter": { "term": { "tag": "t1" } }, "sort": [{ "_id": { "order": "asc" } }], "max_results": 3 } },
+        "expect": { "ids": ["d0001", "d0003", "d0005"], "total_hits": 10 }
+      }
+    ]
+  },
+  {
+    "id": "search.sort_keyword_desc",
+    "description": "A keyword sort, descending, with an _id tie-break ascending.",
+    "covers": ["KoshaService_Search"],
+    "setup": [
+      {
+        "op": "create_namespace",
+        "args": { "schema": { "fields": { "title": { "type": "text", "stored": true, "indexed": true }, "tag": { "type": "keyword", "stored": true, "indexed": true } } } }
+      },
+      {
+        "op": "upsert",
+        "args": { "documents": { "generate": { "count": 6, "id": "d{i}", "fields": { "title": { "type": "Text", "value": "row {i}" }, "tag": { "type": "Keyword", "value": "t{i%3}" } } } } }
+      }
+    ],
+    "steps": [
+      {
+        "op": "search",
+        "args": {
+          "body": {
+            "query_text": "",
+            "filter": { "exists": { "field": "tag" } },
+            "sort": [{ "tag": { "order": "desc" } }, { "_id": { "order": "asc" } }],
+            "max_results": 6
+          }
+        },
+        "expect": { "ids": ["d2", "d5", "d1", "d4", "d0", "d3"] }
+      }
+    ]
+  }
+]

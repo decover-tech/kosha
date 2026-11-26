@@ -45,6 +45,7 @@ fn index(dim: usize, centroids: Vec<Vec<f32>>, radii: &[f32]) -> LazyVectorIndex
             offset: 0,
             length: 0,
             radius,
+            radius_quantiles: None,
         })
         .collect();
     LazyVectorIndex::from_parsed(
@@ -262,6 +263,7 @@ fn no_bounds_without_a_guarantee() {
         offset: 0,
         length: 0,
         radius: 0.0,
+        radius_quantiles: None,
     }];
     let legacy = LazyVectorIndex::from_parsed(
         Path::new("vector.idx"),
@@ -350,6 +352,15 @@ fn code_bytes_are_what_the_codes_hold() {
         held as u64
     );
     assert_eq!(vector_centroid_code_bytes(&dir.join("missing.offsets")), 0);
+    let cap = vi
+        .centroid_cap
+        .as_ref()
+        .expect("a unit-norm column has a cap");
+    assert_eq!(
+        vector_centroid_cap_bytes(&dir.join(kosha_core::vector_offsets_file(0))),
+        (cap.center.len() * std::mem::size_of::<f64>()) as u64
+    );
+    assert_eq!(vector_centroid_cap_bytes(&dir.join("missing.offsets")), 0);
     assert_eq!(reader.knn_centroid_count("emb", 24), Some(vi.ranges.len()));
     assert_eq!(reader.knn_centroid_count("emb", 25), None);
     assert_eq!(reader.knn_centroid_count("nope", 24), None);

@@ -1,9 +1,35 @@
 # Env-specific S3/region values are NOT committed here — the deploy action
 # writes them at apply time from GitHub Environment secrets (see
 # .github/actions/deploy-eks).
+#
+# Legacy routes (#350, ADR-350 §c): prod still serves the unversioned Phase 1
+# routes, with Deprecation/Sunset headers and kosha_legacy_requests_total.
+# The prod flip follows the stage flip (see k8s/stage/configmap-patch.yaml):
+# once prod shows 7 days of zero legacy
+# requests, or the stragglers are known, change the opt-in below to
+#   KOSHA_LEGACY_ROUTES: "off"
+#   KOSHA_LEGACY_ROUTES_TENANTS: "<tenants still migrating>"
+# here (docs/api/versioning.md, "Legacy routes").
+#
+# kNN probe ranking (DEC-3203): rank postings by raw centroid distance. On a
+# real 988k-vector matter, tie-tolerant recall@10 went 0.82 -> 0.99 and server
+# p50 18 -> 7 ms (612 instead of ~2,540 postings probed); legal corpora are
+# near-duplicate heavy, so outlier members inflate posting radii and the
+# radius-weighted default (1.0) ranks most postings as ties. See
+# docs/configuration.md. The engine default is also 0 since #578; set "1"
+# to roll back.
+#
+# Postings format (#386): the engine now writes v6 by default, but the last
+# release (v0.1.0) cannot read v6. Keep writing v5 until a release that
+# reads v6 (d7a6ec7 or later) runs on every prod pod, then delete this key.
+# Rollback past that release needs it back at "5" and v6 segments compacted
+# away first.
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: kosha-config
   namespace: kosha
-data: {}
+data:
+  KOSHA_LEGACY_ROUTES: "on"
+  KOSHA_KNN_PROBE_RADIUS_ALPHA: "0"
+  KOSHA_POSTINGS_WRITE_VERSION: "5"

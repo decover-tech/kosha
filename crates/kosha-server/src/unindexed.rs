@@ -367,25 +367,33 @@ impl AppState {
         if !self.unindexed_cap.exceeded(docs, bytes) {
             return None;
         }
-        let response = crate::json_error(
-            429,
-            &format!(
-                "write backpressure: namespace '{}' has {docs} unindexed document(s) \
+        // The message names the namespace without its tenant prefix (ADR-350
+        // §b); `Retry-After` comes from the retry hint, once.
+        let name = match kosha_core::tenancy::tenant_of_namespace(&namespace.0) {
+            kosha_core::tenancy::LEGACY_TENANT => namespace.0.as_str(),
+            _ => namespace
+                .0
+                .trim_start_matches('/')
+                .split_once('/')
+                .map_or(namespace.0.as_str(), |(_, rest)| rest),
+        };
+        let response = crate::ApiError::new(
+            crate::ErrorCode::Overloaded,
+            format!(
+                "write backpressure: namespace '{name}' has {docs} unindexed document(s) \
                  (~{bytes} bytes), at the cap (KOSHA_MAX_UNINDEXED_DOCS={}, \
                  KOSHA_MAX_UNINDEXED_BYTES={}); indexing is behind — retry after \
                  {BACKPRESSURE_RETRY_AFTER_SECS}s with backoff",
-                namespace.0,
                 self.unindexed_cap
                     .max_docs
                     .map_or("unset".to_string(), |n| n.to_string()),
                 self.unindexed_cap.max_bytes,
             ),
-        );
-        Some(response.replacen(
-            "\r\n",
-            &format!("\r\nretry-after: {BACKPRESSURE_RETRY_AFTER_SECS}\r\n"),
-            1,
-        ))
+        )
+        .detail("reason", "unindexed_backlog")
+        .retry_after(Duration::from_secs(BACKPRESSURE_RETRY_AFTER_SECS))
+        .into_raw();
+        Some(response)
     }
 
     /// The manifest (and, under `Strong`, the unindexed tail) a search of
@@ -501,14 +509,13 @@ impl AppState {
             let tail = self
                 .fetch_unindexed_tail(namespace, base.version, known)
                 .map_err(|e| {
-                    crate::json_error(
-                        503,
-                        &format!(
-                            "strong consistency: cannot read the unindexed tail of '{}': {e} \
+                    crate::ApiError::new(crate::ErrorCode::Unavailable, e.to_string())
+                        .redact(format!(
+                            "strong consistency: cannot read the unindexed tail of '{}' \
                              — retry, or search with \"consistency\": \"eventual\"",
-                            namespace.0
-                        ),
-                    )
+                            crate::tenant_relative(&namespace.0)
+                        ))
+                        .into_raw()
                 })?;
             if tail.stale || tail.manifest_version != base.version {
                 last_mismatch = Some((tail.manifest_version, base.version));
@@ -535,11 +542,11 @@ impl AppState {
                 return Ok(Some(plain(base)));
             }
             let built = self.install_tail(namespace, &base, tail).map_err(|e| {
-                crate::json_error(
-                    500,
+                crate::api_error(
+                    crate::ErrorCode::Internal,
                     &format!(
                         "strong consistency: cannot build the unindexed tail of '{}': {e}",
-                        namespace.0
+                        crate::tenant_relative(&namespace.0)
                     ),
                 )
             })?;
@@ -560,20 +567,21 @@ impl AppState {
                     view.fallback = Some(format!(
                         "eventual: the writer of '{}' is at manifest version {writer}, which \
                          is not published yet; searched published version {}",
-                        namespace.0, view.base.version
+                        crate::tenant_relative(&namespace.0),
+                        view.base.version
                     ));
                     return Ok(Some(view));
                 }
             }
         }
-        Err(crate::json_error(
-            503,
+        Err(crate::api_error(
+            crate::ErrorCode::Unavailable,
             &format!(
                 "strong consistency: the writer's unindexed tail of '{}' is relative to \
                  manifest version {writer} but this node searches version {local} (a \
                  publication is in progress or failing) — retry, or search with \
                  \"consistency\": \"eventual\"",
-                namespace.0
+                crate::tenant_relative(&namespace.0)
             ),
         ))
     }
@@ -733,7 +741,10 @@ impl AppState {
 /// if still current only a `not_modified` marker is returned).
 pub fn handle_internal_unindexed(namespace: &str, query: &str, state: &AppState) -> String {
     if state.ingest_host.is_some() {
-        return crate::json_error(404, "not a writer: this pod holds no unindexed writes");
+        return crate::api_error(
+            crate::ErrorCode::NotFound,
+            "not a writer: this pod holds no unindexed writes",
+        );
     }
     let mut manifest_version = None;
     let mut if_none_match = None;
@@ -743,7 +754,10 @@ pub fn handle_internal_unindexed(namespace: &str, query: &str, state: &AppState)
             "manifest_version" => match value.parse::<u64>() {
                 Ok(v) => manifest_version = Some(v),
                 Err(_) => {
-                    return crate::json_error(400, "'manifest_version' must be an integer");
+                    return crate::api_error(
+                        crate::ErrorCode::InvalidArgument,
+                        "'manifest_version' must be an integer",
+                    );
                 }
             },
             "if_none_match" => if_none_match = Some(crate::url_decode(value)),
@@ -756,8 +770,14 @@ pub fn handle_internal_unindexed(namespace: &str, query: &str, state: &AppState)
         .unindexed_tail(&namespace, manifest_version, if_none_match.as_deref())
     {
         Ok(Some(tail)) => crate::json_ok(&tail),
-        Ok(None) => crate::json_error(404, &format!("namespace '{}' not found", namespace.0)),
-        Err(e) => crate::json_error(500, &format!("unindexed tail error: {e}")),
+        Ok(None) => crate::api_error(
+            crate::ErrorCode::NotFound,
+            &format!("namespace '{}' not found", namespace.0),
+        ),
+        Err(e) => crate::api_error(
+            crate::ErrorCode::Internal,
+            &format!("unindexed tail error: {e}"),
+        ),
     }
 }
 
@@ -794,6 +814,10 @@ mod tests {
     #[test]
     fn namespaces_are_encoded_as_one_path_segment() {
         assert_eq!(encode_path_segment("tenant/ns a"), "tenant%2Fns%20a");
-        assert_eq!(crate::url_decode(&encode_path_segment("t/x-1")), "t/x-1");
+        assert_eq!(crate::path_decode(&encode_path_segment("t/x-1")), "t/x-1");
+        assert_eq!(
+            crate::path_decode(&encode_path_segment("c++ café")),
+            "c++ café"
+        );
     }
 }

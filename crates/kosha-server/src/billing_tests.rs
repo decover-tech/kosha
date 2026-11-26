@@ -25,7 +25,7 @@ const CATALOG: &str = r#"{
   "plans": {
     "free": {"kind": "free",
              "meters": {"queries": {"included": 3}},
-             "limits": {"namespaces": 1, "qps": 1000}},
+             "limits": {"namespaces": 1, "qps": 1000, "bytes_per_namespace": 1048576}},
     "payg": {"kind": "usage", "base_fee_cents": 2500,
              "meters": {
                "queries": {"included": 1000000, "unit": 1000000, "unit_price_cents": 400},
@@ -571,7 +571,9 @@ fn free_tier_is_enforced_in_dispatch_and_an_upgrade_lifts_it() {
         None,
         docs("d1"),
     );
-    assert_eq!(status_of(&second), 429, "{second}");
+    // A quota, not a rate: 403 since #350.
+    assert_eq!(status_of(&second), 403, "{second}");
+    assert_eq!(body_of(&second)["code"], "namespace_quota_exceeded");
     assert_eq!(body_of(&second)["reason"], "namespace_quota_exceeded");
 
     // A tenant key cannot change its own plan.
@@ -675,7 +677,7 @@ fn a_tenant_without_a_plan_is_left_alone() {
 fn limits_file_overrides_plan_quotas_field_by_field() {
     let f = fixture(CATALOG, false, oct().start_ms());
     let file = tenant_limits::LimitsConfig::parse(
-        r#"{"tenants": {"acme": {"qps": 50, "vector_dims": 8}}}"#,
+        r#"{"tenants": {"acme": {"qps": 50, "vector_dims": 8, "bytes_per_namespace": 2097152}}}"#,
         None,
     )
     .unwrap();
@@ -705,6 +707,8 @@ fn limits_file_overrides_plan_quotas_field_by_field() {
         (Some(50.0), Some(1), Some(8))
     );
     let other = limiter.limits("globex").unwrap();
+    assert_eq!(acme.bytes_per_namespace, Some(2097152));
+    assert_eq!(other.bytes_per_namespace, Some(1048576));
     assert_eq!(
         (other.qps, other.namespaces, other.vector_dims),
         (Some(1000.0), Some(1), None)
@@ -979,6 +983,11 @@ fn stripe_stub(invoice_status: &'static str) -> (String, Arc<Mutex<Vec<StubReque
                 .collect();
             let (status, answer) = match (method.as_str(), path.as_str()) {
                 ("POST", "/v1/customers") => (200, serde_json::json!({"id": "cus_stub1"})),
+                ("GET", "/v1/customers/cus_stub1") => (
+                    200,
+                    serde_json::json!({"id": "cus_stub1",
+                                       "invoice_settings": {"default_payment_method": null}}),
+                ),
                 ("POST", "/v1/invoices") => (
                     200,
                     serde_json::json!({"id": "in_stub1", "status": "draft"}),
@@ -1036,6 +1045,7 @@ fn stripe_provider_sends_the_invoice_as_items_in_cents() {
         unit: 1,
         unit_price_cents: 1,
         amount_cents,
+        plan: None,
     };
     let invoice = Invoice {
         id: "acme/2026-10".into(),
@@ -1051,7 +1061,7 @@ fn stripe_provider_sends_the_invoice_as_items_in_cents() {
         ],
         total_cents: 2695,
         issued_at_ms: 2,
-        due_at_ms: 3,
+        due_at_ms: 2 + 14 * DAY_MS,
         status: InvoiceStatus::Open,
         paid_at_ms: None,
         provider_invoice_id: None,
@@ -1080,6 +1090,8 @@ fn stripe_provider_sends_the_invoice_as_items_in_cents() {
         calls,
         vec![
             ("POST", "/v1/customers", "kosha-customer-acme & co"),
+            // No default payment method: the invoice is sent, not charged.
+            ("GET", "/v1/customers/cus_stub1", ""),
             ("POST", "/v1/invoices", "kosha-invoice-acme/2026-10"),
             (
                 "POST",
@@ -1105,13 +1117,13 @@ fn stripe_provider_sends_the_invoice_as_items_in_cents() {
     // Form values survive encoding.
     assert_eq!(requests[0].form["name"], "acme & co");
     assert_eq!(requests[0].form["metadata[kosha_tenant]"], "acme & co");
-    let draft = &requests[1].form;
+    let draft = &requests[2].form;
     assert_eq!(draft["customer"], "cus_stub1");
     assert_eq!(draft["collection_method"], "send_invoice");
     assert_eq!(draft["days_until_due"], "14");
     assert_eq!(draft["metadata[kosha_invoice_id]"], "acme/2026-10");
     // The items add up to the invoice total; the zero line is not sent.
-    let items: Vec<(&str, &str, &str)> = requests[2..4]
+    let items: Vec<(&str, &str, &str)> = requests[3..5]
         .iter()
         .map(|r| {
             (
@@ -1150,4 +1162,99 @@ fn stripe_provider_sends_the_invoice_as_items_in_cents() {
     // An unreachable API is an error, not a status.
     let stripe = StripeProvider::new("http://127.0.0.1:1", "sk_test_stub", 14).unwrap();
     assert!(stripe.invoice_status("in_stub1").is_err());
+}
+
+/// Review finding 1: a month on free, payg, free, payg has two payg
+/// stretches, so its invoice holds the same plan and meter twice. Every
+/// item still gets its own idempotency key, so Stripe neither refuses the
+/// second nor replays the first.
+#[test]
+fn every_invoice_item_of_a_prorated_invoice_has_its_own_key() {
+    use kosha_control::billing::{Biller, PlanChange};
+    use kosha_control::billing_ledger::{BillingLedger, MemoryBillingLedger};
+    let catalog = Catalog::parse(CATALOG).unwrap();
+    let oct = oct();
+    let usage = MemoryUsageStore::new();
+    let store = MemoryBillingStore::new();
+    let history = MemoryBillingLedger::new();
+    for hour in 0..oct.hours() {
+        let at = oct.start_ms() + hour * HOUR_MS;
+        usage
+            .record(&[UsageEvent {
+                id: format!("q/{hour}"),
+                tenant: "acme".into(),
+                namespace: "docs".into(),
+                at_ms: at,
+                meters: [(meter::QUERIES.to_string(), 10_000)].into(),
+            }])
+            .unwrap();
+    }
+    store
+        .put_account(&BillingAccount {
+            tenant: "acme".into(),
+            plan: "payg".into(),
+            provider_customer_id: None,
+            created_at_ms: 0,
+        })
+        .unwrap();
+    for (day, from, to) in [
+        (5, "free", "payg"),
+        (12, "payg", "free"),
+        (20, "free", "payg"),
+    ] {
+        history
+            .record_plan_change(&PlanChange {
+                tenant: "acme".into(),
+                at_ms: oct.start_ms() + day * DAY_MS,
+                from_plan: Some(from.into()),
+                to_plan: to.into(),
+                source: "admin".into(),
+            })
+            .unwrap();
+    }
+    let biller = Biller {
+        catalog: &catalog,
+        store: &store,
+        usage: &usage,
+        provider: None,
+        plan_changes: Some(&history),
+    };
+    biller.close_period(oct, oct.end_ms()).unwrap();
+    let invoice = store.invoice("acme/2026-10").unwrap().unwrap();
+    let charged_payg_queries = invoice
+        .lines
+        .iter()
+        .filter(|l| l.plan.as_deref() == Some("payg") && l.meter == "queries")
+        .count();
+    assert_eq!(charged_payg_queries, 2, "{:#?}", invoice.lines);
+
+    let (base, requests) = stripe_stub("open");
+    let stripe = StripeProvider::new(&base, "sk_test_stub", 14).unwrap();
+    stripe.create_invoice("cus_stub1", &invoice).unwrap();
+    let keys: Vec<String> = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.path == "/v1/invoiceitems")
+        .map(|r| r.idempotency_key.clone())
+        .collect();
+    let charged = invoice.lines.iter().filter(|l| l.amount_cents > 0).count();
+    assert_eq!(keys.len(), charged);
+    let unique: std::collections::BTreeSet<&String> = keys.iter().collect();
+    assert_eq!(unique.len(), keys.len(), "{keys:?}");
+    // A line rated on one plan keeps its old key.
+    let flat = LineItem {
+        meter: "queries".into(),
+        quantity: 1,
+        included: 0,
+        billable: 1,
+        unit: 1,
+        unit_price_cents: 1,
+        amount_cents: 1,
+        plan: None,
+    };
+    assert_eq!(
+        billing::line_idempotency_key("k", 3, &flat),
+        "k-line-queries"
+    );
 }

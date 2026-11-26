@@ -1,6 +1,6 @@
-//! The API-key registry's admin routes (#346). All need the dedicated
-//! `KOSHA_ADMIN_API_KEY` credential (`route` checks it for `/v1/admin/*`)
-//! and a Postgres control plane:
+//! The API-key registry's admin routes (#346). All need an admin
+//! credential (the shared `KOSHA_ADMIN_API_KEY` or an operator credential;
+//! `route` checks it for `/v1/admin/*`) and a Postgres control plane:
 //!
 //! - `POST /v1/admin/api-keys` creates a key:
 //!   `{"tenant_id": "acme", "description": "...", "scopes": ["read"],
@@ -17,16 +17,26 @@
 //!   the same tenant, scopes and namespaces; the old key keeps working for
 //!   `overlap_secs` (default one day), so clients can switch over without
 //!   downtime. `expires_in_secs` / `expires_at` set the new key's expiry.
-//! - `POST /v1/admin/api-keys/scrub-plaintext` removes the plaintext that
-//!   rows created before #346 still hold.
+//! - `POST /v1/admin/api-keys/scrub-plaintext` removes, now, the plaintext
+//!   that rows created before #346 still hold (servers also do it by
+//!   themselves once it is safe: `PgStore::auto_scrub_plaintext`). Audited
+//!   as `api_key.plaintext_scrubbed`.
 //!
 //! A key's `key_id` is the SHA-256 hash the registry stores for it. Where
 //! a `key_id` is expected, `{"api_key": "<the key>"}` works too.
 //!
 //! Create, rotate and revoke are audited (#345): the registry writes the
-//! `kosha.audit_log` row in the transaction that makes the change.
+//! `kosha.audit_log` row in the transaction that makes the change, naming
+//! the admin credential that made the request (`operator` for the shared
+//! key, `operator:<name>` for an operator credential).
+//!
+//! A tenant's own keys can also be managed by the tenant, with a key that
+//! holds the `admin` scope: `tenant_key_admin.rs` (`/v1/api-keys`).
 
-use crate::{json_error, valid_namespace_component, valid_new_tenant_id};
+use crate::{
+    api_error, api_error_status, valid_namespace_component, valid_new_key_tenant_id, ErrorCode,
+};
+use kosha_control::orgs::Actor;
 use kosha_control::{hash_api_key, ApiKeyRecord, NewApiKey, Scopes};
 
 /// How long a rotated key keeps working when the caller does not say.
@@ -52,9 +62,9 @@ enum Action {
     ScrubPlaintext,
 }
 
-/// Answer an `/v1/admin/api-keys` request; `None` for any other route.
-pub(crate) fn handle(request_line: &str, body: &[u8]) -> Option<String> {
-    let (method, path) = crate::parse_method_and_path(request_line)?;
+/// Answer an `/v1/admin/api-keys` request made with `operator`'s admin
+/// credential; `None` for any other route.
+pub(crate) fn handle(method: &str, path: &str, body: &[u8], operator: &Actor) -> Option<String> {
     let (bare, query) = path.split_once('?').unwrap_or((path, ""));
     let sub = bare.strip_prefix("/v1/admin/api-keys")?;
     if !sub.is_empty() && !sub.starts_with('/') {
@@ -62,9 +72,13 @@ pub(crate) fn handle(request_line: &str, body: &[u8]) -> Option<String> {
     }
     let action = match parse(method, sub, query, body, crate::auth::unix_now()) {
         Ok(action) => action,
-        Err((status, message)) => return Some(json_error(status, &message)),
+        Err((status, message)) => return Some(api_error_status(status, &message)),
     };
-    Some(execute(action))
+    // `route` refuses a request that names a user before it gets here.
+    if operator.user_id().is_some() {
+        return Some(api_error_status(403, "this route is operator-only"));
+    }
+    Some(execute(action, &operator.label()))
 }
 
 pub(crate) type Rejection = (u16, String);
@@ -107,9 +121,9 @@ fn parse_create(req: &serde_json::Value, now: i64) -> Result<NewApiKey, Rejectio
         .get("tenant_id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| bad_request("missing 'tenant_id'"))?;
-    if !valid_new_tenant_id(tenant_id) {
+    if !valid_new_key_tenant_id(tenant_id) {
         return Err(bad_request(
-            "invalid 'tenant_id' (must be non-empty, without '/', '\\' or control \
+            "invalid 'tenant_id' (must be 1 to 80 bytes, without '/', '\\' or control \
              characters, and not start with '_' or '.')",
         ));
     }
@@ -117,6 +131,21 @@ fn parse_create(req: &serde_json::Value, now: i64) -> Result<NewApiKey, Rejectio
         .get("description")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    let (scopes, namespaces) = parse_grant(req)?;
+    Ok(NewApiKey {
+        tenant_id: tenant_id.to_string(),
+        description: description.to_string(),
+        scopes: scopes.unwrap_or(Scopes::ALL),
+        namespaces,
+        expires_at: parse_expiry(req, now)?,
+    })
+}
+
+/// A create request's `scopes` and `namespaces`, validated; `None` for
+/// each one left out (or `null`).
+pub(crate) fn parse_grant(
+    req: &serde_json::Value,
+) -> Result<(Option<Scopes>, Option<Vec<String>>), Rejection> {
     let strings = |field: &str| -> Result<Option<Vec<&str>>, Rejection> {
         match req.get(field) {
             None | Some(serde_json::Value::Null) => Ok(None),
@@ -132,9 +161,9 @@ fn parse_create(req: &serde_json::Value, now: i64) -> Result<NewApiKey, Rejectio
         }
     };
     let scopes = match strings("scopes")? {
-        None => Scopes::ALL,
+        None => None,
         Some(names) => {
-            Scopes::parse(names).map_err(|e| bad_request(format!("invalid 'scopes': {e}")))?
+            Some(Scopes::parse(names).map_err(|e| bad_request(format!("invalid 'scopes': {e}")))?)
         }
     };
     let namespaces = match strings("namespaces")? {
@@ -156,13 +185,7 @@ fn parse_create(req: &serde_json::Value, now: i64) -> Result<NewApiKey, Rejectio
             Some(names)
         }
     };
-    Ok(NewApiKey {
-        tenant_id: tenant_id.to_string(),
-        description: description.to_string(),
-        scopes,
-        namespaces,
-        expires_at: parse_expiry(req, now)?,
-    })
+    Ok((scopes, namespaces))
 }
 
 /// `overlap_secs`: how long a rotated key keeps working. One day when the
@@ -221,7 +244,7 @@ pub(crate) fn parse_key_ref(req: &serde_json::Value) -> Result<String, Rejection
 }
 
 #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
-fn record_json(record: &ApiKeyRecord, now: i64) -> serde_json::Value {
+pub(crate) fn record_json(record: &ApiKeyRecord, now: i64) -> serde_json::Value {
     serde_json::json!({
         "key_id": record.key_hash,
         "tenant_id": record.tenant_id,
@@ -236,24 +259,30 @@ fn record_json(record: &ApiKeyRecord, now: i64) -> serde_json::Value {
 }
 
 #[cfg(not(feature = "postgres"))]
-fn execute(_action: Action) -> String {
-    json_error(
-        400,
+fn execute(_action: Action, _actor: &str) -> String {
+    api_error(
+        ErrorCode::NotImplemented,
         "admin API requires postgres feature (compile with --features postgres)",
     )
 }
 
 #[cfg(feature = "postgres")]
-fn execute(action: Action) -> String {
+fn execute(action: Action, actor: &str) -> String {
     use crate::{auth, json_ok};
     let auth::Auth::Keys(store) = auth::global() else {
-        return json_error(400, "API keys are disabled (KOSHA_AUTH=disabled)");
+        return api_error(
+            ErrorCode::NotImplemented,
+            "API keys are disabled (KOSHA_AUTH=disabled)",
+        );
     };
     if std::env::var("DATABASE_URL").is_err() {
-        return json_error(400, "Postgres not configured (DATABASE_URL not set)");
+        return api_error(
+            ErrorCode::NotImplemented,
+            "Postgres not configured (DATABASE_URL not set)",
+        );
     }
     let Some(pg) = store.pg() else {
-        return json_error(500, "failed to connect to postgres");
+        return api_error(ErrorCode::Internal, "failed to connect to postgres");
     };
     let now = auth::unix_now();
     // Held until the change is in this pod's snapshot, so a key refresh
@@ -265,35 +294,35 @@ fn execute(action: Action) -> String {
         value
     };
     match action {
-        Action::Create(new) => match pg.create_api_key(&new) {
+        Action::Create(new) => match pg.create_api_key_as(&new, actor) {
             Ok(issued) => {
                 // Usable on this pod right away; other pods pick it up on
                 // their next key refresh.
                 store.upsert_db_key(issued.record.clone());
                 json_ok(&issued_json(&issued))
             }
-            Err(e) => json_error(500, &format!("failed to create key: {e}")),
+            Err(e) => api_error(ErrorCode::Internal, &format!("failed to create key: {e}")),
         },
         Action::List { tenant_id } => match pg.list_api_keys(tenant_id.as_deref()) {
             Ok(keys) => {
                 let keys: Vec<_> = keys.iter().map(|k| record_json(k, now)).collect();
                 json_ok(&serde_json::json!({ "api_keys": keys }))
             }
-            Err(e) => json_error(500, &format!("failed to list keys: {e}")),
+            Err(e) => api_error(ErrorCode::Internal, &format!("failed to list keys: {e}")),
         },
-        Action::Revoke { key_hash } => match pg.revoke_api_key(&key_hash) {
+        Action::Revoke { key_hash } => match pg.revoke_api_key_as(&key_hash, None, actor) {
             Ok(true) => {
                 store.remove_db_key(&key_hash);
                 json_ok(&serde_json::json!({ "revoked": true, "key_id": key_hash }))
             }
-            Ok(false) => json_error(404, "no active API key with that id"),
-            Err(e) => json_error(500, &format!("failed to revoke key: {e}")),
+            Ok(false) => api_error(ErrorCode::NotFound, "no active API key with that id"),
+            Err(e) => api_error(ErrorCode::Internal, &format!("failed to revoke key: {e}")),
         },
         Action::Rotate {
             key_hash,
             overlap_secs,
             expires_at,
-        } => match pg.rotate_api_key(&key_hash, overlap_secs, expires_at) {
+        } => match pg.rotate_api_key_as(&key_hash, None, overlap_secs, expires_at, actor) {
             Ok(Some(rotated)) => {
                 store.upsert_db_key(rotated.new.record.clone());
                 // The old key keeps its attributes and gains the deadline.
@@ -309,12 +338,27 @@ fn execute(action: Action) -> String {
                 });
                 json_ok(&value)
             }
-            Ok(None) => json_error(404, "no active API key with that id"),
-            Err(e) => json_error(500, &format!("failed to rotate key: {e}")),
+            Ok(None) => api_error(ErrorCode::NotFound, "no active API key with that id"),
+            Err(e) => api_error(ErrorCode::Internal, &format!("failed to rotate key: {e}")),
         },
         Action::ScrubPlaintext => match pg.scrub_plaintext_api_keys() {
-            Ok(scrubbed) => json_ok(&serde_json::json!({ "scrubbed": scrubbed })),
-            Err(e) => json_error(500, &format!("failed to scrub plaintext keys: {e}")),
+            Ok(scrubbed) => {
+                // Best effort: the scrub is done and idempotent either way.
+                use kosha_control::orgs::{NewAuditEvent, OrgStore};
+                let event = NewAuditEvent {
+                    org_id: None,
+                    actor: actor.to_string(),
+                    action: "api_key.plaintext_scrubbed",
+                    target_type: "registry",
+                    target_id: "kosha.api_keys".to_string(),
+                    detail: serde_json::json!({ "rows": scrubbed }),
+                };
+                if let Err(e) = pg.transact(&mut |tx| tx.insert_audit(&event)) {
+                    eprintln!("api keys: failed to audit the plaintext scrub: {e}");
+                }
+                json_ok(&serde_json::json!({ "scrubbed": scrubbed }))
+            }
+            Err(e) => api_error_status(500, &format!("failed to scrub plaintext keys: {e}")),
         },
     }
 }
@@ -487,8 +531,16 @@ mod tests {
         assert_eq!(post("/nope", "{}").unwrap_err().0, 404);
         assert_eq!(parse("DELETE", "", "", b"", NOW).unwrap_err().0, 404);
         // Not an api-keys route at all.
-        assert_eq!(handle("POST /v1/admin/api-keysx HTTP/1.1", b"{}"), None);
-        assert_eq!(handle("POST /v1/admin/gc HTTP/1.1", b"{}"), None);
+        let operator = Actor::Operator;
+        assert_eq!(
+            handle("POST", "/v1/admin/api-keysx", b"{}", &operator),
+            None
+        );
+        assert_eq!(handle("POST", "/v1/admin/gc", b"{}", &operator), None);
+        // A user never gets here, but is refused if it does.
+        let user = Actor::User("usr_1".into());
+        let refused = handle("GET", "/v1/admin/api-keys", b"", &user).unwrap();
+        assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
     }
 
     #[test]

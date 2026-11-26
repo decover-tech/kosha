@@ -236,31 +236,30 @@ the best policy at equal footprint by enough to matter.
 
 ## Bench plan (WF-2)
 
-Nothing below has run. Every input exists in `benchmark.yml` on this branch
-(`cache_max_bytes`, `cache_policy`, `cache_accounting`, `cache_trace`,
-`warm_gate=timed`, `warm_fill_s`, `phase_repeats`, `query_order`); defaults reproduce
-today's runs exactly.
+No MSMarco results are reported here. In `benchmark.yml`, set `warm_gate=timed`
+and pass the experiment settings in the single `cache_experiment` input.
+The default cache accounting is exact (#342); no accounting override is needed.
 
 **Protocol for every arm** (control and bounded alike, so they are comparable):
 `suite=bm25`, `mode=restore`, `bm25_docs=10m`, `qps=8`, `warm_gate=timed`,
-`query_order=zipf`, `warm_fill_s=900`, `duration=600`, `phase_repeats=2`,
+`cache_experiment="order=zipf fill=900 repeats=2 …"`, `duration=600`,
 `keep_vm=true` (last run of the session `false`). `timed` empties the local store,
 so each arm starts cold with only the suite namespace local; the 900 s fill is
 unmeasured; then 2 x 600 s measured no-result-cache phases (about 9,600 requests,
 about 96 samples above p99). Misses count in the measured latency. Every arm reports
-p50/p99 (with bootstrap CIs from `cache_sim.py p99ci`), S3 GETs and bytes per query
-(`cache_sim.py logcost` on the phase logs), `footprint.tsv` and `evictions.tsv`.
-All legacy arms use `cache_accounting=exact`.
+p50/p99 (with bootstrap CIs from `cache_sim.py p99ci`), S3 GETs and bytes per query,
+local GiB-hours and cost per query (`cache_sim.py arm --run-dir <bench-results>`).
+The archived `footprint.tsv` and `evictions.tsv` show occupancy and churn.
 
-| # | arm | cache_max_bytes | policy | trace | purpose |
+| # | arm | max | policy | trace | purpose |
 | --- | --- | --- | --- | --- | --- |
-| 1 | control A | default (600 GiB) | legacy | on | unbounded reference, trace + S3 sizes for the replay, `W` = final `footprint.tsv` value |
-| 2 | bounded | 0.5 W | legacy (exact) | off | FIFO under the bound |
-| 3 | bounded | 0.5 W | sieve | off | |
-| 4 | bounded | 0.5 W | s3fifo | off | |
-| 5 | control B | default | legacy | off | same-session repeat of 1: noise band, and trace overhead (1 vs 5) |
-| 6 | bounded | 0.25 W | legacy (exact) | off | only if 3 or 4 beats 2 |
-| 7 | bounded | 0.25 W | best of 3/4 | off | only if 3 or 4 beats 2 |
+| 1 | control A | default (600 GiB) | legacy | true | unbounded reference, trace + S3 sizes for replay; `W` = `arm`'s `end_local_bytes` |
+| 2 | bounded | 0.5 W | legacy | false | FIFO under the bound |
+| 3 | bounded | 0.5 W | sieve | false | |
+| 4 | bounded | 0.5 W | s3fifo | false | |
+| 5 | control B | default | legacy | false | same-session repeat of 1: noise band, and trace overhead (1 vs 5) |
+| 6 | bounded | 0.25 W | legacy | false | only if 3 or 4 beats 2 |
+| 7 | bounded | 0.25 W | best of 3/4 | false | only if 3 or 4 beats 2 |
 
 Between 1 and 2, replay run 1's trace offline (`cache_sim.py replay --sizes
 server/s3-sizes.tsv.gz --strip-prefix segments/ --capacity-frac 0.25,0.5`). If no
@@ -277,14 +276,14 @@ excludes 0 on the negative side, or GETs/query drop by more than the spread betw
 its own two repeats.
 
 **Success (from #389).** A policy arm at <= 0.5 W within noise of the controls
-(same p99 at half the footprint, by the real `footprint.tsv`, not just the bound),
-or lower total $/query (S3 GETs from `logcost` plus local GB-h from `footprint.tsv`)
+(same p99 at half the measured footprint, not just the bound),
+or lower total $/query (S3 GETs, transfer, and occupied local GiB-hours from `arm`)
 at equal p99. **Failure** is any of: no policy arm within noise at 0.5 W; the policy
 arms not distinguishable from legacy (exact); or the replay predicting a win the
 bench does not show (then the hint granularity is the suspect).
 
 **Vector (conditional, separate session, fresh VM).** Only if BM25 shows a win:
-`suite=vector`, same protocol but `warm_fill_s=3600` (the vector working set is far
+`suite=vector`, same protocol but `fill=3600` (the vector working set is far
 larger; check `footprint.tsv` has flattened before the measured phases), runs 1, 2
 and the BM25 winner at 0.5 W, plus control B.
 

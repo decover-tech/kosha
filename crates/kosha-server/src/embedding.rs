@@ -6,7 +6,8 @@
 //!
 //! - [`Embedder`]: one model. [`MockEmbedder`] is a deterministic hashed
 //!   bag of words for tests and local development; [`HttpEmbedder`] calls
-//!   an OpenAI-compatible `POST {base}/embeddings`.
+//!   an OpenAI-compatible `POST {base}/embeddings`. With the `onnx`
+//!   feature, the local provider runs operator-configured ONNX models.
 //! - [`EmbedderRegistry`]: the providers this pod has, configured from the
 //!   environment, and the embedder serving each declared model.
 //!
@@ -14,7 +15,8 @@
 //!
 //! | Variable | Meaning |
 //! |---|---|
-//! | `KOSHA_EMBEDDING_PROVIDERS` | Comma list of enabled providers: `mock`, `http`. Empty (default): no native embedding on this pod. |
+//! | `KOSHA_EMBEDDING_PROVIDERS` | Comma list of enabled providers: `mock`, `http`, `onnx`. Empty (default): no native embedding on this pod. |
+//! | `KOSHA_EMBEDDING_ONNX_MODELS` | JSON map from ONNX model IDs to their local artifact paths and sequence lengths. |
 //! | `KOSHA_EMBEDDING_URL` | Base URL of the OpenAI-compatible server (`/embeddings` is appended). Required for `http`. |
 //! | `KOSHA_EMBEDDING_API_KEY` | Sent as `Authorization: Bearer …`. Optional. |
 //! | `KOSHA_EMBEDDING_TIMEOUT_MS` | Per-request timeout, default 10000. |
@@ -29,11 +31,16 @@ use std::time::Duration;
 
 use kosha_core::EmbeddingSpec;
 
+#[cfg(feature = "onnx")]
+mod onnx;
+
 /// Why an embedding could not be produced. Each maps to an HTTP status.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EmbedError {
-    /// This pod has no provider for the declared model (503: another pod,
-    /// or this one once configured, can serve it).
+    /// This pod has no provider for the declared model (501
+    /// `not_implemented`, not retryable: the identical request fails the
+    /// same way until an operator configures one, so a client that retries
+    /// on `retryable:true` must not loop on it; ADR-350 §b).
     NotConfigured(String),
     /// The provider could not be reached or timed out (503).
     Unavailable(String),
@@ -44,7 +51,8 @@ pub enum EmbedError {
 impl EmbedError {
     pub fn status(&self) -> u16 {
         match self {
-            Self::NotConfigured(_) | Self::Unavailable(_) => 503,
+            Self::NotConfigured(_) => 501,
+            Self::Unavailable(_) => 503,
             Self::Provider(_) => 502,
         }
     }
@@ -341,7 +349,11 @@ pub const PROVIDER_MOCK: &str = "mock";
 
 /// `(provider, model, dims)` of an embedder the registry built.
 type BuiltKey = (String, String, u32);
+/// An embedder built on first use; `None` until a load succeeds.
+type BuiltSlot = Arc<Mutex<Option<Arc<dyn Embedder>>>>;
 pub const PROVIDER_HTTP: &str = "http";
+#[cfg(feature = "onnx")]
+const PROVIDER_ONNX: &str = "onnx";
 
 /// The embedding providers this pod has, and the embedder serving each
 /// model a schema declares. Embedders are built on first use and kept,
@@ -351,10 +363,14 @@ pub const PROVIDER_HTTP: &str = "http";
 pub struct EmbedderRegistry {
     mock: bool,
     http: Option<HttpConfig>,
+    #[cfg(feature = "onnx")]
+    onnx: HashMap<String, onnx::ModelConfig>,
     /// Embedders registered up front (tests), by model id. Consulted
     /// before the providers.
     fixed: HashMap<String, Arc<dyn Embedder>>,
-    built: Mutex<HashMap<BuiltKey, Arc<dyn Embedder>>>,
+    /// One slot per key: a load holds only its own slot's lock, so loads of
+    /// one model are not duplicated and do not block other models.
+    built: Mutex<HashMap<BuiltKey, BuiltSlot>>,
 }
 
 impl EmbedderRegistry {
@@ -373,6 +389,16 @@ impl EmbedderRegistry {
         {
             match provider.as_str() {
                 PROVIDER_MOCK => registry.mock = true,
+                #[cfg(feature = "onnx")]
+                PROVIDER_ONNX => {
+                    registry.onnx = get("KOSHA_EMBEDDING_ONNX_MODELS")
+                        .ok_or_else(|| "KOSHA_EMBEDDING_ONNX_MODELS is unset".to_owned())
+                        .and_then(|raw| serde_json::from_str(&raw).map_err(|err| err.to_string()))
+                        .unwrap_or_else(|err| {
+                            eprintln!("kosha: ONNX embedding disabled: {err}");
+                            HashMap::new()
+                        });
+                }
                 PROVIDER_HTTP => {
                     let Some(base_url) =
                         get("KOSHA_EMBEDDING_URL").filter(|u| !u.trim().is_empty())
@@ -429,11 +455,16 @@ impl EmbedderRegistry {
         if self.http.is_some() {
             names.push(PROVIDER_HTTP);
         }
+        #[cfg(feature = "onnx")]
+        if !self.onnx.is_empty() {
+            names.push(PROVIDER_ONNX);
+        }
         names
     }
 
     /// The embedder for `spec`. `spec.provider` picks the provider; without
-    /// one, the only enabled provider, or `http` when both are.
+    /// one, keep the existing `http`, then `mock` precedence. ONNX models
+    /// always name their provider explicitly.
     pub fn get(&self, spec: &EmbeddingSpec) -> Result<Arc<dyn Embedder>, EmbedError> {
         if let Some(embedder) = self.fixed.get(&spec.model) {
             if embedder.dims() != spec.dims as usize {
@@ -452,17 +483,41 @@ impl EmbedderRegistry {
             None if self.mock => PROVIDER_MOCK.to_string(),
             None => {
                 return Err(EmbedError::NotConfigured(format!(
-                    "embedding model {} is not configured on this pod (KOSHA_EMBEDDING_PROVIDERS is empty)",
+                    "embedding model {} needs a configured provider on this pod (KOSHA_EMBEDDING_PROVIDERS; specify provider \"onnx\" for local ONNX models)",
                     spec.model
                 )))
             }
         };
         let key = (provider.clone(), spec.model.clone(), spec.dims);
-        let mut built = self.built.lock().unwrap();
-        if let Some(embedder) = built.get(&key) {
+        let shared = Arc::clone(self.built.lock().unwrap().entry(key.clone()).or_default());
+        let mut slot = shared.lock().unwrap();
+        if let Some(embedder) = slot.as_ref() {
             return Ok(Arc::clone(embedder));
         }
-        let embedder: Arc<dyn Embedder> = match provider.as_str() {
+        match self.build(spec, &provider) {
+            Ok(embedder) => {
+                *slot = Some(Arc::clone(&embedder));
+                Ok(embedder)
+            }
+            Err(err) => {
+                // Forget the empty slot so failed lookups (keys are schema
+                // controlled) do not accumulate. A slot another caller is
+                // loading is left to that caller.
+                drop(slot);
+                let mut built = self.built.lock().unwrap();
+                if built.get(&key).is_some_and(|current| {
+                    Arc::ptr_eq(current, &shared)
+                        && current.try_lock().is_ok_and(|loaded| loaded.is_none())
+                }) {
+                    built.remove(&key);
+                }
+                Err(err)
+            }
+        }
+    }
+
+    fn build(&self, spec: &EmbeddingSpec, provider: &str) -> Result<Arc<dyn Embedder>, EmbedError> {
+        Ok(match provider {
             PROVIDER_MOCK if self.mock => {
                 Arc::new(MockEmbedder::new(&spec.model, spec.dims as usize))
             }
@@ -470,12 +525,20 @@ impl EmbedderRegistry {
                 Some(ref config) => {
                     Arc::new(HttpEmbedder::new(&spec.model, spec.dims as usize, config))
                 }
-                None => return Err(not_enabled(spec, &provider)),
+                None => return Err(not_enabled(spec, provider)),
             },
-            _ => return Err(not_enabled(spec, &provider)),
-        };
-        built.insert(key, Arc::clone(&embedder));
-        Ok(embedder)
+            #[cfg(feature = "onnx")]
+            PROVIDER_ONNX => {
+                let config = self.onnx.get(&spec.model).ok_or_else(|| {
+                    EmbedError::NotConfigured(format!(
+                        "embedding model {} has no entry in KOSHA_EMBEDDING_ONNX_MODELS",
+                        spec.model
+                    ))
+                })?;
+                Arc::new(onnx::OnnxEmbedder::load(spec, config)?)
+            }
+            _ => return Err(not_enabled(spec, provider)),
+        })
     }
 }
 
@@ -517,6 +580,7 @@ mod tests {
         EmbeddingSpec {
             model: model.into(),
             dims,
+            distance_metric: None,
             provider: provider.map(str::to_string),
         }
     }
@@ -556,7 +620,11 @@ mod tests {
         let empty = EmbedderRegistry::from_lookup(|_| None);
         assert!(empty.providers().is_empty());
         let err = empty.get(&spec("m", 8, None)).err().unwrap();
-        assert_eq!(err.status(), 503);
+        assert_eq!(err.status(), 501);
+        // 501 is `not_implemented`: not retryable, so an SDK does not loop.
+        let code = crate::api_error::ErrorCode::from_status(err.status());
+        assert_eq!(code.as_str(), "not_implemented");
+        assert!(!code.retryable());
 
         let mock = EmbedderRegistry::from_lookup(|k| {
             (k == "KOSHA_EMBEDDING_PROVIDERS").then(|| "mock".to_string())
@@ -569,7 +637,7 @@ mod tests {
                 .err()
                 .unwrap()
                 .status(),
-            503
+            501
         );
 
         // http without a URL stays disabled.
@@ -583,7 +651,7 @@ mod tests {
         assert!(fixed.get(&spec("fixed", 4, None)).is_ok());
         assert_eq!(
             fixed.get(&spec("fixed", 5, None)).err().unwrap().status(),
-            503
+            501
         );
     }
 
@@ -748,6 +816,17 @@ mod tests {
         let err = e.embed(&["x"]).unwrap_err();
         assert_eq!(err.status(), 503, "{err}");
         assert!(started.elapsed() < Duration::from_millis(700));
+    }
+
+    #[test]
+    fn failed_lookups_leave_no_cache_entry() {
+        let registry = EmbedderRegistry::with_mock();
+        for dims in 1..=3 {
+            assert!(registry.get(&spec("m", dims, Some("nope"))).is_err());
+        }
+        assert!(registry.built.lock().unwrap().is_empty());
+        registry.get(&spec("m", 4, None)).unwrap();
+        assert_eq!(registry.built.lock().unwrap().len(), 1);
     }
 
     #[test]

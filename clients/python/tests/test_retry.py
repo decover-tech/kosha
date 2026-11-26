@@ -1,266 +1,268 @@
-"""The transport retries what the server asks it to retry, and nothing else.
+"""The shared retry policy (clients/conformance/RETRY.md) against a fake server."""
 
-The server answers 429 for work it refused before starting (tenant limits,
-write backpressure, a search shed under load) and 503 for transient
-failures, both on the premise that the caller retries. These tests run the
-real urllib transport against a local HTTP server.
-"""
+from __future__ import annotations
 
 import json
+import socket
 import threading
 import time
-from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from kosha_client import KoshaClient, KoshaRequestError
-from kosha_client.transport import Transport, _is_read, _retry_after_secs
+from kosha_client.transport import (
+    KoshaRequestError,
+    Transport,
+    is_idempotent,
+    parse_retry_after,
+    retryable_status,
+)
 
 
-class Script:
-    """Answers each request with the next scripted (status, headers, body)."""
+class FakeServer:
+    """Answers each request with ``responses[n]`` (status, body, headers[, delay])."""
 
-    def __init__(self, *answers):
-        self.answers = list(answers)
-        self.calls = []
+    def __init__(self, responses):
+        self.responses = responses
+        self.requests = []
+        fake = self
 
-    def next(self, method, path):
-        self.calls.append((method, path, time.monotonic()))
-        if len(self.answers) > 1:
-            return self.answers.pop(0)
-        return self.answers[0]
+        class Handler(BaseHTTPRequestHandler):
+            def _answer(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b""
+                fake.requests.append((self.command, self.path, dict(self.headers), raw))
+                n = min(len(fake.requests), len(fake.responses)) - 1
+                status, body, headers, *rest = fake.responses[n]
+                if rest:
+                    time.sleep(rest[0])
+                payload = body.encode() if isinstance(body, str) else json.dumps(body).encode()
+                try:
+                    self.send_response(status)
+                    for k, v in headers.items():
+                        self.send_header(k, v)
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
 
+            do_GET = do_POST = do_DELETE = _answer
 
-@pytest.fixture(scope="module")
-def server():
-    holder = {}
+            def log_message(self, *args):  # noqa: D401 - silence
+                pass
 
-    class Handler(BaseHTTPRequestHandler):
-        def _answer(self):
-            length = int(self.headers.get("content-length") or 0)
-            self.rfile.read(length)
-            status, headers, body = holder["script"].next(self.command, self.path)
-            data = json.dumps(body).encode()
-            self.send_response(status)
-            for name, value in headers.items():
-                self.send_header(name, value)
-            self.send_header("content-type", "application/json")
-            self.send_header("content-length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
-        do_GET = do_POST = do_DELETE = _answer
-
-        def log_message(self, *args):  # quiet
-            pass
-
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-
-    def run(script, **kwargs):
-        holder["script"] = script
-        kwargs.setdefault("max_retries", 3)
-        return Transport(f"http://127.0.0.1:{httpd.server_port}", **kwargs)
-
-    yield run
-    httpd.shutdown()
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
 
 
-OK = (200, {}, {"results": [], "total_hits": 0})
-SHED = (429, {"retry-after": "0"}, {"error": "search overloaded", "reason": "x"})
+@pytest.fixture
+def serve():
+    servers = []
+
+    def make(*responses):
+        s = FakeServer(list(responses))
+        servers.append(s)
+        return s
+
+    yield make
+    for s in servers:
+        s.close()
 
 
-@pytest.fixture(autouse=True)
-def fast_backoff(monkeypatch):
-    monkeypatch.setattr(Transport, "backoff_base", 0.01)
-    monkeypatch.setattr(Transport, "backoff_cap", 0.02)
+def transport(url, **kw):
+    kw.setdefault("base_delay_ms", 5)
+    kw.setdefault("max_delay_ms", 20)
+    return Transport(url, api_key="sk-test", **kw)
 
 
-def test_429_then_success(server):
-    script = Script(SHED, OK)
-    assert server(script).request("POST", "search", {"q": 1}) == OK[2]
-    assert len(script.calls) == 2
+def err(code, retryable, **extra):
+    return {"error": f"{code} happened", "code": code, "retryable": retryable, "request_id": "req-1", **extra}
 
 
-def test_429_on_a_write_is_retried(server):
-    # A 429 is a refusal before any work: retrying a write cannot apply it twice.
-    script = Script(SHED, (200, {}, {"indexed_count": 1}))
-    assert server(script).request("POST", "index", {"documents": []}) == {
-        "indexed_count": 1
-    }
-    assert len(script.calls) == 2
+def test_outcome_unknown_is_replayed_only_when_safe():
+    unknown = {"retryable": True, "details": {"outcome": "unknown"}}
+    assert not retryable_status(503, unknown, idempotent=False)
+    assert retryable_status(503, unknown, idempotent=True)
+    assert retryable_status(503, {**unknown, "retryable": False}, idempotent=True)
+    assert retryable_status(503, unknown, idempotent=False, replay_safe=True)
+    assert retryable_status(503, {"retryable": True}, idempotent=False)
 
 
-def test_honors_retry_after_seconds(server):
-    script = Script((429, {"retry-after": "1"}, {"error": "shed"}), OK)
-    server(script).request("POST", "search", {})
-    (_, _, first), (_, _, second) = script.calls
-    assert second - first >= 1.0
+def test_retry_after_is_honoured(serve):
+    s = serve((429, {"error": "slow down"}, {"Retry-After": "1"}), (200, {"results": []}, {}))
+    started = time.monotonic()
+    assert transport(s.url).request("POST", "v1/namespaces/n/search", {"query_text": ""}) == {"results": []}
+    assert len(s.requests) == 2
+    assert time.monotonic() - started >= 0.95
 
 
-def test_honors_retry_after_http_date(server):
-    when = formatdate(time.time() + 2, usegmt=True)
-    script = Script((503, {"retry-after": when}, {"error": "warming"}), OK)
-    server(script).request("GET", "v1/namespaces/ns/stats")
-    (_, _, first), (_, _, second) = script.calls
-    # The date has one-second resolution: at least ~1 s, never the full budget.
-    assert 0.9 <= second - first < 3.0
+def test_a_quota_429_is_not_retried(serve):
+    s = serve((429, err("namespace_quota_exceeded", False), {}))
+    with pytest.raises(KoshaRequestError) as e:
+        transport(s.url).request("POST", "v1/namespaces/n/search", {})
+    assert len(s.requests) == 1
+    assert e.value.attempts == 1
+    assert e.value.code == "namespace_quota_exceeded"
+    assert e.value.retryable is False
 
 
-def test_gives_up_after_max_attempts_with_last_error(server):
-    script = Script(
-        (429, {"retry-after": "0"}, {"error": "first"}),
-        (429, {"retry-after": "0"}, {"error": "second"}),
-        (503, {}, {"error": "last"}),
+def test_bare_503s_back_off_then_succeed(serve):
+    s = serve((503, {"error": "x"}, {}), (503, {"error": "x"}, {}), (200, {"status": "flushed"}, {}))
+    assert transport(s.url).request("POST", "v1/namespaces/n/flush", {}) == {"status": "flushed"}
+    assert len(s.requests) == 3
+
+
+def test_max_retries_counts_attempts(serve):
+    s = serve((503, err("unavailable", True, retry_after_ms=10), {}))
+    with pytest.raises(KoshaRequestError) as e:
+        transport(s.url).request("GET", "v1/namespaces")
+    assert len(s.requests) == 3
+    assert e.value.attempts == 3
+    s2 = serve((503, err("unavailable", True, retry_after_ms=10), {}))
+    with pytest.raises(KoshaRequestError):
+        transport(s2.url, max_retries=1).request("GET", "v1/namespaces")
+    assert len(s2.requests) == 1
+
+
+def test_a_long_retry_after_gives_up_at_once(serve):
+    s = serve((429, {"error": "later"}, {"Retry-After": "120"}))
+    started = time.monotonic()
+    with pytest.raises(KoshaRequestError) as e:
+        transport(s.url).request("GET", "v1/namespaces")
+    assert len(s.requests) == 1
+    assert e.value.retry_after_ms == 120000
+    assert time.monotonic() - started < 1
+
+
+def test_the_body_delay_wins_over_the_header(serve):
+    s = serve(
+        (429, err("tenant_qps_exceeded", True, retry_after_ms=50), {"Retry-After": "120"}),
+        (200, {"namespaces": []}, {}),
     )
-    with pytest.raises(KoshaRequestError) as raised:
-        server(script, max_retries=3).request("POST", "search", {})
-    assert raised.value.status_code == 503
-    assert raised.value.error == "last"
-    assert len(script.calls) == 3
+    started = time.monotonic()
+    transport(s.url).request("GET", "v1/namespaces")
+    assert len(s.requests) == 2
+    assert time.monotonic() - started < 1
 
 
-@pytest.mark.parametrize("status", [400, 401, 402, 403, 404, 409, 413, 500])
-def test_does_not_retry_other_statuses(server, status):
-    script = Script((status, {"retry-after": "0"}, {"error": "no"}), OK)
-    with pytest.raises(KoshaRequestError) as raised:
-        server(script).request("POST", "search", {})
-    assert raised.value.status_code == status
-    assert len(script.calls) == 1
+def test_the_total_budget_stops_retries(serve):
+    s = serve((503, err("unavailable", True, retry_after_ms=500), {}))
+    with pytest.raises(KoshaRequestError) as e:
+        transport(s.url, total_budget_ms=200).request("GET", "v1/namespaces")
+    assert len(s.requests) == 1 and e.value.attempts == 1
 
 
-@pytest.mark.parametrize(
-    "method,path",
-    [
-        ("POST", "index"),
-        ("POST", "replace"),
-        ("POST", "delete"),
-        ("POST", "flush"),
-        ("POST", "v1/namespaces"),
-        ("DELETE", "v1/namespaces/ns"),
-        # A namespace whose name ends in "search" is not the search route.
-        ("DELETE", "v1/namespaces/legal_research"),
-        ("POST", "v1/namespaces/research/documents"),
-        ("POST", "v1/namespaces/research"),
-    ],
-)
-@pytest.mark.parametrize("status", [502, 503, 504])
-def test_does_not_retry_5xx_writes(server, method, path, status):
-    # The write may have reached the ingest pod before the 503: no retry.
-    script = Script((status, {"retry-after": "0"}, {"error": "x"}), OK)
-    with pytest.raises(KoshaRequestError) as raised:
-        server(script).request(method, path, {})
-    assert raised.value.status_code == status
-    assert len(script.calls) == 1
-
-
-@pytest.mark.parametrize(
-    "method,path",
-    [("POST", "search"), ("POST", "v1/namespaces/ns/search"), ("GET", "healthz")],
-)
-@pytest.mark.parametrize("status", [502, 503, 504])
-def test_retries_5xx_reads(server, method, path, status):
-    script = Script((status, {}, {"error": "x"}), OK)
-    server(script).request(method, path, {})
-    assert len(script.calls) == 2
-
-
-def test_retry_after_beyond_budget_raises_at_once(server):
-    # A quota refusal says 60 s: not worth holding the caller for.
-    script = Script((429, {"retry-after": "60"}, {"error": "quota"}), OK)
-    start = time.monotonic()
-    with pytest.raises(KoshaRequestError) as raised:
-        server(script, retry_budget=20).request("POST", "search", {})
-    assert raised.value.status_code == 429
-    assert len(script.calls) == 1
-    assert time.monotonic() - start < 1.0
-
-
-def test_total_time_bounded_by_budget(server):
-    # Each retry waits 1 s; a 1.5 s budget admits one retry, not nine.
-    script = Script((429, {"retry-after": "1"}, {"error": "shed"}))
-    start = time.monotonic()
+def test_502_is_retried_only_when_idempotent(serve):
+    s = serve((502, {"error": "bad gateway"}, {}))
     with pytest.raises(KoshaRequestError):
-        server(script, max_retries=10, retry_budget=1.5).request("POST", "search", {})
-    assert len(script.calls) == 2
-    assert time.monotonic() - start < 2.5
-
-
-def test_budget_zero_disables_status_retries(server):
-    script = Script(SHED, OK)
+        transport(s.url).request("POST", "v1/namespaces", {"namespace": "a"})
+    assert len(s.requests) == 1
     with pytest.raises(KoshaRequestError):
-        server(script, retry_budget=0).request("POST", "search", {})
-    assert len(script.calls) == 1
+        transport(s.url).request("GET", "v1/namespaces")
+    assert len(s.requests) == 4
 
 
-def test_client_search_retries_a_shed(server, monkeypatch):
-    script = Script(SHED, OK)
-    transport = server(script)
-    client = KoshaClient(hosts=transport.base_url)
-    assert client._transport.retry_budget == 20.0
-    assert client.search(index="ns", body={"query": {"match_all": {}}})["hits"][
-        "hits"
-    ] == []
-    assert [c[:2] for c in script.calls] == [("POST", "/search")] * 2
+def test_a_timeout_is_retried_only_when_idempotent(serve):
+    s = serve((200, {}, {}, 0.5))
+    t = transport(s.url, timeout=0.1)
+    with pytest.raises(KoshaRequestError) as create:
+        t.request("POST", "v1/namespaces", {"namespace": "a"})
+    assert create.value.attempts == 1 and create.value.status_code == 0
+    t2 = transport(s.url, timeout=0.1, max_retries=2)
+    with pytest.raises(KoshaRequestError) as search:
+        t2.request("POST", "v1/namespaces/a/search", {})
+    assert search.value.attempts == 2
+    t3 = transport(s.url, timeout=0.1, max_retries=2, retry_non_idempotent=True)
+    with pytest.raises(KoshaRequestError) as opted:
+        t3.request("POST", "v1/namespaces", {"namespace": "a"})
+    assert opted.value.attempts == 2
+    t4 = transport(s.url, timeout=0.1, max_retries=2, retry_on_timeout=False)
+    with pytest.raises(KoshaRequestError) as off:
+        t4.request("POST", "v1/namespaces/a/search", {})
+    assert off.value.attempts == 1
 
 
-@pytest.mark.parametrize(
-    "value,expected",
-    [
-        (None, None),
-        ("", None),
-        ("3", 3.0),
-        ("-1", 0.0),
-        ("junk", None),
-        ("nan", None),
-        ("inf", None),
-        ("-inf", None),
-    ],
-)
-def test_retry_after_parsing(value, expected):
-    assert _retry_after_secs(value) == expected
+def test_a_refused_connection_is_retried_for_any_operation():
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    with pytest.raises(KoshaRequestError) as e:
+        transport(f"http://127.0.0.1:{port}").request("POST", "v1/namespaces", {"namespace": "a"})
+    assert e.value.attempts == 3
+    assert e.value.status_code == 0
+    # retry_on_timeout=False is 0.2.x's fail-fast on every transport error.
+    with pytest.raises(KoshaRequestError) as off:
+        transport(f"http://127.0.0.1:{port}", retry_on_timeout=False).request("GET", "v1/namespaces")
+    assert off.value.attempts == 1
 
 
-def test_retry_after_date_in_the_past_is_zero():
-    assert _retry_after_secs("Wed, 21 Oct 2015 07:28:00 GMT") == 0.0
+def test_a_legacy_merge_timeout_is_retried(serve):
+    s = serve((200, {}, {}, 0.5))
+    with pytest.raises(KoshaRequestError) as e:
+        transport(s.url, timeout=0.1, max_retries=2).request("POST", "replace", {"namespace": "a", "documents": []})
+    assert e.value.attempts == 2
 
 
-@pytest.mark.parametrize(
-    "method,path,read",
-    [
-        ("POST", "search", True),
-        ("POST", "v1/namespaces/research/search", True),
-        ("POST", "v1/namespaces/search/search", True),
-        ("GET", "v1/namespaces/legal_research/stats", True),
-        ("DELETE", "v1/namespaces/legal_research", False),
-        ("DELETE", "v1/namespaces/search", False),
-        ("POST", "v1/namespaces/legal_research", False),
-        ("POST", "research", False),
-        ("POST", "index", False),
-    ],
-)
-def test_is_read_matches_the_search_route_only(method, path, read):
-    assert _is_read(method, path) is read
+def test_error_fallbacks(serve):
+    s = serve(
+        (403, {"error": "nope", "reason": "body_too_large"}, {"X-Request-Id": "hdr-1"}),
+        (500, "plain failure", {"Content-Type": "text/plain"}),
+    )
+    t = transport(s.url, max_retries=1)
+    with pytest.raises(KoshaRequestError) as a:
+        t.request("GET", "v1/namespaces")
+    assert a.value.code == "body_too_large"
+    assert a.value.request_id == "hdr-1"
+    with pytest.raises(KoshaRequestError) as b:
+        t.request("GET", "v1/namespaces")
+    assert b.value.code is None
+    assert b.value.error == "plain failure"
+    assert b.value.status_code == 500
 
 
-def test_nan_retry_after_falls_back_to_backoff(server):
-    script = Script((429, {"retry-after": "nan"}, {"error": "shed"}), OK)
-    server(script).request("POST", "search", {})
-    assert len(script.calls) == 2
+def test_idempotency_table():
+    assert is_idempotent("GET", "/v1/namespaces/a/stats")
+    for action in ("search", "documents", "replace", "delete", "flush", "exists"):
+        assert is_idempotent("POST", f"/v1/namespaces/a/{action}")
+    assert is_idempotent("DELETE", "/v1/namespaces/a")
+    assert not is_idempotent("POST", "/v1/namespaces")
+    assert not is_idempotent("POST", "/v1/namespaces/a/schema")
+    assert not is_idempotent("POST", "/v1/namespaces/a/branch")
+    assert not is_idempotent("DELETE", "/v1/namespaces/a/branch")
+    assert not is_idempotent("POST", "/v1/namespaces/a/shards")
+    # Explicit transport calls to the deprecated merge route are still safe.
+    assert is_idempotent("POST", "/replace")
+    assert not is_idempotent("POST", "/index")
+    assert not is_idempotent("POST", "/v1/replace")
 
 
-@pytest.mark.parametrize("body", [["a", "list"], "a string", 7, None])
-def test_non_object_error_body_raises_kosha_error(server, body):
-    script = Script((400, {}, body))
-    with pytest.raises(KoshaRequestError) as raised:
-        server(script).request("POST", "search", {})
-    assert raised.value.status_code == 400
-    assert raised.value.error == json.dumps(body)
+def test_parse_retry_after():
+    assert parse_retry_after("2") == 2000
+    now = 1792567680.0  # Wed, 21 Oct 2026 07:28:00 GMT
+    assert parse_retry_after("Wed, 21 Oct 2026 07:28:03 GMT", now) == 3000
+    assert parse_retry_after("soon") is None
+    assert parse_retry_after(None) is None
 
 
-def test_non_object_body_on_a_retryable_status_is_retried(server):
-    script = Script((503, {}, ["warming"]), OK)
-    server(script).request("POST", "search", {})
-    assert len(script.calls) == 2
+def test_client_constructor_accepts_every_documented_retry_setting():
+    """RETRY.md's Defaults table names these as the Python settings."""
+    from kosha_client import KoshaClient
+
+    c = KoshaClient(
+        "http://kosha.invalid",
+        api_key="k",
+        max_retries=5,
+        base_delay_ms=1,
+        max_delay_ms=2,
+        max_retry_after_ms=5,
+        total_budget_ms=10,
+    )
+    t = c._transport
+    assert (t.max_retries, t.base_delay_ms, t.max_delay_ms, t.max_retry_after_ms, t.total_budget_ms) == (5, 1, 2, 5, 10)

@@ -2,6 +2,8 @@
 //!
 //! Selection only — merge I/O and manifest publish live on `Indexer`.
 
+use std::sync::OnceLock;
+
 use kosha_core::{Manifest, ManifestEntry, SegmentId};
 
 /// Knobs for size-tiered (lite) compaction.
@@ -26,6 +28,16 @@ pub struct CompactionPolicy {
     /// repeated passes converge to ~`ceil(total_bytes / cap)` segments —
     /// callers loop until `segments_after` stops dropping.
     pub max_merged_segment_bytes: u64,
+    /// Research #464: a segment whose tombstoned share of documents is at
+    /// or above this, in basis points (1/10,000), is a tiered merge input
+    /// whatever its size, is listed first, and may be rewritten on its own
+    /// when nothing else fits with it (Lucene's `forceMergeDeletes`).
+    /// Tiered selection otherwise never looks at deletes, so a large
+    /// segment keeps its tombstoned documents (and their vectors, which
+    /// still inflate posting radii and probe cost) until a full pass.
+    /// `None` (the default: `KOSHA_COMPACT_TOMBSTONE_RATIO` unset) is that
+    /// behaviour.
+    pub tombstone_ratio_bp: Option<u32>,
 }
 
 impl Default for CompactionPolicy {
@@ -36,8 +48,99 @@ impl Default for CompactionPolicy {
             min_mergeable_segments: 2,
             trigger_mergeable_segments: 8,
             max_merged_segment_bytes: 5 * 1024 * 1024 * 1024,
+            tombstone_ratio_bp: tombstone_ratio_bp_from_env(),
         }
     }
+}
+
+/// `KOSHA_COMPACT_TOMBSTONE_RATIO` (#464, experimental), read once: a
+/// fraction in `(0, 1]`, e.g. `0.2`. Unset, empty or `off` disables the
+/// trigger; anything else is warned about and disabled.
+pub fn tombstone_ratio_bp_from_env() -> Option<u32> {
+    static BP: OnceLock<Option<u32>> = OnceLock::new();
+    *BP.get_or_init(|| {
+        let raw = std::env::var("KOSHA_COMPACT_TOMBSTONE_RATIO").ok();
+        let bp = parse_tombstone_ratio(raw.as_deref());
+        if let Some(bp) = bp {
+            eprintln!(
+                "INFO: KOSHA_COMPACT_TOMBSTONE_RATIO={}: segments with at least that share of \
+                 tombstoned documents are compaction inputs whatever their size (#464, \
+                 experimental)",
+                bp as f64 / 10_000.0
+            );
+        }
+        bp
+    })
+}
+
+fn parse_tombstone_ratio(raw: Option<&str>) -> Option<u32> {
+    let raw = raw?.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("off") {
+        return None;
+    }
+    match raw.parse::<f64>() {
+        Ok(r) if r.is_finite() && r > 0.0 && r <= 1.0 => {
+            Some(((r * 10_000.0).round() as u32).max(1))
+        }
+        _ => {
+            eprintln!(
+                "WARN: KOSHA_COMPACT_TOMBSTONE_RATIO={raw} is not a fraction in (0, 1] — \
+                 tombstone-ratio compaction stays off"
+            );
+            None
+        }
+    }
+}
+
+fn deleted_docs(manifest: &Manifest, entry: &ManifestEntry) -> u64 {
+    manifest
+        .tombstones
+        .get(&entry.segment_id)
+        .map_or(0, |t| t.len() as u64)
+}
+
+/// Tombstoned share of `entry`'s documents, from the manifest's tombstones.
+pub fn tombstone_ratio(manifest: &Manifest, entry: &ManifestEntry) -> f64 {
+    if entry.doc_count == 0 {
+        return 0.0;
+    }
+    deleted_docs(manifest, entry) as f64 / entry.doc_count as f64
+}
+
+/// Whether `entry` is at or above the policy's tombstone ratio (#464).
+fn over_tombstone_ratio(
+    manifest: &Manifest,
+    policy: &CompactionPolicy,
+    entry: &ManifestEntry,
+) -> bool {
+    let Some(bp) = policy.tombstone_ratio_bp else {
+        return false;
+    };
+    let deleted = deleted_docs(manifest, entry);
+    deleted > 0 && deleted * 10_000 >= bp as u64 * entry.doc_count as u64
+}
+
+/// Segments at or above the policy's tombstone ratio (#464); empty when
+/// the trigger is off.
+pub fn tombstone_heavy_segments<'a>(
+    manifest: &'a Manifest,
+    policy: &CompactionPolicy,
+) -> Vec<&'a ManifestEntry> {
+    manifest
+        .segments
+        .iter()
+        .filter(|e| over_tombstone_ratio(manifest, policy, e))
+        .collect()
+}
+
+/// Whether `inputs` is a single segment over the tombstone ratio: a
+/// rewrite that expunges its deletes is worth running on its own (#464).
+pub fn is_tombstone_rewrite(
+    manifest: &Manifest,
+    policy: &CompactionPolicy,
+    inputs: &[ManifestEntry],
+) -> bool {
+    inputs.len() == 1 && over_tombstone_ratio(manifest, policy, &inputs[0])
 }
 
 /// How aggressively to select merge inputs.
@@ -139,6 +242,7 @@ pub fn mergeable_segment_count(manifest: &Manifest, policy: &CompactionPolicy) -
 /// Whether a scheduler should consider running a tiered pass.
 pub fn needs_compaction(manifest: &Manifest, policy: &CompactionPolicy) -> bool {
     mergeable_segment_count(manifest, policy) >= policy.trigger_mergeable_segments
+        || !tombstone_heavy_segments(manifest, policy).is_empty()
 }
 
 /// Select merge inputs under `opts`.
@@ -167,7 +271,11 @@ where
         .cloned()
         .collect();
 
-    if candidates.len() < 2 {
+    // A lone segment is a plan only as a tiered tombstone rewrite (#464).
+    if candidates.len() < 2
+        && !(opts.mode == CompactMode::Tiered
+            && is_tombstone_rewrite(manifest, &opts.policy, &candidates))
+    {
         return None;
     }
 
@@ -204,19 +312,46 @@ where
             Some(MergePlan { inputs })
         }
         CompactMode::Tiered => {
-            candidates.retain(|e| e.doc_count < opts.policy.max_mergeable_docs);
-            if candidates.len() < opts.policy.min_mergeable_segments {
+            let policy = &opts.policy;
+            // #464: tombstone-heavy segments join whatever their size,
+            // most-deleted first. With the trigger off this is empty and
+            // what follows is the plain doc-count tiering.
+            let mut heavy: Vec<ManifestEntry> = candidates
+                .iter()
+                .filter(|e| over_tombstone_ratio(manifest, policy, e))
+                .cloned()
+                .collect();
+            heavy.sort_by(|a, b| {
+                tombstone_ratio(manifest, b)
+                    .total_cmp(&tombstone_ratio(manifest, a))
+                    .then_with(|| a.segment_id.0.cmp(&b.segment_id.0))
+            });
+            candidates.retain(|e| {
+                e.doc_count < policy.max_mergeable_docs
+                    && !over_tombstone_ratio(manifest, policy, e)
+            });
+            if heavy.is_empty() && candidates.len() < policy.min_mergeable_segments {
                 return None;
             }
             candidates.sort_by_key(|e| e.doc_count);
-            candidates.truncate(opts.policy.max_segments_per_merge);
+            heavy.extend(candidates);
+            let mut candidates = heavy;
+            candidates.truncate(policy.max_segments_per_merge);
             if cap > 0 {
-                // Same greedy prefix, in the existing doc-count order.
+                // Same greedy prefix, in the order above. A first input
+                // over the cap on its own is kept only when it is
+                // tombstone-heavy: rewriting it alone only shrinks it.
                 let mut total = 0u64;
                 let mut kept = Vec::new();
                 for entry in candidates {
                     let bytes = segment_bytes(&entry.segment_id).unwrap_or(u64::MAX);
                     if total.saturating_add(bytes) > cap {
+                        if kept.is_empty()
+                            && bytes != u64::MAX
+                            && over_tombstone_ratio(manifest, policy, &entry)
+                        {
+                            kept.push(entry);
+                        }
                         break;
                     }
                     total += bytes;
@@ -224,7 +359,9 @@ where
                 }
                 candidates = kept;
             }
-            if candidates.len() < opts.policy.min_mergeable_segments {
+            if candidates.len() < policy.min_mergeable_segments
+                && !is_tombstone_rewrite(manifest, policy, &candidates)
+            {
                 return None;
             }
             Some(MergePlan { inputs: candidates })
@@ -479,5 +616,169 @@ mod tests {
         assert!(needs_compaction(&m, &CompactionPolicy::default()));
         let m2 = manifest(vec![entry("a", 1), entry("b", 1)]);
         assert!(!needs_compaction(&m2, &CompactionPolicy::default()));
+    }
+
+    // ── #464: tombstone-ratio trigger ───────────────────────────────────
+
+    /// `m` with `deleted` doc_seqs tombstoned in segment `id`.
+    fn delete(mut m: Manifest, id: &str, deleted: u32) -> Manifest {
+        m.tombstones
+            .insert(SegmentId(id.into()), (0..deleted).collect());
+        m
+    }
+
+    fn policy(trigger_bp: Option<u32>) -> CompactionPolicy {
+        CompactionPolicy {
+            max_mergeable_docs: 50_000,
+            max_segments_per_merge: 32,
+            min_mergeable_segments: 2,
+            trigger_mergeable_segments: 8,
+            max_merged_segment_bytes: 0,
+            tombstone_ratio_bp: trigger_bp,
+        }
+    }
+
+    fn ids(plan: &MergePlan) -> Vec<&str> {
+        plan.inputs
+            .iter()
+            .map(|e| e.segment_id.0.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn tombstone_ratio_parses_fractions_and_rejects_the_rest() {
+        assert_eq!(parse_tombstone_ratio(None), None);
+        assert_eq!(parse_tombstone_ratio(Some("")), None);
+        assert_eq!(parse_tombstone_ratio(Some("off")), None);
+        assert_eq!(parse_tombstone_ratio(Some("0.2")), Some(2_000));
+        assert_eq!(parse_tombstone_ratio(Some(" 1 ")), Some(10_000));
+        assert_eq!(parse_tombstone_ratio(Some("0.00001")), Some(1));
+        for bad in ["0", "-0.1", "1.5", "nan", "inf", "x"] {
+            assert_eq!(parse_tombstone_ratio(Some(bad)), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn trigger_off_leaves_tiered_planning_unchanged() {
+        let segments = vec![
+            entry("small-a", 10),
+            entry("small-b", 20),
+            entry("big", 80_000),
+        ];
+        let clean = manifest(segments.clone());
+        let deleted = delete(manifest(segments), "big", 60_000);
+        let opts = CompactOptions::tiered(policy(None));
+        let a = select_merge_inputs(&clean, &opts, |_| true, |_| Some(1)).unwrap();
+        let b = select_merge_inputs(&deleted, &opts, |_| true, |_| Some(1)).unwrap();
+        assert_eq!(ids(&a), ids(&b));
+        assert_eq!(ids(&b), vec!["small-a", "small-b"]);
+        assert!(!needs_compaction(&deleted, &policy(None)));
+        assert!(tombstone_heavy_segments(&deleted, &policy(None)).is_empty());
+    }
+
+    #[test]
+    fn heavy_segment_joins_first_whatever_its_size() {
+        let m = delete(
+            manifest(vec![
+                entry("small-a", 10),
+                entry("small-b", 20),
+                entry("big", 80_000),
+            ]),
+            "big",
+            40_000,
+        );
+        let p = policy(Some(2_000));
+        assert!(needs_compaction(&m, &p), "a heavy segment alone triggers");
+        let plan = select_merge_inputs(&m, &CompactOptions::tiered(p), |_| true, |_| Some(1))
+            .expect("plan");
+        assert_eq!(ids(&plan), vec!["big", "small-a", "small-b"]);
+    }
+
+    #[test]
+    fn under_the_ratio_is_ignored() {
+        // 10% deleted against a 20% trigger.
+        let m = delete(
+            manifest(vec![entry("a", 10), entry("big", 80_000)]),
+            "big",
+            8_000,
+        );
+        let p = policy(Some(2_000));
+        assert!(!needs_compaction(&m, &p));
+        assert!(
+            select_merge_inputs(&m, &CompactOptions::tiered(p), |_| true, |_| Some(1)).is_none()
+        );
+    }
+
+    #[test]
+    fn a_lone_heavy_segment_is_rewritten_on_its_own() {
+        let m = delete(
+            manifest(vec![entry("big", 80_000), entry("other-big", 90_000)]),
+            "big",
+            80_000,
+        );
+        let p = policy(Some(5_000));
+        let plan = select_merge_inputs(
+            &m,
+            &CompactOptions::tiered(p.clone()),
+            |_| true,
+            |_| Some(1),
+        )
+        .expect("singleton rewrite");
+        assert_eq!(ids(&plan), vec!["big"]);
+        assert!(is_tombstone_rewrite(&m, &p, &plan.inputs));
+        // A lone segment that is not heavy is never a plan.
+        let clean = manifest(vec![entry("big", 80_000), entry("other-big", 90_000)]);
+        assert!(
+            select_merge_inputs(&clean, &CompactOptions::tiered(p), |_| true, |_| Some(1))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn heavy_segment_over_the_byte_cap_is_rewritten_alone() {
+        let m = delete(
+            manifest(vec![entry("small", 10), entry("big", 80_000)]),
+            "big",
+            50_000,
+        );
+        let mut p = policy(Some(5_000));
+        p.max_merged_segment_bytes = 100;
+        let sizes = |id: &SegmentId| Some(if id.0 == "big" { 1_000 } else { 10 });
+        let plan = select_merge_inputs(&m, &CompactOptions::tiered(p.clone()), |_| true, sizes)
+            .expect("plan");
+        assert_eq!(
+            ids(&plan),
+            vec!["big"],
+            "shrinks it; joins nothing over the cap"
+        );
+        // Unknown size: never planned, heavy or not.
+        let plan = select_merge_inputs(
+            &m,
+            &CompactOptions::tiered(p),
+            |_| true,
+            |id| (id.0 != "big").then_some(10),
+        );
+        assert!(plan.is_none());
+    }
+
+    #[test]
+    fn most_deleted_heavy_segment_goes_first() {
+        let m = delete(
+            delete(
+                manifest(vec![entry("h30", 100), entry("h60", 100)]),
+                "h30",
+                30,
+            ),
+            "h60",
+            60,
+        );
+        let plan = select_merge_inputs(
+            &m,
+            &CompactOptions::tiered(policy(Some(2_500))),
+            |_| true,
+            |_| Some(1),
+        )
+        .expect("plan");
+        assert_eq!(ids(&plan), vec!["h60", "h30"]);
     }
 }
