@@ -9767,6 +9767,79 @@ fn rabitq_bound_shortlist_len(scored: &[(u32, f64)], errors: &[f32], k: usize) -
         .count()
 }
 
+/// The candidates a quantized probe rescores exactly, best estimate first:
+/// the top [`floored_shortlist_len`] by estimate, except that on a RaBitQ
+/// column candidates with the same estimate and error bound, bit for bit,
+/// take one slot between them (at most `k` of them are kept: no more can
+/// be hits).
+///
+/// Why: identical vectors in a posting have one code, so one estimate and
+/// one estimate error, and the error bound covers each estimate, not the
+/// block. A block over-estimated past its bound used to fill the shortlist
+/// and push out the true neighbours below it (`knn-085`, exp-codes-rerank
+/// §4); counted once, it takes one slot. Without duplicates this is the
+/// old shortlist. Rescored candidates are at most `k` x the slots, and
+/// every one is read exactly: no copy is assumed to score like another.
+fn rescore_shortlist(
+    scored: Vec<(u32, f64)>,
+    errors: &[f32],
+    k: usize,
+    factor_len: usize,
+    rabitq: bool,
+    rabitq_min: usize,
+) -> Vec<(u32, f64)> {
+    let slots = floored_shortlist_len(&scored, errors, k, factor_len, rabitq, rabitq_min);
+    if !rabitq || errors.len() != scored.len() || slots == 0 || scored.len() <= slots {
+        return top_k_by_score(scored, slots);
+    }
+    let by_estimate = |a: &(u32, f64, f32), b: &(u32, f64, f32)| {
+        b.1.total_cmp(&a.1)
+            .then(a.2.total_cmp(&b.2))
+            .then(a.0.cmp(&b.0))
+    };
+    let mut all: Vec<(u32, f64, f32)> = scored
+        .iter()
+        .zip(errors)
+        .map(|(&(id, s), &e)| (id, s, e))
+        .collect();
+    // The best `pool` estimates, widened while duplicates leave fewer than
+    // `slots` distinct ones among them (each pass is one select).
+    let mut pool = slots.saturating_mul(2);
+    loop {
+        let pool_len = pool.min(all.len());
+        if pool_len < all.len() {
+            all.select_nth_unstable_by(pool_len - 1, by_estimate);
+        }
+        let mut best = all[..pool_len].to_vec();
+        best.sort_unstable_by(by_estimate);
+        let (mut out, mut groups, mut copies) = (Vec::new(), 0usize, 0usize);
+        let mut last: Option<(u64, u32)> = None;
+        let mut complete = pool_len == all.len();
+        for &(id, s, e) in &best {
+            let key = (s.to_bits(), e.to_bits());
+            if last != Some(key) {
+                if groups == slots {
+                    // A new estimate past the last slot: every slot's run
+                    // ended inside the pool.
+                    complete = true;
+                    break;
+                }
+                groups += 1;
+                copies = 0;
+                last = Some(key);
+            }
+            if copies < k {
+                out.push((id, s));
+                copies += 1;
+            }
+        }
+        if complete {
+            return out;
+        }
+        pool = pool.saturating_mul(4);
+    }
+}
+
 /// [`exact_shortlist_len`], at least `rabitq_min` on a RaBitQ column (past
 /// its x8 cap: the floor is the point). See [`rabitq_rescore_min`].
 fn floored_shortlist_len(
@@ -9905,13 +9978,12 @@ pub struct SegmentReader {
 }
 
 /// Default of [`SegmentReader::with_rabitq_rescore_min`]:
-/// `KOSHA_KNN_RABITQ_RESCORE_MIN` (experimental), the least candidates a
-/// RaBitQ column's probe rescores exactly, on top of its bound rule. Unset
-/// or `0` (the default): the rule alone. A block of identical vectors
-/// shares one 1-bit code and so one estimate error, which the epsilon0
-/// bound covers per estimate, not per block; a floor deeper than the block
-/// (`400` passed every set in exp-codes-rerank) rescores past it. Costs up
-/// to that many `doc_vectors.bin` reads per probed segment.
+/// `KOSHA_KNN_RABITQ_RESCORE_MIN` (experimental, opt-in), the least
+/// distinct estimates a RaBitQ column's probe rescores exactly, on top of
+/// its bound rule. Unset or `0` (the default): the rule alone. Duplicate
+/// blocks no longer need it ([`rescore_shortlist`] gives a block one
+/// slot); it stays for measuring a fixed rescore depth against the rule.
+/// Costs up to that many `doc_vectors.bin` reads per probed segment.
 pub fn rabitq_rescore_min() -> usize {
     static MIN: OnceLock<usize> = OnceLock::new();
     *MIN.get_or_init(|| {
@@ -10193,16 +10265,16 @@ impl SegmentReader {
         self
     }
 
-    /// [`floored_shortlist_len`] at this reader's floor.
-    fn rescore_shortlist_len(
+    /// [`rescore_shortlist`] at this reader's floor.
+    fn rescore_shortlist_of(
         &self,
-        scored: &[(u32, f64)],
+        scored: Vec<(u32, f64)>,
         errors: &[f32],
         k: usize,
         factor_len: usize,
         rabitq: bool,
-    ) -> usize {
-        floored_shortlist_len(
+    ) -> Vec<(u32, f64)> {
+        rescore_shortlist(
             scored,
             errors,
             k,
@@ -11867,9 +11939,8 @@ impl SegmentReader {
         hydration_limit: ShortlistHydrationLimit,
     ) -> Result<(Vec<(u32, f64)>, usize), KoshaError> {
         let factor_len = k.saturating_mul(self.vector_rescore_factor.max(1));
-        let limit =
-            self.rescore_shortlist_len(&probed.scored, &probed.errors, k, factor_len, rabitq);
-        let mut seqs: Vec<_> = top_k_by_score(probed.scored, limit)
+        let mut seqs: Vec<_> = self
+            .rescore_shortlist_of(probed.scored, &probed.errors, k, factor_len, rabitq)
             .into_iter()
             .map(|(seq, _)| seq)
             .collect();
@@ -12619,8 +12690,7 @@ impl SegmentReader {
             return scored;
         }
         let factor_len = k.saturating_mul(self.vector_rescore_factor);
-        let shortlist_len = self.rescore_shortlist_len(&scored, errors, k, factor_len, vi.rabitq);
-        let mut shortlist = top_k_by_score(scored, shortlist_len);
+        let mut shortlist = self.rescore_shortlist_of(scored, errors, k, factor_len, vi.rabitq);
         if let Some(field) = vi.field.as_deref() {
             let rescored = self.rescore_exact(field, query, &mut shortlist);
             if rescored > 0 {
@@ -19914,7 +19984,15 @@ mod rabitq_duplicate_cluster_tests {
     /// shortlist of `rescore_probed_shortlist` (floor `k * 4`, bound
     /// shortlist at the code's epsilon0, cap x8), exact rescore, top `k`.
     /// `floor`: `KOSHA_KNN_RABITQ_RESCORE_MIN` (0: the rule alone).
-    fn probe(q: &[f32], docs: &[Vec<f32>], estimator: RaBitQEstimator, floor: usize) -> Vec<u32> {
+    /// `dedup`: the engine's [`rescore_shortlist`]; `false` is the rule
+    /// before it, where every copy of a block takes a slot.
+    fn probe(
+        q: &[f32],
+        docs: &[Vec<f32>],
+        estimator: RaBitQEstimator,
+        floor: usize,
+        dedup: bool,
+    ) -> Vec<u32> {
         let rotation = RaBitQRotation::new(DIM);
         let mut centroid = vec![0f32; DIM];
         docs.iter()
@@ -19930,8 +20008,13 @@ mod rabitq_duplicate_cluster_tests {
             scored.push((id as u32, sim.clamp(-1.0, 1.0) as f64));
             errors.push(err);
         }
-        let limit = floored_shortlist_len(&scored, &errors, K, K * 4, true, floor);
-        let exact: Vec<(u32, f64)> = top_k_by_score(scored, limit)
+        let shortlist = if dedup {
+            rescore_shortlist(scored, &errors, K, K * 4, true, floor)
+        } else {
+            let limit = floored_shortlist_len(&scored, &errors, K, K * 4, true, floor);
+            top_k_by_score(scored, limit)
+        };
+        let exact: Vec<(u32, f64)> = shortlist
             .into_iter()
             .map(|(id, _)| {
                 (
@@ -19950,12 +20033,18 @@ mod rabitq_duplicate_cluster_tests {
     #[test]
     #[ignore]
     fn duplicate_block_miss_rate_by_estimator() {
-        let (mut l_only, mut p_only, mut both, mut n) = (0, 0, 0, 0);
+        let (mut l_only, mut p_only, mut both, mut n, mut dedup_misses) = (0, 0, 0, 0, 0);
         for h in 1000..1100u64 {
             for l in 5000..5060u64 {
                 let (q, docs) = posting(h, l, 20, 48);
-                let lm = !tenth_is_high(&probe(&q, &docs, RaBitQEstimator::Lut, 0), 20);
-                let pm = !tenth_is_high(&probe(&q, &docs, RaBitQEstimator::Popcount4, 0), 20);
+                let lm = !tenth_is_high(&probe(&q, &docs, RaBitQEstimator::Lut, 0, false), 20);
+                let pm =
+                    !tenth_is_high(&probe(&q, &docs, RaBitQEstimator::Popcount4, 0, false), 20);
+                for e in [RaBitQEstimator::Lut, RaBitQEstimator::Popcount4] {
+                    if !tenth_is_high(&probe(&q, &docs, e, 0, true), 20) {
+                        dedup_misses += 1;
+                    }
+                }
                 n += 1;
                 match (lm, pm) {
                     (true, true) => {
@@ -19970,7 +20059,10 @@ mod rabitq_duplicate_cluster_tests {
                 }
             }
         }
-        println!("n={n} both={both} lut_only={l_only} pop_only={p_only}");
+        println!(
+            "n={n} both={both} lut_only={l_only} pop_only={p_only} \
+             duplicate_aware_misses={dedup_misses}"
+        );
     }
 
     /// Whether the 10th hit is a copy of the true 10th neighbour.
@@ -19978,54 +20070,77 @@ mod rabitq_duplicate_cluster_tests {
         ids.len() == K && (9..9 + high).contains(&(ids[9] as usize))
     }
 
-    /// What guards the tie is rescore depth, not the estimator.
+    /// A duplicate block is one slot in the rescore shortlist.
     ///
     /// The miss needs the low block's estimate to sit more than both
-    /// bounds above the high block's. The error comes from the 1-bit data
-    /// code, which both estimators share (Popcount4 only adds the query's
-    /// 4-bit rounding in quadrature, ~2% wider here), so they miss on
-    /// nearly the same inputs. Measured over 6,000 direction pairs of this
-    /// fixture (`h` 1000..1100 x `l` 5000..5060, 20 high / 48 low copies,
-    /// `duplicate_block_miss_rate_by_estimator`): LUT misses 24, Popcount4
-    /// 23; 15 both, 9 only LUT, 8 only Popcount4. The pair below is one
-    /// both miss. That Popcount4 passed `knn-085` in the
-    /// replay is one draw of this, not a property to rely on.
+    /// bounds above the high block's, with more copies than the shortlist
+    /// has slots. The error comes from the 1-bit data code, which both
+    /// estimators share (Popcount4 only adds the query's 4-bit rounding in
+    /// quadrature, ~2% wider here), so they miss on nearly the same inputs.
+    /// Measured over 6,000 direction pairs of this fixture (`h` 1000..1100
+    /// x `l` 5000..5060, 20 high / 48 low copies,
+    /// `duplicate_block_miss_rate_by_estimator`) with every copy taking a
+    /// slot: LUT misses 24, Popcount4 23 (15 both). With the duplicate-aware
+    /// shortlist: 0 under either. The pair below is one both missed.
     #[test]
-    fn duplicate_block_past_the_rescore_floor_needs_depth_not_an_estimator() {
+    fn duplicate_block_takes_one_rescore_slot_under_either_estimator() {
         let estimators = [RaBitQEstimator::Lut, RaBitQEstimator::Popcount4];
-        // Within the floor (9 + 20 + 20 <= k * 4 = 40): rescued either way.
+        // Within the floor (9 + 20 + 20 <= k * 4 = 40): found either way.
         let (q, docs) = posting(1021, 5041, 20, 20);
         for e in estimators {
-            assert!(tenth_is_high(&probe(&q, &docs, e, 0), 20), "{e:?}");
+            for dedup in [false, true] {
+                assert!(tenth_is_high(&probe(&q, &docs, e, 0, dedup), 20), "{e:?}");
+            }
         }
-        // 48 copies of the over-estimated vector fill the shortlist past
-        // the floor, and the high block is outside both bounds: missed
-        // under the engine rule at epsilon0 1.9 by both estimators ...
+        // 48 copies of the over-estimated vector, past the floor, with the
+        // high block outside both bounds: missed by both estimators when
+        // every copy takes a slot ...
         let (q, docs) = posting(1021, 5041, 20, 48);
         for e in estimators {
-            let ids = probe(&q, &docs, e, 0);
+            let ids = probe(&q, &docs, e, 0, false);
             assert!(!tenth_is_high(&ids, 20), "{e:?}: {ids:?}");
             assert!(
                 (9 + 20..9 + 20 + 48).contains(&(ids[9] as usize)),
                 "{e:?}: {ids:?}"
             );
         }
-        // ... and found under a rescore floor deeper than the block
+        // ... found by both when the block takes one slot, with no floor ...
+        for e in estimators {
+            let ids = probe(&q, &docs, e, 0, true);
+            assert!(tenth_is_high(&ids, 20), "{e:?}: {ids:?}");
+        }
+        // ... and by the opt-in floor deeper than the block
         // (`KOSHA_KNN_RABITQ_RESCORE_MIN=400`, past the rule's x8 cap).
         for e in estimators {
-            assert!(tenth_is_high(&probe(&q, &docs, e, 400), 20), "{e:?}");
+            assert!(tenth_is_high(&probe(&q, &docs, e, 400, false), 20), "{e:?}");
         }
-        // The floor never shortens the rule's list, and leaves f32 alone.
-        let scored: Vec<(u32, f64)> = (0..1000).map(|i| (i, 1.0 - i as f64 * 1e-6)).collect();
-        let loose = vec![0.5f32; 1000];
+        // Without duplicates the shortlist is the old one; with them, a
+        // block is one slot of at most k copies, and the slots it frees go
+        // to the next distinct estimates.
+        let distinct: Vec<(u32, f64)> = (0..500).map(|i| (i, 0.9 - i as f64 * 1e-3)).collect();
+        let tight = vec![1e-4f32; 500];
+        let ids = |v: Vec<(u32, f64)>| v.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
         assert_eq!(
-            floored_shortlist_len(&scored, &loose, K, 40, true, 100),
-            320
+            ids(rescore_shortlist(distinct.clone(), &tight, K, 40, true, 0)),
+            ids(top_k_by_score(distinct.clone(), 40))
         );
+        let mut dups = vec![(1000u32, 0.95f64); 100];
+        dups.iter_mut()
+            .enumerate()
+            .for_each(|(i, d)| d.0 += i as u32);
+        dups.extend(distinct);
+        let errors = vec![1e-4f32; 600];
+        // The rule counts the 100 copies (all within bound of the k-th):
+        // 100 slots, the block one of them.
+        let slots = floored_shortlist_len(&dups, &errors, K, 40, true, 0);
+        assert_eq!(slots, 100);
+        let short = ids(rescore_shortlist(dups, &errors, K, 40, true, 0));
         assert_eq!(
-            floored_shortlist_len(&scored, &loose, K, 40, true, 400),
-            400
+            short.len(),
+            K + slots - 1,
+            "k copies of the block + 99 distinct"
         );
-        assert_eq!(floored_shortlist_len(&scored, &[], K, 40, false, 400), 40);
+        assert_eq!(short[..K], (1000..1000 + K as u32).collect::<Vec<_>>()[..]);
+        assert_eq!(short[K..], (0..slots as u32 - 1).collect::<Vec<_>>()[..]);
     }
 }

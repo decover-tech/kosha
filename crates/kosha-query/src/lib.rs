@@ -3023,16 +3023,17 @@ fn effective_knn_budget(requested: usize, total_centroids: usize) -> usize {
 
 /// [`knn_rank_postings`] cut separately per encoding: the f32 sources
 /// (`columns[i]` is `None`) under `budgets.0`, the RaBitQ ones under
-/// `budgets.1`, rankings back in `sources` order. Returns the merged
-/// result and the budget the plan records: the looser of the two cutoffs
-/// and the larger budget, which only a segment left without a ranking
-/// (it could not be scored) plans by.
+/// `budgets.1`, rankings back in `sources` order. Also returns each
+/// encoding's `(cutoff, budget)` (`[f32, RaBitQ]`, `None` without such a
+/// source): a segment left without a ranking (it could not be scored)
+/// plans by its own encoding's. The merged `cutoff` is the f32 one when
+/// there is one.
 fn knn_rank_by_encoding<'a>(
     sources: &[ColumnPlanSource<'a>],
     columns: &[Option<kosha_segment::KnnColumnCost>],
     budgets: (usize, usize),
     rank: impl Fn(&[ColumnPlanSource<'a>], usize) -> KnnRankedPostings,
-) -> (KnnRankedPostings, usize) {
+) -> (KnnRankedPostings, [Option<(f32, usize)>; 2]) {
     let part = |rabitq: bool| -> Vec<ColumnPlanSource<'a>> {
         sources
             .iter()
@@ -3058,16 +3059,19 @@ fn knn_rank_by_encoding<'a>(
             next.and_then(Iterator::next).cloned().flatten()
         })
         .collect();
+    let cutoffs = [&f32_part, &rabitq_part].map(|p| p.as_ref().map(|(r, b)| (r.cutoff, *b)));
     let parts = || f32_part.iter().chain(rabitq_part.iter());
     let merged = KnnRankedPostings {
-        cutoff: parts()
-            .map(|(r, _)| r.cutoff)
-            .fold(f32::NEG_INFINITY, f32::max),
+        cutoff: cutoffs
+            .iter()
+            .flatten()
+            .next()
+            .map_or(f32::NEG_INFINITY, |c| c.0),
         rule: parts().find_map(|(r, _)| r.rule),
         rankings,
         exact_centroids: parts().map(|(r, _)| r.exact_centroids).sum(),
     };
-    (merged, parts().map(|(_, b)| *b).max().unwrap_or(0))
+    (merged, cutoffs)
 }
 
 /// Preflight of a codes-scan plan (K10 iii): the RaBitQ postings the plan
@@ -3493,6 +3497,10 @@ struct KnnPlan {
     cutoff_rule: Option<KnnCutoffRule>,
     /// See [`SearchPhaseStats::knn_plan_exact_centroids`].
     exact_centroids: usize,
+    /// Segments that plan by another `(cutoff, budget)` than `cutoff`
+    /// when they have no ranking: unscorable RaBitQ segments under the
+    /// codes-scan depth, which take the RaBitQ cut.
+    fallback_cutoffs: HashMap<kosha_core::SegmentId, (f32, usize)>,
 }
 
 /// One probed segment as kNN planning sees it: the scores of its
@@ -5743,6 +5751,7 @@ impl Searcher {
             filtered_candidates,
             cutoff_rule: None,
             exact_centroids: 0,
+            fallback_cutoffs: HashMap::new(),
         };
 
         if !budgeted {
@@ -5912,8 +5921,12 @@ impl Searcher {
                 self.knn_segment_prune,
             )
         };
-        let (ranked, budget) = match &rabitq {
-            None => (rank(&sources, budgets.0), budgets.0),
+        let (ranked, cutoffs) = match &rabitq {
+            None => {
+                let ranked = rank(&sources, budgets.0);
+                let cutoff = (ranked.cutoff, budgets.0);
+                (ranked, [Some(cutoff), None])
+            }
             Some(depth) => knn_rank_by_encoding(&sources, &depth.columns, budgets, rank),
         };
         // A segment that could not be scored gets no ranking and ranks its
@@ -5925,7 +5938,17 @@ impl Searcher {
         if let Some(depth) = &rabitq {
             knn_rabitq_preflight(depth, &sources, &ranked.rankings, max_bytes, namespace)?;
         }
-        plan.cutoff = Some((ranked.cutoff, budget));
+        plan.cutoff = cutoffs[0].or(cutoffs[1]);
+        // An unranked RaBitQ segment plans by the RaBitQ cut, not f32's.
+        if let (Some(depth), Some(cutoff)) = (&rabitq, cutoffs[1]) {
+            plan.fallback_cutoffs = probed
+                .iter()
+                .zip(&ranked.rankings)
+                .zip(&depth.columns)
+                .filter(|((_, ranking), column)| ranking.is_none() && column.is_some())
+                .map(|((info, _), _)| (info.segment_id.clone(), cutoff))
+                .collect();
+        }
         plan.cutoff_rule = ranked.rule;
         plan.exact_centroids = ranked.exact_centroids;
         plan.rankings = probed
@@ -9272,7 +9295,11 @@ impl Searcher {
                 manifest,
                 permit,
                 &open_stats,
-                knn_plan.cutoff,
+                knn_plan
+                    .fallback_cutoffs
+                    .get(&entry.segment_id)
+                    .copied()
+                    .or(knn_plan.cutoff),
                 knn_plan.rankings.get(&entry.segment_id),
                 knn_plan.exact_segments.contains(&entry.segment_id),
                 knn_global
@@ -31023,12 +31050,13 @@ mod knn_rabitq_depth_tests {
             joint[0] + joint[1] < rabitq_postings,
             "and RaBitQ is squeezed: {joint:?}"
         );
-        let (split, budget) =
+        let (split, cutoffs) =
             knn_rank_by_encoding(&sources, &columns, (f32_budget, rabitq_postings), rank);
         let split = probed(&split);
         assert_eq!(split[2], f32_budget);
         assert_eq!(split[0] + split[1], rabitq_postings);
-        assert_eq!(budget, rabitq_postings.max(f32_budget));
+        assert_eq!(cutoffs[0].map(|c| c.1), Some(f32_budget));
+        assert_eq!(cutoffs[1].map(|c| c.1), Some(rabitq_postings));
         std::fs::remove_dir_all(&mixed_dir).ok();
         std::fs::remove_dir_all(&f32_dir).ok();
     }
