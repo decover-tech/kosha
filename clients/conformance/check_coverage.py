@@ -28,6 +28,7 @@ EXCLUDED = {
     "KoshaService_BranchNamespace": "no typed SDK method in 0.x; reachable through request()",
     "KoshaService_DeleteBranch": "no typed SDK method in 0.x; reachable through request()",
     "KoshaService_ListBranches": "no typed SDK method in 0.x; reachable through request()",
+    "KoshaService_ReadDocument": "no typed SDK method yet (#584); reachable through request()",
     "KoshaService_PutShards": "no typed SDK method in 0.x; reachable through request()",
     "KoshaService_ListTenantApiKeys": "key management (#346) needs Postgres, off in the test stack",
     "KoshaService_CreateTenantApiKey": "key management (#346) needs Postgres, off in the test stack",

@@ -16,7 +16,7 @@ option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_swagger) = {
     // The contract revision (ADR-350 §a): 1.MINOR.PATCH now that v1 is GA
     // (0.9.x and 0.10.x were pre-GA). Independent of the crate version; kept
     // equal to `api_error::API_VERSION` by a test.
-    version: "1.1.0"
+    version: "1.2.0"
     description:
       "The public Kosha HTTP/JSON API. The OpenAPI document is the wire contract; "
       "proto3 canonical JSON is not (see docs/api/versioning.md). Every request carries "
@@ -819,6 +819,97 @@ service KoshaService {
       extensions: {
         key: "x-stability-level"
         value: {string_value: "stable"}
+      }
+    };
+  }
+
+  // One stored field of one document (issue #586), whole or as a line,
+  // page or byte range, at most `max_bytes` long, with the line, page and
+  // byte references of the cut. Pages are the form-feed separated parts of
+  // the value. A range past the end is an empty cut.
+  rpc ReadDocument(ReadDocumentRequest) returns (ReadDocumentResponse) {
+    option (google.api.http) = {
+      post: "/v1/namespaces/{namespace}/read"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      responses: {
+        key: "409"
+        value: {
+          description: "already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying; sent with write_conflict only."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "429"
+        value: {
+          description: "overloaded and tenant rate limits; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "503"
+        value: {
+          description: "unavailable; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "408"
+        value: {
+          description: "request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      responses: {
+        key: "502"
+        value: {
+          description: "upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds"
+          schema: {json_schema: {ref: ".kosha.v1.ErrorResponse"}}
+          headers: {
+            key: "Retry-After"
+            value: {
+              type: "integer"
+              description: "Seconds to wait before retrying."
+            }
+          }
+        }
+      }
+      extensions: {
+        key: "x-kosha-error-codes"
+        value: {list_value: {values: [{string_value: "internal"}, {string_value: "invalid_argument"}, {string_value: "method_not_allowed"}, {string_value: "namespace_not_found"}, {string_value: "not_found"}, {string_value: "overloaded"}, {string_value: "payload_too_large"}, {string_value: "permission_denied"}, {string_value: "request_timeout"}, {string_value: "tenant_concurrency_exceeded"}, {string_value: "tenant_qps_exceeded"}, {string_value: "tenant_queue_full"}, {string_value: "unauthenticated"}, {string_value: "unavailable"}]}}
+      }
+      extensions: {
+        key: "x-stability-level"
+        value: {string_value: "beta"}
       }
     };
   }
@@ -3322,6 +3413,59 @@ message IndexDocumentsResponse {
     format: "int64"
   }];
   string namespace = 2;
+}
+
+// ─── Read (issue #586) ──────────────────────────────────────────────────────
+
+message ReadDocumentRequest {
+  string namespace = 1;
+  // The document's id. Set exactly one of `id` and `path`.
+  optional string id = 2;
+  // A Keyword value naming one document, matched exactly on `path_field`.
+  optional string path = 3;
+  // The field `path` is matched on (default "path").
+  optional string path_field = 4;
+  // The stored field to read.
+  string field = 5 [(google.api.field_behavior) = REQUIRED];
+  // At most one of `lines`, `page` and `bytes`; none reads the whole value.
+  optional LineRange lines = 6;
+  // 1-based page.
+  optional uint32 page = 7;
+  optional ByteRange bytes = 8;
+  // The longest cut returned (default 65536, at most 1048576). A longer
+  // one is shortened at a line end and `truncated` is set.
+  optional uint32 max_bytes = 9;
+}
+
+// 1-based, inclusive lines; `end` defaults to the last line.
+message LineRange {
+  uint32 start = 1 [(google.api.field_behavior) = REQUIRED];
+  optional uint32 end = 2;
+}
+
+// 0-based, end-exclusive bytes of the UTF-8 value, widened to whole
+// characters; `end` defaults to the end of the value.
+message ByteRange {
+  uint32 start = 1 [(google.api.field_behavior) = REQUIRED];
+  optional uint32 end = 2;
+}
+
+message ReadDocumentResponse {
+  string id = 1;
+  string field = 2;
+  string text = 3;
+  // First and last 1-based line the cut touches; unset for an empty cut.
+  optional uint32 start_line = 4;
+  optional uint32 end_line = 5;
+  uint32 total_lines = 6;
+  uint32 byte_start = 7;
+  uint32 byte_end = 8;
+  uint32 total_bytes = 9;
+  // The 1-based page the cut starts on.
+  uint32 page = 10;
+  uint32 total_pages = 11;
+  // The cut was longer than `max_bytes`; read on from `byte_end`.
+  bool truncated = 12;
 }
 
 // ─── Exists ─────────────────────────────────────────────────────────────────

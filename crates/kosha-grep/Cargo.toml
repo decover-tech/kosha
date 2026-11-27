@@ -1,0 +1,16 @@
+[package]
+name = "kosha-grep"
+description = "Research prototype (#588): exact regex grep over a trigram index, checked against ripgrep"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+regex = "1"
+regex-automata = "0.4"
+regex-syntax = "0.8"
+roaring = "0.11"
+walkdir = "2"

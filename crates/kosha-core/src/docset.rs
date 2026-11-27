@@ -18,7 +18,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    list_elements, lookup_field, BoolFilter, FilterClause, FilterStore, PrefixFilter, RangeBound,
+    list_elements, lookup_field, BoolFilter, FilterClause, FilterStore, GlobFilter, PrefixFilter,
+    RangeBound,
 };
 
 /// A set of `doc_seq`s within one segment, as a bitmap.
@@ -265,6 +266,19 @@ pub fn evaluate_filter(clause: &FilterClause, store: &FilterStore, doc_count: u3
             mark_prefixed(&mut set, store, prefix);
             set
         }
+        FilterClause::Glob { glob } => {
+            // A linear scan of the column, like `prefix`; the columnar
+            // evaluator seeks to the glob's literal prefix instead.
+            let mut set = DocSet::empty(doc_count);
+            if let Some(entries) = lookup_field(&store.string_fields, &glob.field) {
+                for (doc_seq, value) in entries {
+                    if glob_matches(glob, value) {
+                        set.insert(*doc_seq);
+                    }
+                }
+            }
+            set
+        }
     }
 }
 
@@ -286,6 +300,16 @@ pub fn check_filter(clause: &FilterClause, store: &FilterStore) -> Result<(), St
                     || lookup_field(&store.float_fields, field).is_some())
             {
                 return Err(prefix_on_numeric_error(field));
+            }
+            Ok(())
+        }
+        FilterClause::Glob { glob } => {
+            let field = glob.field.as_str();
+            if lookup_field(&store.string_fields, field).is_none()
+                && (lookup_field(&store.integer_fields, field).is_some()
+                    || lookup_field(&store.float_fields, field).is_some())
+            {
+                return Err(glob_on_numeric_error(field));
             }
             Ok(())
         }
@@ -311,6 +335,28 @@ pub fn prefix_on_numeric_error(field: &str) -> String {
         "prefix filter on `{field}` is not supported: it is a numeric \
          field; use `range` or `term` instead"
     )
+}
+
+/// The error [`check_filter`] reports for a `glob` on a numeric field.
+pub fn glob_on_numeric_error(field: &str) -> String {
+    format!(
+        "glob filter on `{field}` is not supported: it is a numeric \
+         field; use `range` or `term` instead"
+    )
+}
+
+/// Whether `value` (or, for a list value, one of its elements) matches the
+/// whole glob. Lists follow the same rule as [`prefix_matches`]: only the
+/// elements are matched, never the JSON text.
+pub fn glob_matches(glob: &GlobFilter, value: &str) -> bool {
+    match value
+        .starts_with('[')
+        .then(|| list_elements(value))
+        .flatten()
+    {
+        Some(elements) => elements.iter().any(|e| glob.is_match(e)),
+        None => glob.is_match(value),
+    }
 }
 
 /// Whether `value` (or, for a list value, one of its elements) starts with
@@ -955,5 +1001,194 @@ mod tests {
         // Other clauses on numeric fields are unaffected.
         let clause: FilterClause = serde_json::from_str(r#"{"term": {"page": "7"}}"#).unwrap();
         assert!(check_filter(&clause, &store).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod glob_tests {
+    use super::*;
+
+    fn glob(json: &str) -> GlobFilter {
+        match serde_json::from_str::<FilterClause>(json).unwrap() {
+            FilterClause::Glob { glob } => glob,
+            other => panic!("expected Glob, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn glob_syntax_is_path_aware() {
+        for (pattern, value, want) in [
+            ("/contracts/*.pdf", "/contracts/a.pdf", true),
+            ("/contracts/*.pdf", "/contracts/2024/a.pdf", false),
+            ("/contracts/**/*.pdf", "/contracts/2024/q1/a.pdf", true),
+            ("/contracts/**/*.pdf", "/contracts/a.pdf", true),
+            ("**/contracts/**", "/x/contracts/y/z.txt", true),
+            ("**/contracts/**", "/x/contract/y", false),
+            ("/a/**", "/a", false),
+            ("/a/?.txt", "/a/b.txt", true),
+            ("/a/?.txt", "/a/bb.txt", false),
+            ("/a/?.txt", "/a//.txt", false),
+            ("/a/[bc].txt", "/a/c.txt", true),
+            ("/a/[!bc].txt", "/a/c.txt", false),
+            ("/a/*.{pdf,docx}", "/a/x.docx", true),
+            ("/a/*.{pdf,docx}", "/a/x.txt", false),
+            ("/a/\\*.txt", "/a/*.txt", true),
+            ("/a/\\*.txt", "/a/b.txt", false),
+            ("/A/*", "/a/b", false),
+            // Classes never match `/`, negated or not.
+            ("/docs/*[!x]*.pdf", "/docs/2026/a.pdf", false),
+            ("/docs/*[!x]*.pdf", "/docs/a.pdf", true),
+            ("/a[ -~]b", "/a/b", false),
+            ("/a[ -~]b", "/a-b", true),
+            ("/a/[]x].txt", "/a/].txt", true),
+            ("/a/[a-c-].txt", "/a/-.txt", true),
+            ("/a/{,x}y", "/a/y", true),
+            // Characters, not bytes.
+            ("/docs/[é]*.pdf", "/docs/ê.pdf", false),
+            ("/docs/[é]*.pdf", "/docs/é1.pdf", true),
+            ("/docs/?.pdf", "/docs/é.pdf", true),
+            // `**` at the edges of an alternative is still recursive.
+            ("/c/{**/*.pdf,s.txt}", "/c/a.pdf", true),
+            ("/c/{**/*.pdf,s.txt}", "/c/x/y/a.pdf", true),
+            ("/c/{s.txt,**}", "/c/x/y", true),
+            ("/c/x{**/*.pdf,s}", "/c/x/y/a.pdf", false),
+            (r"/c/{a\,**/b}", "/c/a,x/y/b", false),
+            (r"/c/{a\,**/b}", "/c/a,x/b", true),
+            (r"/c/\{**/b", "/c/{x/y/b", false),
+            (r"/c/{**,a\}}", "/c/x/y", true),
+            ("/c/**", "/c/x\ny/z", true),
+            (r"/c\/**/b", "/c/x/y/b", true),
+            (r"/c\/**", "/c/x/y", true),
+            ("/c/*", "/c/x\ny", true),
+            ("/a/[!--/]", "/a/x", true),
+            ("/a/[+--]", "/a/,", true),
+            (r"/a/[a\-z]", "/a/b", false),
+        ] {
+            let g = GlobFilter::new("path", pattern, false).unwrap();
+            assert_eq!(g.is_match(value), want, "{pattern} vs {value}");
+        }
+        let ci = GlobFilter::new("path", "/A/*.PDF", true).unwrap();
+        assert!(ci.is_match("/a/x.pdf"));
+        assert_eq!(ci.literal_prefix(), "", "folding case has no byte prefix");
+        let ci = GlobFilter::new("path", "/É/*", true).unwrap();
+        assert!(ci.is_match("/é/x") && !ci.is_match("/e/x"));
+    }
+
+    #[test]
+    fn literal_prefix_is_a_prefix_of_every_match() {
+        for (pattern, prefix) in [
+            ("/contracts/**/*.pdf", "/contracts/"),
+            ("**/x", ""),
+            ("/a/b.txt", "/a/b.txt"),
+            ("/a/{b,c}", "/a/"),
+            ("/a/[bc]", "/a/"),
+            ("/a?", "/a"),
+            ("/a\\*", "/a"),
+        ] {
+            let g = GlobFilter::new("path", pattern, false).unwrap();
+            assert_eq!(g.literal_prefix(), prefix, "{pattern}");
+        }
+        let values = [
+            "/a", "/a/", "/a/b", "/a/b.txt", "/a/c", "/ab", "/a*", "/a/x/y", "b",
+        ];
+        for pattern in [
+            "/a*", "/a/**", "/a/{b,c}", "/a?", "/a/**/y", "/a\\*", "/a/*",
+        ] {
+            let g = GlobFilter::new("path", pattern, false).unwrap();
+            for v in values {
+                if g.is_match(v) {
+                    assert!(v.starts_with(g.literal_prefix()), "{pattern} matched {v}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn glob_parses_round_trips_and_rejects_malformed() {
+        let g = glob(r#"{"glob": {"path": "**/*.pdf"}}"#);
+        assert_eq!((g.field.as_str(), g.pattern.as_str()), ("path", "**/*.pdf"));
+        assert!(!g.case_insensitive);
+        let g = glob(r#"{"glob": {"path": {"value": "/A/*", "case_insensitive": true}}}"#);
+        assert!(g.case_insensitive && g.is_match("/a/b"));
+        for json in [
+            r#"{"glob":{"path":"/a/**"}}"#,
+            r#"{"glob":{"path":{"value":"/A/*","case_insensitive":true}}}"#,
+        ] {
+            let parsed: FilterClause = serde_json::from_str(json).unwrap();
+            let out = serde_json::to_string(&parsed).unwrap();
+            let again: FilterClause = serde_json::from_str(&out).unwrap();
+            assert_eq!(serde_json::to_string(&again).unwrap(), out, "{json}");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&out).unwrap(),
+                serde_json::from_str::<serde_json::Value>(json).unwrap()
+            );
+        }
+        for (json, needle) in [
+            (r#"{"glob": {"path": 7}}"#, "must be a string"),
+            (r#"{"glob": {"a": "x", "b": "y"}}"#, "exactly one field"),
+            (r#"{"glob": {}}"#, "no field"),
+            (
+                r#"{"glob": {"path": {"value": "/a", "boost": 2}}}"#,
+                "unknown glob option",
+            ),
+            (r#"{"glob": {"path": {}}}"#, "missing `value`"),
+            (r#"{"glob": {"path": "/a/[b"}}"#, "invalid pattern"),
+            (r#"{"glob": {"path": "/a/{b"}}"#, "invalid pattern"),
+            (r#"{"glob": {"path": "/a/{b,{c}}"}}"#, "nested"),
+            (r#"{"glob": {"path": "/a/[z-a]"}}"#, "invalid pattern"),
+            (r#"{"glob": {"path": "/a/[z--a]"}}"#, "invalid range"),
+            (r#"{"glob": {"path": "/a/b}"}}"#, "unopened"),
+            (r#"{"glob": {"path": "/a\\"}}"#, "dangling"),
+        ] {
+            let err = serde_json::from_str::<FilterClause>(json).unwrap_err();
+            assert!(err.to_string().contains(needle), "{json}: {err}");
+        }
+    }
+
+    #[test]
+    fn hostile_globs_are_rejected_without_exhausting_the_stack() {
+        let deep = format!("{}{}", "{a,".repeat(50_000), "}".repeat(50_000));
+        assert!(GlobFilter::new("p", deep, false)
+            .unwrap_err()
+            .contains("longer"));
+        let deep = format!("{}{}", "{a,".repeat(1_000), "}".repeat(1_000));
+        assert!(GlobFilter::new("p", deep, false)
+            .unwrap_err()
+            .contains("nested"));
+        let wide = "[a-z]".repeat(crate::MAX_GLOB_PATTERN_BYTES / 5);
+        assert!(GlobFilter::new("p", wide, false).is_ok());
+    }
+
+    #[test]
+    fn glob_evaluates_scalars_and_list_elements_and_rejects_numbers() {
+        let mut store = FilterStore::default();
+        store.string_fields.insert(
+            "path".into(),
+            vec![
+                (0, "/c/a.pdf".into()),
+                (1, "/c/b.txt".into()),
+                (2, r#"["/x","/c/z.pdf"]"#.into()),
+                (3, "[]".into()),
+            ],
+        );
+        store.integer_fields.insert("page".into(), vec![(0, 1)]);
+        let g = FilterClause::Glob {
+            glob: GlobFilter::new("path", "/c/*.pdf", false).unwrap(),
+        };
+        let set = evaluate_filter(&g, &store, 4);
+        assert_eq!(set.iter().collect::<Vec<_>>(), vec![0, 2]);
+        let all = FilterClause::Glob {
+            glob: GlobFilter::new("path", "**", false).unwrap(),
+        };
+        assert_eq!(
+            evaluate_filter(&all, &store, 4).iter().collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        let numeric = FilterClause::Glob {
+            glob: GlobFilter::new("page", "1*", false).unwrap(),
+        };
+        assert!(check_filter(&numeric, &store)
+            .unwrap_err()
+            .contains("numeric field"));
     }
 }

@@ -7,6 +7,17 @@ independent of the server's crate version; see `docs/api/versioning.md`.
 
 Sections: Added, Changed, Deprecated, Removed.
 
+## [1.2.0]
+
+Phase L agent retrieval (#589).
+
+### Added
+
+- `POST /v1/namespaces/{namespace}/read` (#586, beta): one stored field of
+  one document by `id` or keyword `path`, whole or as `lines`, `page`
+  (form-feed separated) or `bytes`, capped at `max_bytes`, with line, page
+  and byte references.
+
 ## [1.1.0]
 
 Phase H control plane (#345–#349). All new operations are beta.

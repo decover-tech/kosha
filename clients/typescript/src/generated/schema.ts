@@ -378,6 +378,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/namespaces/{namespace}/read": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * One stored field of one document (issue #586), whole or as a line,
+         *     page or byte range, at most `max_bytes` long, with the line, page and
+         *     byte references of the cut. Pages are the form-feed separated parts of
+         *     the value. A range past the end is an empty cut.
+         */
+        post: operations["KoshaService_ReadDocument"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/namespaces/{namespace}/replace": {
         parameters: {
             query?: never;
@@ -519,6 +541,29 @@ export interface components {
              * @description 1 to 256.
              */
             shards: number;
+        };
+        KoshaServiceReadDocumentBody: {
+            bytes?: components["schemas"]["v1ByteRange"];
+            /** @description The stored field to read. */
+            field: string;
+            /** @description The document's id. Set exactly one of `id` and `path`. */
+            id?: string;
+            lines?: components["schemas"]["v1LineRange"];
+            /**
+             * Format: int64
+             * @description The longest cut returned (default 65536, at most 1048576). A longer
+             *     one is shortened at a line end and `truncated` is set.
+             */
+            max_bytes?: number;
+            /**
+             * Format: int64
+             * @description 1-based page.
+             */
+            page?: number;
+            /** @description A Keyword value naming one document, matched exactly on `path_field`. */
+            path?: string;
+            /** @description The field `path` is matched on (default "path"). */
+            path_field?: string;
         };
         KoshaServiceReplaceDocumentsBody: {
             /** @description Full or partial documents, matched by `id`. */
@@ -679,6 +724,16 @@ export interface components {
             local_files?: number;
             /** Format: int64 */
             remote_objects?: number;
+        };
+        /**
+         * @description 0-based, end-exclusive bytes of the UTF-8 value, widened to whole
+         *     characters; `end` defaults to the end of the value.
+         */
+        v1ByteRange: {
+            /** Format: int64 */
+            end?: number;
+            /** Format: int64 */
+            start: number;
         };
         v1CollapseSpec: {
             field: string;
@@ -1054,6 +1109,13 @@ export interface components {
              */
             max: number;
         };
+        /** @description 1-based, inclusive lines; `end` defaults to the last line. */
+        v1LineRange: {
+            /** Format: int64 */
+            end?: number;
+            /** Format: int64 */
+            start: number;
+        };
         v1ListBranchesResponse: {
             branches?: components["schemas"]["v1NamespaceBranch"][];
             namespace?: string;
@@ -1158,6 +1220,35 @@ export interface components {
             lexical_rank?: number;
             /** Format: double */
             lexical_score?: number;
+        };
+        v1ReadDocumentResponse: {
+            /** Format: int64 */
+            byte_end?: number;
+            /** Format: int64 */
+            byte_start?: number;
+            /** Format: int64 */
+            end_line?: number;
+            field?: string;
+            id?: string;
+            /**
+             * Format: int64
+             * @description The 1-based page the cut starts on.
+             */
+            page?: number;
+            /**
+             * Format: int64
+             * @description First and last 1-based line the cut touches; unset for an empty cut.
+             */
+            start_line?: number;
+            text?: string;
+            /** Format: int64 */
+            total_bytes?: number;
+            /** Format: int64 */
+            total_lines?: number;
+            /** Format: int64 */
+            total_pages?: number;
+            /** @description The cut was longer than `max_bytes`; read on from `byte_end`. */
+            truncated?: boolean;
         };
         v1ReplaceDocumentsResponse: {
             /** Format: int64 */
@@ -5016,6 +5107,168 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["v1FlushResponse"];
+                };
+            };
+            /** @description invalid_argument, invalid_query */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unauthenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payment_required (billing refuses the operation for the account's standing) */
+            402: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description permission_denied and quota codes */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_found, namespace_not_found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description method_not_allowed; the `Allow` header lists the methods the path takes */
+            405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description request_timeout: the request body did not arrive in time; retry after `Retry-After` seconds */
+            408: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description already_exists, conflict, write_conflict; write_conflict is retryable after `Retry-After` seconds */
+            409: {
+                headers: {
+                    /** @description Seconds to wait before retrying; sent with write_conflict only. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description payload_too_large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description overloaded and tenant rate limits; retry after `Retry-After` seconds */
+            429: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description internal */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description not_implemented: this server was built or configured without the feature (an embedding provider, s3, postgres); not retryable */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description upstream_error: a provider the server called (embedding) failed; retry after `Retry-After` seconds */
+            502: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+            /** @description unavailable; retry after `Retry-After` seconds */
+            503: {
+                headers: {
+                    /** @description Seconds to wait before retrying. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ErrorResponse"];
+                };
+            };
+        };
+    };
+    KoshaService_ReadDocument: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                namespace: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["KoshaServiceReadDocumentBody"];
+            };
+        };
+        responses: {
+            /** @description A successful response. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["v1ReadDocumentResponse"];
                 };
             };
             /** @description invalid_argument, invalid_query */

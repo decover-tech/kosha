@@ -329,6 +329,10 @@ pub(super) fn route_inner(
         return handle_delete_with_ns(&ns, tenant, body, state);
     }
 
+    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/read") {
+        return crate::doc_read::handle_read_with_ns(&ns, tenant, body, state);
+    }
+
     if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/exists") {
         return handle_exists_with_ns(&ns, tenant, body, state);
     }

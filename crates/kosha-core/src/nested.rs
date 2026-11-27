@@ -178,6 +178,7 @@ fn filter_paths<'a>(clause: &'a FilterClause, out: &mut Vec<&'a str>) {
         FilterClause::Exists { exists } => out.push(&exists.field),
         FilterClause::GeoDistance { geo_distance } => out.push(&geo_distance.field),
         FilterClause::Prefix { prefix } => out.push(&prefix.field),
+        FilterClause::Glob { glob } => out.push(&glob.field),
         FilterClause::MatchAll { .. } => {}
         FilterClause::Bool { bool: b } => {
             for c in b.must.iter().chain(&b.should).chain(&b.must_not) {
