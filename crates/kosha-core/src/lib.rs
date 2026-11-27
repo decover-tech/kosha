@@ -1037,14 +1037,18 @@ fn glob_regex(pattern: &str, case_insensitive: bool) -> Result<regex::Regex, Str
             .copied()
             .ok_or_else(|| "dangling `\\` at the end".to_string())
     };
-    let mut re = String::from(if case_insensitive { "(?i)^" } else { "^" });
+    // `(?s)`: a value may hold newlines, and only `/` separates components.
+    let mut re = String::from(if case_insensitive { "(?is)^" } else { "(?s)^" });
     // `Some(at_component_start)` inside `{...}`: whether the group starts
     // a path component, as each alternative then does.
     let mut alternate: Option<bool> = None;
+    // Whether the next token starts a path component.
+    let mut at_component_start = true;
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
         i += 1;
+        let starts_component = std::mem::replace(&mut at_component_start, false);
         match c {
             '\\' => {
                 let next = escaped(i)?;
@@ -1053,21 +1057,14 @@ fn glob_regex(pattern: &str, case_insensitive: bool) -> Result<regex::Regex, Str
             }
             '*' if chars.get(i) == Some(&'*') => {
                 i += 1;
-                let starts_component = match i.checked_sub(3).map(|p| chars[p]) {
-                    None | Some('/') => true,
-                    Some('{' | ',') => alternate == Some(true),
-                    Some(_) => false,
-                };
                 let next = chars.get(i).copied();
                 let ends_pattern = next.is_none()
                     || (alternate.is_some()
                         && matches!(next, Some(',' | '}'))
-                        && chars[i..]
-                            .iter()
-                            .position(|&c| c == '}')
-                            .is_some_and(|close| i + close + 1 == chars.len()));
+                        && closing_brace(&chars, i).is_some_and(|close| close + 1 == chars.len()));
                 if starts_component && next == Some('/') {
                     i += 1;
+                    at_component_start = true;
                     re.push_str("(?:.*/)?");
                 } else if starts_component && ends_pattern {
                     re.push_str(".*");
@@ -1126,10 +1123,18 @@ fn glob_regex(pattern: &str, case_insensitive: bool) -> Result<regex::Regex, Str
                 return Err("nested `{` alternates are not supported".into())
             }
             '{' => {
-                alternate = Some(i == 1 || chars[i - 2] == '/');
+                alternate = Some(starts_component);
+                at_component_start = starts_component;
                 re.push_str("(?:");
             }
-            ',' if alternate.is_some() => re.push('|'),
+            ',' if alternate.is_some() => {
+                at_component_start = alternate == Some(true);
+                re.push('|');
+            }
+            '/' => {
+                at_component_start = true;
+                re.push('/');
+            }
             '}' if alternate.is_some() => {
                 alternate = None;
                 re.push(')');
@@ -1146,6 +1151,18 @@ fn glob_regex(pattern: &str, case_insensitive: bool) -> Result<regex::Regex, Str
         .size_limit(1 << 20)
         .build()
         .map_err(|e| e.to_string())
+}
+
+/// Index of the unescaped `}` closing the alternate group open at `from`.
+fn closing_brace(chars: &[char], mut from: usize) -> Option<usize> {
+    while from < chars.len() {
+        match chars[from] {
+            '\\' => from += 2,
+            '}' => return Some(from),
+            _ => from += 1,
+        }
+    }
+    None
 }
 
 /// One character as a literal inside a regex class.
