@@ -14,7 +14,8 @@ env:
 
 jobs:
   tachyon-warm:
-    runs-on: tachyon-ubuntu-24.04-4x
+    # "prebuilt" keeps this job off tachyon-cold's runner (GitHub gives a job any runner whose labels cover its own).
+    runs-on: [tachyon-ubuntu-24.04-4x, prebuilt]
     env:
       AGENT_TOOLSDIRECTORY: /opt/hostedtoolcache
     steps:
