@@ -9,6 +9,9 @@ use roaring::RoaringBitmap;
 use crate::index::TrigramIndex;
 use crate::plan::{has_newline_literal, parse, plan_hir, TrigramQuery};
 
+/// How often verification checks `max_time` inside a document.
+const TIME_CHECK_LINES: usize = 1024;
+
 /// Limits on one grep. Documents are read in id order, so a truncated
 /// result is the deterministic prefix of the full one.
 #[derive(Clone, Debug, Default)]
@@ -160,8 +163,14 @@ impl<'a> Grep<'a> {
             bytes_read: 0,
             truncated: None,
         };
+        let full = |out: &GrepOutcome| opts.max_matches.is_some_and(|m| out.matches.len() >= m);
+        let late = || opts.max_time.is_some_and(|t| start.elapsed() >= t);
         'docs: for doc in &candidates {
-            if opts.max_time.is_some_and(|t| start.elapsed() >= t) {
+            if full(&out) {
+                out.truncated = Some(Truncation::Matches);
+                break;
+            }
+            if late() {
                 out.truncated = Some(Truncation::Time);
                 break;
             }
@@ -175,11 +184,18 @@ impl<'a> Grep<'a> {
             out.docs_read += 1;
             out.bytes_read += text.len() as u64;
             for (i, line) in lines(text).enumerate() {
+                // Stop at the limit rather than reading on for a match that
+                // would only be dropped; and watch the clock inside a large
+                // document, every `TIME_CHECK_LINES` lines.
+                if full(&out) {
+                    out.truncated = Some(Truncation::Matches);
+                    break 'docs;
+                }
+                if i % TIME_CHECK_LINES == TIME_CHECK_LINES - 1 && late() {
+                    out.truncated = Some(Truncation::Time);
+                    break 'docs;
+                }
                 if re.is_match(line) {
-                    if opts.max_matches.is_some_and(|m| out.matches.len() >= m) {
-                        out.truncated = Some(Truncation::Matches);
-                        break 'docs;
-                    }
                     out.matches.push(GrepMatch {
                         doc,
                         line_number: i as u64 + 1,
@@ -294,6 +310,50 @@ mod tests {
         assert_eq!((o.truncated, o.docs_read), (Some(Truncation::Time), 0));
         let o = run(r"\w+", GrepOptions::default());
         assert_eq!((o.truncated, o.candidates), (None, 5));
+        // Reaching the limit stops reading: `fn main` is the first line.
+        let o = run(
+            r"\w+",
+            GrepOptions {
+                max_matches: Some(1),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            (o.truncated, o.docs_read, o.matches.len()),
+            (Some(Truncation::Matches), 1, 1)
+        );
+        // A limit met by the very last line leaves nothing unverified.
+        let o = run(
+            "cole",
+            GrepOptions {
+                max_matches: Some(1),
+                ..Default::default()
+            },
+        );
+        assert_eq!((o.truncated, o.candidates, o.matches.len()), (None, 1, 1));
+    }
+
+    #[test]
+    fn time_budget_applies_inside_a_document() {
+        let doc = b"x\n".repeat(10 * TIME_CHECK_LINES);
+        let mut idx = TrigramIndex::new();
+        idx.add("big", &doc);
+        let o = Grep::new(&idx)
+            .run(
+                "x",
+                &GrepOptions {
+                    max_time: Some(Duration::from_millis(50)),
+                    ..Default::default()
+                },
+                |_| {
+                    std::thread::sleep(Duration::from_millis(100));
+                    Ok::<_, io::Error>(doc.as_slice())
+                },
+            )
+            .unwrap();
+        // The deadline passes while the document is fetched.
+        assert_eq!(o.truncated, Some(Truncation::Time));
+        assert_eq!((o.docs_read, o.matches.len()), (1, TIME_CHECK_LINES - 1));
     }
 
     #[test]
