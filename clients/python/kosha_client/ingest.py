@@ -37,6 +37,8 @@ from .native import KoshaConfigError, ns_path
 
 PAGE_BREAK = "\f"
 BATCH = 64
+# Well under the server's default 64 MiB request limit (KOSHA_MAX_BODY_BYTES).
+MAX_REQUEST_BYTES = 8 << 20
 # A PDF page with no non-space characters has no text layer.
 _MIN_PAGE_CHARS = 1
 
@@ -336,8 +338,8 @@ def ingest(
                 report.indexed += 1
             except Exception as e:  # noqa: BLE001 - one bad file must not stop the folder
                 report.failed[path] = f"{type(e).__name__}: {e}"
-        if docs:
-            transport.request("POST", ns_path(namespace, "documents"), {"documents": docs})
+        for chunk in _chunks(docs):
+            transport.request("POST", ns_path(namespace, "documents"), {"documents": chunk})
         if stale:
             # Pages past each file's new page count, from an earlier and
             # longer version. Only this ingester's own page records.
@@ -373,6 +375,22 @@ def ingest(
     if report.indexed:
         transport.request("POST", ns_path(namespace, "flush"), {})
     return report
+
+
+def _chunks(docs: list[dict]) -> Iterator[list[dict]]:
+    """``docs`` in write requests of at most ``MAX_REQUEST_BYTES`` of JSON
+    each (a single larger document goes alone)."""
+    chunk: list[dict] = []
+    size = 0
+    for doc in docs:
+        n = len(json.dumps(doc).encode())
+        if chunk and size + n > MAX_REQUEST_BYTES:
+            yield chunk
+            chunk, size = [], 0
+        chunk.append(doc)
+        size += n
+    if chunk:
+        yield chunk
 
 
 def _known_hashes(

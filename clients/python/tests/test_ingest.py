@@ -231,3 +231,16 @@ def test_iter_files_skips_symlinks_out_of_the_folder(tmp_path):
     (root / "leak.txt").symlink_to(outside)
     (root / "alias.txt").symlink_to(root / "a.txt")
     assert [p.name for p in iter_files(root)] == ["a.txt", "alias.txt"]
+
+
+def test_ingest_splits_writes_by_request_size(tmp_path, monkeypatch):
+    from kosha_client import ingest as ingest_mod
+
+    for i in range(5):
+        (tmp_path / f"{i}.txt").write_text("x" * 1000)
+    monkeypatch.setattr(ingest_mod, "MAX_REQUEST_BYTES", 3000)
+    c = KoshaClient("http://kosha.test", api_key="k")
+    c._transport = t = FakeTransport()
+    assert ingest(c, "docs", tmp_path).indexed == 5
+    writes = [len(b["documents"]) for _, p, b in t.calls if p.endswith("/documents")]
+    assert writes == [2, 2, 1]
