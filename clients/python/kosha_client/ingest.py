@@ -316,7 +316,7 @@ def ingest(
         pending.append((kosha_path(root, file, prefix), file))
     for i in range(0, len(pending), BATCH):
         batch = pending[i : i + BATCH]
-        known = {} if force else _known_hashes(transport, namespace, [p for p, _ in batch])
+        known = {} if force else _known_hashes(transport, namespace, [p for p, _ in batch], per_page)
         docs: list[dict] = []
         stale: list[tuple[str, int]] = []
         for path, file in batch:
@@ -329,7 +329,7 @@ def ingest(
                 docs.extend(
                     build_documents(path, extracted, data, file.stat().st_mtime, source, per_page)
                 )
-                if per_page and path in known:
+                if per_page:
                     stale.append((path, len(extracted.pages)))
                 if extracted.scanned:
                     report.scanned.append(path)
@@ -338,7 +338,9 @@ def ingest(
                 report.failed[path] = f"{type(e).__name__}: {e}"
         if docs:
             transport.request("POST", ns_path(namespace, "documents"), {"documents": docs})
-        for path, pages in stale:
+        if stale:
+            # Pages past each file's new page count, from an earlier and
+            # longer version. Only this ingester's own page records.
             transport.request(
                 "POST",
                 ns_path(namespace, "delete"),
@@ -346,8 +348,23 @@ def ingest(
                     "filter": {
                         "bool": {
                             "must": [
-                                {"term": {"path": path}},
-                                {"range": {"page": {"gt": str(pages)}}},
+                                {"term": {"source": source}},
+                                {"exists": {"field": "page"}},
+                                {
+                                    "bool": {
+                                        "should": [
+                                            {
+                                                "bool": {
+                                                    "must": [
+                                                        {"term": {"path": path}},
+                                                        {"range": {"page": {"gt": str(pages)}}},
+                                                    ]
+                                                }
+                                            }
+                                            for path, pages in stale
+                                        ]
+                                    }
+                                },
                             ]
                         }
                     }
@@ -358,11 +375,16 @@ def ingest(
     return report
 
 
-def _known_hashes(transport: Any, namespace: str, paths: list[str]) -> dict[str, str]:
+def _known_hashes(
+    transport: Any, namespace: str, paths: list[str], per_page: bool = False
+) -> dict[str, str]:
+    # One record per path: page 1 per-page, the page-less record otherwise,
+    # so a batch never needs more than `len(paths)` hits.
+    one = {"term": {"page": "1"}} if per_page else {"bool": {"must_not": [{"exists": {"field": "page"}}]}}
     body = {
         "query_text": "",
-        "max_results": 1000,
-        "filter": {"terms": {"path": paths}},
+        "max_results": len(paths),
+        "filter": {"bool": {"must": [{"terms": {"path": paths}}, one]}},
         "source_includes": ["path", "content_sha256"],
     }
     try:

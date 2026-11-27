@@ -155,12 +155,14 @@ class FakeTransport:
                 self.stored[d["id"]] = {f["name"]: f["value"] for f in d["fields"]}
             return {"indexed_count": len(body["documents"])}
         if path.endswith("/search"):
-            wanted = set(body["filter"]["terms"]["path"])
+            paths, one = body["filter"]["bool"]["must"]
+            wanted = set(paths["terms"]["path"])
+            page = one.get("term", {}).get("page")
             return {
                 "results": [
                     {"doc_id": i, "fields": [{"name": k, "value": v} for k, v in f.items()]}
                     for i, f in self.stored.items()
-                    if f["path"] in wanted
+                    if f["path"] in wanted and f.get("page") == page
                 ]
             }
         return {}
@@ -207,11 +209,18 @@ def test_per_page_reingest_deletes_dropped_pages(tmp_path):
     assert len(t.stored) == 3
     f.write_bytes(make_pdf(["one"]))
     ingest(c, "docs", tmp_path, per_page=True)
-    (delete,) = [b for _, p, b in t.calls if p.endswith("/delete")]
-    assert delete["filter"]["bool"]["must"] == [
-        {"term": {"path": "/a.pdf"}},
-        {"range": {"page": {"gt": "1"}}},
+    deletes = [b for _, p, b in t.calls if p.endswith("/delete")]
+    assert len(deletes) == 2  # the first run's is a no-op
+    source, exists, paths = deletes[-1]["filter"]["bool"]["must"]
+    assert source == {"term": {"source": "kosha-ingest"}}
+    assert exists == {"exists": {"field": "page"}}
+    assert paths["bool"]["should"] == [
+        {"bool": {"must": [{"term": {"path": "/a.pdf"}}, {"range": {"page": {"gt": "1"}}}]}}
     ]
+    # --force still drops the pages past the new end.
+    t.calls.clear()
+    ingest(c, "docs", tmp_path, per_page=True, force=True)
+    assert [p for _, p, _ in t.calls if p.endswith("/delete")] == ["v1/namespaces/docs/delete"]
 
 
 def test_iter_files_skips_symlinks_out_of_the_folder(tmp_path):
