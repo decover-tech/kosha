@@ -15609,6 +15609,12 @@ mod tests {
             &state,
         );
         assert!(found.contains("\"total_hits\":2"), "{found}");
+        let globbed = handle_search_post(
+            br#"{"namespace":"prefix-delete","query_text":"hello",
+                 "filter":{"glob":{"path":"/matters/*/[ab]"}}}"#,
+            &state,
+        );
+        assert!(globbed.contains("\"total_hits\":2"), "{globbed}");
         let numeric = handle_search_post(
             br#"{"namespace":"prefix-delete","query_text":"hello",
                  "filter":{"prefix":{"page":"1"}}}"#,
@@ -15626,6 +15632,12 @@ mod tests {
             r#"{"prefix": {"path": {"case_insensitive": true}}}"#,
             r#"{"prefix": {"path": {"value": "/a", "case_insensitive": 1}}}"#,
             r#"{"bool": {"must_not": [{"prefix": {"path": ["/a"]}}]}}"#,
+            // #585: the same rules for `glob`, plus a malformed pattern.
+            r#"{"glob": {"path": 7}}"#,
+            r#"{"glob": {"path": "/matters/[2026"}}"#,
+            r#"{"bool": {"must_not": [{"glob": {"path": "/a/{b"}}]}}"#,
+            r#"{"glob": {"path": {"value": "/a/*", "boost": 1}}}"#,
+            r#"{"glob": {"page": "1*"}}"#,
             // Numeric: parses, but the data cannot answer it.
             r#"{"prefix": {"page": "1"}}"#,
             r#"{"bool": {"must_not": [{"prefix": {"page": "1"}}]}}"#,

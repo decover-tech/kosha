@@ -703,6 +703,11 @@ pub enum FilterClause {
     Prefix {
         prefix: PrefixFilter,
     },
+    /// The field's value (or one of its list elements) matches a
+    /// gitignore-style glob. See [`GlobFilter`].
+    Glob {
+        glob: GlobFilter,
+    },
     /// A `GeoPoint` field within `distance` of a point (issue #212).
     GeoDistance {
         geo_distance: GeoDistanceFilter,
@@ -790,6 +795,7 @@ impl FilterClause {
             Self::Exists { exists } => f(&exists.field),
             Self::GeoDistance { geo_distance } => f(&geo_distance.field),
             Self::Prefix { prefix } => f(&prefix.field),
+            Self::Glob { glob } => f(&glob.field),
             Self::MatchAll { .. } => {}
             Self::Bool { bool } => {
                 for clause in bool.must.iter().chain(&bool.must_not).chain(&bool.should) {
@@ -856,74 +862,190 @@ impl Serialize for PrefixFilter {
 
 impl<'de> Deserialize<'de> for PrefixFilter {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        use serde::de::Error as _;
         let value = serde_json::Value::deserialize(deserializer)?;
-        let obj = value.as_object().ok_or_else(|| {
-            D::Error::custom(
-                "prefix clause must be an object with exactly one field, e.g. \
-                 {\"prefix\": {\"path\": \"/a/\"}}",
-            )
-        })?;
-        let mut entries = obj.iter();
-        let (field, body) = entries.next().ok_or_else(|| {
-            D::Error::custom("prefix clause names no field; expected exactly one")
-        })?;
-        if let Some((extra, _)) = entries.next() {
-            return Err(D::Error::custom(format!(
-                "prefix clause must name exactly one field, found `{field}` and \
-                 `{extra}`; wrap multiple clauses in a `bool`"
-            )));
-        }
-        let (prefix, case_insensitive) = match body {
-            serde_json::Value::String(s) => (s.clone(), false),
-            serde_json::Value::Object(opts) => {
-                let mut prefix = None;
-                let mut case_insensitive = false;
-                for (key, v) in opts {
-                    match key.as_str() {
-                        "value" => {
-                            prefix = Some(
-                                v.as_str()
-                                    .ok_or_else(|| {
-                                        D::Error::custom(format!(
-                                            "prefix `{field}`.value must be a string, got {v}"
-                                        ))
-                                    })?
-                                    .to_owned(),
-                            )
-                        }
-                        "case_insensitive" => {
-                            case_insensitive = v.as_bool().ok_or_else(|| {
-                                D::Error::custom(format!(
-                                    "prefix `{field}`.case_insensitive must be a boolean, got {v}"
-                                ))
-                            })?
-                        }
-                        other => {
-                            return Err(D::Error::custom(format!(
-                                "unknown prefix option `{other}` for field `{field}`, \
-                                 expected: value, case_insensitive"
-                            )))
-                        }
-                    }
-                }
-                let prefix = prefix.ok_or_else(|| {
-                    D::Error::custom(format!("prefix `{field}` is missing `value`"))
-                })?;
-                (prefix, case_insensitive)
-            }
-            other => {
-                return Err(D::Error::custom(format!(
-                    "prefix `{field}` must be a string or {{\"value\": ..., \
-                     \"case_insensitive\": ...}}, got {other}"
-                )))
-            }
-        };
+        let (field, value, case_insensitive) =
+            parse_field_pattern(&value, "prefix", "/a/").map_err(serde::de::Error::custom)?;
         Ok(PrefixFilter {
-            field: field.clone(),
-            value: prefix,
+            field,
+            value,
             case_insensitive,
         })
+    }
+}
+
+/// Parses the body shared by `prefix` and `glob`: exactly one field whose
+/// value is a string, or `{"value": .., "case_insensitive": ..}`. Strict
+/// (issue #170): anything else is an error, never a clause that matches
+/// more than was asked for.
+fn parse_field_pattern(
+    value: &serde_json::Value,
+    clause: &str,
+    example: &str,
+) -> Result<(String, String, bool), String> {
+    let obj = value.as_object().ok_or_else(|| {
+        format!(
+            "{clause} clause must be an object with exactly one field, e.g. \
+             {{\"{clause}\": {{\"path\": \"{example}\"}}}}"
+        )
+    })?;
+    let mut entries = obj.iter();
+    let (field, body) = entries
+        .next()
+        .ok_or_else(|| format!("{clause} clause names no field; expected exactly one"))?;
+    if let Some((extra, _)) = entries.next() {
+        return Err(format!(
+            "{clause} clause must name exactly one field, found `{field}` and \
+             `{extra}`; wrap multiple clauses in a `bool`"
+        ));
+    }
+    let (pattern, case_insensitive) = match body {
+        serde_json::Value::String(s) => (s.clone(), false),
+        serde_json::Value::Object(opts) => {
+            let mut pattern = None;
+            let mut case_insensitive = false;
+            for (key, v) in opts {
+                match key.as_str() {
+                    "value" => {
+                        pattern = Some(
+                            v.as_str()
+                                .ok_or_else(|| {
+                                    format!("{clause} `{field}`.value must be a string, got {v}")
+                                })?
+                                .to_owned(),
+                        )
+                    }
+                    "case_insensitive" => {
+                        case_insensitive = v.as_bool().ok_or_else(|| {
+                            format!(
+                                "{clause} `{field}`.case_insensitive must be a boolean, got {v}"
+                            )
+                        })?
+                    }
+                    other => {
+                        return Err(format!(
+                            "unknown {clause} option `{other}` for field `{field}`, \
+                             expected: value, case_insensitive"
+                        ))
+                    }
+                }
+            }
+            let pattern =
+                pattern.ok_or_else(|| format!("{clause} `{field}` is missing `value`"))?;
+            (pattern, case_insensitive)
+        }
+        other => {
+            return Err(format!(
+                "{clause} `{field}` must be a string or {{\"value\": ..., \
+                 \"case_insensitive\": ...}}, got {other}"
+            ))
+        }
+    };
+    Ok((field.clone(), pattern, case_insensitive))
+}
+
+/// Body of a `glob` clause: one string field and a gitignore-style glob
+/// its value must match in full.
+///
+/// ```json
+/// {"glob": {"path": "**/contracts/**/*.pdf"}}
+/// {"glob": {"path": {"value": "/Matters/*/notes.txt", "case_insensitive": true}}}
+/// ```
+///
+/// Syntax is [`globset`]'s with `/` as the separator: `*` and `?` never
+/// match `/`, `**` matches any number of path components, `[abc]` /
+/// `[!a-z]` are classes, `{a,b}` alternates, and `\` escapes. Case-
+/// sensitive by default, like [`PrefixFilter`]; `case_insensitive: true`
+/// folds both sides. A malformed glob is a parse error (a 400).
+#[derive(Debug, Clone)]
+pub struct GlobFilter {
+    pub field: String,
+    pub pattern: String,
+    pub case_insensitive: bool,
+    matcher: globset::GlobMatcher,
+    literal_prefix: String,
+}
+
+impl PartialEq for GlobFilter {
+    fn eq(&self, other: &Self) -> bool {
+        self.field == other.field
+            && self.pattern == other.pattern
+            && self.case_insensitive == other.case_insensitive
+    }
+}
+
+impl Eq for GlobFilter {}
+
+impl GlobFilter {
+    pub fn new(
+        field: impl Into<String>,
+        pattern: impl Into<String>,
+        case_insensitive: bool,
+    ) -> Result<Self, String> {
+        let field = field.into();
+        let pattern = pattern.into();
+        let matcher = globset::GlobBuilder::new(&pattern)
+            .literal_separator(true)
+            .backslash_escape(true)
+            .case_insensitive(case_insensitive)
+            .empty_alternates(true)
+            .build()
+            .map_err(|e| format!("glob `{field}`: invalid pattern {pattern:?}: {e}"))?
+            .compile_matcher();
+        // Every match starts with the text before the first special
+        // character, so a sorted dictionary can seek to it. Folding case
+        // breaks byte order, so a case-insensitive glob has none.
+        let literal_prefix = if case_insensitive {
+            String::new()
+        } else {
+            pattern
+                .split(['*', '?', '[', '{', '\\'])
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        };
+        Ok(Self {
+            field,
+            pattern,
+            case_insensitive,
+            matcher,
+            literal_prefix,
+        })
+    }
+
+    /// Whether one value (not a list's JSON text) matches the whole glob.
+    pub fn is_match(&self, value: &str) -> bool {
+        self.matcher.is_match(value)
+    }
+
+    /// A prefix every matching value starts with (empty when there is none
+    /// to use, e.g. a case-insensitive glob or one starting with `*`).
+    pub fn literal_prefix(&self) -> &str {
+        &self.literal_prefix
+    }
+}
+
+impl Serialize for GlobFilter {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+        let mut map = serializer.serialize_map(Some(1))?;
+        if self.case_insensitive {
+            map.serialize_entry(
+                &self.field,
+                &serde_json::json!({"value": self.pattern, "case_insensitive": true}),
+            )?;
+        } else {
+            map.serialize_entry(&self.field, &self.pattern)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for GlobFilter {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let (field, pattern, case_insensitive) =
+            parse_field_pattern(&value, "glob", "**/*.pdf").map_err(serde::de::Error::custom)?;
+        GlobFilter::new(field, pattern, case_insensitive).map_err(serde::de::Error::custom)
     }
 }
 
@@ -963,7 +1085,7 @@ impl<'de> Deserialize<'de> for FilterValue {
 }
 
 /// Clause keys `FilterClause` accepts, as reported in parse errors.
-const FILTER_CLAUSE_KEYS: [&str; 8] = [
+const FILTER_CLAUSE_KEYS: [&str; 9] = [
     "term",
     "terms",
     "range",
@@ -972,6 +1094,7 @@ const FILTER_CLAUSE_KEYS: [&str; 8] = [
     "exists",
     "geo_distance",
     "prefix",
+    "glob",
 ];
 
 /// Deserialized by dispatching on the clause's single key rather than with
@@ -1071,6 +1194,7 @@ impl<'de> Deserialize<'de> for FilterClause {
             "prefix" => Ok(FilterClause::Prefix {
                 prefix: body(inner)?,
             }),
+            "glob" => Ok(FilterClause::Glob { glob: body(inner)? }),
             other => {
                 let hint = match other {
                     "filter" | "must" | "must_not" | "should" | "minimum_should_match" => {
@@ -1080,7 +1204,8 @@ impl<'de> Deserialize<'de> for FilterClause {
                     "match" | "match_phrase" | "wildcard" | "regexp" => {
                         " — full-text and wildcard matching is not part of the \
                          filter language; use the query text instead (for a \
-                         keyword prefix, use the `prefix` filter clause)"
+                         keyword prefix or path pattern, use the `prefix` or \
+                         `glob` filter clause)"
                     }
                     _ => "",
                 };
@@ -3175,12 +3300,14 @@ pub fn segment_may_match(
         // A field with no bloom may still be a numeric column, so the
         // absence of a bloom cannot prove the field is absent. A bloom
         // answers "is this exact value present?", which says nothing about
-        // values that merely start with a prefix, so `prefix` never prunes.
+        // values that merely start with a prefix, so `prefix` and `glob`
+        // never prune.
         FilterClause::Range { .. }
         | FilterClause::MatchAll { .. }
         | FilterClause::Exists { .. }
         | FilterClause::GeoDistance { .. }
-        | FilterClause::Prefix { .. } => true,
+        | FilterClause::Prefix { .. }
+        | FilterClause::Glob { .. } => true,
     }
 }
 

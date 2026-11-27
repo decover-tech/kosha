@@ -97,6 +97,19 @@ pub fn check_filter_columns(
             }
             Ok(())
         }
+        FilterClause::Glob { glob } => {
+            if string_column(source, &glob.field)?.is_some() {
+                return Ok(());
+            }
+            for kind in [FilterColumnKind::Integer, FilterColumnKind::Float] {
+                if resolve_column(source, &glob.field, kind)?.is_some() {
+                    return Err(KoshaError::InvalidQuery(
+                        kosha_core::docset::glob_on_numeric_error(&glob.field),
+                    ));
+                }
+            }
+            Ok(())
+        }
         FilterClause::Bool { bool: b } => b
             .must
             .iter()
@@ -164,6 +177,30 @@ pub fn evaluate_filter_columns(
             }
             set
         }
+        FilterClause::Glob { glob } => {
+            // Every match starts with the glob's literal prefix, so only
+            // the dictionary range holding it is tested (all of it when
+            // there is no prefix). List terms sort by their JSON text, so
+            // they are tested separately, on their elements.
+            let mut set = DocSet::empty(doc_count);
+            match string_column(source, &glob.field)? {
+                Some(column) => {
+                    if let FilterColumn::String(c) = &*column {
+                        mark_globbed(&mut set, c, glob);
+                    }
+                }
+                None => {
+                    for kind in [FilterColumnKind::Integer, FilterColumnKind::Float] {
+                        if resolve_column(source, &glob.field, kind)?.is_some() {
+                            return Err(KoshaError::InvalidQuery(
+                                kosha_core::docset::glob_on_numeric_error(&glob.field),
+                            ));
+                        }
+                    }
+                }
+            }
+            set
+        }
         FilterClause::MatchAll { .. } => DocSet::full(doc_count),
         FilterClause::Exists { exists } => {
             let mut set = DocSet::empty(doc_count);
@@ -208,6 +245,31 @@ pub fn evaluate_filter_columns(
 }
 
 /// An empty list is "no value", as in OpenSearch.
+fn mark_globbed(set: &mut DocSet, column: &StringColumn, glob: &kosha_core::GlobFilter) {
+    let literal = glob.literal_prefix();
+    let range = if literal.is_empty() {
+        0..column.term_count() as u32
+    } else {
+        column.ordinal_range(Some((literal, true)), None)
+    };
+    for ord in range {
+        let term = column.term(ord);
+        if !term.starts_with(literal) {
+            break;
+        }
+        if kosha_core::docset::glob_matches(glob, term) {
+            column.for_each_doc(ord, |doc| set.insert(doc));
+        }
+    }
+    if !literal.is_empty() {
+        for &ord in &column.list_index().lists {
+            if kosha_core::docset::glob_matches(glob, column.term(ord)) {
+                column.for_each_doc(ord, |doc| set.insert(doc));
+            }
+        }
+    }
+}
+
 fn mark_string_exists(set: &mut DocSet, column: &StringColumn) {
     let empty = &column.list_index().empty;
     if empty.is_empty() {
@@ -692,6 +754,19 @@ mod tests {
             json!({"range": {"authors": {"gte": "[", "lt": "\\"}}}),
             json!({"range": {"codes": {"gte": "c-00100", "lt": "c-09000"}}}),
             json!({"range": {"codes": {"gte": "[", "lte": "c-00010"}}}),
+            json!({"glob": {"id": "id-0004?"}}),
+            json!({"glob": {"id": "id-000[1-3]*"}}),
+            json!({"glob": {"id": "*-0009{1,8}"}}),
+            json!({"glob": {"matterId": "m[!2]"}}),
+            json!({"glob": {"matterId": {"value": "M*", "case_insensitive": true}}}),
+            json!({"glob": {"matterId": "M*"}}),
+            json!({"glob": {"tags": "ur*"}}),
+            json!({"glob": {"tags": "\\[*"}}),
+            json!({"glob": {"tags": "**"}}),
+            json!({"glob": {"codes": "c-0001*"}}),
+            json!({"glob": {"authors": "*a*"}}),
+            json!({"glob": {"nope": "*"}}),
+            json!({"bool": {"must_not": [{"glob": {"id": "id-00*"}}]}}),
             json!({"match_all": {}}),
             json!({"bool": {}}),
             json!({"bool": {"must": [{"term": {"matterId": "m1"}}, {"range": {"page": {"lt": "50"}}}]}}),
