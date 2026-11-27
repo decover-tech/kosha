@@ -60,11 +60,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: stable
+      # The prebuild compiled with cargo's default incremental setting;
+      # rust-toolchain exports CARGO_INCREMENTAL=0, which is part of every
+      # workspace crate's fingerprint.
       - name: compile
         working-directory: ${{ env.KOSHA_DIR || github.workspace }}
+        env:
+          CARGO_INCREMENTAL: 1
+          CARGO_LOG: cargo::core::compiler::fingerprint=info
         run: cargo test --all-features --locked --no-run
       - name: test
         working-directory: ${{ env.KOSHA_DIR || github.workspace }}
+        env:
+          CARGO_INCREMENTAL: 1
         run: cargo test --all-features --locked
 
   tachyon-cold:
