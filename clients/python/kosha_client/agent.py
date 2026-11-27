@@ -129,7 +129,7 @@ class AgentTools:
     ) -> dict:
         """The exact number of documents matching ``query`` and ``filter``
         (every live document when both are empty)."""
-        body = self._body(query, filter, 0)
+        body = self._body(query, filter or _match_all(query), 0)
         body["exact_total_hits"] = True
         res = self._post(namespace, "search", body)
         return {"count": res.get("total_hits", 0), "relation": res.get("total_hits_relation", "eq")}
@@ -145,7 +145,7 @@ class AgentTools:
         ...) over the documents matching ``query`` and ``filter``."""
         if not isinstance(aggs, dict) or not aggs:
             raise KoshaConfigError("aggregate: `aggs` must be a non-empty object")
-        body = self._body(query, filter, 0)
+        body = self._body(query, filter or _match_all(query), 0)
         body["aggs"] = aggs
         res = self._post(namespace, "search", body)
         return {
@@ -257,6 +257,11 @@ class AgentTools:
         if raw.get("highlight"):
             hit["highlight"] = raw["highlight"]
         return hit
+
+
+def _match_all(query: str) -> dict | None:
+    # With no query text, a search matches only what a filter selects.
+    return None if query else {"match_all": {}}
 
 
 _VALUE_CLAUSES = ("term", "terms", "range", "prefix")

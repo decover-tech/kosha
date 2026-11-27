@@ -185,3 +185,13 @@ def test_numeric_filter_values_become_strings():
             "minimum_should_match": 1,
         }
     }
+
+
+def test_count_and_aggregate_everything():
+    t, tr = tools({"total_hits": 5})
+    assert t.count()["count"] == 5
+    assert tr.calls[-1][2]["filter"] == {"match_all": {}}
+    t.aggregate({"a": {"terms": {"field": "type"}}})
+    assert tr.calls[-1][2]["filter"] == {"match_all": {}}
+    t.count(query="nda")
+    assert "filter" not in tr.calls[-1][2]
