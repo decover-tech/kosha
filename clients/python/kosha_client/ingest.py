@@ -251,9 +251,16 @@ def iter_files(root: Path) -> Iterator[Path]:
                 continue
             # A symlink out of the folder would publish its target's
             # contents under the link's path.
-            if file.is_symlink() and not file.resolve().is_relative_to(real_root):
+            if file.is_symlink() and not _inside(file, real_root):
                 continue
             yield file
+
+
+def _inside(file: Path, real_root: Path) -> bool:
+    try:
+        return file.resolve().is_relative_to(real_root)
+    except (OSError, RuntimeError):  # a symlink loop
+        return False
 
 
 def kosha_path(root: Path, file: Path, prefix: str = "/") -> str:

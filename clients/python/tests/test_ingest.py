@@ -230,6 +230,7 @@ def test_iter_files_skips_symlinks_out_of_the_folder(tmp_path):
     (root / "a.txt").write_text("a")
     (root / "leak.txt").symlink_to(outside)
     (root / "alias.txt").symlink_to(root / "a.txt")
+    (root / "loop.txt").symlink_to(root / "loop.txt")
     assert [p.name for p in iter_files(root)] == ["a.txt", "alias.txt"]
 
 
