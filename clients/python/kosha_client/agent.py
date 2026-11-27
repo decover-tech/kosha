@@ -2,7 +2,8 @@
 
 ``AgentTools`` is the thin SDK behind the ``kosha-mcp`` server: one method
 per tool an agent calls (``search``, ``semantic_search``, ``filter``,
-``count``, ``aggregate``, ``branch``, ``list_branches``, ``index_documents``),
+``glob``, ``read``, ``count``, ``aggregate``, ``branch``, ``list_branches``,
+``index_documents``),
 each taking plain JSON-able arguments and returning plain dicts sized for a
 model's context window. Every hit carries its stable ``id`` and its ``path``
 (when the document has one), so the agent can filter or read it next.
@@ -20,6 +21,8 @@ DEFAULT_MAX_RESULTS = 10
 MAX_RESULTS_CAP = 100
 DEFAULT_SNIPPET_CHARS = 500
 DEFAULT_PATH_FIELD = "path"
+# The field ``kosha-ingest`` stores extracted text in.
+DEFAULT_TEXT_FIELD = "body"
 
 
 class AgentTools:
@@ -39,6 +42,7 @@ class AgentTools:
         max_results_cap: int = MAX_RESULTS_CAP,
         snippet_chars: int = DEFAULT_SNIPPET_CHARS,
         path_field: str = DEFAULT_PATH_FIELD,
+        text_field: str = DEFAULT_TEXT_FIELD,
     ) -> None:
         if client is None:
             from .client import KoshaClient
@@ -49,6 +53,7 @@ class AgentTools:
         self.max_results_cap = max_results_cap
         self.snippet_chars = snippet_chars
         self.path_field = path_field
+        self.text_field = text_field
 
     # ── Retrieval ─────────────────────────────────────────────────────────
 
@@ -135,6 +140,71 @@ class AgentTools:
         if search_after:
             body["search_after"] = [str(v) for v in search_after]
         return self._hits(namespace, body, filter, max_results, include_fields, keys)
+
+    def glob(
+        self,
+        pattern: str,
+        namespace: str | None = None,
+        case_insensitive: bool = False,
+        max_results: int = DEFAULT_MAX_RESULTS,
+        search_after: list | None = None,
+        include_fields: list[str] | None = None,
+    ) -> dict:
+        """Documents whose path matches the gitignore-style ``pattern``
+        (``/contracts/**/*.pdf``), in path order. Hits carry only ``id`` and
+        ``path`` unless ``include_fields`` names more; ``search_after`` pages."""
+        if not isinstance(pattern, str) or not pattern:
+            raise KoshaConfigError("glob: `pattern` must be a non-empty string")
+        clause: dict[str, Any] = {"value": pattern}
+        if case_insensitive:
+            clause["case_insensitive"] = True
+        return self.filter(
+            {"glob": {self.path_field: clause}},
+            namespace,
+            sort=[{self.path_field: {"order": "asc"}}],
+            max_results=max_results,
+            search_after=search_after,
+            include_fields=include_fields or [self.path_field],
+        )
+
+    def read(
+        self,
+        id: str | None = None,
+        path: str | None = None,
+        namespace: str | None = None,
+        field: str | None = None,
+        start_line: int | None = None,
+        end_line: int | None = None,
+        page: int | None = None,
+        byte_start: int | None = None,
+        byte_end: int | None = None,
+        max_bytes: int | None = None,
+    ) -> dict:
+        """One stored field of one document (by ``id`` or ``path``), whole or
+        as lines ``start_line``..``end_line`` (1-based, inclusive), one
+        ``page``, or bytes ``byte_start``..``byte_end``. A cut longer than
+        ``max_bytes`` comes back ``truncated``: read on from ``byte_end``."""
+        if (id is None) == (path is None):
+            raise KoshaConfigError("read: set exactly one of `id` and `path`")
+        body: dict[str, Any] = {"field": field or self.text_field}
+        if id is not None:
+            body["id"] = str(id)
+        else:
+            body["path"] = path
+            body["path_field"] = self.path_field
+        lines = start_line is not None or end_line is not None
+        byte_range = byte_start is not None or byte_end is not None
+        if lines + (page is not None) + byte_range > 1:
+            raise KoshaConfigError("read: set at most one of lines, `page` and bytes")
+        if lines:
+            body["lines"] = _range(start_line if start_line is not None else 1, end_line)
+        elif page is not None:
+            body["page"] = int(page)
+        elif byte_range:
+            body["bytes"] = _range(byte_start or 0, byte_end)
+        if max_bytes is not None:
+            body["max_bytes"] = int(max_bytes)
+        return self._post(namespace, "read", body)
 
     def count(
         self,
@@ -295,6 +365,13 @@ def _sort_values(raw: dict, keys: list[str]) -> list[str]:
             value = stored.get(key, "")
         values.append(str(value))
     return values
+
+
+def _range(start: int, end: int | None) -> dict:
+    out: dict[str, int] = {"start": int(start)}
+    if end is not None:
+        out["end"] = int(end)
+    return out
 
 
 def _match_all(query: str) -> dict | None:

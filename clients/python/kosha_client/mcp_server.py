@@ -19,10 +19,12 @@ from .agent import DEFAULT_MAX_RESULTS, AgentTools
 INSTRUCTIONS = """\
 Kosha is a search engine over the user's documents. Start with `search`
 (keywords, BM25) or `semantic_search` (meaning, vectors); narrow with
-`filter` (exact field conditions, e.g. {"prefix": {"path": "/contracts/2024/"}}),
-and size result sets with `count` / `aggregate` before paging through them.
-Every hit has an `id` and, when indexed with one, a `path`. Long field values
-are cut to a snippet; `truncated_fields` names them."""
+`filter` (exact field conditions, e.g. {"prefix": {"path": "/contracts/2024/"}})
+or `glob` (paths, e.g. "/contracts/**/*.pdf"), and size result sets with
+`count` / `aggregate` before paging through them. Every hit has an `id` and,
+when indexed with one, a `path`. Long field values are cut to a snippet
+(`truncated_fields` names them); `read` returns the full text, or a line,
+page or byte range of it."""
 
 READ_ONLY = {"readOnlyHint": True, "openWorldHint": False}
 
@@ -80,6 +82,45 @@ def build_server(tools: AgentTools, allow_writes: bool = False, **settings: Any)
         pages: pass the previous page's `next_search_after` as
         `search_after`."""
         return tools.filter(filter, namespace, sort, max_results, search_after, include_fields)
+
+    @server.tool(annotations=READ_ONLY)
+    def glob(
+        pattern: str,
+        namespace: str | None = None,
+        case_insensitive: bool = False,
+        max_results: int = DEFAULT_MAX_RESULTS,
+        search_after: list | None = None,
+        include_fields: list[str] | None = None,
+    ) -> dict:
+        """Documents whose path matches a gitignore-style glob, in path
+        order: `*`, `?` and [classes] stay within one directory, `**` spans
+        any number, {pdf,docx} is alternation. Returns ids and paths; page
+        with the previous page's `next_search_after` as `search_after`."""
+        return tools.glob(
+            pattern, namespace, case_insensitive, max_results, search_after, include_fields
+        )
+
+    @server.tool(annotations=READ_ONLY)
+    def read(
+        id: str | None = None,
+        path: str | None = None,
+        namespace: str | None = None,
+        field: str | None = None,
+        start_line: int | None = None,
+        end_line: int | None = None,
+        page: int | None = None,
+        byte_start: int | None = None,
+        byte_end: int | None = None,
+        max_bytes: int | None = None,
+    ) -> dict:
+        """Read one document by `id` or `path`: the whole text, lines
+        `start_line`..`end_line` (1-based, inclusive), one `page`, or bytes
+        `byte_start`..`byte_end`. `field` defaults to the text field. A cut
+        over `max_bytes` (default 64 KiB) is marked `truncated`; continue
+        with `byte_start` = the returned `byte_end`."""
+        return tools.read(
+            id, path, namespace, field, start_line, end_line, page, byte_start, byte_end, max_bytes
+        )
 
     @server.tool(annotations=READ_ONLY)
     def count(filter: dict | None = None, query: str = "", namespace: str | None = None) -> dict:

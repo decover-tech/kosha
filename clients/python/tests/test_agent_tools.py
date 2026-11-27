@@ -241,3 +241,53 @@ def test_filter_cursor_for_missing_fields_score_and_caller_cursors():
     assert tr.calls[-1][2]["sort"] == ["date"]
     t.filter({"exists": {"field": "x"}}, sort=["date"], search_after=["2024", "d7"], max_results=1)
     assert tr.calls[-1][2]["sort"] == ["date", {"_id": {"order": "asc"}}]
+
+
+def test_glob_lists_paths_in_order_and_pages():
+    hit = {"doc_id": "d1", "score": 0.0, "fields": [HIT["fields"][0]]}
+    t, tr = tools({"results": [hit], "total_hits": 4, "total_hits_relation": "eq"})
+    out = t.glob("/contracts/**/*.txt", case_insensitive=True, max_results=1)
+    body = tr.calls[-1][2]
+    assert body["filter"] == {
+        "glob": {"path": {"value": "/contracts/**/*.txt", "case_insensitive": True}}
+    }
+    assert body["sort"] == [{"path": {"order": "asc"}}, {"_id": {"order": "asc"}}]
+    assert body["source_includes"] == ["path"]
+    assert out["hits"] == [{"id": "d1", "score": 0.0, "path": "/contracts/2024/a.txt", "fields": {}}]
+    assert out["next_search_after"] == ["/contracts/2024/a.txt", "d1"]
+    t.glob("/a/*", search_after=out["next_search_after"])
+    assert tr.calls[-1][2]["search_after"] == ["/contracts/2024/a.txt", "d1"]
+    assert tr.calls[-1][2]["filter"] == {"glob": {"path": {"value": "/a/*"}}}
+    with pytest.raises(KoshaConfigError):
+        t.glob("")
+
+
+def test_read_bodies():
+    t, tr = tools({"text": "two", "start_line": 2})
+    assert t.read(id="d1", start_line=2, end_line=3) == {"text": "two", "start_line": 2}
+    method, path, body = tr.calls[-1]
+    assert (method, path) == ("POST", "v1/namespaces/docs/read")
+    assert body == {"field": "body", "id": "d1", "lines": {"start": 2, "end": 3}}
+    t.read(path="/a.pdf", page=3, field="content", namespace="other", max_bytes=100)
+    assert tr.calls[-1][1] == "v1/namespaces/other/read"
+    assert tr.calls[-1][2] == {
+        "field": "content",
+        "path": "/a.pdf",
+        "path_field": "path",
+        "page": 3,
+        "max_bytes": 100,
+    }
+    t.read(id="d1", byte_start=4096)
+    assert tr.calls[-1][2]["bytes"] == {"start": 4096}
+    t.read(id="d1", end_line=5)
+    assert tr.calls[-1][2]["lines"] == {"start": 1, "end": 5}
+    t.read(id="d1")
+    assert tr.calls[-1][2] == {"field": "body", "id": "d1"}
+
+
+def test_read_rejects_ambiguous_requests():
+    t, tr = tools()
+    for kwargs in ({}, {"id": "d1", "path": "/a"}, {"id": "d1", "page": 1, "start_line": 1}):
+        with pytest.raises(KoshaConfigError):
+            t.read(**kwargs)
+    assert tr.calls == []

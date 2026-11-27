@@ -32,7 +32,16 @@ def tool_names(s):
 
 def test_read_only_tools_by_default():
     s, _ = server()
-    assert tool_names(s) == ["aggregate", "count", "filter", "list_branches", "search", "semantic_search"]
+    assert tool_names(s) == [
+        "aggregate",
+        "count",
+        "filter",
+        "glob",
+        "list_branches",
+        "read",
+        "search",
+        "semantic_search",
+    ]
     for t in asyncio.run(s.list_tools()):
         assert t.description, t.name
         assert t.annotations.readOnlyHint is True, t.name

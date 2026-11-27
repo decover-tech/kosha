@@ -216,6 +216,8 @@ pass `--allow-remote`, which you should only do behind an authenticating proxy.
 | `search` | `POST /search` with `query_text` | BM25; optional `filter`, `fields`, `include_fields`. |
 | `semantic_search` | `POST /search` with `knn` | `query` (server-side embedder) or `vector`; `hybrid` fuses BM25 and kNN with RRF. |
 | `filter` | `POST /search` with only `filter` | Unscored; with `sort`, a full page returns `next_search_after` for the next one (`_id` breaks ties). |
+| `glob` | `POST /search` with a `glob` filter on `path`, sorted by `path` | `/contracts/**/*.pdf`; `case_insensitive`; hits are `id` and `path` unless `include_fields` names more; pages with `next_search_after`. |
+| `read` | `POST /read` | By `id` or `path`: whole, `start_line`/`end_line`, `page` or `byte_start`/`byte_end`. `field` defaults to `body` (`AgentTools(text_field=...)`), where `kosha-ingest` stores text. Over `max_bytes` (64 KiB) it is `truncated`: read on from `byte_end`. |
 | `count` | `POST /search`, `max_results: 0`, `exact_total_hits` | Returns `{"count", "relation"}`. |
 | `aggregate` | `POST /search` with `aggs` | No hits returned. |
 | `list_branches` | `GET /branches` | |
@@ -224,7 +226,8 @@ pass `--allow-remote`, which you should only do behind an authenticating proxy.
 
 Every hit is `{"id", "score", "path"?, "fields", "truncated_fields"?, "highlight"?}`. `id` is the
 stable document id. `path` is lifted out of the `path` field (`AgentTools(path_field=...)`) so an
-agent can narrow with `{"prefix": {"path": "/contracts/2024/"}}`. Hits per call are capped at 100
+agent can narrow with `{"prefix": {"path": "/contracts/2024/"}}` or `glob`, then `read` the
+full text. Hits per call are capped at 100
 (`max_results_cap`), each stored string is cut to 500 characters (`snippet_chars`) and named in
 `truncated_fields`, and vectors are never returned. Without `--allow-writes` every tool is
 annotated read-only, so a `read`-scoped key is enough. API errors reach the agent as tool errors
@@ -277,7 +280,8 @@ re-indexes it anyway. With `--per-page`, pages beyond a shortened file's new len
 ### Unreleased
 
 - `AgentTools` and the `kosha-mcp` MCP server (stdio and streamable HTTP), behind the new
-  `mcp` extra (issue #584). See "Agent tools and the MCP server".
+  `mcp` extra (issue #584), with `glob` (#585) and `read` (#586) tools. See "Agent tools and
+  the MCP server".
 - `kosha-ingest`: PDF/DOCX/HTML/text ingestion with page boundaries, behind the new `ingest`
   extra (issue #587). See "Ingesting PDF, DOCX and HTML files".
 
