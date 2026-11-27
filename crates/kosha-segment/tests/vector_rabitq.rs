@@ -475,3 +475,73 @@ fn compacting_a_rabitq_segment_rebuilds_from_full_precision_vectors() {
         }
     }
 }
+
+/// `rewrite_vector_column_rabitq` turns an f32 column into exactly the
+/// column the writer produces with RaBitQ from the same documents: same
+/// postings, centroids, radii and codes, byte for byte, and only the
+/// column's two files and the footer's quantization change.
+#[test]
+fn rewrite_vector_column_rabitq_matches_a_rabitq_write() {
+    let n = 600;
+    let f32_dir = temp_dir("reencode-f32");
+    let rq_dir = temp_dir("reencode-rq");
+    write(
+        &f32_dir,
+        VectorStoreMode::Sidecar,
+        VectorQuantizationConfig::default(),
+        docs(n),
+    );
+    write(&rq_dir, VectorStoreMode::Sidecar, rabitq_emb(), docs(n));
+    let before = files(&f32_dir);
+
+    let footer = SegmentReader::rewrite_vector_column_rabitq(&f32_dir, "emb").unwrap();
+    let (after, want) = (files(&f32_dir), files(&rq_dir));
+    for name in ["vector.idx", "vector.offsets"] {
+        assert_eq!(after[name], want[name], "{name}");
+        assert_ne!(after[name], before[name], "{name}");
+    }
+    for (name, bytes) in &before {
+        if !["vector.idx", "vector.offsets", "footer.json"].contains(&name.as_str()) {
+            assert_eq!(&after[name], bytes, "{name} must not change");
+        }
+    }
+    assert_eq!(after.len(), before.len(), "no temp file left behind");
+    let quantization = |name: &str| {
+        footer
+            .vector_fields
+            .iter()
+            .flatten()
+            .find(|m| m.name == name)
+            .unwrap()
+            .quantization
+    };
+    assert_eq!(quantization("emb"), VectorQuantization::RaBitQ);
+    assert_eq!(quantization("title_emb"), VectorQuantization::F32);
+    assert_eq!(
+        serde_json::to_value(SegmentReader::read_footer(&f32_dir).unwrap()).unwrap(),
+        serde_json::to_value(&footer).unwrap()
+    );
+
+    // The rewritten segment searches like the written one.
+    let reencoded = SegmentReader::open(f32_dir.clone()).unwrap();
+    let written = SegmentReader::open(rq_dir.clone()).unwrap();
+    for q in 0..5u64 {
+        let query = vector(7_000 + q, DIM);
+        assert_eq!(knn(&reencoded, &query, 10), knn(&written, &query, 10));
+    }
+
+    // Already RaBitQ, or no exact vectors to rescore from: refused, untouched.
+    let again = SegmentReader::rewrite_vector_column_rabitq(&f32_dir, "emb");
+    assert!(again.is_err());
+    assert_eq!(files(&f32_dir), after);
+    let inline_dir = temp_dir("reencode-inline");
+    write(
+        &inline_dir,
+        VectorStoreMode::Inline,
+        VectorQuantizationConfig::default(),
+        docs(n),
+    );
+    let inline = files(&inline_dir);
+    assert!(SegmentReader::rewrite_vector_column_rabitq(&inline_dir, "emb").is_err());
+    assert_eq!(files(&inline_dir), inline);
+}

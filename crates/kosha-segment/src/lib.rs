@@ -2662,70 +2662,107 @@ fn encode_vector_index_v2(
     version: u32,
 ) -> (Vec<u8>, Vec<u8>) {
     let total_count: u32 = postings.iter().map(|p| p.entries.len() as u32).sum();
-
-    let mut idx_buf = Vec::new();
-    idx_buf.extend_from_slice(&VECTOR_MAGIC.to_le_bytes());
-    idx_buf.extend_from_slice(&version.to_le_bytes());
-    idx_buf.extend_from_slice(&dim.to_le_bytes());
-    idx_buf.extend_from_slice(&total_count.to_le_bytes());
-
-    let mut offsets_buf = Vec::new();
-    offsets_buf.extend_from_slice(&VECTOR_OFFSETS_MAGIC.to_le_bytes());
-    offsets_buf.extend_from_slice(&version.to_le_bytes());
-    offsets_buf.extend_from_slice(&dim.to_le_bytes());
-    offsets_buf.extend_from_slice(&(postings.len() as u32).to_le_bytes());
-
-    let radius_aware = version >= RADIUS_AWARE_VECTOR_INDEX_VERSION;
-    let quantile_aware = has_radius_quantiles(version);
-    let quantized = is_i8_vector_index_version(version);
-    let rabitq = is_rabitq_vector_index_version(version)
-        .then(|| kosha_vector_spfresh::RaBitQRotation::new(dim as usize));
-    let mut codes: Vec<i8> = Vec::with_capacity(dim as usize);
-    let mut bits: Vec<u8> = Vec::new();
-    let mut distances = Vec::new();
+    let mut idx_buf = vector_file_header(VECTOR_MAGIC, version, dim, total_count);
+    let mut offsets_buf =
+        vector_file_header(VECTOR_OFFSETS_MAGIC, version, dim, postings.len() as u32);
+    let mut encoder = VectorPostingEncoder::new(dim, version);
     for p in postings {
-        let offset = idx_buf.len() as u64;
+        encoder.encode(p, 0, &mut idx_buf, &mut offsets_buf);
+    }
+    (idx_buf, offsets_buf)
+}
+
+/// `[magic][version][dim][count]`: the 16-byte header both `vector.idx`
+/// (count = entries) and `vector.offsets` (count = postings) start with.
+fn vector_file_header(magic: u32, version: u32, dim: u32, count: u32) -> Vec<u8> {
+    let mut header = Vec::with_capacity(VECTOR_IDX_HEADER_LEN);
+    for word in [magic, version, dim, count] {
+        header.extend_from_slice(&word.to_le_bytes());
+    }
+    header
+}
+
+/// Encodes one posting at a time into the v2 layout of `version`: the body
+/// of [`encode_vector_index_v2`], shared with
+/// [`SegmentReader::rewrite_vector_column_rabitq`], which streams a column
+/// posting by posting instead of holding all of it.
+struct VectorPostingEncoder {
+    radius_aware: bool,
+    quantile_aware: bool,
+    quantized: bool,
+    rabitq: Option<kosha_vector_spfresh::RaBitQRotation>,
+    codes: Vec<i8>,
+    bits: Vec<u8>,
+    distances: Vec<f32>,
+}
+
+impl VectorPostingEncoder {
+    fn new(dim: u32, version: u32) -> Self {
+        Self {
+            radius_aware: version >= RADIUS_AWARE_VECTOR_INDEX_VERSION,
+            quantile_aware: has_radius_quantiles(version),
+            quantized: is_i8_vector_index_version(version),
+            rabitq: is_rabitq_vector_index_version(version)
+                .then(|| kosha_vector_spfresh::RaBitQRotation::new(dim as usize)),
+            codes: Vec::with_capacity(dim as usize),
+            bits: Vec::new(),
+            distances: Vec::new(),
+        }
+    }
+
+    /// Appends `p`'s entries to `idx_buf` and its record to `offsets_buf`.
+    /// `idx_base` is how many bytes of `vector.idx` precede `idx_buf`, so
+    /// the record's offset is `idx_base + idx_buf.len()` (0 when `idx_buf`
+    /// is the whole file).
+    fn encode(
+        &mut self,
+        p: &kosha_vector_spfresh::PostingSnapshot,
+        idx_base: u64,
+        idx_buf: &mut Vec<u8>,
+        offsets_buf: &mut Vec<u8>,
+    ) {
+        let start = idx_buf.len();
         for (id, v) in &p.entries {
             idx_buf.extend_from_slice(&id.to_le_bytes());
-            if let Some(rotation) = &rabitq {
-                let code = kosha_vector_spfresh::encode_rabitq(rotation, v, &p.centroid, &mut bits);
+            if let Some(rotation) = &self.rabitq {
+                let code =
+                    kosha_vector_spfresh::encode_rabitq(rotation, v, &p.centroid, &mut self.bits);
                 idx_buf.extend_from_slice(&code.residual_norm.to_le_bytes());
                 idx_buf.extend_from_slice(&code.ip.to_le_bytes());
-                idx_buf.extend_from_slice(&bits);
-            } else if quantized {
-                let scale = kosha_vector_spfresh::quantize_i8(v, &mut codes);
+                idx_buf.extend_from_slice(&self.bits);
+            } else if self.quantized {
+                let scale = kosha_vector_spfresh::quantize_i8(v, &mut self.codes);
                 idx_buf.extend_from_slice(&scale.to_le_bytes());
-                idx_buf.extend(codes.iter().map(|&c| c as u8));
+                idx_buf.extend(self.codes.iter().map(|&c| c as u8));
             } else {
                 for &x in v {
                     idx_buf.extend_from_slice(&x.to_le_bytes());
                 }
             }
         }
-        let length = (idx_buf.len() as u64 - offset) as u32;
+        let offset = idx_base + start as u64;
+        let length = (idx_buf.len() - start) as u32;
 
         for &x in &p.centroid {
             offsets_buf.extend_from_slice(&x.to_le_bytes());
         }
         offsets_buf.extend_from_slice(&offset.to_le_bytes());
         offsets_buf.extend_from_slice(&length.to_le_bytes());
-        if quantile_aware {
-            distances.clear();
-            distances.extend(
+        if self.quantile_aware {
+            self.distances.clear();
+            self.distances.extend(
                 p.entries
                     .iter()
                     .map(|(_, v)| kosha_vector_spfresh::cosine_distance(&p.centroid, v)),
             );
-            let radii = PostingRadii::from_distances(&mut distances);
+            let radii = PostingRadii::from_distances(&mut self.distances);
             offsets_buf.extend_from_slice(&radii.max.to_le_bytes());
             offsets_buf.extend_from_slice(&radii.p50.to_le_bytes());
             offsets_buf.extend_from_slice(&radii.p90.to_le_bytes());
-        } else if radius_aware {
+        } else if self.radius_aware {
             offsets_buf.extend_from_slice(&p.radius.to_le_bytes());
         }
     }
-
-    (idx_buf, offsets_buf)
 }
 
 /// The first `VECTOR_IDX_HEADER_LEN` bytes of a `vector.idx` (fewer if the
@@ -9110,6 +9147,8 @@ pub struct KnnColumnCost {
     /// Entries are quantized, so a probe also rescores a shortlist from
     /// `doc_vectors.bin`.
     pub quantized: bool,
+    /// Entries are 1-bit RaBitQ codes (a subset of `quantized`).
+    pub rabitq: bool,
     /// Bytes an exact scan reads per passing document from
     /// `doc_vectors.bin`; `None` without that file, when an exact scan reads
     /// every posting instead.
@@ -9728,6 +9767,24 @@ fn rabitq_bound_shortlist_len(scored: &[(u32, f64)], errors: &[f32], k: usize) -
         .count()
 }
 
+/// [`exact_shortlist_len`], at least `rabitq_min` on a RaBitQ column (past
+/// its x8 cap: the floor is the point). See [`rabitq_rescore_min`].
+fn floored_shortlist_len(
+    scored: &[(u32, f64)],
+    errors: &[f32],
+    k: usize,
+    factor_len: usize,
+    rabitq: bool,
+    rabitq_min: usize,
+) -> usize {
+    let rule = exact_shortlist_len(scored, errors, k, factor_len, rabitq);
+    if rabitq {
+        rule.max(rabitq_min)
+    } else {
+        rule
+    }
+}
+
 fn exact_shortlist_len(
     scored: &[(u32, f64)],
     errors: &[f32],
@@ -9834,6 +9891,9 @@ pub struct SegmentReader {
     /// candidates at full precision (#210); `0` disables. See
     /// [`vector_rescore_factor`].
     vector_rescore_factor: usize,
+    /// Least candidates a RaBitQ column's probe rescores; see
+    /// [`SegmentReader::with_rabitq_rescore_min`].
+    rabitq_rescore_min: usize,
     /// Late-interaction fields (#205) opened so far, by footer index. Only
     /// success is cached, as for `doc_vectors`.
     multi_vectors: Mutex<HashMap<usize, Arc<multivec::MultiVectorIndex>>>,
@@ -9842,6 +9902,43 @@ pub struct SegmentReader {
     /// `vector_cache`, budgeted by
     /// `KOSHA_LATE_INTERACTION_POSTINGS_CACHE_MAX_BYTES`.
     multi_vector_cache: multivec::IvfPostingCache,
+}
+
+/// Default of [`SegmentReader::with_rabitq_rescore_min`]:
+/// `KOSHA_KNN_RABITQ_RESCORE_MIN` (experimental), the least candidates a
+/// RaBitQ column's probe rescores exactly, on top of its bound rule. Unset
+/// or `0` (the default): the rule alone. A block of identical vectors
+/// shares one 1-bit code and so one estimate error, which the epsilon0
+/// bound covers per estimate, not per block; a floor deeper than the block
+/// (`400` passed every set in exp-codes-rerank) rescores past it. Costs up
+/// to that many `doc_vectors.bin` reads per probed segment.
+pub fn rabitq_rescore_min() -> usize {
+    static MIN: OnceLock<usize> = OnceLock::new();
+    *MIN.get_or_init(|| {
+        match std::env::var("KOSHA_KNN_RABITQ_RESCORE_MIN")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+        {
+            None | Some("") => 0,
+            Some(raw) => match raw.parse() {
+                Ok(min) => {
+                    eprintln!(
+                        "INFO: KOSHA_KNN_RABITQ_RESCORE_MIN={min}: RaBitQ probes rescore at \
+                         least {min} candidates per segment (experimental)"
+                    );
+                    min
+                }
+                Err(_) => {
+                    eprintln!(
+                        "WARN: KOSHA_KNN_RABITQ_RESCORE_MIN={raw} not a non-negative integer — \
+                         using 0 (the bound rule alone)"
+                    );
+                    0
+                }
+            },
+        }
+    })
 }
 
 /// Default of [`SegmentReader::with_vector_rescore_factor`]:
@@ -9985,6 +10082,7 @@ impl SegmentReader {
             doc_vectors: Mutex::new(None),
             field_lengths: Mutex::new(HashMap::new()),
             vector_rescore_factor: vector_rescore_factor(),
+            rabitq_rescore_min: rabitq_rescore_min(),
             multi_vectors: Mutex::new(HashMap::new()),
             multi_vector_cache: PostingsCache::new(
                 late_interaction_postings_cache_max_bytes(),
@@ -10085,6 +10183,33 @@ impl SegmentReader {
     pub fn with_vector_rescore_factor(mut self, factor: usize) -> Self {
         self.vector_rescore_factor = factor;
         self
+    }
+
+    /// Override the least candidates a RaBitQ column's probe rescores
+    /// (`0`: the bound rule alone). Readers default to
+    /// `KOSHA_KNN_RABITQ_RESCORE_MIN` (see [`rabitq_rescore_min`]).
+    pub fn with_rabitq_rescore_min(mut self, min: usize) -> Self {
+        self.rabitq_rescore_min = min;
+        self
+    }
+
+    /// [`floored_shortlist_len`] at this reader's floor.
+    fn rescore_shortlist_len(
+        &self,
+        scored: &[(u32, f64)],
+        errors: &[f32],
+        k: usize,
+        factor_len: usize,
+        rabitq: bool,
+    ) -> usize {
+        floored_shortlist_len(
+            scored,
+            errors,
+            k,
+            factor_len,
+            rabitq,
+            self.rabitq_rescore_min,
+        )
     }
 
     /// Bytes the decoded vector-posting cache holds right now (#210
@@ -11321,8 +11446,25 @@ impl SegmentReader {
                 entries: bytes / entry_bytes as u64,
                 entry_bytes,
                 quantized: vi.quantized,
+                rabitq: vi.rabitq,
                 exact_vector_bytes: doc_vectors.then_some(4 * vi.dim),
             })
+        })
+    }
+
+    /// Bytes of `field`'s `vector.idx` a probe of `postings` (indexes into
+    /// the column, as [`KnnSegmentRanking::budgeted`] lists them) reads;
+    /// `None` exactly when [`Self::knn_centroid_count`] is `None`. An index
+    /// past the column counts nothing.
+    pub fn knn_postings_bytes(&self, field: &str, dim: usize, postings: &[u32]) -> Option<u64> {
+        self.with_knn_plan_index(field, dim, |vi| {
+            Some(
+                postings
+                    .iter()
+                    .filter_map(|&i| vi.ranges.get(i as usize))
+                    .map(|&(_, length)| length as u64)
+                    .sum(),
+            )
         })
     }
 
@@ -11725,7 +11867,8 @@ impl SegmentReader {
         hydration_limit: ShortlistHydrationLimit,
     ) -> Result<(Vec<(u32, f64)>, usize), KoshaError> {
         let factor_len = k.saturating_mul(self.vector_rescore_factor.max(1));
-        let limit = exact_shortlist_len(&probed.scored, &probed.errors, k, factor_len, rabitq);
+        let limit =
+            self.rescore_shortlist_len(&probed.scored, &probed.errors, k, factor_len, rabitq);
         let mut seqs: Vec<_> = top_k_by_score(probed.scored, limit)
             .into_iter()
             .map(|(seq, _)| seq)
@@ -12476,7 +12619,7 @@ impl SegmentReader {
             return scored;
         }
         let factor_len = k.saturating_mul(self.vector_rescore_factor);
-        let shortlist_len = exact_shortlist_len(&scored, errors, k, factor_len, vi.rabitq);
+        let shortlist_len = self.rescore_shortlist_len(&scored, errors, k, factor_len, vi.rabitq);
         let mut shortlist = top_k_by_score(scored, shortlist_len);
         if let Some(field) = vi.field.as_deref() {
             let rescored = self.rescore_exact(field, query, &mut shortlist);
@@ -13318,6 +13461,105 @@ impl SegmentReader {
         let mut footer = Self::read_footer(segment_dir)?;
         let store = Self::read_filters_any(segment_dir, &footer)?;
         footer.filter_blooms = Some(build_filter_blooms(&store.string_fields));
+        let json = serde_json::to_string_pretty(&footer)?;
+        atomic_write(&segment_dir.join("footer.json"), json.as_bytes())?;
+        Ok(footer)
+    }
+
+    /// Re-encode `field`'s f32 posting column as 1-bit RaBitQ codes, in
+    /// place: the idx header version goes 3 → 5 or 6 → 8, and every
+    /// posting keeps its members, centroid and radius, so the column is the
+    /// one [`SegmentWriter`] writes from the same postings with
+    /// `VectorQuantization::RaBitQ`. Rewrites the column's idx and offsets
+    /// files and `footer.json` only. For building an offline copy of a
+    /// namespace to compare the two encodings on the same layout
+    /// (`kosha-reencode-rabitq`); never run it on a segment a server has
+    /// open. Streams one posting at a time: the resident cost is one
+    /// posting plus the column's old and new `vector.offsets` (each ~6 KB
+    /// per posting at 1536-d: ~2 x 23 MB for a 3.7K-posting segment).
+    ///
+    /// Refused (nothing written) when the segment has no `doc_vectors.bin`
+    /// (a RaBitQ probe rescores its shortlist from it), or the column is
+    /// missing, already quantized, or of a version without radii.
+    pub fn rewrite_vector_column_rabitq(
+        segment_dir: &Path,
+        field: &str,
+    ) -> Result<Footer, KoshaError> {
+        let refuse = |why: &str| {
+            Err(KoshaError::InvalidQuery(format!(
+                "{}: cannot re-encode '{field}' as RaBitQ: {why}",
+                segment_dir.display()
+            )))
+        };
+        let mut footer = Self::read_footer(segment_dir)?;
+        if !footer.doc_vectors {
+            return refuse("no doc_vectors.bin to rescore from");
+        }
+        let Some(meta) = footer
+            .vector_fields
+            .iter_mut()
+            .flatten()
+            .find(|meta| meta.name == field)
+        else {
+            return refuse("no such vector column");
+        };
+        if meta.quantization != VectorQuantization::F32 || !meta.offsets {
+            return refuse("not a clustered f32 column");
+        }
+        let idx_path = segment_dir.join(meta.idx_file());
+        let offsets_path = segment_dir.join(meta.offsets_file());
+        let mut idx = fs::File::open(&idx_path)?;
+        let mut header = [0u8; VECTOR_IDX_HEADER_LEN];
+        idx.read_exact(&mut header)?;
+        let corrupt = || {
+            KoshaError::CorruptSegment(format!("{}: unreadable vector column", idx_path.display()))
+        };
+        let (dim, total_count, version) = parse_vector_idx_header(&header).ok_or_else(corrupt)?;
+        let target = match version {
+            RADIUS_AWARE_VECTOR_INDEX_VERSION => RABITQ_VECTOR_INDEX_VERSION,
+            QUANTILE_VECTOR_INDEX_VERSION => RABITQ_QUANTILE_VECTOR_INDEX_VERSION,
+            _ => return refuse(&format!("idx version {version} is not 3 or 6")),
+        };
+        let postings =
+            parse_vector_offsets(&fs::read(&offsets_path)?, dim, version).ok_or_else(corrupt)?;
+
+        let mut offsets =
+            vector_file_header(VECTOR_OFFSETS_MAGIC, target, dim, postings.len() as u32);
+        // The new idx is filled into a temp file renamed over the old one,
+        // so a hard-linked copy of the source keeps its f32 column.
+        kosha_core::atomic_write_with(&idx_path, |tmp| {
+            let mut out = std::io::BufWriter::new(fs::File::create(tmp)?);
+            let idx_header = vector_file_header(VECTOR_MAGIC, target, dim, total_count);
+            out.write_all(&idx_header)?;
+            let mut encoder = VectorPostingEncoder::new(dim, target);
+            let mut written = idx_header.len() as u64;
+            let (mut raw, mut body) = (Vec::new(), Vec::new());
+            for p in &postings {
+                raw.resize(p.length as usize, 0);
+                idx.seek(SeekFrom::Start(p.offset))?;
+                idx.read_exact(&mut raw)?;
+                let VectorPosting::F32 { ids, vectors, .. } =
+                    decode_posting_entries(&raw, dim, version)
+                else {
+                    return Err(std::io::Error::other("f32 column decoded as quantized"));
+                };
+                let snapshot = kosha_vector_spfresh::PostingSnapshot {
+                    centroid: p.centroid.clone(),
+                    entries: ids
+                        .into_iter()
+                        .zip(vectors.chunks_exact(dim as usize).map(<[f32]>::to_vec))
+                        .collect(),
+                    radius: p.radius,
+                };
+                body.clear();
+                encoder.encode(&snapshot, written, &mut body, &mut offsets);
+                out.write_all(&body)?;
+                written += body.len() as u64;
+            }
+            out.into_inner().map_err(|e| e.into_error())?.sync_all()
+        })?;
+        atomic_write(&offsets_path, &offsets)?;
+        meta.quantization = VectorQuantization::RaBitQ;
         let json = serde_json::to_string_pretty(&footer)?;
         atomic_write(&segment_dir.join("footer.json"), json.as_bytes())?;
         Ok(footer)
@@ -19606,5 +19848,184 @@ mod doc_store_zstd_tests {
             }
             let _ = fs::remove_dir_all(&dir);
         }
+    }
+}
+
+/// The `knn-085` failure (exp-codes-rerank §4) through the engine's own
+/// rescoring rule: a block of identical vectors shares one RaBitQ code,
+/// so its estimate error is perfectly correlated across the block.
+#[cfg(test)]
+mod rabitq_duplicate_cluster_tests {
+    use super::*;
+    use kosha_vector_spfresh::{RaBitQEstimator, RaBitQQuery, RaBitQRotation};
+
+    const DIM: usize = 1536;
+    const K: usize = 10;
+
+    fn vector(seed: u64) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
+        (0..DIM)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+            })
+            .collect()
+    }
+
+    fn unit(mut v: Vec<f32>) -> Vec<f32> {
+        kosha_vector_spfresh::normalize_in_place(&mut v);
+        v
+    }
+
+    /// A unit vector at cosine `c` from the unit `q`, its other component
+    /// along `seed`'s direction.
+    fn at(q: &[f32], c: f32, seed: u64) -> Vec<f32> {
+        let mut r = vector(seed);
+        let along: f32 = r.iter().zip(q).map(|(a, b)| a * b).sum();
+        r.iter_mut().zip(q).for_each(|(x, qi)| *x -= along * qi);
+        let r = unit(r);
+        unit(
+            q.iter()
+                .zip(&r)
+                .map(|(qi, ri)| c * qi + (1.0 - c * c).sqrt() * ri)
+                .collect(),
+        )
+    }
+
+    /// One posting: 9 near documents, `high` copies of the true 10th
+    /// neighbour (cos 0.83198) and `low` copies of a vector 4e-5 below it.
+    /// Returns ids `0..9` near, then the high block, then the low block,
+    /// with their vectors, and the query.
+    fn posting(h_seed: u64, l_seed: u64, high: usize, low: usize) -> (Vec<f32>, Vec<Vec<f32>>) {
+        let q = unit(vector(42));
+        let mut docs: Vec<Vec<f32>> = (0..9)
+            .map(|i| at(&q, 0.95 - 0.01 * i as f32, 100 + i))
+            .collect();
+        let (h, l) = (at(&q, 0.83198, h_seed), at(&q, 0.83194, l_seed));
+        docs.extend(std::iter::repeat_n(h, high));
+        docs.extend(std::iter::repeat_n(l, low));
+        (q, docs)
+    }
+
+    /// The per-segment probe of one RaBitQ posting under `estimator`:
+    /// estimates as `VectorPosting::for_each_similarity` emits them, the
+    /// shortlist of `rescore_probed_shortlist` (floor `k * 4`, bound
+    /// shortlist at the code's epsilon0, cap x8), exact rescore, top `k`.
+    /// `floor`: `KOSHA_KNN_RABITQ_RESCORE_MIN` (0: the rule alone).
+    fn probe(q: &[f32], docs: &[Vec<f32>], estimator: RaBitQEstimator, floor: usize) -> Vec<u32> {
+        let rotation = RaBitQRotation::new(DIM);
+        let mut centroid = vec![0f32; DIM];
+        docs.iter()
+            .for_each(|d| centroid.iter_mut().zip(d).for_each(|(c, x)| *c += x));
+        let centroid = unit(centroid);
+        let query = RaBitQQuery::with_estimator(&rotation, q, estimator);
+        let centroid_dot = kosha_vector_spfresh::dot(q, &centroid);
+        let mut bits = Vec::new();
+        let (mut scored, mut errors) = (Vec::new(), Vec::new());
+        for (id, d) in docs.iter().enumerate() {
+            let code = kosha_vector_spfresh::encode_rabitq(&rotation, d, &centroid, &mut bits);
+            let (sim, err) = query.estimate(&code, &bits, centroid_dot);
+            scored.push((id as u32, sim.clamp(-1.0, 1.0) as f64));
+            errors.push(err);
+        }
+        let limit = floored_shortlist_len(&scored, &errors, K, K * 4, true, floor);
+        let exact: Vec<(u32, f64)> = top_k_by_score(scored, limit)
+            .into_iter()
+            .map(|(id, _)| {
+                (
+                    id,
+                    kosha_vector_spfresh::cosine_similarity(q, &docs[id as usize]) as f64,
+                )
+            })
+            .collect();
+        top_k_by_score(exact, K)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// Reproduces the counts in the next test's doc (`--ignored`).
+    #[test]
+    #[ignore]
+    fn duplicate_block_miss_rate_by_estimator() {
+        let (mut l_only, mut p_only, mut both, mut n) = (0, 0, 0, 0);
+        for h in 1000..1100u64 {
+            for l in 5000..5060u64 {
+                let (q, docs) = posting(h, l, 20, 48);
+                let lm = !tenth_is_high(&probe(&q, &docs, RaBitQEstimator::Lut, 0), 20);
+                let pm = !tenth_is_high(&probe(&q, &docs, RaBitQEstimator::Popcount4, 0), 20);
+                n += 1;
+                match (lm, pm) {
+                    (true, true) => {
+                        both += 1;
+                        if both < 4 {
+                            println!("BOTH {h} {l}");
+                        }
+                    }
+                    (true, false) => l_only += 1,
+                    (false, true) => p_only += 1,
+                    _ => {}
+                }
+            }
+        }
+        println!("n={n} both={both} lut_only={l_only} pop_only={p_only}");
+    }
+
+    /// Whether the 10th hit is a copy of the true 10th neighbour.
+    fn tenth_is_high(ids: &[u32], high: usize) -> bool {
+        ids.len() == K && (9..9 + high).contains(&(ids[9] as usize))
+    }
+
+    /// What guards the tie is rescore depth, not the estimator.
+    ///
+    /// The miss needs the low block's estimate to sit more than both
+    /// bounds above the high block's. The error comes from the 1-bit data
+    /// code, which both estimators share (Popcount4 only adds the query's
+    /// 4-bit rounding in quadrature, ~2% wider here), so they miss on
+    /// nearly the same inputs. Measured over 6,000 direction pairs of this
+    /// fixture (`h` 1000..1100 x `l` 5000..5060, 20 high / 48 low copies,
+    /// `duplicate_block_miss_rate_by_estimator`): LUT misses 24, Popcount4
+    /// 23; 15 both, 9 only LUT, 8 only Popcount4. The pair below is one
+    /// both miss. That Popcount4 passed `knn-085` in the
+    /// replay is one draw of this, not a property to rely on.
+    #[test]
+    fn duplicate_block_past_the_rescore_floor_needs_depth_not_an_estimator() {
+        let estimators = [RaBitQEstimator::Lut, RaBitQEstimator::Popcount4];
+        // Within the floor (9 + 20 + 20 <= k * 4 = 40): rescued either way.
+        let (q, docs) = posting(1021, 5041, 20, 20);
+        for e in estimators {
+            assert!(tenth_is_high(&probe(&q, &docs, e, 0), 20), "{e:?}");
+        }
+        // 48 copies of the over-estimated vector fill the shortlist past
+        // the floor, and the high block is outside both bounds: missed
+        // under the engine rule at epsilon0 1.9 by both estimators ...
+        let (q, docs) = posting(1021, 5041, 20, 48);
+        for e in estimators {
+            let ids = probe(&q, &docs, e, 0);
+            assert!(!tenth_is_high(&ids, 20), "{e:?}: {ids:?}");
+            assert!(
+                (9 + 20..9 + 20 + 48).contains(&(ids[9] as usize)),
+                "{e:?}: {ids:?}"
+            );
+        }
+        // ... and found under a rescore floor deeper than the block
+        // (`KOSHA_KNN_RABITQ_RESCORE_MIN=400`, past the rule's x8 cap).
+        for e in estimators {
+            assert!(tenth_is_high(&probe(&q, &docs, e, 400), 20), "{e:?}");
+        }
+        // The floor never shortens the rule's list, and leaves f32 alone.
+        let scored: Vec<(u32, f64)> = (0..1000).map(|i| (i, 1.0 - i as f64 * 1e-6)).collect();
+        let loose = vec![0.5f32; 1000];
+        assert_eq!(
+            floored_shortlist_len(&scored, &loose, K, 40, true, 100),
+            320
+        );
+        assert_eq!(
+            floored_shortlist_len(&scored, &loose, K, 40, true, 400),
+            400
+        );
+        assert_eq!(floored_shortlist_len(&scored, &[], K, 40, false, 400), 40);
     }
 }
