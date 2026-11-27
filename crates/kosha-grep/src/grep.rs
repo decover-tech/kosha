@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use regex_automata::meta;
 use regex_automata::Input;
-use regex_syntax::hir::{Capture, Hir, HirKind, Look, Repetition};
+use regex_syntax::hir::Look;
 use roaring::RoaringBitmap;
 
 use crate::index::TrigramIndex;
@@ -153,12 +153,17 @@ impl<'a> Grep<'a> {
         if has_newline_literal(&hir) {
             return Err(GrepError::Newline);
         }
-        // Each line is searched as a span of the whole text, so `$` and `\b`
-        // see the `\n` after it and `(?R)$` the `\r\n`; `utf8_empty` as in
-        // `regex::bytes`.
+        // Like ripgrep, a line is searched as a span of the whole text, so
+        // `$` and `\b` see the `\n` after it and `(?R)$` the `\r\n`; but a
+        // pattern with `\A`, `\z` or `(?-m)` anchors gets the line alone, so
+        // they mean its start and end. `utf8_empty` as in `regex::bytes`.
+        let alone = {
+            let looks = hir.properties().look_set();
+            looks.contains(Look::Start) || looks.contains(Look::End)
+        };
         let re = meta::Regex::builder()
             .configure(meta::Config::new().utf8_empty(false))
-            .build_from_hir(&line_anchors(&hir))
+            .build_from_hir(&hir)
             .map_err(|e| GrepError::Regex(Box::new(e)))?;
         let query = plan_hir(&hir);
         let candidates = self.candidates(&query);
@@ -202,7 +207,12 @@ impl<'a> Grep<'a> {
                     out.truncated = Some(Truncation::Time);
                     break 'docs;
                 }
-                if re.is_match(Input::new(text).span(line.clone())) {
+                let input = if alone {
+                    Input::new(&text[line.clone()])
+                } else {
+                    Input::new(text).span(line.clone())
+                };
+                if re.is_match(input) {
                     out.matches.push(GrepMatch {
                         doc,
                         line_number: i as u64 + 1,
@@ -212,26 +222,6 @@ impl<'a> Grep<'a> {
             }
         }
         Ok(out)
-    }
-}
-
-/// ripgrep matches one line at a time, so even `(?-m)^` and `(?-m)$` mean
-/// the start and end of a line.
-fn line_anchors(hir: &Hir) -> Hir {
-    match hir.kind() {
-        HirKind::Look(Look::Start) => Hir::look(Look::StartLF),
-        HirKind::Look(Look::End) => Hir::look(Look::EndLF),
-        HirKind::Repetition(r) => Hir::repetition(Repetition {
-            sub: Box::new(line_anchors(&r.sub)),
-            ..r.clone()
-        }),
-        HirKind::Capture(c) => Hir::capture(Capture {
-            sub: Box::new(line_anchors(&c.sub)),
-            ..c.clone()
-        }),
-        HirKind::Concat(v) => Hir::concat(v.iter().map(line_anchors).collect()),
-        HirKind::Alternation(v) => Hir::alternation(v.iter().map(line_anchors).collect()),
-        _ => hir.clone(),
     }
 }
 
