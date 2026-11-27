@@ -236,15 +236,22 @@ def doc_id(path: str) -> str:
 
 def iter_files(root: Path) -> Iterator[Path]:
     """Every regular file under ``root``, in a stable order, skipping
-    hidden files and directories."""
+    hidden files and directories and symlinks that leave ``root``."""
     if root.is_file():
         yield root
         return
+    real_root = root.resolve()
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
         for name in sorted(filenames):
-            if not name.startswith("."):
-                yield Path(dirpath) / name
+            file = Path(dirpath) / name
+            if name.startswith("."):
+                continue
+            # A symlink out of the folder would publish its target's
+            # contents under the link's path.
+            if file.is_symlink() and not file.resolve().is_relative_to(real_root):
+                continue
+            yield file
 
 
 def kosha_path(root: Path, file: Path, prefix: str = "/") -> str:

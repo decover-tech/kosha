@@ -7,7 +7,15 @@ import io
 import pytest
 
 from kosha_client import KoshaClient
-from kosha_client.ingest import PAGE_BREAK, build_documents, doc_id, extract, ingest, kosha_path
+from kosha_client.ingest import (
+    PAGE_BREAK,
+    build_documents,
+    doc_id,
+    extract,
+    ingest,
+    iter_files,
+    kosha_path,
+)
 
 
 def make_pdf(pages: list[str], title: str = "") -> bytes:
@@ -204,3 +212,13 @@ def test_per_page_reingest_deletes_dropped_pages(tmp_path):
         {"term": {"path": "/a.pdf"}},
         {"range": {"page": {"gt": "1"}}},
     ]
+
+
+def test_iter_files_skips_symlinks_out_of_the_folder(tmp_path):
+    root, outside = tmp_path / "root", tmp_path / "secret.txt"
+    root.mkdir()
+    outside.write_text("secret")
+    (root / "a.txt").write_text("a")
+    (root / "leak.txt").symlink_to(outside)
+    (root / "alias.txt").symlink_to(root / "a.txt")
+    assert [p.name for p in iter_files(root)] == ["a.txt", "alias.txt"]
