@@ -338,7 +338,7 @@ Use `scripts/kosha_cluster.py` from this checkout with Python 3.10+ and
 
 ```sh
 python3 scripts/kosha_cluster.py --context customer-eks install \
-  --image "ravidecoverai/kosha:${KOSHA_RELEASE_TAG}" \
+  --image "decoverai/kosha:${KOSHA_RELEASE_TAG}" \
   --s3-bucket customer-kosha --s3-prefix segments/ --aws-region us-east-1 \
   --irsa-role-arn arn:aws:iam::123456789012:role/kosha \
   --confirm-empty-storage
@@ -416,7 +416,7 @@ creating anything.
 
 ```sh
 python3 scripts/kosha_cluster.py --context saas-cell-1 install --overlay saas \
-  --image "ravidecoverai/kosha:${KOSHA_RELEASE_TAG}" \
+  --image "decoverai/kosha:${KOSHA_RELEASE_TAG}" \
   --s3-bucket example-kosha-cell-1 --s3-prefix segments/ --aws-region us-east-1 \
   --irsa-role-arn arn:aws:iam::123456789012:role/kosha \
   --console-public-url https://console.example.com \
@@ -434,9 +434,9 @@ Plans and per-tenant KMS keys are set on the tenant through the same APIs.
 
 ```sh
 python3 scripts/kosha_cluster.py --context saas-cell-1 upgrade \
-  --image "ravidecoverai/kosha:${KOSHA_RELEASE_TAG}" --dry-run   # print the plan
+  --image "decoverai/kosha:${KOSHA_RELEASE_TAG}" --dry-run   # print the plan
 python3 scripts/kosha_cluster.py --context saas-cell-1 upgrade \
-  --image "ravidecoverai/kosha:${KOSHA_RELEASE_TAG}"
+  --image "decoverai/kosha:${KOSHA_RELEASE_TAG}"
 ```
 
 It enforces the [manifest/WAL rules](../README.md#s3-wal-kosha_wal_modes3):

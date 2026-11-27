@@ -2,7 +2,7 @@ name: Release
 
 # Publishes kosha-server to two registries from one multi-arch build:
 #
-#   Docker Hub docker.io/ravidecoverai/kosha                          (public / prod pulls)
+#   Docker Hub docker.io/decoverai/kosha                          (public / prod pulls)
 #   ECR        <nonprod>.dkr.ecr.us-east-1.amazonaws.com/decover/kosha (staging pulls)
 #
 #   push to main        -> :main          (floating, what staging tracks)
@@ -46,7 +46,7 @@ name: Release
 # there) so the staging cluster pulls in-account, like every other service.
 #
 # Docker Hub: requires repo secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN
-# (a Docker Hub access token with read/write/delete on ravidecoverai/kosha).
+# (a Docker Hub access token with read/write/delete on decoverai/kosha).
 #
 # Deploy: after each successful merge, deploy-staging (push to main) and
 # deploy-production (v* tags) call deploy-eks.yml (reusable) to
@@ -75,7 +75,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  DOCKERHUB_IMAGE: ravidecoverai/kosha
+  DOCKERHUB_IMAGE: decoverai/kosha
   AWS_REGION: us-east-1
   ECR_REPOSITORY: decover/kosha
 

@@ -21,7 +21,7 @@ latency guarantees and the limits Kosha enforces.
 
 | Artifact | Where | Get it |
 | --- | --- | --- |
-| Server image | [Docker Hub — `ravidecoverai/kosha`](https://hub.docker.com/r/ravidecoverai/kosha) | `docker pull ravidecoverai/kosha:latest` |
+| Server image | [Docker Hub — `decoverai/kosha`](https://hub.docker.com/r/decoverai/kosha) | `docker pull decoverai/kosha:latest` |
 | Python client | [PyPI — `kosha-client`](https://pypi.org/project/kosha-client/) | `pip install kosha-client` |
 | TypeScript SDK (preview) | npm — `@decover/kosha` ([clients/typescript](clients/typescript)) | `npm install @decover/kosha` |
 | Go SDK (preview) | `github.com/decover-tech/kosha/clients/go` ([clients/go](clients/go)) | `go get github.com/decover-tech/kosha/clients/go` |
@@ -1586,13 +1586,13 @@ auto-created.
 ### Run with Docker
 
 Pre-built images are published to Docker Hub at
-[`ravidecoverai/kosha`](https://hub.docker.com/r/ravidecoverai/kosha) — `:main`
+[`decoverai/kosha`](https://hub.docker.com/r/decoverai/kosha) — `:main`
 on every merge to `main`, and `:latest` plus the semver tags (`:0.1.0`, `:0.1`)
 for every `v*` tag. Tagged releases are multi-arch (amd64 + arm64); `:main` is
 amd64 only.
 
-    docker pull ravidecoverai/kosha:latest
-    docker run --rm -p 8080:8080 ravidecoverai/kosha:latest
+    docker pull decoverai/kosha:latest
+    docker run --rm -p 8080:8080 decoverai/kosha:latest
     curl localhost:8080/healthz   # -> ok
 
 Or build locally:
