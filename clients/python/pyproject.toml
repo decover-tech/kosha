@@ -15,6 +15,11 @@ dependencies = []
 
 [project.optional-dependencies]
 stubs = ["kosha-client-stubs>=0.1"]
+# The MCP server (`kosha-mcp`, kosha_client.mcp_server).
+mcp = ["mcp>=1.20,<2"]
+
+[project.scripts]
+kosha-mcp = "kosha_client.mcp_server:main"
 
 [build-system]
 requires = ["setuptools"]

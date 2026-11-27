@@ -16,10 +16,13 @@ same shape as the OpenSearch / Elasticsearch JSON API.
 
 ``KoshaClient.search_all()`` and ``.bulk_index()`` take native /v1 bodies
 and behave like the TypeScript and Go SDKs' ``searchAll`` / ``bulkIndex``.
+
+``AgentTools`` is the agent-facing SDK behind the ``kosha-mcp`` MCP server.
 """
 
+from .agent import AgentTools
 from .client import KoshaClient
 from .native import BulkError, KoshaConfigError
 from .transport import KoshaRequestError
 
-__all__ = ["BulkError", "KoshaClient", "KoshaConfigError", "KoshaRequestError"]
+__all__ = ["AgentTools", "BulkError", "KoshaClient", "KoshaConfigError", "KoshaRequestError"]

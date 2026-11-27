@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "kosha": {
+      "command": "kosha-mcp",
+      "env": {
+        "KOSHA_HOST": "https://kosha.example.com",
+        "KOSHA_API_KEY": "sk-read-only-key",
+        "KOSHA_NAMESPACE": "docs"
+      }
+    }
+  }
+}
