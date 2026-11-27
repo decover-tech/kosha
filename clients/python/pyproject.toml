@@ -15,6 +15,11 @@ dependencies = []
 
 [project.optional-dependencies]
 stubs = ["kosha-client-stubs>=0.1"]
+# `kosha-ingest` (kosha_client.ingest): PDF and DOCX text extraction.
+ingest = ["pypdf>=4", "python-docx>=1.1"]
+
+[project.scripts]
+kosha-ingest = "kosha_client.ingest:main"
 
 [build-system]
 requires = ["setuptools"]

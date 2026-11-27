@@ -193,7 +193,51 @@ Each hit's `_score` is the rerank score, with `_fused_score` (search stage) and 
 alongside. If the provider times out or fails, hits come back in search order and
 `resp["rerank"] == {"degraded": True, "reason": ...}`.
 
+## Ingesting PDF, DOCX and HTML files
+
+`kosha-ingest` (`kosha_client/ingest.py`, issue #587) turns a folder of `.pdf`, `.docx`,
+`.html`/`.htm`, `.txt` and `.md` files into Kosha documents. Extraction runs client-side
+with [pypdf](https://pypi.org/project/pypdf/) and
+[python-docx](https://pypi.org/project/python-docx/), both under the `ingest` extra.
+
+```bash
+pip install 'kosha-client[ingest]'
+export KOSHA_HOST=https://kosha.example.com KOSHA_API_KEY=sk-...   # a write key
+kosha-ingest ./shared-drive --namespace docs --prefix /drive      # one document per file
+kosha-ingest ./shared-drive --namespace docs-pages --per-page     # one document per page
+```
+
+The command prints `{"indexed", "unchanged", "unsupported", "scanned", "failed"}` and exits 1
+when a file failed to extract. Each document has these fields:
+
+| Field | Type | Value |
+|-------|------|-------|
+| `path` | Keyword | `--prefix` + the path under the folder, e.g. `/drive/contracts/2024/msa.pdf`. |
+| `body` | Text | The extracted text. Pages are separated by a form feed (`\f`). |
+| `page` | Integer | With `--per-page` only: the 1-based page number. |
+| `title` | Text | From the PDF metadata, DOCX core properties or HTML `<title>`, when one is set. |
+| `mime_type`, `content_sha256`, `source` | Keyword | `source` defaults to `kosha-ingest` (`--source`). |
+| `size_bytes`, `page_count` | Integer | |
+| `modified_at` | Date | The file's mtime, in UTC. |
+| `scanned` | Boolean | `true` for a PDF with no text layer. OCR is out of scope, so its body is empty. |
+
+PDF pages are the PDF's own pages. A DOCX page ends at an explicit page break; Word's layout
+pages are not known without rendering. HTML, `.md` and `.txt` files are one page, except that
+form feeds in a `.txt` file (`pdftotext` output) split it into pages.
+
+With `--per-page`, a search hit carries its page number. Without it, `read(path, page=n)` (#586)
+returns page `n` of the document.
+
+Re-running the command is idempotent. A document's id comes from its `path`, so a changed file
+replaces its old document. A file with an unchanged `content_sha256` is skipped; `--force`
+re-indexes it anyway. With `--per-page`, pages beyond a shortened file's new length are deleted.
+
 ## Changelog
+
+### Unreleased
+
+- `kosha-ingest`: PDF/DOCX/HTML/text ingestion with page boundaries, behind the new `ingest`
+  extra (issue #587). See "Ingesting PDF, DOCX and HTML files".
 
 ### 0.3.1
 

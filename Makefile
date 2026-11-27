@@ -109,7 +109,7 @@ client-python-publish:
 	$(PYTHON) -m twine upload clients/python/dist/*
 
 client-python-test:
-	$(PYTHON) -m pip install -e clients/python pytest pyyaml
+	$(PYTHON) -m pip install -e "clients/python[ingest]" pytest pyyaml
 	$(PYTHON) -m pytest clients/python/tests/ scripts/tests/ -q
 
 # ── TypeScript and Go SDKs (#351, ADR-351) ─────────────────────────────────
