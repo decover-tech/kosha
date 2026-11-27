@@ -353,7 +353,8 @@ def ingest(
             transport.request("POST", ns_path(namespace, "documents"), {"documents": chunk})
         if stale:
             # Pages past each file's new page count, from an earlier and
-            # longer version. Only this ingester's own page records.
+            # longer version. Only kosha-ingest page records (any --source):
+            # those carry a content hash.
             transport.request(
                 "POST",
                 ns_path(namespace, "delete"),
@@ -361,7 +362,7 @@ def ingest(
                     "filter": {
                         "bool": {
                             "must": [
-                                {"term": {"source": source}},
+                                {"exists": {"field": "content_sha256"}},
                                 {"exists": {"field": "page"}},
                                 {
                                     "bool": {

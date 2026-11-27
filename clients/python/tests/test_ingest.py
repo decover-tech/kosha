@@ -212,8 +212,8 @@ def test_per_page_reingest_deletes_dropped_pages(tmp_path):
     ingest(c, "docs", tmp_path, per_page=True)
     deletes = [b for _, p, b in t.calls if p.endswith("/delete")]
     assert len(deletes) == 2  # the first run's is a no-op
-    source, exists, paths = deletes[-1]["filter"]["bool"]["must"]
-    assert source == {"term": {"source": "kosha-ingest"}}
+    ours, exists, paths = deletes[-1]["filter"]["bool"]["must"]
+    assert ours == {"exists": {"field": "content_sha256"}}
     assert exists == {"exists": {"field": "page"}}
     assert paths["bool"]["should"] == [
         {"bool": {"must": [{"term": {"path": "/a.pdf"}}, {"range": {"page": {"gt": "1"}}}]}}
