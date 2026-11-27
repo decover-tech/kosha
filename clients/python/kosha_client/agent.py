@@ -119,11 +119,21 @@ class AgentTools:
         if not isinstance(filter, dict) or not filter:
             raise KoshaConfigError("filter: `filter` must be a non-empty object")
         body: dict[str, Any] = {"query_text": ""}
+        keys: list[str] = []
         if sort:
-            body["sort"] = list(sort)
+            sort = list(sort)
+            keys = [k if isinstance(k, str) else next(iter(k), "") for k in sort]
+            if "_id" not in keys:
+                # A unique tie-breaker, so a page boundary inside a run of
+                # equal sort values neither skips nor repeats documents.
+                sort.append({"_id": {"order": "asc"}})
+                keys.append("_id")
+            body["sort"] = sort
+            if include_fields:
+                include_fields = list(include_fields) + [k for k in keys if not k.startswith("_")]
         if search_after:
             body["search_after"] = [str(v) for v in search_after]
-        return self._hits(namespace, body, filter, max_results, include_fields)
+        return self._hits(namespace, body, filter, max_results, include_fields, keys)
 
     def count(
         self,
@@ -229,16 +239,23 @@ class AgentTools:
         filter: dict | None,
         max_results: int,
         include_fields: list[str] | None,
+        sort_keys: list[str] | None = None,
     ) -> dict:
         body = {**self._body(body.get("query_text", ""), filter, self._cap(max_results)), **body}
         if include_fields:
             body["source_includes"] = sorted(set(include_fields) | {self.path_field})
         res = self._post(namespace, "search", body)
-        return {
+        results = res.get("results", [])
+        out = {
             "total_hits": res.get("total_hits", 0),
             "total_hits_relation": res.get("total_hits_relation", "eq"),
-            "hits": [self._hit(h) for h in res.get("results", [])],
+            "hits": [self._hit(h) for h in results],
         }
+        if sort_keys and results and len(results) >= body["max_results"]:
+            cursor = _sort_values(results[-1], sort_keys)
+            if cursor is not None:
+                out["next_search_after"] = cursor
+        return out
 
     def _hit(self, raw: dict) -> dict:
         hit: dict[str, Any] = {"id": raw.get("doc_id", ""), "score": raw.get("score", 0.0)}
@@ -261,6 +278,19 @@ class AgentTools:
         if raw.get("highlight"):
             hit["highlight"] = raw["highlight"]
         return hit
+
+
+def _sort_values(raw: dict, keys: list[str]) -> list[str] | None:
+    """The hit's raw (untruncated) values for each sort key: the
+    ``search_after`` cursor for the next page."""
+    stored = {f.get("name"): f.get("value") for f in raw.get("fields", [])}
+    values = []
+    for key in keys:
+        value = raw.get("doc_id") if key == "_id" else stored.get(key)
+        if value is None:
+            return None
+        values.append(str(value))
+    return values
 
 
 def _match_all(query: str) -> dict | None:

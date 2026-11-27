@@ -207,3 +207,25 @@ def test_semantic_search_filters_inside_the_knn_probe():
     body = tr.calls[-1][2]
     assert body["knn"]["filter"] == {"term": {"type": "nda"}}
     assert body["filter"] == {"term": {"type": "nda"}}
+
+
+def test_filter_pages_with_a_unique_tie_breaker():
+    page = {
+        "results": [
+            {"doc_id": "d1", "fields": [{"name": "date", "field_type": "Keyword", "value": "2024"}]},
+            {"doc_id": "d2", "fields": [{"name": "date", "field_type": "Keyword", "value": "2024"}]},
+        ]
+    }
+    t, tr = tools(page)
+    out = t.filter(
+        {"exists": {"field": "date"}},
+        sort=[{"date": {"order": "desc"}}],
+        max_results=2,
+        include_fields=["title"],
+    )
+    body = tr.calls[-1][2]
+    assert body["sort"] == [{"date": {"order": "desc"}}, {"_id": {"order": "asc"}}]
+    assert body["source_includes"] == ["date", "path", "title"]
+    assert out["next_search_after"] == ["2024", "d2"]
+    # A short page is the last one.
+    assert "next_search_after" not in t.filter({"exists": {"field": "date"}}, sort=["date"])

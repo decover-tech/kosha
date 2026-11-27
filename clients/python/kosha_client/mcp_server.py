@@ -76,7 +76,8 @@ def build_server(tools: AgentTools, allow_writes: bool = False, **settings: Any)
     ) -> dict:
         """Documents matching a filter clause, unscored: term, terms, range,
         prefix, exists, bool, ... `sort` (e.g. [{"date": {"order": "desc"}}])
-        with `search_after` (the last hit's sort values) pages."""
+        pages: pass the previous page's `next_search_after` as
+        `search_after`."""
         return tools.filter(filter, namespace, sort, max_results, search_after, include_fields)
 
     @server.tool(annotations=READ_ONLY)

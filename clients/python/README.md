@@ -211,7 +211,7 @@ kosha-mcp --transport http --port 8765     # streamable HTTP at http://127.0.0.1
 |------|----------|-------|
 | `search` | `POST /search` with `query_text` | BM25; optional `filter`, `fields`, `include_fields`. |
 | `semantic_search` | `POST /search` with `knn` | `query` (server-side embedder) or `vector`; `hybrid` fuses BM25 and kNN with RRF. |
-| `filter` | `POST /search` with only `filter` | Unscored; `sort` + `search_after` page. |
+| `filter` | `POST /search` with only `filter` | Unscored; with `sort`, a full page returns `next_search_after` for the next one (`_id` breaks ties). |
 | `count` | `POST /search`, `max_results: 0`, `exact_total_hits` | Returns `{"count", "relation"}`. |
 | `aggregate` | `POST /search` with `aggs` | No hits returned. |
 | `list_branches` | `GET /branches` | |
