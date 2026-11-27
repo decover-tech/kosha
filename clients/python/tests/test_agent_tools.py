@@ -291,3 +291,12 @@ def test_read_rejects_ambiguous_requests():
         with pytest.raises(KoshaConfigError):
             t.read(**kwargs)
     assert tr.calls == []
+
+
+def test_cursor_for_a_list_value_is_the_element_it_sorts_by():
+    paths = {"name": "path", "field_type": "Keyword", "value": '["/c/z.pdf", "/a/x.pdf"]'}
+    hit = {"doc_id": "d1", "score": 0.0, "fields": [paths]}
+    t, _ = tools({"results": [hit], "total_hits": 3, "total_hits_relation": "eq"})
+    assert t.glob("/**/*.pdf", max_results=1)["next_search_after"] == ["/a/x.pdf", "d1"]
+    out = t.filter({"exists": {"field": "path"}}, sort=[{"path": {"order": "desc"}}], max_results=1)
+    assert out["next_search_after"] == ["/c/z.pdf", "d1"]

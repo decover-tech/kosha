@@ -15,7 +15,7 @@ import json
 import os
 from typing import Any
 
-from .native import KoshaConfigError, ns_path
+from .native import KoshaConfigError, _is_descending, ns_path, sort_value_of
 
 DEFAULT_MAX_RESULTS = 10
 MAX_RESULTS_CAP = 100
@@ -125,6 +125,7 @@ class AgentTools:
             raise KoshaConfigError("filter: `filter` must be a non-empty object")
         body: dict[str, Any] = {"query_text": ""}
         keys: list[str] = []
+        descending: list[bool] = []
         if sort:
             sort = list(sort)
             keys = [k if isinstance(k, str) else next(iter(k), "") for k in sort]
@@ -134,12 +135,13 @@ class AgentTools:
             if "_id" not in keys and (not search_after or len(search_after) > len(keys)):
                 sort.append({"_id": {"order": "asc"}})
                 keys.append("_id")
+            descending = [isinstance(e, dict) and _is_descending(e, k) for e, k in zip(sort, keys)]
             body["sort"] = sort
             if include_fields:
                 include_fields = list(include_fields) + [k for k in keys if not k.startswith("_")]
         if search_after:
             body["search_after"] = [str(v) for v in search_after]
-        return self._hits(namespace, body, filter, max_results, include_fields, keys)
+        return self._hits(namespace, body, filter, max_results, include_fields, keys, descending)
 
     def glob(
         self,
@@ -311,6 +313,7 @@ class AgentTools:
         max_results: int,
         include_fields: list[str] | None,
         sort_keys: list[str] | None = None,
+        sort_descending: list[bool] | None = None,
     ) -> dict:
         body = {**self._body(body.get("query_text", ""), filter, self._cap(max_results)), **body}
         if include_fields:
@@ -323,7 +326,7 @@ class AgentTools:
             "hits": [self._hit(h) for h in results],
         }
         if sort_keys and results and len(results) >= body["max_results"]:
-            out["next_search_after"] = _sort_values(results[-1], sort_keys)
+            out["next_search_after"] = _sort_values(results[-1], sort_keys, sort_descending or [])
         return out
 
     def _hit(self, raw: dict) -> dict:
@@ -349,12 +352,12 @@ class AgentTools:
         return hit
 
 
-def _sort_values(raw: dict, keys: list[str]) -> list[str]:
-    """The hit's raw (untruncated) values for each sort key: the
-    ``search_after`` cursor for the next page."""
+def _sort_values(raw: dict, keys: list[str], descending: list[bool]) -> list[str]:
+    """The hit's raw (untruncated) value the server sorted it by for each
+    sort key: the ``search_after`` cursor for the next page."""
     stored = {f.get("name"): f.get("value") for f in raw.get("fields", [])}
     values = []
-    for key in keys:
+    for i, key in enumerate(keys):
         if key == "_id":
             value = raw.get("doc_id", "")
         elif key == "_score":
@@ -363,6 +366,10 @@ def _sort_values(raw: dict, keys: list[str]) -> list[str]:
             # A document without the field sorts as missing, which the
             # cursor "" denotes.
             value = stored.get(key, "")
+            if isinstance(value, str):
+                # A list value sorts by its smallest element (largest when
+                # descending), not by its JSON text.
+                value = sort_value_of(value, i < len(descending) and descending[i])
         values.append(str(value))
     return values
 
