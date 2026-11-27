@@ -26690,3 +26690,5 @@ mod internal_tls_tests {
 }
 
 // tachyon shadow: incremental benchmark marker.
+
+// tachyon shadow: sticky-disk benchmark marker.
