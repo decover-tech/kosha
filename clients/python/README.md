@@ -207,6 +207,10 @@ kosha-mcp                                  # stdio, for Claude Desktop / Claude 
 kosha-mcp --transport http --port 8765     # streamable HTTP at http://127.0.0.1:8765/mcp
 ```
 
+The HTTP endpoint has no authentication of its own: every caller acts with the server's
+`KOSHA_API_KEY`. It binds loopback by default and refuses another `--host` unless you also
+pass `--allow-remote`, which you should only do behind an authenticating proxy.
+
 | Tool | API call | Notes |
 |------|----------|-------|
 | `search` | `POST /search` with `query_text` | BM25; optional `filter`, `fields`, `include_fields`. |

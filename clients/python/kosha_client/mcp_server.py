@@ -10,6 +10,7 @@ is enough unless ``--allow-writes`` is given.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import os
 from typing import Any
 
@@ -124,6 +125,15 @@ def build_server(tools: AgentTools, allow_writes: bool = False, **settings: Any)
     return server
 
 
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="kosha-mcp", description=__doc__.splitlines()[0])
     parser.add_argument("--transport", choices=["stdio", "http"], default="stdio")
@@ -135,7 +145,16 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="also expose branch and index_documents (needs a write/admin key)",
     )
+    parser.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="allow an HTTP bind beyond loopback. The MCP endpoint has no "
+        "authentication of its own and every caller acts with this server's "
+        "KOSHA_API_KEY: put an authenticating proxy in front",
+    )
     args = parser.parse_args(argv)
+    if args.transport == "http" and not args.allow_remote and not _is_loopback(args.host):
+        parser.error(f"--host {args.host} is not loopback; pass --allow-remote to bind it")
     tools = AgentTools(namespace=args.namespace)
     server = build_server(tools, args.allow_writes, host=args.host, port=args.port)
     server.run("streamable-http" if args.transport == "http" else "stdio")

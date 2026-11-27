@@ -50,3 +50,15 @@ def test_call_tool_hits_the_api():
     assert json.loads(content[0].text) == {"count": 3, "relation": "eq"}
     assert tr.calls[-1][1] == "v1/namespaces/docs/search"
     assert tr.calls[-1][2]["filter"] == {"term": {"type": "nda"}}
+
+
+def test_http_refuses_a_non_loopback_bind_without_allow_remote(capsys):
+    from kosha_client import mcp_server
+
+    with pytest.raises(SystemExit):
+        mcp_server.main(["--transport", "http", "--host", "0.0.0.0"])
+    assert "--allow-remote" in capsys.readouterr().err
+    assert mcp_server._is_loopback("127.0.0.1")
+    assert mcp_server._is_loopback("::1")
+    assert mcp_server._is_loopback("localhost")
+    assert not mcp_server._is_loopback("10.0.0.5")
