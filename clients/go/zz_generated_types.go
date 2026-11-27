@@ -142,6 +142,35 @@ type KoshaServicePutShardsBody struct {
 	Shards int64 `json:"shards"`
 }
 
+// KoshaServiceReadDocumentBody defines model for KoshaServiceReadDocumentBody.
+type KoshaServiceReadDocumentBody struct {
+	// Bytes 0-based, end-exclusive bytes of the UTF-8 value, widened to whole
+	// characters; `end` defaults to the end of the value.
+	Bytes *V1ByteRange `json:"bytes,omitempty"`
+
+	// Field The stored field to read.
+	Field string `json:"field"`
+
+	// Id The document's id. Set exactly one of `id` and `path`.
+	Id *string `json:"id,omitempty"`
+
+	// Lines 1-based, inclusive lines; `end` defaults to the last line.
+	Lines *V1LineRange `json:"lines,omitempty"`
+
+	// MaxBytes The longest cut returned (default 65536, at most 1048576). A longer
+	// one is shortened at a line end and `truncated` is set.
+	MaxBytes *int64 `json:"max_bytes,omitempty"`
+
+	// Page 1-based page.
+	Page *int64 `json:"page,omitempty"`
+
+	// Path A Keyword value naming one document, matched exactly on `path_field`.
+	Path *string `json:"path,omitempty"`
+
+	// PathField The field `path` is matched on (default "path").
+	PathField *string `json:"path_field,omitempty"`
+}
+
 // KoshaServiceReplaceDocumentsBody defines model for KoshaServiceReplaceDocumentsBody.
 type KoshaServiceReplaceDocumentsBody struct {
 	// Documents Full or partial documents, matched by `id`.
@@ -293,6 +322,13 @@ type V1BranchReclaim struct {
 	Kept          *int64 `json:"kept,omitempty"`
 	LocalFiles    *int64 `json:"local_files,omitempty"`
 	RemoteObjects *int64 `json:"remote_objects,omitempty"`
+}
+
+// V1ByteRange 0-based, end-exclusive bytes of the UTF-8 value, widened to whole
+// characters; `end` defaults to the end of the value.
+type V1ByteRange struct {
+	End   *int64 `json:"end,omitempty"`
+	Start int64  `json:"start"`
 }
 
 // V1CollapseSpec defines model for v1CollapseSpec.
@@ -698,6 +734,12 @@ type V1LimitPer struct {
 	Max int64 `json:"max"`
 }
 
+// V1LineRange 1-based, inclusive lines; `end` defaults to the last line.
+type V1LineRange struct {
+	End   *int64 `json:"end,omitempty"`
+	Start int64  `json:"start"`
+}
+
 // V1ListBranchesResponse defines model for v1ListBranchesResponse.
 type V1ListBranchesResponse struct {
 	Branches  *[]V1NamespaceBranch `json:"branches,omitempty"`
@@ -801,6 +843,28 @@ type V1RankDetails struct {
 	KnnScore     *float64 `json:"knn_score,omitempty"`
 	LexicalRank  *int64   `json:"lexical_rank,omitempty"`
 	LexicalScore *float64 `json:"lexical_score,omitempty"`
+}
+
+// V1ReadDocumentResponse defines model for v1ReadDocumentResponse.
+type V1ReadDocumentResponse struct {
+	ByteEnd   *int64  `json:"byte_end,omitempty"`
+	ByteStart *int64  `json:"byte_start,omitempty"`
+	EndLine   *int64  `json:"end_line,omitempty"`
+	Field     *string `json:"field,omitempty"`
+	Id        *string `json:"id,omitempty"`
+
+	// Page The 1-based page the cut starts on.
+	Page *int64 `json:"page,omitempty"`
+
+	// StartLine First and last 1-based line the cut touches; unset for an empty cut.
+	StartLine  *int64  `json:"start_line,omitempty"`
+	Text       *string `json:"text,omitempty"`
+	TotalBytes *int64  `json:"total_bytes,omitempty"`
+	TotalLines *int64  `json:"total_lines,omitempty"`
+	TotalPages *int64  `json:"total_pages,omitempty"`
+
+	// Truncated The cut was longer than `max_bytes`; read on from `byte_end`.
+	Truncated *bool `json:"truncated,omitempty"`
 }
 
 // V1ReplaceDocumentsResponse defines model for v1ReplaceDocumentsResponse.
@@ -1032,6 +1096,9 @@ type KoshaServiceCreateExportJSONRequestBody = KoshaServiceCreateExportJSONBody
 
 // KoshaServiceFlushJSONRequestBody defines body for KoshaServiceFlush for application/json ContentType.
 type KoshaServiceFlushJSONRequestBody = KoshaServiceFlushBody
+
+// KoshaServiceReadDocumentJSONRequestBody defines body for KoshaServiceReadDocument for application/json ContentType.
+type KoshaServiceReadDocumentJSONRequestBody = KoshaServiceReadDocumentBody
 
 // KoshaServiceReplaceDocumentsJSONRequestBody defines body for KoshaServiceReplaceDocuments for application/json ContentType.
 type KoshaServiceReplaceDocumentsJSONRequestBody = KoshaServiceReplaceDocumentsBody

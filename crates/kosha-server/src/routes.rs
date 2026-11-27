@@ -124,6 +124,12 @@ pub(crate) static ROUTES: &[Route] = &[
     ),
     public(
         "POST",
+        "/v1/namespaces/{namespace}/read",
+        "KoshaService_ReadDocument",
+        Search,
+    ),
+    public(
+        "POST",
         "/v1/namespaces/{namespace}/exists",
         "KoshaService_Exists",
         WriterRead,
@@ -653,6 +659,7 @@ mod tests {
         ("DELETE /v1/namespaces/docs HTTP/1.1", true, false),
         ("POST /v1/namespaces/docs/documents HTTP/1.1", true, false),
         ("POST /v1/namespaces/docs/search HTTP/1.1", false, true),
+        ("POST /v1/namespaces/docs/read HTTP/1.1", false, true),
         ("POST /v1/namespaces/docs/exists HTTP/1.1", true, false),
         ("POST /v1/namespaces/docs/flush HTTP/1.1", true, false),
         ("POST /v1/namespaces/docs/delete HTTP/1.1", true, false),
