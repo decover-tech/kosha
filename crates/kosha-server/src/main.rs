@@ -26688,3 +26688,5 @@ mod internal_tls_tests {
         assert_eq!(ingest.indexer.pending_doc_count(&ns), 1);
     }
 }
+
+// tachyon shadow: incremental benchmark marker.
