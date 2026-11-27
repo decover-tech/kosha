@@ -50,6 +50,7 @@ mod console_net;
 mod console_oauth;
 mod dashboard;
 mod deletion_purge;
+mod doc_read;
 mod doc_spans;
 #[cfg(all(test, feature = "s3"))]
 mod doc_store_fallback_tests;
@@ -21466,6 +21467,117 @@ mod tests {
             "{response}"
         );
         assert!(response.contains("\"missing\":[\"absent\"]"), "{response}");
+    }
+
+    #[test]
+    fn read_returns_line_page_and_byte_ranges_by_id_or_path() {
+        let _legacy = auth::override_legacy_policy(true, "");
+        let state = test_state();
+        let body_text = "alpha\nbeta\ngamma\x0cdelta\nepsilon\n";
+        let req = IndexRequest {
+            namespace: NamespaceId("read-ns".into()),
+            documents: vec![
+                Document {
+                    id: DocumentId("d1".into()),
+                    fields: vec![
+                        Field::keyword("path", "/contracts/a.txt"),
+                        Field::text("body", body_text),
+                    ],
+                },
+                Document {
+                    id: DocumentId("d2".into()),
+                    fields: vec![Field::keyword("path", "/dup"), Field::text("body", "x")],
+                },
+                Document {
+                    id: DocumentId("d3".into()),
+                    fields: vec![Field::keyword("path", "/dup"), Field::text("body", "y")],
+                },
+            ],
+        };
+        let index = serde_json::to_vec(&req).unwrap();
+        let send = |line: &str, body: &[u8]| route(line, &HashMap::new(), body, "test", &state);
+        let read = |body: serde_json::Value| {
+            send(
+                "POST /v1/namespaces/read-ns/read HTTP/1.1\r\n",
+                body.to_string().as_bytes(),
+            )
+        };
+        let _ = send("POST /index HTTP/1.1\r\n", &index);
+        for flushed in [false, true] {
+            let r = read(
+                serde_json::json!({"id": "d1", "field": "body", "lines": {"start": 2, "end": 3}}),
+            );
+            assert!(r.starts_with("HTTP/1.1 200"), "flushed={flushed}: {r}");
+            let v = response_body_json(&r);
+            assert_eq!(v["text"], "beta\ngamma\x0cdelta\n", "flushed={flushed}");
+            assert_eq!(
+                (v["start_line"].as_u64(), v["end_line"].as_u64()),
+                (Some(2), Some(3))
+            );
+            assert_eq!(
+                (v["id"].as_str(), v["total_lines"].as_u64()),
+                (Some("d1"), Some(4))
+            );
+            let _ = send("POST /flush HTTP/1.1\r\n", br#"{"namespace":"read-ns"}"#);
+        }
+        let v = response_body_json(&read(
+            serde_json::json!({"path": "/contracts/a.txt", "field": "body", "page": 2}),
+        ));
+        assert_eq!(
+            (v["text"].as_str(), v["page"].as_u64()),
+            (Some("delta\nepsilon\n"), Some(2))
+        );
+        let v = response_body_json(&read(
+            serde_json::json!({"id": "d1", "field": "body", "bytes": {"start": 6}, "max_bytes": 8}),
+        ));
+        assert_eq!(
+            (v["text"].as_str(), v["truncated"].as_bool()),
+            (Some("beta\n"), Some(true))
+        );
+        assert_eq!(v["byte_end"], 11);
+
+        for (body, status, needle) in [
+            (
+                serde_json::json!({"id": "nope", "field": "body"}),
+                "404",
+                "no document",
+            ),
+            (
+                serde_json::json!({"id": "d1", "field": "missing"}),
+                "404",
+                "no stored field",
+            ),
+            (
+                serde_json::json!({"path": "/dup", "field": "body"}),
+                "400",
+                "more than one",
+            ),
+            (
+                serde_json::json!({"field": "body"}),
+                "400",
+                "exactly one of `id`",
+            ),
+            (serde_json::json!({"id": "d1"}), "400", "missing `field`"),
+            (
+                serde_json::json!({"id": "d1", "field": "body", "page": 1, "lines": {"start": 1}}),
+                "400",
+                "at most one",
+            ),
+            (
+                serde_json::json!({"id": "d1", "field": "body", "max_bytes": 0}),
+                "400",
+                "max_bytes",
+            ),
+            (
+                serde_json::json!({"id": "d1", "field": "body", "page": 0}),
+                "400",
+                "1-based",
+            ),
+        ] {
+            let r = read(body.clone());
+            assert!(r.starts_with(&format!("HTTP/1.1 {status}")), "{body}: {r}");
+            assert!(r.contains(needle), "{body}: {r}");
+        }
     }
 
     #[test]
