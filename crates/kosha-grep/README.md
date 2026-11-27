@@ -18,8 +18,9 @@ belongs in Kosha and how to build it.
   anything unbounded (`.`, `\w`, `*`, large classes) cuts the run. Unicode
   case folding comes from the HIR (`(?i)k` also plans the Kelvin sign).
 - **Verification** (`Grep::run`): candidates (minus tombstones) are fetched
-  in id order and every line is checked with `regex::bytes`, the engine
-  ripgrep uses by default. The index only decides what is read, never what
+  in id order and every line is checked as a span of its text with the
+  `regex` crate's engine (`regex-automata`), the engine ripgrep uses by
+  default, so look-arounds see the line terminator. The index only decides what is read, never what
   matches, so results are exact.
 - **Fallback**: a pattern with no required trigram plans to
   `TrigramQuery::All` and scans everything, bounded by `GrepOptions`
@@ -33,7 +34,7 @@ belongs in Kosha and how to build it.
   object. This is the main lever on bytes read (below).
 
 Semantics match `rg --text --hidden --no-ignore --encoding none`: line
-numbering, `^`/`$` per line, CRLF (`\r` stays part of the line), invalid
+numbering, `^`/`$` per line, CRLF (`\r` stays part of the line, and `(?R)$` matches before `\r\n`), invalid
 UTF-8, NUL bytes, BOMs, empty files and files without a final newline. A
 pattern with a literal `\n` is rejected as ripgrep rejects it without `-U`.
 Backreferences and lookaround are rejected, as by ripgrep's default engine;

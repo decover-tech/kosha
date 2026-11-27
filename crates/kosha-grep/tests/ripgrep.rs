@@ -52,6 +52,13 @@ const PATTERNS: &[(&str, bool)] = &[
     (".", false),
     (r"\w+", false),
     (r"\r$", false),
+    (r"(?mR)\r$", false),
+    (r"(?R)line$", false),
+    (r"(?R)^$", false),
+    (r"(?-m)line$", false),
+    (r"(?-m)^second", false),
+    (r"(?R-m)line$", false),
+    (r"(?m)\bend$", false),
     ("line$", false),
     ("^last", false),
     ("Caf\u{e9}", false),
@@ -102,7 +109,7 @@ fn agrees_with_ripgrep() {
             let expected = ripgrep(&rg, &root, pattern, ci).unwrap();
             // Guards against a pattern agreeing only because both find nothing.
             // `^bom` must not match: with no transcoding the BOM bytes come first.
-            let none = ["nothing matches this zzq", "^bom"].contains(&pattern);
+            let none = ["nothing matches this zzq", "^bom", r"(?mR)\r$"].contains(&pattern);
             assert_eq!(
                 expected.is_empty(),
                 none,

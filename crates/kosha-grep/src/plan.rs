@@ -127,10 +127,12 @@ pub(crate) fn parse(
     pattern: &str,
     case_insensitive: bool,
 ) -> Result<Hir, Box<regex_syntax::Error>> {
-    // `utf8(false)` accepts what `regex::bytes` accepts, e.g. `(?-u:\xFF)`.
+    // `utf8(false)` accepts what `regex::bytes` accepts, e.g. `(?-u:\xFF)`;
+    // `multi_line` is ripgrep's default, so `(?R)$` becomes `EndCRLF`.
     regex_syntax::ParserBuilder::new()
         .case_insensitive(case_insensitive)
         .utf8(false)
+        .multi_line(true)
         .build()
         .parse(pattern)
         .map_err(Box::new)

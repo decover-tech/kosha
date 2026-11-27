@@ -2,8 +2,12 @@
 
 use std::fmt;
 use std::io;
+use std::ops::Range;
 use std::time::{Duration, Instant};
 
+use regex_automata::meta;
+use regex_automata::Input;
+use regex_syntax::hir::{Capture, Hir, HirKind, Look, Repetition};
 use roaring::RoaringBitmap;
 
 use crate::index::TrigramIndex;
@@ -60,7 +64,7 @@ pub struct GrepOutcome {
 
 #[derive(Debug)]
 pub enum GrepError {
-    Regex(regex::Error),
+    Regex(Box<meta::BuildError>),
     Syntax(Box<regex_syntax::Error>),
     /// The pattern holds a literal `\n`, which never matches inside a line.
     Newline,
@@ -149,10 +153,13 @@ impl<'a> Grep<'a> {
         if has_newline_literal(&hir) {
             return Err(GrepError::Newline);
         }
-        let re = regex::bytes::RegexBuilder::new(pattern)
-            .case_insensitive(opts.case_insensitive)
-            .build()
-            .map_err(GrepError::Regex)?;
+        // Each line is searched as a span of the whole text, so `$` and `\b`
+        // see the `\n` after it and `(?R)$` the `\r\n`; `utf8_empty` as in
+        // `regex::bytes`.
+        let re = meta::Regex::builder()
+            .configure(meta::Config::new().utf8_empty(false))
+            .build_from_hir(&line_anchors(&hir))
+            .map_err(|e| GrepError::Regex(Box::new(e)))?;
         let query = plan_hir(&hir);
         let candidates = self.candidates(&query);
         let mut out = GrepOutcome {
@@ -195,11 +202,11 @@ impl<'a> Grep<'a> {
                     out.truncated = Some(Truncation::Time);
                     break 'docs;
                 }
-                if re.is_match(line) {
+                if re.is_match(Input::new(text).span(line.clone())) {
                     out.matches.push(GrepMatch {
                         doc,
                         line_number: i as u64 + 1,
-                        line: line.to_vec(),
+                        line: text[line].to_vec(),
                     });
                 }
             }
@@ -208,12 +215,40 @@ impl<'a> Grep<'a> {
     }
 }
 
-/// Lines as ripgrep counts them: split on `\n`, with no empty line after a
-/// final `\n` and none at all in an empty document.
-fn lines(text: &[u8]) -> impl Iterator<Item = &[u8]> {
-    let body = text.strip_suffix(b"\n").unwrap_or(text);
-    let empty = text.is_empty();
-    body.split(|&b| b == b'\n').filter(move |_| !empty)
+/// ripgrep matches one line at a time, so even `(?-m)^` and `(?-m)$` mean
+/// the start and end of a line.
+fn line_anchors(hir: &Hir) -> Hir {
+    match hir.kind() {
+        HirKind::Look(Look::Start) => Hir::look(Look::StartLF),
+        HirKind::Look(Look::End) => Hir::look(Look::EndLF),
+        HirKind::Repetition(r) => Hir::repetition(Repetition {
+            sub: Box::new(line_anchors(&r.sub)),
+            ..r.clone()
+        }),
+        HirKind::Capture(c) => Hir::capture(Capture {
+            sub: Box::new(line_anchors(&c.sub)),
+            ..c.clone()
+        }),
+        HirKind::Concat(v) => Hir::concat(v.iter().map(line_anchors).collect()),
+        HirKind::Alternation(v) => Hir::alternation(v.iter().map(line_anchors).collect()),
+        _ => hir.clone(),
+    }
+}
+
+/// The spans of the lines as ripgrep counts them: split on `\n`, with no
+/// empty line after a final `\n` and none at all in an empty document.
+fn lines(text: &[u8]) -> impl Iterator<Item = Range<usize>> + '_ {
+    let body = text.strip_suffix(b"\n").unwrap_or(text).len();
+    let mut next = (!text.is_empty()).then_some(0);
+    std::iter::from_fn(move || {
+        let start = next?;
+        let end = text[start..body]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(body, |n| start + n);
+        next = (end < body).then_some(end + 1);
+        Some(start..end)
+    })
 }
 
 #[cfg(test)]
