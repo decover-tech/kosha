@@ -37,7 +37,7 @@ inputs:
     required: false
     default: us-east-1
   image_repository:
-    description: "Full image repository without tag (e.g. 123.dkr.ecr.us-east-1.amazonaws.com/decover/kosha). If empty, staging uses ECR login output + /decover/kosha; production uses ravidecoverai/kosha."
+    description: "Full image repository without tag (e.g. 123.dkr.ecr.us-east-1.amazonaws.com/decover/kosha). If empty, staging uses ECR login output + /decover/kosha; production uses decoverai/kosha."
     required: false
     default: ""
 
@@ -137,7 +137,7 @@ runs:
         elif [[ "${{ inputs.environment }}" == "staging" ]]; then
           image="${{ steps.login-ecr.outputs.registry }}/decover/kosha:${IMAGE_TAG}"
         else
-          image="ravidecoverai/kosha:${IMAGE_TAG}"
+          image="decoverai/kosha:${IMAGE_TAG}"
         fi
         kustomize edit set image "kosha=${image}"
         kustomize edit add secret kosha-secret \

@@ -23,5 +23,5 @@ patches:
 
 images:
   - name: kosha
-    newName: ravidecoverai/kosha
+    newName: decoverai/kosha
     newTag: latest
