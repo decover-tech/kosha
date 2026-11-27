@@ -2464,6 +2464,7 @@ name = "kosha-core"
 version = "0.1.0"
 dependencies = [
  "jiff",
+ "regex",
  "roaring",
  "serde",
  "serde_json",

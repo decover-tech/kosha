@@ -27808,6 +27808,81 @@ mod prefix_filter_tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// #585: `glob` over the same two-segment corpus, on lexical,
+    /// filter-only, `bool` and `knn.filter` paths.
+    #[test]
+    fn glob_filters_paths_across_segments() {
+        let (dir, ns, manifest) = corpus("glob");
+        let searcher = Searcher::new(dir.clone());
+        for (filter, want) in [
+            (
+                r#"{"glob": {"path": "/matters/2026/*"}}"#,
+                vec!["d0", "d3", "d4", "d7"],
+            ),
+            (
+                r#"{"glob": {"path": "/matters/*/[a-l]"}}"#,
+                vec!["d0", "d1", "d3"],
+            ),
+            (
+                r#"{"glob": {"path": "**/2026/*"}}"#,
+                vec!["d0", "d2", "d3", "d4", "d7"],
+            ),
+            (
+                r#"{"glob": {"path": {"value": "/MATTERS/2026/{a,c}", "case_insensitive": true}}}"#,
+                vec!["d0", "d2"],
+            ),
+            (r#"{"glob": {"path": "/x"}}"#, vec!["d3"]),
+            (r#"{"glob": {"path": "/matters/*"}}"#, vec![]),
+            (
+                r#"{"bool": {"must": [{"glob": {"path": "/matters/**"}},
+                                      {"range": {"page": {"gte": "3"}}}]}}"#,
+                vec!["d3", "d4", "d7"],
+            ),
+            (
+                r#"{"bool": {"must_not": [{"glob": {"path": "/matters/**"}}]}}"#,
+                vec!["d2", "d5", "d6"],
+            ),
+        ] {
+            for text in ["contract", ""] {
+                assert_eq!(
+                    ids(&searcher, &ns, &manifest, &query(text, filter)),
+                    want,
+                    "{filter} query_text={text:?}"
+                );
+            }
+        }
+        let mut q = query("", r#"{"match_all": {}}"#);
+        q.filter = None;
+        q.knn = Some(KnnQuery {
+            query_text: None,
+            embedding_model: None,
+            field: "contentEmbedding".into(),
+            vector: vec![1.0, 0.0, 0.0, 0.0],
+            k: 8,
+            num_candidates: 8,
+            filter: Some(serde_json::from_str(r#"{"glob": {"path": "/matters/2026/?"}}"#).unwrap()),
+            scoring: None,
+            vectors: None,
+        });
+        assert_eq!(
+            ids(&searcher, &ns, &manifest, &q),
+            vec!["d0", "d3", "d4", "d7"]
+        );
+        let err = searcher
+            .search(
+                &ns,
+                &manifest,
+                &query("contract", r#"{"glob": {"page": "1*"}}"#),
+                None,
+            )
+            .expect_err("numeric glob");
+        assert!(
+            matches!(&err, KoshaError::InvalidQuery(msg) if msg.contains("numeric field")),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
