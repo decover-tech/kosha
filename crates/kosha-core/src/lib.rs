@@ -1031,27 +1031,45 @@ fn glob_regex(pattern: &str, case_insensitive: bool) -> Result<regex::Regex, Str
         return Err(format!("longer than {MAX_GLOB_PATTERN_BYTES} bytes"));
     }
     let chars: Vec<char> = pattern.chars().collect();
+    let escaped = |i: usize| -> Result<char, String> {
+        chars
+            .get(i)
+            .copied()
+            .ok_or_else(|| "dangling `\\` at the end".to_string())
+    };
     let mut re = String::from(if case_insensitive { "(?i)^" } else { "^" });
-    let mut in_alternate = false;
+    // `Some(at_component_start)` inside `{...}`: whether the group starts
+    // a path component, as each alternative then does.
+    let mut alternate: Option<bool> = None;
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
         i += 1;
         match c {
             '\\' => {
-                let Some(&next) = chars.get(i) else {
-                    return Err("dangling `\\` at the end".into());
-                };
+                let next = escaped(i)?;
                 i += 1;
                 re.push_str(&regex::escape(next.encode_utf8(&mut [0; 4])));
             }
             '*' if chars.get(i) == Some(&'*') => {
                 i += 1;
-                let starts_component = i == 2 || chars[i - 3] == '/';
-                if starts_component && chars.get(i) == Some(&'/') {
+                let starts_component = match i.checked_sub(3).map(|p| chars[p]) {
+                    None | Some('/') => true,
+                    Some('{' | ',') => alternate == Some(true),
+                    Some(_) => false,
+                };
+                let next = chars.get(i).copied();
+                let ends_pattern = next.is_none()
+                    || (alternate.is_some()
+                        && matches!(next, Some(',' | '}'))
+                        && chars[i..]
+                            .iter()
+                            .position(|&c| c == '}')
+                            .is_some_and(|close| i + close + 1 == chars.len()));
+                if starts_component && next == Some('/') {
                     i += 1;
                     re.push_str("(?:.*/)?");
-                } else if starts_component && i == chars.len() {
+                } else if starts_component && ends_pattern {
                     re.push_str(".*");
                 } else {
                     re.push_str("[^/]*");
@@ -1067,23 +1085,36 @@ fn glob_regex(pattern: &str, case_insensitive: bool) -> Result<regex::Regex, Str
                 let mut class = String::new();
                 let mut first = true;
                 loop {
-                    let Some(&c) = chars.get(i) else {
-                        return Err("unclosed character class; missing `]`".into());
+                    let lo = match chars.get(i) {
+                        None => return Err("unclosed character class; missing `]`".into()),
+                        Some(']') if !first => {
+                            i += 1;
+                            break;
+                        }
+                        Some('\\') => {
+                            i += 1;
+                            escaped(i)?
+                        }
+                        Some(&c) => c,
                     };
                     i += 1;
-                    match c {
-                        ']' if !first => break,
-                        '\\' => {
-                            let Some(&next) = chars.get(i) else {
-                                return Err("dangling `\\` at the end".into());
-                            };
-                            i += 1;
-                            class.push_str(&class_escape(next));
-                        }
-                        '-' if !first && chars.get(i).is_some_and(|&n| n != ']') => class.push('-'),
-                        c => class.push_str(&class_escape(c)),
-                    }
                     first = false;
+                    class.push_str(&class_escape(lo));
+                    if chars.get(i) == Some(&'-') && chars.get(i + 1).is_some_and(|&n| n != ']') {
+                        i += 1;
+                        let hi = if chars[i] == '\\' {
+                            i += 1;
+                            escaped(i)?
+                        } else {
+                            chars[i]
+                        };
+                        i += 1;
+                        if hi < lo {
+                            return Err(format!("invalid range `{lo}-{hi}` in a class"));
+                        }
+                        class.push('-');
+                        class.push_str(&class_escape(hi));
+                    }
                 }
                 if negated {
                     re.push_str(&format!("[^/{class}]"));
@@ -1091,20 +1122,23 @@ fn glob_regex(pattern: &str, case_insensitive: bool) -> Result<regex::Regex, Str
                     re.push_str(&format!("[[{class}]&&[^/]]"));
                 }
             }
-            '{' if in_alternate => return Err("nested `{` alternates are not supported".into()),
+            '{' if alternate.is_some() => {
+                return Err("nested `{` alternates are not supported".into())
+            }
             '{' => {
-                in_alternate = true;
+                alternate = Some(i == 1 || chars[i - 2] == '/');
                 re.push_str("(?:");
             }
-            ',' if in_alternate => re.push('|'),
-            '}' if in_alternate => {
-                in_alternate = false;
+            ',' if alternate.is_some() => re.push('|'),
+            '}' if alternate.is_some() => {
+                alternate = None;
                 re.push(')');
             }
+            '}' => return Err("unopened alternate: `}` without `{` (escape it as `\\}`)".into()),
             c => re.push_str(&regex::escape(c.encode_utf8(&mut [0; 4]))),
         }
     }
-    if in_alternate {
+    if alternate.is_some() {
         return Err("unclosed alternate; missing `}`".into());
     }
     re.push('$');

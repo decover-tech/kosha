@@ -1047,6 +1047,14 @@ mod glob_tests {
             ("/docs/[é]*.pdf", "/docs/ê.pdf", false),
             ("/docs/[é]*.pdf", "/docs/é1.pdf", true),
             ("/docs/?.pdf", "/docs/é.pdf", true),
+            // `**` at the edges of an alternative is still recursive.
+            ("/c/{**/*.pdf,s.txt}", "/c/a.pdf", true),
+            ("/c/{**/*.pdf,s.txt}", "/c/x/y/a.pdf", true),
+            ("/c/{s.txt,**}", "/c/x/y", true),
+            ("/c/x{**/*.pdf,s}", "/c/x/y/a.pdf", false),
+            ("/a/[!--/]", "/a/x", true),
+            ("/a/[+--]", "/a/,", true),
+            (r"/a/[a\-z]", "/a/b", false),
         ] {
             let g = GlobFilter::new("path", pattern, false).unwrap();
             assert_eq!(g.is_match(value), want, "{pattern} vs {value}");
@@ -1120,6 +1128,8 @@ mod glob_tests {
             (r#"{"glob": {"path": "/a/{b"}}"#, "invalid pattern"),
             (r#"{"glob": {"path": "/a/{b,{c}}"}}"#, "nested"),
             (r#"{"glob": {"path": "/a/[z-a]"}}"#, "invalid pattern"),
+            (r#"{"glob": {"path": "/a/[z--a]"}}"#, "invalid range"),
+            (r#"{"glob": {"path": "/a/b}"}}"#, "unopened"),
             (r#"{"glob": {"path": "/a\\"}}"#, "dangling"),
         ] {
             let err = serde_json::from_str::<FilterClause>(json).unwrap_err();
