@@ -1057,6 +1057,8 @@ mod glob_tests {
             (r"/c/\{**/b", "/c/{x/y/b", false),
             (r"/c/{**,a\}}", "/c/x/y", true),
             ("/c/**", "/c/x\ny/z", true),
+            (r"/c\/**/b", "/c/x/y/b", true),
+            (r"/c\/**", "/c/x/y", true),
             ("/c/*", "/c/x\ny", true),
             ("/a/[!--/]", "/a/x", true),
             ("/a/[+--]", "/a/,", true),

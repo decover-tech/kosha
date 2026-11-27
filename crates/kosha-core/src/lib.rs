@@ -1053,6 +1053,7 @@ fn glob_regex(pattern: &str, case_insensitive: bool) -> Result<regex::Regex, Str
             '\\' => {
                 let next = escaped(i)?;
                 i += 1;
+                at_component_start = next == '/';
                 re.push_str(&regex::escape(next.encode_utf8(&mut [0; 4])));
             }
             '*' if chars.get(i) == Some(&'*') => {
