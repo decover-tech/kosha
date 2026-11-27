@@ -54,7 +54,7 @@ jobs:
             cd "$ws"
             git ls-files -z | xargs -0 touch -h -d @1
             changed=$(git diff --name-only "$base" HEAD | wc -l)
-            git diff --name-only -z "$base" HEAD | xargs -0 -r touch -h
+            git diff --name-only --diff-filter=d -z "$base" HEAD | xargs -0 -r touch -h -c
             echo "KOSHA_DIR=$ws" >> "$GITHUB_ENV"
             echo "building in $ws; mtimes reset against prebuild ${base:0:7}; $changed file(s) changed"
           fi
