@@ -133,9 +133,12 @@ fn main() -> io::Result<()> {
     let positional: u64 = texts.iter().map(|b| positional_bytes(b)).sum();
     let index_file =
         std::env::temp_dir().join(format!("kosha-grep-bench-{}.idx", std::process::id()));
-    corpus
-        .index
-        .write_to(BufWriter::new(fs::File::create(&index_file)?))?;
+    // `create_new` refuses an existing path, e.g. a symlink planted in a shared temp dir.
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&index_file)?;
+    corpus.index.write_to(BufWriter::new(file))?;
     let rg_version = String::from_utf8_lossy(&Command::new(&rg).arg("--version").output()?.stdout)
         .lines()
         .next()
