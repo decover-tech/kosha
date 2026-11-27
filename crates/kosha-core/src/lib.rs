@@ -6473,3 +6473,5 @@ mod multi_rrf_validation {
 
 // tachyon shadow: incremental benchmark marker (core).
 // tachyon shadow: incremental benchmark marker (core, 2).
+
+// tachyon shadow: sticky-disk benchmark marker.
