@@ -249,3 +249,14 @@ def test_ingest_splits_writes_by_request_size(tmp_path, monkeypatch):
     assert ingest(c, "docs", tmp_path).indexed == 5
     writes = [len(b["documents"]) for _, p, b in t.calls if p.endswith("/documents")]
     assert writes == [2, 2, 1]
+
+
+def test_per_page_writes_page_one_last(tmp_path):
+    pytest.importorskip("pypdf")
+    (tmp_path / "a.pdf").write_bytes(make_pdf(["one", "two"]))
+    (tmp_path / "b.pdf").write_bytes(make_pdf(["three", "four"]))
+    c = KoshaClient("http://kosha.test", api_key="k")
+    c._transport = t = FakeTransport()
+    ingest(c, "docs", tmp_path, per_page=True)
+    (write,) = [b for _, p, b in t.calls if p.endswith("/documents")]
+    assert [d["id"].rsplit("_", 1)[1] for d in write["documents"]] == ["p2", "p2", "p1", "p1"]

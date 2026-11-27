@@ -345,6 +345,10 @@ def ingest(
                 report.indexed += 1
             except Exception as e:  # noqa: BLE001 - one bad file must not stop the folder
                 report.failed[path] = f"{type(e).__name__}: {e}"
+        # Page 1 carries the hash a later run trusts, so it is written after
+        # every other page: a run cut short never leaves it marking a file
+        # whose later pages are missing.
+        docs.sort(key=lambda d: d["id"].endswith("_p1"))
         for chunk in _chunks(docs):
             transport.request("POST", ns_path(namespace, "documents"), {"documents": chunk})
         if stale:
