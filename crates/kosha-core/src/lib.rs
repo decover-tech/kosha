@@ -6470,3 +6470,5 @@ mod multi_rrf_validation {
         assert!(err.to_string().contains("queries[0]"), "{err}");
     }
 }
+
+// tachyon shadow: incremental benchmark marker (core).
