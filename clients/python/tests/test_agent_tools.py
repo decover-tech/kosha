@@ -195,3 +195,15 @@ def test_count_and_aggregate_everything():
     assert tr.calls[-1][2]["filter"] == {"match_all": {}}
     t.count(query="nda")
     assert "filter" not in tr.calls[-1][2]
+
+
+def test_semantic_search_filters_inside_the_knn_probe():
+    t, tr = tools({"results": []})
+    t.semantic_search("emb", vector=[1.0], filter={"term": {"year": 2024}})
+    body = tr.calls[-1][2]
+    assert body["knn"]["filter"] == {"term": {"year": "2024"}}
+    assert "filter" not in body
+    t.semantic_search("emb", query="fees", hybrid=True, filter={"term": {"type": "nda"}})
+    body = tr.calls[-1][2]
+    assert body["knn"]["filter"] == {"term": {"type": "nda"}}
+    assert body["filter"] == {"term": {"type": "nda"}}

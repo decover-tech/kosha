@@ -94,12 +94,16 @@ class AgentTools:
             knn["vector"] = [float(x) for x in vector]
         else:
             knn["query_text"] = query
+        if filter:
+            # Filtered inside the probe: a top-level filter with no query
+            # text would also return the filter's non-neighbours.
+            knn["filter"] = _normalize_filter(filter)
         body: dict[str, Any] = {
             "query_text": query if hybrid else "",
             "knn": knn,
             "mode": "hybrid" if hybrid else "semantic",
         }
-        return self._hits(namespace, body, filter, k, include_fields)
+        return self._hits(namespace, body, filter if hybrid else None, k, include_fields)
 
     def filter(
         self,
