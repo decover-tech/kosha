@@ -2,7 +2,7 @@ name: tachyon shadow
 
 # Benchmark only: cargo test compile and run on the same commit, cold (no
 # cache) and warm, on Tachyon (warm = prebuilt target/), Blacksmith and
-# GitHub-hosted (warm = rust-cache). Not a required check; runs only on
+# GitHub-hosted (warm = rust-cache), plus Blacksmith with sticky disks. Not a required check; runs only on
 # this branch.
 on:
   push:
@@ -101,6 +101,51 @@ jobs:
       - name: compile
         run: cargo test --all-features --locked --no-run
       - name: test
+        run: cargo test --all-features --locked
+
+  blacksmith-sticky:
+    # Blacksmith at its best: target/ and the cargo registry on sticky disks,
+    # incremental on, and the same mtime reset as tachyon-warm, against the
+    # commit the disk's target/ was last built from.
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    env:
+      CARGO_INCREMENTAL: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: useblacksmith/stickydisk@v1
+        with:
+          key: ${{ github.repository }}-shadow-target
+          path: ./target
+      - uses: useblacksmith/stickydisk@v1
+        with:
+          key: ${{ github.repository }}-shadow-cargo-registry
+          path: ~/.cargo/registry
+      - name: reset mtimes
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo chown -R "$(id -u):$(id -g)" target ~/.cargo/registry
+          base=$(cat target/.sticky-sha 2>/dev/null || true)
+          if [[ -n "$base" ]] && { git cat-file -e "$base^{commit}" 2>/dev/null || git fetch -q --depth=1 origin "$base"; }; then
+            git ls-files -z | xargs -0 touch -h -d @1
+            git diff --name-only --diff-filter=d -z "$base" HEAD | xargs -0 -r touch -h -c
+            echo "mtimes reset against ${base:0:7}; $(git diff --name-only "$base" HEAD | wc -l) file(s) changed"
+          else
+            echo "sticky target/ empty or no base commit: cold build"
+          fi
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - name: compile
+        env:
+          CARGO_INCREMENTAL: 1
+          CARGO_LOG: cargo::core::compiler::fingerprint=info
+        run: cargo test --all-features --locked --no-run
+      - name: record base
+        run: git rev-parse HEAD > target/.sticky-sha
+      - name: test
+        env:
+          CARGO_INCREMENTAL: 1
         run: cargo test --all-features --locked
 
   blacksmith-cold:
