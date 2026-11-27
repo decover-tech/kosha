@@ -123,9 +123,10 @@ class AgentTools:
         if sort:
             sort = list(sort)
             keys = [k if isinstance(k, str) else next(iter(k), "") for k in sort]
-            if "_id" not in keys:
-                # A unique tie-breaker, so a page boundary inside a run of
-                # equal sort values neither skips nor repeats documents.
+            # A unique tie-breaker, so a page boundary inside a run of equal
+            # sort values neither skips nor repeats documents; not under a
+            # caller's own cursor of one value per requested key.
+            if "_id" not in keys and (not search_after or len(search_after) > len(keys)):
                 sort.append({"_id": {"order": "asc"}})
                 keys.append("_id")
             body["sort"] = sort
@@ -252,9 +253,7 @@ class AgentTools:
             "hits": [self._hit(h) for h in results],
         }
         if sort_keys and results and len(results) >= body["max_results"]:
-            cursor = _sort_values(results[-1], sort_keys)
-            if cursor is not None:
-                out["next_search_after"] = cursor
+            out["next_search_after"] = _sort_values(results[-1], sort_keys)
         return out
 
     def _hit(self, raw: dict) -> dict:
@@ -280,15 +279,20 @@ class AgentTools:
         return hit
 
 
-def _sort_values(raw: dict, keys: list[str]) -> list[str] | None:
+def _sort_values(raw: dict, keys: list[str]) -> list[str]:
     """The hit's raw (untruncated) values for each sort key: the
     ``search_after`` cursor for the next page."""
     stored = {f.get("name"): f.get("value") for f in raw.get("fields", [])}
     values = []
     for key in keys:
-        value = raw.get("doc_id") if key == "_id" else stored.get(key)
-        if value is None:
-            return None
+        if key == "_id":
+            value = raw.get("doc_id", "")
+        elif key == "_score":
+            value = raw.get("score", 0.0)
+        else:
+            # A document without the field sorts as missing, which the
+            # cursor "" denotes.
+            value = stored.get(key, "")
         values.append(str(value))
     return values
 

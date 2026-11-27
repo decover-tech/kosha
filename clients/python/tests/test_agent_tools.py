@@ -229,3 +229,15 @@ def test_filter_pages_with_a_unique_tie_breaker():
     assert out["next_search_after"] == ["2024", "d2"]
     # A short page is the last one.
     assert "next_search_after" not in t.filter({"exists": {"field": "date"}}, sort=["date"])
+
+
+def test_filter_cursor_for_missing_fields_score_and_caller_cursors():
+    page = {"results": [{"doc_id": "d7", "score": 1.5, "fields": []}]}
+    t, tr = tools(page)
+    out = t.filter({"exists": {"field": "x"}}, sort=["date", "_score"], max_results=1)
+    assert out["next_search_after"] == ["", "1.5", "d7"]
+    # A caller cursor of one value per requested key keeps its sort as is.
+    t.filter({"exists": {"field": "x"}}, sort=["date"], search_after=["2024"], max_results=1)
+    assert tr.calls[-1][2]["sort"] == ["date"]
+    t.filter({"exists": {"field": "x"}}, sort=["date"], search_after=["2024", "d7"], max_results=1)
+    assert tr.calls[-1][2]["sort"] == ["date", {"_id": {"order": "asc"}}]
