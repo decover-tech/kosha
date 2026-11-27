@@ -3,6 +3,7 @@ idempotent re-ingest."""
 
 import hashlib
 import io
+import json
 
 import pytest
 
@@ -239,7 +240,10 @@ def test_ingest_splits_writes_by_request_size(tmp_path, monkeypatch):
 
     for i in range(5):
         (tmp_path / f"{i}.txt").write_text("x" * 1000)
-    monkeypatch.setattr(ingest_mod, "MAX_REQUEST_BYTES", 3000)
+    one = json.dumps(
+        build_documents("/0.txt", extract(tmp_path / "0.txt"), b"x" * 1000, 0, "kosha-ingest", False)[0]
+    )
+    monkeypatch.setattr(ingest_mod, "MAX_REQUEST_BYTES", int(len(one.encode()) * 2.5))
     c = KoshaClient("http://kosha.test", api_key="k")
     c._transport = t = FakeTransport()
     assert ingest(c, "docs", tmp_path).indexed == 5
