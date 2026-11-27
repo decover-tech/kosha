@@ -1035,6 +1035,18 @@ mod glob_tests {
             ("/a/\\*.txt", "/a/*.txt", true),
             ("/a/\\*.txt", "/a/b.txt", false),
             ("/A/*", "/a/b", false),
+            // Classes never match `/`, negated or not.
+            ("/docs/*[!x]*.pdf", "/docs/2026/a.pdf", false),
+            ("/docs/*[!x]*.pdf", "/docs/a.pdf", true),
+            ("/a[ -~]b", "/a/b", false),
+            ("/a[ -~]b", "/a-b", true),
+            ("/a/[]x].txt", "/a/].txt", true),
+            ("/a/[a-c-].txt", "/a/-.txt", true),
+            ("/a/{,x}y", "/a/y", true),
+            // Characters, not bytes.
+            ("/docs/[é]*.pdf", "/docs/ê.pdf", false),
+            ("/docs/[é]*.pdf", "/docs/é1.pdf", true),
+            ("/docs/?.pdf", "/docs/é.pdf", true),
         ] {
             let g = GlobFilter::new("path", pattern, false).unwrap();
             assert_eq!(g.is_match(value), want, "{pattern} vs {value}");
@@ -1042,6 +1054,8 @@ mod glob_tests {
         let ci = GlobFilter::new("path", "/A/*.PDF", true).unwrap();
         assert!(ci.is_match("/a/x.pdf"));
         assert_eq!(ci.literal_prefix(), "", "folding case has no byte prefix");
+        let ci = GlobFilter::new("path", "/É/*", true).unwrap();
+        assert!(ci.is_match("/é/x") && !ci.is_match("/e/x"));
     }
 
     #[test]
@@ -1104,10 +1118,27 @@ mod glob_tests {
             (r#"{"glob": {"path": {}}}"#, "missing `value`"),
             (r#"{"glob": {"path": "/a/[b"}}"#, "invalid pattern"),
             (r#"{"glob": {"path": "/a/{b"}}"#, "invalid pattern"),
+            (r#"{"glob": {"path": "/a/{b,{c}}"}}"#, "nested"),
+            (r#"{"glob": {"path": "/a/[z-a]"}}"#, "invalid pattern"),
+            (r#"{"glob": {"path": "/a\\"}}"#, "dangling"),
         ] {
             let err = serde_json::from_str::<FilterClause>(json).unwrap_err();
             assert!(err.to_string().contains(needle), "{json}: {err}");
         }
+    }
+
+    #[test]
+    fn hostile_globs_are_rejected_without_exhausting_the_stack() {
+        let deep = format!("{}{}", "{a,".repeat(50_000), "}".repeat(50_000));
+        assert!(GlobFilter::new("p", deep, false)
+            .unwrap_err()
+            .contains("longer"));
+        let deep = format!("{}{}", "{a,".repeat(1_000), "}".repeat(1_000));
+        assert!(GlobFilter::new("p", deep, false)
+            .unwrap_err()
+            .contains("nested"));
+        let wide = "[a-z]".repeat(crate::MAX_GLOB_PATTERN_BYTES / 5);
+        assert!(GlobFilter::new("p", wide, false).is_ok());
     }
 
     #[test]

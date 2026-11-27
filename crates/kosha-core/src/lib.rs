@@ -951,17 +951,19 @@ fn parse_field_pattern(
 /// {"glob": {"path": {"value": "/Matters/*/notes.txt", "case_insensitive": true}}}
 /// ```
 ///
-/// Syntax is [`globset`]'s with `/` as the separator: `*` and `?` never
-/// match `/`, `**` matches any number of path components, `[abc]` /
-/// `[!a-z]` are classes, `{a,b}` alternates, and `\` escapes. Case-
-/// sensitive by default, like [`PrefixFilter`]; `case_insensitive: true`
-/// folds both sides. A malformed glob is a parse error (a 400).
+/// gitignore-style, with `/` as the separator: `*`, `?` and classes never
+/// match `/`, a `**` path component matches any number of components,
+/// `[abc]` / `[!a-z]` are classes, `{a,b}` alternates (not nested), and
+/// `\` escapes. It matches characters, not bytes, so `?` is one `é`.
+/// Case-sensitive by default, like [`PrefixFilter`]; `case_insensitive:
+/// true` folds both sides (Unicode simple case folding). A malformed glob,
+/// or one longer than [`MAX_GLOB_PATTERN_BYTES`], is a parse error (a 400).
 #[derive(Debug, Clone)]
 pub struct GlobFilter {
     pub field: String,
     pub pattern: String,
     pub case_insensitive: bool,
-    matcher: globset::GlobMatcher,
+    matcher: regex::Regex,
     literal_prefix: String,
 }
 
@@ -983,14 +985,8 @@ impl GlobFilter {
     ) -> Result<Self, String> {
         let field = field.into();
         let pattern = pattern.into();
-        let matcher = globset::GlobBuilder::new(&pattern)
-            .literal_separator(true)
-            .backslash_escape(true)
-            .case_insensitive(case_insensitive)
-            .empty_alternates(true)
-            .build()
-            .map_err(|e| format!("glob `{field}`: invalid pattern {pattern:?}: {e}"))?
-            .compile_matcher();
+        let matcher = glob_regex(&pattern, case_insensitive)
+            .map_err(|e| format!("glob `{field}`: invalid pattern {pattern:?}: {e}"))?;
         // Every match starts with the text before the first special
         // character, so a sorted dictionary can seek to it. Folding case
         // breaks byte order, so a case-insensitive glob has none.
@@ -1021,6 +1017,108 @@ impl GlobFilter {
     /// to use, e.g. a case-insensitive glob or one starting with `*`).
     pub fn literal_prefix(&self) -> &str {
         &self.literal_prefix
+    }
+}
+
+/// The longest `glob` pattern accepted.
+pub const MAX_GLOB_PATTERN_BYTES: usize = 4096;
+
+/// Translate a glob (syntax on [`GlobFilter`]) into an anchored regex.
+/// The translation is iterative and alternates cannot nest, so an
+/// adversarial pattern cannot exhaust the stack; `regex` bounds the rest.
+fn glob_regex(pattern: &str, case_insensitive: bool) -> Result<regex::Regex, String> {
+    if pattern.len() > MAX_GLOB_PATTERN_BYTES {
+        return Err(format!("longer than {MAX_GLOB_PATTERN_BYTES} bytes"));
+    }
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut re = String::from(if case_insensitive { "(?i)^" } else { "^" });
+    let mut in_alternate = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        i += 1;
+        match c {
+            '\\' => {
+                let Some(&next) = chars.get(i) else {
+                    return Err("dangling `\\` at the end".into());
+                };
+                i += 1;
+                re.push_str(&regex::escape(next.encode_utf8(&mut [0; 4])));
+            }
+            '*' if chars.get(i) == Some(&'*') => {
+                i += 1;
+                let starts_component = i == 2 || chars[i - 3] == '/';
+                if starts_component && chars.get(i) == Some(&'/') {
+                    i += 1;
+                    re.push_str("(?:.*/)?");
+                } else if starts_component && i == chars.len() {
+                    re.push_str(".*");
+                } else {
+                    re.push_str("[^/]*");
+                }
+            }
+            '*' => re.push_str("[^/]*"),
+            '?' => re.push_str("[^/]"),
+            '[' => {
+                let negated = matches!(chars.get(i), Some('!' | '^'));
+                if negated {
+                    i += 1;
+                }
+                let mut class = String::new();
+                let mut first = true;
+                loop {
+                    let Some(&c) = chars.get(i) else {
+                        return Err("unclosed character class; missing `]`".into());
+                    };
+                    i += 1;
+                    match c {
+                        ']' if !first => break,
+                        '\\' => {
+                            let Some(&next) = chars.get(i) else {
+                                return Err("dangling `\\` at the end".into());
+                            };
+                            i += 1;
+                            class.push_str(&class_escape(next));
+                        }
+                        '-' if !first && chars.get(i).is_some_and(|&n| n != ']') => class.push('-'),
+                        c => class.push_str(&class_escape(c)),
+                    }
+                    first = false;
+                }
+                if negated {
+                    re.push_str(&format!("[^/{class}]"));
+                } else {
+                    re.push_str(&format!("[[{class}]&&[^/]]"));
+                }
+            }
+            '{' if in_alternate => return Err("nested `{` alternates are not supported".into()),
+            '{' => {
+                in_alternate = true;
+                re.push_str("(?:");
+            }
+            ',' if in_alternate => re.push('|'),
+            '}' if in_alternate => {
+                in_alternate = false;
+                re.push(')');
+            }
+            c => re.push_str(&regex::escape(c.encode_utf8(&mut [0; 4]))),
+        }
+    }
+    if in_alternate {
+        return Err("unclosed alternate; missing `}`".into());
+    }
+    re.push('$');
+    regex::RegexBuilder::new(&re)
+        .size_limit(1 << 20)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// One character as a literal inside a regex class.
+fn class_escape(c: char) -> String {
+    match c {
+        '\\' | '[' | ']' | '-' | '^' | '&' | '~' => format!("\\{c}"),
+        c => c.to_string(),
     }
 }
 

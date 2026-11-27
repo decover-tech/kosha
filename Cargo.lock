@@ -766,16 +766,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bstr"
-version = "1.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a680398c10c7bc0488067c4612226ea905a85f607134b69f3068d505d58c4214"
-dependencies = [
- "memchr",
- "serde_core",
-]
-
-[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1757,18 +1747,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "globset"
-version = "0.4.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e47d37d2ae4464254884b60ab7071be2b876a9c35b696bd018ddcc76847309cd"
-dependencies = [
- "aho-corasick",
- "bstr",
- "regex-automata",
- "regex-syntax",
-]
-
-[[package]]
 name = "group"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2485,8 +2463,8 @@ dependencies = [
 name = "kosha-core"
 version = "0.1.0"
 dependencies = [
- "globset",
  "jiff",
+ "regex",
  "roaring",
  "serde",
  "serde_json",
