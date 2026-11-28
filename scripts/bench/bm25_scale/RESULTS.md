@@ -1,5 +1,11 @@
 # BM25 scale benchmark — results (2026-08-06)
 
+The OpenSearch table in this file is the August 2026 synthetic corpus on a
+2-node domain. It is not the 10M MS MARCO comparison. That harness is
+`vm/run_lucene.sh` (workflow suites `opensearch` and `elasticsearch`); its
+latencies are not copied here until a run has been measured. See
+[docs/benchmarks.md](../../../docs/benchmarks.md).
+
 Methodology: see [README.md](./README.md). Replicates turbopuffer's
 tpuf-benchmark "Full-Text Perf" workload (BM25, 10M docs, ~9GB, 8 QPS,
 topk=10, p50/p90/p99, warm vs cold) for a comparable number. "Docs" here

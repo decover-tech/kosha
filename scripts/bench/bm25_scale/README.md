@@ -1,9 +1,11 @@
 # BM25 scale benchmark
 
 Public summary of what has actually been measured, and what has not:
-[docs/benchmarks.md](../../../docs/benchmarks.md). A one-machine OpenSearch
-comparison that is still a placeholder lives in
-[../compare](../compare/README.md).
+[docs/benchmarks.md](../../../docs/benchmarks.md). The same-corpus
+single-node OpenSearch and Elasticsearch run is
+[below](#same-corpus-opensearch-and-elasticsearch); no latency from it is
+checked in yet. [../compare](../compare/README.md) is a 2,000-document
+laptop smoke test against OpenSearch 2.18 and is not that run.
 
 Replicates turbopuffer's tpuf-benchmark methodology (8 QPS, topk=10,
 p50/p90/p99, warm vs cold namespace) against Kosha, so the two are
@@ -26,6 +28,47 @@ pass — Kosha's vector path has zero production traffic and has never been
 run at that scale; see the assessment in the accompanying chat/PR
 description before attempting it. Running it would be a genuine
 scale-feasibility test of unproven code, not a rerun of this harness.
+
+## Same-corpus OpenSearch and Elasticsearch
+
+`vm/run_lucene.sh` loads `s3://decoverai-bench-corpus-cache/msmarco-10m` into
+one single-node engine on the bench VM and measures it with
+`query_bench_opensearch.py`, which uses `query_bench.py`'s open-loop
+scheduler, query order, and percentile. The workflow suites are
+`opensearch`, `elasticsearch`, and `lucene` (OpenSearch, then
+Elasticsearch). Settings, image tags, and the list-price assumptions are
+`lucene_compare.py`. The dispatch commands and the fairness notes are in
+[docs/benchmarks.md](../../../docs/benchmarks.md).
+
+What the script does, in order: stop the Kosha and Postgres containers
+(a 31g heap does not fit beside Kosha on this box), sync the corpus, set
+`vm.max_map_count`, start the pinned image, bulk-load with
+`refresh_interval=-1` and replicas 0, refresh once, force-merge to one
+segment per shard, warm the page cache with one unmeasured pass over
+`queries.txt`, then run `warm_nocache` and `warm_defaults` at the workflow
+`qps` and `duration`. `load.json` records ingest time, store size, data
+directory bytes, the node-reported version, and the cost assumptions.
+Phase JSON uses the same `p50_ms` / `p90_ms` / `p99_ms` / `errors` fields
+as a Kosha phase, plus request-cache and query-cache hit deltas.
+
+Defaults that are not workflow inputs: 8 shards (`LUCENE_SHARDS`),
+force-merge `max_num_segments=1` (`LUCENE_MAX_SEGMENTS`), heap `31g`,
+OpenSearch `opensearchproject/opensearch:3.10.1`, Elasticsearch
+`docker.elastic.co/elasticsearch/elasticsearch:9.5.7`. `return_fields=ids`
+sends `_source: false`; `all` returns the stored passage.
+
+```bash
+# On the bench VM, after the corpus sync the script does itself:
+cd scripts/bench/bm25_scale/vm
+./run_lucene.sh opensearch /data/results-ci/opensearch 8 1800 ids
+./run_lucene.sh elasticsearch /data/results-ci/elasticsearch 8 1800 ids
+```
+
+Publication dispatches use `duration=1800` and `qps=8`, and
+`keep_vm=true` on every run except the last so they share the instance.
+`suite=lucene` at 1800 seconds per phase can exceed the workflow's 350
+minute limit; dispatch the engines separately. A failed run keeps the VM
+(the workflow's standing rule).
 
 ## Prerequisites
 

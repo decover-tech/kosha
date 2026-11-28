@@ -40,6 +40,16 @@
 #     off, then ONE first-touch phase (knn_cold_nocache / cold_or_nocache):
 #     the per-query S3 GETs and bytes of the layout under test. The preload
 #     "cold" phase cannot measure that: it runs after a full preload.
+#
+# Lucene suites (suite=opensearch, elasticsearch, or lucene) skip the Kosha
+# image. They start one single-node engine on this same VM, load
+# s3://decoverai-bench-corpus-cache/msmarco-10m with refresh off, force-merge,
+# warm the page cache, then measure warm_nocache and warm_defaults at the
+# same qps, top 10 and duration. `lucene` runs OpenSearch and then
+# Elasticsearch back to back; at duration=1800 that can fill the 350 minute
+# job, so a publication run dispatches the two engines separately and keeps
+# the VM between them. Settings live in scripts/bench/bm25_scale/lucene_compare.py.
+#
 # Disk-cache experiment input (research #389; empty = today), one
 # space-separated key=value list to stay under GitHub's 25 dispatch inputs:
 #   cache_experiment  max=<bytes>               KOSHA_CACHE_MAX_BYTES (default 600 GiB)
@@ -67,9 +77,13 @@ on:
   workflow_dispatch:
     inputs:
       suite:
-        description: which benchmark suite(s) to run
+        description: >-
+          which benchmark suite(s) to run. opensearch / elasticsearch load
+          the 10M MS MARCO corpus into one single-node engine and measure
+          warm cache-off and warm defaults. lucene runs both engines
+          sequentially (tight at duration=1800).
         type: choice
-        options: [both, bm25, vector, none]
+        options: [both, bm25, vector, none, opensearch, elasticsearch, lucene]
         default: both
       mode:
         description: restore snapshots (fast) or full load (slow; vector overruns the 6h job limit)
@@ -426,6 +440,9 @@ jobs:
                 chmod +x ~/kosha/scripts/bench/bm25_scale/vm/*.sh'
 
       - name: Build server image + start containers
+        # Lucene suites do not need the Kosha image. two_tier_eval still does,
+        # even when the suite itself is a Lucene engine.
+        if: contains(fromJSON('["both","bm25","vector","none"]'), inputs.suite) || inputs.two_tier_eval == true
         run: |
           IP='${{ steps.tf.outputs.ip }}'
           SSH="ssh -i $RUNNER_TEMP/bench.pem ec2-user@$IP"
@@ -657,6 +674,41 @@ jobs:
             ./knn_budget_sweep.sh $VEC_NS /data/results-ci/knn_sweep \"\$EMB_DIR\" \
               '${{ inputs.qps }}' '${{ inputs.duration }}' '$KNN_SWEEP'"
 
+      - name: Lucene BM25 suite (OpenSearch / Elasticsearch)
+        if: contains(fromJSON('["opensearch","elasticsearch","lucene"]'), inputs.suite)
+        run: |
+          set -euo pipefail
+          IP='${{ steps.tf.outputs.ip }}'
+          SSH="ssh -i $RUNNER_TEMP/bench.pem -o ServerAliveInterval=30 ec2-user@$IP"
+          QPS='${{ inputs.qps }}'
+          DURATION='${{ inputs.duration }}'
+          RET='${{ inputs.return_fields }}'
+          case "$QPS" in
+            ''|*[!0-9.]*) echo "::error::qps must be a number, got: $QPS"; exit 1 ;;
+          esac
+          case "$DURATION" in
+            ''|*[!0-9]*) echo "::error::duration must be whole seconds, got: $DURATION"; exit 1 ;;
+          esac
+          case "$RET" in
+            ids) RETURN=ids ;;
+            all) RETURN=source ;;
+            *) echo "::error::return_fields must be ids or all, got: $RET"; exit 1 ;;
+          esac
+          case "$QUERY_ORDER" in
+            cycle|shuffle|zipf) ;;
+            *) echo "::error::query order must be cycle, shuffle or zipf, got: $QUERY_ORDER"; exit 1 ;;
+          esac
+          run_one() {
+            echo "lucene engine: $1 (qps=$QPS duration=${DURATION}s return=$RETURN order=$QUERY_ORDER)"
+            $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && QUERY_ORDER=$QUERY_ORDER ./run_lucene.sh $1 /data/results-ci/$1 $QPS $DURATION $RETURN"
+          }
+          case '${{ inputs.suite }}' in
+            opensearch|lucene) run_one opensearch ;;
+          esac
+          case '${{ inputs.suite }}' in
+            elasticsearch|lucene) run_one elasticsearch ;;
+          esac
+
       - name: Archive server logs + results to S3
         # Runs on failure too: a failed run's logs are the useful ones. The
         # bench segment bucket is destroyed with the stack, so this goes to
@@ -712,7 +764,7 @@ jobs:
             # has a build-info.json) is provenance, not a phase: without the
             # exclusion the table step failed with KeyError 'p50_ms' and
             # marked a finished run as failed.
-            find results -name '*.json' ! -name 'recall.json' ! -name 'meta.json' ! -name 'snapshot-build-info.json' ! -path 'results/knn_sweep/*' ! -path '*/two_tier/*' | sort | while read -r f; do
+            find results -name '*.json' ! -name 'recall.json' ! -name 'meta.json' ! -name 'snapshot-build-info.json' ! -name 'load.json' ! -path 'results/knn_sweep/*' ! -path '*/two_tier/*' | sort | while read -r f; do
               python3 - "$f" << 'EOF'
           import json, sys
           d = json.load(open(sys.argv[1]))
@@ -727,6 +779,7 @@ jobs:
             # only, so a failure here never fails the run.
             echo ""
             python3 scripts/bench/bm25_scale/internals_report.py results || true
+            python3 scripts/bench/bm25_scale/lucene_compare.py report-load results || true
             # recall.json has a different schema entirely (mean_recall_at_k,
             # not p50_ms) — its own section rather than forcing it into the
             # latency table above.
