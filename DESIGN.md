@@ -70,7 +70,7 @@ another and let the SSD cache warm."
   faceting needed for filters. If a real analytics need emerges, it's a separate consumer of the
   same S3 data, not a feature of the query path. (Since then a bounded set computed from the
   filter columns has been added — metrics, `percentiles`, `histogram` and `date_histogram` (fixed and calendar
-  intervals, time zones, bounds); see the README's Aggregations section.)
+  intervals, time zones, bounds); see [docs/reference/features.md](docs/reference/features.md#aggregations).)
 - Real-time (sub-second) durability of every write. Writes are durable to S3 within a bounded
   flush interval (see §7); we accept a small, tunable visibility lag in exchange for not fusing
   compute and storage.
@@ -79,7 +79,7 @@ another and let the SSD cache warm."
 
 This document describes the target architecture, which was built in phases.
 
-> **Where the implementation stands (keep in sync with the README's supported-features table).**
+> **Where the implementation stands (keep in sync with [docs/reference/features.md](docs/reference/features.md#supported-features)).**
 > Phase 1 (BM25 lexical search on the S3 + SSD-cache storage model) is complete, and most of
 > what was deferred to Phase 2 has shipped too: segments now carry a posting-based
 > `vector.idx` (cluster-and-posting ANN with centroid probing and triangle-inequality bounds),
@@ -194,7 +194,7 @@ per-org/matter index in `IndexRegistry`. Each namespace has:
 - A **schema**: field definitions (text, keyword, date, vector\<dim\>, geo, etc.), which fields are
   lexically indexed, which carry vector indices, which are filter-only.
 - An **index profile**: tokenizer/analyzer choice (implemented: the schema's per-field `analyzer`,
-  stored on the manifest and applied by the segment writers — see §6.2 and README "Analyzers"),
+  stored on the manifest and applied by the segment writers — see §6.2 and [docs/reference/features.md](docs/reference/features.md#analyzers)),
   ANN index type + params (e.g. HNSW `M`/`efConstruction`,
   or IVF-PQ for very large namespaces), compaction policy, cache priority tier.
 - A **manifest**: an ordered, versioned list of segment references that make up the current

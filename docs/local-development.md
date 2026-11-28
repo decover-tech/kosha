@@ -1,8 +1,15 @@
 # Local development & the OpenSearch → Kosha swap
 
+> **This page is a local-overlay note, and parts of it are older than the engine.**
+> It describes the Decover backend's Tilt setup and an acceptance test that had
+> not been flipped when the page was written. It also describes a lexical-only
+> phase. BM25, kNN, and hybrid search are implemented now; the current list is
+> [the feature reference](reference/features.md). The public write-up of the
+> storage model is [how we replaced Elasticsearch](blog/how-we-replaced-elasticsearch.md).
+
 How Kosha fits into the Decover backend's local environment (Tilt + the k8s
-`dev` overlay), and how the eventual local acceptance test — **run the app
-with Kosha instead of OpenSearch** — will be executed.
+`dev` overlay), and how the local acceptance test — **run the app
+with Kosha instead of OpenSearch** — was planned.
 
 ## Where Kosha runs locally
 

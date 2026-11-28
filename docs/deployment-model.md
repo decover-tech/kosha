@@ -37,7 +37,7 @@ customer, and the operational surface (one fleet, one release train) is smaller.
   ([k8s/README.md, "Multi-tenant SaaS cells"](../k8s/README.md#multi-tenant-saas-cells)).
 - #360, reframed for the SaaS fleet: `scripts/kosha_cluster.py` installs a cell
   (`install --overlay saas`), upgrades it in the order the
-  [manifest/WAL compatibility rules](../README.md#s3-wal-kosha_wal_modes3) require
+  [manifest/WAL compatibility rules](reference/auth.md#s3-wal-kosha_wal_modes3) require
   (`upgrade`), and reports health per cell (`status`).
 - Onboarding design partners as organizations in a shared cell, metered and billed
   through the existing usage and billing pipeline.

@@ -64,8 +64,9 @@ fsync per 16 appends. They are not production numbers.
 
 - Local WAL ack latency on production hardware (Linux, EBS): **not yet
   measured.**
-- S3 WAL ack latency against real S3: **not yet measured.** The README's S3
-  WAL table comes from a simulated PUT model (`crates/kosha-write/benches/s3_wal_ack.rs`),
+- S3 WAL ack latency against real S3: **not yet measured.** The S3 WAL
+  table in [docs/reference/auth.md](reference/auth.md#s3-wal-kosha_wal_modes3)
+  comes from a simulated PUT model (`crates/kosha-write/benches/s3_wal_ack.rs`),
   not from a bucket.
 
 ### Consistency

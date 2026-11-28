@@ -2,7 +2,7 @@
 
 Kosha is a search engine that keeps its data in S3 and uses local SSD as a cache. It supports
 BM25 lexical search, kNN/ANN vector search, hybrid RRF retrieval, filters, aggregations,
-compaction and a Postgres-backed control plane. The [README](README.md#supported-features)
+compaction and a Postgres-backed control plane. The [feature reference](docs/reference/features.md#supported-features)
 lists what works today, and [DESIGN.md](DESIGN.md) explains the architecture. This file covers
 what you need to go from a fresh clone to a merged pull request.
 

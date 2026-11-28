@@ -1,0 +1,31 @@
+# Local side-by-side for scripts/bench/compare. Not a deployment.
+# Kosha runs with authentication off because run_benchmark.py does not send
+# a key. OpenSearch runs with the security plugin disabled.
+
+name: kosha-compare
+
+services:
+  opensearch:
+    image: opensearchproject/opensearch:2.18.0
+    environment:
+      - discovery.type=single-node
+      - DISABLE_SECURITY_PLUGIN=true
+      - DISABLE_INSTALL_DEMO_CONFIG=true
+      - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+
+  kosha:
+    image: ${KOSHA_IMAGE:-decoverai/kosha:0.1.0}
+    environment:
+      KOSHA_AUTH: disabled
+      KOSHA_ROLE: standalone
+    ports:
+      - "8080:8080"

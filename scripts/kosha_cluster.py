@@ -24,7 +24,8 @@ BASE = K8S / "base"
 OVERLAYS = ("base", "saas")
 DEPLOYMENTS = ("deployment/kosha", "deployment/kosha-query", "deployment/kosha-indexer")
 # Upgrade order: readers before the writer. New binaries read the old manifest
-# and WAL formats, old binaries cannot read the new ones (README, "S3 WAL").
+# and WAL formats, old binaries cannot read the new ones
+# (docs/reference/auth.md, "S3 WAL").
 # The indexer also writes manifests, so it is stopped for the whole upgrade.
 ROLLOUT_ORDER = ("kosha-query", "kosha", "kosha-indexer")
 ROLE = {"kosha": "ingest", "kosha-query": "query", "kosha-indexer": "indexer"}
@@ -48,7 +49,7 @@ ADMIN_KEY_PATCH = [{
 }]
 TLS_SECRET_KEYS = ("tls.crt", "tls.key", "ca.crt")
 KEY_NAMES = '{{range $k, $v := .data}}{{$k}}{{"\\n"}}{{end}}'
-UPGRADE_NOTE = "See README.md, \"S3 WAL\", for the manifest/WAL upgrade note."
+UPGRADE_NOTE = "See docs/reference/auth.md, \"S3 WAL\", for the manifest/WAL upgrade note."
 WAL_SWITCH_NOTE = (
     "upgrade reads KOSHA_WAL_MODE from configmap/kosha-config, not from the running "
     "ingest pod. Switch the WAL mode as its own drained step before any upgrade: stop "

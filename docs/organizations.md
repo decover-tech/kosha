@@ -39,7 +39,7 @@ that need SSO today use OpenID Connect, which every major identity provider
 
 Every route is under `/v1/admin/` and needs an admin credential:
 `KOSHA_ADMIN_API_KEY`, or a named
-[operator credential](../README.md#operator-admin-credentials). A tenant API
+[operator credential](reference/auth.md#operator-admin-credentials). A tenant API
 key is never enough. The holder of the admin credential is then either:
 
 - **the operator**: no `X-Kosha-Actor` header. Not bound by roles. Audited as
