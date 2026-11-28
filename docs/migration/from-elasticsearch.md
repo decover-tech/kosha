@@ -164,7 +164,7 @@ print(es_ids, kosha_ids)
 Expect the same documents for supported constructs. Rankings are close but
 not identical: both engines use BM25 with `k1=1.2`, `b=0.75`, but Kosha
 computes its statistics over the whole namespace and tokenizes text its own
-way (see [Analyzers](../../README.md#analyzers) in the README).
+way (see [Analyzers](../reference/features.md#analyzers)).
 
 ## 7. Switch the application
 

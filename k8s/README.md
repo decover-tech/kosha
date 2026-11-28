@@ -143,7 +143,7 @@ Consequences worth knowing:
   swap costs a cold hydration, not data. The exception is the default local
   WAL (`data_dir/_wal`): acknowledged but unflushed writes are lost with the
   node. Set `KOSHA_WAL_MODE=s3` on the ingest Deployment to keep the WAL in
-  the bucket instead (see the root README, "S3 WAL").
+  the bucket instead (see [docs/reference/auth.md](../docs/reference/auth.md#s3-wal-kosha_wal_modes3), "S3 WAL").
 - **Prod needs the same pool before it deploys.** These constraints live in
   `base/`, so `k8s/prod` inherits them; without the label and taint on the
   prod cluster, the pod sits `Pending` forever.
@@ -356,7 +356,7 @@ already exists, including after a partial install. Do not use it with
 storage from a previous installation, even on a new Kubernetes cluster:
 `--confirm-empty-storage` is your confirmation, not a storage check. To move
 a running stack to a new release use `upgrade` (below); it follows the
-[manifest and WAL compatibility rules](../README.md#s3-wal-kosha_wal_modes3)
+[manifest and WAL compatibility rules](../docs/reference/auth.md#s3-wal-kosha_wal_modes3)
 in the main README. Old binaries cannot read the new formats, so it refuses
 rollbacks.
 
@@ -439,7 +439,7 @@ python3 scripts/kosha_cluster.py --context saas-cell-1 upgrade \
   --image "decoverai/kosha:${KOSHA_RELEASE_TAG}"
 ```
 
-It enforces the [manifest/WAL rules](../README.md#s3-wal-kosha_wal_modes3):
+It enforces the [manifest/WAL rules](../docs/reference/auth.md#s3-wal-kosha_wal_modes3):
 
 - It refuses a lower release tag than the running one (old readers cannot
   read the manifest object or v2/v3 WAL frames). Digests and non-semver tags
@@ -473,7 +473,7 @@ lose acknowledged writes that were never flushed.
    **current** release (`kubectl -n kosha rollout restart deployment/kosha`).
    For local → s3 the pod must come back on the same node: on first start it
    copies the local `_wal` into the S3 stream. For s3 → local, check the
-   stream is empty first (see the root README, "S3 WAL").
+   stream is empty first (see [docs/reference/auth.md](../docs/reference/auth.md#s3-wal-kosha_wal_modes3), "S3 WAL").
 3. Wait for `kosha_cluster.py status` to report the cell healthy and resume
    writes.
 4. Only then run `upgrade`.

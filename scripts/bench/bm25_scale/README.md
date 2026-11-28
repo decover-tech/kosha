@@ -1,5 +1,10 @@
 # BM25 scale benchmark
 
+Public summary of what has actually been measured, and what has not:
+[docs/benchmarks.md](../../../docs/benchmarks.md). A one-machine OpenSearch
+comparison that is still a placeholder lives in
+[../compare](../compare/README.md).
+
 Replicates turbopuffer's tpuf-benchmark methodology (8 QPS, topk=10,
 p50/p90/p99, warm vs cold namespace) against Kosha, so the two are
 comparable.

@@ -23,5 +23,8 @@
 # Local dev volumes (docker-compose)
 /volumes
 
+# Local benchmark output (scripts/bench/compare/run_local.sh)
+/scripts/bench/compare/out/
+
 # OpenAPI generation scratch and the pinned API tool binaries (make openapi)
 /build
