@@ -48,13 +48,55 @@ The "cold" phase only calls `POST /_cache/clear`. There was no node-shell access
 
 Do not subtract these from the MS MARCO rows.
 
+### Same-corpus OpenSearch and Elasticsearch — not measured yet
+
+The scale workflow can now load the same 10M MS MARCO corpus the Kosha rows used (`s3://decoverai-bench-corpus-cache/msmarco-10m`, the `segment` text and `queries.txt`) onto one `m7i.8xlarge` and measure OpenSearch 3.10.1 and Elasticsearch 9.5.7 with the same open-loop client as `query_bench.py`. No latency from that path is in this file. The commands below are what to dispatch.
+
+Both engines, one node, heap `-Xms31g -Xmx31g` (the compressed-oops ceiling; the rest of the 128 GiB is the page cache). Index: 8 primary shards, 0 replicas, `refresh_interval: -1` for the load and for the measured window, one `_refresh`, then `_forcemerge?max_num_segments=1` (one segment per shard). BM25 `k1=1.2` / `b=0.75`. Analyzer `kosha_standard`: whitespace, lowercase, ASCII punctuation stripped from token edges, empty tokens dropped — Kosha's `standard` chain, not Lucene's `standard` analyzer. Translog durability and the codec stay at each engine's default. Security is off. `search.concurrent_segment_search` is set to OpenSearch `mode=all` and Elasticsearch `enabled=true`; with one segment per shard that setting does not add threads inside a shard, and the 8 shards are the per-query parallelism. A refusal from either engine is stored on `load.json` and the run continues.
+
+Two warm phases, warmup not included in the percentile. `warm_nocache` disables the request cache and the query cache and sends `request_cache=false`. `warm_defaults` turns both caches back to the engine default and does not pass `request_cache`. A default request cache does not store a `size: 10` hit list; each phase JSON records the cache hit and miss deltas. Hits are `_id` and `_score` only when the workflow `return_fields` is `ids` (the current Kosha default). `track_total_hits` is 10,000.
+
+Client latency is `query_bench.py`'s open loop and its percentile, including the time to read and parse the body. A 200 with failed shards or `timed_out` is an error. The page cache is not dropped. This is not a cold-from-S3 number: the Lucene index is the data.
+
+List-price assumptions recorded on `load.json`, not a bill: `m7i.8xlarge` Linux on-demand in us-east-1 at $1.6128/hour (public price on 2026-11-28); the harness's 1,000 GB root volume; gp3 at $0.08/GB-month (the rate cited in [docs/research/389-cost-tiering.md](research/389-cost-tiering.md)), which is $80/month for that volume. Index bytes are filled in by the run. Multiplying them by $0.08 is still a list price.
+
+Dispatch from a checkout that contains this workflow (GitHub runs `workflow_dispatch` from the workflow file on the selected ref; the new `suite` values are not on `main` until this change is merged). Same machine, one campaign, `keep_vm` until the last run. `duration=1800` is the 30-minute phase behind the Kosha rows above. `suite=lucene` runs both engines in one job and can fill the 350-minute limit at that duration, so dispatch them separately.
+
+```bash
+gh workflow run benchmark.yml --ref <ref-with-this-change> \
+  -f suite=bm25 -f mode=restore -f bm25_docs=10m \
+  -f qps=8 -f duration=1800 -f warm_gate=queries -f return_fields=ids \
+  -f keep_vm=true
+
+gh workflow run benchmark.yml --ref <ref-with-this-change> \
+  -f suite=opensearch -f qps=8 -f duration=1800 \
+  -f return_fields=ids -f keep_vm=true
+
+gh workflow run benchmark.yml --ref <ref-with-this-change> \
+  -f suite=elasticsearch -f qps=8 -f duration=1800 \
+  -f return_fields=ids -f keep_vm=false
+```
+
+`suite=none` with `keep_vm` left false tears a kept VM down. Shard count defaults to 8 (`LUCENE_SHARDS` on `run_lucene.sh`); it is not a workflow input.
+
+When those runs exist, copy p50/p90/p99, errors, the `load.json` settings, and the Actions run ids into the table at the top of this page. Until then the Kosha rows stay the November measurements (run 44892212058) and the OpenSearch rows above stay the August synthetic corpus.
+
+Fairness, written down so a later table does not skip it:
+
+- Kosha's cited warm row is a different boot (Actions run 44892212058). Re-run `suite=bm25` in the same campaign for a same-day pair. That November run waited for `/readyz` after a preload and may have returned stored fields; the commands above use `warm_gate=queries` and `return_fields=ids`, which is what the Lucene phases copy.
+- Kosha scores its ~200 segments in parallel. Eight force-merged shards give OpenSearch and Elasticsearch eight search threads per query. One shard would be single-threaded after this force-merge. Thirty-two shards would be one per vCPU on about 10 GB of text. Eight is the harness default, not a tuned result.
+- Kosha's bench pins a 48 GiB segment cache inside the process. The Lucene heap is 31 GiB, with the page cache holding the index. Same machine, different split.
+- Replicas are 0 because the node is alone. The August row's replica and its 2× `r8g.large.search` domain do not apply.
+- Ranking is not compared. The analyzer is aligned with Kosha `standard` so the token stream is the same kind of work, not so the top-10 ids match.
+- Elasticsearch 9.5.7 is Elastic License 2.0 and is pulled at runtime. OpenSearch 3.10.1 is Apache-2.0.
+
 ### turbopuffer's published figures
 
 turbopuffer's full-text figures (warm 13/18/29 ms, cold 316/381/559 ms) are for **1M docs, ~300 MB**, not 10M. Their vector figures (warm 14/17/27 ms) are for 10M docs. Older sections of RESULTS.md compared Kosha at 10M BM25 against the 1M full-text figures. The results file's 2026-11-21 correction says to treat the 10M BM25 rows as a scale result, not a like-for-like comparison. A 1M slice is a workflow input (`bm25_docs: 1m`) and had not been published as a result row when this page was written. All turbopuffer numbers are vendor-reported.
 
 ### Elasticsearch
 
-Not measured. No Elasticsearch version, cluster, or latency number is checked in as a result.
+Not measured. No Elasticsearch latency number is checked in. The scale workflow's `suite=elasticsearch` runs Elasticsearch 9.5.7 on the same corpus; that run has not been dispatched.
 
 ### Cost
 
@@ -71,12 +113,12 @@ Full protocol, warm-gate modes, and the CI workflow inputs are in [scripts/bench
 1. Fetch MS MARCO with `scripts/bench/bm25_scale/fetch_msmarco.py` (and `fetch_msmarco_embeddings.py` for the vector suite). The synthetic stand-in is `generate_corpus.py --docs 10000000 --avg-bytes 900 --seed 42`.
 2. Build segments with the offline builder, or load through `load_corpus.py`. On the server set `KOSHA_FLUSH_THRESHOLD` high (the README suggests `50000`), `KOSHA_FLUSH_MAX_AGE_MS=0`, and `KOSHA_COMPACTION_INTERVAL_MS=0` during the load so the idle flush and the compaction scheduler do not cut the run apart.
 3. Dispatch `.github/workflows/benchmark.yml` (`workflow_dispatch`). Default suite is both BM25 and vector, `mode=restore` from a snapshot, `qps=8`. `duration=1800` is the publication-length phase; the workflow default of 300 is a short check. The job needs the bench AWS credentials and the infra repo token named in the workflow file. It tears the VM down on success.
-4. OpenSearch on the same corpus, if you have a cluster: `load_corpus_opensearch.py` then `query_bench_opensearch.py`. Write the JSON next to a Kosha run that used the same `queries.txt`. That pair does not exist in git.
+4. OpenSearch or Elasticsearch on the same corpus: dispatch `suite=opensearch` or `suite=elasticsearch` as in the section above (`run_lucene.sh` on the bench VM). `load_corpus_opensearch.py` and `query_bench_opensearch.py` are the pieces that script runs. A same-corpus pair is not in git yet.
 
 Query the engine the way the harness does: open-loop 8 QPS, top 10, BM25 `operator: or` on the MS MARCO workload (the August runs were AND, and the results file records that AND returned zero hits on about a third of natural-language queries).
 
 ## Rerun a small comparison on one machine
 
-[scripts/bench/compare](../scripts/bench/compare/README.md) starts OpenSearch 2.18.0 and `decoverai/kosha:0.1.0`, generates a few thousand synthetic documents, and runs [scripts/bench/run_benchmark.py](../scripts/bench/run_benchmark.py) against both. That measures one laptop-sized corpus. It does not replace the table above. Elasticsearch is not started by that compose file. The result file in that directory is a placeholder until someone runs the script and commits the machine description with the JSON.
+[scripts/bench/compare](../scripts/bench/compare/README.md) starts OpenSearch 2.18.0 and `decoverai/kosha:0.1.0`, generates a few thousand synthetic documents, and runs [scripts/bench/run_benchmark.py](../scripts/bench/run_benchmark.py) against both. That measures one laptop-sized corpus. It does not replace the table above. The publication-scale single-node run is the Lucene suite in the benchmark workflow, described above. The result file in `scripts/bench/compare` is a placeholder until someone runs that laptop script and commits the machine description with the JSON.
 
 `run_benchmark.py` is also the older single-client microbench (lexical and kNN). It expects you to pass `--corpus` and `--queries` and to already have both servers listening. It does not send an API key, so the Kosha process has to be started with `KOSHA_AUTH=disabled` or the compare compose file.

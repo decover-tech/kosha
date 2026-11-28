@@ -77,6 +77,7 @@ Shared assumptions:
 | `pipeline_bm25.sh` | 7/8 | BM25 OR-mode: S3-cache load → full compaction (#117/#122, doc-loss guard) → warmup-gated cold reset (#116/#123) → cold + warm cache-off phases |
 | `pipeline_vector_smoke.sh` | vec smoke | 1M-doc kNN shakedown: embeddings-cache seed → aligned vector load → segment-layout check → short kNN phase. Caught issue #126 (query-path HNSW builds) before the 10M round could waste hours on it |
 | `pipeline_vector.sh` | 9 | 10M Vector Perf: 500k-doc flush threshold (~20 large segments — deliberately NO compaction: the vector corpus is ~260GB on disk and capped merging would rewrite it for hours) → warmup incl. vector files (#129) → cold kNN cache-off + warm kNN cache-on (#128) |
+| `run_lucene.sh` | — | Single-node OpenSearch 3.10.1 or Elasticsearch 9.5.7, same `msmarco-10m` text corpus and the same open-loop client. Stops the Kosha container first. Writes `load.json`, `warm_nocache.json`, `warm_defaults.json`. The benchmark workflow runs it for `suite=opensearch`, `elasticsearch`, or `lucene`. |
 
 Gotchas encoded in these scripts, learned the expensive way:
 - Cold reset = stop container + `rm -rf` the data dir + restart, then

@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 DEFAULTS = {"recall_min": 0.93, "max_error_rate": 0.0}
-SKIP_NAMES = {"recall.json", "meta.json", "snapshot-build-info.json"}
+SKIP_NAMES = {"recall.json", "meta.json", "snapshot-build-info.json", "load.json"}
 SKIP_DIRS = {"knn_sweep", "two_tier"}
 
 

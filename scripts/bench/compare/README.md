@@ -25,7 +25,7 @@ is untested.
 | Workload | `scripts/bench/run_benchmark.py --mode lexical`, 20 repetitions per query, first request of each query is an untimed warmup inside that script |
 | Auth | `KOSHA_AUTH=disabled` on the Kosha container. `run_benchmark.py` does not send a key. Do not use this compose file as a deployment. |
 
-The publication-scale OpenSearch loader (`scripts/bench/bm25_scale/load_corpus_opensearch.py`) is a different tool: it expects a corpus from `generate_corpus.py` and a cluster you already have.
+The publication-scale run is `scripts/bench/bm25_scale/vm/run_lucene.sh` (workflow suites `opensearch` and `elasticsearch`), against the 10M MS MARCO corpus on the bench VM. `load_corpus_opensearch.py` is the loader that script calls. It is not this 2,000-document smoke test.
 
 ## Run
 
