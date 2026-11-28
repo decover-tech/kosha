@@ -50,6 +50,15 @@
 # job, so a publication run dispatches the two engines separately and keeps
 # the VM between them. Settings live in scripts/bench/bm25_scale/lucene_compare.py.
 #
+# suite=lance also skips the Kosha image. It starts an Iceberg REST catalog
+# (apache/iceberg-rest-fixture) on the VM, loads the same corpus into a
+# Lance table on S3 in the stack's segment bucket (declared in and resolved
+# through that catalog), builds Lance's BM25 full-text index, then measures
+# cold_first_pass (fresh process, one pass, first-touch S3) and
+# warm_nocache (prewarm + warmup, then duration seconds) at the same qps,
+# top 10 and return_fields. Settings live in
+# scripts/bench/bm25_scale/lance_compare.py.
+#
 # Disk-cache experiment input (research #389; empty = today), one
 # space-separated key=value list to stay under GitHub's 25 dispatch inputs:
 #   cache_experiment  max=<bytes>               KOSHA_CACHE_MAX_BYTES (default 600 GiB)
@@ -81,9 +90,11 @@ on:
           which benchmark suite(s) to run. opensearch / elasticsearch load
           the 10M MS MARCO corpus into one single-node engine and measure
           warm cache-off and warm defaults. lucene runs both engines
-          sequentially (tight at duration=1800).
+          sequentially (tight at duration=1800). lance loads it into a Lance
+          table on S3 behind an Iceberg REST catalog and measures a cold
+          first pass and warm (no result cache).
         type: choice
-        options: [both, bm25, vector, none, opensearch, elasticsearch, lucene]
+        options: [both, bm25, vector, none, opensearch, elasticsearch, lucene, lance]
         default: both
       mode:
         description: restore snapshots (fast) or full load (slow; vector overruns the 6h job limit)
@@ -709,6 +720,38 @@ jobs:
             elasticsearch|lucene) run_one elasticsearch ;;
           esac
 
+      - name: Lance-over-Iceberg BM25 suite
+        if: inputs.suite == 'lance'
+        run: |
+          set -euo pipefail
+          IP='${{ steps.tf.outputs.ip }}'
+          SSH="ssh -i $RUNNER_TEMP/bench.pem -o ServerAliveInterval=30 ec2-user@$IP"
+          QPS='${{ inputs.qps }}'
+          DURATION='${{ inputs.duration }}'
+          RET='${{ inputs.return_fields }}'
+          case "$QPS" in
+            ''|*[!0-9.]*) echo "::error::qps must be a number, got: $QPS"; exit 1 ;;
+          esac
+          case "$DURATION" in
+            ''|*[!0-9]*) echo "::error::duration must be whole seconds, got: $DURATION"; exit 1 ;;
+          esac
+          case "$RET" in
+            ids) RETURN=ids ;;
+            all) RETURN=source ;;
+            *) echo "::error::return_fields must be ids or all, got: $RET"; exit 1 ;;
+          esac
+          case "$QUERY_ORDER" in
+            cycle|shuffle|zipf) ;;
+            *) echo "::error::query order must be cycle, shuffle or zipf, got: $QUERY_ORDER"; exit 1 ;;
+          esac
+          echo "lance over iceberg (qps=$QPS duration=${DURATION}s return=$RETURN order=$QUERY_ORDER)"
+          # Same bench segment bucket Kosha uses on this VM (torn down with
+          # the stack) and the same corpus cache the Lucene suites sync.
+          $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && \
+            LANCE_ROOT=s3://decoverai-bench-kosha-segments/lance \
+            CORPUS_S3=s3://decoverai-bench-corpus-cache/msmarco-10m \
+            QUERY_ORDER=$QUERY_ORDER ./run_lance.sh /data/results-ci/lance $QPS $DURATION $RETURN"
+
       - name: Archive server logs + results to S3
         # Runs on failure too: a failed run's logs are the useful ones. The
         # bench segment bucket is destroyed with the stack, so this goes to
@@ -780,6 +823,7 @@ jobs:
             echo ""
             python3 scripts/bench/bm25_scale/internals_report.py results || true
             python3 scripts/bench/bm25_scale/lucene_compare.py report-load results || true
+            python3 scripts/bench/bm25_scale/lance_compare.py report-load results || true
             # recall.json has a different schema entirely (mean_recall_at_k,
             # not p50_ms) — its own section rather than forcing it into the
             # latency table above.

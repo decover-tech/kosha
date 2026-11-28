@@ -251,7 +251,7 @@ def format_load_reports(root: Path) -> str:
             d = json.loads(path.read_text())
         except (OSError, ValueError):
             continue
-        if not isinstance(d, dict) or "engine" not in d:
+        if not isinstance(d, dict) or d.get("engine") not in ENGINES:
             continue
         rel = path.relative_to(root).as_posix()
         store = d.get("store_size_bytes")

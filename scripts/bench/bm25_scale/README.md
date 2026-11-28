@@ -70,6 +70,40 @@ Publication dispatches use `duration=1800` and `qps=8`, and
 minute limit; dispatch the engines separately. A failed run keeps the VM
 (the workflow's standing rule).
 
+## Same-corpus Lance over an Iceberg REST catalog
+
+`suite=lance` runs `vm/run_lance.sh`. It starts the Iceberg project's
+reference REST catalog (`apache/iceberg-rest-fixture:1.10.1`) on the VM,
+then `load_corpus_lance.py` writes the same corpus into a Lance table on S3
+(the stack's segment bucket, under `lance/`; `LANCE_ROOT`) through lance-namespace's
+`iceberg` implementation: the catalog declares the table (`table_type=lance`)
+and hands back its location, and every reader opens it through the catalog.
+Iceberg's spec only allows Parquet/ORC/Avro data files, so this is a Lance
+table cataloged in Iceberg, not Lance files inside an Iceberg table.
+
+- Index: one Lance INVERTED (BM25, k1=1.2 b=0.75) index on a pre-trimmed
+  copy of the passage. Lance's `whitespace` tokenizer keeps edge
+  punctuation, so the loader and the query client both apply Kosha's
+  `standard@1` edge trim first; the index lowercases and does not stem,
+  remove stop words or fold accents. `test_lance_compare.py` checks the
+  tokens match `lucene_compare`'s analyzer.
+- Phases, each its own process: `cold_first_pass` (empty Lance caches, one
+  pass over the queries, first-touch S3) and `warm_nocache` (`prewarm_index`
+  plus one unmeasured pass, then `duration` seconds). Lance has no result
+  cache. The index cache is 64 GiB, standing in for the page cache Lucene
+  gets. Each phase records Lance's object-store reads for the measured
+  window (`io_stats`): fetching `id` for the top 10 reads the data files
+  on S3 on every query, warm or not.
+- The client calls Lance in-process. There is no HTTP hop, which slightly
+  favors Lance against the Kosha and Lucene clients.
+- Pinned: pylance 14.0.3, lance-namespace 0.13.0, lance-namespace-impls
+  0.4.2 (`lance_compare.py`).
+
+```bash
+gh workflow run benchmark.yml --ref <branch> -f suite=lance -f qps=8 \
+  -f duration=1800 -f return_fields=ids -f keep_vm=false
+```
+
 ## Prerequisites
 
 1. **Server-side flush threshold.** Kosha's live default (`flush_threshold =
